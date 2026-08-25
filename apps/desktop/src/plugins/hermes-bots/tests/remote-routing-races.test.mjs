@@ -37,7 +37,7 @@ function load({ requestProfile, agents, profileRoutes } = {}) {
       activeConnectionId = connectionId
       calls.push(['ensureAgent', connectionId, profile])
     },
-    newChat: (route, options) => calls.push(['newChat', route, options]),
+    newChat: route => calls.push(['newChat', route]),
     notify: () => undefined,
     notifyError: () => undefined,
     profileRoutes: profileRoutes || (async () => []),
@@ -50,7 +50,6 @@ function load({ requestProfile, agents, profileRoutes } = {}) {
       calls.push(['profile', route, method, params])
       return {}
     }),
-    setWorkspaceScope: (mode, ownerKey, target) => calls.push(['workspaceScope', mode, ownerKey, target]),
     state: {
       connectionId: { get: () => activeConnectionId, listen: () => undefined },
       gateway: { get: () => 'open', listen: () => undefined },
@@ -272,8 +271,7 @@ test('non-identity alias resolves the canonical chat by NAME on the backend prof
 
   const result = await runtime.context.__race.openBotCanonicalChat(workerBot)
 
-  assert.equal(result.registryId, 'worker-chat')
-  assert.equal(result.openedId, 'worker-chat-tip')
+  assert.equal(result, 'worker-chat')
   const lookup = requests.find(([method]) => method === 'session.list')
   assert.equal(lookup[1].profile, 'backend-worker', 'lookup uses the backend alias, not the logical name')
   assert.equal(lookup[1].title, 'Bot Chat')
@@ -353,17 +351,6 @@ test('delayed duplicate, delete, and new chat keep source ownership', async () =
     .filter(value => value && typeof value === 'object')
   assert.ok(routes.length >= 3)
   assert.ok(routes.every(route => route.connectionId === 'remote-a'))
-
-  const newChat = runtime.calls.find(call => call[0] === 'newChat')
-  assert.equal(newChat[2].workspaceMode, 'bots')
-  assert.equal(newChat[2].workspaceOwnerKey, 'bot:remote-a::worker')
-  assert.equal(newChat[1].targetProfile, 'backend-worker')
-
-  const scope = runtime.calls.find(call => call[0] === 'workspaceScope')
-  assert.equal(scope[1], 'bots')
-  assert.equal(scope[2], 'bot:remote-a::worker')
-  assert.equal(scope[3].kind, 'route')
-  assert.equal(scope[3].route.connectionId, 'remote-a')
 })
 
 

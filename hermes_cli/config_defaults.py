@@ -397,17 +397,6 @@ DEFAULT_CONFIG = {
         # window so it can't leak indefinitely. 0 disables escalation (SIGTERM
         # only — the historical behavior). Floored internally at 0.
         "daemon_term_grace_seconds": 2.0,
-        # Bounded linger (seconds) for one-shot CLI runs (-q/-Q/-z) that exit
-        # while background processes spawned with notify_on_complete=true are
-        # still running. The dying parent owns those children's stdout pipes,
-        # so exiting immediately kills the delivery a few seconds later —
-        # destroying Bot Mode handoff replies dispatched via message_agent /
-        # bot_relay from a short-lived `hermes -p <bot> chat -Q` recipient
-        # (#90879). The parent instead waits (up to this bound) for tracked
-        # notify_on_complete processes to finish before exiting. Plain
-        # background processes without notify_on_complete (servers, daemons)
-        # are never waited on. 0 disables the linger.
-        "oneshot_completion_wait_seconds": 600.0,
         # Environment variables to pass through to sandboxed execution
         # (terminal and execute_code).  Skill-declared required_environment_variables
         # are passed through automatically; this list is for non-skill use cases.
@@ -478,6 +467,9 @@ DEFAULT_CONFIG = {
         # Opt-in egress lockdown for Docker terminal sessions. When false,
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,
+        # Suppress automatic credential, skill, cache, and egress-proxy mounts.
+        # Required for secure remote-model task containers; default off for compatibility.
+        "docker_isolate_host_data": False,
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
         # /dev/shm size for the Docker sandbox. Docker's 64 MB default silently
         # breaks Chromium/Playwright and PyTorch DataLoader workers; tmpfs is
@@ -1162,6 +1154,17 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Short, tool-free classifier used by explicitly opted-in specialist
+        # task routing. Invalid/unavailable results always fall back to chat.
+        "specialist_router": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 12,
+            "extra_body": {},
+            "reasoning_effort": "none",
+        },
         # Kanban decomposer — decomposes a triage task into a graph of
         # child tasks routed to specialist profiles by description.
         # Invoked by ``hermes kanban decompose`` and the kanban
@@ -1799,11 +1802,6 @@ DEFAULT_CONFIG = {
         "submit_mode": "direct",       # TUI: direct submits immediately; draft leaves an editable transcript
         "max_recording_seconds": 120,
         "auto_tts": False,
-        # Desktop remote clients call the profile's STT/TTS providers
-        # DIRECTLY (config + key fetched over the authenticated REST channel
-        # at voice-session start) instead of relaying audio through the
-        # gateway — lowest-hop path in both directions. false = always relay.
-        "client_direct": True,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
         "beep_volume": 0.3,           # Beep amplitude multiplier (0.0-1.0, default keeps prior hardcoded value)
         "thinking_sound": True,       # Calm ambient bubble sound while the agent works in voice chat (volume follows beep_volume)
@@ -2220,6 +2218,14 @@ DEFAULT_CONFIG = {
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
+        # Disabled by default. When enabled, only high-confidence bounded
+        # task requests create a subscribed Kanban card; all other messages
+        # retain the ordinary chat path.
+        "specialist_routing": {
+            "enabled": False,
+            "confidence_threshold": 0.80,
+            "timeout_seconds": 12,
+        },
         "missed_message_backfill": {
             "enabled": False,             # Replay missed Discord messages after reconnect/startup
             "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels

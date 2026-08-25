@@ -2480,35 +2480,6 @@ function getVenvPython(venvRoot) {
   return path.join(venvRoot, IS_WINDOWS ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'))
 }
 
-// Map a selected interpreter back to the venv that OWNS it (the directory
-// above bin/ or Scripts/), but only when that venv lives inside `root`.
-// Returns null for system pythons — they own no site-packages we should mount.
-//
-// This exists because findPythonForRoot() probes `.venv` before `venv`, and a
-// checkout can legitimately have BOTH (dev tooling venv + the CLI install
-// venv, possibly on different Python versions). The interpreter and the
-// site-packages placed on PYTHONPATH must come from the SAME venv: pairing a
-// .venv 3.12 python with venv/lib/python3.11/site-packages makes the backend
-// die on its first native import (pydantic_core) before the gateway binds —
-// the renderer then reports "Gateway offline" on every profile.
-function venvRootForPython(python: string, root: string) {
-  const parent = path.dirname(python)
-  const binName = path.basename(parent).toLowerCase()
-
-  if (binName !== 'bin' && binName !== 'scripts') {
-    return null
-  }
-
-  const candidate = path.dirname(parent)
-  const relative = path.relative(root, candidate)
-
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-    return null
-  }
-
-  return candidate
-}
-
 // Windows console-window flashes are governed by the *parent's* console, not by
 // each child spawn. A GUI-subsystem parent (pythonw.exe) has no console, so every
 // console-subsystem child it spawns (git, gh, cmd, ...) must allocate its own —
@@ -4430,12 +4401,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
     return null
   }
 
-  // The venv whose interpreter we selected is the venv whose site-packages
-  // belong on PYTHONPATH — findPythonForRoot may have picked `.venv` over
-  // `venv`, and mixing the two crashes the backend on its first native
-  // import (see venvRootForPython). Fall back to root/venv only for a
-  // system python, where the historical layout is the best guess.
-  const venvRoot = venvRootForPython(python, root) ?? path.join(root, 'venv')
+  const venvRoot = path.join(root, 'venv')
   const venvPython = getVenvPython(venvRoot)
   const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
 
@@ -13854,7 +13820,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
       isDefaultProfile: profile => profile === 'default',
       isValidProfileName: profile => PROFILE_NAME_RE.test(profile),
       prepareLocal: localRequest => prepareProfileDeleteRequest(localRequest).then(() => undefined),
-      teardownConnection: (connectionId, profile) => teardownConnectionScopedProfileBackend(connectionId, profile)
+      teardownConnection: (connectionId, profile) =>
+        teardownConnectionScopedProfileBackend(connectionId, profile)
     })
   }
 
@@ -14046,27 +14013,6 @@ ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
     }
   } finally {
     await handle.close()
-  }
-})
-
-// Runtime desktop plugins load their FULL source through this door.
-// `hermes:readFileText` is the *preview* read and silently truncates at
-// TEXT_PREVIEW_MAX_BYTES (512 KiB) — for a plugin that means evaluating half a
-// file. Dedicated generous cap, full read, and a hard EFBIG (via maxBytes)
-// instead of truncation when the source exceeds it.
-const PLUGIN_SOURCE_MAX_BYTES = 16 * 1024 * 1024
-
-ipcMain.handle('hermes:readPluginSource', async (_event: unknown, filePath: unknown) => {
-  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
-    maxBytes: PLUGIN_SOURCE_MAX_BYTES,
-    purpose: 'Plugin source'
-  })
-
-  return {
-    byteSize: stat.size,
-    path: resolvedPath,
-    text: await fs.promises.readFile(resolvedPath, 'utf8'),
-    truncated: false
   }
 })
 

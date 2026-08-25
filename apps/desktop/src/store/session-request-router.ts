@@ -95,7 +95,14 @@ export function requestForSessionProfile<T>(
 
     return timeoutMs === undefined && signal === undefined
       ? requestGatewayForAgent<T>(connectionId, normKey(ownerProfile.profile), method, routedParams)
-      : requestGatewayForAgent<T>(connectionId, normKey(ownerProfile.profile), method, routedParams, timeoutMs, signal)
+      : requestGatewayForAgent<T>(
+          connectionId,
+          normKey(ownerProfile.profile),
+          method,
+          routedParams,
+          timeoutMs,
+          signal
+        )
   }
 
   if (!sessionRpcNeedsProfileRoute(ownerProfile)) {

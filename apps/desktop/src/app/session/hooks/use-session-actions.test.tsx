@@ -17,7 +17,12 @@ import {
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { requestGatewayForAgent } from '@/store/gateway'
-import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $newChatRoute,
+  ensureGatewayProfile
+} from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
@@ -178,9 +183,7 @@ describe('connection-qualified session deletion', () => {
     render(
       <Harness
         activeSessionId="runtime-shared"
-        onReady={value => {
-          actions = value
-        }}
+        onReady={value => { actions = value }}
         requestGateway={requestGateway}
         selectedStoredSessionId="shared-session"
       />
@@ -195,9 +198,12 @@ describe('connection-qualified session deletion', () => {
       connectionId: 'source-a',
       profile: 'worker'
     })
-    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'worker', 'session.close', {
-      session_id: 'runtime-shared'
-    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'worker',
+      'session.close',
+      { session_id: 'runtime-shared' }
+    )
     expect(requestGateway).not.toHaveBeenCalledWith('session.close', expect.anything())
   })
 })
@@ -707,7 +713,11 @@ function ResumeHarness({
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
   onReady: (
-    resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
+    resume: (
+      storedSessionId: string,
+      replaceRoute?: boolean,
+      ownerRoute?: SessionProfileRoute
+    ) => Promise<unknown>
   ) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
@@ -1791,9 +1801,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     setMessages([])
     setSessions([])
     vi.mocked(getSession).mockReset()
-    vi.mocked(getLatestSessionMessages)
-      .mockReset()
-      .mockResolvedValue({ messages: [] } as never)
+    vi.mocked(getLatestSessionMessages).mockReset().mockResolvedValue({ messages: [] } as never)
     vi.mocked(requestGatewayForAgent).mockReset()
     vi.restoreAllMocks()
   })
@@ -1842,9 +1850,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     const ambientRequest = vi.fn(async () => ({}) as never)
 
-    let resume:
-      null | ((storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>) =
-      null
+    let resume: null | ((
+      storedSessionId: string,
+      replaceRoute?: boolean,
+      ownerRoute?: SessionProfileRoute
+    ) => Promise<unknown>) = null
 
     render(
       <ResumeHarness
@@ -1884,9 +1894,12 @@ describe('resumeSession warm-cache mapping integrity', () => {
       'session.activate',
       expect.objectContaining({ session_id: 'runtime-warm' })
     )
-    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'default', 'session.usage', {
-      session_id: 'runtime-warm'
-    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'default',
+      'session.usage',
+      { session_id: 'runtime-warm' }
+    )
     expect(requestGatewayForAgent).toHaveBeenCalledWith(
       'source-a',
       'default',
