@@ -1,8 +1,8 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { atom } from 'nanostores'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { ProfileRail } from './profile-switcher'
+import { mergeCompactProfileOrder, ProfileRail } from './profile-switcher'
 
 // The rail's discoverability pills are navigation, not identity — assert the
 // multi-gateway entry point deep-links to Settings → Connections instead of
@@ -11,8 +11,17 @@ import { ProfileRail } from './profile-switcher'
 
 const navigate = vi.fn()
 
+const { gatewayState, requestGateway } = vi.hoisted(() => ({
+  gatewayState: { current: { id: 'pc' } },
+  requestGateway: vi.fn()
+}))
+
 vi.mock('react-router', () => ({
   useNavigate: () => navigate
+}))
+
+vi.mock('@/app/gateway/hooks/use-gateway-request', () => ({
+  useGatewayRequest: () => ({ gateway: gatewayState.current, requestGateway })
 }))
 
 vi.mock('@/i18n', () => ({
@@ -84,16 +93,38 @@ vi.mock('../../profiles/rename-profile-dialog', () => ({ RenameProfileDialog: ()
 
 const { $hasMultipleConnections } = await import('@/store/connections')
 const hasMultipleConnections = $hasMultipleConnections as ReturnType<typeof atom<boolean>>
-const { $profiles } = await import('@/store/profile')
-const profiles = $profiles as ReturnType<typeof atom<Array<{ is_default: boolean; name: string }>>>
+const { $activeGatewayProfile, $profileScope, $profiles } = await import('@/store/profile')
+
+const profiles = $profiles as ReturnType<
+  typeof atom<Array<{ display_name?: string; is_default: boolean; name: string }>>
+>
+
+const profileScope = $profileScope as ReturnType<typeof atom<string>>
+const activeGatewayProfile = $activeGatewayProfile as ReturnType<typeof atom<string>>
+
+beforeEach(() => {
+  gatewayState.current = { id: 'pc' }
+  requestGateway.mockReset()
+  requestGateway.mockResolvedValue({ found: false })
+})
 
 afterEach(() => {
   cleanup()
   hasMultipleConnections.set(false)
   profiles.set([{ is_default: true, name: 'default' }])
+  profileScope.set('default')
+  activeGatewayProfile.set('default')
 })
 
 describe('ProfileRail multi-gateway entry point', () => {
+  it('reorders visible compact profiles without moving the hidden active profile', () => {
+    expect(mergeCompactProfileOrder(['picasso', 'founder', 'writer'], ['picasso', 'writer'], 'writer', 'picasso')).toEqual([
+      'writer',
+      'founder',
+      'picasso'
+    ])
+  })
+
   it('deep-links to the unified Settings → Gateways page from the rail', () => {
     render(<ProfileRail />)
 
@@ -119,6 +150,95 @@ describe('ProfileRail multi-gateway entry point', () => {
     expect(screen.getByRole('button', { name: 'default' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Manage gateways…' })).toBeNull()
     expect(screen.getByRole('button', { name: 'Manage profiles…' })).toBeTruthy()
+  })
+
+  it('shows the default owner name and initial instead of a generic home glyph', () => {
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { is_default: false, name: 'picasso' }
+    ])
+    render(<ProfileRail />)
+
+    const owner = screen.getByRole('button', { name: 'Clyde' })
+
+    expect(within(owner).getByText('C')).toBeTruthy()
+    expect(within(owner).getByText('Clyde')).toBeTruthy()
+  })
+
+  it('expands the active named profile and collapses the inactive owner to a circular initial', () => {
+    activeGatewayProfile.set('picasso')
+    profileScope.set('picasso')
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { display_name: 'Picasso', is_default: false, name: 'picasso' },
+      { display_name: 'Founder', is_default: false, name: 'founder' }
+    ])
+    render(<ProfileRail />)
+
+    const active = screen.getByRole('button', { name: 'Picasso' })
+    const owner = screen.getByRole('button', { name: 'Clyde' })
+    const founder = screen.getByRole('button', { name: 'Founder' })
+
+    expect(within(active).getByText('Picasso')).toBeTruthy()
+    expect(active.getAttribute('aria-pressed')).toBe('true')
+    expect(owner.querySelector('[data-slot="profile-owner-compact"]')).toBeTruthy()
+    expect(within(owner).getByText('C')).toBeTruthy()
+    expect(within(owner).queryByText('Clyde')).toBeNull()
+    expect(within(founder).getByText('F')).toBeTruthy()
+  })
+
+  it('uses the default profile avatar when the gateway has one', async () => {
+    requestGateway.mockResolvedValue({ data: 'data:image/png;base64,YXZhdGFy', found: true })
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { is_default: false, name: 'picasso' }
+    ])
+    render(<ProfileRail />)
+
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('profiles.get_asset', { asset: 'avatar', name: 'default' })
+    )
+
+    const owner = screen.getByRole('button', { name: 'Clyde' })
+    const avatar = owner.querySelector('img')
+
+    expect(avatar?.getAttribute('src')).toBe('data:image/png;base64,YXZhdGFy')
+    expect(within(owner).queryByText('C')).toBeNull()
+  })
+
+  it('does not render the previous gateway owner while the next avatar loads', async () => {
+    requestGateway.mockResolvedValueOnce({ data: 'data:image/png;base64,cGM=', found: true })
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { is_default: false, name: 'picasso' }
+    ])
+    const { rerender } = render(<ProfileRail />)
+    const owner = screen.getByRole('button', { name: 'Clyde' })
+
+    await waitFor(() => expect(owner.querySelector('img')).toBeTruthy())
+
+    gatewayState.current = { id: 'forge' }
+    requestGateway.mockImplementationOnce(() => new Promise(() => undefined))
+    rerender(<ProfileRail />)
+
+    const switchedOwner = screen.getByRole('button', { name: 'Clyde' })
+
+    expect(switchedOwner.querySelector('img')).toBeNull()
+    expect(within(switchedOwner).getByText('C')).toBeTruthy()
+  })
+
+  it('keeps the layers control in the all-profiles state', () => {
+    profileScope.set('*')
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { is_default: false, name: 'picasso' }
+    ])
+    render(<ProfileRail />)
+
+    const allProfiles = screen.getByRole('button', { name: 'All profiles' })
+
+    expect(allProfiles.querySelector('.codicon-layers')).toBeTruthy()
+    expect(within(allProfiles).queryByText('Clyde')).toBeNull()
   })
 
   it('keeps thirteen profiles direct and condenses the fourteenth', () => {

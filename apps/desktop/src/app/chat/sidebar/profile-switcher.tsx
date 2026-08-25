@@ -22,6 +22,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
+import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { CodeEditor } from '@/components/chat/code-editor'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -117,11 +118,30 @@ const stepThroughCells: Modifier = ({ containerNodeRect, draggingNodeRect, trans
   return { ...transform, x: Math.min(maxX, Math.max(minX, snapped)), y: 0 }
 }
 
-// Arc-Spaces-style profile rail at the sidebar foot: a default↔all toggle pinned
-// left, the colored named profiles scrolling between, and Manage pinned right.
-// The active profile pops in its own color — the "where am I" cue. Gateway
-// identity lives in the statusbar, so this strip remains entirely available to
-// profiles regardless of how many backends are registered.
+export function mergeCompactProfileOrder(
+  allIds: string[],
+  compactIds: string[],
+  activeId: string,
+  overId: string
+): string[] {
+  const from = compactIds.indexOf(activeId)
+  const to = compactIds.indexOf(overId)
+
+  if (from < 0 || to < 0 || from === to) {
+    return allIds
+  }
+
+  const reordered = arrayMove(compactIds, from, to)
+  const compact = new Set(compactIds)
+  let cursor = 0
+
+  return allIds.map(id => (compact.has(id) ? reordered[cursor++] : id))
+}
+
+// Arc-Spaces-style profile rail at the sidebar foot: the active identity expands
+// on the left, inactive profiles stay compact in the scrolling strip, and Manage
+// remains pinned right. The default profile's circular initial marks it as the
+// machine owner; ordinary profiles use rounded squares.
 export function ProfileRail() {
   const { t } = useI18n()
   const p = t.profiles
@@ -173,12 +193,19 @@ export function ProfileRail() {
   const isAll = scope === ALL_PROFILES
   const activeKey = normalizeProfileKey(gatewayProfile)
   const defaultProfile = profiles.find(profile => profile.is_default)
+  const defaultLabel = defaultProfile ? profileLabel(defaultProfile) : ''
   const onDefault = !isAll && activeKey === 'default'
+
+  const activeProfile = isAll
+    ? null
+    : profiles.find(profile => normalizeProfileKey(profile.name) === activeKey) ?? defaultProfile ?? null
 
   const named = sortByProfileOrder(
     profiles.filter(profile => !profile.is_default),
     order
   )
+
+  const compactNamed = isAll ? named : named.filter(profile => normalizeProfileKey(profile.name) !== activeKey)
 
   const multiProfile = profiles.length > 1
 
@@ -213,11 +240,11 @@ export function ProfileRail() {
     }
 
     const ids = named.map(profile => profile.name)
-    const from = ids.indexOf(String(active.id))
-    const to = ids.indexOf(String(over.id))
+    const compactIds = compactNamed.map(profile => profile.name)
+    const next = mergeCompactProfileOrder(ids, compactIds, String(active.id), String(over.id))
 
-    if (from >= 0 && to >= 0) {
-      setProfileOrder(arrayMove(ids, from, to))
+    if (next !== ids) {
+      setProfileOrder(next)
       reorderCommitHaptic()
     }
   }
@@ -257,30 +284,25 @@ export function ProfileRail() {
 
   return (
     <div aria-label={p.title} className="flex min-w-0 items-center gap-0.5" data-slot="profile-rail" role="group">
-      {/* One button toggles default ↔ all: home face when scoped to a profile,
-          layers face when showing everything. Pinned left like Manage is right.
-          Hidden until a second profile exists. */}
       {multiProfile &&
-        (defaultProfile ? (
-          // On default → toggle to all. Anywhere else (all view or a named
-          // profile) → return to default. So leaving a profile never lands on all.
-          <ProfilePill
-            active={isAll || onDefault}
-            glyph={isAll ? 'layers' : 'home'}
-            label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
-            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
+        (isAll ? (
+          <ProfilePill active glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
+        ) : activeProfile ? (
+          <ActiveProfilePill
+            color={resolveProfileColor(profileLabel(activeProfile), colors)}
+            label={profileLabel(activeProfile)}
+            onSelect={() => (activeProfile.is_default ? setShowAllProfiles(true) : selectProfile(activeProfile.name))}
+            profileName={activeProfile.name}
           />
-        ) : (
-          <ProfilePill active={isAll} glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
-        ))}
+        ) : null)}
 
-      {/* Single-profile: the active default's home icon next to the create +. */}
+      {/* Single-profile: the active default owner's identity next to create. */}
       {!multiProfile && defaultProfile && (
-        <ProfilePill
-          active
-          glyph="home"
-          label={profileLabel(defaultProfile)}
+        <ActiveProfilePill
+          color={resolveProfileColor(defaultLabel, colors)}
+          label={defaultLabel}
           onSelect={() => selectProfile(defaultProfile.name)}
+          profileName={defaultProfile.name}
         />
       )}
 
@@ -289,13 +311,20 @@ export function ProfileRail() {
         // reorder, no long-press recolor, no per-square context menu — Manage
         // covers rename/delete at this scale.
         <div className="flex min-w-0 flex-1 items-center gap-1">
+          {defaultProfile && (isAll || !onDefault) && (
+            <OwnerProfileCompact
+              color={resolveProfileColor(defaultLabel, colors)}
+              label={defaultLabel}
+              onSelect={() => selectProfile(defaultProfile.name)}
+            />
+          )}
           <ProfileDropdown
-            activeKey={isAll ? null : activeKey}
+            activeKey={null}
             colors={colors}
             onCreate={() => setCreateOpen(true)}
             onImport={() => void runImportProfileFlow()}
             onSelect={selectProfile}
-            profiles={named}
+            profiles={compactNamed}
           />
         </div>
       ) : (
@@ -303,6 +332,14 @@ export function ProfileRail() {
           className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           ref={scrollRef}
         >
+          {multiProfile && defaultProfile && (isAll || !onDefault) && (
+            <OwnerProfileCompact
+              color={resolveProfileColor(defaultLabel, colors)}
+              label={defaultLabel}
+              onSelect={() => selectProfile(defaultProfile.name)}
+            />
+          )}
+
           {multiProfile && (
             <DndContext
               collisionDetection={closestCenter}
@@ -312,13 +349,13 @@ export function ProfileRail() {
               onDragStart={handleDragStart}
               sensors={sensors}
             >
-              <SortableContext items={named.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
+              <SortableContext items={compactNamed.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
                 {/* relative → the strip is the dragged square's offsetParent, so the
                     clamp modifier bounds drags to the occupied cells (not the +). */}
                 <div className="relative flex items-center gap-1">
-                  {named.map(profile => (
+                  {compactNamed.map(profile => (
                     <ProfileSquare
-                      active={!isAll && normalizeProfileKey(profile.name) === activeKey}
+                      active={false}
                       color={resolveProfileColor(profile.name, colors)}
                       key={profile.name}
                       label={profileLabel(profile)}
@@ -608,6 +645,111 @@ interface ProfilePillProps {
   glyph: string
   label: string
   onSelect: () => void
+}
+
+function ActiveProfilePill({
+  color,
+  label,
+  onSelect,
+  profileName
+}: {
+  color: null | string
+  label: string
+  onSelect: () => void
+  profileName: string
+}) {
+  const { gateway, requestGateway } = useGatewayRequest()
+
+  const [avatar, setAvatar] = useState<{
+    data: string
+    gateway: typeof gateway
+    profileName: string
+  } | null>(null)
+  // A gateway/profile switch renders before its passive effects run. Scope the
+  // committed image to the identity that fetched it so the previous machine's
+  // owner can never flash in the new machine's rail during that first paint.
+
+  const avatarSrc = avatar?.gateway === gateway && avatar.profileName === profileName ? avatar.data : null
+
+  useEffect(() => {
+    let live = true
+
+    if (!gateway) {
+      return () => {
+        live = false
+      }
+    }
+
+    void requestGateway<{ data?: string; found?: boolean }>('profiles.get_asset', {
+      asset: 'avatar',
+      name: profileName
+    })
+      .then(asset => {
+        if (live && asset.found && asset.data) {
+          setAvatar({ data: asset.data, gateway, profileName })
+        }
+      })
+      .catch(() => undefined)
+
+    return () => {
+      live = false
+    }
+  }, [gateway, profileName, requestGateway])
+
+  return (
+    <Tip label={label}>
+      <Button
+        aria-label={label}
+        aria-pressed="true"
+        className="max-w-28 bg-(--ui-control-active-background) px-1 text-foreground hover:bg-(--ui-control-hover-background)"
+        onClick={onSelect}
+        size="xs"
+        type="button"
+        variant="ghost"
+      >
+        {avatarSrc ? (
+          <img
+            alt=""
+            aria-hidden="true"
+            className="size-4 shrink-0 rounded-full object-cover"
+            onError={() => setAvatar(null)}
+            src={avatarSrc}
+          />
+        ) : (
+          <ProfileGlyph aria-hidden="true" color={color} isDefault={false} name={label} />
+        )}
+        <span className="truncate">{label}</span>
+      </Button>
+    </Tip>
+  )
+}
+
+function OwnerProfileCompact({
+  color,
+  label,
+  onSelect
+}: {
+  color: null | string
+  label: string
+  onSelect: () => void
+}) {
+  const hue = color ?? 'var(--ui-text-quaternary)'
+  const initial = label.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'
+
+  return (
+    <Tip label={label}>
+      <button
+        aria-label={label}
+        aria-pressed="false"
+        className="grid size-5 shrink-0 place-items-center rounded-full text-[0.5625rem] font-semibold uppercase leading-none opacity-70 ring-1 ring-current ring-offset-1 ring-offset-background transition-opacity hover:opacity-100"
+        onClick={onSelect}
+        style={{ backgroundColor: profileColorSoft(hue, 24), color: hue }}
+        type="button"
+      >
+        <span data-slot="profile-owner-compact">{initial}</span>
+      </button>
+    </Tip>
+  )
 }
 
 function ProfilePill({ active, glyph, label, onSelect }: ProfilePillProps) {
