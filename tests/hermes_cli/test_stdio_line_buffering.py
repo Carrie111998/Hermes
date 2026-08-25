@@ -59,8 +59,14 @@ def test_missing_stdout_is_survivable():
 
 
 def test_real_piped_textiowrapper_is_reconfigured():
-    stream = io.StringIO()
+    """Use a real TextIOWrapper (has reconfigure, isatty=False when wrapped
+    around BytesIO) to verify the reconfigure call actually happens."""
+    stream = io.TextIOWrapper(io.BytesIO())
     assert not stream.isatty()
+    reconfigured = []
+    original_reconfigure = stream.reconfigure
+    stream.reconfigure = lambda **kw: (reconfigured.append(kw), original_reconfigure(**kw))
     with patch("sys.stdout", stream):
-        # StringIO has no reconfigure(); the helper must skip it silently.
-        configure_headless_stdout_buffering()
+        result = configure_headless_stdout_buffering()
+    assert result is True
+    assert reconfigured == [{"line_buffering": True}]
