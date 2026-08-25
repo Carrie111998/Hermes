@@ -208,7 +208,9 @@ class GatewayAuthorizationMixin:
         This returns the profile that OWNS the receiving adapter, as a token
         that survives serialization onto a durable record:
 
-        * ``"default"`` — the process-default adapter map (``self.adapters``).
+        * ``"default"`` — the process-default adapter map (``self.adapters``),
+          which is also the answer for relay ingress: one process-level
+          RelayAdapter fronts every multiplexed profile.
         * ``"<name>"``  — ``_profile_adapters["<name>"]``.
         * ``None``      — no live transport provenance on this source (a
           restored or hand-built source), i.e. legacy: the caller must fall
@@ -221,6 +223,18 @@ class GatewayAuthorizationMixin:
         """
         adapter = self._registered_transport_adapter(source)
         if adapter is None:
+            # Relay ingress: the receiving adapter is registered under
+            # ``Platform.RELAY`` while the source keeps the logical platform,
+            # so the registry check above cannot see it. ONE process-level
+            # RelayAdapter owns the connector socket for every multiplexed
+            # profile (secondary profiles deliberately register no relay
+            # adapter), so the process-default map IS the owner — the same rule
+            # :meth:`_adapter_for_source` applies. Without this a relayed turn
+            # records no provenance at all and its completion falls back to
+            # runtime-profile resolution, which is the wrong-bot delivery this
+            # method exists to prevent.
+            if getattr(source, "delivered_via_upstream_relay", False) is True:
+                return TRANSPORT_PROFILE_DEFAULT
             return None
         # #89860's ownership API is the adapter's own declaration of which
         # profile's credentials it holds. Prefer it; it is set by

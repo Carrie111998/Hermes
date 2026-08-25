@@ -435,3 +435,66 @@ async def test_legacy_async_delegation_enrichment_uses_the_canonical_parser():
     assert await runner._inject_watch_notification("[delegation done]", evt) is True
     delivered = alpha_matrix.handle_message.await_args[0][0]
     assert delivered.source.chat_id == "!room:example.org"
+
+
+# ---------------------------------------------------------------------------
+# Relay ingress — the receiving adapter is registered under Platform.RELAY
+# while the source keeps the logical platform, so the registry check in
+# ``_registered_transport_adapter`` cannot see it. Provenance must still be
+# recorded, or a relayed turn's completion falls back to runtime-profile
+# resolution and answers out of a secondary profile's own bot.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_relay_ingress_records_default_provenance():
+    """A relayed turn routed into runtime ``alpha`` records ``default``
+    provenance, not nothing."""
+    import weakref
+
+    relay = _Adapter("relay")
+    alpha_slack = _Adapter("slack-alpha")
+    runner = _runner(
+        {Platform.RELAY: relay}, {"alpha": {Platform.SLACK: alpha_slack}},
+    )
+    source = SimpleNamespace(
+        platform=Platform.SLACK,
+        profile="alpha",
+        delivered_via_upstream_relay=True,
+    )
+    source._transport_adapter_ref = weakref.ref(relay)
+
+    assert runner._transport_owner_profile(source) == "default", (
+        "a relayed turn recorded no transport provenance, so its completion "
+        "would fall back to the runtime profile's own adapter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_completion_is_not_answered_by_a_secondary_bot():
+    """With that provenance the completion goes back out the relay chain, not
+    out ``alpha``'s native Slack bot."""
+    relay = _Adapter("relay")
+    alpha_slack = _Adapter("slack-alpha")
+    runner = _runner(
+        {Platform.RELAY: relay}, {"alpha": {Platform.SLACK: alpha_slack}},
+    )
+    evt = {
+        "type": "process_completed",
+        "session_id": "proc_relay_1",
+        "session_key": "agent:alpha:slack:group:T0WORKSPACE:C0CHANNEL",
+        "platform": "slack",
+        "chat_type": "group",
+        "chat_id": "C0CHANNEL",
+        "scope_id": "T0WORKSPACE",
+        "profile": "alpha",
+        "transport_profile": "default",
+        "status": "completed",
+    }
+
+    await runner._inject_watch_notification("[task finished]", evt)
+
+    assert alpha_slack.handle_message.await_count == 0, (
+        "delivered through the secondary profile's own Slack bot although the "
+        "originating turn arrived over the shared relay transport"
+    )
