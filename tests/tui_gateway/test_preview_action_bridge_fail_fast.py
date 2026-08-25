@@ -97,6 +97,77 @@ def test_unanswered_bridge_reprobes_after_cooldown(session, bridge, monkeypatch)
     assert session["preview_action_bridge"] == "answered"
 
 
+def test_only_one_concurrent_caller_owns_expired_cooldown_reprobe(session, monkeypatch):
+    now = 100.0
+    session["preview_action_bridge"] = "unanswered"
+    session["preview_action_bridge_retry_at"] = now
+    monkeypatch.setattr(server.time, "monotonic", lambda: now)
+    entered = threading.Event()
+    release = threading.Event()
+    call_lock = threading.Lock()
+    call_count = 0
+
+    def blocking_probe(*_args, **_kwargs):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+        entered.set()
+        assert release.wait(2)
+        return "", True
+
+    monkeypatch.setattr(server, "_block", blocking_probe)
+    results: list[str | None] = [None] * 5
+    threads = [
+        threading.Thread(
+            target=lambda i=i: results.__setitem__(
+                i, server._preview_action_request("s1", {"action": "elements"})
+            )
+        )
+        for i in range(5)
+    ]
+
+    for thread in threads:
+        thread.start()
+    assert entered.wait(2)
+    for thread in threads:
+        thread.join(0.2)
+    blocked_callers = sum(thread.is_alive() for thread in threads)
+
+    release.set()
+    for thread in threads:
+        thread.join(2)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert blocked_callers == 1
+    assert call_count == 1
+    assert all(result is not None and json.loads(result)["success"] is False for result in results)
+
+
+def test_cancelled_cooldown_reprobe_releases_ownership(session, monkeypatch):
+    now = 100.0
+    session["preview_action_bridge"] = "unanswered"
+    session["preview_action_bridge_retry_at"] = now
+    monkeypatch.setattr(server.time, "monotonic", lambda: now)
+    calls = 0
+
+    def cancel_then_answer(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt
+        return json.dumps({"success": True}), False
+
+    monkeypatch.setattr(server, "_block", cancel_then_answer)
+
+    with pytest.raises(KeyboardInterrupt):
+        server._preview_action_request("s1", {"action": "elements"})
+    result = server._preview_action_request("s1", {"action": "elements"})
+
+    assert json.loads(result)["success"] is True
+    assert calls == 2
+    assert "preview_action_bridge_reprobe" not in session
+
+
 def test_interrupted_preview_probe_does_not_poison_session(session, monkeypatch):
     calls = 0
 

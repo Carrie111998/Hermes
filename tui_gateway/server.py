@@ -4263,29 +4263,37 @@ def _preview_action_request(sid: str, payload: dict) -> str:
         return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
 
     now = time.monotonic()
+    reprobe_token = None
     with _prompt_lock:
         state = session.get("preview_action_bridge")
-
-    if state == "unanswered":
-        with _prompt_lock:
+        if state == "unanswered":
             retry_at = session.get("preview_action_bridge_retry_at")
             if retry_at is None:
                 retry_at = now + _PREVIEW_ACTION_REPROBE_COOLDOWN_S
                 session["preview_action_bridge_retry_at"] = retry_at
-        if now < retry_at:
-            return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+            if now < retry_at or session.get("preview_action_bridge_reprobe") is not None:
+                return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+            reprobe_token = object()
+            session["preview_action_bridge_reprobe"] = reprobe_token
 
-    block_result = _block(
-        "preview.act.request",
-        sid,
-        dict(payload),
-        timeout=(
-            _PREVIEW_ACTION_TIMEOUT_S
-            if state == "answered"
-            else _PREVIEW_ACTION_PROBE_TIMEOUT_S
-        ),
-        with_outcome=True,
-    )
+    try:
+        block_result = _block(
+            "preview.act.request",
+            sid,
+            dict(payload),
+            timeout=(
+                _PREVIEW_ACTION_TIMEOUT_S
+                if state == "answered"
+                else _PREVIEW_ACTION_PROBE_TIMEOUT_S
+            ),
+            with_outcome=True,
+        )
+    except BaseException:
+        if reprobe_token is not None:
+            with _prompt_lock:
+                if session.get("preview_action_bridge_reprobe") is reprobe_token:
+                    session.pop("preview_action_bridge_reprobe", None)
+        raise
 
     if isinstance(block_result, tuple):
         answer, timed_out = block_result
@@ -4294,6 +4302,8 @@ def _preview_action_request(sid: str, payload: dict) -> str:
         answer, timed_out = block_result, not bool(block_result)
 
     with _prompt_lock:
+        if session.get("preview_action_bridge_reprobe") is reprobe_token:
+            session.pop("preview_action_bridge_reprobe", None)
         if answer:
             session["preview_action_bridge"] = "answered"
             session.pop("preview_action_bridge_retry_at", None)
