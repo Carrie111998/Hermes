@@ -269,6 +269,59 @@ class TestIsBlockedIp:
         assert _is_blocked_ip(ip) is False, f"{ip_str} should be allowed"
 
 
+class TestNat64Dns64Addresses:
+    """DNS64 answers under 64:ff9b::/96 (RFC 6052) wrap a public IPv4
+    destination for IPv6-only clients — CPython marks the well-known prefix
+    ``is_reserved``, which used to false-positive every A-only hostname on
+    IPv6-only networks (carrier mobile data) with "Blocked: URL targets a
+    private or internal network address". The address must be judged by its
+    embedded IPv4 bits instead; DNS64 for genuinely internal hosts stays
+    blocked.
+    """
+
+    def test_public_embedded_ipv4_allowed(self):
+        # Real-world shape: DNS64 synthesis of 216.150.16.193
+        ip = ipaddress.ip_address("64:ff9b::d896:10c1")
+        assert _is_blocked_ip(ip) is False
+
+    @pytest.mark.parametrize("embedded, expected", [
+        ("216.150.16.193", False),   # public web host (hermes docs domain)
+        ("93.184.216.34", False),    # example.com's classic A record
+        ("10.0.0.1", True),          # RFC1918 behind NAT64 stays blocked
+        ("192.168.1.10", True),
+        ("172.16.0.9", True),
+        ("169.254.169.254", True),   # cloud metadata via NAT64 synthesis
+        ("127.0.0.1", True),
+        ("100.64.0.1", True),        # CGNAT range embedded
+    ])
+    def test_judged_by_embedded_ipv4(self, embedded, expected):
+        import struct
+        n = struct.unpack("!I", socket.inet_aton(embedded))[0]
+        ip = ipaddress.ip_address(f"64:ff9b::{n >> 16:x}:{n & 0xFFFF:x}")
+        assert _is_blocked_ip(ip) is expected, f"NAT64({embedded}) -> {expected}"
+
+    def test_is_safe_url_allows_dns64_resolved_public_host(self):
+        """End-to-end: hostname resolving only to NAT64 addresses passes."""
+        with _resolves_to("64:ff9b::d896:1065", "64:ff9b::d896:141"):
+            assert (
+                is_safe_url("https://hermes-agent.nousresearch.com/docs/llms.txt")
+                is True
+            )
+
+    def test_connect_path_allows_dns64_resolved_public_host(self):
+        """The connect-time transport check shares the same verdict."""
+        from tools.url_safety import _resolved_http_connect_ips
+        with _resolves_to("64:ff9b::d896:1065"):
+            assert _resolved_http_connect_ips(
+                "a-only.example.com", 443, "https"
+            ) == ["64:ff9b::d896:1065"]
+
+    def test_metadata_floor_unaffected_by_nat64(self):
+        """Cloud metadata stays blocked even when reached via NAT64 form."""
+        with _resolves_to("64:ff9b::a9fe:a9fe"):
+            assert is_safe_url("http://example.com/latest/meta-data/") is False
+
+
 class TestGlobalAllowPrivateUrls:
     """Tests for the security.allow_private_urls config toggle."""
 
