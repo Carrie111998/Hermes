@@ -1271,7 +1271,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         fingerprint_failures: bool = True,
     ) -> None:
         """Record against this batch's turn state, never a later turn's state."""
-        if blocked or not mutation_verifier_enabled:
+        if not mutation_verifier_enabled:
             return
         try:
             with batch_mutation_lock:
@@ -2797,14 +2797,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # the concurrent path for the rationale; both paths must feed
         # the same state so the footer reflects every tool call in the
         # turn, not just the parallel ones.
-        if not _execution_blocked:
-            try:
-                agent._record_file_mutation_result(
-                    function_name, function_args, function_result, _is_error_result,
-                    task_id=effective_task_id,
-                )
-            except Exception as _ver_err:
-                logging.debug("file-mutation verifier record failed: %s", _ver_err)
+        try:
+            agent._record_file_mutation_result(
+                function_name, function_args, function_result, _is_error_result,
+                task_id=effective_task_id,
+            )
+        except Exception as _ver_err:
+            logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
         agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""

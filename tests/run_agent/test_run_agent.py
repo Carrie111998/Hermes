@@ -2244,6 +2244,43 @@ class TestConcurrentToolExecution:
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
 
+    @pytest.mark.parametrize("concurrent", [False, True])
+    def test_blocked_file_mutation_is_recorded_for_final_backstop(
+        self, agent, monkeypatch, concurrent
+    ):
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"blocked.txt","content":"hello"}',
+            call_id="blocked-write",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *args, **kwargs: ("Blocked by policy", None),
+        )
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_fingerprint_phase_bytes = {}
+        agent._turn_file_mutation_fingerprint_exhausted_phases = set()
+        agent._turn_file_mutation_fingerprint_lock = threading.Lock()
+        agent._turn_file_mutation_state_lock = threading.Lock()
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("blocked mutation must not dispatch"),
+        ):
+            if concurrent:
+                agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+            else:
+                agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert len(agent._turn_failed_file_mutations) == 1
+        failure = next(iter(agent._turn_failed_file_mutations.values()))
+        assert failure["tool"] == "write_file"
+        assert failure["error_preview"] == "Blocked by policy"
+
 
 
 
