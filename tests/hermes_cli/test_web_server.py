@@ -2866,6 +2866,74 @@ class TestNewEndpoints:
         assert ssh["status"] == "ready"
         assert "hermes@devbox.example.com" in ssh["detail"]
 
+    def test_terminal_probe_isolates_named_profile_secrets(self, monkeypatch):
+        """A target profile's probes must resolve that profile's own secrets
+        and never borrow the dashboard process's environment values."""
+        from agent import terminal_env_registry as reg
+        from agent.secret_scope import current_secret_scope, get_secret
+        from agent.terminal_env_provider import TerminalEnvironmentProvider
+        from hermes_cli.profiles import get_profile_dir
+
+        class _ScopedProvider(TerminalEnvironmentProvider):
+            name = "fakebox"
+            display_name = "FakeBox"
+
+            def is_available(self):
+                return bool(get_secret("FAKEBOX_API_TOKEN"))
+
+            def probe(self):
+                token = get_secret("FAKEBOX_API_TOKEN") or ""
+                if token:
+                    return ("ready", f"token:{token}")
+                return ("needs_setup", "Set FAKEBOX_API_TOKEN.")
+
+            def create_environment(self, *, cwd, timeout, task_id="default",
+                                   image=None, container_config=None, **kwargs):
+                raise NotImplementedError
+
+        monkeypatch.setenv("FAKEBOX_API_TOKEN", "process-token-must-not-leak")
+
+        alpha = get_profile_dir("fakebox-alpha")
+        alpha.mkdir(parents=True)
+        (alpha / ".env").write_text(
+            "FAKEBOX_API_TOKEN=alpha-token\n", encoding="utf-8"
+        )
+
+        beta = get_profile_dir("fakebox-beta")
+        beta.mkdir(parents=True)
+        (beta / ".env").write_text(
+            "FAKEBOX_API_TOKEN=beta-token\n", encoding="utf-8"
+        )
+
+        provider = _ScopedProvider()
+        reg.register_provider(provider)
+        try:
+            alpha_body = self.client.get(
+                "/api/tools/terminal/backends?profile=fakebox-alpha"
+            ).json()
+            beta_body = self.client.get(
+                "/api/tools/terminal/backends?profile=fakebox-beta"
+            ).json()
+            # No-profile request AFTER the scoped ones: the dashboard's own
+            # environment must answer, proving no profile scope lingered.
+            process_body = self.client.get("/api/tools/terminal/backends").json()
+        finally:
+            reg.restore_registration("fakebox", provider, None)
+
+        alpha_row = next(r for r in alpha_body["backends"] if r["name"] == "fakebox")
+        beta_row = next(r for r in beta_body["backends"] if r["name"] == "fakebox")
+        process_row = next(
+            r for r in process_body["backends"] if r["name"] == "fakebox"
+        )
+
+        assert alpha_row["status"] == "ready"
+        assert alpha_row["detail"] == "token:alpha-token"
+        assert beta_row["status"] == "ready"
+        assert beta_row["detail"] == "token:beta-token"
+        assert process_row["detail"] == "token:process-token-must-not-leak"
+        # The scope is installed per request and reset afterwards.
+        assert current_secret_scope() is None
+
 
 
 
