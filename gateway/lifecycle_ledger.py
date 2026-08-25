@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,9 +78,33 @@ def get_lifecycle_sentinel_path(home: Optional[Path] = None) -> Path:
 def sample_memory() -> Dict[str, Any]:
     """Cheap memory snapshot: own RSS + system availability + swap.
 
-    Pure ``/proc`` reads, Linux-only (returns ``{}`` elsewhere), never
-    raises.  Values in KiB to match the kernel's units.
+    Linux hosts read ``/proc`` directly (cheap, <1ms).  Non-Linux hosts fall
+    back to ``psutil`` — the same pattern already used by
+    :mod:`gateway.status` and :mod:`gateway.memory_monitor`.  When
+    ``psutil`` is unavailable the fallback returns whatever keys it could
+    fill, never raises: a forensics failure must not affect the gateway
+    lifecycle it is observing.
+
+    Returns a dict with the same key shape on every platform so the OOM
+    heuristic and heartbeat consumers downstream need no changes:
+
+    * ``rss_kib``              — own resident-set size in KiB
+    * ``mem_total_kib``        — total system memory in KiB
+    * ``mem_available_kib``    — available system memory in KiB
+    * ``swap_used_kib``        — used swap in KiB
+
+    Values are in KiB to match the kernel's units.  Missing keys mean the
+    platform/backend could not supply that specific value; the OOM
+    heuristic in :func:`detect_unclean_exit` treats every missing key as
+    "no measurement", which is the safe default.
     """
+    if sys.platform.startswith("linux"):
+        return _sample_memory_proc()
+    return _sample_memory_psutil()
+
+
+def _sample_memory_proc() -> Dict[str, Any]:
+    """Linux fast-path: pure ``/proc`` reads."""
     sample: Dict[str, Any] = {}
     try:
         with open("/proc/self/status", encoding="utf-8") as fh:
@@ -106,6 +131,38 @@ def sample_memory() -> Dict[str, Any]:
         if "SwapTotal" in meminfo and "SwapFree" in meminfo:
             sample["swap_used_kib"] = meminfo["SwapTotal"] - meminfo["SwapFree"]
     except (OSError, ValueError, IndexError):
+        pass
+    return sample
+
+
+def _sample_memory_psutil() -> Dict[str, Any]:
+    """Cross-platform fallback: ``psutil`` for RSS, virtual_memory, swap.
+
+    ``psutil`` is already a runtime dependency elsewhere in the gateway
+    (e.g. :mod:`gateway.status`, :mod:`gateway.memory_monitor`); this adds
+    no new dependency.  When ``psutil`` is unavailable the function
+    returns an empty dict — never raises — per the module's stated
+    contract that a forensics failure must not affect the lifecycle it is
+    observing.
+    """
+    sample: Dict[str, Any] = {}
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return sample
+    try:
+        sample["rss_kib"] = psutil.Process(os.getpid()).memory_info().rss // 1024
+    except Exception:
+        pass
+    try:
+        vm = psutil.virtual_memory()
+        sample["mem_total_kib"] = vm.total // 1024
+        sample["mem_available_kib"] = vm.available // 1024
+    except Exception:
+        pass
+    try:
+        sample["swap_used_kib"] = psutil.swap_memory().used // 1024
+    except Exception:
         pass
     return sample
 
