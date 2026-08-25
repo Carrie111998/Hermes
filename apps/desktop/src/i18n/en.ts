@@ -3408,6 +3408,7 @@ export const en: Translations = {
     clipboard: 'Clipboard',
     noClipboardImage: 'No image found in clipboard',
     noClipboardText: 'No text in clipboard',
+    clipboardTextTooLarge: 'Clipboard text is too large to attach (maximum 10 MB)',
     clipboardPasteFailed: 'Clipboard paste failed',
     dropFiles: 'Drop files',
     handoff: {

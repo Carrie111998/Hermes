@@ -32,7 +32,6 @@ import {
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
-import { clipboardTextExtension, composerTextFilenamePrefix, hasClipboardText } from './composer-clipboard'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
   type BackendOutputTail,
@@ -78,6 +77,13 @@ import {
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
 import { detectBundleSkew } from './bundle-skew'
+import {
+  clipboardTextExtension,
+  type ClipboardTextSaveResult,
+  composerTextFilenamePrefix,
+  hasClipboardText,
+  isClipboardTextTooLarge
+} from './composer-clipboard'
 import { applyConnectionChange } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -14546,7 +14552,15 @@ ipcMain.handle('hermes:saveClipboardImage', async () => {
 ipcMain.handle('hermes:saveClipboardText', async () => {
   const text = clipboard.readText()
 
-  return hasClipboardText(text) ? writeComposerText(text) : ''
+  if (!hasClipboardText(text)) {
+    return { status: 'empty' } satisfies ClipboardTextSaveResult
+  }
+
+  if (isClipboardTextTooLarge(text)) {
+    return { status: 'too_large' } satisfies ClipboardTextSaveResult
+  }
+
+  return { status: 'saved', path: await writeComposerText(text) } satisfies ClipboardTextSaveResult
 })
 
 ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>

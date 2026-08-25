@@ -3552,6 +3552,7 @@ export const zh: Translations = {
     clipboard: '剪贴板',
     noClipboardImage: '剪贴板中没有图片',
     noClipboardText: '剪贴板中没有文本',
+    clipboardTextTooLarge: '剪贴板文本过大，无法附加（最大 10 MB）',
     clipboardPasteFailed: '粘贴剪贴板失败',
     dropFiles: '拖放文件',
     handoff: {

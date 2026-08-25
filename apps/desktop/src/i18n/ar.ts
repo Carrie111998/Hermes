@@ -2805,6 +2805,7 @@ export const ar = defineLocale({
     clipboard: 'الحافظة',
     noClipboardImage: 'لا توجد صورة في الحافظة',
     noClipboardText: 'لا يوجد نص في الحافظة',
+    clipboardTextTooLarge: 'نص الحافظة كبير جدًا ولا يمكن إرفاقه (الحد الأقصى 10 ميغابايت)',
     clipboardPasteFailed: 'فشل اللصق من الحافظة',
     dropFiles: 'أفلت الملفات هنا',
     handoff: {

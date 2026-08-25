@@ -590,9 +590,9 @@ export function useComposerActions({
 
   const pasteClipboardText = useCallback(async () => {
     try {
-      const path = await window.hermesDesktop?.saveClipboardText()
+      const result = await window.hermesDesktop?.saveClipboardText()
 
-      if (!path) {
+      if (!result || result.status === 'empty') {
         notify({
           kind: 'warning',
           title: copy.clipboard,
@@ -602,13 +602,29 @@ export function useComposerActions({
         return false
       }
 
-      return attachContextFilePath(path)
+      if (result.status === 'too_large') {
+        notify({
+          kind: 'warning',
+          title: copy.clipboard,
+          message: copy.clipboardTextTooLarge
+        })
+
+        return false
+      }
+
+      return attachContextFilePath(result.path)
     } catch (err) {
       notifyError(err, copy.clipboardPasteFailed)
 
       return false
     }
-  }, [attachContextFilePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardText])
+  }, [
+    attachContextFilePath,
+    copy.clipboard,
+    copy.clipboardPasteFailed,
+    copy.clipboardTextTooLarge,
+    copy.noClipboardText
+  ])
 
   const attachContextFolderPath = useCallback(
     (folderPath: string) => {

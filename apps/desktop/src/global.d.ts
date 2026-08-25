@@ -259,7 +259,9 @@ declare global {
       ) => () => void
       saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
       saveClipboardImage: () => Promise<string>
-      saveClipboardText: () => Promise<string>
+      saveClipboardText: () => Promise<
+        { status: 'saved'; path: string } | { status: 'empty' } | { status: 'too_large' }
+      >
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
       watchPreviewFile: (url: string) => Promise<HermesPreviewWatch>

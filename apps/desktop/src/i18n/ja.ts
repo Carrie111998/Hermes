@@ -3057,6 +3057,7 @@ export const ja = defineLocale({
     clipboard: 'クリップボード',
     noClipboardImage: 'クリップボードに画像が見つかりません',
     noClipboardText: 'クリップボードにテキストがありません',
+    clipboardTextTooLarge: 'クリップボードのテキストが大きすぎて添付できません（最大 10 MB）',
     clipboardPasteFailed: 'クリップボードからの貼り付けに失敗しました',
     dropFiles: 'ファイルをドロップ',
     handoff: {
