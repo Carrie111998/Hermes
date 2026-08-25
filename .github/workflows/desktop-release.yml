@@ -21,15 +21,18 @@
 # provider (electron/ix-updater.ts) — the "Update available" button pops up
 # within 4 h and installs in place.
 #
-# Required repo secrets:
-#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY — IAM user
-#     intelliverse-x-desktop-ci (S3 read/write on that bucket only).
+# AWS publishing uses short-lived GitHub OIDC credentials from the
+# github-actions-desktop-release role. No long-lived AWS keys are required.
 # Optional (macOS signing + notarization; unsigned builds still publish, but
 # mac in-place auto-update needs a signed app — unsigned falls back to
 # opening the .dmg URL):
 #   CSC_LINK / CSC_KEY_PASSWORD — Developer ID cert (base64 .p12 / password)
 #   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID — notarytool
 name: desktop-release
+
+permissions:
+  contents: read
+  id-token: write
 
 on:
   push:
@@ -63,6 +66,13 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::970547373533:role/github-actions-desktop-release
+          role-session-name: desktop-release-${{ matrix.brand }}-${{ github.run_id }}
+          aws-region: us-east-1
+
       - name: Linux packaging deps (rpm for the rpm target)
         if: matrix.platform == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y rpm
@@ -86,6 +96,7 @@ jobs:
           npx tsx --test electron/ix-updater.test.ts electron/ix-status.test.ts electron/qv-deeptutor.test.ts
           npm run test:local-ai
           npm run test:governed-voice
+          npm run test:release-auth
           npx vitest run --environment jsdom src/components/local-ai-setup-overlay.test.tsx src/components/assistant-ui/tool/approval.test.tsx src/store/prompts.test.ts src/store/local-ai.test.ts
 
       - name: Test governed local routing and computer use
@@ -107,9 +118,6 @@ jobs:
       - name: Package locally for verification
         working-directory: apps/desktop
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
           # macOS signing/notarization (skipped when unset; CSC_IDENTITY_AUTO_DISCOVERY
           # avoids electron-builder hunting a keychain identity that isn't there).
           CSC_LINK: ${{ secrets.CSC_LINK }}
@@ -144,9 +152,6 @@ jobs:
       - name: Publish verified package to S3 feed
         working-directory: apps/desktop
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -183,11 +188,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::970547373533:role/github-actions-desktop-release
+          role-session-name: desktop-download-page-${{ github.run_id }}
+          aws-region: us-east-1
       - name: Upload download-site/index.html to s3://intelliverse-x-desktop/index.html
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
         run: |
           aws s3 cp apps/desktop/download-site/index.html s3://intelliverse-x-desktop/index.html \
             --content-type "text/html; charset=utf-8" \

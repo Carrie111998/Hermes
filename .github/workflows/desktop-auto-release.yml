@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: write # to push the ix-desktop-v<version> tag after publishing
+  id-token: write # delegated to desktop-release.yml for AWS OIDC
 
 concurrency:
   group: desktop-auto-release
