@@ -479,3 +479,109 @@ class TestBlueBubblesWebhookRegistration:
         assert len(deleted_ids) == 2
 
 
+
+
+class TestBlueBubblesReplyPrefix:
+    @staticmethod
+    def _wire(adapter, monkeypatch):
+        """Capture outbound payloads instead of hitting the REST API."""
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "any;+;family-group"
+
+        async def fake_api_post(path, payload):
+            assert path == "/api/v1/message/text"
+            payloads.append(payload)
+            return {"data": {"guid": f"reply-{len(payloads)}"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        return payloads
+
+    @pytest.mark.asyncio
+    async def test_no_prefix_by_default(self, monkeypatch):
+        """Default behaviour is unchanged: no prefix is added."""
+        monkeypatch.delenv("BLUEBUBBLES_REPLY_PREFIX", raising=False)
+        adapter = _make_adapter(monkeypatch)
+        payloads = self._wire(adapter, monkeypatch)
+
+        result = await adapter.send("any;+;family-group", "First para\n\nSecond para")
+
+        assert result.success is True
+        assert [p["message"] for p in payloads] == ["First para", "Second para"]
+
+    @pytest.mark.asyncio
+    async def test_prefix_from_config_applies_to_every_bubble(self, monkeypatch):
+        monkeypatch.delenv("BLUEBUBBLES_REPLY_PREFIX", raising=False)
+        adapter = _make_adapter(monkeypatch, reply_prefix="[bot]")
+        payloads = self._wire(adapter, monkeypatch)
+
+        await adapter.send("any;+;family-group", "First para\n\nSecond para")
+
+        assert [p["message"] for p in payloads] == [
+            "[bot] First para",
+            "[bot] Second para",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_prefix_from_env(self, monkeypatch):
+        monkeypatch.setenv("BLUEBUBBLES_REPLY_PREFIX", "[env]")
+        adapter = _make_adapter(monkeypatch)
+        payloads = self._wire(adapter, monkeypatch)
+
+        await adapter.send("any;+;family-group", "Hello")
+
+        assert [p["message"] for p in payloads] == ["[env] Hello"]
+
+    @pytest.mark.asyncio
+    async def test_config_takes_precedence_over_env(self, monkeypatch):
+        monkeypatch.setenv("BLUEBUBBLES_REPLY_PREFIX", "[env]")
+        adapter = _make_adapter(monkeypatch, reply_prefix="[yaml]")
+        payloads = self._wire(adapter, monkeypatch)
+
+        await adapter.send("any;+;family-group", "Hello")
+
+        assert [p["message"] for p in payloads] == ["[yaml] Hello"]
+
+    @pytest.mark.asyncio
+    async def test_empty_string_disables_prefix(self, monkeypatch):
+        """"" is 'explicitly no prefix', distinct from unset."""
+        monkeypatch.setenv("BLUEBUBBLES_REPLY_PREFIX", "[env]")
+        adapter = _make_adapter(monkeypatch, reply_prefix="")
+        payloads = self._wire(adapter, monkeypatch)
+
+        await adapter.send("any;+;family-group", "Hello")
+
+        assert [p["message"] for p in payloads] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_escaped_newline_becomes_real_newline(self, monkeypatch):
+        """Matches the WhatsApp contract so a banner fits on one .env line."""
+        monkeypatch.delenv("BLUEBUBBLES_REPLY_PREFIX", raising=False)
+        adapter = _make_adapter(monkeypatch, reply_prefix="line1\\nline2")
+        payloads = self._wire(adapter, monkeypatch)
+
+        await adapter.send("any;+;family-group", "Body")
+
+        assert [p["message"] for p in payloads] == ["line1\nline2 Body"]
+
+    @pytest.mark.asyncio
+    async def test_prefixed_chunks_stay_within_message_limit(self, monkeypatch):
+        """The chunk budget reserves room for the prefix."""
+        monkeypatch.delenv("BLUEBUBBLES_REPLY_PREFIX", raising=False)
+        adapter = _make_adapter(monkeypatch, reply_prefix="[bot]")
+        payloads = self._wire(adapter, monkeypatch)
+
+        await adapter.send("any;+;family-group", "x" * 9000)
+
+        assert payloads
+        for payload in payloads:
+            assert len(payload["message"]) <= adapter.MAX_MESSAGE_LENGTH
+
+    def test_absurdly_long_prefix_keeps_a_usable_chunk_budget(self, monkeypatch):
+        monkeypatch.delenv("BLUEBUBBLES_REPLY_PREFIX", raising=False)
+        adapter = _make_adapter(monkeypatch, reply_prefix="p" * 10_000)
+
+        assert adapter._outgoing_chunk_limit() >= 512
+

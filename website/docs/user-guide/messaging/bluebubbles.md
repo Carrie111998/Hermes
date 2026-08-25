@@ -63,6 +63,27 @@ platforms:
         - '(?<![\w@])@?amos\b[,:\-]?'
 ```
 
+#### Optional: Prefix agent replies
+
+In a shared iMessage thread it can be hard to tell an agent reply from a person's message, because everything Hermes sends appears as your own blue bubble. Set a `reply_prefix` to mark them:
+
+```yaml
+platforms:
+  bluebubbles:
+    extra:
+      reply_prefix: "🤖"
+```
+
+Or in `~/.hermes/.env`:
+
+```bash
+BLUEBUBBLES_REPLY_PREFIX=🤖
+```
+
+The prefix is prepended to **every** outbound bubble, separated by a space. `config.yaml` wins over the environment variable. A literal `\n` becomes a newline, so a multi-line banner fits on one `.env` line (same convention as WhatsApp's `reply_prefix`).
+
+No prefix is added by default. Set it to an empty string to explicitly disable it.
+
 ### 4. Authorize Users
 
 Choose one approach:
