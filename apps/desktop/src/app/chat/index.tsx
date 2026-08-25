@@ -70,7 +70,9 @@ import { isRouteSessionMismatch } from './route-session-state'
 import { useRuntimeMessageRepository } from './runtime-repository'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { useSessionView } from './session-view'
+import { FileCheckpointsButton } from './file-checkpoints-panel'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
+import { useFileCheckpointFirstUse } from './use-file-checkpoint-first-use'
 import { threadLoadingState } from './thread-loading'
 import {
   backfillOlderTranscriptPage,
@@ -175,6 +177,7 @@ function ChatHeader({
           <TitleMenuTrigger>{title}</TitleMenuTrigger>
         </SessionActionsMenu>
       </div>
+      <FileCheckpointsButton sessionId={activeSessionId || selectedSessionId || ''} />
     </header>
   )
 }
@@ -420,6 +423,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const gatewayState = useStore($gatewayState)
   const gatewaySwapTarget = useStore($gatewaySwapTarget)
   const gatewayOpen = gatewayState === 'open'
+  useFileCheckpointFirstUse(isPrimary && gatewayOpen)
   const introPersonality = useStore($introPersonality)
   const introSeed = useStore($introSeed)
   const introSplash = useStore($introSplash)
