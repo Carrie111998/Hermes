@@ -237,7 +237,27 @@ class IntentApplier:
             # CANONICAL WRITE. The mirror is a file write, not a network call,
             # so it costs nothing the pre-flight was trying to save, and when the
             # intent really is redundant the tracker's set_stage no-ops on it.
-            self._emit_canonical_pipeline_update(msg)
+            if not self._emit_canonical_pipeline_update(msg):
+                # The one durable write on this path failed. Consuming now
+                # would burn the key and make the loss permanent: is_applied()
+                # short-circuits every future retry, so no redrive, no re-issue
+                # and no reaper could ever land this decision again. Route to
+                # partial/ with the key unburned instead: redrive_partials()
+                # retries it with backoff, and once it caps (production sets
+                # TRACKER_APPLIER_REDRIVE_GIVE_UP_ATTEMPTS=5, NOT the code
+                # default of 0) PartialBacklogMonitor alerts on it. Loud and
+                # recoverable beats silent and permanent. reap_converged_partials
+                # cannot quietly finish it off either -- its gate B requires the
+                # canonical store to ALREADY show the target stage, i.e. it only
+                # clears intents whose canonical write demonstrably exists.
+                logger.error(
+                    "intent-applier: pre-flight satisfied but the canonical mirror "
+                    "FAILED for job=%s stage=%s — not consuming; moved to partial/ "
+                    "for redrive (idempotency key NOT burned)",
+                    msg.job_id, msg.requested_stage,
+                )
+                self._move_to_partial(intent_path)
+                return "partial"
             self.idempotency.mark_applied(msg.idempotency_key, message_id=msg.message_id)
             self._move_to(intent_path, self.processed_dir)
             return "satisfied"
@@ -259,20 +279,40 @@ class IntentApplier:
             # The legacy projection write failed, but the operator's decision
             # must still reach the tracker agent — emit before dead-lettering
             # so the next tracker cycle can apply it to the canonical store.
-            self._emit_canonical_pipeline_update(
+            mirrored = self._emit_canonical_pipeline_update(
                 msg, pipeline_manager_error=f"{exc.__class__.__name__}: {exc}",
             )
+            # This path is already loud (dead-letter), so a lost mirror does not
+            # need to change the routing -- but it does change what a human must
+            # do about the letter, so it is recorded rather than only logged.
+            mirror_note = "" if mirrored else " [canonical mirror ALSO failed: no durable write]"
             write_dead_letter(
                 intent_path, dead_letter_dir=self.dead_letter_dir,
                 error_class=exc.__class__.__name__,
-                error_message=f"PipelineManager.update_stage failed: {exc}",
+                error_message=f"PipelineManager.update_stage failed: {exc}{mirror_note}",
                 stack_trace=traceback.format_exc(),
                 retry_count=0,
             )
             return "dead_lettered"
 
         # Step 3b: mirror into the tracker agent's mailbox lane (canonical feed)
-        self._emit_canonical_pipeline_update(msg)
+        #
+        # Step 3 (the legacy projection) and step 4 (Postgres) both succeeding is
+        # NOT durability. postgres-sync projects the tracker's canonical store
+        # ONTO Postgres every 15 minutes and reverts whatever canonical does not
+        # carry, so an approval canonical never learned about is erased within
+        # the cycle even though the :4100 POST returned 2xx. The mirror is the
+        # write that makes the decision survive, so a failure here stops the
+        # intent from being consumed -- before the POST, so a redrive re-runs a
+        # clean sequence rather than re-POSTing a write that already landed.
+        if not self._emit_canonical_pipeline_update(msg):
+            logger.error(
+                "intent-applier: canonical mirror FAILED for job=%s stage=%s — not "
+                "consuming; moved to partial/ for redrive (idempotency key NOT burned)",
+                msg.job_id, msg.requested_stage,
+            )
+            self._move_to_partial(intent_path)
+            return "partial"
 
         # Step 4: JobOps API (Postgres mirror)
         try:
@@ -383,7 +423,7 @@ class IntentApplier:
         msg: IntentMessage,
         *,
         pipeline_manager_error: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Mirror an operator intent as a PIPELINE_UPDATE in the tracker inbox.
 
         PipelineManager writes the legacy ``workspaces/tracker/pipeline.json``
@@ -399,9 +439,19 @@ class IntentApplier:
         must never contain ``_INTENT_`` (Windows globbing is case-insensitive,
         so even a lowercase ``_intent_`` infix would be re-consumed).
 
-        Best-effort: a failure here is logged loudly but never changes the
-        intent's outcome — the JobOps mirror and tracker parity sync remain
-        as fallbacks.
+        Returns True iff the mirror is on disk. NEVER raises: a mirror failure
+        must not crash the single applier thread that every other intent shares.
+
+        CHANGED 2026-08-24 — this used to be best-effort, returning None and
+        swallowing failures on the grounds that "the JobOps mirror and tracker
+        parity sync remain as fallbacks". Neither is a fallback for this write.
+        The JobOps mirror is the *Postgres* side, which postgres-sync then
+        reverts to match canonical (see this docstring's own second paragraph),
+        and parity sync reconciles toward canonical too — so both "fallbacks"
+        converge on the store the lost mirror is precisely what failed to
+        update. A swallowed failure here therefore destroys the decision, and
+        because the caller went on to burn the idempotency key it destroyed it
+        permanently. Callers now gate consumption on the return value.
         """
         try:
             now = datetime.now(timezone.utc)
@@ -435,6 +485,9 @@ class IntentApplier:
                 f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_PIPELINE_UPDATE_operator_"
                 f"{str(msg.job_id)[:8]}.json"
             )
+            # mkdir like every other writer here (_move_to does): an absent
+            # inbox is a FileNotFoundError, i.e. exactly the silent-loss shape.
+            self.inbox_dir.mkdir(parents=True, exist_ok=True)
             tmp = self.inbox_dir / (fname + ".tmp")
             tmp.write_text(
                 json.dumps(body, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -444,12 +497,15 @@ class IntentApplier:
                 "intent-applier: mirrored intent to tracker mailbox %s (job=%s stage=%s)",
                 fname, msg.job_id, msg.requested_stage,
             )
+            return True
         except Exception:
             logger.exception(
                 "intent-applier: failed to mirror PIPELINE_UPDATE for job=%s — "
-                "canonical pipeline will lag until tracker parity sync",
+                "the operator decision has NO durable write; the caller must "
+                "leave this intent unconsumed",
                 msg.job_id,
             )
+            return False
 
     def _move_to(self, src: Path, dest_dir: Path) -> Path:
         dest_dir.mkdir(parents=True, exist_ok=True)

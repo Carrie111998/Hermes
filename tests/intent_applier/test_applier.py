@@ -338,9 +338,15 @@ class TestCanonicalEmission:
         # JobOps must not have been reached after the dead-letter
         jobops.post_legacy_stage.assert_not_called()
 
-    def test_emission_failure_never_raises(self, tmp_path, mailbox, applier):
-        """_emit is best-effort by contract: a broken mailbox path must be
-        swallowed (logged), never propagated into the intent outcome."""
+    def test_emission_failure_reports_false_without_raising(self, tmp_path, mailbox, applier):
+        """A failed mirror must be REPORTABLE, not merely survivable.
+
+        CHANGED 2026-08-24 (was test_emission_failure_never_raises). Not raising
+        is still required -- a mirror failure must never crash the applier
+        thread -- but swallowing it into ``None`` left every caller unable to
+        tell a durable write from a lost one, which is the whole hazard. The
+        contract is now: never raise, always report.
+        """
         from intent_applier.parser import parse_intent_file
 
         a, _jobops, _mgr = applier
@@ -351,7 +357,112 @@ class TestCanonicalEmission:
         blocker.write_text("x", encoding="utf-8")
         a.inbox_dir = blocker / "sub"  # parent is a file -> any write fails
 
-        a._emit_canonical_pipeline_update(msg)  # must not raise
+        assert a._emit_canonical_pipeline_update(msg) is False   # never raises
+
+    def test_emission_success_reports_true(self, mailbox, applier):
+        from intent_applier.parser import parse_intent_file
+
+        a, _jobops, _mgr = applier
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        msg = parse_intent_file(f)
+        assert a._emit_canonical_pipeline_update(msg) is True
+
+    def test_emission_creates_a_missing_inbox_dir(self, tmp_path, mailbox, applier):
+        """The mirror is the durable write; it must not lose to a missing dir.
+
+        Every other writer here mkdirs its destination (_move_to does), but the
+        mirror wrote its .tmp straight into inbox_dir. An absent inbox is a
+        FileNotFoundError, i.e. exactly the swallowed-loss shape.
+        """
+        from intent_applier.parser import parse_intent_file
+
+        a, _jobops, _mgr = applier
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        msg = parse_intent_file(f)
+
+        a.inbox_dir = tmp_path / "vanished" / "inbox"   # does not exist
+        assert a._emit_canonical_pipeline_update(msg) is True
+        assert len(_pipeline_updates(a.inbox_dir)) == 1
+
+
+class TestMirrorFailureDoesNotConsumeTheIntent:
+    """THE DURABILITY INVARIANT, enforced rather than merely asserted.
+
+    applier.py Step 2b states it: "NO INTENT IS EVER CONSUMED WITHOUT A
+    CANONICAL WRITE". Before this change the mirror was best-effort -- it was
+    always *called*, but a failed write was swallowed and the intent went on to
+    burn its idempotency key and move to processed/ anyway. That makes the loss
+    silent AND permanent: is_applied() then short-circuits every retry, so the
+    operator's decision cannot be re-driven by any means.
+
+    A failed mirror must instead route to partial/ with the key unburned, which
+    is the lane redrive_partials() already retries with backoff and, once capped
+    (production sets TRACKER_APPLIER_REDRIVE_GIVE_UP_ATTEMPTS=5 -- read the env,
+    not the code default of 0), PartialBacklogMonitor alerts on. The intent ends
+    up loud and recoverable instead of silently gone.
+    """
+
+    @staticmethod
+    def _break_the_mirror(a, tmp_path):
+        blocker = tmp_path / "mirror-blocker"
+        blocker.write_text("x", encoding="utf-8")
+        a.inbox_dir = blocker / "sub"   # parent is a file -> mkdir and write fail
+
+    def test_satisfied_branch_does_not_burn_the_key_when_the_mirror_fails(
+        self, tmp_path, mailbox, pipeline_path
+    ):
+        """The pre-flight's ONLY durable write is the mirror.
+
+        It deliberately skips the :4100 POST, so if the mirror is also lost the
+        intent produces nothing at all -- the exact shape that destroyed five
+        operator approvals on 2026-08-23.
+        """
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "approved_for_tailor")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        self._break_the_mirror(a, tmp_path)
+
+        assert a.apply_one(f) == "partial"
+        assert not a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+        assert not (mailbox["processed"] / "intent.json").exists()
+        assert (mailbox["partial"] / "intent.json").exists()
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+
+    def test_normal_path_does_not_burn_the_key_when_the_mirror_fails(
+        self, tmp_path, mailbox, pipeline_path
+    ):
+        """Step 3 and step 4 both succeeding is NOT durability.
+
+        postgres-sync projects canonical ONTO Postgres every 15 minutes, so a
+        Postgres row canonical never learned about is reverted within the cycle.
+        Losing the mirror loses the approval even when the POST returned 2xx.
+        """
+        a = _make_applier(tmp_path, mailbox, pipeline_path)
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        self._break_the_mirror(a, tmp_path)
+
+        assert a.apply_one(f) == "partial"
+        assert not a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+        assert not (mailbox["processed"] / "intent.json").exists()
+        assert (mailbox["partial"] / "intent.json").exists()
+        # The :4100 POST is never reached: a lost mirror is decided before it.
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+
+    def test_redrive_picks_the_mirror_failure_back_up(self, tmp_path, mailbox, pipeline_path):
+        """partial/ is only the right home if the retry lane actually drains it."""
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "approved_for_tailor",
+                          redrive_base_backoff=0.0)
+        f = write_intent(mailbox["inbox"], "intent_INTENT_x.json", VALID_INTENT_PAYLOAD)
+        self._break_the_mirror(a, tmp_path)
+        assert a.apply_one(f) == "partial"
+
+        a.inbox_dir = mailbox["inbox"]          # the transient condition clears
+        assert list(a.redrive_partials().values()) == ["redriven"]
+        redriven = next(mailbox["inbox"].glob("*_INTENT_*.json"))
+        assert a.apply_one(redriven) == "satisfied"
+        assert len(_pipeline_updates(mailbox["inbox"])) == 1
+        assert a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
 
 
 class TestPartialDoesNotBurnIdempotencyKey:
