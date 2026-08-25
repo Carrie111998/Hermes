@@ -34,6 +34,88 @@ class TestAuxProbeMode:
         with aux._client_cache_lock:
             assert key not in aux._client_cache
 
+    def test_get_cached_client_probe_does_not_poison_runtime_cache(self):
+        import agent.auxiliary_client as aux
+
+        provider = "custom:vision-test"
+        model = "vendor/vision-model"
+        runtime_client = object()
+
+        def fake_resolver(*args, **kwargs):
+            if aux._aux_probe_active():
+                return aux._AuxProbeClientStub(
+                    base_url="https://vision.invalid/v1"
+                ), model
+            return runtime_client, model
+
+        with aux._client_cache_lock:
+            aux._client_cache.clear()
+        try:
+            with patch.object(
+                aux, "resolve_provider_client", side_effect=fake_resolver
+            ):
+                with aux.aux_probe_mode():
+                    probe_client, probe_model = aux._get_cached_client(
+                        provider,
+                        model,
+                        is_vision=True,
+                    )
+
+                assert isinstance(probe_client, aux._AuxProbeClientStub)
+                assert probe_model == model
+                with aux._client_cache_lock:
+                    assert not aux._client_cache
+
+                client, resolved_model = aux._get_cached_client(
+                    provider,
+                    model,
+                    is_vision=True,
+                )
+
+            assert client is runtime_client
+            assert resolved_model == model
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.clear()
+
+    def test_get_cached_client_discards_stale_probe_stub(self):
+        import agent.auxiliary_client as aux
+
+        provider = "custom:vision-test"
+        model = "vendor/vision-model"
+        runtime_client = object()
+        cache_key = aux._client_cache_key(
+            provider,
+            async_mode=False,
+            is_vision=True,
+            model=model,
+        )
+
+        with aux._client_cache_lock:
+            aux._client_cache.clear()
+            aux._client_cache[cache_key] = (
+                aux._AuxProbeClientStub(base_url="https://vision.invalid/v1"),
+                model,
+                None,
+            )
+        try:
+            with patch.object(
+                aux,
+                "resolve_provider_client",
+                return_value=(runtime_client, model),
+            ):
+                client, resolved_model = aux._get_cached_client(
+                    provider,
+                    model,
+                    is_vision=True,
+                )
+
+            assert client is runtime_client
+            assert resolved_model == model
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.clear()
+
     def test_probe_stub_raises_on_runtime_use(self):
         import agent.auxiliary_client as aux
 

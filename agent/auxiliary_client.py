@@ -8016,7 +8016,13 @@ def _get_cached_client(
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
+            if isinstance(cached_client, _AuxProbeClientStub):
+                # Probe clients are non-functional sentinels. Older code could
+                # insert one through this function's inline cache path, bypassing
+                # _store_cached_client's guard. Drop any poisoned entry and build
+                # a real runtime client below.
+                del _client_cache[cache_key]
+            elif async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
                 # OPEN loop.  If the loop changed or was closed, the httpx
                 # transport inside is dead — force-close and replace.
@@ -8063,7 +8069,7 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
     )
-    if client is not None:
+    if client is not None and not isinstance(client, _AuxProbeClientStub):
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
