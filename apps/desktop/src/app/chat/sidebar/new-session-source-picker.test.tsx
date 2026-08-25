@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopRegistryConnection } from '@/global'
 
+import { Tip } from '@/components/ui/tooltip'
+
 import { NewSessionSourcePicker } from './new-session-source-picker'
 
 // Radix menus use pointer capture; jsdom does not implement it.
@@ -124,6 +126,31 @@ describe('NewSessionSourcePicker', () => {
     await waitFor(() => expect(screen.getByText('No gateways available')).toBeDefined())
     // No connection rows render — not even the active source.
     expect(screen.queryByText('This device')).toBeNull()
-    expect(screen.getByRole('menuitem', { name: 'No gateways available' })).toBeDefined()
+    await waitFor(() =>
+      expect(screen.getByRole('menuitem', { name: 'No gateways available' })).toBeDefined()
+    )
+  })
+
+  // In the real sidebar the picker's trigger sits inside a Tip (tooltip). The
+  // Tooltip's `asChild` trigger and the DropdownMenu's `asChild` trigger share
+  // the same button, which must not swallow the pointer-down that opens the menu.
+  it('opens the source menu even when its trigger lives inside a Tip (tooltip)', async () => {
+    render(
+      <Tip label="New session">
+        <NewSessionSourcePicker
+          activeConnectionId="local"
+          connections={[connection('local', 'This device', 'local'), connection('homelab', 'Homelab', 'remote')]}
+          onPick={vi.fn()}
+          trigger={<button>New session</button>}
+        />
+      </Tip>
+    )
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'New session' }), {
+      button: 0,
+      pointerType: 'mouse'
+    })
+
+    await waitFor(() => expect(screen.getByText('Homelab')).toBeDefined())
   })
 })
