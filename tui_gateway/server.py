@@ -2638,8 +2638,12 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
     return model, None
 
 
-# Bare billing buckets are not routable provider identities (kept in parity with the
-# provider gate in agent_init). Restoring one as a session provider override breaks resume.
+# Bare billing buckets are not routable provider identities: restoring one as a session
+# provider override breaks resume.  This set is deliberately NOT in parity with the
+# fallback gate in agent_init, which dropped "openrouter" in 2026-08 once openrouter
+# became an ordinary named provider.  The two sets answer different questions -- "may
+# this be restored as a session identity" versus "does this name a specific credential"
+# -- so do not re-sync them.
 _BARE_BILLING_PROVIDERS = {"auto", "openrouter", "custom"}
 
 
