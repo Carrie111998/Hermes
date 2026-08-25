@@ -25,12 +25,18 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+# Maximum file size (20MB) to buffer into memory for UTF-8 BOM injection.
+# Files exceeding this threshold are streamed directly to avoid excessive RAM usage.
+_MAX_BOM_INJECTION_BYTES = 20 * 1024 * 1024
+
 # Text-file extensions whose bytes we normalize for Telegram delivery. Telegram
 # clients guess the charset of text documents and render UTF-8 without a BOM as
 # mojibake (e.g. Turkish ğ/ş/ı/ç/ö/ü). Prepending a UTF-8 BOM forces correct
-# decoding. Binary files are never touched (extension whitelist + UTF-8 check).
+# decoding. Formats with strict UTF-8 specs or standard BOM rejections (like .json
+# and .tsv) are excluded to prevent downstream parser failures. Binary files are
+# never touched (extension whitelist + UTF-8 check).
 _TEXT_EXTENSIONS_FOR_UTF8_BOM = frozenset({
-    ".md", ".markdown", ".txt", ".json", ".csv", ".tsv", ".log", ".yaml", ".yml",
+    ".md", ".markdown", ".txt", ".csv", ".log", ".yaml", ".yml",
     ".toml", ".ini", ".cfg", ".conf", ".xml", ".html", ".htm", ".css", ".js",
     ".ts", ".jsx", ".tsx", ".py", ".sh", ".bash", ".zsh", ".sql", ".r", ".rb",
     ".go", ".rs", ".java", ".c", ".h", ".cpp", ".hpp", ".env", ".gitignore",
@@ -44,6 +50,16 @@ def _ensure_utf8_bom(file_path: str, fileobj):
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in _TEXT_EXTENSIONS_FOR_UTF8_BOM:
         return fileobj
+    try:
+        if hasattr(fileobj, "seek") and hasattr(fileobj, "tell"):
+            curr = fileobj.tell()
+            fileobj.seek(0, os.SEEK_END)
+            size = fileobj.tell()
+            fileobj.seek(curr)
+            if size > _MAX_BOM_INJECTION_BYTES:
+                return fileobj
+    except (OSError, io.UnsupportedOperation):
+        pass
     data = fileobj.read()
     if data.startswith(b"\xef\xbb\xbf"):
         fileobj.seek(0)

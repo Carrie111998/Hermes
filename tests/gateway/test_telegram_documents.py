@@ -163,6 +163,34 @@ class TestEnsureUtf8Bom:
         out = _ensure_utf8_bom("/tmp/data.bin", io.BytesIO(payload))
         assert out.read() == payload
 
+    def test_leaves_json_and_tsv_untouched_to_prevent_parser_breakage(self):
+        payload = '{"test": "ğüş"}'.encode("utf-8")
+        out = _ensure_utf8_bom("/tmp/data.json", io.BytesIO(payload))
+        assert out.read() == payload
+
+        tsv_payload = "col1\tcol2\nğ\tü\n".encode("utf-8")
+        out_tsv = _ensure_utf8_bom("/tmp/data.tsv", io.BytesIO(tsv_payload))
+        assert out_tsv.read() == tsv_payload
+
+    def test_leaves_oversized_text_file_untouched(self):
+        # Create a mock/stream that reports size > 20MB
+        from plugins.platforms.telegram.adapter import _MAX_BOM_INJECTION_BYTES
+        payload = "test".encode("utf-8")
+        stream = io.BytesIO(payload)
+        # Monkeypatch or test tell/seek behavior
+        class LargeStream(io.BytesIO):
+            def seek(self, offset, whence=os.SEEK_SET):
+                if whence == os.SEEK_END:
+                    return _MAX_BOM_INJECTION_BYTES + 1024
+                return super().seek(offset, whence)
+
+            def tell(self):
+                return _MAX_BOM_INJECTION_BYTES + 1024
+
+        large = LargeStream(payload)
+        out = _ensure_utf8_bom("/tmp/large.log", large)
+        assert out == large
+
 
 # ---------------------------------------------------------------------------
 # TestDocumentTypeDetection
