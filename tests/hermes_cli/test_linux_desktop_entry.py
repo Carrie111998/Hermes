@@ -563,23 +563,32 @@ def test_running_interpreter_resolves_plain_interpreter(monkeypatch):
     assert Path(out).is_absolute()
 
 
-def test_can_import_probe_rejects_foreign_interpreter(tmp_path):
-    """Isolated-mode probe: a bare interpreter without hermes_cli fails."""
-    import sys as _s
+def test_can_import_probe_runs_and_caches(tmp_path):
+    """The probe executes the real interpreter and memoizes the answer.
 
-    fake = tmp_path / "bin" / "python3"
-    fake.parent.mkdir(parents=True)
-    # A real system interpreter copy? No - use the real system python if
-    # present; otherwise skip (CI hosts always have one).
-    real = _s.base_prefix and Path("/usr/bin/python3")
-    if not real or not real.exists():
+    Asserts the two things that hold on ANY host: the probe returns a
+    definite boolean for a real interpreter (not None, not an exception
+    path), and the per-path cache is populated so the second call pays
+    no subprocess. Host-dependent capability itself (True vs False) is
+    deliberately NOT asserted - a CI host with hermes pip-installed
+    system-wide would legitimately answer True.
+    """
+    import time
+
+    real = Path("/usr/bin/python3")
+    if not real.exists():
         pytest.skip("no system python to probe")
     lde._probe_cache.pop(str(real), None)
-    # Isolated mode from / : system python cannot import hermes_cli.main
-    # unless hermes is pip-installed system-wide (not the case on CI).
-    result = lde._can_import_hermes_cli(real)
-    assert result in (True, False)  # sanity: probe ran and answered
-    lde._probe_cache.pop(str(real), None)
+    try:
+        first = lde._can_import_hermes_cli(real)
+        assert isinstance(first, bool)
+        assert str(real) in lde._probe_cache
+        t0 = time.monotonic()
+        second = lde._can_import_hermes_cli(real)
+        assert second is first
+        assert time.monotonic() - t0 < 0.05  # cache hit: no subprocess
+    finally:
+        lde._probe_cache.pop(str(real), None)
 
 
 def test_exec_falls_back_to_running_interpreter_when_probe_fails(
