@@ -1,8 +1,8 @@
 # Terminal Environment Provider Plugins
 
 Hermes runs shell commands through a pluggable set of **terminal backends**.
-The built-in backends (local, Docker, Singularity, Modal, Daytona, Vercel
-Sandbox, SSH) live in the core repo under `tools/environments/`. Third-party
+The built-in backends (local, Docker, Singularity, Modal, Daytona, E2B,
+Vercel Sandbox, SSH) live in the core repo under `tools/environments/`. Third-party
 sandbox vendors integrate as **plugins** instead — a standalone plugin repo
 installed under `~/.hermes/plugins/`, registering a backend the user selects
 exactly like a built-in one via `terminal.backend` in `config.yaml`.
@@ -102,7 +102,7 @@ hermes config set terminal.backend acmebox
 ## Rules
 
 - **Reserved names.** Registrations that collide with a built-in backend name
-  (`local`, `docker`, `singularity`, `modal`, `managed_modal`, `daytona`,
+  (`local`, `docker`, `singularity`, `modal`, `managed_modal`, `daytona`, `e2b`,
   `vercel_sandbox`, `ssh`) are rejected. Plugins extend the backend set; they
   never shadow in-tree backends.
 - **`create_environment` must accept `**kwargs`** and ignore unknown keys —

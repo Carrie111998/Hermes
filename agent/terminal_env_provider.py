@@ -7,7 +7,7 @@ Defines the pluggable-backend interface for terminal execution environments
 :meth:`PluginContext.register_terminal_environment_provider`; the dispatch
 ladder in :func:`tools.terminal_tool._create_environment` consults the
 registry for any ``TERMINAL_ENV`` / ``terminal.backend`` value that is not a
-built-in backend (local, docker, singularity, modal, daytona,
+built-in backend (local, docker, singularity, modal, daytona, e2b,
 vercel_sandbox, ssh).
 
 Providers live in ``~/.hermes/plugins/<name>/`` (user, opt-in via
@@ -83,7 +83,7 @@ class TerminalEnvironmentProvider(abc.ABC):
         ``TERMINAL_ENV`` value.
 
         Lowercase, ``[a-z0-9_]``. Must not collide with a built-in backend
-        name (local, docker, singularity, modal, managed_modal, daytona,
+        name (local, docker, singularity, modal, managed_modal, daytona, e2b,
         vercel_sandbox, ssh) — the registry rejects such registrations.
         """
 
