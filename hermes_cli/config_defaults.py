@@ -350,6 +350,12 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
 
+        # Global reasoning effort applied to every model unless a per-model
+        # override in ``reasoning_overrides`` (below) matches.  Valid levels:
+        # none|minimal|low|medium|high|xhigh|max|ultra (empty = provider
+        # default).  Read by hermes_constants.resolve_reasoning_config().
+        "reasoning_effort": "",
+
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.
         # Takes precedence over agent.reasoning_effort when the current model
