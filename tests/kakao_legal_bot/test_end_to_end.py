@@ -172,14 +172,27 @@ def test_full_round_trip_with_a_law_lookup(settings, db, tmp_path):
 
         _wait_until(lambda: any(ANSWER.split("\n")[0] in r["data"] for r in fake_iris.replies))
 
+        _wait_until(lambda: any("[3/3]" in r["data"] for r in fake_iris.replies))
+
         # Assert inside the context: leaving it runs the lifespan shutdown,
         # which closes the database this stack is sharing.
-        rooms = [reply["room"] for reply in fake_iris.replies]
-        assert set(rooms) == {"room-e2e"}
+        assert {reply["room"] for reply in fake_iris.replies} == {"room-e2e", "lawyer-room"}
+        to_client = [r["data"] for r in fake_iris.replies if r["room"] == "room-e2e"]
+        to_lawyer = [r["data"] for r in fake_iris.replies if r["room"] == "lawyer-room"]
 
-        joined = "\n".join(reply["data"] for reply in fake_iris.replies)
+        joined = "\n".join(to_client)
         assert "모아입니다" in joined  # first contact greeting
         assert "동시이행" in joined
+
+        # The lawyer learns who applied before the answer exists, and what
+        # the client was finally told. Two alerts — the answer was quick,
+        # so there was no 90-second mark to report.
+        assert len(to_lawyer) == 2
+        assert "[1/3]" in to_lawyer[0]
+        assert "홍길동" in to_lawyer[0]
+        assert "전세금을 안 돌려줘요" in to_lawyer[0]
+        assert "[3/3]" in to_lawyer[1]
+        assert "주택임대차보호법" in to_lawyer[1]  # 근거까지 함께
 
         logged = db._query("SELECT * FROM answers")
         assert len(logged) == 1
@@ -199,6 +212,7 @@ def test_slow_model_still_gets_a_message_out_inside_the_deadline(settings, db, t
     )
     db.upsert_room("room-e2e", "상담방", "direct")
     db.set_room_flag("room-e2e", "intro_sent", 1)
+    db.set_room_flag("room-e2e", "first_alerts_done", 1)  # not first contact
 
     with TestClient(app) as client:
         started = time.monotonic()
@@ -226,6 +240,7 @@ def test_unreachable_iris_falls_back_to_the_outbox(settings, db, tmp_path):
     services.iris._client = httpx.AsyncClient(transport=httpx.MockTransport(dead))
     db.upsert_room("room-e2e", "상담방", "direct")
     db.set_room_flag("room-e2e", "intro_sent", 1)
+    db.set_room_flag("room-e2e", "first_alerts_done", 1)  # not first contact
 
     with TestClient(app) as client:
         client.post("/iris/webhook", json=webhook_payload("질문"))
@@ -246,6 +261,7 @@ def test_long_answers_arrive_as_several_readable_bubbles(settings, db, tmp_path)
     )
     db.upsert_room("room-e2e", "상담방", "direct")
     db.set_room_flag("room-e2e", "intro_sent", 1)
+    db.set_room_flag("room-e2e", "first_alerts_done", 1)  # not first contact
 
     with TestClient(app) as client:
         client.post("/iris/webhook", json=webhook_payload("긴 답변 주세요"))

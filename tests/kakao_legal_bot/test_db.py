@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from kakao_legal_bot.app.db import pseudonymise
 
 
@@ -112,6 +114,48 @@ def test_retention_purge(db):
     assert [m.text for m in db.recent_messages("room-1")] == ["새 메시지"]
     # 0 disables retention entirely rather than deleting everything.
     assert db.purge_old_messages(older_than_days=0) == 0
+
+
+def test_an_existing_v1_database_gains_the_new_column(tmp_path):
+    """CREATE TABLE IF NOT EXISTS is a no-op — a deployed bot needs ALTER."""
+    import sqlite3
+
+    from kakao_legal_bot.app.db import Database
+
+    path = tmp_path / "old.sqlite3"
+    legacy = sqlite3.connect(str(path))
+    legacy.execute(
+        """
+        CREATE TABLE rooms (
+            room_id TEXT PRIMARY KEY, room_name TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT 'unknown', consult_id INTEGER,
+            lawyer_takeover INTEGER NOT NULL DEFAULT 0, muted INTEGER NOT NULL DEFAULT 0,
+            intro_sent INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL, updated_at REAL NOT NULL
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO rooms(room_id, created_at, updated_at) VALUES('old-room', 1, 1)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    upgraded = Database(path)
+    try:
+        room = upgraded.get_room("old-room")
+        assert room is not None
+        assert room["first_alerts_done"] == 0  # existing rooms default to "not yet"
+        upgraded.set_room_flag("old-room", "first_alerts_done", 1)
+        assert upgraded.get_room("old-room")["first_alerts_done"] == 1
+    finally:
+        upgraded.close()
+
+
+def test_unknown_room_flags_are_rejected(db):
+    db.upsert_room("room-1")
+    with pytest.raises(ValueError, match="not a room flag"):
+        db.set_room_flag("room-1", "room_name; DROP TABLE rooms", 1)
 
 
 def test_pseudonymise_is_stable_and_salted():

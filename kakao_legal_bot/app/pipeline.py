@@ -41,11 +41,36 @@ TIMEOUT_TEXT = """자료를 찾는 데 예상보다 오래 걸리고 있습니�
 ERROR_TEXT = """죄송합니다, 지금 답변을 만들지 못했습니다.
 {lawyer_name}님께 전달해 두었습니다. 조금 뒤 다시 여쭤봐 주시면 답변드리겠습니다."""
 
+# The three first-turn alerts. Numbered so the lawyer can see at a glance
+# where a consultation stands without scrolling — and knows no fourth is
+# coming for this question.
+ALERT_NEW = """🆕 [1/3] 새 상담이 접수되었습니다
+상담자: {sender}
+방: {room}
+상담번호: {consult_id}
+접수: {when}
+———
+{question}"""
+
+ALERT_PROGRESS = """⏳ [2/3] 상담 #{consult_id} 진행 중 ({elapsed:.0f}초 경과)
+방: {room}
+자료를 계속 찾는 중이며, 상담자에게는 {minutes}분 내 답변드린다고 안내했습니다."""
+
+ALERT_DONE = """✅ [3/3] 상담 #{consult_id} 1차 답변 전송 완료 ({elapsed:.0f}초)
+방: {room}
+{sources}———
+{preview}
+
+이 방의 다음 질문부터는 알림을 보내지 않습니다."""
+
 
 class Pipeline:
     def __init__(self, services: Services) -> None:
         self.services = services
         self._last_answer_at: dict[str, float] = {}
+        # Detached alert tasks need a strong reference or the loop may
+        # collect them mid-send.
+        self._alert_tasks: set[asyncio.Task[None]] = set()
 
     # ── entry point ──────────────────────────────────────────────────────
     async def handle(self, event: IrisEvent) -> None:
@@ -128,10 +153,63 @@ class Pipeline:
                     record_role="",
                 )
 
-        await self._answer(event, decision.question)
+        # A room's first question is the one the lawyer needs to know about:
+        # who applied, and how the consultation is going. The flag is set
+        # before the alert goes out so two near-simultaneous messages can't
+        # both claim to be the first.
+        first_turn = settings.lawyer_first_turn_alerts and not room["first_alerts_done"]
+        consult_id = 0
+        if first_turn:
+            await asyncio.to_thread(db.set_room_flag, room_id, "first_alerts_done", 1)
+            consult_id = await self._alert_new_consultation(event, decision.question)
+
+        await self._answer(event, decision.question, first_turn=first_turn, consult_id=consult_id)
+
+    # ── lawyer alerts (first question of a room only) ────────────────────
+    async def _alert_new_consultation(self, event: IrisEvent, question: str) -> int:
+        """Alert 1/3 — sent the moment the client asks, not after the answer.
+
+        Runs on the message path but never blocks it: the notification is
+        detached so a slow Iris cannot eat into the acknowledgement budget.
+        """
+        services = self.services
+        try:
+            consultation = await asyncio.to_thread(
+                services.db.get_or_create_consultation, event.room_id, event.sender_name
+            )
+            consult_id = int(consultation["id"])
+        except Exception:  # noqa: BLE001
+            log.exception("could not open a consultation for room %s", event.room_id)
+            return 0
+
+        text = ALERT_NEW.format(
+            sender=event.sender_name or "(이름 없음)",
+            room=event.room_name or event.room_id,
+            consult_id=consult_id,
+            when=time.strftime("%Y-%m-%d %H:%M"),
+            question=question[: services.settings.lawyer_alert_preview_chars],
+        )
+        self._notify_lawyer_detached(text)
+        return consult_id
+
+    def _notify_lawyer_detached(self, text: str) -> None:
+        async def run() -> None:
+            with contextlib.suppress(Exception):
+                await self.services.sender.notify_lawyer(text)
+
+        task = asyncio.create_task(run())
+        self._alert_tasks.add(task)
+        task.add_done_callback(self._alert_tasks.discard)
 
     # ── the 5-second race ────────────────────────────────────────────────
-    async def _answer(self, event: IrisEvent, question: str) -> None:
+    async def _answer(
+        self,
+        event: IrisEvent,
+        question: str,
+        *,
+        first_turn: bool = False,
+        consult_id: int = 0,
+    ) -> None:
         services = self.services
         settings = services.settings
         room_id = event.room_id
@@ -171,6 +249,17 @@ class Pipeline:
                         ),
                         timeout=10.0,
                     )
+                # Alert 2/3 — the lawyer sees the consultation is still
+                # running rather than wondering whether it stalled.
+                if first_turn:
+                    self._notify_lawyer_detached(
+                        ALERT_PROGRESS.format(
+                            consult_id=consult_id or "-",
+                            elapsed=time.monotonic() - started,
+                            room=event.room_name or room_id,
+                            minutes=max(1, round(settings.answer_extension_s / 60)),
+                        )
+                    )
 
         # ③ Hard ceiling. Only now do we hand the question to the lawyer.
         remaining = max(settings.total_answer_budget_s - (time.monotonic() - started), 1.0)
@@ -180,8 +269,11 @@ class Pipeline:
             await services.sender.send(
                 room_id, TIMEOUT_TEXT.format(lawyer_name=settings.lawyer_name), record_role=""
             )
+            # This *is* the third alert when one is owed — the sequence
+            # always ends, whether the answer landed or not.
             await services.sender.notify_lawyer(
-                f"⏱️ 답변 시간 초과 ({settings.total_answer_budget_s:.0f}초)\n"
+                f"⏱️ {'[3/3] ' if first_turn else ''}답변 시간 초과 "
+                f"({settings.total_answer_budget_s:.0f}초) — 직접 답변이 필요합니다\n"
                 f"방: {event.room_name or room_id}\n질문: {question[:300]}"
             )
             return
@@ -191,13 +283,30 @@ class Pipeline:
                 room_id, ERROR_TEXT.format(lawyer_name=settings.lawyer_name), record_role=""
             )
             await services.sender.notify_lawyer(
-                f"⚠️ 답변 실패 ({result.error or 'empty answer'})\n"
+                f"⚠️ {'[3/3] ' if first_turn else ''}답변 실패 "
+                f"({result.error or 'empty answer'}) — 직접 답변이 필요합니다\n"
                 f"방: {event.room_name or room_id}\n질문: {question[:300]}"
             )
             return
 
         await services.sender.send(room_id, result.text)
         self._last_answer_at[room_id] = time.monotonic()
+
+        # Alert 3/3 — what the client was actually told, so the lawyer can
+        # correct it in the room if needed. Last one for this consultation.
+        if first_turn:
+            citations = result.state.citations[:5]
+            self._notify_lawyer_detached(
+                ALERT_DONE.format(
+                    consult_id=consult_id or "-",
+                    elapsed=time.monotonic() - started,
+                    room=event.room_name or room_id,
+                    sources=("근거: " + " / ".join(citations) + "\n") if citations else "",
+                    preview=" ".join(result.text.split())[
+                        : settings.lawyer_alert_preview_chars
+                    ],
+                )
+            )
 
         await asyncio.to_thread(
             services.db.log_answer,

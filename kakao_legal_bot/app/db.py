@@ -17,7 +17,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_done"})
+
+# Columns added after v1. `CREATE TABLE IF NOT EXISTS` is a no-op on an
+# existing database, so a new column has to be added explicitly or a
+# deployed bot breaks on its next query.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("rooms", "first_alerts_done", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rooms (
@@ -28,6 +37,7 @@ CREATE TABLE IF NOT EXISTS rooms (
     lawyer_takeover   INTEGER NOT NULL DEFAULT 0,
     muted             INTEGER NOT NULL DEFAULT 0,
     intro_sent        INTEGER NOT NULL DEFAULT 0,
+    first_alerts_done INTEGER NOT NULL DEFAULT 0,
     created_at        REAL NOT NULL,
     updated_at        REAL NOT NULL
 );
@@ -183,11 +193,24 @@ class Database:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
+            self._migrate_locked()
             self._conn.execute(
                 "INSERT OR REPLACE INTO kv(key, value, updated_at) VALUES('schema_version', ?, ?)",
                 (str(SCHEMA_VERSION), time.time()),
             )
             self._conn.commit()
+
+    def _migrate_locked(self) -> None:
+        """Add columns introduced after the database was first created."""
+        for table, column, spec in _ADDED_COLUMNS:
+            existing = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})")  # noqa: S608
+            }
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {spec}"  # noqa: S608
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -234,7 +257,7 @@ class Database:
         return self._query_one("SELECT * FROM rooms WHERE room_id = ?", (room_id,))
 
     def set_room_flag(self, room_id: str, field: str, value: int) -> None:
-        if field not in {"lawyer_takeover", "muted", "intro_sent"}:
+        if field not in ROOM_FLAGS:
             raise ValueError(f"not a room flag: {field}")
         self._exec(
             f"UPDATE rooms SET {field} = ?, updated_at = ? WHERE room_id = ?",  # noqa: S608

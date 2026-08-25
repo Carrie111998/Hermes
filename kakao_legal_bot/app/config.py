@@ -166,6 +166,15 @@ class Settings:
     lawyer_room_id: str = field(default_factory=lambda: _env("LAWYER_ROOM_ID"))
     lawyer_email: str = field(default_factory=lambda: _env("LAWYER_EMAIL"))
     lawyer_kakao_ids: list[str] = field(default_factory=lambda: _env_list("LAWYER_KAKAO_IDS"))
+    # Three alerts on a room's *first* question — 접수 / 90초 경과 / 답변 완료 —
+    # so the lawyer knows who applied and can follow the consultation. Later
+    # questions in the same room stay silent; the lawyer already knows.
+    lawyer_first_turn_alerts: bool = field(
+        default_factory=lambda: _env_bool("LAWYER_FIRST_TURN_ALERTS", True)
+    )
+    lawyer_alert_preview_chars: int = field(
+        default_factory=lambda: _env_int("LAWYER_ALERT_PREVIEW_CHARS", 300)
+    )
     public_base_url: str = field(default_factory=lambda: _env("PUBLIC_BASE_URL").rstrip("/"))
     admin_token: str = field(default_factory=lambda: _env("ADMIN_TOKEN"))
 
