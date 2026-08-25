@@ -1517,7 +1517,16 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
     if not config.get("docker_mount_cwd_to_workspace"):
         return None
     if not _docker_session_isolation_enabled():
-        return config.get("host_cwd") or _resolve_override_host_cwd(task_id)
+        host_cwd = config.get("host_cwd")
+        if host_cwd:
+            return host_cwd
+        override_cwd = _resolve_override_host_cwd(task_id)
+        if override_cwd:
+            logger.info(
+                "Shared-container mount: host_cwd unset, using task %s override %s",
+                task_id, override_cwd,
+            )
+        return override_cwd
     if _resolve_container_task_id(task_id) == "default":
         # Top-level CLI parent — single-session process, legacy behavior.
         return config.get("host_cwd")
