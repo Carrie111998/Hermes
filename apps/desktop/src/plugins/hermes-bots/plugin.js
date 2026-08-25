@@ -985,6 +985,7 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
       watermarks: bounded.watermarks,
       sessions: existing.sessions && typeof existing.sessions === 'object' ? existing.sessions : {},
       stranded: existing.stranded && typeof existing.stranded === 'object' ? existing.stranded : {},
+      externalCursors: existing.externalCursors && typeof existing.externalCursors === 'object' ? existing.externalCursors : {},
       members: [...members.values()],
       ...(projectedRoomId || existing.roomId ? { roomId: existing.roomId || projectedRoomId } : {}),
       image: isPreserved
@@ -1043,6 +1044,7 @@ function durableGroupChatRooms(all = $groupChats.get()) {
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
       stranded: room.stranded || {},
+      externalCursors: room.externalCursors || {},
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
       // remote-sync path (the only caller of this function) loses its
@@ -7261,6 +7263,146 @@ async function answerGroupClarify(entry, member, answers) {
  *  so slow models aren't cut off mid-run. A turn that still times out
  *  records a stranded marker so the finished reply can be harvested into
  *  the room at the member's next turn instead of being lost. */
+// --- external write reconciliation (#93813) ---------------------------------
+//
+// Member sessions are persistent Hermes sessions titled "Group: <room>".
+// Besides this plugin's own turn prompts, other writers legitimately append
+// to them: the bot itself via `hermes -p <bot> chat -c "Group: <room>"`, cron
+// jobs, or the agent's own tools. Those rows land in the session transcript
+// but never reach the room log, so the room view silently diverges from what
+// members actually said. The sweep below mirrors such unseen rows into the
+// room log as entries authored by that member.
+//
+// Classification heuristic:
+//   - Room-fed prompts start with ROOM_PROMPT_MARKER_PREFIX.
+//   - A user row without that marker = an external post by this member.
+//   - An assistant row is external iff the nearest preceding user row was
+//     external (its reply belongs to the member's own exchange).
+//   - Tool rows and empty rows are never mirrored.
+
+const ROOM_PROMPT_MARKER_PREFIX = '[Group chat: "'
+const GROUP_RECONCILE_MAX_ENTRIES = 10
+
+function isRoomFedUserText(text) {
+  return String(text || '').startsWith(ROOM_PROMPT_MARKER_PREFIX)
+}
+
+/** Conversational text of a resumed message row ('' for tool/empty rows). */
+function reconciledRowText(msg) {
+  if (!msg || msg.role === 'tool') {
+    return ''
+  }
+
+  const text = typeof msg.content === 'string'
+    ? msg.content
+    : Array.isArray(msg.content)
+      ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
+      : msg?.text || ''
+
+  return String(text).trim()
+}
+
+/** Split a member's unseen transcript window into external-origin entries.
+ *  `seenCount` is how many leading messages the room already accounted for. */
+function collectExternalGroupEntries(messages, seenCount) {
+  const rows = Array.isArray(messages) ? messages.slice(Math.max(0, seenCount)) : []
+  const entries = []
+  let lastUserWasExternal = false
+
+  for (const row of rows) {
+    const text = reconciledRowText(row)
+
+    if (!text) {
+      continue
+    }
+
+    if (row.role === 'user') {
+      lastUserWasExternal = !isRoomFedUserText(text)
+
+      if (lastUserWasExternal) {
+        entries.push({ role: 'user', text })
+      }
+      continue
+    }
+
+    // Assistant rows mirror only when they belong to an external exchange —
+    // room-driven replies are committed by the turn machinery itself.
+    if (row.role === 'assistant' && lastUserWasExternal) {
+      entries.push({ role: 'assistant', text })
+    }
+  }
+
+  return { entries, totalRows: Array.isArray(messages) ? messages.length : 0 }
+}
+
+/** Mirror collected external entries into the room log (dedupe-safe, capped).
+ *  Returns the new seen-count cursor on success, null when nothing changed. */
+function commitExternalGroupEntries(group, member, entries, totalRows) {
+  const memberKey = groupMemberKey(member)
+  let committed = 0
+
+  for (const entry of entries.slice(0, GROUP_RECONCILE_MAX_ENTRIES)) {
+    if (isGroupPassText(entry.text)) {
+      continue
+    }
+
+    appendGroupChatEntry(
+      group,
+      { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
+      entry.text,
+      'legacy'
+    )
+    committed += 1
+  }
+
+  if (totalRows > 0) {
+    updateGroupChat(group, room => {
+      room.externalCursors = { ...(room.externalCursors || {}), [memberKey]: totalRows }
+      return room
+    })
+    return totalRows
+  }
+
+  return committed > 0 ? null : null
+}
+
+/** Reconcile unseen external writes for one member. Returns true when any
+ *  room-log entry was added. */
+async function reconcileExternalGroupWrites(group, member, resumeState, fallbackSeenCount) {
+  const memberKey = groupMemberKey(member)
+  const room = $groupChats.get()[group] || {}
+  const seenCount = Math.max(
+    0,
+    Number(room.externalCursors?.[memberKey] ?? fallbackSeenCount ?? 0)
+  )
+
+  const messages = Array.isArray(resumeState?.messages) ? resumeState.messages : []
+
+  if (messages.length <= seenCount) {
+    return false
+  }
+
+  const { entries, totalRows } = collectExternalGroupEntries(messages, seenCount)
+
+  if (!entries.length) {
+    // Nothing to mirror, but advance the cursor so stale rows are not
+    // rescanned forever.
+    updateGroupChat(group, r => {
+      r.externalCursors = { ...(r.externalCursors || {}), [memberKey]: messages.length }
+      return r
+    })
+    return false
+  }
+
+  commitExternalGroupEntries(group, member, entries, totalRows)
+
+  if (entries.length > GROUP_RECONCILE_MAX_ENTRIES) {
+    recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: 'legacy' })
+  }
+
+  return true
+}
+
 async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   // #93602: hold the member's route socket for the whole turn. Without the
   // lease, every RPC below rides its own request-scoped socket lease; the
@@ -7292,6 +7434,17 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
       session_id: stored || runtime,
       profile: member.name
     })
+
+    // #93813: mirror any external writes (CLI `chat -c "Group: ..."`, cron,
+    // agent tools) that landed in this member's session since we last looked.
+    // Runs BEFORE the baseline is taken so mirrored content is treated as
+    // already-seen history, not as part of this turn's reply window.
+    try {
+      await reconcileExternalGroupWrites(group, member, pre, before)
+    } catch {
+      /* reconciliation is best-effort; never block the turn */
+    }
+
     before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
   } catch {
     /* lazy session — zero messages */
