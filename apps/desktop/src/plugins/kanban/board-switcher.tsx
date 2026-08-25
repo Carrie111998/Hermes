@@ -33,6 +33,7 @@ import {
 import { useEffect, useState } from 'react'
 
 import { $boardSlug, BOARDS_KEY, createBoard, fetchBoards, fetchProjects, PROJECTS_KEY, updateBoard } from './api'
+import { shouldSubmitOnEnter } from './ime-enter'
 import type { BoardMeta } from './types'
 import { errText, FIELD_LABEL, useKanban } from './ui'
 
@@ -111,7 +112,7 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
             <Input
               autoFocus
               onChange={event => setName(event.target.value)}
-              onKeyDown={event => event.key === 'Enter' && slug && !project && create.mutate()}
+              onKeyDown={event => shouldSubmitOnEnter(event) && slug && !project && create.mutate()}
               placeholder={k.boardNamePlaceholder}
               value={name}
             />
