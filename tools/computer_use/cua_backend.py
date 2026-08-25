@@ -1473,8 +1473,38 @@ def _flush_modifier_after(action: str, args: Dict[str, Any]) -> bool:
         keys = args.get("keys")
         if keys:
             return True  # hotkey is by construction a modifier chord
-        return bool(args.get("key") is None and args.get("modifiers"))
+        # press_key with modifiers is ALSO a chord and can lose its modifier
+        # key-up — flush regardless of whether a main key accompanies the
+        # modifiers (review #93702-3: previously this only flushed when
+        # `key is None`, leaving press_key(key='x', modifiers=['cmd']) with
+        # the same stuck-state risk as hotkey).
+        return bool(args.get("modifiers") or args.get("modifier"))
     return bool(args.get("modifiers")) or bool(args.get("modifier"))
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_stuck_key_helper() -> Optional[str]:
+    """Resolve the trusted release-stuck-keys helper path, or None.
+
+    The helper is the compiled product of the macos-input-troubleshooting
+    skill's `scripts/release-stuck-keys.swift` (installed per its SKILL.md
+    via `swiftc -O ... -o ~/bin/release-stuck-keys`). We only trust the
+    ~/bin copy when the skill's source file is still present on disk —
+    otherwise an arbitrary executable dropped into ~/bin would be silently
+    executed by the backend on every modifier-bearing action (review
+    #93702-1: supply-chain surface). Resolved once and cached: per-action
+    stat/spawn during drags and scroll loops is wasted work.
+    """
+    helper = os.path.expanduser("~/bin/release-stuck-keys")
+    if not (os.path.exists(helper) and os.access(helper, os.X_OK)):
+        return None
+    # Provenance gate: the helper may only come from the skill we ship.
+    skill_src = os.path.expanduser(
+        "~/.hermes/skills/devops/macos-input-troubleshooting/scripts/release-stuck-keys.swift"
+    )
+    if not os.path.exists(skill_src):
+        return None
+    return helper
 
 
 # ---------------------------------------------------------------------------
@@ -3324,11 +3354,11 @@ class CuaDriverBackend(ComputerUseBackend):
         # feels "stuck" (see macos-input-troubleshooting skill). After any
         # action that carries modifier state (hotkey, press_key with
         # modifiers, click/drag/scroll with modifiers), flush the chord with
-        # a no-op key so the OS modifier state machine is re-synced. F12 has
-        # no default binding on macOS and is deliberately used here; it is
-        # harmless if the target app binds it because this only runs after a
-        # modifier-bearing injection already changed focus semantics.
-        if result.ok and _flush_modifier_after(action, args):
+        # a no-op key so the OS modifier state machine is re-synced. Flush
+        # runs even when the injection reported failure: a partially-injected
+        # chord (lost key-up) is exactly the stuck-state scenario (review
+        # #93702 minor).
+        if _flush_modifier_after(action, args):
             self._flush_stuck_modifiers()
         return result
 
@@ -3343,19 +3373,30 @@ class CuaDriverBackend(ComputerUseBackend):
         This prefers the standalone `release-stuck-keys --fix` helper
         (ships with the macos-input-troubleshooting skill): it re-posts
         every modifier key-up via CGEvent, which re-syncs the OS state
-        machine without producing any visible key. When the helper is not
-        installed (e.g. fresh machines / CI), fall back to pressing F12
-        with no modifiers through the live session — F12 has no default
-        binding on macOS, produces no text, and nudges the state machine
-        to drop stale presses. Failures are silent: the flush must never
-        change the outcome of the action it follows.
+        machine without producing any visible key. The helper path is
+        provenance-gated (only trusted when the skill's source file is
+        present) and resolved once via lru_cache — per-action stat/spawn
+        during drags and scroll loops is wasted work (review #93702-1).
+
+        When the helper is not installed (e.g. fresh machines / CI), fall
+        back to pressing F12 with no modifiers through the live session —
+        F12 has no default binding on macOS, produces no text, and nudges
+        the state machine to drop stale presses. Known trade-off (review
+        #93702-2): a synthetic F12 is delivered to the focused window, and
+        apps that bind F12 (DevTools, IDE actions) could react; the
+        injection is targeted at the active session's pid/window_id, macOS
+        has no system-level F12 default, and this path only runs when the
+        CGEvent helper is unavailable. An in-process CGEvent re-post would
+        be strictly safer but requires Quartz bindings the backend does not
+        ship. Failures are silent: the flush must never change the outcome
+        of the action it follows.
         """
         if sys.platform != "darwin":
             return
         # Preferred: local helper re-posts all modifier key-ups.
         try:
-            helper = os.path.expanduser("~/bin/release-stuck-keys")
-            if os.path.exists(helper):
+            helper = _resolve_stuck_key_helper()
+            if helper:
                 subprocess.run(
                     [helper, "--fix"],
                     stdin=subprocess.DEVNULL,
