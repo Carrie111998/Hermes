@@ -22,8 +22,10 @@ from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
+    _extract_output_tail,
     _get_max_concurrent_children,
     _load_config,
+    _message_tool_trace,
     delegate_task,
     _build_child_agent,
     _build_child_progress_callback,
@@ -537,6 +539,72 @@ class TestToolNamePreservation(unittest.TestCase):
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 
+    def test_output_tail_pairs_divergent_ids_canonically(self):
+        """Output classification must retain the tool name keyed by call_id."""
+        tail = _extract_output_tail(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "call_id": "call_process",
+                                "id": "call_process|fc_process",
+                                "function": {"name": "process", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_process",
+                        "content": "[exit 2] process failed",
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(
+            tail,
+            [
+                {
+                    "tool": "process",
+                    "preview": "[exit 2] process failed",
+                    "is_error": True,
+                }
+            ],
+        )
+
+    def test_message_trace_pairs_divergent_ids_canonically(self):
+        """Fallback trace must pair a canonical result with its assistant start."""
+        trace = _message_tool_trace(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "call_id": "call_read",
+                            "id": "call_read|fc_read",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"/frozen/a.txt"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_read",
+                    "name": "read_file",
+                    "content": "ok",
+                },
+            ]
+        )
+
+        self.assertEqual(len(trace), 1)
+        self.assertEqual(trace[0]["tool"], "read_file")
+        self.assertEqual(trace[0]["status"], "ok")
+        self.assertNotIn("trace_anomaly", trace[0])
+
     def test_observability_fields_present(self):
         """Completed child should return tool_trace, tokens, model, exit_reason."""
         parent = _make_mock_parent(depth=0)
@@ -729,7 +797,8 @@ class TestDelegateObservability(unittest.TestCase):
 
         def call(call_id, name, arguments):
             return types.SimpleNamespace(
-                id=call_id,
+                call_id=call_id,
+                id=f"{call_id}|fc_{call_id}",
                 function=types.SimpleNamespace(
                     name=name,
                     arguments=arguments,
@@ -821,7 +890,7 @@ class TestDelegateObservability(unittest.TestCase):
                     )
 
                 expected_identities = [
-                    (call.id, call.function.name) for call in tool_calls
+                    (call.call_id, call.function.name) for call in tool_calls
                 ]
                 agent._delegate_tool_turn_callback.assert_called_once_with(
                     expected_identities
@@ -839,6 +908,17 @@ class TestDelegateObservability(unittest.TestCase):
                 self.assertEqual(
                     agent._delegate_tool_terminal_callback.call_count,
                     len(tool_calls),
+                )
+                self.assertEqual(
+                    [
+                        (invocation.args[0], invocation.args[1])
+                        for invocation in agent._delegate_tool_terminal_callback.call_args_list
+                    ],
+                    expected_identities,
+                )
+                self.assertEqual(
+                    [message["tool_call_id"] for message in messages],
+                    [call.call_id for call in tool_calls],
                 )
 
     def test_concurrent_normal_success_emits_one_owned_terminal_event(self):
@@ -3716,6 +3796,81 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+    def test_pinned_provider_disables_parent_fallback_chain(self):
+        """An explicit delegation.provider pin must NOT inherit the parent
+        fallback chain — a mid-run failure on the pin would otherwise silently
+        reroute the quiet-mode child onto parent fallback models (#80450)."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test pinned provider",
+                context=None,
+                toolsets=None,
+                model="minimax/m2",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="minimax",
+                override_base_url="https://api.minimax.example/v1",
+                override_api_key="sk-mm-x",
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertIsNone(kwargs["fallback_model"])
+
+    def test_pinned_acp_command_missing_raises(self):
+        """A pinned delegation command absent from PATH must refuse the spawn
+        loudly instead of silently falling back to the default transport
+        (#80450)."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = None
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            with patch("shutil.which", return_value=None):
+                with self.assertRaises(ValueError) as ctx:
+                    _build_child_agent(
+                        task_index=0,
+                        goal="test pinned acp command",
+                        context=None,
+                        toolsets=None,
+                        model=None,
+                        max_iterations=10,
+                        parent_agent=parent,
+                        task_count=1,
+                        override_acp_command="definitely-not-a-real-binary",
+                    )
+        self.assertIn("definitely-not-a-real-binary", str(ctx.exception))
+        self.assertIn("not", str(ctx.exception).lower())
+
+    def test_resolve_credentials_rejects_missing_pinned_command(self):
+        """_resolve_delegation_credentials refuses a provider whose pinned
+        command is not installed (#80450)."""
+        cfg = {"provider": "acp-provider", "model": "some-model"}
+        parent = _make_mock_parent(depth=0)
+        runtime = {
+            "api_key": "sk-x",
+            "base_url": "https://api.example/v1",
+            "api_mode": "chat_completions",
+            "provider": "acp-provider",
+            "command": "missing-acp-binary",
+            "args": [],
+        }
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=runtime,
+        ):
+            with patch("shutil.which", return_value=None):
+                with self.assertRaises(ValueError) as ctx:
+                    _resolve_delegation_credentials(cfg, parent)
+        self.assertIn("missing-acp-binary", str(ctx.exception))
 
 
 if __name__ == "__main__":
