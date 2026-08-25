@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 
 
@@ -14,6 +15,40 @@ def _point_ledger(monkeypatch, tmp_path):
 
 def test_census_returns_every_full_nonterminal_row_without_mutation(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
+
+    # Serve the PID-liveness probes from one real answer instead of ~1000 live
+    # ones. This test was failing on the 30s per-test cap and flapping with
+    # host load; it is the only test in this file that left the probes live,
+    # and the only one building 505 rows.
+    #
+    # ONE of the two probes is the entire cost. Measured on this box, and the
+    # figure that matters is the ORDER OF MAGNITUDE, not the absolutes — those
+    # drift with host load (_pid_exists read 56ms in one session and 31-34ms in
+    # another; neither probe is memoized, so that is pure load):
+    #     _pid_exists         tens of ms/call  -> 505 census rows = ~30s
+    #     _process_start_time  ~0.1 ms/call    -> 506 inserts     = ~0.05s
+    # Two-plus orders of magnitude apart under every load condition measured.
+    # _pid_exists goes to psutil and is what blows the cap. The census calls
+    # BOTH per row; create_execution() calls only _process_start_time (see
+    # cron/executions.py, in the INSERT parameter tuple), which is free. So
+    # setup's ~13s is essentially all SQLite commit-per-insert, NOT probing,
+    # and stubbing anywhere before the census would have worked. Stubbing
+    # before setup as well is tidier, not load-bearing. Both are stubbed to
+    # keep the recorded and observed values coherent.
+    #
+    # The answer served is the REAL start time of this process, read once
+    # before stubbing, and every row here is genuinely owned by this process.
+    # So the "process_start_time_matches" evidence asserted below stays true
+    # rather than fabricated — this trades repetition for speed, not accuracy.
+    # The five probe-BEHAVIOUR tests in this file stub the same two seams.
+    own_start = executions._process_start_time(os.getpid())
+    assert own_start is not None, (
+        "the real probe must resolve this process for the liveness-match "
+        "assertions below to mean anything"
+    )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: own_start)
+
     first = executions.create_execution("job-000", source="builtin")
     executions.mark_execution_running(first["id"])
     for index in range(1, 505):

@@ -169,6 +169,11 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = _get_output_dir()
 ONESHOT_GRACE_SECONDS = 120
 
+# How many completed pause/resume cycles a job record keeps in
+# ``paused_history``. Bounded so a job that is paused and resumed daily cannot
+# grow jobs.json without limit; oldest entries are dropped first.
+PAUSED_HISTORY_LIMIT = 10
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -1833,20 +1838,76 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def _unpause_updates(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Field updates that take a job OUT of the paused state, coherently.
+
+    Clearing ``paused_at``/``paused_reason`` is deliberate — a running job must
+    not keep advertising why it was once paused — but the WHY is not destroyed:
+    the finished pause is archived to ``paused_history`` first, so an audit can
+    still tell a routine pause from one that meant "this is broken".
+
+    ``pause_jobs_cas`` (the scheduler's bulk pause) additionally writes a legacy
+    ``paused: True`` flag that the scheduler itself ignores — every gate reads
+    ``enabled``/``state``. Left behind it outlives the un-pause and reads as
+    "still paused" to anyone auditing the record, so it is cleared in the same
+    write. It is only touched when the key is already present, so records that
+    never carried it stay byte-identical.
+
+    Shared by ``resume_job`` and ``trigger_job``, the two paths that revive a
+    paused job, so the field can never be coherent on one and lossy on the
+    other.
+    """
+    updates: Dict[str, Any] = {"paused_at": None, "paused_reason": None}
+
+    if "paused" in job:
+        updates["paused"] = False
+
+    if job.get("paused_at") or job.get("paused_reason"):
+        history = [
+            entry for entry in (job.get("paused_history") or [])
+            if isinstance(entry, dict)
+        ]
+        history.append(
+            {
+                "paused_at": job.get("paused_at"),
+                "paused_reason": job.get("paused_reason"),
+                "resumed_at": _hermes_now().isoformat(),
+            }
+        )
+        updates["paused_history"] = history[-PAUSED_HISTORY_LIMIT:]
+
+    return updates
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Pause a job without deleting it. Accepts a job ID or name."""
+    """Pause a job without deleting it. Accepts a job ID or name.
+
+    ``reason`` is the WHY, and it is worth passing: a paused job with no
+    ``paused_reason`` is indistinguishable from one paused because it is
+    broken, so the next reader has to guess whether resuming is safe.
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    return update_job(
-        job["id"],
-        {
-            "enabled": False,
-            "state": "paused",
-            "paused_at": _hermes_now().isoformat(),
-            "paused_reason": reason,
-        },
-    )
+    normalized_reason = (reason or "").strip() or None
+    updates: Dict[str, Any] = {
+        "enabled": False,
+        "state": "paused",
+        "paused_at": _hermes_now().isoformat(),
+        "paused_reason": normalized_reason,
+    }
+
+    # Mirror of ``_unpause_updates``: keep the legacy ``paused`` bool in
+    # lockstep with the lifecycle whenever the record carries it. Without this,
+    # clearing the flag on resume just inverts the hazard — a job paused again
+    # afterwards would sit at ``paused: False`` + ``enabled: False`` +
+    # ``state: "paused"``, and an audit grepping for a false flag would read a
+    # genuinely contained job as live. Same only-when-already-present rule, so
+    # records that never carried the key stay byte-identical.
+    if "paused" in job:
+        updates["paused"] = True
+
+    return update_job(job["id"], updates)
 
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -1862,16 +1923,14 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": next_run_at,
-        },
-    )
+
+    updates: Dict[str, Any] = {
+        "enabled": True,
+        "state": "scheduled",
+        "next_run_at": next_run_at,
+    }
+    updates.update(_unpause_updates(job))
+    return update_job(job["id"], updates)
 
 
 def _get_event_bus():
@@ -1996,9 +2055,8 @@ def _trigger_job_admitted(
         {
             "enabled": True,
             "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
             "next_run_at": _hermes_now().isoformat(),
+            **_unpause_updates(job),
         },
     )
 
