@@ -1,0 +1,70 @@
+name: Installer E2E Change Acceptance
+
+# The scheduled Install & Update E2E matrix is the release-shaped authority,
+# but relevant pull-request heads also need one exact-object installer witness.
+# Generic CI cannot prove the sandboxed real-network install path. This focused
+# lane samples the newest release and exercises the installer re-run whenever
+# the installer, sandbox, test harness, or its workflow wiring changes.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/install-e2e-acceptance.yml'
+      - '.github/workflows/install-e2e-run.yml'
+      - 'scripts/dev-sandbox.sh'
+      - 'scripts/install.sh'
+      - 'scripts/sandbox/**'
+      - 'tests/install/**'
+      - 'tests/test_sandbox_stage2_node_ca.py'
+  pull_request:
+    paths:
+      - '.github/workflows/install-e2e-acceptance.yml'
+      - '.github/workflows/install-e2e-run.yml'
+      - 'scripts/dev-sandbox.sh'
+      - 'scripts/install.sh'
+      - 'scripts/sandbox/**'
+      - 'tests/install/**'
+      - 'tests/test_sandbox_stage2_node_ca.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-e2e-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pick-release:
+    name: Pick newest release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tags: ${{ steps.pick.outputs.tags }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: blob:none
+          fetch-tags: true
+          sparse-checkout: scripts/sandbox/pick-release-tags.sh
+          sparse-checkout-cone-mode: false
+      - id: pick
+        run: |
+          set -euo pipefail
+          tags="$(scripts/sandbox/pick-release-tags.sh --count 1)"
+          echo "Testing installer path from: $tags"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+  installer:
+    name: Installer exact-head witness
+    needs: pick-release
+    strategy:
+      fail-fast: false
+      matrix:
+        install-ref: ${{ fromJSON(needs.pick-release.outputs.tags) }}
+    uses: ./.github/workflows/install-e2e-run.yml
+    with:
+      route: installer
+      install-ref: ${{ matrix.install-ref }}
