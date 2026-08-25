@@ -24,6 +24,7 @@ def _adapter():
     adapter._should_process_message = lambda msg, is_command=False: True
     adapter._should_observe_unmentioned_group_message = lambda msg: False
     adapter._observe_unmentioned_group_message = lambda *args, **kwargs: None
+    adapter._rich_inbound_handling = True
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
     adapter._forum_lock = AsyncMock()
@@ -159,7 +160,7 @@ def test_plaintext_fallback_walks_nested_text():
             },
         ]
     }
-    assert rich_message_to_plaintext(rich) == "TopIgnoredNested text"
+    assert rich_message_to_plaintext(rich) == "Top\nIgnored\nNested \ntext"
 
 
 @pytest.mark.asyncio
@@ -186,6 +187,28 @@ async def test_rich_message_handler_builds_text_event_from_markdown():
 
 
 @pytest.mark.asyncio
+async def test_rich_message_handler_respects_disable_flag():
+    adapter = _adapter()
+    adapter._rich_inbound_handling = False
+    adapter._build_message_event = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not build"))
+    captured = []
+    adapter._enqueue_text_event = lambda event: captured.append(event)
+    msg = _message(
+        rich_message={
+            "blocks": [
+                {"type": "paragraph", "text": "rich"},
+            ]
+        }
+    )
+
+    await adapter._handle_rich_message(_update(msg), SimpleNamespace())
+
+    assert captured == []
+    adapter._ensure_forum_commands.assert_not_awaited()
+    adapter._cache_replied_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rich_message_handler_ignores_text_bearing_messages():
     adapter = _adapter()
     adapter._build_message_event = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not build"))
@@ -194,7 +217,41 @@ async def test_rich_message_handler_ignores_text_bearing_messages():
     await adapter._handle_rich_message(_update(msg), SimpleNamespace())
 
 
+@pytest.mark.asyncio
+async def test_rich_message_handler_drops_unauthorized_users():
+    adapter = _adapter()
+    adapter._is_user_authorized_from_message = lambda msg: False
+    adapter._build_message_event = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not build"))
+    captured = []
+    adapter._enqueue_text_event = lambda event: captured.append(event)
+    msg = _message(
+        rich_message={
+            "blocks": [
+                {"type": "paragraph", "text": "rich"},
+            ]
+        }
+    )
+
+    await adapter._handle_rich_message(_update(msg), SimpleNamespace())
+
+    assert captured == []
+    adapter._ensure_forum_commands.assert_not_awaited()
+    adapter._cache_replied_media.assert_not_awaited()
+
+
 def test_rich_message_filter_matches_rich_only_messages():
     filt = _RichMessageFilter()
     assert filt.filter(_message(rich_message={"blocks": [{"type": "paragraph", "text": "x"}]}))
     assert not filt.filter(_message(text="hello", rich_message={"blocks": [{"type": "paragraph", "text": "x"}]}))
+
+
+def test_rich_message_filter_returns_false_when_to_dict_raises():
+    filt = _RichMessageFilter()
+
+    class BrokenMessage(SimpleNamespace):
+        text = None
+
+        def to_dict(self):
+            raise RuntimeError("boom")
+
+    assert not filt.filter(BrokenMessage())

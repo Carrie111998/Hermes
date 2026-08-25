@@ -187,11 +187,16 @@ if TELEGRAM_AVAILABLE and getattr(filters, "MessageFilter", None) is not None:
         """Match inbound Telegram messages that carry rich_message payloads."""
 
         def filter(self, message: Any) -> bool:
+            if getattr(message, "text", None):
+                return False
+            rp = getattr(message, "rich_message", None)
+            if rp is not None:
+                return True
             try:
-                payload = message.to_dict()
+                rp = message.to_dict().get("rich_message")
             except Exception:
                 return False
-            return bool(payload.get("rich_message")) and not bool(getattr(message, "text", None))
+            return rp is not None
 else:
     class _RichMessageFilter:
         def filter(self, message: Any) -> bool:
@@ -691,6 +696,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._rich_inbound_handling: bool = self._coerce_bool_extra("rich_inbound_handling", True)
         # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
         # path degrades (tables → bullet lists, task lists, <details>, block
         # math) via sendRichMessage / editMessageText's rich_message param using
@@ -9713,6 +9719,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_rich_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle inbound rich messages as markdown text."""
+        if not self._rich_inbound_handling:
+            return
         msg = self._effective_update_message(update)
         if not msg or getattr(msg, "text", None):
             return
@@ -9729,11 +9737,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
 
-        raw = None
-        try:
-            raw = msg.to_dict().get("rich_message")
-        except Exception:
-            raw = None
+        raw = getattr(msg, "rich_message", None)
+        if raw is None:
+            try:
+                raw = msg.to_dict().get("rich_message")
+            except Exception:
+                raw = None
         text = rich_message_to_markdown(raw) if raw is not None else ""
         if not text:
             return

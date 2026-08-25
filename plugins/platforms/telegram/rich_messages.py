@@ -32,7 +32,7 @@ def rich_message_to_plaintext(rich: dict) -> str:
                         walk(child)
 
         walk(rich)
-        return "".join(parts)
+        return "\n".join(parts)
     except Exception:
         return ""
 
@@ -171,8 +171,7 @@ def _render_list(block: dict) -> List[str]:
         if item.get("has_checkbox"):
             checkbox = "[x] " if item.get("is_checked") else "[ ] "
         value = item.get("value")
-        item_type = item.get("type")
-        ordered = value is not None or item_type is not None
+        ordered = value is not None
         prefix = f"{value}. " if value is not None else ("1. " if ordered else "- ")
         first_line = content.splitlines()[0]
         if label:
