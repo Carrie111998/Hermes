@@ -62,16 +62,18 @@ def _mod(name: str, **attrs) -> ModuleType:
 @pytest.fixture(autouse=True)
 def _reset_mcp_startup_state():
     """Ensure each test starts with a clean discovery thread state."""
-    saved_started = mcp_startup._mcp_discovery_started
-    saved_thread = mcp_startup._mcp_discovery_thread
-    mcp_startup._mcp_discovery_started = False
-    mcp_startup._mcp_discovery_thread = None
+    saved_started = set(mcp_startup._mcp_discovery_started)
+    saved_threads = dict(mcp_startup._mcp_discovery_threads)
+    mcp_startup._mcp_discovery_started.clear()
+    mcp_startup._mcp_discovery_threads.clear()
     yield
-    thread = mcp_startup._mcp_discovery_thread
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=2.0)
-    mcp_startup._mcp_discovery_started = saved_started
-    mcp_startup._mcp_discovery_thread = saved_thread
+    for thread in list(mcp_startup._mcp_discovery_threads.values()):
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+    mcp_startup._mcp_discovery_started.clear()
+    mcp_startup._mcp_discovery_started.update(saved_started)
+    mcp_startup._mcp_discovery_threads.clear()
+    mcp_startup._mcp_discovery_threads.update(saved_threads)
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +115,13 @@ def test_acp_background_discovery_does_not_block_startup(monkeypatch):
     elapsed = time.monotonic() - start
 
     assert elapsed < 0.2, "start_background_mcp_discovery blocked for {:.3f}s".format(elapsed)
-    assert mcp_startup._mcp_discovery_thread is not None
-    assert mcp_startup._mcp_discovery_thread.is_alive()
+    thread = mcp_startup._mcp_discovery_threads.get(
+        mcp_startup._discovery_scope_key()
+    )
+    assert thread is not None
+    assert thread.is_alive()
     block.set()
-    mcp_startup._mcp_discovery_thread.join(timeout=2.0)
+    thread.join(timeout=2.0)
 
 
 # ---------------------------------------------------------------------------

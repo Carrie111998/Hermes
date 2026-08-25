@@ -84,7 +84,24 @@ def _(rid, params: dict) -> dict:
 @method("reload.mcp")
 def _(rid, params: dict) -> dict:
     session = _sessions.get(params.get("session_id", ""))
+    _home_token = None
+    _secret_token = None
     try:
+        # RPC-pool dispatch preserves the transport ContextVar but does not
+        # implicitly bind a session's profile.  Bind it here before reading
+        # config or touching MCP state so Desktop/shared-backend reloads act on
+        # the selected profile rather than the process launch profile.
+        _profile_home = session.get("profile_home") if session else None
+        if _profile_home:
+            from pathlib import Path
+            from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+            from hermes_constants import set_hermes_home_override
+
+            _home_token = set_hermes_home_override(str(_profile_home))
+            _secret_token = set_secret_scope(
+                build_profile_secret_scope(Path(str(_profile_home)))
+            )
+
         # Gate: /reload-mcp invalidates the prompt cache for this session.
         # Respect the ``approvals.mcp_reload_confirm`` config toggle — if
         # set (default true) AND the caller did not pass ``confirm=true``
@@ -133,7 +150,11 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, f"compute-host reload_mcp failed: {exc}")
             return _ok(rid, {"status": "reloaded", "turn_isolation": True, "host_ack": ack})
 
-        from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools
+        from tools.mcp_tool import (
+            _mcp_scope_key,
+            discover_mcp_tools,
+            shutdown_current_profile_mcp_servers,
+        )
 
         def _refresh_session_agent() -> None:
             """Rebuild THIS session's cached tool snapshot from the live
@@ -162,7 +183,7 @@ def _(rid, params: dict) -> dict:
                 )
             _emit("session.info", params.get("session_id", ""), _session_info(agent, session))
 
-        global _mcp_reload_gen, _mcp_reload_loaded_rev
+        global _mcp_reload_gen, _mcp_reload_loaded_rev, _mcp_reload_loaded_scope
 
         # The revision the CALLER is asking to load (the mcp_rev its poll
         # observed). Empty on legacy clients and manual /reload-mcp — those
@@ -179,11 +200,11 @@ def _(rid, params: dict) -> dict:
             reload racing a config edit): re-hash after discovery and repeat
             until the hash is stable, so the generation we mark completed
             always reflects the config that was actually loaded."""
-            global _mcp_reload_gen, _mcp_reload_loaded_rev
+            global _mcp_reload_gen, _mcp_reload_loaded_rev, _mcp_reload_loaded_scope
 
             loaded = _compute_mcp_rev()
             for _ in range(_MCP_RELOAD_MAX_PASSES):
-                shutdown_mcp_servers()
+                shutdown_current_profile_mcp_servers()
                 discover_mcp_tools()
                 after = _compute_mcp_rev()
                 if after == loaded:
@@ -192,6 +213,7 @@ def _(rid, params: dict) -> dict:
 
             _refresh_session_agent()
             _mcp_reload_loaded_rev = loaded
+            _mcp_reload_loaded_scope = _mcp_scope_key()
             _mcp_reload_gen += 1
 
         # Serialize reloads. The LEADER (won the non-blocking acquire) runs the
@@ -208,27 +230,42 @@ def _(rid, params: dict) -> dict:
         if _mcp_reload_lock.acquire(blocking=False):
             try:
                 _do_full_reload()
+                return _finish_reload(rid, params, coalesced=False)
             finally:
                 _mcp_reload_lock.release()
-
-            return _finish_reload(rid, params, coalesced=False)
 
         gen_before = _mcp_reload_gen
 
         with _mcp_reload_lock:
             leader_completed = _mcp_reload_gen > gen_before
             rev_satisfied = not req_rev or req_rev == _mcp_reload_loaded_rev
+            scope_satisfied = _mcp_scope_key() == _mcp_reload_loaded_scope
 
-            if leader_completed and rev_satisfied:
+            if leader_completed and rev_satisfied and scope_satisfied:
                 _refresh_session_agent()
                 coalesced = True
             else:
                 _do_full_reload()
                 coalesced = False
 
-        return _finish_reload(rid, params, coalesced=coalesced)
+            return _finish_reload(rid, params, coalesced=coalesced)
     except Exception as e:
         return _err(rid, 5015, str(e))
+    finally:
+        if _secret_token is not None:
+            try:
+                from agent.secret_scope import reset_secret_scope
+
+                reset_secret_scope(_secret_token)
+            except Exception:
+                pass
+        if _home_token is not None:
+            try:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(_home_token)
+            except Exception:
+                pass
 
 
 @method("reload.env")

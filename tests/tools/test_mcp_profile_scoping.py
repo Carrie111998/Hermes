@@ -15,6 +15,7 @@ These tests pin the contract in both directions:
   every operation is the plain dict/set operation it was before.
 """
 
+import asyncio
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -83,6 +84,8 @@ def _clean_mcp_state():
             mcp._mcp_tool_server_names,
         ):
             container._by_scope.clear()
+        mcp._profile_lifecycle_generations.clear()
+        mcp._profile_lifecycle_locks.clear()
 
     _wipe()
     yield
@@ -290,6 +293,188 @@ def test_idle_check_sees_other_profiles_servers(profiles):
     with _scoped_to(home_b):
         assert len(mcp._servers) == 0          # nothing in B's own scope...
         assert mcp._servers.total_len() == 1   # ...but the process is not idle
+
+
+def test_reload_fences_inflight_eager_publication(profiles, monkeypatch):
+    """A pre-reload connect cannot publish after the new generation wins."""
+    home_a, _ = profiles
+    scope_a = hermes_home_key(home_a)
+    old_started = threading.Event()
+    release_old = threading.Event()
+    connect_calls = 0
+    tool_name = "mcp__shared__ping"
+
+    class _Connected:
+        def __init__(self, label):
+            self.label = label
+            self.name = "shared"
+            self.session = object()
+            self._registered_tool_names = []
+            self._registered_scope = scope_a
+            self.shutdown_calls = 0
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+            self.session = None
+
+    async def _connect(_name, _config):
+        nonlocal connect_calls
+        connect_calls += 1
+        label = "old" if connect_calls == 1 else "new"
+        if label == "old":
+            old_started.set()
+            await asyncio.to_thread(release_old.wait, 10)
+        return _Connected(label)
+
+    def _register(_name, server, _config):
+        registry.register(
+            name=tool_name,
+            toolset="mcp-shared",
+            schema={"name": tool_name, "description": server.label},
+            handler=lambda _args, label=server.label: label,
+            scope=scope_a,
+        )
+        registry.register_toolset_alias(
+            "shared", "mcp-shared", scope=scope_a
+        )
+        return [tool_name]
+
+    monkeypatch.setattr(mcp, "_connect_server", _connect)
+    monkeypatch.setattr(mcp, "_register_server_tools", _register)
+    results = {}
+
+    def _run(label):
+        with _scoped_to(home_a):
+            try:
+                results[label] = asyncio.run(
+                    mcp._discover_and_register_server("shared", {})
+                )
+            except BaseException as exc:  # exact stale-attempt witness
+                results[label] = exc
+
+    old = threading.Thread(target=_run, args=("old",), daemon=True)
+    old.start()
+    assert old_started.wait(timeout=10)
+
+    with _scoped_to(home_a):
+        mcp.shutdown_current_profile_mcp_servers()
+
+    new = threading.Thread(target=_run, args=("new",), daemon=True)
+    new.start()
+    new.join(timeout=10)
+    assert not new.is_alive()
+
+    release_old.set()
+    old.join(timeout=10)
+    assert not old.is_alive()
+    assert isinstance(results["old"], mcp._MCPProfileReloaded)
+    assert results["new"] == [tool_name]
+    assert registry.dispatch(tool_name, {}, scope=scope_a) == "new"
+
+    with _scoped_to(home_a):
+        mcp.shutdown_current_profile_mcp_servers()
+
+
+def test_reload_serializes_lazy_cache_publication(profiles, monkeypatch):
+    """Lazy registry/trust/provenance publication is atomic with reload."""
+    home_a, _ = profiles
+    scope_a = hermes_home_key(home_a)
+    entry = {
+        "fingerprint": "fp",
+        "tools": [
+            {
+                "name": "ping",
+                "description": "ping",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        ],
+        "utility_tools": [],
+    }
+    config = {"command": "shared-mcp", "lazy": True, "trust": "untrusted"}
+    register_entered = threading.Event()
+    release_register = threading.Event()
+    shutdown_finished = threading.Event()
+    lazy_result = []
+    original_register = registry.register
+
+    def _blocking_register(*args, **kwargs):
+        register_entered.set()
+        assert release_register.wait(timeout=10)
+        return original_register(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "register", _blocking_register)
+
+    def _lazy():
+        with _scoped_to(home_a), patch(
+            "tools.mcp_schema_cache.config_fingerprint", return_value="fp"
+        ):
+            lazy_result.extend(
+                mcp._register_from_cache_sync("shared", config, entry)
+            )
+
+    def _shutdown():
+        with _scoped_to(home_a):
+            mcp.shutdown_current_profile_mcp_servers()
+        shutdown_finished.set()
+
+    lazy = threading.Thread(target=_lazy, daemon=True)
+    lazy.start()
+    assert register_entered.wait(timeout=10)
+    shutdown = threading.Thread(target=_shutdown, daemon=True)
+    shutdown.start()
+    assert not shutdown_finished.wait(timeout=0.1), (
+        "reload must wait for the lazy lifecycle transaction"
+    )
+
+    release_register.set()
+    lazy.join(timeout=10)
+    shutdown.join(timeout=10)
+    assert not lazy.is_alive() and not shutdown.is_alive()
+    assert len(lazy_result) == 1
+    tool_name = lazy_result[0]
+
+    with _scoped_to(home_a):
+        assert registry.get_entry(tool_name) is None
+        assert "shared" not in mcp._lazy_server_configs
+        assert "shared" not in mcp._server_trust_levels
+        assert tool_name not in mcp._mcp_tool_server_names
+
+
+def test_profile_alias_cleanup_preserves_sibling_alias(profiles):
+    """Removing A's MCP toolset alias must not remove B's equal alias."""
+    from toolsets import get_toolset
+
+    home_a, home_b = profiles
+    scope_a = hermes_home_key(home_a)
+    scope_b = hermes_home_key(home_b)
+    name = "mcp__shared__ping"
+
+    for scope, label in ((scope_a, "a"), (scope_b, "b")):
+        registry.register(
+            name=name,
+            toolset="mcp-shared",
+            schema={"name": name, "description": label},
+            handler=lambda _args, value=label: value,
+            scope=scope,
+        )
+        registry.register_toolset_alias(
+            "shared", "mcp-shared", scope=scope
+        )
+
+    registry.deregister(name, scope=scope_a)
+
+    assert registry.get_toolset_alias_target("shared", scope=scope_a) is None
+    assert (
+        registry.get_toolset_alias_target("shared", scope=scope_b)
+        == "mcp-shared"
+    )
+    assert registry.dispatch(name, {}, scope=scope_b) == "b"
+    with _scoped_to(home_a):
+        assert get_toolset("shared") is None
+    with _scoped_to(home_b):
+        assert get_toolset("shared")["tools"] == [name]
+
+    registry.deregister(name, scope=scope_b)
 
 
 # ---------------------------------------------------------------------------

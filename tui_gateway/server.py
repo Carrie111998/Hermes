@@ -277,7 +277,8 @@ _LONG_HANDLERS = frozenset(
         "pet.thumb",
         "learning.frames",
         "plugins.manage",
-        # reload.mcp shuts down and rediscovers every MCP server — with a
+        # reload.mcp shuts down and rediscovers the caller profile's MCP
+        # servers — with a
         # flapping server (retry loops, connect timeouts up to 120s) that can
         # block for minutes. Inline it froze the reader thread: config.set,
         # complete.slash, prompt.submit all sat unread and the TUI appeared
@@ -13996,6 +13997,11 @@ _mcp_reload_gen = 0
 # under the leader (rev A loaded, rev B requested) and the follower must
 # re-run the full reload itself instead of acking B against A's registry.
 _mcp_reload_loaded_rev = ""
+# Profile-home scope that produced ``_mcp_reload_loaded_rev``.  Revision text
+# alone is not enough in a multiplex backend: two profiles can have identical
+# MCP config hashes while owning different server processes and registry
+# overlays, so a follower may coalesce only within the same profile scope.
+_mcp_reload_loaded_scope = ""
 # Bounded convergence for a config edit racing a slow reload: the leader
 # re-hashes after discovery and repeats until the hash is stable.
 _MCP_RELOAD_MAX_PASSES = 3

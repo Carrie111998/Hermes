@@ -4585,6 +4585,14 @@ class _ScopedDict(MutableMapping):
         """Drop every profile's entries (full process shutdown only)."""
         self._by_scope.clear()
 
+    def values_for_scope(self, scope: str) -> list:
+        """Snapshot values owned by one explicit profile scope."""
+        return list(self._by_scope.get(scope, {}).values())
+
+    def clear_scope(self, scope: str) -> None:
+        """Drop one profile's entries without touching sibling profiles."""
+        self._by_scope.pop(scope, None)
+
     def total_len(self) -> int:
         """Entry count across all profiles."""
         return sum(len(mapping) for mapping in list(self._by_scope.values()))
@@ -4647,6 +4655,10 @@ class _ScopedSet(MutableSet):
     def clear(self) -> None:
         self._current().clear()
 
+    def clear_scope(self, scope: str) -> None:
+        """Drop one profile's members without touching sibling profiles."""
+        self._by_scope.pop(scope, None)
+
     def total_len(self) -> int:
         """Member count across all profiles (process-lifecycle callers only)."""
         return sum(len(members) for members in list(self._by_scope.values()))
@@ -4661,6 +4673,43 @@ class _ScopedSet(MutableSet):
 _servers: Dict[str, MCPServerTask] = _ScopedDict()
 _server_connecting: Set[str] = _ScopedSet()
 _server_connect_errors: Dict[str, str] = _ScopedDict()
+# Monotonic lifecycle generation per profile.  A profile-local reload bumps
+# this before taking its shutdown snapshot, fencing off connections that were
+# already in flight: a stale connection may finish, but it must never publish
+# its server or registry entries into the freshly reloaded profile.
+_profile_lifecycle_generations: Dict[str, int] = {}
+_profile_lifecycle_locks: Dict[str, threading.RLock] = {}
+_profile_lifecycle_locks_guard = threading.Lock()
+
+
+class _MCPProfileReloaded(RuntimeError):
+    """An MCP connect attempt was superseded by a profile-local reload."""
+
+
+def _profile_lifecycle_is_current(scope: str, generation: int) -> bool:
+    """Return whether an attempt still belongs to the live profile epoch.
+
+    Callers hold :data:`_lock`; keeping the check beside related state writes
+    makes publication and invalidation atomic without requiring a re-entrant
+    lock.
+    """
+    return _profile_lifecycle_generations.get(scope, 0) == generation
+
+
+def _profile_lifecycle_lock(scope: str) -> threading.RLock:
+    """Return the stable publication/shutdown gate for one profile."""
+    with _profile_lifecycle_locks_guard:
+        return _profile_lifecycle_locks.setdefault(scope, threading.RLock())
+
+
+async def _acquire_profile_lifecycle_lock(scope: str) -> threading.RLock:
+    """Acquire a profile gate without blocking the shared MCP event loop."""
+    lifecycle_lock = _profile_lifecycle_lock(scope)
+    while not lifecycle_lock.acquire(blocking=False):
+        await asyncio.sleep(0.01)
+    return lifecycle_lock
+
+
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
 # entries are popped once a real connection is established on first use.
@@ -4673,6 +4722,12 @@ _lazy_server_tool_names: Dict[str, List[str]] = _ScopedDict()
 _connect_server_claim: contextvars.ContextVar[
     Optional[Callable[[MCPServerTask], None]]
 ] = contextvars.ContextVar("mcp_connect_server_claim", default=None)
+# Lifecycle ownership is carried context-locally so the public/internal
+# two-positional-argument connect contract remains compatible with tests and
+# integrations that wrap ``_discover_and_register_server``.
+_connect_lifecycle_claim: contextvars.ContextVar[
+    Optional[tuple[str, int]]
+] = contextvars.ContextVar("mcp_connect_lifecycle_claim", default=None)
 
 # Connection-retry cooldown (per-server isolation against restart storms).
 #
@@ -6108,7 +6163,11 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     cooldown bookkeeping stays in one place. Returns True when a live
     session is available afterwards.
     """
+    profile_scope = _mcp_scope_key()
     with _lock:
+        lifecycle_generation = _profile_lifecycle_generations.get(
+            profile_scope, 0
+        )
         server = _servers.get(server_name)
         if server is not None and server.session is not None:
             return True
@@ -6127,22 +6186,42 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
 
     async def _connect():
-        return await _discover_and_register_server(server_name, config)
+        lifecycle_token = _connect_lifecycle_claim.set(
+            (profile_scope, lifecycle_generation)
+        )
+        try:
+            return await _discover_and_register_server(server_name, config)
+        finally:
+            _connect_lifecycle_claim.reset(lifecycle_token)
 
     try:
         _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
     except BaseException as exc:
         message = _format_connect_error(exc)
         with _lock:
-            _server_connecting.discard(server_name)
-            _server_connect_errors[server_name] = message
-            _record_connect_failure(server_name)
+            lifecycle_current = _profile_lifecycle_is_current(
+                profile_scope, lifecycle_generation
+            )
+            if lifecycle_current:
+                _server_connecting.discard(server_name)
+                _server_connect_errors[server_name] = message
+                _record_connect_failure(server_name)
+        if not lifecycle_current:
+            logger.debug(
+                "Lazy MCP connect for '%s' was superseded by profile reload",
+                server_name,
+            )
+            return False
         logger.warning(
             "Lazy MCP connect failed for '%s': %s", server_name, message,
         )
         return False
 
     with _lock:
+        if not _profile_lifecycle_is_current(
+            profile_scope, lifecycle_generation
+        ):
+            return False
         _server_connecting.discard(server_name)
         _clear_connect_failure(server_name)
         _lazy_server_configs.pop(server_name, None)
@@ -7558,7 +7637,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         registered_names.append(registry_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(
+            name, toolset_name, scope=registry_scope
+        )
         # Write-through (#56832): refresh the on-disk schema cache after a
         # live connect so the next startup can lazily register this server
         # without spawning it. Cache failures never break registration.
@@ -7610,7 +7691,47 @@ class _CachedMCPTool:
         self.inputSchema = inputSchema or {}
 
 
-def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]:
+def _register_from_cache_sync(
+    name: str,
+    config: dict,
+    entry: dict,
+    *,
+    _profile_scope: Optional[str] = None,
+    _lifecycle_generation: Optional[int] = None,
+) -> List[str]:
+    """Publish a lazy cache entry as one profile-lifecycle transaction."""
+    lifecycle_claim = _connect_lifecycle_claim.get()
+    profile_scope = (
+        _profile_scope
+        or (lifecycle_claim[0] if lifecycle_claim is not None else None)
+        or _mcp_scope_key()
+    )
+    with _lock:
+        lifecycle_generation = (
+            _lifecycle_generation
+            if _lifecycle_generation is not None
+            else (
+                lifecycle_claim[1]
+                if lifecycle_claim is not None
+                else _profile_lifecycle_generations.get(profile_scope, 0)
+            )
+        )
+
+    # This path is synchronous and may run on any worker thread.  The same
+    # per-profile gate used by eager publication makes its registry, trust,
+    # provenance, and lazy-runtime writes indivisible with respect to reload.
+    with _profile_lifecycle_lock(profile_scope):
+        with _lock:
+            if not _profile_lifecycle_is_current(
+                profile_scope, lifecycle_generation
+            ):
+                return []
+        return _register_from_cache_sync_locked(name, config, entry)
+
+
+def _register_from_cache_sync_locked(
+    name: str, config: dict, entry: dict
+) -> List[str]:
     """Register a server's tools from a cached manifest, no child process.
 
     Lazy startup (#56832, design by Vansh5632): tools appear in the registry
@@ -7740,7 +7861,9 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         registered_names.append(util_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(
+            name, toolset_name, scope=registry_scope
+        )
         with _lock:
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint
@@ -7751,12 +7874,25 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         )
     return registered_names
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(
+    name: str,
+    config: dict,
+    *,
+    _profile_scope: Optional[str] = None,
+    _lifecycle_generation: Optional[int] = None,
+) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+    profile_scope = _profile_scope or _mcp_scope_key()
+    with _lock:
+        lifecycle_generation = (
+            _profile_lifecycle_generations.get(profile_scope, 0)
+            if _lifecycle_generation is None
+            else _lifecycle_generation
+        )
     # List-based claim (not a ``nonlocal`` rebind): the claim callback runs
     # inside ``_connect_server`` while this frame is suspended, and appending
     # keeps type narrowing intact for the module's other ``server`` locals.
@@ -7771,7 +7907,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             _connect_server(name, config),
             timeout=connect_timeout,
         )
-    except BaseException:
+    except BaseException as exc:
         server = claimed[0] if claimed else None
         task = server._task if server is not None else None
         task_cancelling = (
@@ -7779,30 +7915,69 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             if task is not None and hasattr(task, "cancelling")
             else 0
         )
-        if (
+        recoverable_park = (
             server is not None
             and server._error is not None
             and task is not None
             and not task.done()
             and not task_cancelling
-        ):
-            # Recoverable park: the run task deliberately stays alive to
-            # self-probe, so adopt it into the registry for shutdown/revival.
+        )
+        lifecycle_lock = await _acquire_profile_lifecycle_lock(profile_scope)
+        try:
             with _lock:
-                _servers[name] = server
-        elif server is not None:
+                lifecycle_current = _profile_lifecycle_is_current(
+                    profile_scope, lifecycle_generation
+                )
+                if lifecycle_current and recoverable_park:
+                    # Recoverable park: the run task deliberately stays alive
+                    # to self-probe, so adopt it only while this generation
+                    # still owns the attempt.
+                    _servers[name] = server
+                    parked = True
+                else:
+                    parked = False
+        finally:
+            lifecycle_lock.release()
+        if not parked and server is not None:
             await server.shutdown()
+        if not lifecycle_current:
+            raise _MCPProfileReloaded(
+                f"MCP server '{name}' connect was superseded by profile reload"
+            ) from exc
         raise
     finally:
         _connect_server_claim.reset(claim_token)
 
-    with _lock:
-        _server_connecting.discard(name)
-        _server_connect_errors.pop(name, None)
-        _servers[name] = server
+    lifecycle_lock = await _acquire_profile_lifecycle_lock(profile_scope)
+    try:
+        with _lock:
+            lifecycle_current = _profile_lifecycle_is_current(
+                profile_scope, lifecycle_generation
+            )
+        if lifecycle_current:
+            # The profile gate serializes schema publication with reload's
+            # generation bump, shutdown snapshot, registry cleanup, and state
+            # clear.  A reload therefore either sees this whole server or the
+            # connect sees a stale generation and publishes nothing.
+            registered_names = _register_server_tools(name, server, config)
+            server._registered_tool_names = list(registered_names)
+            with _lock:
+                # Reload cannot advance the generation while we hold the gate.
+                # Publish runtime ownership in the same lifecycle transaction.
+                assert _profile_lifecycle_is_current(
+                    profile_scope, lifecycle_generation
+                )
+                _server_connecting.discard(name)
+                _server_connect_errors.pop(name, None)
+                _servers[name] = server
+    finally:
+        lifecycle_lock.release()
 
-    registered_names = _register_server_tools(name, server, config)
-    server._registered_tool_names = list(registered_names)
+    if not lifecycle_current:
+        await server.shutdown()
+        raise _MCPProfileReloaded(
+            f"MCP server '{name}' connect was superseded by profile reload"
+        )
 
     transport_type = "HTTP" if "url" in config else "stdio"
     logger.info(
@@ -7842,7 +8017,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # connecting) and are enabled.  Checking ``_server_connecting`` prevents
     # duplicate subprocess spawns when ``discover_mcp_tools()`` is called
     # from multiple entry-points before the first batch finishes (#58862).
+    profile_scope = _mcp_scope_key()
     with _lock:
+        lifecycle_generation = _profile_lifecycle_generations.get(
+            profile_scope, 0
+        )
         connecting = set(_server_connecting)
         new_servers = {
             k: v
@@ -7910,7 +8089,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             with _lock:
                 _server_connecting.discard(name)
             try:
-                names = _register_from_cache_sync(name, cfg, entry)
+                names = _register_from_cache_sync(
+                    name,
+                    cfg,
+                    entry,
+                    _profile_scope=profile_scope,
+                    _lifecycle_generation=lifecycle_generation,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed lazy MCP registration for '%s': %s", name, exc,
@@ -7937,7 +8122,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     async def _discover_one(name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
-        return await _discover_and_register_server(name, cfg)
+        lifecycle_token = _connect_lifecycle_claim.set(
+            (profile_scope, lifecycle_generation)
+        )
+        try:
+            return await _discover_and_register_server(name, cfg)
+        finally:
+            _connect_lifecycle_claim.reset(lifecycle_token)
 
     async def _discover_all():
         server_names = list(new_servers.keys())
@@ -7947,10 +8138,20 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             return_exceptions=True,
         )
         for name, result in zip(server_names, results):
+            if isinstance(result, _MCPProfileReloaded):
+                logger.debug(
+                    "MCP connect for '%s' was superseded by profile reload",
+                    name,
+                )
+                continue
             if isinstance(result, BaseException):
                 command = new_servers.get(name, {}).get("command")
                 message = _format_connect_error(result)
                 with _lock:
+                    if not _profile_lifecycle_is_current(
+                        profile_scope, lifecycle_generation
+                    ):
+                        continue
                     _server_connecting.discard(name)
                     _server_connect_errors[name] = message
                     # Arm the per-server backoff so the next discovery pass
@@ -7966,6 +8167,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 )
             else:
                 with _lock:
+                    if not _profile_lifecycle_is_current(
+                        profile_scope, lifecycle_generation
+                    ):
+                        continue
                     _server_connecting.discard(name)
                     _server_connect_errors.pop(name, None)
                     _clear_connect_failure(name)
@@ -7988,7 +8193,14 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         # entries stranded in _server_connecting.  Those stale
         # entries would block future reconnection attempts (#58862).
         with _lock:
-            stale = [n for n in new_servers if n in _server_connecting]
+            lifecycle_current = _profile_lifecycle_is_current(
+                profile_scope, lifecycle_generation
+            )
+            stale = (
+                [n for n in new_servers if n in _server_connecting]
+                if lifecycle_current
+                else []
+            )
             if stale:
                 logger.warning(
                     "MCP discovery %s while %d server(s) were still "
@@ -8517,6 +8729,15 @@ def shutdown_mcp_servers():
     All servers are shut down in parallel via ``asyncio.gather``.
     """
     with _lock:
+        lifecycle_scopes = (
+            set(_profile_lifecycle_generations)
+            | set(_servers._by_scope)
+            | set(_server_connecting._by_scope)
+        )
+        for scope in lifecycle_scopes:
+            _profile_lifecycle_generations[scope] = (
+                _profile_lifecycle_generations.get(scope, 0) + 1
+            )
         # Every profile's servers: this is a process-wide teardown and the MCP
         # event loop stopped below is shared across profiles, so a
         # caller-scoped view would strand another profile's live sessions.
@@ -8577,6 +8798,122 @@ def shutdown_mcp_servers():
         _server_connect_failures.clear_all()
 
     _stop_mcp_loop()
+
+
+def shutdown_current_profile_mcp_servers() -> None:
+    """Close and deregister MCP state owned by the active profile only.
+
+    This is the lifecycle primitive for an interactive ``/reload-mcp``.  The
+    full :func:`shutdown_mcp_servers` function is intentionally process-wide
+    because it also stops the shared MCP event loop; using it for a session
+    reload would tear down every sibling profile served by the same Desktop /
+    dashboard compute host (#67605).
+
+    The caller must bind the target profile's ``HERMES_HOME`` before calling.
+    Server shutdown coroutines receive that same context so their registry and
+    provenance cleanup targets the profile overlay that is being reloaded.
+    The shared event loop is stopped only when no profile still owns a server
+    or an in-flight connection.
+    """
+    scope = _mcp_scope_key()
+    with _profile_lifecycle_lock(scope):
+        _shutdown_current_profile_mcp_servers_locked(scope)
+
+
+def _shutdown_current_profile_mcp_servers_locked(scope: str) -> None:
+    """Profile shutdown implementation; caller holds its lifecycle gate."""
+    registry_scope = scope or None
+
+    with _lock:
+        _profile_lifecycle_generations[scope] = (
+            _profile_lifecycle_generations.get(scope, 0) + 1
+        )
+        servers_snapshot = _servers.values_for_scope(scope)
+        registered_names = {
+            tool_name
+            for server in servers_snapshot
+            for tool_name in list(
+                getattr(server, "_registered_tool_names", []) or []
+            )
+        }
+        registered_names.update(
+            tool_name
+            for names in _lazy_server_tool_names._by_scope.get(scope, {}).values()
+            for tool_name in list(names or [])
+        )
+        loop = _mcp_loop
+
+    async def _shutdown_profile() -> None:
+        results = await asyncio.gather(
+            *(server.shutdown() for server in servers_snapshot),
+            return_exceptions=True,
+        )
+        for server, result in zip(servers_snapshot, results):
+            if isinstance(result, Exception):
+                logger.debug(
+                    "Error closing MCP server '%s' for profile reload: %s",
+                    server.name,
+                    result,
+                )
+
+    if servers_snapshot and loop is not None and loop.is_running():
+        from agent.async_utils import safe_schedule_threadsafe
+
+        future = safe_schedule_threadsafe(
+            _wrap_with_home_override(_shutdown_profile()),
+            loop,
+            logger=logger,
+            log_message="Profile MCP shutdown: failed to schedule",
+        )
+        if future is not None:
+            try:
+                future.result(timeout=15)
+            except BaseException as exc:
+                logger.debug("Error during profile MCP shutdown: %s", exc)
+
+    # Guarantee registry cleanup even if the event loop was already stopped or
+    # an individual server's async teardown failed.  _deregister_tools is
+    # idempotent and carries each server's original explicit registry scope.
+    for server in servers_snapshot:
+        try:
+            server._deregister_tools()
+        except Exception as exc:
+            logger.debug(
+                "Error deregistering MCP server '%s' for profile reload: %s",
+                getattr(server, "name", "unknown"),
+                exc,
+            )
+
+    # Lazy schema-cache registrations have no MCPServerTask to clean them up.
+    if registered_names:
+        from tools.registry import registry
+
+        for tool_name in registered_names:
+            registry.deregister(tool_name, scope=registry_scope)
+
+    with _lock:
+        # Clear only config/runtime state derived for this profile.  Sibling
+        # buckets remain byte-for-byte intact and continue using the shared
+        # event loop.
+        for container in (
+            _servers,
+            _server_connect_errors,
+            _lazy_server_configs,
+            _lazy_server_fingerprints,
+            _lazy_server_tool_names,
+            _server_connect_retry_after,
+            _server_connect_failures,
+            _server_error_counts,
+            _server_breaker_opened_at,
+            _server_trust_levels,
+            _tool_read_only_hints,
+            _mcp_tool_server_names,
+        ):
+            container.clear_scope(scope)
+        for container in (_server_connecting, _parallel_safe_servers):
+            container.clear_scope(scope)
+
+    _stop_mcp_loop_if_idle()
 
 
 def _kill_orphaned_mcp_children(
