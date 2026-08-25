@@ -251,11 +251,17 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
     # force-kill reaps the process: terminate_pid(force=True) flips it dead,
     # and the post-kill re-poll via _pid_exists then sees it gone so the
     # replacement proceeds.
-    def _mock_terminate_pid(pid, force=False):
+    def _mock_terminate_pid(pid, force=False, reason=None):
         calls.append((pid, force))
         if force:
             _pid_state["alive"] = False
     monkeypatch.setattr("gateway.status.terminate_pid", _mock_terminate_pid)
+    # The replace path ASKS first now. Simulate an incumbent that refuses to
+    # drain inside its budget, which is what licenses the force-kill below.
+    monkeypatch.setattr(
+        "gateway.run._request_incumbent_shutdown",
+        lambda pid, *, timeout: False,
+    )
     monkeypatch.setattr(
         "gateway.status._pid_exists", lambda pid: _pid_state["alive"]
     )
@@ -272,7 +278,10 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
     ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
 
     assert ok is True
-    assert calls == [(42, False), (42, True)]
+    # Only the escalation reaches terminate_pid now: the graceful request is a
+    # separate seam, and reaching terminate_pid(force=False) on Windows was the
+    # defect (os.kill SIGTERM there is TerminateProcess).
+    assert calls == [(42, True)]
 
 
 @pytest.mark.asyncio
@@ -312,7 +321,11 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
     )
     monkeypatch.setattr(
         "gateway.status.terminate_pid",
-        lambda pid, force=False: calls.append((pid, force)),
+        lambda pid, force=False, reason=None: calls.append((pid, force)),
+    )
+    monkeypatch.setattr(
+        "gateway.run._request_incumbent_shutdown",
+        lambda pid, *, timeout: False,
     )
     # _pid_exists never goes False — the force-kill did not take.
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
@@ -329,7 +342,7 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
     ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
 
     assert ok is False
-    assert calls == [(42, False), (42, True)]
+    assert calls == [(42, True)]
     assert removed_pid is False
     assert released_locks is False
 
@@ -367,8 +380,16 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
         })
         return True
 
-    def record_terminate(pid, force=False):
+    def record_terminate(pid, force=False, reason=None):
         events.append(f"terminate_pid(pid={pid}, force={force})")
+
+    def record_request(pid, *, timeout):
+        # The replace path now ASKS the incumbent to stop (planned-stop marker
+        # on Windows, real SIGTERM on POSIX) and only escalates to terminate_pid
+        # if that is refused. The ordering this test pins — takeover marker
+        # first — is unchanged; the thing it must precede moved.
+        events.append(f"request_shutdown(pid={pid})")
+        return True
 
     class _CleanExitRunner:
         def __init__(self, config):
@@ -397,6 +418,7 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
     )
     monkeypatch.setattr("gateway.status.write_takeover_marker", record_write_marker)
     monkeypatch.setattr("gateway.status.terminate_pid", record_terminate)
+    monkeypatch.setattr("gateway.run._request_incumbent_shutdown", record_request)
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
     # Simulate old process exiting on first check so we don't loop into force-kill
     monkeypatch.setattr(
@@ -414,9 +436,12 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
     ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
 
     assert ok is True
-    # Ordering: marker written BEFORE SIGTERM
+    # Ordering: marker written BEFORE we ask the incumbent to stop, so its
+    # shutdown handler can already see the takeover and exit 0.
     assert events[0] == "write_marker(target_pid=42)"
-    assert any(e.startswith("terminate_pid(pid=42") for e in events[1:])
+    assert any(e.startswith("request_shutdown(pid=42") for e in events[1:])
+    # And a cooperative takeover must NOT reach the force-kill escalation.
+    assert not any(e.startswith("terminate_pid(") for e in events)
     # Marker file cleanup: replacer cleans it after loop completes
     assert not (tmp_path / ".gateway-takeover.json").exists()
 

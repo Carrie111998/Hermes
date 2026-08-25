@@ -271,8 +271,15 @@ def _terminate_caller() -> str | None:
         return None
 
 
-def terminate_pid(pid: int, *, force: bool = False) -> None:
+def terminate_pid(pid: int, *, force: bool = False, reason: str | None = None) -> None:
     """Terminate a PID with platform-appropriate force semantics.
+
+    ``reason`` is recorded on the ``process.terminate`` diag record. A bare
+    caller + force flag does not distinguish "the incumbent refused to drain
+    inside its budget" from an ordinary kill, and that distinction is the one
+    a postmortem needs: the first means in-flight work was lost on purpose
+    after being asked nicely, the second means it was never asked. Optional
+    and keyword-only so no existing caller changes.
 
     POSIX uses SIGTERM/SIGKILL. Windows uses taskkill /T /F for true force-kill
     because os.kill(..., SIGTERM) is not equivalent to a tree-killing hard stop.
@@ -304,6 +311,7 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
             force=force,
             killer_pid=os.getpid(),
             caller=_terminate_caller(),
+            reason=reason,
         )
     except Exception:
         pass

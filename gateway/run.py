@@ -23225,6 +23225,135 @@ def _booting_incumbent_blocks_replace(existing_pid: int) -> Optional[float]:
     return age
 
 
+# Windows cannot deliver a catchable signal to a Python asyncio loop, so
+# ``--replace`` used to reach ``terminate_pid(pid, force=False)`` believing it
+# was asking politely.  It was not: that call falls through to
+# ``os.kill(pid, SIGTERM)``, which CPython routes through ``TerminateProcess``
+# on Windows (the hazard ``gateway/status.py::pid_exists`` already documents
+# for ``os.kill(pid, 0)``).  The incumbent died instantly, its shutdown handler
+# never ran, and ``_drain_active_agents`` -- which already waits on
+# ``_active_cron_job_count()`` (#60432) -- never got to drain anything.
+# Measured 2026-08-24: 39 cron executions killed mid-run across the ledger,
+# 405 minutes of work, each recoverable only as "whether the side effects ran
+# is unknown".
+#
+# The graceful channel already existed and ``hermes gateway stop`` already used
+# it: write the planned-stop marker, which the in-process watcher translates
+# into the same shutdown-handler invocation a real SIGTERM produces on POSIX.
+# ``--replace`` now uses it too, and force-kills only if the incumbent refuses.
+_REPLACE_DRAIN_CEILING_S = 600.0
+_IS_WINDOWS = sys.platform == "win32"
+
+
+def _terminate_incumbent(pid: int, *, force: bool) -> None:
+    """Single patchable seam over ``gateway.status.terminate_pid``.
+
+    This module imports ``gateway.status`` lazily everywhere on purpose, so the
+    helpers below cannot close over a module-level name.  Routing the call
+    through one wrapper keeps the lazy import and still gives tests something
+    to assert against -- which matters here, because "did anything reach
+    terminate_pid on the Windows request path" IS the defect.
+    """
+    from gateway.status import terminate_pid
+
+    terminate_pid(pid, force=force)
+
+
+def _replace_drain_timeout() -> float:
+    """How long to let the incumbent drain before escalating to a hard kill.
+
+    DERIVED from the incumbent's own shutdown budget rather than picked
+    independently -- the replace path previously waited a hardcoded 10s while
+    the thing it was killing believed it had ``restart_drain_timeout`` (60s by
+    default).  That ordering guaranteed a mid-drain kill whenever a drain
+    actually took time, which is the same misordering
+    ``_windows_stop_drain_timeout`` was written to fix on the ``stop`` path.
+
+    Reuses that function when it is importable so the two teardown paths cannot
+    drift apart, and falls back to a directly-derived value otherwise.  Bounded
+    so a misconfigured budget cannot hang a replace forever; waiting costs
+    nothing in the common case because the caller polls until the PID exits.
+    """
+    granted: Optional[float] = None
+    try:
+        from hermes_cli.gateway_windows import _windows_stop_drain_timeout
+
+        granted = float(_windows_stop_drain_timeout())
+    except Exception:
+        granted = None
+
+    if granted is None:
+        try:
+            from hermes_cli.gateway import _get_restart_drain_timeout
+
+            granted = float(_get_restart_drain_timeout() or 30.0)
+        except Exception:
+            granted = 30.0
+        # Outlast the incumbent's own budget rather than matching it exactly;
+        # a drain that finishes at the buzzer still needs to write its records.
+        granted *= 1.5
+
+    return max(15.0, min(granted, _REPLACE_DRAIN_CEILING_S))
+
+
+def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
+    """Poll until ``pid`` is gone or ``timeout`` elapses. True if it exited."""
+    from gateway.status import _pid_exists
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        if not _pid_exists(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def _drain_incumbent_via_marker(pid: int, timeout: float) -> bool:
+    """Ask ``pid`` to shut down gracefully via the planned-stop marker.
+
+    This is the Windows-viable equivalent of SIGTERM: the target's own
+    watcher thread notices the marker and drives the normal shutdown handler,
+    which runs the drain that waits for in-flight cron work.
+
+    Returns True only when the process actually exited within ``timeout``.
+    A marker we could not write still falls through to the wait, so a target
+    that is already stopping is still noticed; the caller escalates on False.
+    """
+    from gateway.status import write_planned_stop_marker
+
+    try:
+        write_planned_stop_marker(pid)
+    except Exception as exc:
+        # Best-effort by contract -- without the marker the target simply
+        # never hears us, the wait times out, and the caller force-kills.
+        logger.debug("Could not write planned-stop marker for PID %s: %s", pid, exc)
+
+    return _wait_for_pid_exit(pid, timeout)
+
+
+def _request_incumbent_shutdown(existing_pid: int, *, timeout: float) -> bool:
+    """Ask the incumbent gateway to stop, and report whether it did.
+
+    Returns True if it exited within ``timeout``. False means the caller must
+    escalate to a force-kill -- never start a second gateway on a False.
+    Propagates PermissionError/OSError so the caller can abort the replacement
+    rather than ending up with two live gateways fighting over one token
+    (#19471).
+    """
+    if _IS_WINDOWS:
+        return _drain_incumbent_via_marker(existing_pid, timeout)
+
+    # POSIX signal delivery is genuine, and the takeover marker the caller
+    # already wrote makes the handler exit 0 instead of tripping
+    # Restart=on-failure.
+    try:
+        _terminate_incumbent(existing_pid, force=False)
+    except ProcessLookupError:
+        return True  # beat us to it
+    return _wait_for_pid_exit(existing_pid, timeout)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -23299,41 +23428,55 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 write_takeover_marker(existing_pid)
             except Exception as e:
                 logger.debug("Could not write takeover marker: %s", e)
+            # ASK, then wait, then escalate.  On Windows this writes the
+            # planned-stop marker the incumbent's own watcher polls, which
+            # drives the normal shutdown handler and its drain — the drain
+            # that waits on in-flight cron work (#60432).  On POSIX it is a
+            # real SIGTERM.  Either way we grant the incumbent at least as
+            # long as its own shutdown budget instead of the 10s this path
+            # used to allow, which was short enough to guarantee a mid-drain
+            # kill whenever a drain actually took time.
+            _drain_budget = _replace_drain_timeout()
+            logger.info(
+                "Asking gateway PID %d to shut down gracefully (up to %.0fs) "
+                "so in-flight cron work can drain.",
+                existing_pid, _drain_budget,
+            )
             try:
-                terminate_pid(existing_pid, force=False)
-            except ProcessLookupError:
-                pass  # Already gone
+                old_gateway_exited = _request_incumbent_shutdown(
+                    existing_pid, timeout=_drain_budget
+                )
             except (PermissionError, OSError):
                 logger.error(
                     "Permission denied killing PID %d. Cannot replace.",
                     existing_pid,
                 )
-                # Marker is scoped to a specific target; clean it up on
-                # give-up so it doesn't grief an unrelated future shutdown.
+                # Markers are scoped to a specific target; clean them up on
+                # give-up so they don't grief an unrelated future shutdown.
                 try:
-                    from gateway.status import clear_takeover_marker
+                    from gateway.status import (
+                        clear_planned_stop_marker,
+                        clear_takeover_marker,
+                    )
                     clear_takeover_marker()
+                    clear_planned_stop_marker()
                 except Exception:
                     pass
                 return False
-            # Wait up to 10 seconds for the old process to exit.
-            # ``os.kill(pid, 0)`` on Windows is NOT a no-op — use the
-            # handle-based existence check instead.
-            from gateway.status import _pid_exists
-            old_gateway_exited = False
-            for _ in range(20):
-                if not _pid_exists(existing_pid):
-                    old_gateway_exited = True
-                    break  # Process is gone
-                time.sleep(0.5)
-            else:
-                # Still alive after 10s — force kill
+            if not old_gateway_exited:
+                # Refused to drain inside its own budget — force kill.
                 logger.warning(
-                    "Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.",
-                    existing_pid,
+                    "Old gateway (PID %d) did not exit after a graceful stop "
+                    "request within %.0fs, sending SIGKILL. In-flight cron work "
+                    "may be lost.",
+                    existing_pid, _drain_budget,
                 )
                 try:
-                    terminate_pid(existing_pid, force=True)
+                    terminate_pid(
+                        existing_pid,
+                        force=True,
+                        reason="replace_drain_timeout",
+                    )
                 except ProcessLookupError:
                     old_gateway_exited = True
                 except (PermissionError, OSError):
@@ -23344,6 +23487,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 # if we blindly clear the metadata and start a fresh instance
                 # we end up with two live gateways fighting over the same
                 # token — the duplicate-gateway failure in #19471.
+                # ``os.kill(pid, 0)`` on Windows is NOT a no-op — use the
+                # handle-based existence check instead.
+                from gateway.status import _pid_exists
                 if not old_gateway_exited:
                     for _ in range(20):
                         if not _pid_exists(existing_pid):
@@ -23369,11 +23515,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 (get_hermes_home() / "gateway.pid").unlink(missing_ok=True)
             except Exception:
                 pass
-            # Clean up any takeover marker the old process didn't consume
-            # (e.g. SIGKILL'd before its shutdown handler could read it).
+            # Clean up any marker the old process didn't consume (e.g.
+            # SIGKILL'd before its shutdown handler could read it).
+            #
+            # BOTH markers, not just the takeover one: the replace path now
+            # also writes a planned-stop marker to request the drain, and the
+            # shutdown handler checks takeover FIRST and only reads planned-stop
+            # ``elif not planned_takeover`` — so on a successful takeover the
+            # planned-stop marker is deliberately left unconsumed. Harmless to a
+            # fresh boot (the watcher validates target_pid and self-heals on a
+            # mismatch), but leaving it behind is litter, and litter in this
+            # directory has caused wedges before.
             try:
-                from gateway.status import clear_takeover_marker
+                from gateway.status import (
+                    clear_planned_stop_marker,
+                    clear_takeover_marker,
+                )
                 clear_takeover_marker()
+                clear_planned_stop_marker()
             except Exception:
                 pass
             # Also release all scoped locks left by the old process.
