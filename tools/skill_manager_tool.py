@@ -126,6 +126,16 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
     No-op when skills.guard_agent_created is disabled (the default).
+
+    Verdict routing: a hard denial (``allowed is False``) always blocks,
+    including the approval replay — those findings are policy, not judgment.
+    An "ask" verdict (``allowed is None``, dangerous findings detected)
+    blocks the agent's own write so it can retry with the flagged content
+    removed, but during a human-approval replay (``/skills approve`` →
+    ``apply_skill_pending``) it degrades to a logged warning: "ask" means
+    "needs a human decision", and the operator's approval IS that decision.
+    Blocking it anyway deadlocked every flagged write — false positives
+    included — with no confirmation surface at all (#94353).
     """
     if not _GUARD_AVAILABLE:
         return None
@@ -138,10 +148,16 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             report = format_scan_report(result)
             return f"Security scan blocked this skill ({reason}):\n{report}"
         if allowed is None:
-            # "ask" verdict — for agent-created skills this means dangerous
-            # findings were detected.  Surface as an error so the agent can
-            # retry with the flagged content removed.
             report = format_scan_report(result)
+            if _skill_gate_bypass.get():
+                # Human-approval replay: the operator just reviewed and
+                # approved this exact write. The "ask" decision has been
+                # made; record what was overridden for the audit trail.
+                logger.warning(
+                    "Agent-created skill approved despite scan findings "
+                    "(human approval replay): %s\n%s", reason, report,
+                )
+                return None
             logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
             return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
