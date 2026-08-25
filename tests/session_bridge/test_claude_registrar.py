@@ -650,7 +650,20 @@ def test_launch_waits_for_multiline_paste_before_submitting_return() -> None:
     assert events[3] == ("write", "\r")
 
 
-def test_launch_accepts_exact_response_after_paste_auto_submit() -> None:
+def test_launch_submits_when_the_input_frame_was_unreadable() -> None:
+    """An unreadable input frame is not evidence the paste self-submitted.
+
+    "terminal_input_disabled" is the last-resort branch of
+    _prompt_input_timeout_reason, reached only once every positive test has
+    already failed, so it cannot support the positive conclusion that the TUI
+    submitted anything.  Measured against the live TUI on 2026-08-24 with the
+    real multi-line prompt: withholding the CR leaves the paste sitting in the
+    input box and NO transcript is ever written, while sending it produces both
+    a transcript and an answer.  A redundant CR into an already-emptied box was
+    measured the same day to be a no-op -- the transcript's turn census is
+    unchanged -- so submitting here is safe in both worlds.
+    """
+
     item = claim()
     process = FakePty(
         output="REGISTERED\r\n",
@@ -662,11 +675,20 @@ def test_launch_accepts_exact_response_after_paste_auto_submit() -> None:
 
     assert result.status == "visible"
     assert process.writes[0].startswith("\x1b[200~")
-    assert "\r" not in process.writes
+    assert "\r" in process.writes
     assert process.writes[-1] == "/exit\r"
 
 
-def test_launch_keeps_auto_submit_without_exact_response_ambiguous() -> None:
+def test_launch_keeps_unverified_submission_retryable_not_fatal() -> None:
+    """Sending the CR must not reclassify an unrecognized reply as fatal.
+
+    bridge_conflict is in CLAUDE_VISIBILITY_FATAL_CODES, and one uncleared
+    fatal row fail-closes the whole lane before the coordinator claims.  The
+    submission flag therefore had to be split: the CR is gated on positive
+    evidence of a self-submit, while retryability still covers the unverified
+    case exactly as it did before.
+    """
+
     item = claim()
     process = FakePty(
         output="input surface changed\r\n",
@@ -678,7 +700,7 @@ def test_launch_keeps_auto_submit_without_exact_response_ambiguous() -> None:
 
     assert result.status == "retry"
     assert result.error_code == "creation_ambiguous"
-    assert "\r" not in process.writes
+    assert "\r" in process.writes
 
 
 @pytest.mark.parametrize(
@@ -1113,7 +1135,9 @@ def test_auth_recovery_accepts_exact_response_after_paste_auto_submit() -> None:
     )
 
     assert outcome.status == "recovered"
-    assert "\r" not in process.writes
+    # Same unreadable-input-frame correction as the launch path; this path
+    # pastes through the identical bracketed frame and inherited the same bug.
+    assert "\r" in process.writes
     assert process.writes[-1] == "/exit\r"
 
 
@@ -1141,7 +1165,8 @@ def test_auth_recovery_keeps_auto_submit_without_exact_response_ambiguous() -> N
 
     assert outcome.status == "retry"
     assert outcome.error_code == "creation_ambiguous"
-    assert "\r" not in process.writes
+    # Retryability is unchanged by the split; only the CR gate moved.
+    assert "\r" in process.writes
 
 
 @pytest.mark.parametrize("phase", ["prompt_input", "response"])
