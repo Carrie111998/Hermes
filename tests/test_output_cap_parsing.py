@@ -191,3 +191,51 @@ class TestParseVllmTokenBasedOutputCap:
             cap = available
         assert real_input + cap <= window, f"did not converge: cap={cap}"
 
+
+class TestParseLlamaCppCombinedRequestBudget:
+    """llama.cpp reports input + reserved output as one request total.
+
+    Unlike its older error format, the current server response does not name
+    ``max_tokens`` or split input from output.  The wire request still gives
+    Hermes the missing output reservation, so the parser can recover the
+    available output budget without compacting an input that already fits.
+    """
+
+    _MSG = (
+        "request (67585 tokens) exceeds the available context size "
+        "(65536 tokens), try increasing it"
+    )
+
+    def test_combined_request_budget_uses_wire_output_reservation(self):
+        # inferred input = 67,585 - 32,768 = 34,817
+        # available output = 65,536 - 34,817 = 30,719
+        assert parse_available_output_tokens_from_error(
+            self._MSG,
+            requested_output_tokens=32_768,
+        ) == 30_719
+
+    def test_combined_request_budget_is_output_cap_error(self):
+        assert is_output_cap_error(
+            self._MSG,
+            requested_output_tokens=32_768,
+        ) is True
+
+    def test_combined_request_without_wire_cap_stays_ambiguous(self):
+        # The same wording could describe a genuinely oversized input when
+        # the caller does not know what output reservation was sent.
+        assert parse_available_output_tokens_from_error(self._MSG) is None
+        assert is_output_cap_error(self._MSG) is False
+
+    def test_input_alone_over_window_stays_context_overflow(self):
+        msg = (
+            "request (100000 tokens) exceeds the available context size "
+            "(65536 tokens), try increasing it"
+        )
+        assert parse_available_output_tokens_from_error(
+            msg,
+            requested_output_tokens=8_192,
+        ) is None
+        assert is_output_cap_error(
+            msg,
+            requested_output_tokens=8_192,
+        ) is False
