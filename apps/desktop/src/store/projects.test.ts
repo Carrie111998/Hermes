@@ -14,6 +14,7 @@ import {
   $projectTree,
   $removedSessionIds,
   $sessionMutationsInFlight,
+  $startWorkSessionRequest,
   $worktreeRefreshToken,
   ALL_PROJECTS,
   beginSessionMutation,
@@ -22,6 +23,8 @@ import {
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
+  goToProject,
+  openFolderAsProject,
   openProjectCreate,
   pickProjectFolder,
   projectIdForCwd,
@@ -29,6 +32,7 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  requestStartWorkSession,
   resolveNewSessionCwd,
   scanAndRecordRepos,
   startWorkInRepo,
@@ -53,6 +57,7 @@ vi.mock('@/lib/desktop-fs', () => ({
 vi.mock('@/store/gateway', () => ({
   $gateway: atom(null),
   activeGateway: vi.fn(),
+  activeGatewayConnectionId: vi.fn(() => null),
   ensureActiveGatewayOpen: vi.fn()
 }))
 
@@ -76,6 +81,7 @@ const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
 
 const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
+const activeGatewayConnectionId = vi.mocked(gw.activeGatewayConnectionId)
 const gatewayAtom = gw.$gateway
 
 const git = await import('@/lib/desktop-git')
@@ -127,6 +133,64 @@ describe('project scope', () => {
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
     expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+  })
+})
+
+describe('worktree session handoff ownership', () => {
+  afterEach(() => {
+    $activeGatewayProfile.set('default')
+    activeGatewayConnectionId.mockReturnValue(null)
+    activeGateway.mockReset()
+    gatewayAtom.set(null)
+    $projectTree.set([])
+    $startWorkSessionRequest.set(null)
+  })
+
+  it('preserves the source owner after the initiating surface changes', () => {
+    requestStartWorkSession('C:/repo/.worktrees/tests', undefined, { owner: 'itb' })
+
+    expect($startWorkSessionRequest.get()).toMatchObject({
+      owner: 'itb',
+      path: 'C:/repo/.worktrees/tests'
+    })
+  })
+
+  it('uses the exact active connection for a project-palette new session', () => {
+    $activeGatewayProfile.set('itb')
+    activeGatewayConnectionId.mockReturnValue('source-itb')
+    $projectTree.set([{ id: 'p-itb', label: 'ITB', path: 'C:/repo', repos: [], sessionCount: 0 }])
+
+    goToProject('p-itb', { newSession: true })
+
+    expect($startWorkSessionRequest.get()).toMatchObject({
+      openTab: true,
+      owner: { connectionId: 'source-itb', profile: 'itb' },
+      path: 'C:/repo'
+    })
+  })
+
+  it('captures the folder-open owner before asynchronous project refresh', async () => {
+    const tree = deferred<{ active_id: null; projects: []; scoped_session_ids: [] }>()
+    const gateway = { connectionState: 'open', request: vi.fn(() => tree.promise) }
+
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+    $activeGatewayProfile.set('itb')
+    activeGatewayConnectionId.mockReturnValue('source-itb')
+    $projectTree.set([{ id: 'p-itb', label: 'ITB', path: 'C:/repo', repos: [], sessionCount: 0 }])
+
+    const opening = openFolderAsProject('C:/repo')
+
+    $activeGatewayProfile.set('default')
+    activeGatewayConnectionId.mockReturnValue('source-default')
+    tree.resolve({ active_id: null, projects: [], scoped_session_ids: [] })
+    await opening
+
+    expect($startWorkSessionRequest.get()).toMatchObject({
+      openTab: true,
+      owner: { connectionId: 'source-itb', profile: 'itb' },
+      path: 'C:/repo'
+    })
   })
 })
 

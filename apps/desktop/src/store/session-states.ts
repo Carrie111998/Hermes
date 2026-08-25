@@ -42,7 +42,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   clearReadBaseline,
-  knownSessionProfile,
+  getSessionOwnerHints,
   lineageAliases,
   markSessionRead,
   sessionMatchesStoredId,
@@ -743,9 +743,10 @@ export function sessionTileOwnerRoute(storedSessionId: string): SessionProfileRo
 
 /**
  * Sync owner resolution for a session id that may be a RUNTIME or a STORED id.
- * Tile route first (exact connectionId+profile, survives relaunch), then the
- * known session profile (row or open-time hint). Returns undefined when no
- * owner is known — the caller falls back to ambient, never to "active".
+ * Tile route first (exact connectionId+profile, survives relaunch), then a
+ * unique open-time hint, then a unique connection-qualified/profile row.
+ * Ambiguous claims remain unresolved instead of collapsing to a profile name
+ * that could select a same-named profile on another connection.
  */
 export function knownOwnerForSession(sessionId: null | string | undefined): SessionOwnerScope {
   if (!sessionId) {
@@ -753,8 +754,36 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
   }
 
   const storedSessionId = storedSessionIdForRuntimeId(sessionId) ?? sessionId
+  const tileRoute = sessionTileOwnerRoute(storedSessionId)
 
-  return sessionTileOwnerRoute(storedSessionId) ?? knownSessionProfile($sessions.get(), storedSessionId)
+  if (tileRoute) {
+    return tileRoute
+  }
+
+  const hints = getSessionOwnerHints(storedSessionId)
+
+  if (hints.length !== 0) {
+    return hints.length === 1 ? hints[0] : undefined
+  }
+
+  const owners = new Map<string, Exclude<SessionOwnerScope, null | undefined>>()
+
+  for (const session of $sessions.get().filter(row => sessionMatchesStoredId(row, storedSessionId))) {
+    const connectionId = session.connection_id?.trim()
+    const rawProfile = session.profile?.trim()
+
+    if (connectionId) {
+      const profile = normalizeProfileKey(rawProfile)
+
+      owners.set(`route:${connectionId}\0${profile}`, { connectionId, profile })
+    } else if (rawProfile) {
+      const profile = normalizeProfileKey(rawProfile)
+
+      owners.set(`profile:${profile}`, profile)
+    }
+  }
+
+  return owners.size === 1 ? [...owners.values()][0] : undefined
 }
 
 /**
@@ -811,7 +840,7 @@ export function storedSessionIdForRuntimeId(sessionId: string): null | string {
 export function setSessionTileWorkspaceScope(storedSessionId: string, scope: SessionTileWorkspaceScope): boolean {
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.workspaceMode === 'bots' ? scope.ownerRoute : undefined
+  const ownerRoute = scope.ownerRoute ?? (scope.workspaceMode === 'sessions' ? tile?.ownerRoute : undefined)
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (
@@ -1066,7 +1095,7 @@ export function openSessionTile(
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        ownerRoute: workspaceScope.ownerRoute,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,

@@ -206,9 +206,49 @@ export interface AgentProfileRoute {
   targetProfile?: string
 }
 
+export type NewChatOwner = string | AgentProfileRoute
+
+/** Snapshot the backend that owns a new-chat action at its interaction boundary. */
+export function activeNewChatOwner(): NewChatOwner {
+  const profile = normalizeProfileKey($activeGatewayProfile.get())
+  const connectionId = activeGatewayConnectionId()
+
+  return connectionId ? { connectionId, profile } : profile
+}
+
 // A draft remembers the source it was created for. The active gateway may
 // change before the first Send; the draft's owner must not change with it.
 export const $newChatRoute = atom<AgentProfileRoute | null>(null)
+
+function normalizeAgentProfileRoute(owner: AgentProfileRoute): AgentProfileRoute {
+  const captured = {
+    ...owner,
+    connectionId: owner.connectionId.trim(),
+    profile: normalizeProfileKey(owner.profile),
+    ...(owner.targetProfile ? { targetProfile: normalizeProfileKey(owner.targetProfile) } : {})
+  }
+
+  if (!captured.connectionId) {
+    throw new Error('Agent profile route is missing connectionId')
+  }
+
+  return captured
+}
+
+/** Pin a fresh draft to the profile/backend that initiated it. */
+export function setNewChatOwner(owner: NewChatOwner): void {
+  if (typeof owner === 'string') {
+    $newChatProfile.set(normalizeProfileKey(owner))
+    $newChatRoute.set(null)
+
+    return
+  }
+
+  const captured = normalizeAgentProfileRoute(owner)
+
+  $newChatProfile.set(captured.profile)
+  $newChatRoute.set(captured)
+}
 
 // Bumped whenever the open session should be dropped for a fresh new-session
 // draft: a profile switch/create (below), or deleting the project that owns the
@@ -561,19 +601,9 @@ export function newSessionInProfile(name: string): void {
  * only a presentation step; the route stays attached to the draft for the
  * eventual session.create request. */
 export function newSessionInAgent(route: AgentProfileRoute): void {
-  const captured = {
-    ...route,
-    connectionId: route.connectionId.trim(),
-    profile: normalizeProfileKey(route.profile),
-    ...(route.targetProfile ? { targetProfile: normalizeProfileKey(route.targetProfile) } : {})
-  }
+  const captured = normalizeAgentProfileRoute(route)
 
-  if (!captured.connectionId) {
-    throw new Error('Agent profile route is missing connectionId')
-  }
-
-  $newChatProfile.set(captured.profile)
-  $newChatRoute.set(captured)
+  setNewChatOwner(captured)
   requestFreshSession()
   void ensureGatewayAgent(captured.connectionId, captured.profile)
 }

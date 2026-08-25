@@ -47,13 +47,14 @@ import {
   sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
-import { requestForSessionProfile } from '@/store/session-request-router'
 import {
   $sessionStates,
   $sessionTileDelegateRevision,
   $sessionTiles,
   closeSessionTile,
+  knownOwnerForSession,
   patchSessionTile,
+  requestForOwnedSession,
   type SessionTile,
   sessionTileDelegate,
   sessionTileOwnerRoute
@@ -158,11 +159,12 @@ function TileChat({
   const { gateway, requestGateway } = useGatewayRequest()
   const queryClient = useQueryClient()
   const ownerRoute = sessionTileOwnerRoute(storedSessionId)
+  const owner = ownerRoute ?? knownOwnerForSession(storedSessionId)
 
   const requestTileGateway = useCallback(
     <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<T> =>
-      requestForSessionProfile<T>(ownerRoute, requestGateway, method, params, timeoutMs, signal),
-    [ownerRoute, requestGateway]
+      requestForOwnedSession<T>(storedSessionId, requestGateway, method, params, timeoutMs, signal),
+    [requestGateway, storedSessionId]
   )
 
   const { selectModel } = useModelControls({ queryClient, requestGateway: requestTileGateway })
@@ -178,9 +180,10 @@ function TileChat({
       $awaitingInput: sessionAwaitingInput(runtimeId),
       $messages: view.$messages,
       attachments,
+      owner,
       target: `tile:${storedSessionId}`
     }),
-    [attachments, runtimeId, storedSessionId, view.$messages]
+    [attachments, owner, runtimeId, storedSessionId, view.$messages]
   )
 
   // Tile actions must keep the persisted owner route. The ambient gateway hook

@@ -35,7 +35,9 @@ import {
   type AgentProfileRoute,
   ensureGatewayAgent,
   ensureGatewayProfile,
-  normalizeProfileKey
+  type NewChatOwner,
+  normalizeProfileKey,
+  setNewChatOwner
 } from '@/store/profile'
 import {
   $projectScope,
@@ -248,6 +250,7 @@ async function desktopSessionCreateParams(
 }
 
 interface FreshSessionDraftOptions {
+  owner?: NewChatOwner
   preserveRoute?: boolean
   replaceRoute?: boolean
   workspaceTarget?: NewChatWorkspaceTarget
@@ -372,6 +375,10 @@ export function useSessionActions({
       const workspaceTarget = hasWorkspaceTarget
         ? normalizeNewChatWorkspaceTarget(draftOptions.workspaceTarget)
         : undefined
+
+      if (draftOptions.owner !== undefined) {
+        setNewChatOwner(draftOptions.owner)
+      }
 
       resetViewSync()
       busyRef.current = false
@@ -661,7 +668,13 @@ export function useSessionActions({
         const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
-        openSessionTile(stored, dir, undefined, undefined, workspaceScope)
+        openSessionTile(
+          stored,
+          dir,
+          undefined,
+          undefined,
+          capturedRoute ? { ...workspaceScope, ownerRoute: capturedRoute } : workspaceScope
+        )
         patchSessionTile(stored, { runtimeId: created.session_id })
 
         if (dir === 'center' && runtimeInfo?.cwd) {

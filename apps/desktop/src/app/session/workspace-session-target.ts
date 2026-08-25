@@ -1,6 +1,7 @@
 import type { MutableRefObject } from 'react'
 
-import { followActiveSessionCwd, resolveNewSessionCwd } from '@/store/projects'
+import type { NewChatOwner } from '@/store/profile'
+import { followActiveSessionCwd, resolveNewSessionCwd, type StartWorkSessionRequest } from '@/store/projects'
 import {
   $newChatWorkspaceTargetGeneration,
   type NewChatWorkspaceTarget,
@@ -13,15 +14,32 @@ interface WorkspaceSessionOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   followActiveSessionCwd?: (cwd: string) => void | Promise<void>
   onExplicitWorkspace?: (cwd: string) => void
+  owner?: NewChatOwner
   path: null | string
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
-  startFreshSessionDraft: (options?: { workspaceTarget: NewChatWorkspaceTarget }) => void
+  startFreshSessionDraft: (options?: { owner?: NewChatOwner; workspaceTarget?: NewChatWorkspaceTarget }) => void
+}
+
+export function handleStartWorkSessionRequest(
+  request: StartWorkSessionRequest,
+  startSessionInWorkspace: (path: string, options: { openTab?: boolean; owner?: NewChatOwner }) => void,
+  insertDraft: (draft: string) => void
+): void {
+  startSessionInWorkspace(request.path, {
+    openTab: request.openTab,
+    owner: request.owner
+  })
+
+  if (request.draft) {
+    insertDraft(request.draft)
+  }
 }
 
 export function startWorkspaceSession({
   activeSessionIdRef,
   followActiveSessionCwd: followCwd = followActiveSessionCwd,
   onExplicitWorkspace,
+  owner,
   path,
   requestGateway,
   startFreshSessionDraft
@@ -31,7 +49,7 @@ export function startWorkspaceSession({
   // return a default/remembered project folder and re-attach the last repo
   // (digitwo: New session in Home still shows `main`).
   if (path === null) {
-    startFreshSessionDraft({ workspaceTarget: null })
+    startFreshSessionDraft({ ...(owner !== undefined ? { owner } : {}), workspaceTarget: null })
 
     return
   }
@@ -41,7 +59,13 @@ export function startWorkspaceSession({
   const explicitTarget = path.trim()
   const target = explicitTarget || resolveNewSessionCwd()
 
-  startFreshSessionDraft(target ? { workspaceTarget: target } : undefined)
+  startFreshSessionDraft(
+    target
+      ? { ...(owner !== undefined ? { owner } : {}), workspaceTarget: target }
+      : owner !== undefined
+        ? { owner }
+        : undefined
+  )
 
   if (!target) {
     return

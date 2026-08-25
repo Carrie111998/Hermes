@@ -19,7 +19,9 @@ import { notify } from '@/store/notifications'
 import {
   $activeGatewayProfile,
   $profileScope,
+  activeNewChatOwner,
   ALL_PROFILES,
+  type NewChatOwner,
   normalizeProfileKey,
   requestFreshSession
 } from '@/store/profile'
@@ -198,7 +200,10 @@ export function goToProject(id: string, options?: { newSession?: boolean }): voi
   const cwd = projectRootCwd($projectTree.get().find(node => node.id === id))
 
   if (cwd) {
-    requestStartWorkSession(cwd, undefined, { openTab: true })
+    requestStartWorkSession(cwd, undefined, {
+      openTab: true,
+      owner: activeNewChatOwner()
+    })
   } else {
     requestFreshSession()
   }
@@ -1264,6 +1269,8 @@ export interface StartWorkSessionRequest {
   draft?: string
   /** Stack the fresh session as a tab when main already holds a chat (palette/⌘O opens-from-nowhere). */
   openTab?: boolean
+  /** Session/profile route that owns the draft which initiated this hand-off. */
+  owner?: NewChatOwner
   path: string
   token: number
 }
@@ -1284,6 +1291,8 @@ export interface WorktreeDialogState {
   repoPath: string
   /** The base branch selected in a "branch off from X" menu. */
   base?: string
+  /** Owner of the surface that opened the dialog, captured before focus can move. */
+  owner?: NewChatOwner
 }
 
 export const $worktreeDialog = atom<null | WorktreeDialogState>(null)
@@ -1294,7 +1303,11 @@ export function closeWorktreeDialog(): void {
 
 let startWorkToken = 0
 
-export function requestStartWorkSession(path: string, draft?: string, options?: { openTab?: boolean }): void {
+export function requestStartWorkSession(
+  path: string,
+  draft?: string,
+  options?: { openTab?: boolean; owner?: NewChatOwner }
+): void {
   const target = path.trim()
 
   if (!target) {
@@ -1302,9 +1315,11 @@ export function requestStartWorkSession(path: string, draft?: string, options?: 
   }
 
   startWorkToken += 1
+
   $startWorkSessionRequest.set({
     draft: draft?.trim() || undefined,
     openTab: options?.openTab || undefined,
+    ...(options?.owner ? { owner: options.owner } : {}),
     path: target,
     token: startWorkToken
   })
@@ -1359,6 +1374,7 @@ export async function pickProjectFolder(): Promise<null | string> {
 // one-keystroke version of new project → enter → new session. Like goToProject,
 // this is an open-from-nowhere: an occupied main gets a stacked tab, not stolen.
 export async function openFolderAsProject(dir?: string): Promise<void> {
+  const owner = activeNewChatOwner()
   const target = (dir ?? (await pickProjectFolder()) ?? '').trim()
 
   if (!target) {
@@ -1394,5 +1410,8 @@ export async function openFolderAsProject(dir?: string): Promise<void> {
     }
   }
 
-  requestStartWorkSession(target, undefined, { openTab: true })
+  requestStartWorkSession(target, undefined, {
+    openTab: true,
+    owner
+  })
 }

@@ -9,10 +9,17 @@ import type { ProfileInfo } from '@/types/hermes'
 const ensureGatewayForProfile = vi.fn(async () => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+const activeGatewayConnectionId = vi.fn<() => null | string>(() => null)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
-vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForAgent, ensureGatewayForProfile, openGatewayForProfile }))
+vi.mock('@/store/gateway', () => ({
+  $gateway,
+  activeGatewayConnectionId,
+  ensureGatewayForAgent,
+  ensureGatewayForProfile,
+  openGatewayForProfile
+}))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   setApiRequestProfile: vi.fn()
@@ -23,6 +30,7 @@ vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 const {
   $activeGatewayProfile,
   $profiles,
+  activeNewChatOwner,
   ensureGatewayProfile,
   invalidateProfileListFetches,
   prewarmProfileBackend,
@@ -57,6 +65,7 @@ beforeEach(() => {
   openGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
+  activeGatewayConnectionId.mockReturnValue(null)
   $connection.set(localConn())
   $profiles.set([])
   vi.stubGlobal('window', { hermesDesktop: { getConnection } })
@@ -67,6 +76,21 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals()
   $connection.set(null)
+})
+
+describe('activeNewChatOwner', () => {
+  it('returns a profile for the local profile pool', () => {
+    $activeGatewayProfile.set('itb')
+
+    expect(activeNewChatOwner()).toBe('itb')
+  })
+
+  it('preserves the registry connection when the active source is connection-qualified', () => {
+    $activeGatewayProfile.set('worker')
+    activeGatewayConnectionId.mockReturnValue('source-a')
+
+    expect(activeNewChatOwner()).toEqual({ connectionId: 'source-a', profile: 'worker' })
+  })
 })
 
 describe('ensureGatewayProfile → $connection sync (#46651)', () => {

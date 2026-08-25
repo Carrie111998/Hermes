@@ -20,7 +20,13 @@ import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/stor
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
-import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
+import {
+  $projectScope,
+  $projectTree,
+  $startWorkSessionRequest,
+  ALL_PROJECTS,
+  requestStartWorkSession
+} from '@/store/projects'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
@@ -57,6 +63,7 @@ import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-re
 import { deferred } from '../../../test/deferred'
 import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
+import { handleStartWorkSessionRequest, startWorkspaceSession } from '../workspace-session-target'
 
 import { useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
@@ -539,12 +546,15 @@ describe('createBackendSessionForSend profile routing', () => {
     $activeGatewayProfile.set('default')
     $projectScope.set(ALL_PROJECTS)
     $projectTree.set([])
+    setSelectedStoredSessionId(null)
+    setSessions([])
     $currentCwd.set('')
     $currentFastMode.set(false)
     $currentModel.set('')
     $currentProvider.set('')
     $currentReasoningEffort.set('')
     setNewChatWorkspaceTarget(undefined)
+    $startWorkSessionRequest.set(null)
     vi.restoreAllMocks()
   })
 
@@ -568,6 +578,41 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ profile: 'analyst' })
+  })
+
+  it('routes the published worktree handoff through its source owner into session.create', async () => {
+    const params = await createWith(
+      () => {
+        $activeGatewayProfile.set('default')
+        $newChatProfile.set('default')
+      },
+      handle => {
+        requestStartWorkSession('C:/repo/.worktrees/automated-tests-update', undefined, { owner: 'itb' })
+        const request = $startWorkSessionRequest.get()
+
+        expect(request).toMatchObject({
+          owner: 'itb',
+          path: 'C:/repo/.worktrees/automated-tests-update'
+        })
+        handleStartWorkSessionRequest(
+          request!,
+          (path, options) =>
+            startWorkspaceSession({
+              activeSessionIdRef: { current: null },
+              owner: options.owner,
+              path,
+              requestGateway: vi.fn(async () => ({}) as never),
+              startFreshSessionDraft: handle.startFreshSessionDraft
+            }),
+          vi.fn()
+        )
+      }
+    )
+
+    expect(params).toMatchObject({
+      cwd: 'C:/repo/.worktrees/automated-tests-update',
+      profile: 'itb'
+    })
   })
 
   it('passes the default profile for single-profile users (backend resolves it to launch)', async () => {
@@ -607,8 +652,6 @@ describe('createBackendSessionForSend profile routing', () => {
       stored_session_id: null
     } as never)
 
-    $newChatProfile.set(route.profile)
-    $newChatRoute.set({ ...route })
     $activeGatewayProfile.set('other-connection-profile')
 
     let handle: HarnessHandle | null = null
@@ -616,6 +659,7 @@ describe('createBackendSessionForSend profile routing', () => {
     await waitFor(() => expect(handle).not.toBeNull())
 
     await act(async () => {
+      handle!.startFreshSessionDraft({ owner: route, workspaceTarget: '/remote/worktree' })
       await handle!.createBackendSessionForSend()
     })
 
@@ -623,7 +667,7 @@ describe('createBackendSessionForSend profile routing', () => {
       'source-a',
       'default',
       'session.create',
-      expect.objectContaining({ profile: 'backend-default', source: 'desktop' })
+      expect.objectContaining({ cwd: '/remote/worktree', profile: 'backend-default', source: 'desktop' })
     )
     expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
   })
@@ -3201,8 +3245,11 @@ describe('createBackendSessionForSend workspace target', () => {
 describe('openNewSessionTile workspace target', () => {
   afterEach(() => {
     cleanup()
+    $newChatProfile.set(null)
+    $newChatRoute.set(null)
     $projectScope.set(ALL_PROJECTS)
     $projectTree.set([])
+    $sessionTiles.set([])
     vi.restoreAllMocks()
   })
 
@@ -3243,6 +3290,43 @@ describe('openNewSessionTile workspace target', () => {
     })
 
     expect(createParams).not.toHaveProperty('cwd')
+  })
+
+  it('keeps an openTab tile pinned to its exact request-captured owner', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'worker',
+      targetProfile: 'backend-worker'
+    }
+
+    $newChatProfile.set('worker')
+    $newChatRoute.set(route)
+    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
+      info: { cwd: '/remote/worktree', model: 'test-model', skills: {}, tools: {} },
+      session_id: RUNTIME_SESSION_ID,
+      stored_session_id: 'stored-remote-tile'
+    } as never)
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { cwd: '/remote/worktree', listed: false })
+    })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'worker',
+      'session.create',
+      expect.objectContaining({ cwd: '/remote/worktree', profile: 'backend-worker' })
+    )
+    expect($sessionTiles.get()).toContainEqual(
+      expect.objectContaining({ ownerRoute: route, storedSessionId: 'stored-remote-tile' })
+    )
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
   })
 })
 describe('selectSidebarItem', () => {

@@ -5,6 +5,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { type ComposerAttachmentScope, mainComposerScope } from '@/store/composer'
 import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { $messages } from '@/store/session'
+import type { SessionOwnerScope } from '@/store/session-request-router'
 
 import type { ComposerTarget } from './focus'
 
@@ -27,6 +28,8 @@ export interface ComposerScope {
    *  keep streaming out of the composer's renders; subscribe only off-render
    *  (auto-speak) where the reply edge is the whole point. */
   $messages: ReadableAtom<ChatMessage[]>
+  /** Backend/profile that owns this surface's session. */
+  owner?: SessionOwnerScope
   /** Focus-bus routing key (`'main'` | `'tile:<id>'`). */
   target: ComposerTarget
 }
