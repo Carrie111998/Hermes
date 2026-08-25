@@ -2115,6 +2115,50 @@ class TestConcurrentToolExecution:
             )
             assert result == "result"
 
+    def test_concurrent_session_search_forwards_profile(self, agent):
+        """Cross-profile recall must reach the profile-aware search implementation."""
+        session_db = object()
+        agent._get_session_db_for_recall = lambda: session_db
+
+        with patch(
+            "tools.session_search_tool.session_search",
+            return_value='{"success": true}',
+        ) as mock_search:
+            result = agent._invoke_tool(
+                "session_search",
+                {"query": "continuity", "profile": "cso_montecristo"},
+                "task-1",
+                pre_tool_block_checked=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert json.loads(result)["success"] is True
+        assert mock_search.call_args.kwargs["db"] is session_db
+        assert mock_search.call_args.kwargs["profile"] == "cso_montecristo"
+
+    def test_sequential_session_search_forwards_profile(self, agent):
+        """The single-tool executor must preserve the same profile selector."""
+        session_db = object()
+        agent._get_session_db_for_recall = lambda: session_db
+        tool_call = _mock_tool_call(
+            name="session_search",
+            arguments='{"query":"continuity","profile":"default"}',
+            call_id="c-profile",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch(
+            "tools.session_search_tool.session_search",
+            return_value='{"success": true}',
+        ) as mock_search:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert json.loads(messages[0]["content"])["success"] is True
+        assert mock_search.call_args.kwargs["db"] is session_db
+        assert mock_search.call_args.kwargs["profile"] == "default"
+
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
