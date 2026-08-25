@@ -1492,3 +1492,33 @@ class TestDoctorMemoryFileReadGuard:
 
         out = capsys.readouterr().out
         assert "exists but is unreadable" in out
+
+    def test_doctor_warns_on_binary_memory_file(self, monkeypatch, tmp_path, capsys):
+        """A corrupt/binary MEMORY.md raises UnicodeDecodeError (a ValueError
+        subclass, not OSError) from read_text(encoding='utf-8'); doctor must
+        warn and continue instead of crashing."""
+        import pathlib
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        memories = hermes_home / "memories"
+        memories.mkdir()
+        (memories / "MEMORY.md").write_bytes(b"\xff\xfe\x00binary\x81")
+        (memories / "USER.md").write_text("some user")
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: (_ for _ in ()).throw(SystemExit(0)),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        with pytest.raises(SystemExit):
+            doctor_mod.run_doctor(Namespace(fix=False))
+
+        out = capsys.readouterr().out
+        assert "MEMORY.md exists but is unreadable" in out
+        # The warning detail must not itself crash on UnicodeDecodeError's
+        # missing .strerror attribute.
+        assert "can't decode" in out or "byte" in out

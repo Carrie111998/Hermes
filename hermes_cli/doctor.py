@@ -1672,8 +1672,12 @@ def run_doctor(args):
         if memory_file.exists():
             try:
                 size = len(memory_file.read_text(encoding="utf-8").strip())
-            except OSError as exc:
-                check_warn("MEMORY.md exists but is unreadable", f"({exc.strerror or exc})")
+            except (OSError, UnicodeDecodeError) as exc:
+                # read_text(encoding="utf-8") raises UnicodeDecodeError (a
+                # ValueError subclass, not OSError) on corrupt/binary content;
+                # both must warn instead of crashing run_doctor. UnicodeDecodeError
+                # has no .strerror, so fall back to its message.
+                check_warn("MEMORY.md exists but is unreadable", f"({getattr(exc, 'strerror', None) or exc})")
             else:
                 check_ok(f"MEMORY.md exists ({size} chars)")
         else:
@@ -1681,8 +1685,8 @@ def run_doctor(args):
         if user_file.exists():
             try:
                 size = len(user_file.read_text(encoding="utf-8").strip())
-            except OSError as exc:
-                check_warn("USER.md exists but is unreadable", f"({exc.strerror or exc})")
+            except (OSError, UnicodeDecodeError) as exc:
+                check_warn("USER.md exists but is unreadable", f"({getattr(exc, 'strerror', None) or exc})")
             else:
                 check_ok(f"USER.md exists ({size} chars)")
         else:
