@@ -2005,14 +2005,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
     def _record_mcp_stop(result: Any) -> Any:
-        try:
-            from tools.mcp_tool import consume_mcp_runtime_stop
-            directive = consume_mcp_runtime_stop()
-            if directive and agent._runtime_stop_reason is None:
-                agent._runtime_stop_reason = directive["reason"]
-                agent._runtime_terminal_outcome = dict(directive)
-        except Exception:
-            pass
+        from agent.agent_runtime_helpers import apply_mcp_runtime_stop
+
+        apply_mcp_runtime_stop(agent)
         return result
 
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):

@@ -564,6 +564,93 @@ def test_runtime_stop_halts_the_rest_of_the_assistant_batch():
     assert "was not executed" in tool_rows[1]["content"]
 
 
+def test_malformed_stop_directive_under_policy_still_halts_the_batch():
+    """An unreadable directive must fail closed, not vanish.
+
+    The directive is trusted input from an MCP server, so it can arrive
+    malformed. Reading ``reason`` off it raised inside a bare ``except:
+    pass``, which dropped the stop entirely and let ``claim-2`` run after
+    the policy had already closed the item boundary — the fail-open path
+    this hook exists to prevent.
+    """
+    agent = _make_agent("mcp_fleet_claim", max_iterations=10)
+    agent.runtime_policy = "fleet-runtime"
+    agent.runtime_task_id = "fire-1"
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("mcp_fleet_claim", '{"item": 1}', "claim-1"),
+                _mock_tool_call("mcp_fleet_claim", '{"item": 2}', "claim-2"),
+            ],
+        ),
+        AssertionError("an unreadable stop must prevent another model call"),
+    ]
+
+    dispatched = []
+
+    def dispatch(*args, **kwargs):
+        from tools import mcp_tool
+        dispatched.append(kwargs.get("tool_call_id"))
+        # No "reason" key: indexing it raises inside the consumer.
+        mcp_tool._mcp_runtime_stop.set({"status": "success", "policy": "fleet-runtime"})
+        return '{"result": "done"}'
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("claim work")
+
+    assert dispatched == ["claim-1"], "the second dispatcher must never be entered"
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "runtime_stop(invalid_stop_directive)"
+
+    # A directive that could not be validated must never book as success.
+    assert result["trusted_terminal_outcome"]["status"] == "failure"
+
+    tool_rows = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert [row["tool_call_id"] for row in tool_rows] == ["claim-1", "claim-2"]
+    assert "was not executed" in tool_rows[1]["content"]
+
+
+def test_malformed_stop_directive_without_policy_does_not_halt_the_run():
+    """With no policy there is no authority to enforce.
+
+    Observer-path directives are advisory, so a malformed one is logged and
+    dropped rather than terminating an ordinary interactive run.
+    """
+    agent = _make_agent("mcp_fleet_claim", max_iterations=10)
+    assert getattr(agent, "runtime_policy", None) in (None, "")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("mcp_fleet_claim", '{"item": 1}', "claim-1")],
+        ),
+        _mock_response(content="done", finish_reason="stop"),
+    ]
+
+    def dispatch(*args, **kwargs):
+        from tools import mcp_tool
+        mcp_tool._mcp_runtime_stop.set({"status": "success"})
+        return '{"result": "done"}'
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("claim work")
+
+    assert agent.client.chat.completions.create.call_count == 2
+    assert not str(result.get("turn_exit_reason") or "").startswith("runtime_stop")
+
+
 def test_runtime_stop_halts_later_segments_of_a_mixed_batch():
     """A stop inside one segment must stop every later segment too."""
     from agent import tool_executor

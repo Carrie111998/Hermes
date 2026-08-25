@@ -54,6 +54,60 @@ from utils import base_url_host_matches, base_url_hostname, env_var_enabled, ato
 logger = logging.getLogger(__name__)
 
 
+INVALID_STOP_REASON = "invalid_stop_directive"
+
+
+def _fail_closed_stop(agent, policy: Any) -> None:
+    """Stop the run when a trusted directive cannot be trusted."""
+    if getattr(agent, "_runtime_stop_reason", None) is not None:
+        return
+    agent._runtime_stop_reason = INVALID_STOP_REASON
+    agent._runtime_terminal_outcome = {
+        "status": "failure",
+        "reason": INVALID_STOP_REASON,
+        "policy": str(policy),
+    }
+    logger.warning(
+        "unreadable trusted stop directive under policy %s — stopping the run",
+        policy,
+        exc_info=True,
+    )
+
+
+def apply_mcp_runtime_stop(agent) -> None:
+    """Consume the stop directive left in the context by the last MCP call.
+
+    Under an active runtime policy this is an admission boundary, so a
+    directive that cannot be read — the import fails, it is not a mapping,
+    it carries no ``reason`` — must stop the run rather than be dropped.
+    Swallowing it lets the remaining calls in the assistant batch execute
+    after the policy already said stop, which is the fail-open path this
+    hook exists to close. With no policy in force there is no authority to
+    enforce and the directive is observer data, so a failure is logged and
+    the run continues.
+    """
+    policy = getattr(agent, "runtime_policy", None)
+    try:
+        from tools.mcp_tool import consume_mcp_runtime_stop
+
+        directive = consume_mcp_runtime_stop()
+        if not directive:
+            return
+        if getattr(agent, "_runtime_stop_reason", None) is not None:
+            return
+        reason = directive["reason"]
+        outcome = dict(directive)
+    except Exception:
+        if policy:
+            _fail_closed_stop(agent, policy)
+        else:
+            logger.debug("mcp runtime stop directive dropped", exc_info=True)
+        return
+
+    agent._runtime_stop_reason = reason
+    agent._runtime_terminal_outcome = outcome
+
+
 # Max consecutive successful credential-pool token refreshes of the SAME entry
 # on a persistent auth failure before we give up and let the fallback chain
 # activate. A single-entry OAuth pool can re-mint a fresh token indefinitely
@@ -3441,14 +3495,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
 
     def _record_mcp_stop(result: Any) -> Any:
-        try:
-            from tools.mcp_tool import consume_mcp_runtime_stop
-            directive = consume_mcp_runtime_stop()
-            if directive and agent._runtime_stop_reason is None:
-                agent._runtime_stop_reason = directive["reason"]
-                agent._runtime_terminal_outcome = dict(directive)
-        except Exception:
-            pass
+        apply_mcp_runtime_stop(agent)
         return result
 
     if skip_tool_execution_middleware:

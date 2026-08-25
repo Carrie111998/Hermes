@@ -1057,10 +1057,18 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
         # Key the lease by the run's immutable fire identity, not by
         # agent.session_id — compression rotates that id mid-run, and a lease
-        # keyed by it disappears at the rotation boundary.
+        # keyed by it disappears at the rotation boundary. Falling back to the
+        # session id would silently restore that failure for any caller that
+        # sets a policy without a run id, so refuse the run instead.
+        _run_id = str(getattr(agent, "runtime_task_id", "") or "")
+        if not _run_id:
+            raise RuntimeError(
+                "runtime policy requires an immutable run id: "
+                "agent.runtime_task_id is unset"
+            )
         _session_start_results = [activate_authoritative_run(
             str(_runtime_policy),
-            str(getattr(agent, "runtime_task_id", "") or agent.session_id or ""),
+            _run_id,
             str(agent.session_id or ""),
             **_start_payload,
         )]
