@@ -35,6 +35,7 @@ support.
 
 import json
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_state_common import _RESET_END_REASONS
@@ -96,23 +97,37 @@ _COMPACTION_PREFIXES = (
 _FRESH_RESET_END_REASONS = frozenset(_RESET_END_REASONS) | {"new_session"}
 
 
+def _local_datetime(ts: float) -> datetime:
+    """Convert an epoch timestamp to an aware datetime in the user's timezone.
+
+    Mirrors ``hermes_time.now()``: the configured IANA zone when one is set,
+    the server's local zone otherwise. Always returns an *aware* datetime so
+    callers can stamp a zone marker onto whatever they render — an unlabelled
+    wall clock reaches the model as an unanchored number and gets shifted by
+    the offset a second time (#75751).
+    """
+    from hermes_time import get_timezone
+
+    tz = get_timezone()
+    if tz is not None:
+        return datetime.fromtimestamp(ts, tz=tz)
+    return datetime.fromtimestamp(ts).astimezone()
+
+
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
 
+    Rendered in the user's configured timezone and always zone-labelled.
     Returns "unknown" for None, str(ts) if conversion fails.
     """
     if ts is None:
         return "unknown"
     try:
         if isinstance(ts, (int, float)):
-            from datetime import datetime
-            dt = datetime.fromtimestamp(ts)
-            return dt.strftime("%B %d, %Y at %I:%M %p")
+            return _local_datetime(ts).strftime("%B %d, %Y at %I:%M %p %Z")
         if isinstance(ts, str):
             if ts.replace(".", "").replace("-", "").isdigit():
-                from datetime import datetime
-                dt = datetime.fromtimestamp(float(ts))
-                return dt.strftime("%B %d, %Y at %I:%M %p")
+                return _local_datetime(float(ts)).strftime("%B %d, %Y at %I:%M %p %Z")
             return ts
     except (ValueError, OSError, OverflowError) as e:
         logging.debug("Failed to format timestamp %s: %s", ts, e, exc_info=True)
@@ -327,6 +342,15 @@ def _shape_message(
         "content": content,
         "timestamp": m.get("timestamp"),
     }
+    # A bare epoch forces the model to do the epoch→wall-clock conversion
+    # itself, and it defaults to UTC even when the user is in another zone
+    # (#75751). Hand it an offset-bearing time it can just read.
+    raw_ts = m.get("timestamp")
+    if isinstance(raw_ts, (int, float)):
+        try:
+            entry["timestamp_iso"] = _local_datetime(raw_ts).isoformat(timespec="seconds")
+        except (ValueError, OSError, OverflowError) as e:
+            logging.debug("Failed to render timestamp %s: %s", raw_ts, e, exc_info=True)
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
