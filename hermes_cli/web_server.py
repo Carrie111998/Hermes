@@ -748,6 +748,7 @@ def _is_isolated_desktop_ssh_backend(
     headless: bool,
     ssh_session_token: Optional[str],
     ssh_owner_nonce: Optional[str],
+    is_isolated: bool = False,
 ) -> bool:
     """Return whether this is Desktop's private SSH-tunnel backend.
 
@@ -759,15 +760,20 @@ def _is_isolated_desktop_ssh_backend(
     dashboard URL must not switch this private transport to cookie/OAuth mode
     because the Desktop client authenticates its WebSocket with that session token.
 
-    Keep every marker mandatory so ordinary dashboard/serve invocations cannot
-    use this path to bypass the public-dashboard auth gate.
+    Keep every marker mandatory -- including explicit Desktop isolation
+    (``is_isolated`` / ``--isolated`` / ``HERMES_DESKTOP=1``) -- so ordinary
+    dashboard/serve invocations cannot use this path to bypass the
+    public-dashboard auth gate.
     """
+    token = (ssh_session_token or "").strip()
+    nonce = (ssh_owner_nonce or "").strip()
     return bool(
-        host in _LOOPBACK_HOST_VALUES
+        is_isolated
+        and host in _LOOPBACK_HOST_VALUES
         and port == 0
         and headless
-        and ssh_session_token
-        and ssh_owner_nonce
+        and token
+        and nonce
     )
 
 
@@ -19293,6 +19299,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    is_isolated: bool = False,
 ):
     """Start the web UI server.
 
@@ -19344,6 +19351,7 @@ def start_server(
         headless=headless,
         ssh_session_token=ssh_session_token,
         ssh_owner_nonce=ssh_owner_nonce,
+        is_isolated=is_isolated,
     )
     if _private_desktop_ssh:
         _log.info(

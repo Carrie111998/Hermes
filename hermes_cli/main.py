@@ -11813,6 +11813,7 @@ def cmd_dashboard(args):
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
         ssh_owner_nonce=_ssh_owner_nonce,
+        is_isolated=getattr(args, "isolated", False) or os.environ.get("HERMES_DESKTOP") == "1",
     )
 
 
