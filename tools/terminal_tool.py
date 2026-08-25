@@ -1294,24 +1294,15 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     """
     _task_env_overrides[task_id] = overrides
 
-    # If a live environment already exists for this task, a freshly registered
-    # ``cwd`` override (e.g. the ACP client switching the editor's project root
-    # mid-session via ``session/load`` / ``session/resume``) must take effect
-    # immediately. The session record is what commands resolve against;
-    # the live env's cwd is also updated so env-side seeding stays consistent.
+    # If a live environment already exists under this raw task id, a freshly
+    # registered cwd override must take effect immediately. Do not mutate the
+    # collapsed shared "default" environment: gateway/TUI sessions share it,
+    # so doing so would leak one chat's workspace into every other chat.
     new_cwd = overrides.get("cwd")
     if isinstance(new_cwd, str) and new_cwd.strip():
-        # A registered workspace cwd IS the session's working directory until
-        # a `cd` changes it.
         record_session_cwd(task_id, new_cwd)
-        # The live env is cached under the raw task_id for per-session surfaces
-        # (ACP/gateway/dashboard) and under the collapsed container id for
-        # isolation-keyed rollouts. Try the raw id first, then the container id,
-        # so a CWD-only override (which collapses to "default") still finds and
-        # updates the originating session's env.
-        container_id = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(task_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 

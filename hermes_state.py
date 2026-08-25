@@ -7022,6 +7022,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def clear_session_workspace(self, session_id: str) -> None:
+        """Atomically clear cwd and all metadata derived from that cwd."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET cwd = NULL, git_branch = NULL, "
+                "git_repo_root = NULL, "
+                "git_metadata_generation = COALESCE(git_metadata_generation, 0) + 1 "
+                "WHERE id = ?",
+                (session_id,),
+            )
+
+        self._execute_write(_do)
+
+    def set_session_workspace(self, session_id: str, cwd: str) -> None:
+        """Atomically set cwd and invalidate stale Git metadata."""
+        if not session_id or not cwd:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET cwd = ?, git_branch = NULL, "
+                "git_repo_root = NULL, "
+                "git_metadata_generation = COALESCE(git_metadata_generation, 0) + 1 "
+                "WHERE id = ?",
+                (cwd, session_id),
+            )
+
+        self._execute_write(_do)
+
     def publish_session_git_metadata(
         self,
         session_id: str,
