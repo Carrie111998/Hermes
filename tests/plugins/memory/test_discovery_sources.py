@@ -429,8 +429,14 @@ class Provider(MemoryProvider):
     def get_tool_schemas(self):
         return []
 
+    def current_origin(self):
+        from .helper import ORIGIN
+        return ORIGIN
+
     def clone_profile(self, profile_name, **kwargs):
-        (kwargs["profile_dir"] / "provider-origin.txt").write_text(ORIGIN)
+        (kwargs["profile_dir"] / "provider-origin.txt").write_text(
+            self.current_origin()
+        )
 
 
 def register(ctx):
@@ -443,12 +449,14 @@ def register(ctx):
     ambient_dir.mkdir(parents=True)
     source_provider_dir.mkdir(parents=True)
     profile_dir.mkdir()
-    (ambient_dir / "__init__.py").write_text(
-        f'ORIGIN = "ambient"\n{marker_source}',
+    (ambient_dir / "__init__.py").write_text(marker_source, encoding="utf-8")
+    (ambient_dir / "helper.py").write_text('ORIGIN = "ambient"\n', encoding="utf-8")
+    (source_provider_dir / "__init__.py").write_text(
+        marker_source,
         encoding="utf-8",
     )
-    (source_provider_dir / "__init__.py").write_text(
-        f'ORIGIN = "source"\n{marker_source}',
+    (source_provider_dir / "helper.py").write_text(
+        'ORIGIN = "source"\n',
         encoding="utf-8",
     )
     (source_dir / "config.yaml").write_text(
@@ -467,9 +475,10 @@ def register(ctx):
     )
 
     assert (profile_dir / "provider-origin.txt").read_text() == "source"
+    assert ambient_provider.current_origin() == "ambient"
 
 
-def test_profile_clone_evicts_cli_discovery_package_descendants(
+def test_profile_clone_ignores_cli_discovery_package_descendants(
     tmp_path, monkeypatch
 ):
     provider_name = "syntheticprofilemem"

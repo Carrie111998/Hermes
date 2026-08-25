@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.machinery
 import importlib.metadata
@@ -512,7 +513,17 @@ def _load_provider_from_dir(
     # Use a separate namespace for user-installed plugins so they don't
     # collide with bundled providers in sys.modules.
     _is_bundled = _MEMORY_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _MEMORY_PLUGINS_DIR
-    module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
+    if _is_bundled:
+        module_name = f"plugins.memory.{name}"
+    else:
+        # The same provider name may be installed by multiple profiles in one
+        # long-lived process. Give each resolved directory its own package so
+        # retained provider instances and lazy relative imports cannot cross
+        # profile boundaries through sys.modules.
+        path_key = hashlib.sha256(
+            str(provider_dir.resolve()).encode("utf-8")
+        ).hexdigest()[:16]
+        module_name = f"{_USER_NAMESPACE}.{name}_{path_key}"
     init_file = provider_dir / "__init__.py"
 
     if not init_file.exists():
@@ -526,11 +537,8 @@ def _load_provider_from_dir(
     if cached_file and Path(cached_file).resolve() == init_file.resolve():
         mod = cached
     else:
-        # A synthetic package shell has no __file__, but CLI discovery may
-        # already have loaded descendants such as ``<provider>.cli`` from a
-        # different profile. Whenever the exact full package is not reusable,
-        # clear the package and every descendant before loading this profile's
-        # implementation.
+        # Clear an incomplete or mismatched package in this directory-specific
+        # namespace before retrying the load, including relative submodules.
         for loaded_name in list(sys.modules):
             if loaded_name == module_name or loaded_name.startswith(
                 f"{module_name}."
