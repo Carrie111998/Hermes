@@ -155,6 +155,53 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert captured["client"]["api_key"] == "cfg-key"
 
 
+def test_openai_streamer_reuses_client_across_stream_calls(monkeypatch):
+    """Regression: each stream() call must reuse one cached client.
+
+    The OpenAI client owns the HTTP/2 connection pool, so constructing a
+    fresh one per sentence pays a TCP+TLS handshake on every call. This
+    guards the cached_property against regressing to per-call construction.
+    """
+    constructions = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_bytes(self):
+            yield b"\x01\x00"
+
+    class _StreamingCreate:
+        @staticmethod
+        def create(**kwargs):
+            return _Response()
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            constructions.append(kwargs)
+            self.audio = MagicMock()
+            self.audio.speech.with_streaming_response = _StreamingCreate()
+
+    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "env-key")
+    monkeypatch.setattr(ts, "get_env_value", lambda key, *args: None)
+    monkeypatch.setattr("openai.OpenAI", _OpenAI)
+
+    config = {"provider": "openai", "openai": {"api_key": "cfg-key"}}
+    streamer = ts.resolve_streaming_provider(config)
+
+    assert streamer is not None
+    list(streamer.stream("First sentence."))
+    list(streamer.stream("Second sentence."))
+    list(streamer.stream("Third sentence."))
+
+    assert len(constructions) == 1, (
+        f"expected one OpenAI client, got {len(constructions)}"
+    )
+
+
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
 
 
