@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 
 
@@ -14,6 +15,28 @@ def _point_ledger(monkeypatch, tmp_path):
 
 def test_census_returns_every_full_nonterminal_row_without_mutation(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
+
+    # Serve the PID-liveness probes from one real answer instead of ~1000 live
+    # ones. Both halves of this test pay for them: create_execution() calls
+    # _process_start_time() on every insert, and the census calls both probes
+    # per row. On Windows each probe falls through the /proc branch to psutil
+    # and costs tens of ms, which put this test ~28% over the 30s per-test cap
+    # and made it flap with host load — it is the only test in this file that
+    # left the probes live, and the only one building 505 rows.
+    #
+    # The answer served is the REAL start time of this process, read once
+    # before stubbing, and every row here is genuinely owned by this process.
+    # So the "process_start_time_matches" evidence asserted below stays true
+    # rather than fabricated — this trades repetition for speed, not accuracy.
+    # The five probe-BEHAVIOUR tests in this file stub the same two seams.
+    own_start = executions._process_start_time(os.getpid())
+    assert own_start is not None, (
+        "the real probe must resolve this process for the liveness-match "
+        "assertions below to mean anything"
+    )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: own_start)
+
     first = executions.create_execution("job-000", source="builtin")
     executions.mark_execution_running(first["id"])
     for index in range(1, 505):
