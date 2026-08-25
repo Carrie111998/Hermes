@@ -341,8 +341,17 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     }
 
     if (modelValueChanged || providerValueChanged) {
+      // Registry events carry their exact owner. Invalidate that composite
+      // catalog, not whichever connection/profile is ambient now; primary
+      // events are untagged and retain the active-profile path.
+      const eventProfile = event.profile?.trim() || activeGatewayProfile
+
+      const profileScope = event.connectionId
+        ? { connectionId: event.connectionId, profile: eventProfile }
+        : eventProfile
+
       void queryClient.invalidateQueries({
-        queryKey: explicitSid && sessionId ? modelOptionsQueryKey(activeGatewayProfile, sessionId) : ['model-options']
+        queryKey: explicitSid && sessionId ? modelOptionsQueryKey(profileScope, sessionId) : ['model-options']
       })
     }
 

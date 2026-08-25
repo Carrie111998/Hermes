@@ -2,6 +2,7 @@ import { QueryClient } from '@tanstack/react-query'
 import { act, cleanup } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection } from '@/api/client'
 import { isTargetSessionBusy } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -55,6 +56,7 @@ afterEach(() => {
   setCurrentProvider('')
   vi.useRealTimers()
   vi.restoreAllMocks()
+  setApiRequestConnection(null)
 })
 
 describe('session.info config refetch gating', () => {
@@ -117,6 +119,31 @@ describe('session.info model-options invalidation gating', () => {
     sessionInfo(ACTIVE_SID, { model: 'm2', provider: 'p1', running: true })
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: modelOptionsQueryKey(ACTIVE_PROFILE, ACTIVE_SID) })
+  })
+
+  it('invalidates the exact event owner without touching the ambient connection', () => {
+    setApiRequestConnection('ambient-remote')
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const ownerScope = { connectionId: 'remote-owner', profile: 'bot' }
+    const ownerKey = modelOptionsQueryKey(ownerScope, ACTIVE_SID)
+    const ambientKey = modelOptionsQueryKey(ACTIVE_PROFILE, ACTIVE_SID)
+
+    sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
+    invalidate.mockClear()
+
+    act(() =>
+      stream.handleEvent({
+        connectionId: ownerScope.connectionId,
+        payload: { model: 'm2', provider: 'p1', running: true },
+        profile: ownerScope.profile,
+        session_id: ACTIVE_SID,
+        type: 'session.info'
+      })
+    )
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ownerKey })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ambientKey })
   })
 })
 

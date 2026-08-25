@@ -1,4 +1,6 @@
-import { profileScopeKey } from '@/api/client'
+import { registryBackendScopeKey } from '@hermes/shared'
+
+import { capabilityScoped, getApiRequestConnection } from '@/api/client'
 import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse, type ProfileScope } from '@/hermes'
 import type { ModelOptionProvider } from '@/types/hermes'
 
@@ -61,8 +63,19 @@ interface ModelOptionsRequest {
   sessionId?: null | string
 }
 
+/** Canonical model-catalog ownership key. Unlike the general capability key,
+ * model catalogs must distinguish an explicit local pin from ambient routing,
+ * and ambient routing must rotate with the active registry connection. */
+export function modelOptionsScopeKey(profile: ProfileScope): string {
+  const effective = capabilityScoped(profile)
+  const explicit = !!profile && typeof profile === 'object'
+  const connectionId = explicit ? (profile.connectionId ?? '').trim() || 'local' : getApiRequestConnection()
+
+  return registryBackendScopeKey(connectionId, effective.profile)
+}
+
 export function modelOptionsQueryKey(profile: ProfileScope, sessionId?: null | string) {
-  return ['model-options', profileScopeKey(profile), sessionId || 'global'] as const
+  return ['model-options', modelOptionsScopeKey(profile), sessionId || 'global'] as const
 }
 
 function hasSelectableModels(options: ModelOptionsResponse | null | undefined): boolean {

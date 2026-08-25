@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
+import type { ProfileScope } from '@/hermes'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { $activeSessionId, $currentModel, $currentProvider } from '@/store/session'
 
@@ -54,14 +55,14 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-function renderPanel(onSelectModel = vi.fn()) {
+function renderPanel(onSelectModel = vi.fn(), profile?: ProfileScope) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   const content = render(
     <QueryClientProvider client={client}>
       <DropdownMenu open>
         <DropdownMenuContent>
-          <ModelMenuPanel onSelectModel={onSelectModel} requestGateway={vi.fn() as never} />
+          <ModelMenuPanel onSelectModel={onSelectModel} profile={profile} requestGateway={vi.fn() as never} />
         </DropdownMenuContent>
       </DropdownMenu>
     </QueryClientProvider>
@@ -125,6 +126,20 @@ describe('ModelMenuPanel MoA presets', () => {
 })
 
 describe('ModelMenuPanel current selection', () => {
+  it('carries the exact catalog owner into the model selection', async () => {
+    const ownerScope = { connectionId: 'remote-owner', profile: 'bot' }
+    const { content, onSelectModel } = renderPanel(vi.fn(), ownerScope)
+
+    fireEvent.click(await content.findByText(/Gemini 3\.1 Pro/i))
+
+    expect(onSelectModel).toHaveBeenCalledWith({
+      model: 'gemini-3.1-pro',
+      profile: ownerScope,
+      provider: 'google',
+      sessionId: 'runtime-1'
+    })
+  })
+
   it('keeps the checkmark on the live SessionView model when a stale options response disagrees', async () => {
     $currentProvider.set('google')
     $currentModel.set('gemini-3.1-pro')
