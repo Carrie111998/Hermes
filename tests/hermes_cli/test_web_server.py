@@ -509,7 +509,7 @@ class TestWebServerEndpoints:
         finally:
             seed.close()
 
-        # Recents without exclusions still carries everything (back-compat).
+        # Recents: transient/junk are always excluded server-side (review #11).
         response = self.client.get("/api/profiles/sessions/sidebar?recents_limit=50")
         assert response.status_code == 200
         payload = response.json()
@@ -520,13 +520,7 @@ class TestWebServerEndpoints:
         assert proj["project_group"] == "Hermes Community Extensions"
         assert proj["project"] == "Fusion Router"
         assert proj["disposition"] == "project"
-
-        # With exclusions, transient/junk disappear from recents.
-        response = self.client.get(
-            "/api/profiles/sessions/sidebar?recents_limit=50&recents_exclude_dispositions=transient,junk"
-        )
-        assert response.status_code == 200
-        recents_ids = {row["id"] for row in response.json()["recents"]["sessions"]}
+        recents_ids = {row["id"] for row in payload["recents"]["sessions"]}
         assert "noise-a" not in recents_ids
         assert "proj-a" in recents_ids
 

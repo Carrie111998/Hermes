@@ -435,8 +435,6 @@ def get_profiles_sessions_sidebar(
     messaging_exclude: str = None,
     projects_limit: int = 300,
     archives_limit: int = 300,
-    recents_exclude_dispositions: str = None,
-    messaging_exclude_dispositions: str = None,
 ):
     """Batched sidebar session slices — one profile-DB open per refresh.
 
@@ -458,7 +456,9 @@ def get_profiles_sessions_sidebar(
     ``messaging_exclude`` CSV, ``source=cron`` is implicit) so this stays
     taxonomy-agnostic like the per-slice endpoint. All three slices use
     ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
-    desktop's per-slice calls.
+    desktop's per-slice calls. Transient and junk are operational noise
+    (probes, cron echoes, tool runs) and are always excluded from the recents
+    and messaging slices server-side — they never surface in the sidebar.
     """
     from hermes_cli import profiles as profiles_mod
 
@@ -473,15 +473,12 @@ def get_profiles_sessions_sidebar(
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
     recents_scope = (recents_profile or "all").strip() or "all"
-    _validate_dispositions(recents_exclude_dispositions, messaging_exclude_dispositions)
     recents_exclude_list = _parse_csv_param(recents_exclude, "recents_exclude")
     messaging_exclude_list = _parse_csv_param(messaging_exclude, "messaging_exclude")
-    recents_exclude_disp_list = _parse_csv_param(
-        recents_exclude_dispositions, "recents_exclude_dispositions"
-    )
-    messaging_exclude_disp_list = _parse_csv_param(
-        messaging_exclude_dispositions, "messaging_exclude_dispositions"
-    )
+    # Transient + junk are operational noise and never surface in the sidebar
+    # (review #11: hardcode server-side instead of two always-constant request
+    # fields). Projects/archives slices are disposition-filtered by design.
+    _SIDEBAR_HIDDEN_DISPOSITIONS = ("transient", "junk")
 
     recents_cap = min(max(recents_limit, 1), 500)
     cron_cap = min(max(cron_limit, 1), 500)
@@ -548,8 +545,6 @@ def get_profiles_sessions_sidebar(
             tuple(messaging_exclude_list),
             projects_cap,
             archives_cap,
-            tuple(recents_exclude_disp_list),
-            tuple(messaging_exclude_disp_list),
         )
         slices = _sidebar_profile_cache_get(profile_cache_key)
         if slices is None:
@@ -568,7 +563,7 @@ def get_profiles_sessions_sidebar(
                         db,
                         exclude=recents_exclude_list,
                         cap=recents_cap,
-                        exclude_dispositions=recents_exclude_disp_list,
+                        exclude_dispositions=list(_SIDEBAR_HIDDEN_DISPOSITIONS),
                     ),
                     # Aggregated in SQL rather than over the recents window: the
                     # window is a page, and a total that shrank when you scrolled
@@ -579,7 +574,7 @@ def get_profiles_sessions_sidebar(
                         db,
                         exclude=messaging_exclude_list,
                         cap=messaging_cap,
-                        exclude_dispositions=messaging_exclude_disp_list,
+                        exclude_dispositions=list(_SIDEBAR_HIDDEN_DISPOSITIONS),
                     ),
                     # Taxonomy slices: active PROJECT sessions (grouped
                     # client-side by project_group -> project) and finished
