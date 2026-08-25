@@ -32,6 +32,17 @@ declare global {
       }) => Promise<GatewayWsUrlResult>
       // Union agent roster across every registered connection.
       getAgentRoster?: () => Promise<DesktopAgentRoster>
+      // Process-wide courier authority. Every full renderer loads plugins, so
+      // only Electron main can enforce one Desktop-global relay worker.
+      botRelayLeadership?: {
+        acquire: () => Promise<{
+          acquired: boolean
+          courierNamespaceId?: string
+          leadershipToken?: string
+          retryAfterMs?: number
+        }>
+        release: (leadershipToken: string) => Promise<{ released: boolean }>
+      }
       // Credential-free routes across the union connection registry. The
       // optional profile list is used only by the single-local v1 fallback;
       // endpoint and auth material never crosses the IPC boundary.
@@ -667,6 +678,8 @@ export interface DesktopPluginProfileRoute {
   // Registry source identity. Pair with profile; profile names are not unique
   // across sources.
   connectionId: string
+  // Stable backend installation identity from /api/status, when available.
+  installId?: string
   mode: 'local' | 'remote'
   profile: string
   targetProfile: string

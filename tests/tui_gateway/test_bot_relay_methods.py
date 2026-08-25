@@ -78,16 +78,23 @@ def test_deliver_validates_profile_and_runs_transport(home, monkeypatch):
         srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "ping"})
     )
     assert out["reply"] == "pong from ops"
-    # Decoding is pinned (#93590 sibling defect): without encoding= the
-    # child's UTF-8 output is decoded with the locale codec — cp1252/GBK on
-    # Windows — mangling non-ASCII replies; errors="replace" keeps a bad
-    # byte from raising instead of delivering.
-    assert calls["kwargs"]["encoding"] == "utf-8"
-    assert calls["kwargs"]["errors"] == "replace"
+    # Decoding is pinned (#93590 sibling defect): the file-backed capture
+    # handles are opened with encoding="utf-8" so the child's UTF-8 output
+    # is never decoded with the locale codec (cp1252/GBK on Windows), which
+    # would mangle non-ASCII replies.
+    stdout_handle = calls["kwargs"]["stdout"]
+    stderr_handle = calls["kwargs"]["stderr"]
+    assert stdout_handle.mode == "w+" and stdout_handle.encoding == "utf-8"
+    assert stderr_handle.encoding == "utf-8"
     argv = calls["argv"]
     # argv[0] may be a resolved venv path (#93590) — match by basename.
     assert argv[1:3] == ["-p", "ops"]
-    assert argv[0].rsplit("\\", 1)[-1].rsplit("/", 1)[-1] in ("hermes", "hermes.exe")
+    assert argv[0].rsplit("\\", 1)[-1].rsplit("/", 1)[-1] in (
+        "hermes",
+        "hermes.exe",
+        "hermes.CMD",
+        "hermes.cmd",
+    )
     assert "Bot Chat" in argv and "--query-file" in argv
 
     # 'hermes' alias resolves to default
@@ -107,12 +114,35 @@ def test_deliver_requires_params(home):
 
 
 def test_reply_roundtrip_and_id_validation(home):
-    envelope_id = "c" * 32
-    _result(srv._methods["bot_relay.reply"](1, {"id": envelope_id, "reply": "hi"}))
-    path = bot_relay.relay_root(home) / bot_relay.REPLIES_DIR / f"{envelope_id}.json"
+    target = {
+        "profile": "scout",
+        "handle": "scout",
+        "connection_id": "cloud-1",
+    }
+    event = bot_relay.enqueue_envelope(
+        home,
+        target=target,
+        message="ping",
+        sender_profile="default",
+        sender_handle="hermes",
+    )
+    claimed = _result(srv._methods["bot_relay.outbox.drain"](1, {}))
+    assert [row["id"] for row in claimed["envelopes"]] == [event["id"]]
+
+    _result(
+        srv._methods["bot_relay.reply"](
+            2, {"id": event["id"], "reply": "hi"}
+        )
+    )
+    path = bot_relay.relay_root(home) / bot_relay.REPLIES_DIR / f"{event['id']}.json"
     assert json.loads(path.read_text(encoding="utf-8"))["reply"] == "hi"
 
-    err = srv._methods["bot_relay.reply"](2, {"id": "../evil"})
+    nonexistent = srv._methods["bot_relay.reply"](
+        3, {"id": "c" * 32, "reply": "forged"}
+    )
+    assert nonexistent["error"]["code"] == 4094
+
+    err = srv._methods["bot_relay.reply"](4, {"id": "../evil"})
     assert "error" in err
 
 

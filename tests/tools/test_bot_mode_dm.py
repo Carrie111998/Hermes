@@ -28,7 +28,7 @@ def _fresh_probe_cache():
 
 def _managed_home(tmp_path, *, teammates=("researcher",), peers=()) -> Path:
     home = tmp_path / ".hermes"
-    home.mkdir(exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True)
     for name in teammates:
         d = home / "profiles" / name
         d.mkdir(parents=True, exist_ok=True)
@@ -116,6 +116,24 @@ def test_config_toggle_disables_injection(tmp_path):
     assert agent.tools == []
 
 
+def test_prepopulated_schema_is_removed_before_noncanonical_gate(tmp_path):
+    cases = [
+        (_managed_home(tmp_path / "ordinary"), "Ordinary chat", True),
+        (_managed_home(tmp_path / "group"), "Group: room-abc123", True),
+        (tmp_path / "unmanaged", "Bot Chat", True),
+        (_managed_home(tmp_path / "disabled"), "Bot Chat", False),
+    ]
+    cases[2][0].mkdir(parents=True, exist_ok=True)
+    for home, title, protocol in cases:
+        agent = _FakeAgent(home, title=title)
+        agent._bot_mode_protocol = protocol
+        agent.tools = [bot_mode_dm.message_agent_tool_schema()]
+        agent.valid_tool_names.add(bot_mode_dm.MESSAGE_AGENT_TOOL_NAME)
+        assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+        assert agent.tools == []
+        assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME not in agent.valid_tool_names
+
+
 def test_schema_never_in_global_registry():
     """message_agent must not be registered/toolset-reachable anywhere."""
     from tools.registry import registry
@@ -125,6 +143,45 @@ def test_schema_never_in_global_registry():
 
     for names in toolsets.TOOLSETS.values():
         assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME not in names
+
+
+def test_committed_relay_enqueue_returns_event_scoped_ack_when_waiter_fails(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    target = {
+        "profile": "researcher",
+        "handle": "researcher",
+        "connection_id": "remote-1",
+        "connection_label": "remote",
+    }
+    event_id = "e" * 32
+    monkeypatch.setattr("tools.bot_relay.read_remote_roster", lambda _root: [target])
+    monkeypatch.setattr("tools.bot_relay.resolve_remote_target", lambda _raw, _roster: target)
+    monkeypatch.setattr(
+        "tools.bot_relay.enqueue_envelope",
+        lambda *_args, **_kwargs: {"id": event_id},
+    )
+    monkeypatch.setattr(
+        "tools.bot_relay.waiter_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("waiter failed")),
+    )
+
+    result = json.loads(
+        bot_mode_dm._try_relay_delivery(
+            root,
+            "researcher",
+            "hello",
+            "default",
+            "hermes",
+            task_id=None,
+            agent=_FakeAgent(root),
+        )
+    )
+    assert result["status"] == "queued"
+    assert result["event_id"] == event_id
+    assert "waiter" in result["error"]
 
 
 # ── dispatch gate (defense in depth) ─────────────────────────────────────────

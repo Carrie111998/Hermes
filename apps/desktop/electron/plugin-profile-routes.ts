@@ -19,6 +19,8 @@ export interface EffectiveSshRoute {
 
 export interface OpaqueProfileRoute {
   connectionId: string
+  /** Stable backend installation identity, when reported by /api/status. */
+  installId?: string
   mode: 'local' | 'remote'
   profile: string
   targetProfile: string
@@ -29,11 +31,23 @@ interface RegistryProfileRouteAgent {
   profile: string
 }
 
-interface RegistryProfileRouteSource {
+export interface RegistryProfileRouteSource {
   [field: string]: unknown
   id: string
+  installId?: string
   kind: 'cloud' | 'local' | 'remote' | 'ssh'
   remoteProfile?: string
+}
+
+interface RegistryProfileRouteEnumeration {
+  connection: RegistryProfileRouteSource
+  installId?: string
+}
+
+interface ConnectionDiscoveryCaches {
+  installIds: { delete: (connectionId: string) => boolean }
+  sshInventoryAttemptedAt: { delete: (connectionId: string) => boolean }
+  sshRoster: { delete: (connectionId: string) => boolean }
 }
 
 interface BuildRegistryProfileRoutesOptions {
@@ -264,9 +278,12 @@ export function buildRegistryProfileRoutes({
 
     seen.add(key)
 
+    const installId = typeof source.installId === 'string' ? source.installId.trim() : ''
+
     if (source.kind === 'local') {
       routes.push({
         connectionId: source.id,
+        ...(installId ? { installId } : {}),
         mode: 'local',
         profile,
         targetProfile: profile
@@ -277,6 +294,7 @@ export function buildRegistryProfileRoutes({
 
     routes.push({
       connectionId: source.id,
+      ...(installId ? { installId } : {}),
       mode: 'remote',
       profile,
       targetProfile: source.kind === 'ssh' && source.remoteProfile ? normalizeProfile(source.remoteProfile) : profile
@@ -284,6 +302,39 @@ export function buildRegistryProfileRoutes({
   }
 
   return routes
+}
+
+/** Project live registry enumerations into credential-free route sources.
+ * Prefer the fresh status probe, but retain the connection's last-known
+ * stable identity while an SSH/on-demand or unreachable source has no live
+ * result. */
+export function registryProfileRouteSources(
+  enumerations: RegistryProfileRouteEnumeration[]
+): RegistryProfileRouteSource[] {
+  return enumerations.map(({ connection, installId: rawLiveInstallId }) => {
+    const liveInstallId = typeof rawLiveInstallId === 'string' ? rawLiveInstallId.trim() : ''
+    const cachedInstallId = typeof connection.installId === 'string' ? connection.installId.trim() : ''
+    const installId = liveInstallId || cachedInstallId
+
+    return {
+      id: connection.id,
+      kind: connection.kind,
+      ...(connection.kind === 'ssh' && connection.remoteProfile ? { remoteProfile: connection.remoteProfile } : {}),
+      ...(installId ? { installId } : {})
+    }
+  })
+}
+
+/** A registry id may be reused after its endpoint/auth/SSH dial material is
+ * edited. Forget every observation tied to the old backend before redial so
+ * routes cannot advertise the prior installation identity or SSH roster. */
+export function invalidateConnectionDiscovery(
+  connectionId: string,
+  { installIds, sshInventoryAttemptedAt, sshRoster }: ConnectionDiscoveryCaches
+): void {
+  installIds.delete(connectionId)
+  sshInventoryAttemptedAt.delete(connectionId)
+  sshRoster.delete(connectionId)
 }
 
 /** Add the backend profile scope only for registry remote/cloud descriptors. */

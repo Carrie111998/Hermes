@@ -194,6 +194,7 @@ describe('connection-aware plugin host APIs', () => {
       { connectionId: 'connection-local', mode: 'local', profile: 'desktop-primary', targetProfile: 'desktop-primary' },
       {
         connectionId: 'connection-remote',
+        installId: 'backend-install-remote',
         mode: 'remote',
         profile: 'remote-worker',
         targetProfile: 'backend-worker'
@@ -209,6 +210,7 @@ describe('connection-aware plugin host APIs', () => {
       { connectionId: 'connection-local', mode: 'local', profile: 'desktop-primary', targetProfile: 'desktop-primary' },
       {
         connectionId: 'connection-remote',
+        installId: 'backend-install-remote',
         mode: 'remote',
         profile: 'remote-worker',
         targetProfile: 'backend-worker'
@@ -253,6 +255,32 @@ describe('connection-aware plugin host APIs', () => {
       include_sessions: true
     })
     expect(requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('forwards a per-call timeout through targeted and legacy profile routes', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'remote-worker',
+      targetProfile: 'backend-worker'
+    }
+
+    await host.requestProfile(route, 'chat.send', { prompt: 'long turn' }, 720_000)
+    await host.requestProfile('legacy-worker', 'chat.send', { prompt: 'long turn' }, 720_000)
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'remote-worker',
+      'chat.send',
+      { prompt: 'long turn' },
+      720_000
+    )
+    expect(requestGatewayForProfile).toHaveBeenCalledWith(
+      'legacy-worker',
+      'chat.send',
+      { prompt: 'long turn' },
+      720_000
+    )
   })
 
   it('fails closed when a descriptor omits connection or target profile identity', async () => {

@@ -124,22 +124,49 @@ def test_enqueue_claim_is_atomic_and_single_shot(root):
 def test_write_reply_validates_envelope_id(root):
     with pytest.raises(ValueError):
         bot_relay.write_reply(root, "../../etc/passwd", reply="x")
-    path = bot_relay.write_reply(root, "a" * 32, reply="pong")
+    with pytest.raises(ValueError, match="unknown|unclaimed"):
+        bot_relay.write_reply(root, "a" * 32, reply="forged")
+
+    env = bot_relay.enqueue_envelope(
+        root,
+        target=_rows()[0],
+        message="ping",
+        sender_profile="work",
+        sender_handle="work",
+    )
+    assert [row["id"] for row in bot_relay.claim_pending_envelopes(root)] == [
+        env["id"]
+    ]
+    path = bot_relay.write_reply(root, env["id"], reply="pong")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     assert data["reply"] == "pong" and not data["error"]
 
 
 def test_write_reply_reason_passthrough_and_classification(root):
+    # write_reply settles a *claimed* envelope (write-once projection); set up
+    # three claimed envelopes for the three assertions below.
+    claimed_ids = []
+    for letter in ("c", "d", "e"):
+        env = bot_relay.enqueue_envelope(
+            root,
+            target=_rows()[0],
+            message=f"ping {letter}",
+            sender_profile="work",
+            sender_handle="work",
+        )
+        claimed_ids.append(env["id"])
+    assert len(bot_relay.claim_pending_envelopes(root)) == len(claimed_ids)
+
     # explicit reason is persisted verbatim
-    path = bot_relay.write_reply(root, "c" * 32, error="boom", reason="delivery_timeout")
+    path = bot_relay.write_reply(root, claimed_ids[0], error="boom", reason="delivery_timeout")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     assert data["reason"] == "delivery_timeout" and data["error"] == "boom"
     # no reason given → classified from error text
-    path = bot_relay.write_reply(root, "d" * 32, error="Error code: 429 - rate limit")
+    path = bot_relay.write_reply(root, claimed_ids[1], error="Error code: 429 - rate limit")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     assert data["reason"] == "provider_rate_limit"
     # success reply carries an empty reason
-    path = bot_relay.write_reply(root, "e" * 32, reply="ok")
+    path = bot_relay.write_reply(root, claimed_ids[2], reply="ok")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     assert data["reason"] == "" and data["reply"] == "ok"
 
@@ -293,7 +320,8 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     monkeypatch.setattr("tools.bot_mode_dm._spawn_delivery", _fake_spawn)
     agent = _FakeAgent(home)
     out = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))
-    assert out.get("status") == "sent"
+    assert out.get("status") == "accepted"
+    assert re.fullmatch(r"[0-9a-f]{32}", out.get("event_id", ""))
     assert "Hermes Cloud" in spawned["label"]
     # envelope landed in the outbox with attribution prefixed
     pending = bot_relay.claim_pending_envelopes(home)
@@ -301,6 +329,7 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     assert pending[0]["target_connection"] == "cloud-1"
     assert pending[0]["target_profile"] == "default"
     assert pending[0]["message"].startswith("Message from 🤖 hermes (@hermes): ping")
+    assert out["event_id"] == pending[0]["id"]
     # waiter watches this envelope's reply file
     assert pending[0]["id"] in spawned["command"]
 
@@ -320,7 +349,8 @@ def test_relay_route_ambiguous_target_errors_with_forms(tmp_path, monkeypatch):
     assert "scout@cloud-1" in out.get("error", "") and "scout@ssh-vps" in out["error"]
     # connection-qualified form goes through
     out2 = json.loads(message_agent_tool(target="scout@ssh-vps", message="hi", agent=agent))
-    assert out2.get("status") == "sent"
+    assert out2.get("status") == "accepted"
+    assert re.fullmatch(r"[0-9a-f]{32}", out2.get("event_id", ""))
 
 
 def test_unknown_target_error_mentions_connected_machines(tmp_path):
@@ -365,8 +395,16 @@ def test_cleanup_bot_relay_artifacts_sweeps_stale_plaintext(tmp_path, monkeypatc
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     target = {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
               "connection_label": "", "title": "", "description": ""}
-    stale_env = bot_relay.enqueue_envelope(
+    reply_env = bot_relay.enqueue_envelope(
         tmp_path, target=target, message="old secret",
+        sender_profile="default", sender_handle="hermes",
+    )
+    assert [row["id"] for row in bot_relay.claim_pending_envelopes(tmp_path)] == [
+        reply_env["id"]
+    ]
+    stale_reply = bot_relay.write_reply(tmp_path, reply_env["id"], reply="done")
+    stale_env = bot_relay.enqueue_envelope(
+        tmp_path, target=target, message="abandoned secret",
         sender_profile="default", sender_handle="hermes",
     )
     fresh_env = bot_relay.enqueue_envelope(
@@ -374,7 +412,6 @@ def test_cleanup_bot_relay_artifacts_sweeps_stale_plaintext(tmp_path, monkeypatc
         sender_profile="default", sender_handle="hermes",
     )
     base = bot_relay.relay_root(tmp_path)
-    stale_reply = bot_relay.write_reply(tmp_path, stale_env["id"], reply="done")
     old = _time.time() - bot_relay.STALE_AFTER_SECONDS - 1
     _os.utime(base / bot_relay.OUTBOX_DIR / f"{stale_env['id']}.json", (old, old))
     _os.utime(stale_reply, (old, old))
