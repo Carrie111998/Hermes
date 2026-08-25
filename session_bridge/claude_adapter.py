@@ -337,6 +337,21 @@ class ClaudeSourceAdapter:
                     projected_by_identity[identity] = message
                     messages.append(message)
 
+        # Claude Code does not guarantee that a user record is written before
+        # the assistant records it caused; measured 2026-08-25, a registration
+        # transcript carried the prompt with the EARLIER timestamp but appended
+        # it LAST.  Consumers read this list as an ordered turn sequence, so
+        # file position is the wrong order to hand them.
+        #
+        # Sort only when every message carries a usable timestamp.  An absent
+        # or unparseable one projects as 0.0, so sorting on it would hoist that
+        # record ahead of the prompt -- the same malformed shape this ordering
+        # exists to prevent.  The sort is stable, so messages sharing a
+        # timestamp -- notably the content blocks of one record, appended in
+        # ordinal order -- keep the order they were projected in.
+        if messages and all(message.timestamp > 0.0 for message in messages):
+            messages.sort(key=lambda message: message.timestamp)
+
         origin_kind, origin_bridge_id = _detect_origin(
             records,
             self._marker_secret,
