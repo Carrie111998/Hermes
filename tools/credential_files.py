@@ -518,6 +518,31 @@ def from_agent_visible_cache_path(
     return container_path
 
 
+def get_agent_visible_cache_base(
+    container_base: str = "/root/.hermes",
+) -> str | None:
+    """Return the exact agent-visible Hermes cache root for the active backend.
+
+    ``None`` means cache paths remain host-native and must not be classified by
+    a remote-path suffix alone.
+    """
+    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    if backend in ("docker", "modal"):
+        return container_base
+    if backend in ("ssh", "daytona", "vercel_sandbox"):
+        return "~/.hermes"
+
+    # Plugin-registered backends declare where synced cache files land via
+    # ``cache_path_base``; None means host paths remain correct.
+    try:
+        from agent.terminal_env_registry import provider_flag
+
+        plugin_base = provider_flag(backend, "cache_path_base", False)
+    except Exception:
+        plugin_base = None
+    return str(plugin_base) if plugin_base else None
+
+
 def to_agent_visible_cache_path(
     host_path: str,
     container_base: str = "/root/.hermes",
@@ -546,26 +571,11 @@ def to_agent_visible_cache_path(
     Backend is identified by TERMINAL_ENV (same env var
     tools/terminal_tool.py reads in _get_environment_config).
     """
-    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
-    if backend in ("docker", "modal"):
-        pass  # /root/.hermes default
-    elif backend in ("ssh", "daytona", "vercel_sandbox"):
-        container_base = "~/.hermes"
-    else:
-        # Plugin-registered backends declare where synced cache files land
-        # via ``cache_path_base``; None means host paths remain correct.
-        plugin_base = None
-        try:
-            from agent.terminal_env_registry import provider_flag
+    visible_base = get_agent_visible_cache_base(container_base)
+    if visible_base is None:
+        return host_path  # local, singularity, unknown: host path is correct
 
-            plugin_base = provider_flag(backend, "cache_path_base", None)
-        except Exception:
-            plugin_base = None
-        if not plugin_base:
-            return host_path  # local, singularity, unknown: host path is correct
-        container_base = str(plugin_base)
-
-    mapped = map_cache_path_to_container(host_path, container_base=container_base)
+    mapped = map_cache_path_to_container(host_path, container_base=visible_base)
     return mapped if mapped is not None else host_path
 
 
