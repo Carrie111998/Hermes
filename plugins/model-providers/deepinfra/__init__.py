@@ -24,14 +24,34 @@ class _DeepInfraProfile(ProviderProfile):
     def default_vision_model(self):  # type: ignore[override]
         """First vision-capable *chat* model from the live catalog, or None.
 
-        Key-gated so a box without ``DEEPINFRA_API_KEY`` never pays the
+        Key-gated so a box without a DeepInfra credential never pays the
         catalog round-trip. Requires the ``chat`` surface tag (not just the
         ``vision`` capability) so an image-gen/edit model that merely carries
         a ``vision`` tag can't be picked as a chat-completions vision backend.
-        """
-        import os
 
-        if not (os.environ.get("DEEPINFRA_API_KEY") or "").strip():
+        The gate asks the SAME resolver that builds the client
+        (``resolve_api_key_provider_credentials``), not ``os.environ``.
+        That matters: Hermes stores credentials in ``~/.hermes/.env`` and in
+        the auth pool, and **neither is loaded into the process
+        environment**. Verified 2026-08-25 -- with ``DEEPSEEK_API_KEY`` set
+        the normal way, ``get_env_value("DEEPSEEK_API_KEY")`` is truthy while
+        ``os.environ.get("DEEPSEEK_API_KEY")`` is None.
+
+        So the old ``os.environ`` gate meant a correctly-installed DeepInfra
+        key returned None here, the vision chain logged "deepinfra catalog
+        unreachable or returned no vision-tagged models -- skipping", and
+        vision stayed dead while blaming the network. The credential was
+        present and the diagnosis pointed elsewhere.
+        """
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+            creds = resolve_api_key_provider_credentials("deepinfra")
+            api_key = str(creds.get("api_key") or "").strip()
+        except Exception:
+            # Never let credential resolution break model discovery; treat an
+            # unresolvable credential as "no key" and skip the round-trip.
+            return None
+        if not api_key:
             return None
         try:
             from hermes_cli.models import _fetch_deepinfra_models_by_tag

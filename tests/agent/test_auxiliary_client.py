@@ -1217,9 +1217,9 @@ class TestVisionClientFallback:
     def test_nous_excluded_from_vision_AUTO_but_kept_for_explicit_routing(self):
         """The two vision tuples must not be collapsed back into one.
 
-        STRICT is non-empty while AUTO is empty -- that asymmetry IS the
+        STRICT is a strict superset of AUTO -- that asymmetry IS the
         contract, so a "cleanup" that unifies them would silently restore
-        automatic probing of three uncredentialed providers.
+        automatic probing of providers that have no credential.
 
         `_VISION_STRICT_BACKENDS` decides ROUTING for an explicit
         `auxiliary.vision.provider`; `_VISION_AUTO_PROVIDER_ORDER` decides
@@ -1234,12 +1234,16 @@ class TestVisionClientFallback:
             _VISION_STRICT_BACKENDS,
             _VISION_AUTO_PROVIDER_ORDER,
         )
-        # Every strict backend is uncredentialed on this machine, so AUTO is
-        # empty while STRICT still carries all of them for explicit routing.
-        assert _VISION_AUTO_PROVIDER_ORDER == ()
-        for dead in ("nous", "openrouter", "deepinfra"):
+        # nous and openrouter have no credential in either auth store, so
+        # they stay out of AUTO while STRICT still carries them for explicit
+        # routing. deepinfra was restored to AUTO on 2026-08-25 (credential
+        # added), which is why this is a per-name check and not "AUTO is
+        # empty" -- the roster changes, the ASYMMETRY is the invariant.
+        for dead in ("nous", "openrouter"):
             assert dead in _VISION_STRICT_BACKENDS, dead
             assert dead not in _VISION_AUTO_PROVIDER_ORDER, dead
+        assert "deepinfra" in _VISION_STRICT_BACKENDS
+        assert "deepinfra" in _VISION_AUTO_PROVIDER_ORDER
         # AUTO must remain a subset of STRICT: a name may only be probed
         # automatically if it also has a strict backend to be probed with.
         assert set(_VISION_AUTO_PROVIDER_ORDER) <= set(_VISION_STRICT_BACKENDS)

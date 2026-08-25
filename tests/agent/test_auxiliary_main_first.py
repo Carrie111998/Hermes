@@ -558,23 +558,25 @@ class TestResolveVisionMainFirst:
         assert provider == "sentinel-aggregator"
 
     def test_vision_auto_empty_yields_no_client_without_crashing(self):
-        """The live state: no aggregator has a credential, so AUTO is empty.
+        """An EMPTY aggregator tuple must return cleanly rather than raise.
 
-        A main provider with no vision capability then means no vision at
-        all. That must return cleanly rather than raise -- callers report
-        vision as unconfigured (hermes_cli/setup.py) and the tool is gated
-        off. Guards the empty-tuple path that the sentinel tests above
-        deliberately bypass.
+        A main provider with no vision capability and no aggregator means no
+        vision at all; callers report vision as unconfigured
+        (hermes_cli/setup.py) and the tool is gated off. Guards the
+        empty-tuple path that the sentinel tests above deliberately bypass.
+
+        The tuple is INJECTED as empty rather than read from the live
+        roster. It used to assert the live roster was ``()``, which made
+        this test fail the moment deepinfra was restored (2026-08-25) even
+        though the empty-tuple code path it guards was untouched. The
+        behaviour under test is "empty tuple is safe", not "the roster
+        happens to be empty today".
         """
-        from agent.auxiliary_client import _VISION_AUTO_PROVIDER_ORDER
-
-        assert _VISION_AUTO_PROVIDER_ORDER == (), (
-            "this test documents the empty-roster state; update it "
-            "deliberately if an aggregator is restored"
-        )
         strict = MagicMock(side_effect=AssertionError(
             "no aggregator should be probed when the AUTO tuple is empty"))
         with patch(
+            "agent.auxiliary_client._VISION_AUTO_PROVIDER_ORDER", (),
+        ), patch(
             "agent.auxiliary_client._read_main_provider", return_value="deepseek",
         ), patch(
             "agent.auxiliary_client._read_main_model", return_value="deepseek-chat",
