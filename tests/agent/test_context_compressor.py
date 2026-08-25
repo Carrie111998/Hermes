@@ -688,6 +688,9 @@ class TestNonStringContent:
         assert summary != SUMMARY_PREFIX
         # Transient cooldown engaged so we don't immediately retry the bad proxy.
         assert c._summary_failure_cooldown_until > 0
+        # #94448: flagged so compress() aborts instead of dropping the middle
+        # window via the destructive static-fallback path.
+        assert c._last_summary_empty_content_failure is True
 
 
 
@@ -2818,6 +2821,39 @@ class TestCooldownReentryAbort:
         assert first == msgs
         assert c._last_compress_aborted is True
         assert c._last_summary_auth_failure is True
+
+        second = c.compress(msgs, current_tokens=999999)
+        assert second == msgs, (
+            "Second compress during cooldown must abort (preserve messages), "
+            "not drop the middle window via static-fallback"
+        )
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+
+    def test_empty_content_failure_aborts_compression(self):
+        """#94448: a well-formed but empty-content summary response must
+        ABORT compression (preserve messages unchanged) instead of taking
+        the destructive static-fallback path that drops the middle window.
+        Cooldown re-entry must also keep aborting, same as network/auth."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = ""
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            first = c.compress(msgs, current_tokens=999999, force=True)
+        assert first == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_empty_content_failure is True
 
         second = c.compress(msgs, current_tokens=999999)
         assert second == msgs, (
