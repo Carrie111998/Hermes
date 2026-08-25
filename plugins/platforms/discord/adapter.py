@@ -3432,9 +3432,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return False, None
         return True, names
 
-    def _warn_reaction_trigger_env_shadow(self) -> None:
+    def _warn_reaction_trigger_env_shadow(self, env_raw: str) -> None:
         """Warn when DISCORD_REACTION_TRIGGERS env shadows fresh YAML config.
 
+        ``env_raw`` is passed in by the caller (_reaction_trigger_config),
+        which reads the env snapshot once and shares it between this shadow
+        check and the actual resolution — no duplicate env read here.
         Resolution is env-first (legacy precedence via _gate_raw) and the
         YAML->env bridge only writes os.environ when the var is UNSET, so a
         stale .env/shell value makes edits to discord.reaction_triggers in
@@ -3445,7 +3448,6 @@ class DiscordAdapter(BasePlatformAdapter):
         return to a previously warned disagreement re-warns exactly once,
         while per-reaction Gate 4 resolution cannot spam the log.
         """
-        env_raw = self._gate_env("DISCORD_REACTION_TRIGGERS")
         extra = getattr(getattr(self, "config", None), "extra", None)
         extra_raw = extra.get("reaction_triggers") if isinstance(extra, dict) else None
         if not env_raw or extra_raw is None:
@@ -3478,7 +3480,8 @@ class DiscordAdapter(BasePlatformAdapter):
         disagree we warn once so the shadowing is visible.
         """
         raw = str(self._gate_raw("reaction_triggers", "DISCORD_REACTION_TRIGGERS") or "").strip()
-        self._warn_reaction_trigger_env_shadow()
+        env_raw = self._gate_env("DISCORD_REACTION_TRIGGERS")
+        self._warn_reaction_trigger_env_shadow(env_raw)
         enabled, allowlist = self._reaction_triggers_parsed(raw)
         return enabled, (set(allowlist) if allowlist is not None else None)
 
@@ -3526,7 +3529,9 @@ class DiscordAdapter(BasePlatformAdapter):
           Gate 3  hook fan-out (awaited; fires for every human reaction
                   regardless of opt-in, mirroring Slack)
           Gate 4  opt-in off => hooks-only return
-          Gate 5  allowlist (normalized emoji vs normalized allowlist names)
+          Gate 5  allowlist (emoji vs allowlist names, normalized AND
+                  variant-folded on both sides — VS15/VS16 selectors,
+                  skin-tone modifiers)
           Gate 6  target-authorship: 6a ``message_author_id`` fast path
                   (REACTION_ADD); 6b single-fetch fallback — EVERY
                   REACTION_REMOVE takes 6b because the remove payload lacks
