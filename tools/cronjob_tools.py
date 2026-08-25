@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
+    EMPTY_PAYLOAD_ERROR,
     claim_job_for_fire,
     effective_job_state,
     get_job,
@@ -1771,6 +1772,12 @@ def cronjob(
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
     except Exception as e:
+        if isinstance(e, ValueError) and str(e) == EMPTY_PAYLOAD_ERROR:
+            return tool_error(
+                EMPTY_PAYLOAD_ERROR,
+                success=False,
+                error_kind="invalid_job_payload",
+            )
         if isinstance(e, ValueError) and "past and cannot be scheduled" in str(e):
             return tool_error(
                 "One-shot schedule is in the past and cannot be scheduled.",
