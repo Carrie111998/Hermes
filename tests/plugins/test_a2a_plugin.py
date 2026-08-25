@@ -18,7 +18,7 @@ import socket
 import threading
 import urllib.error
 import urllib.request
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
@@ -1690,6 +1690,49 @@ class TestClientTenantAndDiscovery:
 
 
 class TestV1SpecRegressionFixes:
+    def test_forwarded_first_contacts_claim_only_their_own_session(self, monkeypatch):
+        adapter = _bare_adapter()
+        sessions = set()
+        calls = []
+        sessions_lock = threading.Lock()
+
+        monkeypatch.setattr(adapter, "_lookup_forward_session", lambda *_: "")
+        monkeypatch.setattr(adapter, "_title_forward_session", lambda *_: None)
+
+        def snapshot(_profile):
+            with sessions_lock:
+                return set(sessions)
+
+        def fake_run(cmd, **kwargs):
+            peer = kwargs["env"]["HERMES_A2A_PEER"]
+            with sessions_lock:
+                sessions.add(f"session-{peer}")
+                calls.append((peer, list(cmd)))
+            return SimpleNamespace(returncode=0, stdout=f"reply-{peer}", stderr="")
+
+        monkeypatch.setattr(adapter, "_a2a_session_ids", snapshot)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter.subprocess.run", fake_run)
+        agent = {"profile": "shared-profile", "slug": "dev", "timeout": 5}
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda peer: adapter._forward_to_profile(
+                    agent, peer, f"context-{peer}", "hello"
+                ),
+                ("alice", "bob"),
+            ))
+
+        assert sorted(results) == sorted([
+            ("reply-alice", protocol.STATE_COMPLETED),
+            ("reply-bob", protocol.STATE_COMPLETED),
+        ])
+
+        adapter._forward_to_profile(agent, "alice", "context-alice", "again")
+        adapter._forward_to_profile(agent, "bob", "context-bob", "again")
+        resume_by_peer = {peer: cmd for peer, cmd in calls[-2:]}
+        assert resume_by_peer["alice"][-2:] == ["--resume", "session-alice"]
+        assert resume_by_peer["bob"][-2:] == ["--resume", "session-bob"]
+
     def test_rpc_send_message_v1_returns_send_message_response_wrapper(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)

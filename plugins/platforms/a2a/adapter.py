@@ -831,21 +831,21 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug("A2A: could not lookup forwarded session", exc_info=True)
             return ""
 
-    def _latest_a2a_session(self, profile: str, started_after: float) -> str:
+    def _a2a_session_ids(self, profile: str) -> set[str]:
+        """Snapshot A2A session ids for unambiguous first-contact discovery."""
         db = self._profile_state_db(profile)
         if not db or not os.path.exists(db):
-            return ""
+            return set()
         try:
             con = sqlite3.connect(db, timeout=5)
-            row = con.execute(
-                "SELECT id FROM sessions WHERE source = 'a2a' AND started_at >= ? ORDER BY started_at DESC LIMIT 1",
-                (started_after - 2.0,),
-            ).fetchone()
+            rows = con.execute(
+                "SELECT id FROM sessions WHERE source = 'a2a'"
+            ).fetchall()
             con.close()
-            return str(row[0]) if row else ""
+            return {str(row[0]) for row in rows if row and row[0]}
         except Exception:
-            logger.debug("A2A: could not find latest forwarded session", exc_info=True)
-            return ""
+            logger.debug("A2A: could not snapshot forwarded sessions", exc_info=True)
+            return set()
 
     def _title_forward_session(self, profile: str, session_id: str, title: str) -> None:
         db = self._profile_state_db(profile)
@@ -874,7 +874,11 @@ class A2AAdapter(BasePlatformAdapter):
         key = (profile or "default", slug, safe_ctx)
         timeout = int(agent.get("timeout") or _reply_timeout())
 
-        lock = self._forward_lock(key)
+        # First-contact session discovery uses a before/after ID set. Serialize
+        # profile dispatches so two peer contexts in this adapter cannot both
+        # claim the same newly-created session. Other processes remain safe:
+        # multiple new IDs make discovery ambiguous and fail closed below.
+        lock = self._forward_lock((profile or "default", "__profile__", ""))
         with lock:
             session_id = self._profile_sessions.get(key) or self._lookup_forward_session(profile, session_title)
             cmd = ["hermes", "chat", "-q", framed_text, "-Q", "--source", "a2a"]
@@ -886,7 +890,7 @@ class A2AAdapter(BasePlatformAdapter):
             if home:
                 env["HERMES_HOME"] = home
             env["HERMES_A2A_PEER"] = peer
-            start = time.time()
+            before_session_ids = self._a2a_session_ids(profile) if not session_id else set()
             try:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=timeout,
@@ -900,10 +904,18 @@ class A2AAdapter(BasePlatformAdapter):
                 msg = (proc.stderr or proc.stdout or f"profile exited {proc.returncode}").strip()
                 return security.redact_outbound(msg[-2000:]), protocol.STATE_FAILED
             if not session_id:
-                session_id = self._latest_a2a_session(profile, start)
-                if session_id:
+                new_session_ids = self._a2a_session_ids(profile) - before_session_ids
+                if len(new_session_ids) == 1:
+                    session_id = new_session_ids.pop()
                     self._profile_sessions[key] = session_id
                     self._title_forward_session(profile, session_id, session_title)
+                else:
+                    logger.warning(
+                        "A2A: could not identify forwarded session for profile %s "
+                        "without ambiguity (%d new sessions)",
+                        profile or "default",
+                        len(new_session_ids),
+                    )
             return security.redact_outbound((proc.stdout or "").strip()), protocol.STATE_COMPLETED
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
