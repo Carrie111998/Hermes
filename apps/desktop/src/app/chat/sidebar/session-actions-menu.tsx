@@ -44,6 +44,7 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
+import { enterSelectionMode } from '@/store/session-selection'
 import { $sessionTiles } from '@/store/session-states'
 import { ackStoredSessionId } from '@/store/session-unread'
 import { canOpenSessionInTerminal, canOpenSessionWindow, openSessionInTerminal } from '@/store/windows'
@@ -423,6 +424,21 @@ function useSessionActions({
         ]
       : []
 
+  // Entry point into the sidebar's explicit multi-select mode. Its own group
+  // (not folded into workItems/dangerItems) since it changes what every OTHER
+  // row's click does, not just this one.
+  const selectionItems: ActionItemSpec[] = [
+    spec({
+      disabled: !sessionId,
+      icon: 'checklist',
+      label: r.selectChats,
+      onSelect: () => {
+        triggerHaptic('selection')
+        enterSelectionMode(sessionId)
+      }
+    })
+  ]
+
   // DANGER — put it away / destroy it (delete stays last, destructive-red).
   const dangerItems: ActionItemSpec[] = [
     spec({
@@ -479,6 +495,8 @@ function useSessionActions({
         onCopyError={err => notifyError(err, r.copyIdFailed)}
         text={sessionId}
       />
+      <kit.Separator />
+      {selectionItems.map(item => renderActionItem(kit, item))}
       <kit.Separator />
       {workItems.map(item => renderActionItem(kit, item))}
       <kit.Sub>

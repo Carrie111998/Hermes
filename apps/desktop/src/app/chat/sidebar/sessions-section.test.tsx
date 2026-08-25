@@ -3,11 +3,17 @@ import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
+import { forgetSessionRowOrder, registerSessionRowOrder } from '@/store/session-selection'
 
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import type { VirtualSessionListProps } from './virtual-session-list'
 
 afterEach(cleanup)
+
+vi.mock('@/store/session-selection', () => ({
+  forgetSessionRowOrder: vi.fn(),
+  registerSessionRowOrder: vi.fn()
+}))
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -36,10 +42,20 @@ vi.mock('./virtual-session-list', () => ({
   }
 }))
 
+const mockSessionRowPropsHistory: Array<{ selectionScope?: string; session: SessionInfo }> = []
+
+vi.mock('./projects', () => ({
+  EnteredProjectContent: () => null,
+  ProjectOverviewRow: () => null,
+  SidebarWorkspaceGroup: () => <div data-testid="workspace-group" />
+}))
+
 vi.mock('./session-row', () => ({
-  SidebarSessionRow: ({ session }: { session: SessionInfo }) => (
-    <div data-testid={`session-row-${session.id}`}>{session.id}</div>
-  )
+  SidebarSessionRow: (props: { selectionScope?: string; session: SessionInfo }) => {
+    mockSessionRowPropsHistory.push(props)
+
+    return <div data-testid={`session-row-${props.session.id}`}>{props.session.id}</div>
+  }
 }))
 
 function makeSession(id: string, startedAt = 1000): SessionInfo {
@@ -180,5 +196,94 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
 
     const thirdRowsRef = mockVirtualListPropsHistory[2].rows
     expect(thirdRowsRef).not.toBe(secondRowsRef)
+  })
+})
+
+// ⇧-click range selection walks the DATA order the section publishes, not DOM
+// order (virtualization only mounts a window) — see `selectSessionRange`.
+describe('SidebarSessionsSection selection scope', () => {
+  afterEach(() => {
+    vi.mocked(registerSessionRowOrder).mockClear()
+    vi.mocked(forgetSessionRowOrder).mockClear()
+  })
+
+  it("defaults the selection scope to the section's own label and publishes the row order", () => {
+    mockSessionRowPropsHistory.length = 0
+    const sessions = generateSessions(3)
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Pinned"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        sessions={sessions}
+      />
+    )
+
+    expect(registerSessionRowOrder).toHaveBeenCalledWith('Pinned', ['session-1', 'session-2', 'session-3'])
+    expect(mockSessionRowPropsHistory.every(props => props.selectionScope === 'Pinned')).toBe(true)
+  })
+
+  it('does not publish one range across separate grouped lanes', () => {
+    const groups = [
+      { id: 'lane-a', label: 'Lane A', path: null, sessions: generateSessions(2) },
+      {
+        id: 'lane-b',
+        label: 'Lane B',
+        path: null,
+        sessions: generateSessions(2).map(session => ({ ...session, id: `b-${session.id}` }))
+      }
+    ]
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        groups={groups}
+        label="Projects"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        sessions={[]}
+      />
+    )
+
+    expect(registerSessionRowOrder).not.toHaveBeenCalled()
+  })
+
+  it('forgets the row order on unmount', () => {
+    const { unmount } = render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Pinned"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        sessions={generateSessions(2)}
+      />
+    )
+
+    unmount()
+
+    expect(forgetSessionRowOrder).toHaveBeenCalledWith('Pinned')
   })
 })

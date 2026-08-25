@@ -30,6 +30,7 @@ interface SessionRowCommonProps {
   onToggleUnread: () => void
   onResume: () => void
   reorderable?: boolean
+  selectionScope?: string
   showProfile?: boolean
 }
 
@@ -48,6 +49,8 @@ export interface VirtualSessionListProps {
   onTogglePin: (sessionId: string) => void
   onToggleUnread: (sessionId: string) => void
   pinned: boolean
+  /** Range-selection scope, forwarded to every row (see `selectSessionRange`). */
+  selectionScope?: string
   showProfileTags?: boolean
   sortable: boolean
 }
@@ -72,6 +75,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   onTogglePin,
   onToggleUnread,
   pinned,
+  selectionScope,
   showProfileTags = false,
   sortable
 }) => {
@@ -151,6 +155,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       onToggleUnread: () => onToggleUnread(session.id),
       onResume: () => onResumeSession(session.id),
       reorderable,
+      selectionScope,
       showProfile: showProfileTags,
       unread: session.unread === true
     }

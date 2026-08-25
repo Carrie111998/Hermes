@@ -2241,6 +2241,7 @@ export const en: Translations = {
       branchFrom: 'Branch',
       rename: 'Rename',
       archive: 'Archive',
+      selectChats: 'Select chats',
       newWindow: 'New window',
       openInTerminal: 'Open in terminal',
       hideTabBar: 'Hide tab bar',
@@ -2279,6 +2280,14 @@ export const en: Translations = {
       thisWeek: 'Earlier this week',
       lastWeek: 'Last week',
       thisMonth: 'Earlier this month'
+    },
+    selection: {
+      count: n => `${n} selected`,
+      archive: 'Archive',
+      delete: 'Delete',
+      cancel: 'Cancel',
+      deleteTitle: n => `Delete ${n} chats?`,
+      deleteDesc: n => `This will permanently delete ${n} chats. This cannot be undone.`
     },
     statusDivider: {
       working: 'Working',
@@ -3385,6 +3394,10 @@ export const en: Translations = {
     deleteFailed: 'Delete failed',
     archived: 'Archived',
     archiveFailed: 'Archive failed',
+    archivedMany: count => `Archived ${count} chats`,
+    archiveFailedMany: count => `Could not archive ${count} chats`,
+    deletedMany: count => `Deleted ${count} chats`,
+    deleteFailedMany: count => `Could not delete ${count} chats`,
     cwdChangeFailed: 'Working directory change failed',
     cwdStagedTitle: 'Working directory staged',
     cwdStagedMessage: 'Restart the desktop backend to apply cwd changes to this active session.',

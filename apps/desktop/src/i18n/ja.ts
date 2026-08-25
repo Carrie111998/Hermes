@@ -1946,6 +1946,7 @@ export const ja = defineLocale({
       branchFrom: '分岐',
       rename: '名前を変更',
       archive: 'アーカイブ',
+      selectChats: 'チャットを選択',
       newWindow: '新しいウィンドウ',
       openInTerminal: 'ターミナルで開く',
       copyIdFailed: 'セッション ID をコピーできませんでした',
@@ -1980,6 +1981,14 @@ export const ja = defineLocale({
       thisWeek: '今週',
       lastWeek: '先週',
       thisMonth: '今月'
+    },
+    selection: {
+      count: n => `${n} 件選択中`,
+      archive: 'アーカイブ',
+      delete: '削除',
+      cancel: 'キャンセル',
+      deleteTitle: n => `${n} 件のチャットを削除しますか？`,
+      deleteDesc: n => `${n} 件のチャットを完全に削除します。この操作は元に戻せません。`
     },
     statusDivider: {
       working: '実行中',
@@ -3033,6 +3042,10 @@ export const ja = defineLocale({
     deleteFailed: '削除に失敗しました',
     archived: 'アーカイブしました',
     archiveFailed: 'アーカイブに失敗しました',
+    archivedMany: count => `${count} 件のチャットをアーカイブしました`,
+    archiveFailedMany: count => `${count} 件のチャットのアーカイブに失敗しました`,
+    deletedMany: count => `${count} 件のチャットを削除しました`,
+    deleteFailedMany: count => `${count} 件のチャットの削除に失敗しました`,
     cwdChangeFailed: '作業ディレクトリの変更に失敗しました',
     cwdStagedTitle: '作業ディレクトリがステージングされました',
     cwdStagedMessage:

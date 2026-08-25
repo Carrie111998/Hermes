@@ -1904,6 +1904,7 @@ export interface Translations {
       branchFrom: string
       rename: string
       archive: string
+      selectChats: string
       newWindow: string
       openInTerminal: string
       hideTabBar: string
@@ -1942,6 +1943,16 @@ export interface Translations {
       thisWeek: string
       lastWeek: string
       thisMonth: string
+    }
+    // The sidebar's compact action bar, shown while multi-select mode is
+    // active (entered via a row's "Select chats" menu item).
+    selection: {
+      count: (n: number) => string
+      archive: string
+      delete: string
+      cancel: string
+      deleteTitle: (n: number) => string
+      deleteDesc: (n: number) => string
     }
     statusDivider: {
       working: string
@@ -2906,6 +2917,10 @@ export interface Translations {
     deleteFailed: string
     archived: string
     archiveFailed: string
+    archivedMany: (count: number) => string
+    archiveFailedMany: (count: number) => string
+    deletedMany: (count: number) => string
+    deleteFailedMany: (count: number) => string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string
