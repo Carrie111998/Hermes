@@ -237,9 +237,13 @@ def test_ytdlp_prefers_audio_or_bounded_quality_hls_and_enables_packaged_js_runt
     assert captured["format"] == (
         "bestaudio[protocol^=m3u8]/"
         "best[protocol^=m3u8][acodec!=none][height<=480]/"
-        "worst[protocol^=m3u8][acodec!=none]"
+        "worst[protocol^=m3u8][acodec!=none]/"
+        "bestaudio/best"
     )
     assert captured["ignoreerrors"] is True
+    assert captured["extractor_args"] == {
+        "youtube": {"player_client": ["android"]}
+    }
     assert "node" in captured["js_runtimes"]
 
 

@@ -236,22 +236,31 @@ class TrackResolver:
             "noplaylist": False,
             "extract_flat": "in_playlist" if flat else False,
             "playlistend": TrackResolver.MAX_TRACKS_PER_REQUEST,
-            # YouTube's direct GVS URLs can return HTTP 403 even when freshly
-            # extracted. Require its lowest-bandwidth HLS stream and discard
-            # the video in FFmpeg. Other providers retain audio-only formats.
+            # Prefer audio-only or bandwidth-conscious HLS when available;
+            # retain a direct-format fallback for videos without HLS.
             "format": (
                 None
                 if flat
                 else (
                     "bestaudio[protocol^=m3u8]/"
                     "best[protocol^=m3u8][acodec!=none][height<=480]/"
-                    "worst[protocol^=m3u8][acodec!=none]"
+                    "worst[protocol^=m3u8][acodec!=none]/"
+                    "bestaudio/best"
                     if is_youtube
                     else "bestaudio/best"
                 )
             ),
+            # The default/Android-VR client currently emits signed direct
+            # audio URLs that FFmpeg receives as HTTP 403. The Android client
+            # falls back to a directly playable muxed MP4 when HLS and
+            # audio-only formats are unavailable.
+            "extractor_args": (
+                {"youtube": {"player_client": ["android"]}}
+                if is_youtube
+                else {}
+            ),
             # Search several candidates and let yt-dlp omit YouTube results
-            # that do not expose a playable HLS stream.
+            # that do not expose a playable stream.
             "ignoreerrors": is_youtube,
             # yt-dlp enables Deno by default but not Node. Hermes installations
             # already ship Node, so allow either supported runtime to solve
