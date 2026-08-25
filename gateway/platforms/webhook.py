@@ -844,8 +844,11 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = request.headers.get(
             "X-GitHub-Delivery",
             request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                "webhook-id",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                ),
             ),
         )
 
@@ -1084,6 +1087,24 @@ class WebhookAdapter(BasePlatformAdapter):
                 request.headers.get(name, "")
                 or request.headers.get(name.lower(), "")
                 or request.headers.get(name.upper(), "")
+            )
+
+        # Standard Webhooks / Render:
+        #   webhook-id: msg_...
+        #   webhook-timestamp: unix seconds
+        #   webhook-signature: v1,<base64-hmac> [v1,<base64-hmac> ...]
+        # Standard Webhooks uses the same signed-content and secret encoding
+        # rules as Svix, but intentionally uses vendor-neutral header names.
+        standard_id = _header("webhook-id")
+        standard_timestamp = _header("webhook-timestamp")
+        standard_signature = _header("webhook-signature")
+        if standard_id or standard_timestamp or standard_signature:
+            return self._validate_svix_signature(
+                body=body,
+                secret=secret,
+                msg_id=standard_id,
+                timestamp=standard_timestamp,
+                signature_header=standard_signature,
             )
 
         # Svix / AgentMail:

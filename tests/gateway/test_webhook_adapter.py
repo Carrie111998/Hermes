@@ -300,6 +300,46 @@ class TestValidateSignature:
         )
         assert adapter._validate_signature(req, body, secret) is True
 
+    def test_validate_render_standard_webhook_signature_valid(self):
+        """Render's Standard Webhooks headers use the Svix signing scheme."""
+        adapter = _make_adapter()
+        body = b'{"type":"deploy_ended","data":{"status":"failed"}}'
+        secret = "whsec_" + base64.b64encode(b"render-signing-key").decode()
+        msg_id = "evt_render_123"
+        timestamp = str(int(time.time()))
+        sig = _svix_signature(body, secret, msg_id, timestamp)
+        req = _mock_request(
+            headers={
+                "webhook-id": msg_id,
+                "webhook-timestamp": timestamp,
+                "webhook-signature": sig,
+            }
+        )
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_render_standard_webhook_partial_headers_reject(self):
+        """A partial Render signature set must fail closed, not fall through."""
+        adapter = _make_adapter()
+        req = _mock_request(headers={"webhook-id": "evt_render_partial"})
+        assert adapter._validate_signature(req, b"{}", "render-secret") is False
+
+    def test_render_standard_webhook_stale_timestamp_rejects(self):
+        """Render replays outside the five-minute window are rejected."""
+        adapter = _make_adapter()
+        body = b'{"type":"deploy_ended"}'
+        secret = "render-secret"
+        msg_id = "evt_render_stale"
+        timestamp = str(int(time.time()) - 301)
+        sig = _svix_signature(body, secret, msg_id, timestamp)
+        req = _mock_request(
+            headers={
+                "webhook-id": msg_id,
+                "webhook-timestamp": timestamp,
+                "webhook-signature": sig,
+            }
+        )
+        assert adapter._validate_signature(req, body, secret) is False
+
 
 # ===================================================================
 # Prompt rendering
@@ -537,6 +577,27 @@ class TestIdempotency:
             assert resp2.status == 200
             data = await resp2.json()
             assert data["status"] == "duplicate"
+
+    @pytest.mark.asyncio
+    async def test_render_webhook_id_is_used_for_idempotency(self):
+        """Render retries with the same webhook-id are processed only once."""
+        routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"webhook-id": "evt_render_duplicate"}
+            resp1 = await cli.post("/webhooks/idem", json={"a": 1}, headers=headers)
+            assert resp1.status == 202
+
+            resp2 = await cli.post("/webhooks/idem", json={"a": 1}, headers=headers)
+            assert resp2.status == 200
+            data = await resp2.json()
+            assert data == {
+                "status": "duplicate",
+                "delivery_id": "evt_render_duplicate",
+            }
 
 
 # ===================================================================
