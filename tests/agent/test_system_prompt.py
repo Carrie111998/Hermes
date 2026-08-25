@@ -40,7 +40,7 @@ def _captured_context_cwd(agent):
 
     def fake_context_files(
         cwd=None, skip_soul=False, context_length=None,
-        allow_install_tree_fallback=False, home_override=None,
+        allow_install_tree_fallback=False, home_override=None, scan_policy=None,
     ):
         captured["cwd"] = cwd
         return ""
@@ -293,12 +293,16 @@ def test_blocked_context_file_surfaces_status_notice(monkeypatch, tmp_path):
     agent = _make_agent(_emit_status=statuses.append)
 
     with (
+        patch(
+            "run_agent._context_file_scanning_policy", return_value="enforce"
+        ) as resolve_policy,
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
     ):
         prompt = build_system_prompt(agent)
 
+    resolve_policy.assert_called_once_with()
     assert "[BLOCKED: AGENTS.md" in prompt
     assert len(statuses) == 1
     assert "AGENTS.md was blocked" in statuses[0]

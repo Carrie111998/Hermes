@@ -80,7 +80,9 @@ def _context_file_scanning_policy() -> str:
     return "enforce"
 
 
-def _scan_context_content(content: str, filename: str) -> str:
+def _scan_context_content(
+    content: str, filename: str, *, policy: Optional[str] = None
+) -> str:
     """Apply the configured injection policy to context-file content.
 
     Uses the "context" scope from the shared threat-pattern library, which
@@ -101,7 +103,8 @@ def _scan_context_content(content: str, filename: str) -> str:
     if content.startswith("\ufeff"):
         content = content[1:]
 
-    policy = _context_file_scanning_policy()
+    if policy is None:
+        policy = _context_file_scanning_policy()
     if policy == "off":
         return content
 
@@ -2451,6 +2454,7 @@ def _truncate_content(
 def load_soul_md(
     context_length: Optional[int] = None,
     home_override: "Path | None" = None,
+    scan_policy: Optional[str] = None,
 ) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
@@ -2478,7 +2482,7 @@ def load_soul_md(
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
             return None
-        content = _scan_context_content(content, "SOUL.md")
+        content = _scan_context_content(content, "SOUL.md", policy=scan_policy)
         content = _truncate_content(
             content, "SOUL.md", context_length=context_length,
             read_path=str(soul_path),
@@ -2489,7 +2493,11 @@ def load_soul_md(
         return None
 
 
-def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_hermes_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
     if not hermes_md_path:
@@ -2504,7 +2512,7 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             rel = str(hermes_md_path.relative_to(cwd_path))
         except ValueError:
             pass
-        content = _scan_context_content(content, rel)
+        content = _scan_context_content(content, rel, policy=scan_policy)
         result = f"## {rel}\n\n{content}"
         return _truncate_content(
             result, ".hermes.md", context_length=context_length,
@@ -2542,7 +2550,11 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
     return chain
 
 
-def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_agents_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
@@ -2578,7 +2590,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
                 label = name
             else:
                 label = os.path.relpath(candidate, cwd_resolved)
-            scanned = _scan_context_content(content, label)
+            scanned = _scan_context_content(content, label, policy=scan_policy)
             section = f"## {label}\n\n{scanned}"
             section = _truncate_content(
                 section, label, context_length=context_length,
@@ -2600,7 +2612,11 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     )
 
 
-def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_claude_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
@@ -2608,7 +2624,7 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
-                    content = _scan_context_content(content, name)
+                    content = _scan_context_content(content, name, policy=scan_policy)
                     result = f"## {name}\n\n{content}"
                     return _truncate_content(
                         result, "CLAUDE.md", context_length=context_length,
@@ -2619,7 +2635,11 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     return ""
 
 
-def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_cursorrules(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
     cursorrules_file = cwd_path / ".cursorrules"
@@ -2627,7 +2647,9 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
         try:
             content = cursorrules_file.read_text(encoding="utf-8").strip()
             if content:
-                content = _scan_context_content(content, ".cursorrules")
+                content = _scan_context_content(
+                    content, ".cursorrules", policy=scan_policy
+                )
                 cursorrules_content += f"## .cursorrules\n\n{content}\n\n"
         except Exception as e:
             logger.debug("Could not read .cursorrules: %s", e)
@@ -2639,7 +2661,11 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
             try:
                 content = mdc_file.read_text(encoding="utf-8").strip()
                 if content:
-                    content = _scan_context_content(content, f".cursor/rules/{mdc_file.name}")
+                    content = _scan_context_content(
+                        content,
+                        f".cursor/rules/{mdc_file.name}",
+                        policy=scan_policy,
+                    )
                     cursorrules_content += f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"
             except Exception as e:
                 logger.debug("Could not read %s: %s", mdc_file, e)
@@ -2658,6 +2684,7 @@ def build_context_files_prompt(
     context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False,
     home_override: "Path | None" = None,
+    scan_policy: Optional[str] = None,
 ) -> str:
     """Discover and load context files for the system prompt.
 
@@ -2677,6 +2704,9 @@ def build_context_files_prompt(
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).
     """
+    if scan_policy is None:
+        scan_policy = _context_file_scanning_policy()
+
     if cwd is None:
         cwd = os.getcwd()
         cwd_is_fallback = True
@@ -2711,17 +2741,21 @@ def build_context_files_prompt(
     else:
         # Priority-based project context: first match wins
         project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
+            _load_hermes_md(cwd_path, context_length, scan_policy)
+            or _load_agents_md(cwd_path, context_length, scan_policy)
+            or _load_claude_md(cwd_path, context_length, scan_policy)
+            or _load_cursorrules(cwd_path, context_length, scan_policy)
         )
     if project_context:
         sections.append(project_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
-        soul_content = load_soul_md(context_length, home_override=home_override)
+        soul_content = load_soul_md(
+            context_length,
+            home_override=home_override,
+            scan_policy=scan_policy,
+        )
         if soul_content:
             sections.append(soul_content)
 

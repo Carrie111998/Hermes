@@ -372,6 +372,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
+    # Resolve once for the whole build so SOUL.md and every project context
+    # file observe one coherent policy even if config.yaml changes mid-build.
+    _context_scan_policy = _r._context_file_scanning_policy()
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -383,7 +387,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
         # ambient resolution on a thread that lost the HERMES_HOME ContextVar
         # reads the launch profile's SOUL.md instead (#50233).
-        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
+        _soul_content = _r.load_soul_md(
+            _ctx_len,
+            home_override=_agent_home(agent),
+            scan_policy=_context_scan_policy,
+        )
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -806,7 +814,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=_agent_home(agent))
+            home_override=_agent_home(agent),
+            scan_policy=_context_scan_policy)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
