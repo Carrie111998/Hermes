@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from hermes_cli.cli_commands_mixin import CLICommandsMixin
+from hermes_cli.cli_commands_mixin import CLICommandsMixin, _read_editor_file_when_settled
 from hermes_cli.commands import resolve_command
 
 
@@ -93,3 +93,15 @@ def test_compose_waits_for_save_visible_after_editor_exit(monkeypatch, tmp_path)
             writer.join()
 
     assert out == "edited prompt"
+
+
+def test_unchanged_editor_file_returns_without_full_timeout(tmp_path):
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("initial draft", encoding="utf-8")
+
+    started_at = time.monotonic()
+    out = _read_editor_file_when_settled(str(prompt_path), "initial draft")
+    elapsed = time.monotonic() - started_at
+
+    assert out == "initial draft"
+    assert elapsed < 1.0

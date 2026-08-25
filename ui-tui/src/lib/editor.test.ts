@@ -132,6 +132,19 @@ describe('openInEditor', () => {
     await expect(openInEditor('initial draft', '.md')).resolves.toBe('final prompt')
   })
 
+  it('returns an unchanged buffer without waiting for the full save timeout', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'editor-unchanged-test-'))
+    const editor = join(dir, 'unchanged-editor.mjs')
+
+    writeFileSync(editor, '#!/usr/bin/env node\nprocess.exit(0)\n')
+    chmodSync(editor, 0o755)
+    process.env.VISUAL = `${process.execPath} ${editor}`
+
+    const startedAt = Date.now()
+    await expect(openInEditor('initial draft', '.md')).resolves.toBe('initial draft')
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
+  })
+
   it('returns null when the editor exits unsuccessfully', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'editor-failure-test-'))
     const editor = join(dir, 'failing-editor.mjs')

@@ -13,6 +13,7 @@ import { withInkSuspended } from '@hermes/ink'
 const FALLBACKS = ['editor', 'nano', 'pico', 'vi', 'emacs']
 const EDITOR_SAVE_POLL_MS = 50
 const EDITOR_SAVE_STABLE_MS = 200
+const EDITOR_SAVE_UNCHANGED_GRACE_MS = 300
 const EDITOR_SAVE_TIMEOUT_MS = 2_000
 
 const delay = async (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
@@ -32,7 +33,11 @@ const readEditorFileWhenSettled = async (file: string, initial: string): Promise
         latest = current
         stableSince = now
         observedChange = true
-      } else if (observedChange && now - stableSince >= EDITOR_SAVE_STABLE_MS) {
+      } else if (observedChange) {
+        if (now - stableSince >= EDITOR_SAVE_STABLE_MS) {
+          return latest
+        }
+      } else if (now - startedAt >= EDITOR_SAVE_UNCHANGED_GRACE_MS) {
         return latest
       }
     } catch {
