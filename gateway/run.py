@@ -1768,6 +1768,13 @@ from agent.replay_cleanup import (  # noqa: E402
     strip_stale_dangerous_confirmations,
 )
 
+# Single policy owner for tool_call/tool_result pairing (id vs call_id
+# precedence, pipe-encoded bridge ids) — see agent/message_sanitization.py.
+from agent.message_sanitization import (  # noqa: E402
+    tool_call_id_variants,
+    tool_result_id_variants,
+)
+
 
 _AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
 _AUTO_CONTINUE_FALLBACK_PREFIX = "[System note: A new message"
@@ -1854,27 +1861,41 @@ def _collect_auto_append_media_tags(
     else:
         new_messages = messages
 
+    # Register every wire spelling of each tool_call's pairing id (Codex/
+    # Responses calls carry ``id`` and ``call_id`` separately, and a tool
+    # result pairs on whichever one its ``tool_call_id`` happens to carry —
+    # see agent/message_sanitization.py's tool_call_id_variants(), the single
+    # policy owner for this. A one-field-only lookup here silently drops the
+    # producer-tool name for exactly that divergent-id shape, which makes
+    # this function fail closed (treats a real TTS/image-generate result as
+    # an untrusted tool and never appends its MEDIA: tag).
     tool_name_by_call_id: Dict[str, str] = {}
     for msg in new_messages:
         if msg.get("role") != "assistant":
             continue
         for call in msg.get("tool_calls") or []:
-            call_id = call.get("id") or call.get("call_id")
             fn = call.get("function") or {}
             name = str(fn.get("name") or call.get("name") or "")
-            if call_id and name:
-                tool_name_by_call_id[str(call_id)] = name
+            if not name:
+                continue
+            for variant in tool_call_id_variants(call):
+                tool_name_by_call_id[variant] = name
 
     media_tags: List[str] = []
     has_voice_directive = False
     for msg in new_messages:
         if msg.get("role") not in ("tool", "function"):
             continue
-        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        result_variants = tool_result_id_variants(
+            msg.get("tool_call_id") or msg.get("call_id")
+        )
+        tool_name = next(
+            (tool_name_by_call_id[v] for v in result_variants if v in tool_name_by_call_id),
+            None,
+        )
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
@@ -1932,14 +1953,21 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
         media_files, _ = BasePlatformAdapter.extract_media(content)
         paths.update(path for path, _is_voice in media_files)
 
+    # Register every wire spelling of each tool_call's pairing id — a
+    # Codex/Responses call's ``id`` and ``call_id`` diverge, and the paired
+    # result's ``tool_call_id`` may carry either one. See
+    # agent/message_sanitization.py's tool_call_id_variants(), the single
+    # policy owner for this (same divergent-id shape as
+    # _collect_auto_append_media_tags above).
     for msg in agent_history:
         if msg.get("role") == "assistant":
             for call in msg.get("tool_calls") or []:
-                cid = call.get("id") or call.get("call_id")
                 fn = call.get("function") or {}
                 name = str(fn.get("name") or call.get("name") or "")
-                if cid and name:
-                    tool_name_by_call_id[str(cid)] = name
+                if not name:
+                    continue
+                for variant in tool_call_id_variants(call):
+                    tool_name_by_call_id[variant] = name
     for msg in agent_history:
         role = msg.get("role")
         if role == "assistant":
@@ -1953,8 +1981,14 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
         if "MEDIA:" in content:
             _add_text_media_paths(content)
             continue
-        cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(cid) == "image_generate":
+        result_variants = tool_result_id_variants(
+            msg.get("tool_call_id") or msg.get("call_id")
+        )
+        tool_name = next(
+            (tool_name_by_call_id[v] for v in result_variants if v in tool_name_by_call_id),
+            None,
+        )
+        if tool_name == "image_generate":
             try:
                 payload = json.loads(content)
             except Exception:
