@@ -43,6 +43,53 @@ from hermes_cli.web_models import (
     SessionPrScanBody,
 )
 
+# Session taxonomy allowlist (must match hermes_state.SessionDB
+# set_session_disposition). Unknown dispositions silently vanish from every
+# sidebar bucket, so reject them at the boundary instead.
+_DISPOSITION_ALLOWLIST = {"project", "archive", "transient", "junk"}
+_MAX_CSV_ENTRIES = 8
+
+
+def _parse_csv_param(value: Optional[str], param_name: str) -> List[str]:
+    """Parse a comma-separated query param into a stripped, bounded list.
+
+    Filters on the stripped value but stores the stripped value (the old
+    behavior filtered untrimmed entries yet kept the raw string, so a caller
+    passing ``a , b`` would filter on ``a``/``b`` but store ``a ``/`` b``).
+    Bounds the list so a hostile query can't explode the WHERE clause.
+    """
+    if not value:
+        return []
+    items = [s.strip() for s in value.split(",") if s.strip()]
+    if len(items) > _MAX_CSV_ENTRIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{param_name}: at most {_MAX_CSV_ENTRIES} comma-separated values",
+        )
+    return items
+
+
+def _validate_dispositions(
+    disposition: Optional[str], exclude_dispositions: Optional[str]
+) -> None:
+    """400 on unknown disposition values (single or CSV)."""
+    for raw, param_name in (
+        (disposition, "disposition"),
+        (exclude_dispositions, "exclude_dispositions"),
+    ):
+        if not raw:
+            continue
+        values = _parse_csv_param(raw, param_name)
+        unknown = [v for v in values if v not in _DISPOSITION_ALLOWLIST]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{param_name}: unknown disposition(s) {', '.join(unknown)}; "
+                    f"must be one of project/archive/transient/junk"
+                ),
+            )
+
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
 
@@ -253,6 +300,7 @@ def get_profiles_sessions(
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
+    _validate_dispositions(disposition, exclude_dispositions)
 
     from hermes_cli import profiles as profiles_mod
 
@@ -278,12 +326,10 @@ def get_profiles_sessions(
     # the cron-jobs section passes source=cron — two independent lists so
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
-    source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
-    exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
+    source_list = _parse_csv_param(sources, "sources")
+    exclude_list = _parse_csv_param(exclude_sources, "exclude_sources")
     disposition_filter = disposition.strip() if disposition else None
-    exclude_dispositions_list = [
-        s.strip() for s in (exclude_dispositions or "").split(",") if s.strip()
-    ]
+    exclude_dispositions_list = _parse_csv_param(exclude_dispositions, "exclude_dispositions")
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -336,6 +382,7 @@ def get_profiles_sessions(
                 include_archived=include_archived,
                 archived_only=archived_only,
                 exclude_children=True,
+                include_pinned=True,
                 disposition=disposition_filter,
                 exclude_dispositions=exclude_dispositions_list or None,
             )
@@ -426,14 +473,15 @@ def get_profiles_sessions_sidebar(
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
     recents_scope = (recents_profile or "all").strip() or "all"
-    recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
-    messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
-    recents_exclude_disp_list = [
-        s for s in (recents_exclude_dispositions or "").split(",") if s.strip()
-    ]
-    messaging_exclude_disp_list = [
-        s for s in (messaging_exclude_dispositions or "").split(",") if s.strip()
-    ]
+    _validate_dispositions(recents_exclude_dispositions, messaging_exclude_dispositions)
+    recents_exclude_list = _parse_csv_param(recents_exclude, "recents_exclude")
+    messaging_exclude_list = _parse_csv_param(messaging_exclude, "messaging_exclude")
+    recents_exclude_disp_list = _parse_csv_param(
+        recents_exclude_dispositions, "recents_exclude_dispositions"
+    )
+    messaging_exclude_disp_list = _parse_csv_param(
+        messaging_exclude_dispositions, "messaging_exclude_dispositions"
+    )
 
     recents_cap = min(max(recents_limit, 1), 500)
     cron_cap = min(max(cron_limit, 1), 500)
