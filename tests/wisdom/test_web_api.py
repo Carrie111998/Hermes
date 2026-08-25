@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -123,6 +124,37 @@ def test_wisdom_error_mapping_is_opaque_and_bounded() -> None:
 
     assert web_server._wisdom_http_error(WisdomNotFound("not found")).status_code == 404
     assert web_server._wisdom_http_error(WisdomError("retry")).status_code == 503
+
+
+def test_profile_bff_requires_setup_before_running_an_operation(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Service:
+        def require_setup(self):
+            calls.append("setup")
+
+    monkeypatch.setattr(web_server, "_profile_scope", lambda _profile: nullcontext())
+    monkeypatch.setattr("hermes_wisdom.service.WisdomService", Service)
+
+    result = asyncio.run(
+        web_server._run_wisdom("research", lambda _service: calls.append("work"))
+    )
+
+    assert result is None
+    assert calls == ["setup", "work"]
+
+
+def test_status_bff_is_available_before_setup(monkeypatch) -> None:
+    async def run(profile, fn, *, require_setup=True):
+        assert profile == "research"
+        assert require_setup is False
+        return {"configured": False}
+
+    monkeypatch.setattr(web_server, "_run_wisdom", run)
+
+    assert asyncio.run(web_server.get_wisdom_status(profile="research")) == {
+        "configured": False
+    }
 
 
 def test_update_bff_forwards_only_explicit_confirmation_flags(monkeypatch) -> None:

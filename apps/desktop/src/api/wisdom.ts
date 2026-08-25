@@ -4,9 +4,11 @@ import { capabilityScoped, type ProfileScope } from './client'
 
 export interface WisdomStatus {
   configured: boolean
+  setup_required_reason?: 'not_configured' | 'organization_changed' | null
   gateway_available: boolean
   capability_advertised: boolean
   verified_org_id: null | string
+  authenticated_org_id?: null | string
   display_scopes: string[]
   error?: null | string
 }

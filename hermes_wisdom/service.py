@@ -48,6 +48,7 @@ from .store import WisdomStore, utc_now
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
+ORG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 WISDOM_DISCLOSURE = (
     "Candidate signals stay on this profile. Only owner-approved private draft bytes, "
     "author copy, manifest metadata, and managed-install state reach the Gateway."
@@ -97,6 +98,20 @@ def _source_fingerprint(source: Path) -> str:
                 f"{path.relative_to(source).as_posix()} {sha256_address(path.read_bytes())}\n"
             )
     return sha256_address("".join(rows).encode("utf-8"))
+
+
+def _write_active_org_marker(managed: Path, org_id: str) -> None:
+    if not ORG_ID_RE.fullmatch(org_id):
+        raise WisdomValidationError("team organization identity is malformed")
+    managed.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marker = managed / ".active_org"
+    pending = managed / f".active_org.{uuid.uuid4().hex}.pending"
+    try:
+        pending.write_text(org_id + "\n", encoding="utf-8")
+        pending.chmod(0o600)
+        os.replace(pending, marker)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def _verified_tree(root: Path) -> tuple[dict[str, str], str]:
@@ -224,28 +239,54 @@ class WisdomService:
             config=_config(),
         )
 
+    def require_setup(self) -> None:
+        wisdom = _config()
+        active_org_id = self.store.active_org_id()
+        if (
+            wisdom.get("enabled") is not True
+            or not wisdom.get("disclosure_acknowledged_at")
+            or self.store.existing_installation_identity() is None
+            or active_org_id is None
+            or not ORG_ID_RE.fullmatch(active_org_id)
+        ):
+            raise PackagePolicyError(
+                "Collective Wisdom is not set up for this profile; run `hermes wisdom setup` first"
+            )
+        try:
+            token_org_id = self.client.display_org_id
+        except Exception:
+            # The last server-verified org remains usable offline. Gateway is
+            # authoritative whenever a network operation is attempted.
+            return
+        if token_org_id and token_org_id != active_org_id:
+            raise PackagePolicyError(
+                "the authenticated organization changed; rerun `hermes wisdom setup` before using Collective Wisdom"
+            )
+
     def setup(self, *, disclosure_accepted: bool = False) -> dict[str, Any]:
         if not disclosure_accepted:
             raise PackagePolicyError(
                 "setup requires explicit acceptance of the local telemetry and private-draft disclosure"
             )
-        installation_id = self.store.installation_identity()
         capability = self.client.capability()
-        registered = self.client.register_identity(installation_id)
         org_id = self.client.display_org_id
         if not org_id:
             raise WisdomValidationError(
                 "team organization identity is missing from the current token"
             )
-        self.store.verify_installation_identity(org_id)
+        if not ORG_ID_RE.fullmatch(org_id):
+            raise WisdomValidationError("team organization identity is malformed")
+        installation_id = self.store.existing_installation_identity()
+        if installation_id is None or self.store.active_org_id() not in {None, org_id}:
+            installation_id = "hwi_" + uuid.uuid4().hex
+        registered = self.client.register_identity(installation_id)
         managed = get_skills_dir() / "_wisdom"
-        managed.mkdir(parents=True, exist_ok=True, mode=0o700)
-        marker = managed / ".active_org"
-        marker.write_text(org_id + "\n", encoding="utf-8")
-        try:
-            marker.chmod(0o600)
-        except OSError:
-            pass
+        # Publish the server-verified org marker before switching the local
+        # ledger. A crash may temporarily select the new verified org while
+        # setup asks to resume, but can never keep loading the stale org after
+        # Gateway accepted the change.
+        _write_active_org_marker(managed, org_id)
+        self.store.activate_installation_identity(installation_id, org_id)
         recovered = self.reconcile_pending_install_records()
         recovered.extend(self.consumption.recover())
         candidates = self.scan_candidates()
@@ -366,6 +407,7 @@ class WisdomService:
             live = True
             capability = client.capability()
             scopes = list(client.display_scopes)
+            authenticated_org_id = client.display_org_id
             admin_gate = (
                 client.identity.get("claims", {}).get("tool_gateway_admin") is True
             )
@@ -373,17 +415,41 @@ class WisdomService:
             live = False
             capability = {}
             scopes = []
+            authenticated_org_id = None
             admin_gate = False
             error = str(exc)
+        wisdom = _config()
+        installation_id = self.store.existing_installation_identity()
+        verified_org_id = self.store.active_org_id()
+        locally_configured = bool(
+            wisdom.get("enabled") is True
+            and wisdom.get("disclosure_acknowledged_at")
+            and installation_id
+            and verified_org_id
+            and ORG_ID_RE.fullmatch(verified_org_id)
+        )
+        organization_changed = bool(
+            authenticated_org_id
+            and verified_org_id
+            and authenticated_org_id != verified_org_id
+        )
         return {
-            "configured": bool(_config().get("enabled", False)),
+            "configured": locally_configured and not organization_changed,
+            "setup_required_reason": (
+                "organization_changed"
+                if organization_changed
+                else None
+                if locally_configured
+                else "not_configured"
+            ),
             "gateway_available": live,
             "error": None if live else error,
             "capability_advertised": "wisdom" in (capability.get("capabilities") or []),
             "display_scopes": scopes,
             "dogfood_admin_claim": admin_gate,
-            "installation_id": self.store.installation_identity(),
-            "verified_org_id": self.store.active_org_id(),
+            "installation_id": installation_id,
+            "verified_org_id": verified_org_id,
+            "authenticated_org_id": authenticated_org_id,
             "pending_operations": self.store.pending_operations(),
             "contract": asdict(CONTRACT_PIN),
         }

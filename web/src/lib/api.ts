@@ -2486,9 +2486,11 @@ export interface SkillInfo {
 
 export interface WisdomStatus {
   configured: boolean;
+  setup_required_reason?: "not_configured" | "organization_changed" | null;
   gateway_available: boolean;
   capability_advertised: boolean;
   verified_org_id: string | null;
+  authenticated_org_id?: string | null;
   display_scopes: string[];
   error?: string | null;
 }

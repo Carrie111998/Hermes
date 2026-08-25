@@ -27,6 +27,8 @@ def cmd_wisdom(args: argparse.Namespace) -> int:
     service = WisdomService()
     command = getattr(args, "wisdom_command", None)
     try:
+        if command not in {"setup", "status", None}:
+            service.require_setup()
         if command == "setup":
             accepted = bool(args.accept_disclosure)
             if not accepted:

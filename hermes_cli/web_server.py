@@ -387,9 +387,14 @@ async def _wisdom_checker_loop(interval: int = 300) -> None:
 
             wisdom = (load_config() or {}).get("wisdom") or {}
             if isinstance(wisdom, dict) and wisdom.get("enabled"):
-                from hermes_wisdom.service import WisdomService
+                def reconcile_wisdom():
+                    from hermes_wisdom.service import WisdomService
 
-                await asyncio.to_thread(WisdomService().check, apply_automatic=False)
+                    service = WisdomService()
+                    service.require_setup()
+                    return service.check(apply_automatic=False)
+
+                await asyncio.to_thread(reconcile_wisdom)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -15326,12 +15331,15 @@ def _wisdom_http_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="Collective Wisdom request failed")
 
 
-async def _run_wisdom(profile: Optional[str], fn):
+async def _run_wisdom(profile: Optional[str], fn, *, require_setup: bool = True):
     def run():
         with _profile_scope(profile):
             from hermes_wisdom.service import WisdomService
 
-            return fn(WisdomService())
+            service = WisdomService()
+            if require_setup:
+                service.require_setup()
+            return fn(service)
 
     try:
         return await asyncio.to_thread(run)
@@ -15341,7 +15349,9 @@ async def _run_wisdom(profile: Optional[str], fn):
 
 @app.get("/api/wisdom/status")
 async def get_wisdom_status(profile: Optional[str] = None):
-    return await _run_wisdom(profile, lambda service: service.status())
+    return await _run_wisdom(
+        profile, lambda service: service.status(), require_setup=False
+    )
 
 
 def _wisdom_action_name(verb: str, profile: Optional[str]) -> str:

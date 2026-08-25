@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_wisdom.client import Draft
+from hermes_wisdom.client import Draft, WisdomValidationError
 from hermes_wisdom.contract import (
     PackageManifest,
     SystemSpecification,
@@ -92,9 +92,11 @@ class InstallClient:
 
 
 class SetupClient:
-    display_org_id = "org-1"
     display_scopes = ("wisdom:read", "wisdom:install")
     identity = {"claims": {"tool_gateway_admin": True}}
+
+    def __init__(self, org_id: str = "org-1"):
+        self.display_org_id = org_id
 
     def capability(self):
         return {"capabilities": ["wisdom"]}
@@ -190,6 +192,106 @@ def test_setup_persists_explicit_disclosure_and_enables_the_profile(
         == first["disclosure_acknowledged_at"]
     )
     assert second["disclosure_acknowledged_at"] == first["disclosure_acknowledged_at"]
+    assert second["installation_id"] == first["installation_id"]
+
+    service._client = SetupClient("org-2")
+    third = service.setup(disclosure_accepted=True)
+    assert third["installation_id"] != first["installation_id"]
+    assert service.store.active_org_id() == "org-2"
+
+
+def test_status_does_not_enroll_an_unconfigured_profile(monkeypatch, tmp_path: Path):
+    store = WisdomStore(tmp_path / "state")
+    service = WisdomService(store=store, client=SetupClient())
+    monkeypatch.setattr("hermes_wisdom.service._config", lambda: {})
+
+    status = service.status()
+
+    assert status["configured"] is False
+    assert status["setup_required_reason"] == "not_configured"
+    assert status["installation_id"] is None
+    assert store.existing_installation_identity() is None
+    with pytest.raises(PackagePolicyError, match="wisdom setup"):
+        service.require_setup()
+
+
+def test_setup_guard_rejects_a_changed_authenticated_org(monkeypatch, tmp_path: Path):
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    service = WisdomService(store=store, client=SetupClient("org-2"))
+    monkeypatch.setattr(
+        "hermes_wisdom.service._config",
+        lambda: {
+            "enabled": True,
+            "disclosure_acknowledged_at": "2026-08-25T00:00:00+00:00",
+        },
+    )
+
+    with pytest.raises(PackagePolicyError, match="organization changed"):
+        service.require_setup()
+
+    status = service.status()
+    assert status["configured"] is False
+    assert status["setup_required_reason"] == "organization_changed"
+    assert status["verified_org_id"] == "org-1"
+    assert status["authenticated_org_id"] == "org-2"
+
+
+def test_org_change_does_not_rotate_identity_before_gateway_accepts(
+    monkeypatch, tmp_path: Path
+):
+    class RejectingSetupClient(SetupClient):
+        def register_identity(self, installation_id):
+            raise RuntimeError("gateway rejected identity")
+
+    skills = tmp_path / "skills"
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    store = WisdomStore(tmp_path / "state")
+    old_identity = store.installation_identity()
+    store.verify_installation_identity("org-1")
+    service = WisdomService(store=store, client=RejectingSetupClient("org-2"))
+
+    with pytest.raises(RuntimeError, match="gateway rejected"):
+        service.setup(disclosure_accepted=True)
+
+    assert store.existing_installation_identity() == old_identity
+    assert store.active_org_id() == "org-1"
+
+
+def test_org_change_switches_marker_before_local_ledger(monkeypatch, tmp_path: Path):
+    skills = tmp_path / "skills"
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    service = WisdomService(store=store, client=SetupClient("org-2"))
+    monkeypatch.setattr(
+        store,
+        "activate_installation_identity",
+        lambda *_args: (_ for _ in ()).throw(OSError("injected ledger failure")),
+    )
+
+    with pytest.raises(OSError, match="injected ledger"):
+        service.setup(disclosure_accepted=True)
+
+    assert (skills / "_wisdom" / ".active_org").read_text() == "org-2\n"
+    assert store.active_org_id() == "org-1"
+
+
+def test_setup_rejects_an_unsafe_org_path_before_writing_marker(
+    monkeypatch, tmp_path: Path
+):
+    skills = tmp_path / "skills"
+    monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
+    service = WisdomService(
+        store=WisdomStore(tmp_path / "state"), client=SetupClient("../other-org")
+    )
+
+    with pytest.raises(WisdomValidationError, match="malformed"):
+        service.setup(disclosure_accepted=True)
+
+    assert not (skills / "_wisdom" / ".active_org").exists()
 
 
 def test_install_retries_from_staged_bytes_after_directory_swap_failure(

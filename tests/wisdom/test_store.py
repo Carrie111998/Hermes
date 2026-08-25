@@ -5,6 +5,7 @@ from hermes_wisdom.store import WisdomStore
 
 def test_profile_store_permissions_identity_and_rename(tmp_path: Path):
     store = WisdomStore(tmp_path / "wisdom")
+    assert store.existing_installation_identity() is None
     skill = tmp_path / "skill"
     skill.mkdir()
     (skill / "SKILL.md").write_text("hello", encoding="utf-8")
@@ -14,6 +15,7 @@ def test_profile_store_permissions_identity_and_rename(tmp_path: Path):
     second = store.register_skill(moved, content_hash="sha256:b", source_kind="local")
     assert first == second
     assert store.installation_identity() == store.installation_identity()
+    assert store.existing_installation_identity() == store.installation_identity()
     assert store.root.stat().st_mode & 0o777 == 0o700
     assert store.path.stat().st_mode & 0o777 == 0o600
 
@@ -103,6 +105,18 @@ def test_verified_org_change_deactivates_stale_managed_installs(tmp_path: Path):
 
     assert store.active_org_id() == "org-2"
     assert store.installation("skill-1")["state"] == "inactive"
+
+
+def test_identity_rotation_is_atomic_with_org_activation(tmp_path: Path):
+    store = WisdomStore(tmp_path / "wisdom")
+    old_identity = store.installation_identity()
+    store.verify_installation_identity("org-1")
+
+    store.activate_installation_identity("hwi_" + "n" * 32, "org-2")
+
+    assert store.existing_installation_identity() != old_identity
+    assert store.existing_installation_identity() == "hwi_" + "n" * 32
+    assert store.active_org_id() == "org-2"
 
 
 def test_schema_v4_migrates_snapshot_text_and_stability_provenance(tmp_path: Path):

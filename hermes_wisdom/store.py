@@ -603,6 +603,13 @@ class WisdomStore:
                         (now, now, row["id"]),
                     )
 
+    def existing_installation_identity(self) -> str | None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT installation_id FROM installation_identity WHERE singleton=1"
+            ).fetchone()
+            return str(row["installation_id"]) if row else None
+
     def installation_identity(self) -> str:
         with self.transaction() as db:
             row = db.execute(
@@ -616,6 +623,25 @@ class WisdomStore:
                 (installation_id, None, None, utc_now()),
             )
             return installation_id
+
+    def activate_installation_identity(self, installation_id: str, org_id: str) -> None:
+        now = utc_now()
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE managed_install SET state='inactive',updated_at=? "
+                "WHERE org_id<>? AND state='active'",
+                (now, org_id),
+            )
+            db.execute(
+                """INSERT INTO installation_identity(
+                     singleton,installation_id,verified_org_id,verified_at,disclosure_at
+                   ) VALUES(1,?,?,?,?)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                     installation_id=excluded.installation_id,
+                     verified_org_id=excluded.verified_org_id,
+                     verified_at=excluded.verified_at""",
+                (installation_id, org_id, now, now),
+            )
 
     def verify_installation_identity(self, org_id: str) -> None:
         with self.transaction() as db:
