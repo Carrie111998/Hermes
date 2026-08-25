@@ -50,7 +50,7 @@ from agent.prompt_builder import (
     TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
-    drain_truncation_warnings,
+    drain_context_file_notices,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -304,7 +304,7 @@ def _agent_home(agent: Any) -> Optional[Path]:
     try:
         db = getattr(agent, "_session_db", None)
         db_path = getattr(db, "db_path", None)
-        if db_path:
+        if isinstance(db_path, (str, os.PathLike)):
             return Path(db_path).parent
     except Exception:
         pass
@@ -372,9 +372,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
-    # Resolve once for the whole build so SOUL.md and every project context
+    # Resolve the agent home and policy once for the whole build so SOUL.md
+    # and every project context
     # file observe one coherent policy even if config.yaml changes mid-build.
-    _context_scan_policy = _r._context_file_scanning_policy()
+    agent_home = _agent_home(agent)
+    _context_scan_policy = _r._context_file_scanning_policy(
+        home_override=agent_home
+    )
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
@@ -389,7 +393,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # reads the launch profile's SOUL.md instead (#50233).
         _soul_content = _r.load_soul_md(
             _ctx_len,
-            home_override=_agent_home(agent),
+            home_override=agent_home,
             scan_policy=_context_scan_policy,
         )
         if _soul_content:
@@ -814,7 +818,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=_agent_home(agent),
+            home_override=agent_home,
             scan_policy=_context_scan_policy)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
@@ -950,7 +954,7 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
 
     # Surface context-file truncation and security-scan warnings through the
     # normal agent status channel so users see them instead of only in logs.
-    for warning in drain_truncation_warnings():
+    for warning in drain_context_file_notices():
         agent._emit_status(warning)
 
     return joined

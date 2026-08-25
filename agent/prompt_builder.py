@@ -58,17 +58,27 @@ logger = logging.getLogger(__name__)
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
-def _context_file_scanning_policy() -> str:
-    """Return the configured context-file scan policy, failing closed."""
+def _context_file_scanning_policy(home_override: "Path | None" = None) -> str:
+    """Return the profile-scoped context-file scan policy, failing closed."""
+    home_token = None
     try:
         from hermes_cli.config import load_config_readonly
 
+        if home_override is not None:
+            home_token = set_hermes_home_override(str(home_override))
         security = load_config_readonly().get("security", {})
         configured = security.get("context_file_scanning", "enforce")
     except Exception as exc:
         logger.debug("Could not read context-file scanning policy: %s", exc)
         return "enforce"
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
+    # YAML 1.1 loaders parse an unquoted ``off`` scalar as ``False``. Accept
+    # that representation so the documented enum works when written by hand.
+    if configured is False:
+        return "off"
     if isinstance(configured, str):
         policy = configured.strip().lower()
         if policy in {"enforce", "warn", "off"}:
@@ -1694,19 +1704,19 @@ def _record_truncation_warning(msg: str) -> None:
     warnings.append(msg)
 
 
-def drain_truncation_warnings() -> list:
-    """Return and clear context-file warnings accumulated in this context.
-
-    The historical name is retained for compatibility; the channel now also
-    carries security-scan notices because both must reach the user while the
-    system prompt is built.
-    """
+def drain_context_file_notices() -> list:
+    """Return and clear context-file notices accumulated in this context."""
     warnings = _truncation_warnings.get()
     if not warnings:
         return []
     drained = list(warnings)
     warnings.clear()
     return drained
+
+
+def drain_truncation_warnings() -> list:
+    """Compatibility alias for callers using the historical channel name."""
+    return drain_context_file_notices()
 
 
 # =========================================================================
