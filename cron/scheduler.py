@@ -1583,11 +1583,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")
         if origin_thread and not thread_id:
-            logger.warning(
-                "Job '%s': origin has thread_id=%s but delivery target lost it "
-                "(deliver=%s, target=%s)",
-                job["id"], origin_thread, job.get("deliver", "local"), target,
+            same_conversation = (
+                str(origin.get("platform", "")).lower() == str(platform_name).lower()
+                and str(origin.get("chat_id", "")) == str(chat_id)
             )
+            if same_conversation:
+                logger.warning(
+                    "Job '%s': origin has thread_id=%s but delivery target lost it "
+                    "(deliver=%s, target=%s)",
+                    job["id"], origin_thread, job.get("deliver", "local"), target,
+                )
+            else:
+                logger.debug(
+                    "Job '%s': delivering to %s:%s outside origin conversation; "
+                    "origin thread_id=%s not applicable",
+                    job["id"], platform_name, chat_id, origin_thread,
+                )
         elif thread_id:
             logger.debug(
                 "Job '%s': delivering to %s:%s thread_id=%s",
