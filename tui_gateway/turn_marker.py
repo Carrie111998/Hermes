@@ -181,6 +181,10 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
     Reads from the per-session file for ``session_key``; the file is the
     only place session data lives, so this read can never observe another
     session's marker regardless of how many backends share ``HERMES_HOME``.
+    The in-file ``session_key`` stamp is the writer's claim: a marker whose
+    recorded owner disagrees with the requested key is treated as absent, so
+    no caller — including the auto-continue scheduling path, which admits a
+    fresh marker as crash evidence — can act on a foreign marker.
     """
     if not _safe_session_key(session_key):
         return None
@@ -191,6 +195,19 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
     except Exception:
         return None
     if not isinstance(data, dict):
+        return None
+    recorded_owner = data.get("session_key")
+    if recorded_owner is not None and str(recorded_owner) != session_key:
+        # The file claims to belong to another session. The per-session file
+        # name is the primary owner key, but the body stamp must agree too:
+        # a marker whose writer's claim differs from the resumed session is
+        # never crash evidence (issue #94778 / owner-check parity with the
+        # state.db records of #86786).
+        logger.debug(
+            "turn-marker owner mismatch for %s (recorded %s); treating as absent",
+            session_key,
+            recorded_owner,
+        )
         return None
     prompt = str(data.get("prompt") or "")
     if not prompt.strip():

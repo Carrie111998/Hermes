@@ -20,6 +20,9 @@ Contract pinned here:
 
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 
 from tui_gateway import turn_marker
@@ -190,6 +193,40 @@ def test_unsanitized_session_key_returns_none_on_read(tmp_path):
     """Path-traversal session keys are rejected end-to-end (no read either)."""
     record_turn_start(tmp_path, "../escape", "escape prompt", attempts=0)
     assert read_turn_marker(tmp_path, "../escape") is None
+
+
+def test_read_rejects_marker_whose_recorded_owner_differs(tmp_path):
+    """The in-file ``session_key`` stamp is the writer's claim; a read for a
+    different session must treat a mismatching claim as absent.
+
+    The per-session layout already keys the file by session, but the body
+    stamp makes the ownership checkable — this pins the contract that a
+    marker whose recorded owner disagrees with the requested key can never
+    be returned as crash evidence (issue #94778, scheduling-path parity with
+    the owner-checked records of #86786)."""
+    marker_dir = _marker_dir(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    # A file named after session-B whose body claims session-A: this must be
+    # treated exactly like "no marker for B" — not like B's own crash.
+    (marker_dir / "session-B.json").write_text(
+        json.dumps(
+            {
+                "session_key": "session-A",
+                "prompt": "finish the migration",
+                "attempts": 0,
+                "started_at": time.time(),
+            }
+        )
+    )
+
+    assert read_turn_marker(tmp_path, "session-B") is None
+
+    # A matching claim (what ``record_turn_start`` writes) still round-trips,
+    # and a body without the stamp (pre-stamp layout) is still accepted.
+    record_turn_start(tmp_path, "session-B", "B prompt", attempts=1)
+    marker = read_turn_marker(tmp_path, "session-B")
+    assert marker is not None
+    assert marker["prompt"] == "B prompt"
 
 
 def test_module_layout_uses_per_session_subdir():
