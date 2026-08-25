@@ -37,7 +37,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -1310,6 +1310,34 @@ _terminal_cwd_lock = _ReadWriteLock()
 # (stagger schedules / drop the workdir) is actionable.
 _CWD_LOCK_TIMEOUT_FLOOR_SECONDS = 120.0
 _CWD_LOCK_TIMEOUT_MARGIN_SECONDS = 60.0
+
+
+def _inactivity_watchdog_loop(
+    *,
+    get_idle_seconds: Callable[[], float],
+    limit_s: float,
+    poll_s: float,
+    stop: threading.Event,
+    future_done: Callable[[], bool],
+) -> bool:
+    """Poll job idle time until the limit, stop, or the watched future completes.
+
+    Driven by ``threading.Event.wait`` (a kernel timeout), not asyncio, so a
+    blocked event-loop / ``run_job`` thread cannot disable this watchdog the
+    way ``asyncio.sleep`` / ``wait_for`` would (family A of #94285 — the
+    4118s-idle-on-a-600s-limit cron hang). Returns True when *limit_s* of
+    inactivity was observed.
+    """
+    while not stop.wait(poll_s):
+        if future_done():
+            return False
+        try:
+            idle = float(get_idle_seconds() or 0.0)
+        except Exception:
+            idle = 0.0
+        if idle >= limit_s:
+            return True
+    return False
 
 
 def _cron_inactivity_seconds() -> float:
@@ -6159,24 +6187,44 @@ def run_job(
         _audit_t_start = time.monotonic()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
-        try:
+        _watch_stop = threading.Event()
+
+        def _idle_seconds() -> float:
+            if not hasattr(agent, "get_activity_summary"):
+                return 0.0
+            try:
+                _act = agent.get_activity_summary()
+                return float(_act.get("seconds_since_activity", 0.0) or 0.0)
+            except Exception:
+                return 0.0
+
+        def _watch_inactivity() -> None:
+            nonlocal _inactivity_timeout
             if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot or cancel_event is not None:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            _abort_if_fire_claim_lost()
-                            result = _cron_future.result()
-                            break
-                        _abort_if_fire_claim_lost()
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
+                return
+            if _inactivity_watchdog_loop(
+                get_idle_seconds=_idle_seconds,
+                limit_s=_cron_inactivity_limit,
+                poll_s=_POLL_INTERVAL,
+                stop=_watch_stop,
+                future_done=_cron_future.done,
+            ):
+                _inactivity_timeout = True
+
+        _watch_thread = threading.Thread(
+            target=_watch_inactivity,
+            name=f"cron-inactivity-{str(job_id)[:8]}",
+            daemon=True,
+        )
+        try:
+            if _cron_inactivity_limit is not None:
+                # Daemon thread: kernel ``Event.wait`` timeout, independent of
+                # the ``run_job`` thread. A blocked loop / hung
+                # ``get_activity_summary`` on this thread can no longer keep
+                # the 600s inactivity limit from firing (#94285).
+                _watch_thread.start()
+            if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+                result = _cron_future.result()
             else:
                 result = None
                 while True:
@@ -6187,23 +6235,15 @@ def run_job(
                         _abort_if_fire_claim_lost()
                         result = _cron_future.result()
                         break
+                    if _inactivity_timeout:
+                        break
                     _abort_if_fire_claim_lost()
                     _heartbeat_run_claim_if_due()
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
+            _watch_stop.set()
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
         if _inactivity_timeout:
