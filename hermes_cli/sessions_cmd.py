@@ -348,7 +348,26 @@ def cmd_sessions(args, sessions_parser=None):
             sessions = [s for s in sessions if _in_workspace(s)]
 
         if not sessions:
-            print("No sessions found.")
+            if getattr(args, "json_output", False):
+                print("[]")
+            else:
+                print("No sessions found.")
+            return
+
+        if getattr(args, "json_output", False):
+            rows = []
+            for s in sessions:
+                rows.append({
+                    "id": s["id"],
+                    "source": s.get("source", ""),
+                    "title": s.get("title", ""),
+                    "preview": s.get("preview", ""),
+                    "started_at": s.get("started_at", ""),
+                    "last_active": s.get("last_active", ""),
+                    "message_count": s.get("message_count", 0),
+                    "model": s.get("model", ""),
+                })
+            print(_json.dumps(rows, indent=2, ensure_ascii=False))
             return
 
         # Short workspace label: the repo/dir basename, "—" when unbound. The

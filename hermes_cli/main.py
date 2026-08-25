@@ -13561,6 +13561,12 @@ def main():
         help="Only sessions in one workspace: a git repo root or project dir "
         "(matched by path substring or basename).",
     )
+    sessions_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print sessions as a JSON array (one object per session).",
+    )
 
     def _add_session_filter_args(p, default_older_help):
         p.add_argument(
