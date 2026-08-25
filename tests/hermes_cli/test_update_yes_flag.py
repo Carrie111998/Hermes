@@ -9,10 +9,33 @@ Covers:
 """
 
 import subprocess
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cmd_update(monkeypatch):
+    import hermes_cli.gateway as hermes_gateway
+    import hermes_cli.main as hermes_main
+
+    # These tests cover prompt behavior, not module purging or fleet restart.
+    # Retain the no-live-gateway stubs so cmd_update cannot rediscover and
+    # signal a developer's running gateway after the simulated pull.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(
+        hermes_main, "_finish_dashboard_update_cleanup", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
+    )
+    monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
 
 
 def _make_run_side_effect(

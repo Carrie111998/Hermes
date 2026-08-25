@@ -257,11 +257,23 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
         hermes_main, "_park_stashed_changes",
         lambda *a, **kw: park_calls.append(a) or None,
     )
+    # This test owns the gateway stubs below. The upstream stale-module purge
+    # is tested separately; allowing it here would discard those stubs and
+    # rediscover a developer's live gateway from inside the unit test.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     # Keep the update flow away from the real gateway fleet on this machine —
     # a live gateway PID would trip the test-suite kill guard and turn the
     # run into exit 1 (gateway_fleet_restart_incomplete).
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        lambda *a, **kw: [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.supports_systemd_services", lambda: False, raising=False
     )
     return restore_calls, discard_calls, park_calls
 
