@@ -30,7 +30,7 @@ import { resolveProfileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
-import { $activeConnectionId } from '@/store/connections'
+import { $activeConnectionId, $connectionsRegistry, $hasMultipleConnections } from '@/store/connections'
 import { $cronJobs } from '@/store/cron'
 import { $bindings } from '@/store/keybinds'
 import {
@@ -147,6 +147,7 @@ import type { SidebarNavItem } from '../../types'
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
+import { NewSessionSourcePicker } from './new-session-source-picker'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
@@ -294,6 +295,10 @@ function searchResultToSession(result: SessionSearchResult): SessionInfo {
 interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   currentView: AppView
   onNavigate: (item: SidebarNavItem) => void
+  /** Start a brand-new session on a specific registered source. Used by the
+   *  new-session source picker; undefined on single-connection installs (where
+   *  the plain one-click new-session behavior is kept). */
+  onStartSessionOnSource?: (connectionId: string) => void
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
   onResumeSession: (sessionId: string) => void
@@ -310,6 +315,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
 export function ChatSidebar({
   currentView,
   onNavigate,
+  onStartSessionOnSource,
   onLoadMoreSessions,
   onLoadMoreMessaging,
   onResumeSession,
@@ -324,6 +330,10 @@ export function ChatSidebar({
   const { t } = useI18n()
   const s = t.sidebar
   const { pathname } = useLocation()
+  // Per-session source picker data: only surfaced when more than one
+  // connection is registered, so single-source installs see zero change.
+  const hasMultipleConnections = useStore($hasMultipleConnections)
+  const connectionsRegistry = useStore($connectionsRegistry)
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
   // below the built-ins with the same chrome; active = at their route.
   const navContributions = useContributions(SIDEBAR_NAV_AREA)
@@ -1482,6 +1492,10 @@ export function ChatSidebar({
                   (Boolean(item.route) && pathname === item.route)
 
                 const isNewSession = item.id === 'new-session'
+                // With more than one connection, "new session" lets you pick
+                // which source it runs on instead of always using the active
+                // agent. Single-connection installs keep the historical click.
+                const pickSource = isNewSession && hasMultipleConnections
 
                 const button = (
                   <SidebarMenuButton
@@ -1501,6 +1515,13 @@ export function ChatSidebar({
                         'cursor-default hover:border-transparent hover:bg-transparent hover:text-inherit'
                     )}
                     onClick={() => {
+                      // When the source picker is shown, the click opens it
+                      // (the DropdownMenu trigger handles that); here we must
+                      // NOT navigate or the picker would never appear.
+                      if (pickSource) {
+                        return
+                      }
+
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →
                       // no swap. The switcher header is the single place to
@@ -1534,13 +1555,27 @@ export function ChatSidebar({
                   </SidebarMenuButton>
                 )
 
+                // With multiple connections, the new-session button opens the
+                // per-session source picker (dropdown) instead of acting
+                // directly; the picker chooses the target and starts the draft.
+                const trigger = pickSource ? (
+                  <NewSessionSourcePicker
+                    activeConnectionId={activeConnectionId}
+                    connections={connectionsRegistry?.connections ?? []}
+                    onPick={connectionId => onStartSessionOnSource?.(connectionId)}
+                    trigger={button}
+                  />
+                ) : (
+                  button
+                )
+
                 // New session + route-backed pages can open in a split —
                 // right-click for the directional "Open in split" submenu.
                 return (
                   <SidebarMenuItem key={item.id}>
                     {isNewSession || item.route ? (
                       <ContextMenu>
-                        <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
+                        <ContextMenuTrigger asChild>{trigger}</ContextMenuTrigger>
                         <ContextMenuContent aria-label={s.nav[item.id] ?? item.label}>
                           <SplitSubmenu
                             kit={CONTEXT_SPLIT_KIT}

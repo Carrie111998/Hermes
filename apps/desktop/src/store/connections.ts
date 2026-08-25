@@ -244,3 +244,25 @@ export async function selectConnection(connectionId: string): Promise<void> {
     }
   }
 }
+
+/**
+ * Start a brand-new session on a specific registered source (the per-session
+ * "where does this session run?" affordance). Same source → just open a fresh
+ * draft on the active profile (the historical one-click behavior). A different
+ * source → re-home there first via `selectConnection` (which also lands on a
+ * fresh intro draft), then open the draft to be explicit. Throws if the target
+ * source cannot become active, leaving the current session untouched.
+ */
+export async function startSessionOnSource(
+  connectionId: string,
+  startFreshSessionDraft: () => void
+): Promise<void> {
+  if (connectionId === $activeConnectionId.get()) {
+    startFreshSessionDraft()
+
+    return
+  }
+
+  await selectConnection(connectionId)
+  startFreshSessionDraft()
+}
