@@ -4,6 +4,8 @@ This ledger covers the Agent-owned portion of the canonical design in
 [Gateway PR #215](https://github.com/NousResearch/gateway-gateway/pull/215) at
 `600bbf5f181a89e5e54f8ed494c94aa8f8687b01`. The implementation is one unified
 [Hermes Agent PR #94266](https://github.com/NousResearch/hermes-agent/pull/94266).
+Earlier staging drafts #93609 and #93637 are closed and superseded; neither is
+a delivery dependency.
 
 ## Pinned contract and QA catalog
 
