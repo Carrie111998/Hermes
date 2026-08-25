@@ -22,6 +22,7 @@ from typing import Optional
 
 from gateway.config import Platform
 from gateway.session import SessionSource
+from gateway.transport_provenance import TransportProvenance
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
@@ -258,32 +259,39 @@ class GatewayAuthorizationMixin:
             return str(value) if value else None
         return None
 
-    def _adapter_for_transport_slot(self, transport_slot, transport_profile):
-        """Re-resolve the live adapter for a recorded owner + slot pair.
+    def _capture_transport_provenance(self, source) -> Optional[TransportProvenance]:
+        """Record the exact ingress adapter of *source* as one atomic pair.
+
+        The two dimensions are read behind a single failure boundary and only
+        a complete pair is returned: half a return address would later be
+        replayed as a guessed transport, so an incomplete read records nothing
+        and the completion takes the legacy path instead.
+        """
+        try:
+            profile = (self._transport_owner_profile(source) or "").strip()
+            slot = (self._ingress_transport_slot(source) or "").strip()
+        except Exception:
+            return None
+        if not profile or not slot:
+            return None
+        return TransportProvenance(profile, slot)
+
+    def _adapter_for_provenance(self, provenance: TransportProvenance):
+        """Re-resolve the live adapter a recorded provenance pair names.
 
         Exact provenance, so the lookup is the recorded slot rather than the
         logical platform: no alias resolution, and a miss means the ingress
-        transport is gone and the caller must fail closed.
+        transport is gone and the caller must fail closed. An adapter object
+        captured at commissioning time cannot be held across a completion —
+        the reconnect path may have replaced it, or the process may have
+        restarted — so provenance is a name, turned back here into whatever
+        adapter is live now.
         """
-        if not transport_slot:
-            return None
         try:
-            platform = Platform(str(transport_slot))
+            platform = Platform(str(provenance.slot))
         except (ValueError, KeyError):
             return None
-        return self._authorization_adapter(platform, transport_profile or None)
-
-    def _adapter_for_transport_profile(self, platform, transport_profile):
-        """Re-resolve the currently live adapter for a recorded provenance token.
-
-        An adapter object captured at commissioning time cannot be held across a
-        completion: the reconnect path may have replaced it, or the process may
-        have restarted. Provenance is a name, and this turns it back into
-        whatever adapter is live now.
-        """
-        if not transport_profile:
-            return None
-        return self._authorization_adapter(platform, transport_profile)
+        return self._authorization_adapter(platform, provenance.profile or None)
 
     def _adapter_authorization_is_upstream(
         self,

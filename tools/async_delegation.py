@@ -49,6 +49,12 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
+from gateway.transport_provenance import (
+    PROVENANCE_KEYS,
+    provenance_fields,
+    provenance_from_session_env,
+    read_provenance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -213,11 +219,22 @@ _ROUTING_ORIGIN_FIELDS = (
     ("user_id", "HERMES_SESSION_USER_ID"),
     ("user_name", "HERMES_SESSION_USER_NAME"),
     ("profile", "HERMES_SESSION_PROFILE"),
-    ("transport_profile", "HERMES_SESSION_TRANSPORT_PROFILE"),
-    ("transport_slot", "HERMES_SESSION_TRANSPORT_SLOT"),
 )
 
-_ROUTING_ORIGIN_KEYS = tuple(key for key, _ in _ROUTING_ORIGIN_FIELDS)
+# The transport provenance pair is deliberately not in the tuple above: it is
+# captured, persisted and replayed as one unit (see gateway.transport_provenance)
+# so no leg of this path can emit half a return address.
+_ROUTING_ORIGIN_KEYS = tuple(key for key, _ in _ROUTING_ORIGIN_FIELDS) + PROVENANCE_KEYS
+
+
+def _copy_routing_origin(source: Any, event: Dict[str, Any]) -> None:
+    """Replay a recorded return address from *source* onto *event*."""
+    for key, _ in _ROUTING_ORIGIN_FIELDS:
+        if source.get(key):
+            event[key] = source[key]
+    provenance = read_provenance(source)
+    if any(provenance):
+        event.update(provenance_fields(provenance))
 
 
 def _capture_routing_origin() -> Dict[str, Any]:
@@ -242,6 +259,9 @@ def _capture_routing_origin() -> Dict[str, Any]:
             value = get_session_env(env_name, "")
             if value:
                 origin[evt_key] = value
+        provenance = provenance_from_session_env(get_session_env)
+        if any(provenance):
+            origin.update(provenance_fields(provenance))
     except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
         pass
     return origin
@@ -384,9 +404,7 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
-            for _k in _ROUTING_ORIGIN_KEYS:
-                if task.get(_k):
-                    event[_k] = task[_k]
+            _copy_routing_origin(task, event)
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -995,9 +1013,7 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in _ROUTING_ORIGIN_KEYS:
-        if record.get(_k):
-            evt[_k] = record[_k]
+    _copy_routing_origin(record, evt)
     # Structured stall metadata (#51690) — additive, present only on
     # stall-monitor finalizations.
     for _k in (
@@ -1209,9 +1225,7 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in _ROUTING_ORIGIN_KEYS:
-        if event_record.get(_k):
-            evt[_k] = event_record[_k]
+    _copy_routing_origin(event_record, evt)
     # Structured stall metadata (#51690) — additive, present only on
     # stall-monitor finalizations.
     for _k in (

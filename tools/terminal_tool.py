@@ -50,6 +50,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
+from gateway.transport_provenance import (
+    provenance_fields,
+    provenance_from_session_env,
+    read_provenance,
+    stamp_provenance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3489,16 +3495,14 @@ def terminal_tool(
                             proc_session.watcher_profile = _gse(
                                 "HERMES_SESSION_PROFILE", ""
                             )
-                            # ...and the profile owning the adapter it arrived
-                            # on, which is the bot that must answer.
-                            proc_session.watcher_transport_profile = _gse(
-                                "HERMES_SESSION_TRANSPORT_PROFILE", ""
-                            )
-                            # ...and which of that profile's adapter slots
-                            # received it, so a relay-fronted platform is not
+                            # ...and the exact adapter it arrived on: the
+                            # owning profile plus that map's slot, stamped as
+                            # one pair so a relay-fronted platform is never
                             # answered by a native adapter for the same one.
-                            proc_session.watcher_transport_slot = _gse(
-                                "HERMES_SESSION_TRANSPORT_SLOT", ""
+                            stamp_provenance(
+                                proc_session,
+                                provenance_from_session_env(_gse),
+                                prefix="watcher_",
                             )
                             # Stamp the spawning conversation's session-db id
                             # so the gateway's completion pre-flight
@@ -3549,8 +3553,9 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "profile": proc_session.watcher_profile,
-                            "transport_profile": proc_session.watcher_transport_profile,
-                            "transport_slot": proc_session.watcher_transport_slot,
+                            **provenance_fields(
+                                read_provenance(proc_session, prefix="watcher_")
+                            ),
                             "notify_on_complete": True,
                             "parent_session_id": proc_session.parent_session_id,
                         })

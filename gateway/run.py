@@ -2669,7 +2669,14 @@ from gateway.session_state import (
     legacy_dict_property,
     legacy_lease_token_property,
 )
-from gateway.authz_mixin import GatewayAuthorizationMixin, TRANSPORT_PROFILE_DEFAULT
+from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.transport_provenance import (
+    EXACT,
+    MALFORMED,
+    classify_provenance,
+    provenance_fields,
+    read_provenance,
+)
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
@@ -24687,15 +24694,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         # The only point where the receiving adapter is still reachable from
-        # the source (see _transport_owner_profile).
-        try:
-            _transport_profile = self._transport_owner_profile(context.source) or ""
-        except Exception:
-            _transport_profile = ""
-        try:
-            _transport_slot = self._ingress_transport_slot(context.source) or ""
-        except Exception:
-            _transport_slot = ""
+        # the source (see _capture_transport_provenance).
+        _provenance = self._capture_transport_provenance(context.source)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -24711,8 +24711,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
-            transport_profile=_transport_profile,
-            transport_slot=_transport_slot,
+            **provenance_fields(_provenance),
             async_delivery=_async_delivery,
             cron_session="",
         )
@@ -25360,6 +25359,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = None
+        _provenance = read_provenance(evt)
         _return_address = (
             "platform=%s chat_type=%s chat_id=%s thread=%s scope=%s "
             "runtime profile=%r transport provenance=%r slot=%r "
@@ -25370,42 +25370,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(source, "thread_id", None),
                 getattr(source, "scope_id", None),
                 getattr(source, "profile", None),
-                str(evt.get("transport_profile") or "") or None,
-                str(evt.get("transport_slot") or "") or None,
+                _provenance.profile or None,
+                _provenance.slot or None,
                 sorted(getattr(self, "_profile_adapters", None) or {}) or "none",
             )
         )
-        # Provenance wins over ``source.profile``, the runtime namespace: one
-        # credential can serve several runtimes, so resolving from the runtime
-        # drops the completion or answers from another bot.
-        _transport_profile = str(evt.get("transport_profile") or "").strip() or None
-        _provenance_is_default = _transport_profile == TRANSPORT_PROFILE_DEFAULT
-        # Owner map plus slot is exact: it names the one adapter the turn
-        # arrived on, so no alias resolution runs. Without it a default owner
-        # cannot tell a relay-fronted platform from a native one, and
-        # resolve_delivery_transport answers out of the native bot by contract.
-        _transport_slot = str(evt.get("transport_slot") or "").strip() or None
-        if _transport_slot and _transport_slot not in (
-            platform_name, Platform.RELAY.value,
-        ):
-            # Capture only ever records the logical platform's own slot or
-            # relay, so a third value is a damaged record: fall back to the
-            # chain below instead of delivering out of an unrelated platform.
-            logger.debug(
-                "Ignoring transport slot %r: not a slot the %s turn could "
-                "have arrived on",
-                _transport_slot, platform_name,
+        # owner map plus slot names the one adapter the turn arrived on, so no
+        # alias resolution runs. either dimension alone is a guess — a default
+        # owner cannot tell a relay-fronted platform from a native one — so a
+        # partial or contradictory pair is dropped rather than resolved.
+        _record_class = classify_provenance(_provenance, platform_name)
+        if _record_class == MALFORMED:
+            logger.warning(
+                "Dropping watch notification for process %s: incomplete or "
+                "contradictory transport provenance — %s",
+                evt.get("session_id", "unknown"),
+                _return_address,
             )
-            _transport_slot = None
-        if _transport_slot:
+            return None
+        if _record_class == EXACT:
             try:
-                adapter = self._adapter_for_transport_slot(
-                    _transport_slot, _transport_profile,
-                )
+                adapter = self._adapter_for_provenance(_provenance)
             except Exception as exc:
                 logger.debug(
-                    "Transport-slot adapter resolution failed for %s/%s: %s",
-                    _transport_profile, _transport_slot, exc,
+                    "Transport-provenance adapter resolution failed for %s/%s: %s",
+                    _provenance.profile, _provenance.slot, exc,
                 )
                 adapter = None
             if adapter is None:
@@ -25413,37 +25402,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Dropping watch notification for process %s: ingress "
                     "transport %r/%r is no longer live — %s",
                     evt.get("session_id", "unknown"),
-                    _transport_profile,
-                    _transport_slot,
+                    _provenance.profile,
+                    _provenance.slot,
                     _return_address,
                 )
                 return None
-        elif _transport_profile and not _provenance_is_default:
-            # A named profile owns the transport, so fail closed on a miss
-            # rather than delivering out of another profile's bot.
-            try:
-                adapter = self._adapter_for_transport_profile(
-                    source.platform, _transport_profile,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Transport-provenance adapter resolution failed for %s: %s",
-                    _transport_profile, exc,
-                )
-                adapter = None
-            if adapter is None:
-                logger.warning(
-                    "Dropping watch notification for process %s: transport "
-                    "provenance %r has no live adapter — %s",
-                    evt.get("session_id", "unknown"),
-                    _transport_profile,
-                    _return_address,
-                )
-                return None
-        elif not _provenance_is_default:
-            # No provenance recorded: resolve from the runtime profile, which
-            # is correct for the dedicated-adapter-per-profile topology and
-            # fails closed on an unknown profile.
+        else:
+            # Legacy record, from before provenance was recorded: resolve from
+            # the runtime profile, which is correct for the
+            # dedicated-adapter-per-profile topology and fails closed on an
+            # unknown profile.
             try:
                 adapter = self._adapter_for_source(source)
             except Exception as exc:
@@ -25452,11 +25420,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_name, getattr(source, "profile", None), exc,
                 )
                 adapter = None
-        # The fallbacks below read the default profile's map, so without
-        # provenance a source stamped with a secondary profile that owns a
-        # registry entry must not reach them (as ``_authorization_adapter``).
+        # The fallbacks below read the default profile's map, so a legacy source
+        # stamped with a secondary profile that owns a registry entry must not
+        # reach them (as ``_authorization_adapter``).
         _profile_name = (getattr(source, "profile", None) or "").strip() or None
-        _fallback_ok = _provenance_is_default or not (
+        _fallback_ok = not (
             _profile_name
             and _profile_name != "default"
             and _profile_name in (getattr(self, "_profile_adapters", None) or {})
@@ -26304,8 +26272,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Runtime namespace and, separately, the transport the
                         # turn arrived on; delivery re-resolves the latter.
                         "profile": watcher.get("profile", ""),
-                        "transport_profile": watcher.get("transport_profile", ""),
-                        "transport_slot": watcher.get("transport_slot", ""),
+                        **provenance_fields(read_provenance(watcher)),
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
                         "exit_code": session.exit_code,

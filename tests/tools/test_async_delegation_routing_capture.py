@@ -87,6 +87,26 @@ def test_capture_records_the_slack_workspace_scope(slack_turn):
     assert origin["transport_slot"] == "relay"
 
 
+def test_a_damaged_context_is_captured_as_a_pair_not_completed():
+    """A half provenance context stays visibly half, so delivery can drop it."""
+    tokens = set_session_vars(
+        platform="slack",
+        chat_id="C0CHANNEL",
+        session_key="agent:main:slack:group:C0CHANNEL",
+        transport_profile="default",
+    )
+    try:
+        origin = ad._capture_routing_origin()
+    finally:
+        clear_session_vars(tokens)
+
+    assert origin["transport_profile"] == "default"
+    assert origin["transport_slot"] == "", (
+        "the missing half was omitted instead of recorded, so the completion "
+        "would be replayed as a legacy record and alias-resolved"
+    )
+
+
 def test_capture_outside_a_gateway_turn_is_empty():
     """CLI / contextvar-unaware paths persist nothing new."""
     tokens = set_session_vars()

@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional
 from hermes_cli.config import get_hermes_home
 
 from agent.redact import redact_sensitive_text
+from gateway.transport_provenance import provenance_fields, read_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -389,8 +390,7 @@ def _watcher_return_address(session: "ProcessSession") -> Dict[str, Any]:
         "thread_id": session.watcher_thread_id,
         "message_id": session.watcher_message_id,
         "profile": session.watcher_profile,
-        "transport_profile": session.watcher_transport_profile,
-        "transport_slot": session.watcher_transport_slot,
+        **provenance_fields(read_provenance(session, prefix="watcher_")),
     }
 
 
@@ -427,14 +427,11 @@ class ProcessSession:
     watcher_scope_id: str = ""
     # Runtime namespace this process's turn was routed to.
     watcher_profile: str = ""
-    # The profile owning the adapter the commissioning turn arrived on, which is
-    # distinct from watcher_profile when one credential serves several routed
-    # runtimes. A name, never an adapter object, so it survives reconnects and
-    # restarts and is re-resolved to whatever adapter is live at completion.
+    # One atomic pair — never written apart (see gateway.transport_provenance):
+    # the profile owning the adapter the commissioning turn arrived on, and the
+    # slot in that map which received it. Names, never adapter objects, so they
+    # survive reconnects and are re-resolved to whatever is live at completion.
     watcher_transport_profile: str = ""
-    # Which adapter slot in that map received it, as a platform value: "relay"
-    # for relay ingress, the platform's own value for native ingress. Owner
-    # alone cannot tell the two apart when both front the same platform.
     watcher_transport_slot: str = ""
     watcher_user_id: str = ""
     watcher_user_name: str = ""
@@ -2786,8 +2783,10 @@ class ProcessRegistry:
                             "watcher_chat_type": s.watcher_chat_type,
                             "watcher_scope_id": s.watcher_scope_id,
                             "watcher_profile": s.watcher_profile,
-                            "watcher_transport_profile": s.watcher_transport_profile,
-                            "watcher_transport_slot": s.watcher_transport_slot,
+                            **provenance_fields(
+                                read_provenance(s, prefix="watcher_"),
+                                prefix="watcher_",
+                            ),
                             "watcher_user_id": s.watcher_user_id,
                             "watcher_user_name": s.watcher_user_name,
                             "watcher_thread_id": s.watcher_thread_id,
@@ -2890,8 +2889,9 @@ class ProcessRegistry:
                 watcher_chat_type=entry.get("watcher_chat_type", ""),
                 watcher_scope_id=entry.get("watcher_scope_id", ""),
                 watcher_profile=entry.get("watcher_profile", ""),
-                watcher_transport_profile=entry.get("watcher_transport_profile", ""),
-                watcher_transport_slot=entry.get("watcher_transport_slot", ""),
+                **provenance_fields(
+                    read_provenance(entry, prefix="watcher_"), prefix="watcher_"
+                ),
                 watcher_user_id=entry.get("watcher_user_id", ""),
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),

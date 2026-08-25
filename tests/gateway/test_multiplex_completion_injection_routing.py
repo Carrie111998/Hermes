@@ -119,7 +119,9 @@ def _shared_primary_event(**overrides):
     """A shared-primary Matrix completion whose runtime and transport disagree."""
     evt = _alpha_event()
     evt["profile"] = "alpha"
+    # Capture always stamps the pair, so every well-formed record carries both.
     evt["transport_profile"] = "default"
+    evt["transport_slot"] = "matrix"
     evt.update(overrides)
     return evt
 
@@ -247,6 +249,7 @@ async def test_completion_routes_correctly_after_a_gateway_restart(tmp_path, mon
         watcher_message_id="$evt",
         watcher_profile="alpha",
         watcher_transport_profile="default",
+        watcher_transport_slot="matrix",
         watcher_interval=5,
         notify_on_complete=True,
     )
@@ -265,6 +268,7 @@ async def test_completion_routes_correctly_after_a_gateway_restart(tmp_path, mon
         w for w in restarted.pending_watchers if w["session_id"] == "proc_restart_1"
     )
     assert watcher["transport_profile"] == "default"
+    assert watcher["transport_slot"] == "matrix"
     assert watcher["chat_type"] == "group"
     assert watcher["chat_id"] == "!room:example.org"
 
@@ -287,6 +291,7 @@ async def test_completion_routes_correctly_after_a_gateway_restart(tmp_path, mon
         "user_id": watcher["user_id"],
         "profile": watcher["profile"],
         "transport_profile": watcher["transport_profile"],
+        "transport_slot": watcher["transport_slot"],
         "status": "completed",
     }
 
@@ -331,6 +336,7 @@ async def test_async_delegation_matrix_colon_room_id_routes_to_the_full_id():
         "user_id": "@user:example.org",
         "profile": "alpha",
         "transport_profile": "alpha",
+        "transport_slot": "matrix",
         "status": "completed",
     }
 
@@ -355,6 +361,7 @@ async def test_async_delegation_slack_scoped_session_routes_to_the_channel():
         "scope_id": "T0WORKSPACE",
         "user_id": "U0USER",
         "transport_profile": "default",
+        "transport_slot": "slack",
         "status": "completed",
     }
 
@@ -413,6 +420,10 @@ async def test_relay_ingress_records_default_provenance():
     assert runner._ingress_transport_slot(source) == "relay", (
         "the owner map alone cannot tell relay ingress from native ingress "
         "when both front the same logical platform"
+    )
+    assert runner._capture_transport_provenance(source) == ("default", "relay"), (
+        "the pair must be captured atomically — a half record is dropped at "
+        "delivery, not resolved"
     )
 
 
