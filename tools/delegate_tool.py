@@ -1855,6 +1855,7 @@ def _build_child_agent(
     # invalid review value can fall back to the already-resolved result.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
+    child_reasoning_override = None
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
@@ -1866,6 +1867,7 @@ def _build_child_agent(
             parsed = parse_reasoning_effort(delegation_effort)
             if parsed is not None:
                 child_reasoning = parsed
+                child_reasoning_override = parsed
             else:
                 logger.warning(
                     "Unknown delegation.reasoning_effort '%s', inheriting parent level",
@@ -1891,6 +1893,7 @@ def _build_child_agent(
             parsed = parse_reasoning_effort(override_reasoning_effort)
             if parsed is not None:
                 child_reasoning = parsed
+                child_reasoning_override = parsed
             else:
                 logger.warning(
                     "Unknown auxiliary.review.reasoning_effort '%s', "
@@ -2044,6 +2047,15 @@ def _build_child_agent(
                 except Exception:
                     pass
             raise
+    # Fallback activation normally re-resolves reasoning for the fallback
+    # model. Preserve an explicit delegation or review level across that
+    # transport switch; provider adapters still clamp unsupported levels at
+    # request construction time.
+    child._delegation_reasoning_override = (
+        dict(child_reasoning_override)
+        if isinstance(child_reasoning_override, dict)
+        else None
+    )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can

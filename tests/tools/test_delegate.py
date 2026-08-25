@@ -1454,6 +1454,32 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
+    def test_invalid_review_and_delegation_reasoning_fall_back_to_parent(
+        self, MockAgent, mock_cfg
+    ):
+        """Invalid values at both override levels retain parent reasoning."""
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "reasoning_effort": "invalid-delegation",
+        }
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        with self.assertLogs("tools.delegate_tool", level="WARNING"):
+            _build_child_agent(
+                task_index=0, goal="test", context=None, toolsets=None,
+                model=None, max_iterations=50, parent_agent=parent,
+                task_count=1, override_reasoning_effort="invalid-review",
+            )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"],
+            {"enabled": True, "effort": "xhigh"},
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
     def test_review_override_is_per_call_and_does_not_leak(self, MockAgent, mock_cfg):
         """A review override does not mutate the parent or later children."""
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
@@ -1508,6 +1534,41 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         self.assertEqual(
             MockAgent.call_args[1]["reasoning_config"],
             {"enabled": True, "effort": "high"},
+        )
+        self.assertEqual(
+            child._delegation_reasoning_override,
+            {"enabled": True, "effort": "high"},
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("run_agent.AIAgent")
+    def test_ordinary_delegate_task_keeps_delegation_reasoning(
+        self, MockAgent, mock_creds, mock_cfg
+    ):
+        """Ordinary delegation still uses its configured reasoning level."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "low"}
+        mock_creds.return_value = {
+            "provider": None,
+            "model": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        child = _make_role_mock_child()
+        MockAgent.return_value = child
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        delegate_task(goal="ordinary child", parent_agent=parent)
+
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"],
+            {"enabled": True, "effort": "low"},
+        )
+        self.assertEqual(
+            child._delegation_reasoning_override,
+            {"enabled": True, "effort": "low"},
         )
 
 # =========================================================================

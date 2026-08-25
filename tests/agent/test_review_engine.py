@@ -286,6 +286,74 @@ def test_start_review_loads_credentials_and_reasoning_from_one_snapshot(monkeypa
     assert captured["override_reasoning_effort"] == "high"
 
 
+def test_start_review_resolves_real_config_into_child(tmp_path, monkeypatch):
+    """The live config and delegation path agree at child construction."""
+    import run_agent
+    import tools.delegate_tool as dt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n"
+        "  reasoning_effort: low\n"
+        "auxiliary:\n"
+        "  review:\n"
+        "    model: review-model\n"
+        "    base_url: https://review.invalid/v1\n"
+        "    reasoning_effort: high\n",
+        encoding="utf-8",
+    )
+
+    constructed = {}
+    child = MagicMock()
+    child._delegate_role = "leaf"
+
+    def fake_agent(**kwargs):
+        constructed.update(kwargs)
+        return child
+
+    monkeypatch.setattr(run_agent, "AIAgent", fake_agent)
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda *args, **kwargs: {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 0,
+            "duration_seconds": 0.0,
+            "model": "review-model",
+            "exit_reason": "completed",
+        },
+    )
+
+    parent = _fake_parent()
+    parent.base_url = "https://parent.invalid/v1"
+    parent.api_key = "parent-key"
+    parent.provider = "openrouter"
+    parent.api_mode = "chat_completions"
+    parent.model = "parent-model"
+    parent.reasoning_config = {"enabled": True, "effort": "medium"}
+    parent.enabled_toolsets = ["terminal", "file"]
+    parent.disabled_toolsets = []
+    parent._session_db = None
+    parent._fallback_chain = []
+
+    result = start_review(
+        parent,
+        [{"role": "user", "content": "review this"}],
+    )
+
+    assert result["status"] == "dispatched"
+    assert constructed["model"] == "review-model"
+    assert constructed["provider"] == "custom"
+    assert constructed["base_url"] == "https://review.invalid/v1"
+    assert constructed["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert child._delegation_reasoning_override == {
+        "enabled": True,
+        "effort": "high",
+    }
+
+
 # ---------------------------------------------------------------------------
 # delegate_task credentials_cfg override (the internal /review routing hook)
 # ---------------------------------------------------------------------------
