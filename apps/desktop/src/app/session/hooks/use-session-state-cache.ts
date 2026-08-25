@@ -36,6 +36,8 @@ interface SessionStateCacheOptions {
   setMessages: (messages: ChatMessage[]) => void
 }
 
+const VIEW_SYNC_FALLBACK_MS = 100
+
 function syncRuntimeMetadataToView(state: ClientSessionState) {
   setCurrentModel(state.model ?? '')
   setCurrentProvider(state.provider ?? '')
@@ -114,6 +116,7 @@ export function useSessionStateCache({
   const sessionStateCache = sessionStateByRuntimeIdRef.current
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
+  const viewSyncFallbackTimerRef = useRef<number | null>(null)
   // Runtime id whose transcript currently occupies `$messages` — lets the
   // flush below tell a same-session refresh from a thread switch.
   const viewSessionIdRef = useRef<string | null>(null)
@@ -181,7 +184,7 @@ export function useSessionStateCache({
   )
 
   const resetViewSync = useCallback(() => {
-    // Drop any RAF-pending transcript stage so a backgrounded turn cannot
+    // Drop any pending transcript stage so a backgrounded turn cannot
     // repaint over the chat the user just switched to (#47709 / #47743).
     pendingViewStateRef.current = null
     viewSessionIdRef.current = null
@@ -189,6 +192,11 @@ export function useSessionStateCache({
     if (viewSyncRafRef.current !== null && typeof window !== 'undefined') {
       window.cancelAnimationFrame(viewSyncRafRef.current)
       viewSyncRafRef.current = null
+    }
+
+    if (viewSyncFallbackTimerRef.current !== null && typeof window !== 'undefined') {
+      window.clearTimeout(viewSyncFallbackTimerRef.current)
+      viewSyncFallbackTimerRef.current = null
     }
   }, [])
 
@@ -276,12 +284,17 @@ export function useSessionStateCache({
           viewSyncRafRef.current = null
         }
 
+        if (viewSyncFallbackTimerRef.current !== null && typeof window !== 'undefined') {
+          window.clearTimeout(viewSyncFallbackTimerRef.current)
+          viewSyncFallbackTimerRef.current = null
+        }
+
         flushPendingViewState()
 
         return
       }
 
-      if (viewSyncRafRef.current !== null) {
+      if (viewSyncRafRef.current !== null || viewSyncFallbackTimerRef.current !== null) {
         return
       }
 
@@ -291,10 +304,28 @@ export function useSessionStateCache({
         return
       }
 
-      viewSyncRafRef.current = window.requestAnimationFrame(() => {
+      const flushFromAnimationFrame = () => {
         viewSyncRafRef.current = null
+
+        if (viewSyncFallbackTimerRef.current !== null) {
+          window.clearTimeout(viewSyncFallbackTimerRef.current)
+          viewSyncFallbackTimerRef.current = null
+        }
+
         flushPendingViewState()
-      })
+      }
+
+      viewSyncRafRef.current = window.requestAnimationFrame(flushFromAnimationFrame)
+      viewSyncFallbackTimerRef.current = window.setTimeout(() => {
+        viewSyncFallbackTimerRef.current = null
+
+        if (viewSyncRafRef.current !== null) {
+          window.cancelAnimationFrame(viewSyncRafRef.current)
+          viewSyncRafRef.current = null
+        }
+
+        flushPendingViewState()
+      }, VIEW_SYNC_FALLBACK_MS)
     },
     [flushPendingViewState]
   )
@@ -304,6 +335,11 @@ export function useSessionStateCache({
       if (viewSyncRafRef.current !== null && typeof window !== 'undefined') {
         window.cancelAnimationFrame(viewSyncRafRef.current)
         viewSyncRafRef.current = null
+      }
+
+      if (viewSyncFallbackTimerRef.current !== null && typeof window !== 'undefined') {
+        window.clearTimeout(viewSyncFallbackTimerRef.current)
+        viewSyncFallbackTimerRef.current = null
       }
     },
     []
