@@ -405,6 +405,55 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_senv_command(self, event: MessageEvent) -> str:
+        """Handle /senv — persist a secret without sending it to the model."""
+        from hermes_cli.senv import (
+            DELETE_USER_MESSAGE_HINT,
+            maybe_delete_user_senv_message,
+            run_senv,
+        )
+
+        args = event.get_command_args().strip()
+        multiplexed = getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        source = getattr(event, "source", None)
+
+        def _run() -> str:
+            return run_senv(args, messenger=True).text
+
+        if multiplexed:
+            try:
+                from gateway.run import _profile_runtime_scope
+
+                profile_home = self._resolve_profile_home_for_source(source)
+                if profile_home is None:
+                    return (
+                        "Could not resolve the profile env for this chat. "
+                        "Secret was not saved."
+                    )
+                with _profile_runtime_scope(profile_home):
+                    text = _run()
+            except Exception:
+                logger.debug("senv multiplex write aborted", exc_info=True)
+                return (
+                    "Could not resolve the profile env for this chat. "
+                    "Secret was not saved."
+                )
+        else:
+            text = _run()
+
+        adapter = None
+        if source is not None:
+            adapter_fn = getattr(self, "_adapter_for_source", None)
+            if callable(adapter_fn):
+                try:
+                    adapter = adapter_fn(source)
+                except Exception:
+                    adapter = None
+        deleted = await maybe_delete_user_senv_message(adapter, event, enabled=False)
+        if deleted and DELETE_USER_MESSAGE_HINT in text:
+            text = text.replace(f" {DELETE_USER_MESSAGE_HINT}", "")
+        return text
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 

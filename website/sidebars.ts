@@ -37,6 +37,7 @@ const sidebars: SidebarsConfig = {
           collapsed: true,
           items: [
             'user-guide/secrets/index',
+            'user-guide/secrets/senv',
             'user-guide/secrets/bitwarden',
             'user-guide/secrets/onepassword',
           ],

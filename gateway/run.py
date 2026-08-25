@@ -16482,6 +16482,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "help": self._handle_help_command,
                 "commands": self._handle_commands_command,
                 "profile": self._handle_profile_command,
+                "senv": self._handle_senv_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
             }.get(name)
@@ -17542,6 +17543,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # before (telemetry-style hooks keep working).
         if command and is_gateway_known_command(canonical):
             raw_args = event.get_command_args().strip()
+            from hermes_cli.senv import redact_senv_hook_args
+
+            raw_args = redact_senv_hook_args(str(canonical), raw_args)
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -17815,6 +17819,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "insights":
             return await self._handle_insights_command(event)
+
+        if canonical == "senv":
+            return await self._handle_senv_command(event)
 
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)

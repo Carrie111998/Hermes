@@ -368,7 +368,7 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
     '/update',
     '/verbose'
   ],
-  messaging: ['/approve', '/deny'],
+  messaging: ['/approve', '/deny', '/senv', '/secure-env', '/secure_env'],
   settings: ['/skills', '/pets'],
   advanced: ['/curator', '/fast', '/insights', '/kanban', '/reasoning'],
   // /voice arms SERVER-side capture (voice.record → PortAudio on the backend

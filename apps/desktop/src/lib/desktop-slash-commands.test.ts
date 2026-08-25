@@ -39,6 +39,8 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/density')).toBe(false)
     expect(isDesktopSlashSuggestion('/redraw')).toBe(false)
     expect(isDesktopSlashSuggestion('/approve')).toBe(false)
+    expect(isDesktopSlashSuggestion('/senv')).toBe(false)
+    expect(isDesktopSlashSuggestion('/secure-env')).toBe(false)
     expect(isDesktopSlashSuggestion('/model')).toBe(false)
     expect(isDesktopSlashSuggestion('/skills')).toBe(false)
     expect(isDesktopSlashSuggestion('/voice')).toBe(false)
