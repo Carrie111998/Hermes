@@ -62,6 +62,73 @@ def test_actual_sudo_command_uses_configured_password(monkeypatch):
     assert sudo_stdin == "testpass\n"
 
 
+def test_non_interactive_sudo_probe_passes_through_unchanged(monkeypatch):
+    """#94534: ``sudo -n`` means "fail immediately if a password would be
+    required" and never reads a piped password — rewriting it to
+    ``sudo -S -p '' -n`` makes the probe always fail with "a password is
+    required" even when one is configured, so the model concludes sudo is
+    broken. -n invocations must pass through with no prompt and no stdin."""
+    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    for command in (
+        "sudo -n true",
+        "sudo --non-interactive id",
+        "sudo -nv true",
+    ):
+        transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
+        assert transformed == command
+        assert sudo_stdin is None
+
+
+def test_non_interactive_sudo_probe_never_prompts_interactively(monkeypatch):
+    """Even with no configured password and an interactive UI available, a
+    ``-n`` probe must not trigger the 45s sudo password prompt (#94534)."""
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+    def _fail_prompt(*_args, **_kwargs):
+        raise AssertionError("interactive sudo prompt must not run for a -n probe")
+
+    monkeypatch.setattr(terminal_tool, "_prompt_for_sudo_password", _fail_prompt)
+    monkeypatch.setattr(
+        terminal_tool, "_sudo_nopasswd_works", lambda: False
+    )
+
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command("sudo -n true")
+
+    assert transformed == "sudo -n true"
+    assert sudo_stdin is None
+
+
+def test_compound_command_rewrites_only_non_n_sudo_invocations(monkeypatch):
+    """``sudo -n true && sudo apt update`` keeps the probe verbatim while the
+    real invocation takes the normal password-pipe rewrite (#94534)."""
+    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command(
+        "sudo -n true && sudo apt update"
+    )
+
+    assert transformed == "sudo -n true && sudo -S -p '' apt update"
+    assert sudo_stdin == "testpass\n"
+
+
+def test_sudo_flag_like_argument_of_child_command_is_not_non_interactive(monkeypatch):
+    """``-n`` belonging to the command sudo runs, not to sudo itself, must
+    not disable the rewrite."""
+    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command(
+        "sudo rm -n /tmp/thing"
+    )
+
+    assert transformed == "sudo -S -p '' rm -n /tmp/thing"
+    assert sudo_stdin == "testpass\n"
+
+
 def test_explicit_empty_sudo_password_tries_empty_without_prompt(monkeypatch):
     monkeypatch.setenv("SUDO_PASSWORD", "")
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
