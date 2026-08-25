@@ -273,6 +273,7 @@ import {
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { backendQuitNeedsWait, createQuitTeardownCoordinator } from './quit-teardown'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -9201,9 +9202,6 @@ const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PA
 
 const sshBootstrapCoordinator = createBootstrapCoordinator()
 
-let sshQuitTeardownDone = false
-let backendQuitTeardownDone = false
-
 function sshScopeKey(profile) {
   return connectionScopeKey(profile) || ''
 }
@@ -10665,6 +10663,7 @@ function stopAllPoolBackends() {
 }
 
 const backendShutdown = createBackendShutdownCoordinator(async () => {
+  const pendingConnection = backendConnectionState.getPendingPromise()
   const primary = backendConnectionState.invalidate()
 
   stopBackendChild(primary)
@@ -10675,8 +10674,28 @@ const backendShutdown = createBackendShutdownCoordinator(async () => {
     poolIdleReaper = null
   }
 
-  await Promise.all([waitForBackendExit(primary), pooledStops])
+  const pendingConnectionSettled = pendingConnection?.then(
+    () => undefined,
+    () => undefined
+  )
+
+  await Promise.all([waitForBackendExit(primary), pooledStops, pendingConnectionSettled])
 })
+
+const quitTeardown = createQuitTeardownCoordinator(() => app.quit())
+
+async function teardownSshForQuit() {
+  sshBootstrapCoordinator.cancelAll()
+  const scopes = [...sshConnections.keys()]
+
+  const pending = Promise.allSettled([
+    ...scopes.map(scope => teardownSshConnection(scope || null)),
+    ...sshBootstrapCoordinator.promises()
+  ])
+
+  await Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))])
+  await sshBootstrapCoordinator.forceCleanupAll()
+}
 
 async function exitAfterBackendShutdown(code) {
   await backendShutdown.run()
@@ -15604,29 +15623,22 @@ app.on('before-quit', event => {
     return
   }
 
-  if (!backendQuitTeardownDone) {
-    event.preventDefault()
-    void backendShutdown.run().finally(() => {
-      backendQuitTeardownDone = true
-      app.quit()
-    })
+  const backendNeedsWait = backendQuitNeedsWait({
+    connectionPending: backendConnectionState.getPendingPromise() !== null,
+    poolPending: poolStopper.hasPending(),
+    processAttached: backendConnectionState.getProcess() !== null,
+    shutdownPending: backendShutdown.isPending()
+  })
+
+  const sshNeedsWait = sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0
+  const teardownTasks = [{ run: () => backendShutdown.run(), waitForCompletion: backendNeedsWait }]
+
+  if (sshNeedsWait) {
+    teardownTasks.push({ run: teardownSshForQuit, waitForCompletion: true })
   }
 
-  if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
+  if (quitTeardown.begin(teardownTasks)) {
     event.preventDefault()
-    sshBootstrapCoordinator.cancelAll()
-    const scopes = [...sshConnections.keys()]
-
-    const pending = Promise.allSettled([
-      ...scopes.map(scope => teardownSshConnection(scope || null)),
-      ...sshBootstrapCoordinator.promises()
-    ])
-
-    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))]).then(async () => {
-      await sshBootstrapCoordinator.forceCleanupAll()
-      sshQuitTeardownDone = true
-      app.quit()
-    })
   }
 
   // Clean quit mid-boot should not trip next-launch --no-sandbox (#38216).
@@ -15683,8 +15695,6 @@ app.on('before-quit', event => {
   // Kill open PTYs before environment teardown to avoid the node-pty#904
   // ThreadSafeFunction SIGABRT race.
   terminalIpc.disposeAllTerminalSessions()
-
-  void backendShutdown.run()
 })
 
 app.on('window-all-closed', () => {
