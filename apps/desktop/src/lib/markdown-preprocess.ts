@@ -14,6 +14,15 @@ const FENCE_LINE_RE = /^([ \t]*)(`{3,}|~{3,})([^\n]*)$/
 const EMPTY_FENCE_BLOCK_RE = /(^|\n)[ \t]*(?:`{3,}|~{3,})[^\n]*\n[ \t]*(?:`{3,}|~{3,})[ \t]*(?=\n|$)/g
 const CODE_FENCE_SPLIT_RE = /((?:```|~~~)[\s\S]*?(?:```|~~~))/g
 const INLINE_CODE_SPLIT_RE = /(`[^`\n]+`)/g
+// The lookbehind checks the preceding BACKSLASH RUN, not just one character:
+// `(?<=(?:[^\\]|^)(?:\\\\)*)` anchors at a non-backslash boundary and consumes complete escape
+// pairs, accepting only an even-length run
+// before the delimiter. In `$a\\$` the `\\` is an escaped backslash — valid
+// TeX — so the final `$` really closes the span; a single-character
+// lookbehind misread it as escaped and left the math unshielded from the
+// prose rewrites (#92371). A bare (?<!...) cannot express this: its match may
+// START mid-run and re-align at the last backslash. Mirrors
+// findClosingSingleDollar's isEscapedAt.
 // Math spans as remark-math will see them: a `$$…$$` block, which may span
 // lines, or a same-line `$…$`. A delimiter escaped as `\$` is prose — that is
 // exactly how escapeCurrencyDollarsPreservingMath marks a price, so the
@@ -24,7 +33,7 @@ const INLINE_CODE_SPLIT_RE = /(`[^`\n]+`)/g
 // must not end the span — the same distinction findClosingSingleDollar draws
 // via isEscapedAt. The two alternatives are disjoint on their first character,
 // so the body cannot backtrack ambiguously.
-const MATH_SPAN_SPLIT_RE = /((?<!\\)\$\$[\s\S]*?(?<!\\)\$\$|(?<!\\)\$(?:[^\n$\\]|\\[^\n])+?(?<!\\)\$)/g
+const MATH_SPAN_SPLIT_RE = /((?<=(?:[^\\]|^)(?:\\\\)*)\$\$[\s\S]*?(?<=(?:[^\\]|^)(?:\\\\)*)\$\$|(?<=(?:[^\\]|^)(?:\\\\)*)\$(?:[^\n$\\]|\\[^\n])+?(?<=(?:[^\\]|^)(?:\\\\)*)\$)/g
 const LATEX_DISPLAY_OPEN_LINE_RE = /^([ \t]*(?:>[ \t]*)*(?:(?:[-+*]|\d+[.)])[ \t]+)?[ \t]*)\\{1,2}\[[ \t]*\r?$/
 const LATEX_DISPLAY_CLOSE_LINE_RE = /^([ \t]*(?:>[ \t]*)*(?:(?:[-+*]|\d+[.)])[ \t]+)?[ \t]*)\\{1,2}\][ \t]*\r?$/
 const CUSTOM_DISPLAY_MATH_LINE_RE = /^([ \t]*(?:>[ \t]*)*(?:(?:[-+*]|\d+[.)])[ \t]+)?[ \t]*)\[\/math\][ \t]*\r?$/

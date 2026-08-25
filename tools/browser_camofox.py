@@ -628,11 +628,7 @@ def _camofox_private_page_block(session: Dict[str, Any], task_id: Optional[str],
 
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
                      user_task: Optional[str] = None) -> str:
-    """Get accessibility tree snapshot from Camofox.
-
-    ``user_task`` is deprecated and ignored — oversized snapshots always
-    truncate-and-store (no LLM summarization), same as the main browser tool.
-    """
+    """Get accessibility tree snapshot from Camofox."""
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -650,16 +646,18 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         snapshot = data.get("snapshot", "")
         refs_count = data.get("refsCount", 0)
 
-        # Same truncate-and-store handling as the main browser tool: cut at
-        # line boundaries, store the full tree to cache/web, append a
-        # read_file pointer.
+        # Apply same summarization logic as the main browser tool
         from tools.browser_tool import (
             SNAPSHOT_SUMMARIZE_THRESHOLD,
+            _extract_relevant_content,
             _truncate_snapshot,
         )
 
         if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-            snapshot = _truncate_snapshot(snapshot)
+            if user_task:
+                snapshot = _extract_relevant_content(snapshot, user_task)
+            else:
+                snapshot = _truncate_snapshot(snapshot)
 
         return json.dumps({
             "success": True,

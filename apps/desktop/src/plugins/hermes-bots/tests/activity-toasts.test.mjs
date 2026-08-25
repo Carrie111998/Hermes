@@ -32,8 +32,6 @@ function loadTracker(toastsEnabled) {
       let value = {}
       return { get: () => value, set: next => { value = next } }
     })(),
-    botRosterMeta: (bot, meta) => meta?.[bot.name] || null,
-    botSelectionKey: bot => bot.name,
     displayName: bot => bot.name
   }
   const section = source

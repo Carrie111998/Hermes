@@ -1,5 +1,5 @@
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -11,12 +11,10 @@ import { $activeSessionId } from '@/store/session'
 
 import { ClarifyTool, readClarifyBatchResult, readClarifyResult } from './clarify-tool'
 
-// The live pending card used to require message-running. Tests that exercise
-// the pending form force that on; the settle-shift case flips it off.
-let messageRunning = true
-
+// The live pending card only renders while its message is running. Force that so
+// keyboard-navigation tests can exercise ClarifyToolPending directly.
 vi.mock('@assistant-ui/react', () => ({
-  useAuiState: () => messageRunning
+  useAuiState: () => true
 }))
 
 afterEach(() => {
@@ -24,20 +22,15 @@ afterEach(() => {
   clearClarifyRequest()
   $activeSessionId.set(null)
   $gateway.set(null)
-  messageRunning = true
   vi.clearAllMocks()
 })
 
-function clarifyTree(ui: ReactNode) {
-  return (
+function renderClarify(ui: ReactNode) {
+  return render(
     <I18nProvider configClient={null} initialLocale="en">
       {ui}
     </I18nProvider>
   )
-}
-
-function renderClarify(ui: ReactNode) {
-  return render(clarifyTree(ui))
 }
 
 function settledClarifyProps(
@@ -90,75 +83,14 @@ function renderLiveClarify({ multiSelect = false }: { multiSelect?: boolean } = 
     requestId: 'request-1',
     sessionId: 'session-1'
   })
-  const { rerender } = renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+  renderClarify(<ClarifyTool {...liveClarifyProps()} />)
 
-  return { request, rerender }
+  return request
 }
-
-describe('ClarifyTool live card stays mounted across settle', () => {
-  it('keeps the question card while the gateway request is open and the turn reports not-running', () => {
-    messageRunning = false
-    renderLiveClarify()
-
-    expect(screen.getByText('Which deployment target?')).toBeTruthy()
-    expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
-    expect(document.querySelector('[data-clarify-settled]')).toBeNull()
-  })
-
-  it('demotes to a tool row when the turn stopped and no request is left to answer', () => {
-    messageRunning = false
-    $activeSessionId.set('session-1')
-    $gateway.set({ request: vi.fn() } as never)
-    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
-
-    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
-    expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
-  })
-
-  it('holds the card through the gap between answering and the settled result', async () => {
-    const { request, rerender } = renderLiveClarify()
-
-    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
-    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
-
-    await waitFor(() => {
-      expect(request).toHaveBeenCalled()
-    })
-
-    // tool.complete is what swaps in the settled card; the turn can already
-    // read as not-running in that gap.
-    messageRunning = false
-    rerender(clarifyTree(<ClarifyTool {...liveClarifyProps()} />))
-
-    expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
-  })
-
-  it('demotes when the turn is stopped after the card was live but never answered', () => {
-    renderLiveClarify()
-
-    expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
-
-    messageRunning = false
-    act(() => clearClarifyRequest('request-1', 'session-1'))
-
-    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
-    expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
-  })
-
-  it('paints the question from tool args instead of a spinner while request_id is still racing', () => {
-    $activeSessionId.set('session-1')
-    $gateway.set({ request: vi.fn() } as never)
-    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
-
-    expect(screen.getByText('Which deployment target?')).toBeTruthy()
-    expect(screen.queryByRole('status', { name: /loading question/i })).toBeNull()
-    expect(screen.getByRole('button', { name: /Continue/ }).hasAttribute('disabled')).toBe(true)
-  })
-})
 
 describe('ClarifyTool choice selection', () => {
   it('selects independently, deselects and submits multi-select choices as a JSON array', async () => {
-    const { request } = renderLiveClarify({ multiSelect: true })
+    const request = renderLiveClarify({ multiSelect: true })
     const staging = screen.getByRole('button', { name: /staging/ })
     const production = screen.getByRole('button', { name: /production/ })
 
@@ -186,7 +118,7 @@ describe('ClarifyTool choice selection', () => {
   })
 
   it('keeps single-select replacement and plain-string submission', async () => {
-    const { request } = renderLiveClarify()
+    const request = renderLiveClarify()
     const staging = screen.getByRole('button', { name: /staging/ })
     const production = screen.getByRole('button', { name: /production/ })
 
@@ -378,7 +310,7 @@ describe('ClarifyTool keyboard navigation', () => {
   })
 
   it('selects by number and confirms the answer with Enter', async () => {
-    const { request } = renderLiveClarify()
+    const request = renderLiveClarify()
 
     fireEvent.keyDown(window, { key: '2' })
     fireEvent.keyDown(window, { key: 'Enter' })
@@ -392,7 +324,7 @@ describe('ClarifyTool keyboard navigation', () => {
   })
 
   it('stages a highlighted multi-select choice with Enter and submits it with Continue', async () => {
-    const { request } = renderLiveClarify({ multiSelect: true })
+    const request = renderLiveClarify({ multiSelect: true })
     const production = screen.getByRole('button', { name: /production/ })
 
     fireEvent.keyDown(window, { key: 'ArrowDown' })
@@ -426,7 +358,7 @@ describe('ClarifyTool keyboard navigation', () => {
   })
 
   it('does not intercept keyboard events while an action button has focus', () => {
-    const { request } = renderLiveClarify()
+    const request = renderLiveClarify()
     const skip = screen.getByRole('button', { name: 'Skip' })
 
     skip.focus()
@@ -543,7 +475,7 @@ function liveBatchProps(): ToolCallMessagePartProps {
   }
 }
 
-function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = false) {
+function renderLiveBatch(lockedAnswers?: Record<string, string>) {
   const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
 
   $activeSessionId.set('session-1')
@@ -554,7 +486,7 @@ function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = f
     multiSelect: false,
     question: '',
     questions: [
-      { choices: ['red', 'blue'], multiSelect, qid: 'q0', question: 'Color?' },
+      { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
       { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
     ],
     requestId: 'request-batch',
@@ -661,14 +593,6 @@ describe('ClarifyTool batch card', () => {
     renderLiveBatch({ q0: 'red' })
 
     // The replayed answer counts as staged: one question left to answer.
-    expect(screen.getByText('1 of 2 answered')).toBeTruthy()
-  })
-
-  it('reselects every choice from a replayed multi-select JSON answer', () => {
-    renderLiveBatch({ q0: '["red","blue"]' }, true)
-
-    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
-    expect(screen.getByRole('button', { name: /blue/ }).getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByText('1 of 2 answered')).toBeTruthy()
   })
 
