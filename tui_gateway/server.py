@@ -786,10 +786,6 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
         history_ready.set()
-    # A session closing mid-turn ends that turn. Without this the row stays
-    # STARTED under a pid still alive for OTHER sessions, and a producer waits on
-    # a turn that no longer exists.
-    _finish_external_turn_if_idle(session, outcome="session_closed")
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
@@ -821,6 +817,22 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                 agent._persist_session(snapshot)
             except Exception:
                 pass
+
+    # ── Close any external turn this session was hosting ───────────────
+    # AFTER the flush above, not before it. FINISHED tells a producer that
+    # canonical history is complete and may now be judged, and this function
+    # exists precisely because there may be messages not yet durable -- so
+    # announcing it first would invite exactly the misreading the state was
+    # introduced to prevent.
+    #
+    # Without it at all, the row would stay STARTED under a pid still alive for
+    # OTHER sessions, and a producer would wait on a turn that no longer exists.
+    #
+    # The outcome is deliberately distinct from a turn that ended on its own. A
+    # forced close is not the measured "killed before the marker persisted" case:
+    # finalization runs because state may be unflushed, so an absent marker here
+    # does NOT prove nothing happened, and must not by itself authorise a replay.
+    _finish_external_turn_if_idle(session, outcome="session_closed")
 
     # ── Plugin hook: on_session_end ────────────────────────────────────
     # Signals every plugin that the session is closing, with

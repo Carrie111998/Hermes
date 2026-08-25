@@ -185,6 +185,55 @@ def main() -> int:
         g2.close()
     shutil.rmtree(home, ignore_errors=True)
 
+    # ── closing the session racing the dispatch that hosts its event ─────
+    # The consumer registers _external_turn_in_flight only AFTER dispatch
+    # returns and STARTED is written. If a close lands inside that gap the
+    # poller exits without ever closing the lifecycle, and the row would be left
+    # CLAIMED or STARTED under a gateway process that is STILL ALIVE -- which no
+    # other process may recover, because a live holder is exactly what
+    # _claimer_alive protects. That is the one shape this rail cannot tolerate,
+    # so it is pinned rather than assumed.
+    #
+    # The gateway keeps a SECOND session open, so closing the first does not
+    # simply end the process and make every row trivially recoverable.
+    print()
+    print("  closing the hosting session at a spread of delays:")
+    for i, delay in enumerate((0.0, 0.05, 0.2, 0.6, 1.2)):
+        home = PROBE_HOME.parent / f".probe-home-close-{i}"
+        shutil.rmtree(home, ignore_errors=True)
+        g = Gateway("closer", home)
+        eid = f"X{i}"
+        try:
+            sid1 = g.call("session.create", {"cols": 80})["result"]["session_id"]
+            g.call("prompt.submit", {"session_id": sid1, "text": "probe: own it"})
+            held = registry(home)
+            if not held:
+                raise RuntimeError("never claimed")
+            key1 = held[0]["session_id"]
+            g.call("session.interrupt", {"session_id": sid1})
+            # A second live session so the process outlives the first close.
+            g.call("session.create", {"cols": 80})
+
+            enqueue(home, eid, key1, f"MARK-{eid} close race")
+            wait_for(lambda: (inbox(home, eid) or {}).get("state") != "PENDING", 60,
+                     interval=0.01)
+            time.sleep(delay)
+            g.call("session.close", {"session_id": sid1})
+            time.sleep(2.0)
+
+            row = inbox(home, eid) or {}
+            state = row.get("state")
+            gateway_alive = g.proc.poll() is None
+            holder_alive = bool(row.get("owner_pid")) and gateway_alive
+            stranded = state in ("CLAIMED", "STARTED") and holder_alive
+            print(f"    close +{delay:<4} -> state={str(state):<8} "
+                  f"gateway_alive={gateway_alive} stranded={stranded}")
+            check(f"an event is not stranded by a close at +{delay}s", not stranded,
+                  f"state={state} under live pid {row.get('owner_pid')}")
+        finally:
+            g.close()
+            shutil.rmtree(home, ignore_errors=True)
+
     print()
     if failures:
         print(f"FAILED: {len(failures)} check(s): {', '.join(failures)}")
