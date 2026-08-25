@@ -885,7 +885,12 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
 
 
 def _profile_from_gateway_argv(run_argv: list[str]) -> str | None:
-    """Return a validated explicit profile from a captured gateway argv."""
+    """Return a validated explicit profile from a captured gateway argv.
+
+    Keep the accepted spellings aligned with ``main._apply_profile_override``:
+    ``-p NAME``, ``--profile NAME``, and ``--profile=NAME``.  Hermes pre-parses
+    these flags itself, so argparse's attached ``-pNAME`` spelling is not valid.
+    """
     profile: str | None = None
     for index, arg in enumerate(run_argv):
         if arg in {"--profile", "-p"} and index + 1 < len(run_argv):
@@ -937,14 +942,17 @@ def _profile_gateway_restart_env(profile: str) -> dict[str, str]:
     profile's tokens and integration settings into every restarted gateway.
     For a cross-profile restart, remove all known profile-managed variables
     plus every secret defined by the source profile, then install only the
-    target profile's secret scope.  Same-profile restarts preserve shell-only
-    credential injection for backwards compatibility.
+    target profile's secret scope and runtime identity.  Process-level values
+    outside those profile-managed sets (for example ``PATH``) remain intact.
+    Same-profile restarts preserve shell-only credential injection for
+    backwards compatibility.
     """
     from agent.secret_scope import build_profile_secret_scope
     from hermes_cli.config import _EXTRA_ENV_KEYS
     from hermes_cli.config_defaults import OPTIONAL_ENV_VARS
-    from hermes_cli.profiles import get_profile_dir
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name
 
+    profile = normalize_profile_name(profile)
     restart_env = dict(os.environ)
     source_home = Path(get_hermes_home()).resolve()
     target_home = Path(get_profile_dir(profile)).resolve()
@@ -959,6 +967,12 @@ def _profile_gateway_restart_env(profile: str) -> dict[str, str]:
     for key in profile_managed_keys:
         restart_env.pop(key, None)
     restart_env.update(target_secrets)
+    # Pin the child to the target even when its argv is bare (the default
+    # profile) and overwrite any stale source-profile identity inherited from
+    # the updater or supplied by a hand-edited target .env.
+    restart_env["HERMES_HOME"] = str(target_home)
+    restart_env["HERMES_PROFILE"] = profile
+    restart_env["HERMES_PROFILE_NAME"] = profile
     return restart_env
 
 
