@@ -117,3 +117,42 @@ def test_cli_picker_hides_excluded_provider_by_alias(config_home):
     )
 
 
+def test_shared_filter_expands_aliases_for_gateway_parity(monkeypatch):
+    """list_authenticated_providers / the picker-data builder must expand
+    provider aliases in ``excluded_providers`` exactly like the CLI picker,
+    else an aliased exclusion (e.g. ``grok`` for xai) hides the row on one
+    surface but not the other."""
+    from hermes_cli import model_switch
+
+    monkeypatch.setattr(
+        "hermes_cli.providers.ALIASES",
+        {"grok": "xai", "zhipu": "zai"},
+    )
+
+    expanded = model_switch._expanded_excluded_provider_set(
+        [" Grok ", "", "zhipu", "openrouter"]
+    )
+    assert expanded == {"grok", "xai", "zhipu", "zai", "openrouter"}
+
+    # Section-1 style check: an entry whose canonical slug is excluded is
+    # filtered even when the raw id differs from the configured alias.
+    fake_models_dev = {
+        "xai": {"env": ["XAI_API_KEY"]},
+        "zai": {"env": ["ZAI_API_KEY"]},
+        "openrouter": {"env": ["OPENROUTER_API_KEY"]},
+    }
+    monkeypatch.setattr("hermes_cli.auth.is_runtime_provider_routable", lambda _p: True)
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    monkeypatch.setenv("XAI_API_KEY", "k")
+    monkeypatch.setenv("ZAI_API_KEY", "k")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+
+    slugs = model_switch._collect_authed_provider_slugs(
+        models_dev_data=fake_models_dev,
+        curated={},
+        excluded=["grok"],
+    )
+    assert "xai" not in slugs, f"alias 'grok' should hide xai; got {slugs}"
+    assert "zai" in slugs, "unrelated providers must survive"
+
+
