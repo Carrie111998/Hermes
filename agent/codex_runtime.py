@@ -631,11 +631,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
-        # Codex emits both commentary and the final answer as completed
-        # agentMessage items. The final answer is delivered by the gateway's
-        # normal final-response path, so emitting it here as interim
-        # commentary posts the same response twice on Discord.
-        if item.get("phase") == "final_answer":
+        # Only explicitly classified commentary belongs on the interim path.
+        # Final or unclassified messages stay on the gateway's normal final-
+        # response path; emitting them here can post the response twice.
+        if item.get("phase") != "commentary":
             return
         if not isinstance(text, str) or not text.strip():
             return
