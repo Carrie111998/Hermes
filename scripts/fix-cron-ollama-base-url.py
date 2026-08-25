@@ -4,11 +4,14 @@ Fix cron jobs blocked by the provider/base_url safety gate.
 
 These jobs were created with base_url='https://api.ollama.com' which the
 scheduler rejects because it cannot host-match 'api.ollama.com' to the ollama
-provider's registered inference endpoint.  The fix is to point them at the
-local LiteLLM proxy (provider='custom', base_url='http://localhost:4000/v1'),
-which:
-  - passes the safety gate (custom providers are BYOK — no stored credential)
-  - routes to whatever backend LiteLLM is configured to use on this host
+provider's registered inference endpoint.
+
+On this fleet, Hermes already has a named custom provider ``litellm_proxy``
+(Tailscale LiteLLM, stored ``LITELLM_VIRTUAL_KEY``). Pointing jobs at that
+named provider + its configured host passes the safety-gate host-match and
+actually authenticates. Bare ``custom`` + ``http://localhost:4000/v1`` is the
+generic fallback for hosts with no named proxy — and on mfc1 nothing listens
+on :4000.
 
 Usage:
     python3 scripts/fix-cron-ollama-base-url.py [--dry-run]
@@ -16,6 +19,7 @@ Usage:
 Requires: a live Hermes environment (HERMES_HOME / ~/.hermes must exist and
 contain cron/jobs.json).
 """
+from __future__ import annotations
 
 import argparse
 import sys
@@ -33,8 +37,32 @@ TARGET_JOB_IDS = {
 }
 
 BAD_BASE_URL = "https://api.ollama.com"
-GOOD_PROVIDER = "custom"
-GOOD_BASE_URL = "http://localhost:4000/v1"
+FALLBACK_PROVIDER = "custom"
+FALLBACK_BASE_URL = "http://localhost:4000/v1"
+NAMED_PROXY = "litellm_proxy"
+
+
+def resolve_litellm_target(config: dict | None) -> tuple[str, str]:
+    """Return (provider, base_url) for this host's LiteLLM proxy."""
+    if isinstance(config, dict):
+        for entry in config.get("custom_providers") or []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("name") or "").strip() != NAMED_PROXY:
+                continue
+            url = str(entry.get("base_url") or "").strip().rstrip("/")
+            if url:
+                return NAMED_PROXY, url
+    return FALLBACK_PROVIDER, FALLBACK_BASE_URL
+
+
+def _load_hermes_config() -> dict | None:
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        return cfg if isinstance(cfg, dict) else None
+    except Exception:
+        return None
 
 
 def main():
@@ -43,6 +71,9 @@ def main():
     args = parser.parse_args()
 
     from cron.jobs import load_jobs, save_jobs, _normalize_job_optional_text
+
+    good_provider, good_base_url = resolve_litellm_target(_load_hermes_config())
+    print(f"Target: provider={good_provider!r} base_url={good_base_url!r}")
 
     jobs = load_jobs()
     changed = []
@@ -57,15 +88,17 @@ def main():
         name = job.get("name", job_id)
 
         print(f"  Job {job_id} ({name!r})")
-        print(f"    provider: {current_provider!r} → {GOOD_PROVIDER!r}")
-        print(f"    base_url: {current_base_url!r} → {GOOD_BASE_URL!r}")
+        print(f"    provider: {current_provider!r} → {good_provider!r}")
+        print(f"    base_url: {current_base_url!r} → {good_base_url!r}")
+
+        if current_provider == good_provider and current_base_url == good_base_url:
+            print("    already at target — skip")
+            continue
 
         if not args.dry_run:
-            job["provider"] = GOOD_PROVIDER
-            job["base_url"] = GOOD_BASE_URL
-            # Clear any stale provider snapshot — it captured 'ollama' at create
-            # time; after the update the job uses 'custom' which carries no
-            # stored credential and needs no snapshot.
+            job["provider"] = good_provider
+            job["base_url"] = good_base_url
+            # Drop a stale snapshot from the old ollama/openrouter pairing.
             job["provider_snapshot"] = None
             # If the job was auto-paused due to the base_url error, re-enable it.
             if job.get("state") in {"paused", "error"} and (
