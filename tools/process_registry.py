@@ -380,6 +380,7 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    origin_ui_session_id: str = ""              # Spawning conversation row across /new/compression
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -622,6 +623,7 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "origin_ui_session_id": session.origin_ui_session_id,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -660,6 +662,7 @@ class ProcessRegistry:
             "session_id": session.id,
             "session_key": session.session_key,
             "task_id": session.task_id,
+            "origin_ui_session_id": session.origin_ui_session_id,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -1034,6 +1037,7 @@ class ProcessRegistry:
         cwd: str = None,
         task_id: str = "",
         session_key: str = "",
+        origin_ui_session_id: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
     ) -> ProcessSession:
@@ -1061,6 +1065,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -1273,6 +1278,7 @@ class ProcessRegistry:
         cwd: str = None,
         task_id: str = "",
         session_key: str = "",
+        origin_ui_session_id: str = "",
         timeout: int = 10,
     ) -> ProcessSession:
         """
@@ -1291,6 +1297,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -1633,6 +1640,7 @@ class ProcessRegistry:
                 "session_id": session.id,
                 "session_key": session.session_key,
                 "task_id": session.task_id,
+                "origin_ui_session_id": session.origin_ui_session_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -2754,6 +2762,7 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "origin_ui_session_id": s.origin_ui_session_id,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2844,6 +2853,7 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                origin_ui_session_id=entry.get("origin_ui_session_id", ""),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
@@ -2873,6 +2883,7 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
+                    "origin_ui_session_id": session.origin_ui_session_id,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,
