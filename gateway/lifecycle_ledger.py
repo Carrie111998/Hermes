@@ -26,11 +26,16 @@ This module closes that gap with a tiny state machine persisted to
   exits, #53107) and the two watchdog ``os._exit`` sites in
   :mod:`gateway.shutdown_watchdog`.
 
-:func:`sample_memory` provides the cheap (<1ms, pure /proc reads) memory
-snapshot that :func:`gateway.shutdown_watchdog.write_loop_heartbeat`
-embeds in the 30s heartbeat — giving every unclean-death report a
-"memory available N seconds before death" data point so OOM crash cycles
-are classifiable from the volume alone (no Prometheus retention races).
+:func:`sample_memory` provides the cheap (<1ms, pure /proc reads on Linux;
+a handful of psutil syscalls elsewhere) memory snapshot that
+:func:`gateway.shutdown_watchdog.write_loop_heartbeat` embeds in the 30s
+heartbeat — giving every unclean-death report a "memory available N
+seconds before death" data point so OOM crash cycles are classifiable from
+the volume alone (no Prometheus retention races). Was Linux-only (returned
+``{}`` everywhere else) until 2026-08-25 — every one of this Windows
+install's `gateway.previous_unclean_exit` records carried ``last_mem=None``
+until then, so the OOM-suspicion heuristic below had never actually been a
+measurement on this platform.
 
 Everything here is best-effort: a forensics failure must never affect the
 gateway lifecycle it is observing.
@@ -41,6 +46,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,9 +83,18 @@ def get_lifecycle_sentinel_path(home: Optional[Path] = None) -> Path:
 def sample_memory() -> Dict[str, Any]:
     """Cheap memory snapshot: own RSS + system availability + swap.
 
-    Pure ``/proc`` reads, Linux-only (returns ``{}`` elsewhere), never
-    raises.  Values in KiB to match the kernel's units.
+    Pure ``/proc`` reads on Linux; falls back to psutil elsewhere (Windows,
+    macOS) so the same keys are populated on every platform. Never raises.
+    Values in KiB to match the kernel's units — the psutil path (which
+    reports bytes) converts to match.
     """
+    if sys.platform.startswith("linux"):
+        return _sample_memory_proc()
+    return _sample_memory_psutil()
+
+
+def _sample_memory_proc() -> Dict[str, Any]:
+    """Linux: pure ``/proc`` reads, no subprocess, no third-party import."""
     sample: Dict[str, Any] = {}
     try:
         with open("/proc/self/status", encoding="utf-8") as fh:
@@ -106,6 +121,39 @@ def sample_memory() -> Dict[str, Any]:
         if "SwapTotal" in meminfo and "SwapFree" in meminfo:
             sample["swap_used_kib"] = meminfo["SwapTotal"] - meminfo["SwapFree"]
     except (OSError, ValueError, IndexError):
+        pass
+    return sample
+
+
+def _sample_memory_psutil() -> Dict[str, Any]:
+    """Windows/macOS: same shape as :func:`_sample_memory_proc`, via psutil.
+
+    ``MemAvailable`` has no exact psutil equivalent on every platform;
+    ``virtual_memory().available`` is the documented closest match (already
+    accounts for reclaimable cache/buffers on the platforms that report
+    them) and is what the rest of this codebase uses for the same purpose
+    (see gateway/pre_mortem.py's ``_proc_context``).
+    """
+    sample: Dict[str, Any] = {}
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except Exception:
+        return sample
+    try:
+        rss = psutil.Process(os.getpid()).memory_info().rss
+        sample["rss_kib"] = rss // 1024
+    except Exception:
+        pass
+    try:
+        vm = psutil.virtual_memory()
+        sample["mem_total_kib"] = vm.total // 1024
+        sample["mem_available_kib"] = vm.available // 1024
+    except Exception:
+        pass
+    try:
+        sw = psutil.swap_memory()
+        sample["swap_used_kib"] = sw.used // 1024
+    except Exception:
         pass
     return sample
 

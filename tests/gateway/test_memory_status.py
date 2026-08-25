@@ -176,8 +176,9 @@ class TestCollectMemoryStatus:
         assert status["pressure"] == "unknown"
 
     def test_heartbeat_without_mem_block(self, tmp_path: Path) -> None:
-        # Non-Linux hosts: sample_memory() returns {} so the heartbeat has
-        # no mem key at all.
+        # A heartbeat can lack a mem key for reasons unrelated to platform
+        # (psutil unavailable, an old heartbeat file predating this field) —
+        # collect_memory_status must still degrade gracefully.
         _write_heartbeat(tmp_path, updated_at=_NOW)
         status = collect_memory_status(tmp_path, now=_NOW)
         assert status["pressure"] == "unknown"
