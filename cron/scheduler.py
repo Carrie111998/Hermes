@@ -3898,6 +3898,12 @@ def _deliver_result(
                     components={"media"},
                 )
                 if _media_errors:
+                    # A failed SendResult does not prove that the provider did
+                    # not accept the media. Preserve any receipts above, but
+                    # never retry the whole target through the standalone lane:
+                    # that could duplicate text or attachments after an
+                    # ambiguous live-adapter write.
+                    ambiguous_live_timeout = True
                     adapter_ok = False
                 if media_files and not media_receipts_persisted:
                     # Preserve any partial typed acknowledgements, but keep the

@@ -564,6 +564,7 @@ def test_live_adapter_media_error_prevents_delivery_side_effects_even_with_deliv
     monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
     execution = executions.create_execution("receipt-e2e", source="direct")
     adapter = _FailedMediaWithDeliveredReceiptAdapter(["text"])
+    standalone_calls = AsyncMock(return_value={"success": True})
     job = _job()
     job["attach_to_session"] = True
 
@@ -573,6 +574,7 @@ def test_live_adapter_media_error_prevents_delivery_side_effects_even_with_deliv
         patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coroutine_threadsafe),
         patch("cron.scheduler._open_continuable_cron_thread", return_value=None),
         patch("cron.scheduler._maybe_mirror_cron_delivery") as mirror_delivery,
+        patch("tools.send_message_tool._send_to_platform", new=standalone_calls),
     ):
         result = _deliver_result(
             job, f"report\nMEDIA:{media}",
@@ -583,6 +585,13 @@ def test_live_adapter_media_error_prevents_delivery_side_effects_even_with_deliv
     assert result is not None
     assert "provider reported media failure" in result
     mirror_delivery.assert_not_called()
+    standalone_calls.assert_not_awaited()
+    assert executions.receipt_summary(execution["id"]) == {
+        "delivered": 2,
+        "failed": 0,
+        "unknown": 0,
+        "targets_delivered": 1,
+    }
 
 
 def test_new_continuation_thread_preserves_preregistered_requested_target(monkeypatch, tmp_path):
