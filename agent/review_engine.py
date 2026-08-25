@@ -218,11 +218,10 @@ def _load_review_config() -> _ReviewConfig:
     value to the child-agent reasoning resolver.
     """
     try:
-        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config import cfg_get, load_config_readonly
 
         full = load_config_readonly()
-        aux = full.get("auxiliary") or {}
-        review = aux.get("review") or {}
+        review = cfg_get(full, "auxiliary", "review", default={}) or {}
         if not isinstance(review, dict):
             return _ReviewConfig(credentials_cfg=None)
     except Exception:
@@ -250,16 +249,6 @@ def _load_review_config() -> _ReviewConfig:
         credentials_cfg=credentials_cfg,
         reasoning_effort=review.get("reasoning_effort"),
     )
-
-
-def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
-    """Read ``auxiliary.review`` into a delegation-credentials-shaped dict.
-
-    Kept as a compatibility wrapper for callers that only need routing.  The
-    review dispatch path uses :func:`_load_review_config` so both settings are
-    read from the same read-only config snapshot.
-    """
-    return _load_review_config().credentials_cfg
 
 
 def start_review(

@@ -113,24 +113,6 @@ def test_build_review_task_without_prompt_has_no_instruction_block():
 # auxiliary.review credential resolution
 # ---------------------------------------------------------------------------
 
-def test_load_review_credentials_cfg_reads_config(monkeypatch):
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly",
-        lambda: {"auxiliary": {"review": {
-            "provider": "openrouter",
-            "model": "anthropic/claude-opus-4.6",
-        }}},
-    )
-    cfg = re_mod._load_review_credentials_cfg()
-    assert cfg == {
-        "provider": "openrouter",
-        "model": "anthropic/claude-opus-4.6",
-        "base_url": "",
-        "api_key": "",
-        "api_mode": "",
-    }
-
-
 def test_load_review_config_separates_reasoning_from_credentials(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
@@ -161,15 +143,25 @@ def test_load_review_config_reasoning_only_keeps_credentials_inherit(monkeypatch
     assert snapshot.reasoning_effort == "xhigh"
 
 
-@pytest.mark.parametrize("review", [{}, {"reasoning_effort": ""}])
-def test_load_review_config_empty_reasoning_is_inert(monkeypatch, review):
+@pytest.mark.parametrize(
+    ("config", "expected_reasoning"),
+    [
+        ({"auxiliary": {"review": {}}}, None),
+        ({"auxiliary": {"review": {"reasoning_effort": ""}}}, ""),
+        ({"auxiliary": {"review": {"provider": "auto", "model": ""}}}, None),
+        ({"auxiliary": {}}, None),
+    ],
+)
+def test_load_review_config_inert_values_keep_credentials_inherited(
+    monkeypatch, config, expected_reasoning
+):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
-        lambda: {"auxiliary": {"review": review}},
+        lambda: config,
     )
     snapshot = re_mod._load_review_config()
     assert snapshot.credentials_cfg is None
-    assert snapshot.reasoning_effort == review.get("reasoning_effort")
+    assert snapshot.reasoning_effort == expected_reasoning
 
 
 def test_load_review_config_preserves_yaml_false(monkeypatch):
@@ -192,21 +184,6 @@ def test_load_review_config_reads_real_isolated_home(tmp_path, monkeypatch):
     snapshot = re_mod._load_review_config()
     assert snapshot.credentials_cfg is None
     assert snapshot.reasoning_effort == "high"
-
-
-def test_load_review_credentials_cfg_auto_means_inherit(monkeypatch):
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly",
-        lambda: {"auxiliary": {"review": {"provider": "auto", "model": ""}}},
-    )
-    assert re_mod._load_review_credentials_cfg() is None
-
-
-def test_load_review_credentials_cfg_missing_section(monkeypatch):
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly", lambda: {"auxiliary": {}}
-    )
-    assert re_mod._load_review_credentials_cfg() is None
 
 
 @pytest.mark.parametrize("effort", ["high", "", False, "not-a-level"])
