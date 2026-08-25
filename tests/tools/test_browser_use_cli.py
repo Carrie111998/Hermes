@@ -247,6 +247,24 @@ class TestBrowserUseLifecycle:
         assert Path(lines[1].removeprefix("tmp:")) == expected
         assert cli == bu_cli._browser_use_sessions["r7k2"]["command"]
 
+    def test_state_persists_exact_session_identity(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(bu_cli, "_start_browser_use_cleanup_thread", lambda: None)
+        runtime = bu_cli._managed_browser_use_runtime("r7k2", {})
+        assert runtime is not None
+        state = bu_cli._register_browser_use_session(
+            "r7k2", runtime, ["browser-use"]
+        )
+        assert state is not None
+
+        bu_cli._finish_browser_use_session(state)
+        persisted = bu_cli._browser_use_read_state(runtime)
+
+        assert persisted is not None
+        assert persisted["session"] == "r7k2"
+        assert persisted["active_pid"] is None
+
     def test_posix_runtime_base_keeps_unix_socket_path_short(self):
         home = Path("/home/user/.hermes/profiles/") / ("long-profile-" + "x" * 80)
         root = bu_cli._browser_use_runtime_base(home, "darwin")
