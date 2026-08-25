@@ -6850,6 +6850,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # session_persistence_failed. Ride out long sibling holds.
         self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def try_reserve_restored_draft_session(
+        self,
+        session_id: str,
+        *,
+        source: str,
+        model: Optional[str] = None,
+        cwd: Optional[str] = None,
+        profile_name: Optional[str] = None,
+    ) -> bool:
+        """Atomically reserve a never-persisted draft key across processes.
+
+        A restored Desktop draft must keep its original stored id, but two
+        gateways can share one profile database.  ``BEGIN IMMEDIATE`` plus the
+        primary-key ``DO NOTHING`` makes the empty row an inter-process claim:
+        exactly one caller wins.  The zero-message row remains absent from
+        normal session lists, and the first real turn enriches it through
+        ``create_session``'s existing conflict-update path.
+        """
+
+        if not (profile_name or "").strip():
+            profile_name = self._own_profile_name()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO sessions (
+                       id, source, model, cwd, profile_name, started_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO NOTHING""",
+                (session_id, source, model, cwd, profile_name, time.time()),
+            )
+            # Python's sqlite3 reports 1 for the inserted claim and 0 for the
+            # conflict no-op, so exactly one competing connection returns True.
+            return cursor.rowcount == 1
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
