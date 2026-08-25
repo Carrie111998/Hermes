@@ -57,5 +57,27 @@ def test_rename_and_archive(tmp_path):
         assert len(pdb.list_projects(conn)) == 1
 
 
+def test_delete_requires_confirmation(monkeypatch, tmp_path):
+    _run(["create", "Throwaway", str(tmp_path)])
+
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert _run(["delete", "throwaway"]) == 1
+    with pdb.connect_closing() as conn:
+        assert len(pdb.list_projects(conn)) == 1
+
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    assert _run(["delete", "throwaway"]) == 0
+    with pdb.connect_closing() as conn:
+        assert pdb.list_projects(conn, include_archived=True) == []
+
+
+def test_delete_yes_flag_skips_prompt(tmp_path):
+    _run(["create", "Scratch", str(tmp_path)])
+
+    assert _run(["delete", "scratch", "--yes"]) == 0
+    with pdb.connect_closing() as conn:
+        assert pdb.list_projects(conn, include_archived=True) == []
+
+
 
 
