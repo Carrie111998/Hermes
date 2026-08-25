@@ -461,31 +461,34 @@ class EventBridge:
         if not db:
             return
         try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
-        try:
-            self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
-        except OSError:
-            self._state_db_mtime = 0.0
-        try:
-            self._cached_sessions_index = _load_sessions_index()
-        except Exception:
-            self._cached_sessions_index = {}
-        for session_key, entry in self._cached_sessions_index.items():
-            session_id = entry.get("session_id", "")
-            if not session_id:
-                continue
             try:
-                messages = db.get_messages(session_id)
+                from hermes_constants import get_hermes_home
+                db_file = get_hermes_home() / "state.db"
+            except ImportError:
+                db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+            try:
+                self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+            except OSError:
+                self._state_db_mtime = 0.0
+            try:
+                self._cached_sessions_index = _load_sessions_index()
             except Exception:
-                continue
-            all_ts = [_ts_float(m.get("timestamp", 0)) for m in (messages or ())]
-            if all_ts:
-                latest = max(all_ts)
-                if latest > 0.0:
-                    self._last_poll_timestamps[session_key] = latest
+                self._cached_sessions_index = {}
+            for session_key, entry in self._cached_sessions_index.items():
+                session_id = entry.get("session_id", "")
+                if not session_id:
+                    continue
+                try:
+                    messages = db.get_messages(session_id)
+                except Exception:
+                    continue
+                all_ts = [_ts_float(m.get("timestamp", 0)) for m in (messages or ())]
+                if all_ts:
+                    latest = max(all_ts)
+                    if latest > 0.0:
+                        self._last_poll_timestamps[session_key] = latest
+        finally:
+            db.close()
 
     def _poll_loop(self):
         """Background loop: poll SessionDB for new messages."""
@@ -494,12 +497,15 @@ class EventBridge:
             logger.warning("EventBridge: SessionDB unavailable, event polling disabled")
             return
 
-        while self._running:
-            try:
-                self._poll_once(db)
-            except Exception as e:
-                logger.debug("EventBridge poll error: %s", e)
-            time.sleep(POLL_INTERVAL)
+        try:
+            while self._running:
+                try:
+                    self._poll_once(db)
+                except Exception as e:
+                    logger.debug("EventBridge poll error: %s", e)
+                time.sleep(POLL_INTERVAL)
+        finally:
+            db.close()
 
     def _poll_once(self, db):
         """Check for new messages across all sessions.
@@ -727,31 +733,33 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             return json.dumps({"error": "Session database unavailable"})
 
         try:
-            all_messages = db.get_messages(session_id)
-        except Exception as e:
-            return json.dumps({"error": f"Failed to read messages: {e}"})
+            try:
+                all_messages = db.get_messages(session_id)
+            except Exception as e:
+                return json.dumps({"error": f"Failed to read messages: {e}"})
+            filtered = []
+            for msg in all_messages:
+                role = msg.get("role", "")
+                if role in {"user", "assistant"}:
+                    content = _extract_message_content(msg)
+                    if content:
+                        filtered.append({
+                            "id": str(msg.get("id", "")),
+                            "role": role,
+                            "content": content[:2000],
+                            "timestamp": msg.get("timestamp", ""),
+                        })
 
-        filtered = []
-        for msg in all_messages:
-            role = msg.get("role", "")
-            if role in {"user", "assistant"}:
-                content = _extract_message_content(msg)
-                if content:
-                    filtered.append({
-                        "id": str(msg.get("id", "")),
-                        "role": role,
-                        "content": content[:2000],
-                        "timestamp": msg.get("timestamp", ""),
-                    })
+            messages = filtered[-limit:]
 
-        messages = filtered[-limit:]
-
-        return json.dumps({
-            "session_key": session_key,
-            "count": len(messages),
-            "total_in_session": len(filtered),
-            "messages": messages,
-        }, indent=2)
+            return json.dumps({
+                "session_key": session_key,
+                "count": len(messages),
+                "total_in_session": len(filtered),
+                "messages": messages,
+            }, indent=2)
+        finally:
+            db.close()
 
     # -- attachments_fetch -------------------------------------------------
 
@@ -783,27 +791,29 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             return json.dumps({"error": "Session database unavailable"})
 
         try:
-            all_messages = db.get_messages(session_id)
-        except Exception as e:
-            return json.dumps({"error": f"Failed to read messages: {e}"})
+            try:
+                all_messages = db.get_messages(session_id)
+            except Exception as e:
+                return json.dumps({"error": f"Failed to read messages: {e}"})
+            # Find the target message
+            target_msg = None
+            for msg in all_messages:
+                if str(msg.get("id", "")) == message_id:
+                    target_msg = msg
+                    break
 
-        # Find the target message
-        target_msg = None
-        for msg in all_messages:
-            if str(msg.get("id", "")) == message_id:
-                target_msg = msg
-                break
+            if not target_msg:
+                return json.dumps({"error": f"Message not found: {message_id}"})
 
-        if not target_msg:
-            return json.dumps({"error": f"Message not found: {message_id}"})
+            attachments = _extract_attachments(target_msg)
 
-        attachments = _extract_attachments(target_msg)
-
-        return json.dumps({
-            "message_id": message_id,
-            "count": len(attachments),
-            "attachments": attachments,
-        }, indent=2)
+            return json.dumps({
+                "message_id": message_id,
+                "count": len(attachments),
+                "attachments": attachments,
+            }, indent=2)
+        finally:
+            db.close()
 
     # -- events_poll -------------------------------------------------------
 
