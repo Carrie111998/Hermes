@@ -91,6 +91,7 @@ from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
     InvalidCodeError,
     LoginStart,
+    MalformedTokenError,
     ProviderError,
     RefreshExpiredError,
     Session,
@@ -461,7 +462,12 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         if token_type and token_type != "bearer":
             raise ProviderError(f"unexpected token_type={token_type!r}")
 
-        claims = self._verify_id_token(id_token)
+        try:
+            claims = self._verify_id_token(id_token)
+        except MalformedTokenError as exc:
+            # Preserve auth-code vs. refresh failure semantics for a malformed
+            # token returned by the token endpoint.
+            raise bad_request_exc(f"IDP returned a malformed token: {exc}") from exc
 
         # Refresh-token rotation: prefer a freshly-issued one, else keep the
         # previous (some IDPs don't rotate). Empty string if neither — the
@@ -617,18 +623,12 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 id_token
             )
+        except jwt.DecodeError as exc:
+            # Header parsing happens before any JWKS fetch. Catch only structural
+            # decode failures; other token errors keep their existing semantics.
+            raise MalformedTokenError(f"malformed id token: {exc}") from exc
         except jwt.PyJWKClientError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
-        except jwt.InvalidTokenError as exc:
-            # A non-JWT / malformed token is "not my token", not an IDP
-            # outage. ``get_signing_key_from_jwt`` raises ``jwt.DecodeError``
-            # (an ``InvalidTokenError``, NOT a ``PyJWKClientError``) for a
-            # token that isn't a JWT at all — e.g. a session minted by a
-            # different provider, or a stale cookie. Raising ``InvalidCodeError``
-            # lets ``verify_session`` map it to ``None`` so the middleware can
-            # fall through to the next provider or force a clean re-login,
-            # instead of surfacing a bogus 503 "provider unreachable".
-            raise InvalidCodeError(f"token is not a valid JWT: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 
