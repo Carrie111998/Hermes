@@ -13,9 +13,10 @@ Subcommands:
 """
 
 from __future__ import annotations
+from hermes_cli.cli_output import line_input
 
 import sys
-from typing import List, Optional
+from typing import List
 
 from rich.console import Console
 from rich.table import Table
@@ -100,7 +101,7 @@ def _cmd_create(args) -> None:
         )
         try:
             while True:
-                line = input("skill> ").strip()
+                line = line_input("skill> ").strip()
                 if not line:
                     break
                 skills.append(line)
