@@ -840,6 +840,7 @@ class TestBuildDebugShare:
                 "version: 1.2.3",
                 "model: C:/Users/Alice/private-profile/model.gguf",
                 "provider: profile-Alice",
+                "terminal: C:/Users/Alice/private-project",
             )
         )
 
@@ -854,6 +855,7 @@ class TestBuildDebugShare:
         assert "version: 1.2.3" in uploaded[0]
         assert "model:" not in uploaded[0]
         assert "provider:" not in uploaded[0]
+        assert "terminal:" not in uploaded[0]
         assert "Alice" not in uploaded[0]
 
     def test_public_upload_refuses_redaction_opt_out(self):

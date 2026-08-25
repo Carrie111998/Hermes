@@ -584,9 +584,7 @@ def collect_debug_report(
     return buf.getvalue()
 
 
-_PUBLIC_DUMP_FIELDS = frozenset(
-    {"version", "os", "python", "openai_sdk", "terminal"}
-)
+_PUBLIC_DUMP_FIELDS = frozenset({"version", "os", "python", "openai_sdk"})
 
 
 def collect_public_debug_report() -> str:
