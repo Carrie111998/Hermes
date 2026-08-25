@@ -290,14 +290,6 @@ def try_acquire_active_session(
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None:
-        return ActiveSessionLease(
-            lease_id=lease_id,
-            session_id=session_id,
-            surface=surface,
-            enabled=False,
-        ), None
-
     now = time.time()
     entry = {
         "lease_id": lease_id,
@@ -321,7 +313,7 @@ def try_acquire_active_session(
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
         active_count = len(entries)
-        if active_count >= max_sessions:
+        if max_sessions is not None and active_count >= max_sessions:
             _write_entries(state_path, entries)
             logger.info(
                 "Active session limit reached: active=%d max=%d surface=%s",
@@ -413,8 +405,8 @@ def release_orphaned_leases(live_lease_ids: set[str]) -> int:
     """
     pid = os.getpid()
     state_path = _state_path()
-    # With the cap disabled the registry is never written, so don't take a lock
-    # (or create its file) on the idle-reaper tick for the majority of installs.
+    # Avoid creating the registry from the idle-reaper tick before any real
+    # session has acquired ownership.
     if not state_path.exists():
         return 0
     with _FileLock(_lock_path()):
