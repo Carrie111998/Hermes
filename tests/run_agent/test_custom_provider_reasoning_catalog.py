@@ -17,7 +17,7 @@ def _make_custom_agent(base_url="http://127.0.0.1:8977/v1", model="sonnet"):
     agent.base_url = base_url
     agent._base_url_lower = base_url.lower()
     agent.model = model
-    agent._api_key = ""  # required by the catalog lookup path
+    agent.api_key = ""
     return agent
 
 
@@ -64,31 +64,41 @@ class TestCustomProviderReasoningFromCatalog:
             result = agent._supports_reasoning_extra_body()
         assert result is False
 
-    def test_openrouter_url_still_uses_openrouter_path(self):
-        """OpenRouter URLs must not be short-circuited by a False catalog result --
-        they already went through the catalog gate and fall through to the existing
-        OpenRouter logic which handles them correctly."""
+    def test_openrouter_url_skips_the_catalog_entirely(self):
+        """OpenRouter must never take the catalog path: its per-model gating below
+        is deliberate, and a catalog entry advertising reasoning for a model that
+        gating excludes would silently flip behavior."""
         agent = object.__new__(AIAgent)
         agent.provider = "openrouter"
         agent.base_url = "https://openrouter.ai/api/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "anthropic/claude-sonnet-4-5"
-        agent._api_key = ""
+        agent.api_key = ""
 
-        # Catalog returns None (not listed on OpenRouter's own /v1/models metadata,
-        # because OpenRouter is not the final provider endpoint). The function must
-        # NOT return False here; it should fall through to the OpenRouter-specific
-        # path and let that decide.
+        # Even a True catalog verdict must not be consulted for OpenRouter.
         with patch(
             "agent.model_metadata.endpoint_model_supports_reasoning",
-            return_value=None,
+            return_value=True,
+        ) as mock_catalog:
+            agent._supports_reasoning_extra_body()
+
+        mock_catalog.assert_not_called()
+
+    def test_catalog_failure_is_logged_at_debug(self):
+        """The catalog probe's except branch must log rather than silently pass,
+        so a real bug (e.g. AttributeError) stays diagnosable."""
+        agent = _make_custom_agent()
+        with patch(
+            "agent.model_metadata.endpoint_model_supports_reasoning",
+            side_effect=RuntimeError("boom"),
         ):
-            # We only assert it doesn't raise and doesn't return True from the catalog
-            # path. The actual OpenRouter path decision is tested by existing tests.
-            result = agent._supports_reasoning_extra_body()
-        # For a non-reasoning OpenRouter model the result is False; for a known
-        # reasoning model it would be True. Just assert no exception propagates.
-        assert result in (True, False)
+            with patch("run_agent.logger") as mock_logger:
+                result = agent._supports_reasoning_extra_body()
+
+        assert result is False
+        assert mock_logger.debug.called
+        logged = " ".join(str(a) for a in mock_logger.debug.call_args[0])
+        assert "atalog reasoning probe failed" in logged
 
     def test_nousresearch_url_unaffected_by_catalog(self):
         """nousresearch.com returns True before the catalog lookup runs."""
@@ -97,7 +107,7 @@ class TestCustomProviderReasoningFromCatalog:
         agent.base_url = "https://inference.nousresearch.com/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "hermes-3"
-        agent._api_key = ""
+        agent.api_key = ""
 
         # Even if catalog were reachable it must never be called for this host,
         # because the nousresearch.com short-circuit fires first.

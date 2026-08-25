@@ -1533,16 +1533,7 @@ def endpoint_model_supports_reasoning(
     metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
     if not metadata:
         return None
-    # Try exact match first, then single-entry shortcut, then substring match
     entry = metadata.get(model)
-    if entry is None and len(metadata) == 1:
-        entry = next(iter(metadata.values()))
-    if entry is None and model:
-        lower = model.lower()
-        for key, val in metadata.items():
-            if lower in key.lower() or key.lower() in lower:
-                entry = val
-                break
     if entry is None:
         return None
     params = entry.get("supported_parameters")

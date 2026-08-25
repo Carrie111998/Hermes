@@ -2,6 +2,9 @@
 
 Covers the supported_parameters extraction added to fetch_endpoint_model_metadata
 and the model-lookup logic in endpoint_model_supports_reasoning.
+
+Lookup is exact-match only: no substring fallback, no single-entry shortcut.
+A model not listed by its exact name returns None.
 """
 
 from unittest.mock import patch
@@ -43,30 +46,48 @@ class TestEndpointModelSupportsReasoning:
         assert result is False
 
     def test_returns_none_when_catalog_empty(self):
-        """Empty catalog -> None (unreachable / model unlisted)."""
+        """Empty catalog -> None."""
         with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}):
             result = endpoint_model_supports_reasoning(
                 "sonnet", "http://127.0.0.1:8977/v1"
             )
         assert result is None
 
-    def test_returns_none_when_model_not_in_catalog(self):
-        """Catalog present with multiple entries but model not listed -> None.
-        (Single-entry shortcut doesn't apply when there are multiple entries and
-        the model name doesn't substring-match any key.)"""
+    def test_returns_none_when_model_not_listed_by_exact_name(self):
+        """Catalog present but model name is not an exact key -> None.
+        No fuzzy/substring/shortcut matching."""
         metadata = {
+            "claude-sonnet-4-6": {"context_length": 200000, "supported_parameters": ["reasoning"]},
             "claude-haiku-4": {"context_length": 48000, "supported_parameters": ["reasoning"]},
-            "claude-opus-4-6": {"context_length": 200000, "supported_parameters": ["reasoning"]},
         }
         with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value=metadata):
-            # "gpt-4o" has no substring overlap with either key
             result = endpoint_model_supports_reasoning(
                 "gpt-4o", "http://127.0.0.1:8977/v1"
             )
         assert result is None
 
+    def test_substring_of_catalog_key_does_not_match(self):
+        """A model name that is a substring of a listed key still returns None.
+        Callers must use the exact same name the endpoint lists."""
+        metadata = _make_metadata("claude-sonnet-4-6", ["reasoning"])
+        with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value=metadata):
+            # "sonnet" is a substring of "claude-sonnet-4-6" but is not the same key
+            result = endpoint_model_supports_reasoning(
+                "sonnet", "http://127.0.0.1:8977/v1"
+            )
+        assert result is None
+
+    def test_single_entry_catalog_requires_exact_name(self):
+        """Even a one-model catalog must not match a request for a different model name."""
+        metadata = _make_metadata("claude-sonnet-4-6", ["reasoning"])
+        with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value=metadata):
+            result = endpoint_model_supports_reasoning(
+                "sonnet", "http://127.0.0.1:8977/v1"
+            )
+        assert result is None
+
     def test_returns_none_when_supported_parameters_missing(self):
-        """Model found but entry has no supported_parameters key -> None."""
+        """Model found by exact name but entry has no supported_parameters key -> None."""
         metadata = {"claude-sonnet": {"context_length": 200000}}
         with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value=metadata):
             result = endpoint_model_supports_reasoning(
@@ -82,40 +103,6 @@ class TestEndpointModelSupportsReasoning:
                 "claude-sonnet", "http://127.0.0.1:8977/v1"
             )
         assert result is None
-
-    def test_single_entry_shortcut_matches_any_model_name(self):
-        """Single-entry catalog: model name mismatch still matches the only entry."""
-        metadata = _make_metadata("claude-sonnet-4-6", ["reasoning"])
-        with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value=metadata):
-            # Caller uses a shorter alias; single-entry shortcut applies
-            result = endpoint_model_supports_reasoning(
-                "sonnet", "http://127.0.0.1:8977/v1"
-            )
-        assert result is True
-
-    def test_substring_match_used_when_exact_fails_and_multi_entry(self):
-        """Multi-entry catalog falls back to substring match."""
-        metadata = {
-            "claude-sonnet-4-6": {"context_length": 200000, "supported_parameters": ["reasoning"]},
-            "claude-haiku-4": {"context_length": 48000, "supported_parameters": []},
-        }
-        with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value=metadata):
-            result = endpoint_model_supports_reasoning(
-                "claude-sonnet", "http://127.0.0.1:8977/v1"
-            )
-        assert result is True
-
-    def test_substring_match_negative(self):
-        """Substring match finds model but reasoning absent -> False."""
-        metadata = {
-            "claude-sonnet-4-6": {"context_length": 200000, "supported_parameters": ["temperature"]},
-            "claude-haiku-4": {"context_length": 48000, "supported_parameters": ["reasoning"]},
-        }
-        with patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value=metadata):
-            result = endpoint_model_supports_reasoning(
-                "claude-sonnet", "http://127.0.0.1:8977/v1"
-            )
-        assert result is False
 
 
 # ============================================================
