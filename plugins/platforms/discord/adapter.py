@@ -3472,7 +3472,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
             # Hydration map contract: "" means known-but-empty (captionless
             # attachment — a hit, do NOT replace it with a fetch); None means
-            # unknown. Gate 6a therefore keeps whatever the map returned.
+            # unknown. Gate 6a keeps whatever the map returned; Gate 6b falls
+            # back to the fetch result ONLY on None, so a known-empty hit
+            # survives REMOVE-path authorship fetches too.
             target_text = self._lookup_outbound_snippet(message_id)
             author_id = str(getattr(payload, "message_author_id", "") or "")
             if author_id:                                  # Gate 6a: ADD fast path
@@ -3483,7 +3485,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     message_id, payload)
                 if not is_ours:
                     return
-                target_text = target_text or fetched_text
+                if target_text is None:
+                    target_text = fetched_text
 
             # Gate 7: Channel policy before authorization: outcome-equivalent
             # to ingress (both must pass); channel-first avoids potential

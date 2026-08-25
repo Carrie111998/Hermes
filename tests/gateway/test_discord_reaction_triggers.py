@@ -618,3 +618,61 @@ async def test_remove_uses_map_snippet_over_fetch(monkeypatch):
     assert len(dispatched) == 1
     assert dispatched[0].text == "reaction:removed:👍"
     assert dispatched[0].reply_to_text == "map text"   # map wins for hydration
+
+
+# ===========================================================================
+# Fix round Task A: Gate 6b merge must honor the hydration-map sentinel.
+# "" = known-but-empty (a hit); None = unknown (fall back to the fetch).
+# These exercise the REAL _resolve_reaction_target through a fake client
+# whose fetch_message returns bot-authored text.
+# ===========================================================================
+def _client_with_bot_fetch(adapter, *, content: str) -> None:
+    """Swap in a fake client whose channels resolve and whose fetch_message
+    returns a bot-authored (id=999) message with the given content."""
+    chan = SimpleNamespace(id=2, name="general", parent_id=None, parent=None)
+
+    async def _fetch_message(mid):
+        return SimpleNamespace(author=SimpleNamespace(id=999), content=content)
+
+    chan.fetch_message = _fetch_message
+
+    def _get_channel(cid):
+        return chan if int(cid) == chan.id else None
+
+    async def _fetch_channel(cid):
+        return _get_channel(cid)
+
+    adapter._client = type("C", (), {
+        "user": _FakeClientUser(),
+        "get_channel": staticmethod(_get_channel),
+        "fetch_channel": staticmethod(_fetch_channel),
+        "fetch_user": staticmethod(lambda uid: SimpleNamespace(id=int(uid))),
+    })()
+
+
+@pytest.mark.asyncio
+async def test_remove_known_empty_sentinel_not_overwritten_by_fetch(monkeypatch):
+    # Map holds "" (captionless attachment) for msg X; REMOVE takes Gate 6b,
+    # whose authorship fetch returns real text. The fetched text must NOT
+    # clobber the known-empty hit: reply_to_text renders None either way,
+    # but only because "" was honored — not because the fetch won the merge.
+    adapter = _make_adapter()
+    dispatched, _hooks = _patch_common(monkeypatch, adapter)
+    adapter._remember_outbound_snippet("42", "")
+    _client_with_bot_fetch(adapter, content="fetched text")
+    await adapter._handle_reaction_payload(
+        _reaction_payload(message_author_id=None), added=False)
+    assert len(dispatched) == 1      # authorship fetch passed Gate 6b
+    assert dispatched[0].reply_to_text is None   # "" sentinel survived
+
+
+@pytest.mark.asyncio
+async def test_remove_unknown_target_falls_back_to_fetch_text(monkeypatch):
+    # Map miss (None = unknown): the Gate 6b fetch result IS the hydration.
+    adapter = _make_adapter()
+    dispatched, _hooks = _patch_common(monkeypatch, adapter)
+    _client_with_bot_fetch(adapter, content="fetched text")
+    await adapter._handle_reaction_payload(
+        _reaction_payload(message_author_id=None), added=False)
+    assert len(dispatched) == 1
+    assert dispatched[0].reply_to_text == "fetched text"
