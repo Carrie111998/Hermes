@@ -52,11 +52,15 @@ const row = (id: string, over: Partial<SessionInfo> = {}): SessionInfo =>
 const sidebar = (
   recents: { sessions: SessionInfo[]; profiles_truncated?: Record<string, boolean> },
   cron: SessionInfo[] = [],
-  messaging: SessionInfo[] = []
+  messaging: SessionInfo[] = [],
+  projects: SessionInfo[] = [],
+  archives: SessionInfo[] = []
 ): SidebarSessionsResponse => ({
   recents: { sessions: recents.sessions, profiles_truncated: recents.profiles_truncated },
   cron: { sessions: cron },
-  messaging: { sessions: messaging }
+  messaging: { sessions: messaging },
+  projects: { sessions: projects },
+  archives: { sessions: archives }
 })
 
 const listSidebarSessions = vi.fn()

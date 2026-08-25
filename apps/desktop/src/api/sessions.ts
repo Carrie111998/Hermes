@@ -63,6 +63,10 @@ export async function listSessions(
 export interface SessionSourceFilter {
   source?: string
   excludeSources?: string[]
+  /** Only rows with this disposition (e.g. 'project'). */
+  disposition?: string
+  /** Omit rows with these dispositions (e.g. ['transient', 'junk']). */
+  excludeDispositions?: string[]
 }
 
 export async function listAllProfileSessions(
@@ -79,10 +83,19 @@ export async function listAllProfileSessions(
     ? `&exclude_sources=${encodeURIComponent(filter.excludeSources.join(','))}`
     : ''
 
+  const dispositionParam = filter.disposition
+    ? `&disposition=${encodeURIComponent(filter.disposition)}`
+    : ''
+
+  const excludeDispositionsParam = filter.excludeDispositions?.length
+    ? `&exclude_dispositions=${encodeURIComponent(filter.excludeDispositions.join(','))}`
+    : ''
+
   const result = await hermesApi<PaginatedSessions>({
     path:
       `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=${Math.max(0, minMessages)}` +
-      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
+      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}` +
+      `${dispositionParam}${excludeDispositionsParam}`,
     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 
@@ -129,6 +142,11 @@ export interface SidebarSessionsResponse {
   recents: SidebarSessionSlice
   cron: SidebarSessionSlice
   messaging: SidebarSessionSlice
+  /** Taxonomy slice: sessions with disposition=project (active work). The
+   *  sidebar groups these by project_group -> project. */
+  projects: SidebarSessionSlice
+  /** Taxonomy slice: sessions with disposition=archive (finished work). */
+  archives: SidebarSessionSlice
   errors?: Array<{ profile: string; error: string }>
 }
 
@@ -139,6 +157,12 @@ export interface SidebarSessionsRequest {
   cronLimit: number
   messagingLimit: number
   messagingExclude: string[]
+  projectsLimit?: number
+  archivesLimit?: number
+  /** Dispositions the recents slice should omit (e.g. transient,junk). */
+  recentsExcludeDispositions?: string[]
+  /** Dispositions the messaging slice should omit (e.g. transient,junk). */
+  messagingExcludeDispositions?: string[]
 }
 
 // The batched /sidebar endpoint shipped later than the per-slice route, so a
@@ -164,13 +188,21 @@ export function resetSidebarBatchCapability() {
 // Rides the same Electron remote-splice
 // interception as the pre-batching desktop, so remote profiles stay correct.
 async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
-  const [recents, cron, messaging] = await Promise.all([
+  const [recents, cron, messaging, projects, archives] = await Promise.all([
     listAllProfileSessions(req.recentsLimit, 1, 'exclude', 'recent', req.recentsProfile, {
-      excludeSources: req.recentsExclude
+      excludeSources: req.recentsExclude,
+      excludeDispositions: req.recentsExcludeDispositions
     }),
     listAllProfileSessions(req.cronLimit, 1, 'exclude', 'recent', req.recentsProfile, { source: 'cron' }),
     listAllProfileSessions(req.messagingLimit, 1, 'exclude', 'recent', req.recentsProfile, {
-      excludeSources: req.messagingExclude
+      excludeSources: req.messagingExclude,
+      excludeDispositions: req.messagingExcludeDispositions
+    }),
+    listAllProfileSessions(req.projectsLimit ?? 300, 1, 'exclude', 'recent', req.recentsProfile, {
+      disposition: 'project'
+    }),
+    listAllProfileSessions(req.archivesLimit ?? 300, 1, 'exclude', 'recent', req.recentsProfile, {
+      disposition: 'archive'
     })
   ])
 
@@ -183,6 +215,8 @@ async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<S
     },
     cron: { sessions: cron.sessions },
     messaging: { sessions: messaging.sessions },
+    projects: { sessions: projects.sessions },
+    archives: { sessions: archives.sessions },
     ...(errors.length ? { errors } : {})
   }
 }
@@ -213,7 +247,9 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
     recents_profile: req.recentsProfile,
     recents_limit: String(Math.max(1, req.recentsLimit)),
     cron_limit: String(Math.max(1, req.cronLimit)),
-    messaging_limit: String(Math.max(1, req.messagingLimit))
+    messaging_limit: String(Math.max(1, req.messagingLimit)),
+    projects_limit: String(Math.max(1, req.projectsLimit ?? 300)),
+    archives_limit: String(Math.max(1, req.archivesLimit ?? 300))
   })
 
   if (req.recentsExclude.length) {
@@ -222,6 +258,14 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
 
   if (req.messagingExclude.length) {
     params.set('messaging_exclude', req.messagingExclude.join(','))
+  }
+
+  if (req.recentsExcludeDispositions?.length) {
+    params.set('recents_exclude_dispositions', req.recentsExcludeDispositions.join(','))
+  }
+
+  if (req.messagingExcludeDispositions?.length) {
+    params.set('messaging_exclude_dispositions', req.messagingExcludeDispositions.join(','))
   }
 
   let result: SidebarSessionsResponse
@@ -248,6 +292,8 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
     recents: { ...result.recents, sessions: result.recents?.sessions ?? [] },
     cron: { ...result.cron, sessions: result.cron?.sessions ?? [] },
     messaging: { ...result.messaging, sessions: result.messaging?.sessions ?? [] },
+    projects: { ...result.projects, sessions: result.projects?.sessions ?? [] },
+    archives: { ...result.archives, sessions: result.archives?.sessions ?? [] },
     errors: result.errors
   }
 }

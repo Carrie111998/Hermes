@@ -476,6 +476,17 @@ export interface SessionCreateResponse {
 
 export interface SessionInfo {
   archived?: boolean
+  /** Session taxonomy bucket: 'project' | 'archive' | 'transient' | 'junk'.
+   *  The sidebar groups by this (Projects / Archives sections); transient and
+   *  junk rows are hidden from the sidebar. Absent on backends predating the
+   *  taxonomy — treat as unclassified. */
+  disposition?: null | string
+  /** Taxonomy category bucket, e.g. "Hermes Community Extensions" or
+   *  "Hermes infra". Projects group under this in the sidebar. */
+  project_group?: null | string
+  /** Named project within the category, e.g. "Fusion Router". Optional — a
+   *  project_group can hold sessions without a specific named project. */
+  project?: null | string
   cwd?: null | string
   /** Git branch checked out in {@link cwd} when the session started/resumed.
    *  The sidebar groups main-checkout sessions by this so feature-branch work
