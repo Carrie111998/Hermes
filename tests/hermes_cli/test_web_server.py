@@ -2251,6 +2251,34 @@ class TestWebServerEndpoints:
             "msg 499",
         ]
 
+    def test_get_session_detail_falls_back_across_profiles(self):
+        """A bot session living in a non-default profile's state.db must
+        still resolve when the request omits ?profile= (#94609): the desktop
+        resumes bookmarked/restored session ids without a profile hint, and
+        each profile owns its own state.db.
+        """
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        bot_home = profiles_mod.get_profile_dir("basselect")
+        bot_home.mkdir(parents=True)
+        (bot_home / "config.yaml").write_text("")
+        db = SessionDB(db_path=bot_home / "state.db")
+        try:
+            db.create_session(session_id="bot-session-1", source="telegram")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/bot-session-1")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["id"] == "bot-session-1"
+        assert payload["profile"] == "basselect"
+
+        assert self.client.get(
+            "/api/sessions/does-not-exist-anywhere"
+        ).status_code == 404
+
     def test_export_session_streams_bounded_message_pages(self, monkeypatch):
         from hermes_state import SessionDB
 

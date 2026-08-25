@@ -552,27 +552,50 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-@manage_router.get("/api/sessions/{session_id}")
-async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile, read_only=True)
+def _lookup_session_in_profile(session_id: str, candidate: Optional[str]):
+    db = _open_session_db_for_profile(candidate, read_only=True)
     try:
         sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        # Always stamp the owning profile — the serving profile is known even
-        # when the request carries no ``?profile=`` (it's this process's own
-        # profile). Stamping only on explicit ``?profile=`` left rows for the
-        # default/primary profile systematically unowned, so multi-profile
-        # clients resolved them to whichever gateway happened to be active
-        # (cross-profile open asymmetry, #67603 family).
-        session["profile"] = (
-            _cron_profile_home(profile)[0] if profile else _cron_default_profile()
-        )
-        session["is_default_profile"] = session["profile"] == "default"
-        return session
+        return db.get_session(sid) if sid else None
     finally:
         db.close()
+
+
+@manage_router.get("/api/sessions/{session_id}")
+async def get_session_detail(session_id: str, profile: Optional[str] = None):
+    resolved_profile = profile
+    session = _lookup_session_in_profile(session_id, profile)
+    if not session and not profile:
+        # Bot sessions live in their own profile's state.db. A request that
+        # omits ?profile= only checked the default profile above, so a bot
+        # chat opened without its owning profile 404s here even though it
+        # exists on disk (cross-profile open asymmetry, #67603 family).
+        # Fall back across the other local profiles; an explicit ?profile=
+        # that misses stays a real 404 rather than guessing elsewhere.
+        from hermes_cli.kanban_db import list_profiles_on_disk
+
+        for name in list_profiles_on_disk():
+            if name == "default":
+                continue  # already tried above via the profile=None lookup
+            session = _lookup_session_in_profile(session_id, name)
+            if session:
+                resolved_profile = name
+                break
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # Always stamp the owning profile — the serving profile is known even
+    # when the request carries no ``?profile=`` (it's this process's own
+    # profile). Stamping only on explicit ``?profile=`` left rows for the
+    # default/primary profile systematically unowned, so multi-profile
+    # clients resolved them to whichever gateway happened to be active
+    # (cross-profile open asymmetry, #67603 family).
+    session["profile"] = (
+        _cron_profile_home(resolved_profile)[0]
+        if resolved_profile
+        else _cron_default_profile()
+    )
+    session["is_default_profile"] = session["profile"] == "default"
+    return session
 
 
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
