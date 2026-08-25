@@ -32,6 +32,7 @@ import {
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
+import { clipboardTextExtension, composerTextFilenamePrefix, hasClipboardText } from './composer-clipboard'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
   type BackendOutputTail,
@@ -5737,41 +5738,8 @@ async function writeComposerImage(buffer, ext = '.png') {
   return filePath
 }
 
-function clipboardTextExtension(text) {
-  const trimmed = String(text || '').trim()
-
-  if (trimmed[0] !== '{' && trimmed[0] !== '[') {
-    return '.md'
-  }
-
-  try {
-    const value = JSON.parse(trimmed)
-
-    return Array.isArray(value) || (value !== null && typeof value === 'object') ? '.json' : '.md'
-  } catch {
-    return '.md'
-  }
-}
-
-function isFilenameControlCharacter(char) {
-  const code = char.codePointAt(0)
-
-  return code !== undefined && (code < 32 || (code >= 127 && code <= 159))
-}
-
 async function writeComposerText(text) {
-  const preview = String(text || '')
-    .trim()
-    .replace(/\s+/g, ' ')
-    .slice(0, 30)
-    .replace(/[<>:"/\\|?*]/g, '')
-
-  const safePreview =
-    Array.from(preview)
-      .filter(char => !isFilenameControlCharacter(char))
-      .join('')
-      .trim()
-      .replace(/[. ]+$/, '') || 'clipboard'
+  const safePreview = composerTextFilenamePrefix(text)
 
   const dir = path.join(app.getPath('userData'), 'composer-files')
   await fs.promises.mkdir(dir, { recursive: true })
@@ -14578,7 +14546,7 @@ ipcMain.handle('hermes:saveClipboardImage', async () => {
 ipcMain.handle('hermes:saveClipboardText', async () => {
   const text = clipboard.readText()
 
-  return text.trim() ? writeComposerText(text) : ''
+  return hasClipboardText(text) ? writeComposerText(text) : ''
 })
 
 ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
