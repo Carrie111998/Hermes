@@ -6,6 +6,7 @@ import type { PreviewActAction } from '@/lib/preview-act/act-in-page'
 import type { TourAction, TourStep } from '@/lib/tour'
 import { $gateway } from '@/store/gateway'
 import { applyDesktopLayoutPreset, revealDesktopPane } from '@/store/pane-focus'
+import { openPenCanvas, runPenTool } from '@/store/pen'
 import { recordAgentReaction } from '@/store/reactions-local'
 import { setMessages } from '@/store/session'
 
@@ -43,7 +44,7 @@ const loadPreviewEngine = () => {
  *  (terminal/preview/window), agent terminal streaming, pane reveal, and
  *  message reactions. */
 export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
-  const { event, payload, isActiveEvent } = ctx
+  const { event, payload, isActiveEvent, sessionId } = ctx
 
   if (event.type === 'terminal.read.request') {
     // read_terminal tool: serialize the renderer's xterm buffer and answer
@@ -163,6 +164,55 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
     // Agent closed its own read-only tab via the desktop-gated close_terminal tool.
     // The process is untouched — this only drops the view.
     closeAgentTerminalByProc(payload?.process_id ?? '')
+
+    return true
+  }
+
+  if (event.type === 'pen.tool.request') {
+    // pen_canvas tool: run a pen.dev design operation. 'open' opens (or
+    // re-fronts) a Canvas tab; everything else goes to the live canvas —
+    // main falls back to the user's running pen.dev app when no Canvas tab
+    // is open (the HUD-mode path). Empty text = unavailable.
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+    if (requestId) {
+      const action = typeof payload?.action === 'string' ? payload.action : ''
+      const args = payload?.args && typeof payload.args === 'object' ? (payload.args as Record<string, unknown>) : {}
+
+      const answer = (result: unknown) =>
+        $gateway.get()?.request('pen.tool.respond', {
+          request_id: requestId,
+          text: result ? JSON.stringify(result) : ''
+        })
+
+      // `open` and `close` are HOST actions (they own the drawer), not pen
+      // MCP operations — everything else passes through to the editor.
+      const run =
+        action === 'open'
+          ? openPenCanvas(
+              {
+                // The agent names the canvas from its design brief — the same
+                // "derive from the opening intent" stage sessions use for
+                // instant titles. No name = Untitled N.
+                name: typeof args.name === 'string' ? args.name : undefined,
+                path: typeof args.path === 'string' ? args.path : undefined,
+                template: typeof args.template === 'string' ? args.template : undefined
+              },
+              // The route's session — the chat this agent is designing in. The
+              // selected atom is null in a draft; this never is.
+              sessionId
+            ).then(doc =>
+              doc ? { success: true, result: { docId: doc.docId, fileURI: doc.fileURI || null } } : null
+            )
+          : action === 'close'
+            ? (window.hermesDesktop?.pen?.close() ?? Promise.resolve()).then(() => ({
+                success: true,
+                result: { closed: true }
+              }))
+            : runPenTool(action, args)
+
+      void run.then(answer, () => answer(null))
+    }
 
     return true
   }

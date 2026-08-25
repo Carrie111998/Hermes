@@ -24,6 +24,7 @@ GUI_TOOLS = {
     "close_terminal",
     "focus_pane",
     "open_preview",
+    "pen_canvas",
     "read_preview",
     "read_terminal",
     "read_window_below",

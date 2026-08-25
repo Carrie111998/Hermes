@@ -573,6 +573,7 @@ def init_agent(
     drive_preview_callback: callable = None,
     read_window_below_callback: callable = None,
     setup_mcp_callback: callable = None,
+    pen_canvas_callback: callable = None,
     tour_callback: callable = None,
     step_callback: callable = None,
     stream_delta_callback: callable = None,
@@ -871,6 +872,7 @@ def init_agent(
     agent.drive_preview_callback = drive_preview_callback
     agent.read_window_below_callback = read_window_below_callback
     agent.setup_mcp_callback = setup_mcp_callback
+    agent.pen_canvas_callback = pen_canvas_callback
     agent.tour_callback = tour_callback
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
