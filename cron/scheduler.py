@@ -2861,11 +2861,14 @@ def _record_delivery_receipt(
     configured_thread_id: Optional[str],
     send_result: Any,
 ) -> None:
-    """Persist safe identifiers for a confirmed delivery, never provider payloads.
+    """Persist safe identifiers for a confirmed *text* delivery, never payloads.
 
     This lets automation link a just-created Slack discussion to an external
     artifact without depending on the bot receiving its own outbound message.
     A root message is its own Slack thread anchor; replies retain their parent.
+    Attachment-only sends do not currently create receipts. ``thread_id`` is a
+    platform-routing identifier: on non-Slack platforms consumers must treat it
+    as opaque rather than assume it names a discussion thread.
     """
     if isinstance(send_result, dict):
         message_id = send_result.get("message_id")
@@ -2889,8 +2892,9 @@ def _record_delivery_receipt(
     receipts = job.setdefault("_delivery_receipts", [])
     if receipt not in receipts:
         receipts.append(receipt)
-        # update_job acquires the job-store lock, so concurrent cron executions
-        # cannot clobber a receipt while marking another job run.
+        # One job has one active delivery attempt: claim_job_for_fire() fences
+        # concurrent fires before they reach _deliver_result. update_job's lock
+        # then serializes this persistence with other job-store mutations.
         update_job(job["id"], {"last_delivery_receipts": receipts})
 
 

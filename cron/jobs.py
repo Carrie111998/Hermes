@@ -2133,7 +2133,8 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
-        # Structured transport references from the latest successful delivery.
+        # Structured transport references confirmed during the latest delivery
+        # attempt. A later failed attempt intentionally clears these receipts.
         # Keep provider responses and message content out of persistent job state.
         "last_delivery_receipts": [],
         "failure_streak": 0,
