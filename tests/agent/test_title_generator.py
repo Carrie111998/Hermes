@@ -107,6 +107,32 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             assert generate_title("how does the registration system work?", "...") is None
 
+    def test_falls_back_to_reasoning_content_when_content_empty(self):
+        """Reasoning models (R1-style APIs) can return empty ``content`` with
+        everything in ``reasoning_content``. Without the fallback every
+        auto-title attempt failed and sessions stayed untitled."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = ""
+        mock_response.choices[0].message.reasoning_content = (
+            'Let me think... the user asks about X. Output: {"title": "Debug the reasoning fallback"}'
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("question", "answer") == "Debug the reasoning fallback"
+
+    def test_falls_back_to_reasoning_content_dict_message(self):
+        """Dict-shaped messages (non-object clients) get the same fallback."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message = {
+            "content": None,
+            "reasoning_content": '{"title": "Dict message title"}',
+        }
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("question", "answer") == "Dict message title"
+
     def test_rejects_many_short_words(self):
         """13 short words stays under the 80-char cap but is not a title."""
         mock_response = MagicMock()
