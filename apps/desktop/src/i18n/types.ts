@@ -754,6 +754,9 @@ export interface Translations {
       plainTextConfirmAction: string
       plainTextStoredTitle: string
       plainTextStoredDesc: string
+      keychainEncryptionTitle: string
+      keychainEncryptionDesc: string
+      keychainEncryptionFailed: string
       testRemote: string
       saveForRestart: string
       saveAndReconnect: string
@@ -2532,6 +2535,7 @@ export interface Translations {
     hide: string
     openPreview: string
     openInBrowser: string
+    openInExternal: string
     linkHint: string
     sourceLineTitle: string
     source: string
