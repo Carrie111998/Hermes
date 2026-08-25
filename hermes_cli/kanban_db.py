@@ -5982,19 +5982,34 @@ def _insert_completion_attachment(
             raise ArtifactPreservationError(
                 f"preserved completion artifact changed while hashing: {stored_path}"
             )
+        artifact_sha256 = digest.hexdigest()
+        if artifact_sha256 != expected_sha256:
+            raise ArtifactPreservationError(
+                f"preserved completion artifact digest changed before admission: {stored_path}"
+            )
+        insertion = conn.execute(
+            "INSERT INTO task_attachments "
+            "(task_id, filename, stored_path, content_type, size, sha256, uploaded_by, created_at) "
+            "VALUES (?, ?, ?, NULL, ?, ?, 'kanban_complete', ?)",
+            (task_id, filename, stored_path, size, artifact_sha256, created_at),
+        )
+        admitted = os.fstat(fd)
+        if (
+            admitted.st_dev != opened.st_dev
+            or admitted.st_ino != opened.st_ino
+            or admitted.st_size != opened.st_size
+            or admitted.st_mtime_ns != opened.st_mtime_ns
+            or admitted.st_ctime_ns != opened.st_ctime_ns
+        ):
+            conn.execute(
+                "DELETE FROM task_attachments WHERE rowid = ?",
+                (insertion.lastrowid,),
+            )
+            raise ArtifactPreservationError(
+                f"preserved completion artifact changed during admission: {stored_path}"
+            )
     finally:
         os.close(fd)
-    artifact_sha256 = digest.hexdigest()
-    if artifact_sha256 != expected_sha256:
-        raise ArtifactPreservationError(
-            f"preserved completion artifact digest changed before admission: {stored_path}"
-        )
-    conn.execute(
-        "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, sha256, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, artifact_sha256, created_at),
-    )
     _append_event(
         conn,
         task_id,
