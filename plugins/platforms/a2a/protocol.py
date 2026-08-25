@@ -28,9 +28,10 @@ import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 PROTOCOL_VERSION = "1.0"
 
@@ -65,6 +66,7 @@ ERR_METHOD_NOT_FOUND = -32601
 ERR_TASK_NOT_FOUND = -32001        # A2A spec: TaskNotFoundError
 ERR_TASK_NOT_CANCELABLE = -32002   # A2A spec: TaskNotCancelableError
 ERR_PUSH_NOT_SUPPORTED = -32003    # A2A spec: PushNotificationNotSupportedError
+ERR_UNSUPPORTED_OPERATION = -32004 # A2A spec: UnsupportedOperationError
 ERR_UNAUTHORIZED = -32050
 ERR_RATE_LIMITED = -32051
 ERR_UNTRUSTED_PEER = -32052
@@ -258,12 +260,17 @@ def data_part(data: Any, media_type: str = "application/json") -> dict:
     return {"data": data, "mediaType": media_type}
 
 
-def text_message(role: str, text: str, context_id: str = "") -> dict:
+def text_message(
+    role: str,
+    text: str,
+    context_id: str = "",
+    message_id: str = "",
+) -> dict:
     """Build an A2A v1.0 Message with a single text Part."""
     msg: dict[str, Any] = {
         "role": role,  # ROLE_USER | ROLE_AGENT
         "parts": [text_part(text)],
-        "messageId": uuid.uuid4().hex,
+        "messageId": message_id or uuid.uuid4().hex,
     }
     if context_id:
         msg["contextId"] = context_id
@@ -371,6 +378,9 @@ def build_task(
     agent_text: str = "",
     *,
     created_at: str = "",
+    status_timestamp: str = "",
+    artifact_id: str = "",
+    status_message_id: str = "",
 ) -> dict:
     """Build an A2A v1.0 Task object for a message/send result.
 
@@ -379,18 +389,26 @@ def build_task(
     ``lastModified`` field.  Strict ProtoJSON parsers (e.g. a2a-sdk 1.1.0)
     reject unknown fields, so we must not include them.  The spec's §5.6.1
     timestamp-format example mentions them but they are not in the proto.
+    ``status_timestamp``, ``artifact_id``, and ``status_message_id`` let stored
+    tasks render the same wire object on every side-effect-free GetTask poll;
+    one-shot responses omit them and receive fresh values.
     """
-    now = now_iso()
+    now = status_timestamp or now_iso()
     task: dict[str, Any] = {
         "id": task_id,
         "contextId": context_id,
         "status": {"state": state, "timestamp": now},
     }
     if agent_text:
-        task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
+        task["status"]["message"] = text_message(
+            ROLE_AGENT,
+            agent_text,
+            context_id,
+            message_id=status_message_id,
+        )
         if state == STATE_COMPLETED:
             task["artifacts"] = [{
-                "artifactId": uuid.uuid4().hex,
+                "artifactId": artifact_id or uuid.uuid4().hex,
                 "parts": [text_part(agent_text)],
             }]
     return task
@@ -571,15 +589,17 @@ metrics = Metrics()
 
 
 # --------------------------------------------------------------------------
-# Task store — pending AND completed tasks (queryable via tasks/get, tasks/list)
+# Task store — active AND finalized tasks (queryable via tasks/get, tasks/list)
 # --------------------------------------------------------------------------
 
 class TaskStore:
-    """In-memory store of A2A tasks, kept after completion for tasks/get.
+    """In-memory store of active and finalized A2A tasks.
 
-    Records carry the routed agent slug and tenant. All read/write helpers accept
-    optional scope values and return not-found when the task exists but is not
-    visible in that scope, satisfying the spec's authorization scoping rule.
+    Finalized records include terminal and interrupted states and remain
+    queryable until bounded retention trims them. Records carry the routed
+    agent slug and tenant. All read/write helpers accept optional scope values
+    and return not-found when the task exists but is not visible in that scope,
+    satisfying the spec's authorization scoping rule.
     """
 
     _MAX_TERMINAL = 500
@@ -588,6 +608,8 @@ class TaskStore:
         self._tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._completion_sequence = 0
 
     @staticmethod
     def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
@@ -599,6 +621,7 @@ class TaskStore:
 
     def create(self, task_id: str, context_id: str, peer: str,
                agent_slug: str = "", tenant: str = "") -> dict:
+        created_iso = now_iso()
         rec = {
             "task_id": task_id,
             "context_id": context_id,
@@ -607,8 +630,13 @@ class TaskStore:
             "tenant": tenant or "",
             "state": STATE_SUBMITTED,
             "reply": "",
+            "progress": "",
             "created_at": time.time(),
-            "created_iso": now_iso(),
+            "created_iso": created_iso,
+            "status_iso": created_iso,
+            "revision": 0,
+            "artifact_id": uuid.uuid4().hex,
+            "status_message_id": uuid.uuid4().hex,
             "push_url": "",
             "push_config_id": "",
         }
@@ -619,8 +647,23 @@ class TaskStore:
     def set_state(self, task_id: str, state: str) -> None:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if rec and rec["state"] not in TERMINAL_STATES:
+            if rec and rec.get("completed_at") is None:
                 rec["state"] = state
+                rec["status_iso"] = now_iso()
+                rec["revision"] = int(rec.get("revision", 0)) + 1
+                self._condition.notify_all()
+
+    def set_progress(self, task_id: str, text: str) -> bool:
+        """Replace the latest non-terminal progress snapshot for a task."""
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec.get("completed_at") is not None:
+                return False
+            rec["progress"] = text
+            rec["status_iso"] = now_iso()
+            rec["revision"] = int(rec.get("revision", 0)) + 1
+            self._condition.notify_all()
+            return True
 
     def set_push_config(self, task_id: str, url: str,
                         agent_slug: str = "", tenant: str = "") -> Optional[dict]:
@@ -688,17 +731,29 @@ class TaskStore:
             return dict(rec)
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
-        """Transition a task to a terminal state. Idempotent."""
+        """Finalize one dispatch cycle. Idempotent, including interrupted states."""
         watchers: list[Future] = []
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or rec["state"] in TERMINAL_STATES:
+            if not rec:
                 return None
+            if rec.get("completed_at") is not None:
+                can_cancel_interrupted = (
+                    rec.get("state") in {STATE_INPUT_REQUIRED, STATE_AUTH_REQUIRED}
+                    and state == STATE_CANCELED
+                )
+                if not can_cancel_interrupted:
+                    return None
             rec["state"] = state
             rec["reply"] = reply
             rec["completed_at"] = time.time()
+            self._completion_sequence += 1
+            rec["completion_seq"] = self._completion_sequence
+            rec["status_iso"] = now_iso()
+            rec["revision"] = int(rec.get("revision", 0)) + 1
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
+            self._condition.notify_all()
             out = dict(rec)
         for fut in watchers:
             if not fut.done():
@@ -711,11 +766,39 @@ class TaskStore:
             if not rec or not self._in_scope(rec, agent_slug, tenant):
                 return None
             fut: Future = Future()
-            if rec["state"] in TERMINAL_STATES:
+            if rec.get("completed_at") is not None:
                 fut.set_result((rec["state"], rec.get("reply", "")))
             else:
                 self._watchers.setdefault(task_id, []).append(fut)
             return fut
+
+    def wait_for_update(
+        self,
+        task_id: str,
+        revision: int,
+        timeout: float,
+        agent_slug: str = "",
+        tenant: str = "",
+    ) -> Optional[dict]:
+        """Wait until a task's status snapshot changes, then return it.
+
+        A timeout returns the current unchanged record so SSE callers can emit
+        a keepalive without losing their subscription.
+        """
+        with self._condition:
+            def changed() -> bool:
+                current = self._tasks.get(task_id)
+                return (
+                    current is None
+                    or not self._in_scope(current, agent_slug, tenant)
+                    or int(current.get("revision", 0)) != revision
+                )
+
+            self._condition.wait_for(changed, timeout=max(0.0, timeout))
+            rec = self._tasks.get(task_id)
+            if not rec or not self._in_scope(rec, agent_slug, tenant):
+                return None
+            return dict(rec)
 
     def list(
         self,
@@ -748,14 +831,21 @@ class TaskStore:
             return page, next_offset, total
         return page, next_offset
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def orphan_ids(self, timeout_seconds: int = 300,
+                   skip: Optional[set[str]] = None) -> List[str]:
+        skip = skip or set()
         with self._lock:
             now = time.time()
-            stale = [
+            return [
                 tid for tid, rec in self._tasks.items()
-                if rec["state"] not in TERMINAL_STATES
+                if tid not in skip
+                and rec.get("completed_at") is None
                 and now - rec["created_at"] > timeout_seconds
             ]
+
+    def fail_orphans(self, timeout_seconds: int = 300,
+                     skip: Optional[set[str]] = None) -> List[str]:
+        stale = self.orphan_ids(timeout_seconds, skip)
         failed = []
         for tid in stale:
             if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]"):
@@ -763,20 +853,33 @@ class TaskStore:
         return failed
 
     def _trim_locked(self) -> None:
-        terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES]
+        terminal = sorted(
+            (
+                (tid, int(rec.get("completion_seq") or 0))
+                for tid, rec in self._tasks.items()
+                if rec.get("completed_at") is not None
+            ),
+            key=lambda item: item[1],
+        )
         excess = len(terminal) - self._MAX_TERMINAL
-        for tid in terminal[:max(0, excess)]:
+        for tid, _completed_at in terminal[:max(0, excess)]:
             self._tasks.pop(tid, None)
 
     @staticmethod
     def to_task(rec: dict, history_length: Optional[int] = None, include_artifacts: bool = True) -> dict:
         """Render a stored record as an A2A v1.0 Task object."""
+        text = rec.get("reply", "")
+        if rec.get("state") in (STATE_SUBMITTED, STATE_WORKING):
+            text = rec.get("progress", "")
         task = build_task(
             rec["task_id"],
             rec["context_id"],
             rec["state"],
-            rec.get("reply", ""),
+            text,
             created_at=rec.get("created_iso", ""),
+            status_timestamp=rec.get("status_iso", ""),
+            artifact_id=rec.get("artifact_id", ""),
+            status_message_id=rec.get("status_message_id", ""),
         )
         if not include_artifacts:
             task.pop("artifacts", None)
@@ -787,6 +890,38 @@ class TaskStore:
 # --------------------------------------------------------------------------
 # Conversation persistence (outside the context-compaction pipeline)
 # --------------------------------------------------------------------------
+
+_conversation_lock = threading.Lock()
+
+
+@contextmanager
+def _conversation_file_lock(path: Path):
+    """Serialize a conversation read-modify-append across Hermes processes."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
 
 def _conv_dir() -> Path:
     try:
@@ -807,10 +942,47 @@ def persist_message(context_id: str, role: str, text: str, task_id: str = "") ->
         d = _conv_dir()
         d.mkdir(parents=True, exist_ok=True)
         rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
-        with (d / f"{_safe_name(context_id)}.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with _conversation_lock:
+            with (d / f"{_safe_name(context_id)}.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def persist_message_once(context_id: str, role: str, text: str,
+                         task_id: str) -> bool:
+    """Append a task result once, returning whether a record was written."""
+    if not task_id:
+        return False
+    try:
+        directory = _conv_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{_safe_name(context_id)}.jsonl"
+        with _conversation_lock:
+            with _conversation_file_lock(path):
+                if path.exists():
+                    with path.open("r", encoding="utf-8") as handle:
+                        for line in handle:
+                            try:
+                                existing = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if (
+                                existing.get("role") == role
+                                and existing.get("task_id") == task_id
+                            ):
+                                return False
+                record = {
+                    "ts": time.time(),
+                    "role": role,
+                    "text": text,
+                    "task_id": task_id,
+                }
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        return False
 
 
 def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
