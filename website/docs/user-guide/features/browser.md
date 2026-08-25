@@ -76,6 +76,12 @@ The mode is a **driver** that composes with your configured browser backend: it 
 
 **Concurrent sessions:** `browser_exec` accepts a `session=<name>` argument that isolates browser work per name on every backend. Each name gets its own harness daemon (its own IPC socket, log, and state), and on cloud backends its own browser — so parallel subagents or simultaneous chats no longer clobber a single shared connection. Omitting `session` uses the shared default daemon, which is fine for one-at-a-time browsing.
 
+#### Browser Use CLI lifecycle
+
+Hermes applies `browser.inactivity_timeout` to Browser Use CLI daemons as well as to the built-in browser sessions. On the first `browser_exec` call, Hermes gives the harness a profile-scoped runtime (a short hashed directory under `/tmp` on POSIX, or `$HERMES_HOME/cache/browser-use/runtime/<session>` on Windows) and records activity there. A background worker checks every 30 seconds; a timed-out CLI call requests an immediate daemon shutdown, and a normal Hermes exit closes the daemons it started. Previous Hermes instances are reclaimed through an atomic per-instance claim; ambiguous or live in-flight state fails closed.
+
+Cleanup uses Browser Use's supported `--reload`/IPC path for the exact Hermes-owned runtime. Hermes does not scan process names or kill arbitrary `python`, Chrome, or `browser-use` processes. An operator-supplied `BH_RUNTIME_DIR` or `BH_TMP_DIR` is treated as externally owned and is not managed by Hermes. When the harness is attached to an existing local Chrome or Chromium instance, cleanup disconnects the harness and intentionally leaves that external browser running; cloud browser shutdown remains handled by the provider.
+
 To opt out and force the built-in browser tools, use `/browser use off`, or:
 
 ```yaml

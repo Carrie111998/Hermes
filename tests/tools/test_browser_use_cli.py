@@ -14,7 +14,11 @@ Covers the three seams the integration relies on:
 import json
 import os
 import stat
+import subprocess
+import sys
+import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -26,7 +30,25 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    monkeypatch.delenv("BH_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("BH_TMP_DIR", raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_browser_use_lifecycle():
+    """Stop the lifecycle worker and discard its process-local registry."""
+    stop = getattr(bu_cli, "_stop_browser_use_cleanup_thread", None)
+    if stop is not None:
+        stop()
+    sessions = getattr(bu_cli, "_browser_use_sessions", None)
+    if sessions is not None:
+        sessions.clear()
+    yield
+    if stop is not None:
+        stop()
+    if sessions is not None:
+        sessions.clear()
 
 
 def _fake_cli(tmp_path, body):
@@ -176,6 +198,238 @@ class TestSubprocessEnvironment:
         parts = env["PATH"].split(os.pathsep)
         assert "/usr/bin" in parts
         assert "/home/u/.nvm/versions/node/v24.18.0/bin" in parts
+
+
+class TestBrowserUseLifecycle:
+    """Browser Use CLI daemons must use a Hermes-owned lifecycle boundary."""
+
+    def _patch_local_cli(self, tmp_path, monkeypatch, body='print("ok")'):
+        script = tmp_path / "browser_use_fake.py"
+        script.write_text("import os\n" + body + "\n")
+        cli = [sys.executable, str(script)]
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: cli)
+        monkeypatch.setattr(
+            bu_cli,
+            "_resolve_backend_cdp",
+            lambda env, task_id, session_name="": None,
+        )
+        return cli
+
+    def test_browser_exec_uses_profile_scoped_harness_runtime(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(
+            tmp_path,
+            monkeypatch,
+            'print("runtime:" + os.environ["BH_RUNTIME_DIR"])\n'
+            'print("tmp:" + os.environ["BH_TMP_DIR"])',
+        )
+        expected = bu_cli._managed_browser_use_runtime("r7k2", {})
+        assert expected is not None
+
+        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
+
+        assert result["success"] is True, result
+        lines = result["output"].splitlines()
+        assert Path(lines[0].removeprefix("runtime:")) == expected
+        assert Path(lines[1].removeprefix("tmp:")) == expected
+        assert cli == bu_cli._browser_use_sessions["r7k2"]["command"]
+
+    def test_posix_runtime_base_keeps_unix_socket_path_short(self):
+        home = Path("/home/user/.hermes/profiles/") / ("long-profile-" + "x" * 80)
+        root = bu_cli._browser_use_runtime_base(home, "darwin")
+        socket_path = root / ("s" * 64) / "bu.sock"
+
+        assert root.name.startswith("hbu-")
+        assert len(str(socket_path).encode("utf-8")) < 104
+
+    def test_cli_timeout_reloads_the_exact_harness_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(tmp_path, monkeypatch)
+        expected = bu_cli._managed_browser_use_runtime("r7k2", {})
+        assert expected is not None
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((list(command), kwargs))
+            if list(command) == cli:
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_run)
+
+        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2", timeout_s=5))
+
+        assert "timed out" in result["error"]
+        reload_calls = [item for item in calls if item[0] == cli + ["--reload"]]
+        assert len(reload_calls) == 1
+        assert Path(reload_calls[0][1]["env"]["BH_RUNTIME_DIR"]) == expected
+        assert Path(reload_calls[0][1]["env"]["BH_TMP_DIR"]) == expected
+
+    def test_inactivity_cleanup_reaps_a_tracked_harness_session(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr(bu_cli, "_browser_use_inactivity_timeout", lambda: 120)
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((list(command), kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout="ok\\n", stderr="")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_run)
+        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
+        assert result["success"] is True
+
+        state = bu_cli._browser_use_sessions["r7k2"]
+        state["last_activity"] = 0.0
+        bu_cli._browser_use_update_state(
+            state["runtime_dir"], last_activity=0.0, active_pid=None
+        )
+
+        bu_cli._cleanup_browser_use_sessions(now=200.0)
+
+        assert cli + ["--reload"] in [item[0] for item in calls]
+        assert "r7k2" not in bu_cli._browser_use_sessions
+        assert not state["runtime_dir"].joinpath(".hermes_state.json").exists()
+
+    def test_startup_cleanup_reaps_stale_persisted_runtime(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr(bu_cli, "_browser_use_inactivity_timeout", lambda: 120)
+        runtime = bu_cli._managed_browser_use_runtime("old-session", {})
+        assert runtime is not None
+        bu_cli._browser_use_update_state(
+            runtime, last_activity=0.0, active_pid=None
+        )
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((list(command), kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_run)
+
+        bu_cli._cleanup_browser_use_sessions(now=200.0)
+
+        assert cli + ["--reload"] in [item[0] for item in calls]
+        assert not runtime.joinpath(".hermes_state.json").exists()
+
+    def test_reaper_claims_a_dead_instance_once(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr(bu_cli, "_browser_use_inactivity_timeout", lambda: 120)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        profile_root = bu_cli._browser_use_profile_root()
+        assert profile_root is not None
+        instance = profile_root / "dead-instance"
+        runtime = instance / "old-session"
+        runtime.mkdir(parents=True)
+        instance.joinpath(".hermes_owner.json").write_text(
+            json.dumps({"pid": 999999, "instance_id": "dead-instance"})
+        )
+        bu_cli._browser_use_update_state(
+            runtime, last_activity=0.0, active_pid=None
+        )
+        calls = []
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((list(command), kwargs))
+            or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        )
+
+        bu_cli._cleanup_browser_use_sessions(now=200.0)
+
+        assert cli + ["--reload"] in [item[0] for item in calls]
+        assert not instance.joinpath(".hermes_reap.lock").exists()
+        assert not runtime.joinpath(".hermes_state.json").exists()
+
+    def test_active_owner_marker_blocks_stale_runtime_reap(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr(bu_cli, "_browser_use_inactivity_timeout", lambda: 120)
+        runtime = bu_cli._managed_browser_use_runtime("busy-session", {})
+        assert runtime is not None
+        bu_cli._browser_use_update_state(
+            runtime,
+            last_activity=0.0,
+            active_pid=os.getpid(),
+            active_started_at=0.0,
+        )
+        calls = []
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((list(command), kwargs))
+            or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        )
+
+        bu_cli._cleanup_browser_use_sessions(now=200.0)
+
+        assert cli + ["--reload"] not in [item[0] for item in calls]
+        assert runtime.joinpath(".hermes_state.json").exists()
+
+    def test_reaper_and_new_call_do_not_deadlock_on_one_session(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr(bu_cli, "_browser_use_inactivity_timeout", lambda: 120)
+        monkeypatch.setattr(bu_cli, "_start_browser_use_cleanup_thread", lambda: None)
+        runtime = bu_cli._managed_browser_use_runtime("r7k2", {})
+        assert runtime is not None
+        state = bu_cli._register_browser_use_session("r7k2", runtime, cli)
+        assert state is not None
+        _finish = bu_cli._finish_browser_use_session
+        _finish(state)
+        state["last_activity"] = 0.0
+        bu_cli._browser_use_update_state(
+            runtime, last_activity=0.0, active_pid=None
+        )
+
+        reaper_entered = threading.Event()
+        release_reaper = threading.Event()
+
+        def fake_reload(_state):
+            reaper_entered.set()
+            assert release_reaper.wait(2)
+            return True
+
+        monkeypatch.setattr(bu_cli, "_reload_browser_use_daemon", fake_reload)
+        cleanup = threading.Thread(
+            target=bu_cli._cleanup_browser_use_sessions, kwargs={"now": 200.0}
+        )
+        cleanup.start()
+        assert reaper_entered.wait(2)
+
+        registered = threading.Event()
+
+        def register_again():
+            new_state = bu_cli._register_browser_use_session("r7k2", runtime, cli)
+            assert new_state is not None
+            registered.set()
+
+        caller = threading.Thread(target=register_again)
+        caller.start()
+        assert not registered.wait(0.1)
+        release_reaper.set()
+        cleanup.join(2)
+        caller.join(2)
+        assert not cleanup.is_alive()
+        assert not caller.is_alive()
+        assert registered.is_set()
 
 
 class TestToolSurfaceSwap:
