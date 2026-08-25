@@ -19,6 +19,11 @@ storage discipline as the other indexes). On a populated database, run
 
 to backfill it; new messages are indexed live either way. Set
 `sessions.cjk_fts: false` in `~/.hermes/config.yaml` to disable. Override
-the .so location with `HERMES_FTS5_CJK_SO`.
+the extension location with `HERMES_FTS5_CJK_SO`.
+
+Windows: there is no build script for this platform yet. If you compile
+`fts5_cjk.c` yourself (MSVC or MinGW), install the result as
+`~/.hermes/lib/libfts5_cjk.dll` — that is the name the default lookup
+expects on win32 — or point `HERMES_FTS5_CJK_SO` at it directly.
 
 Contributed by Soju06 (PR #65544).
