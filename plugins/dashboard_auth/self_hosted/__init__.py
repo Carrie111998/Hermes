@@ -56,6 +56,7 @@ same precedence convention as the ``nous`` plugin)::
           issuer: https://auth.example.com/application/o/hermes/   # required
           client_id: hermes-dashboard                              # required
           scopes: "openid profile email"                           # optional
+          displayname: "Custom SSO Name"                           # optional
           # client_secret: set ONLY for a confidential client. It is a
           # credential — prefer the env var / ~/.hermes/.env over config.yaml.
 
@@ -64,8 +65,8 @@ same precedence convention as the ``nous`` plugin)::
     HERMES_DASHBOARD_OIDC_CLIENT_ID
     HERMES_DASHBOARD_OIDC_SCOPES        # optional; defaults to "openid profile email"
     HERMES_DASHBOARD_OIDC_CLIENT_SECRET # optional; set for a confidential client
-                                        # (the .env file is the canonical home —
-                                        # it's a secret, not a behavioural setting)
+    HERMES_DASHBOARD_OIDC_PROVIDERNAME  # optional; UI label for login button
+                                        # (config: providername / provider_name)
 
 Skip reasons: when the plugin loads but can't register (missing issuer /
 client_id), it writes a human-readable reason to the module-level
@@ -175,7 +176,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
     """Generic self-hosted OpenID Connect provider (authorization-code + PKCE)."""
 
     name = "self-hosted"
-    display_name = "Self-Hosted OIDC"
+    display_name = "Self-hosted OIDC"
 
     def __init__(
         self,
@@ -184,11 +185,13 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        display_name: str = "Self-hosted OIDC",
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
         if not client_id:
             raise ValueError("client_id is required")
+        self.display_name = display_name or "Self-hosted OIDC"
         # ``issuer`` is the OIDC issuer identifier. Normalise the trailing
         # slash for stable string compares (the ``iss`` claim must match the
         # issuer the IDP advertises in discovery — we pin against the
@@ -822,6 +825,10 @@ def register(ctx) -> None:
     client_secret = _resolve_setting(
         "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
     )
+    display_name = _resolve_setting(
+        "HERMES_DASHBOARD_OIDC_PROVIDERNAME",
+        oidc_cfg.get("providername") or oidc_cfg.get("provider_name"),
+    ) or "Self-hosted OIDC"
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -842,6 +849,7 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            display_name=display_name,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (
