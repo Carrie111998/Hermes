@@ -2062,7 +2062,8 @@ export const en: Translations = {
     sessions: 'Sessions',
     taxonomy: {
       projects: 'Projects',
-      archives: 'Archives'
+      archives: 'Archives',
+      unfiled: 'Unfiled'
     },
     cronJobs: 'Cron jobs',
     groupAriaGrouped: 'Show sessions as a single list',

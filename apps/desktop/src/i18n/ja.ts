@@ -1775,7 +1775,8 @@ export const ja = defineLocale({
 
     taxonomy: {
       projects: 'プロジェクト',
-      archives: 'アーカイブ'
+      archives: 'アーカイブ',
+      unfiled: '未分類'
     },
     sessions: 'セッション',
     cronJobs: 'Cronジョブ',

@@ -1717,7 +1717,8 @@ export const zhHant = defineLocale({
 
     taxonomy: {
       projects: '專案',
-      archives: '封存'
+      archives: '封存',
+      unfiled: '未分類'
     },
     sessions: '工作階段',
     cronJobs: '排程任務',

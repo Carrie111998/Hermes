@@ -11,12 +11,14 @@ import { invalidateProfileListFetches } from '@/store/profile'
 import {
   $unreadFinishedSessionIds,
   setActiveSessionId,
+  setArchiveSessions,
   setCronSessions,
   setFreshDraftReady,
   setMessages,
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
+  setProjectSessions,
   setSelectedStoredSessionId,
   setSessionProfilesTruncated,
   setSessionProfilesUsage,
@@ -67,6 +69,11 @@ export function wipeSessionListsForGatewaySwitch(): void {
   setMessagingSessions([])
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
+  // Taxonomy slices come from the same backend as the other rails; a
+  // gateway switch must not keep the previous backend's projects/archives
+  // painted (review #4 — stale taxonomy rows after a backend/profile switch).
+  setProjectSessions([])
+  setArchiveSessions([])
   // Clearing $sessionStates automatically clears $workingSessionIds and
   // $attentionSessionIds (computed) and $stalledSessionIds (owned beside it).
   // $unreadFinishedSessionIds is separate, so wipe it explicitly. Only the

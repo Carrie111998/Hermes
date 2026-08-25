@@ -38,7 +38,10 @@ export interface TaxonomyView {
 }
 
 const categoryLabel = (group: null | string | undefined): string =>
-  group && group.trim().length > 0 ? group.trim() : 'Unfiled'
+  group && group.trim().length > 0 ? group.trim() : UNFILED_GROUP
+
+/** Sentinel id for sessions with no project_group (localized at render). */
+export const UNFILED_GROUP = '__unfiled__'
 
 const sessionTime = (session: SessionInfo): number =>
   session.last_active || session.started_at || 0

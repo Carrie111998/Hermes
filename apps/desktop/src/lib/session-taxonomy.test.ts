@@ -56,7 +56,8 @@ describe('groupByTaxonomy', () => {
 
   it('labels categories without a project_group as Unfiled', () => {
     const view = groupByTaxonomy([row({ disposition: 'project', project_group: null })])
-    expect(view.groups[0].label).toBe('Unfiled')
+    expect(view.groups[0].id).toBe('__unfiled__')
+    expect(view.groups[0].label).toBe('__unfiled__')
   })
 
   it('keeps unclassified sessions in the fallback list', () => {

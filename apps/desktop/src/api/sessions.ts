@@ -159,10 +159,6 @@ export interface SidebarSessionsRequest {
   messagingExclude: string[]
   projectsLimit?: number
   archivesLimit?: number
-  /** Dispositions the recents slice should omit (e.g. transient,junk). */
-  recentsExcludeDispositions?: string[]
-  /** Dispositions the messaging slice should omit (e.g. transient,junk). */
-  messagingExcludeDispositions?: string[]
 }
 
 // The batched /sidebar endpoint shipped later than the per-slice route, so a
@@ -191,12 +187,12 @@ async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<S
   const [recents, cron, messaging, projects, archives] = await Promise.all([
     listAllProfileSessions(req.recentsLimit, 1, 'exclude', 'recent', req.recentsProfile, {
       excludeSources: req.recentsExclude,
-      excludeDispositions: req.recentsExcludeDispositions
+      excludeDispositions: ['transient', 'junk']
     }),
     listAllProfileSessions(req.cronLimit, 1, 'exclude', 'recent', req.recentsProfile, { source: 'cron' }),
     listAllProfileSessions(req.messagingLimit, 1, 'exclude', 'recent', req.recentsProfile, {
       excludeSources: req.messagingExclude,
-      excludeDispositions: req.messagingExcludeDispositions
+      excludeDispositions: ['transient', 'junk']
     }),
     listAllProfileSessions(req.projectsLimit ?? 300, 1, 'exclude', 'recent', req.recentsProfile, {
       disposition: 'project'
@@ -258,14 +254,6 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
 
   if (req.messagingExclude.length) {
     params.set('messaging_exclude', req.messagingExclude.join(','))
-  }
-
-  if (req.recentsExcludeDispositions?.length) {
-    params.set('recents_exclude_dispositions', req.recentsExcludeDispositions.join(','))
-  }
-
-  if (req.messagingExcludeDispositions?.length) {
-    params.set('messaging_exclude_dispositions', req.messagingExcludeDispositions.join(','))
   }
 
   let result: SidebarSessionsResponse

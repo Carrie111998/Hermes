@@ -1615,7 +1615,8 @@ export const ar = defineLocale({
 
     taxonomy: {
       projects: 'المشاريع',
-      archives: 'الأرشيف'
+      archives: 'الأرشيف',
+      unfiled: 'غير مصنف'
     },
     sessions: 'الجلسات',
     cronJobs: 'المهام المجدولة',

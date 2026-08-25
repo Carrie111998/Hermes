@@ -272,11 +272,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         messagingLimit: MESSAGING_SECTION_LIMIT,
         messagingExclude: MESSAGING_EXCLUDED_SOURCES,
         projectsLimit: PROJECT_SECTION_LIMIT,
-        archivesLimit: ARCHIVE_SECTION_LIMIT,
-        // Transient + junk are operational noise (probes, cron runs, echoes).
-        // They never surface in the sidebar; search is the way back to them.
-        recentsExcludeDispositions: ['transient', 'junk'],
-        messagingExcludeDispositions: ['transient', 'junk']
+        archivesLimit: ARCHIVE_SECTION_LIMIT
       })
 
       if (

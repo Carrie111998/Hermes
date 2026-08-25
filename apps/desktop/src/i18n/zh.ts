@@ -2249,7 +2249,8 @@ export const zh: Translations = {
 
     taxonomy: {
       projects: '项目',
-      archives: '归档'
+      archives: '归档',
+      unfiled: '未分类'
     },
     sessions: '会话',
     cronJobs: '定时任务',

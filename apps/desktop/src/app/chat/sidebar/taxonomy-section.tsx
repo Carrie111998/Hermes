@@ -7,7 +7,7 @@ import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import { groupByTaxonomy, type TaxonomyView } from '@/lib/session-taxonomy'
+import { groupByTaxonomy, UNFILED_GROUP, type TaxonomyView } from '@/lib/session-taxonomy'
 import { sessionPinId, $projectSessions, $archiveSessions } from '@/store/session'
 
 import { SidebarGroupRow, SidebarRowLeadGlyph, SidebarRowStack } from './chrome'
@@ -82,15 +82,20 @@ function TaxonomyCategory({
   openByDefault: boolean
 }) {
   const [open, setOpen] = useState(openByDefault)
+  const { t } = useI18n()
 
   // A category with named projects nests them as sub-rows; a category with no
   // named project renders its sessions directly under the category header.
   const hasNamedProjects = category.projects.length > 0
+  const label =
+    category.id === UNFILED_GROUP
+      ? (t.sidebar.taxonomy?.unfiled ?? 'Unfiled')
+      : category.label
 
   return (
     <div className="flex flex-col gap-px">
       <SidebarGroupRow
-        label={<span className="truncate text-[0.8125rem]">{category.label}</span>}
+        label={<span className="truncate text-[0.8125rem]">{label}</span>}
         lead={
           <SidebarRowLeadGlyph>
             <Codicon
