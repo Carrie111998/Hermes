@@ -91,6 +91,7 @@ from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
     InvalidCodeError,
     LoginStart,
+    MalformedTokenError,
     ProviderError,
     RefreshExpiredError,
     Session,
@@ -461,7 +462,14 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         if token_type and token_type != "bearer":
             raise ProviderError(f"unexpected token_type={token_type!r}")
 
-        claims = self._verify_id_token(id_token)
+        try:
+            claims = self._verify_id_token(id_token)
+        except MalformedTokenError as exc:
+            # Malformed token from the *token endpoint* is a rejected grant, not
+            # an unverifiable session: re-map to the caller's bad-request type
+            # (auth-code -> InvalidCodeError -> 400; refresh -> RefreshExpired
+            # Error -> force re-login) so those paths keep their semantics.
+            raise bad_request_exc(f"IDP returned a malformed token: {exc}") from exc
 
         # Refresh-token rotation: prefer a freshly-issued one, else keep the
         # previous (some IDPs don't rotate). Empty string if neither — the
@@ -617,6 +625,16 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 id_token
             )
+        except jwt.InvalidTokenError as exc:
+            # Structurally malformed token: PyJWKClient parses the header/kid
+            # locally before any JWKS fetch, so a non-JWT string fails here as a
+            # bad credential, not an IDP outage. Raise MalformedTokenError (an
+            # InvalidCodeError) so verify_session returns None (-> 401 / refresh)
+            # and the shared login/refresh helper re-maps it — instead of a bare
+            # Exception below becoming ProviderError -> 503. Must precede the
+            # PyJWKClientError catch (sibling PyJWTError subclasses), so genuine
+            # JWKS/network failures still raise ProviderError.
+            raise MalformedTokenError(f"malformed id token: {exc}") from exc
         except jwt.PyJWKClientError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive

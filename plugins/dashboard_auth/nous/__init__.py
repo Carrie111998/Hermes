@@ -83,6 +83,7 @@ from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
     InvalidCodeError,
     LoginStart,
+    MalformedTokenError,
     ProviderError,
     RefreshExpiredError,
     Session,
@@ -337,7 +338,16 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         if token_type and token_type != "bearer":
             raise ProviderError(f"unexpected token_type={token_type!r}")
 
-        claims = self._verify_jwt(access_token)
+        try:
+            claims = self._verify_jwt(access_token)
+        except MalformedTokenError as exc:
+            # A malformed token from a *token-endpoint* response is a rejected
+            # grant, not an unverifiable session: re-map to the caller's own
+            # bad-request exception (auth-code -> InvalidCodeError -> HTTP 400;
+            # refresh -> RefreshExpiredError -> force re-login) so login/refresh
+            # keep their existing semantics and never surface an unhandled error.
+            raise bad_request_exc(f"Portal returned a malformed token: {exc}") from exc
+
         # The dashboard grant issues a rotating refresh token; capture it so
         # the caller can persist it. Empty string if Portal omitted it (the
         # session then behaves as access-token-only until expiry).
@@ -436,6 +446,19 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 access_token
             )
+        except jwt.InvalidTokenError as exc:
+            # The token is structurally malformed (e.g. an opaque or truncated
+            # string): PyJWKClient parses the header/kid BEFORE any JWKS fetch,
+            # so this raises jwt.DecodeError ('Not enough segments') locally,
+            # with the JWKS endpoint never contacted. That is a bad credential,
+            # NOT an IDP outage — raise MalformedTokenError (an InvalidCodeError)
+            # so verify_session returns None (-> 401 / refresh) and the shared
+            # login/refresh helper can re-map it, instead of a bare Exception
+            # here masquerading as ProviderError -> 503. NOTE: jwt.InvalidToken
+            # Error must be caught BEFORE PyJWKClientError; the two are sibling
+            # PyJWTError subclasses, so a genuine PyJWKClientError (real JWKS/
+            # network failure) is unaffected and still becomes ProviderError.
+            raise MalformedTokenError(f"malformed access token: {exc}") from exc
         except jwt.PyJWKClientError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive

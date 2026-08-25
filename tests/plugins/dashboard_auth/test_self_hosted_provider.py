@@ -571,6 +571,24 @@ class TestVerifySession:
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
 
+    def test_malformed_token_returns_none_not_provider_error(self, provider):
+        """A structurally malformed token is a bad credential, not an IDP
+        outage: verify_session returns None (-> 401 / refresh), not
+        ProviderError (-> misleading 503)."""
+        bad_client = MagicMock()
+        bad_client.get_signing_key_from_jwt.side_effect = jwt.DecodeError(
+            "Not enough segments"
+        )
+        provider._jwks_client = bad_client
+        assert provider.verify_session(access_token="not-a-jwt") is None
+
+    def test_real_pyjwt_malformed_token_returns_none(self, provider):
+        """Through the REAL PyJWKClient parse path: a two-segment string fails
+        header parsing locally before any JWKS fetch (URL never contacted)."""
+        provider._jwks_client = jwt.PyJWKClient("https://jwks.invalid/keys")
+        assert provider.verify_session(access_token="aaa.bbb") is None
+
+
     def test_jwks_client_sends_explicit_http_headers(self):
         provider = oidc_plugin.SelfHostedOIDCProvider(
             issuer=_ISSUER, client_id=_CLIENT_ID
@@ -601,6 +619,26 @@ class TestRefreshAndRevoke:
     @pytest.fixture
     def provider(self, rsa_keypair):
         return _make_provider(rsa_keypair)
+
+    def test_refresh_with_malformed_id_token_raises_refresh_expired(
+        self, provider
+    ):
+        """Regression / shared-helper hazard: if the IDP returns 200 with a
+        MALFORMED id_token on the refresh grant, the shared token parser must
+        re-map to RefreshExpiredError (force re-login), NOT let a raw
+        MalformedTokenError/InvalidCodeError escape into the middleware refresh
+        loop (which would 500)."""
+        provider._jwks_client = jwt.PyJWKClient("https://jwks.invalid/keys")
+        mock_resp = _mock_post(
+            200,
+            {"id_token": "not-a-jwt", "token_type": "Bearer", "refresh_token": "rt2"},
+        )
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            with pytest.raises(RefreshExpiredError):
+                provider.refresh_session(refresh_token="rt_old")
+
 
 
 # ---------------------------------------------------------------------------

@@ -91,6 +91,24 @@ class InvalidCodeError(Exception):
     """
 
 
+class MalformedTokenError(InvalidCodeError):
+    """A token was structurally malformed / unparseable as a JWT.
+
+    Distinct from a JWKS/IDP outage: the token itself is a bad credential (e.g.
+    an opaque or truncated string that fails JWT parsing *before* any network
+    fetch), NOT evidence the identity provider is unreachable. Subclasses
+    :class:`InvalidCodeError` so:
+
+    * ``verify_session`` (which already maps ``InvalidCodeError -> None``)
+      treats it as an unverifiable session -> the middleware issues 401 / drives
+      the refresh path, instead of a misleading 503 ``provider unavailable``;
+    * the shared login/refresh token-parsing helper can re-map it to the
+      caller's own bad-request exception (auth-code -> ``InvalidCodeError``;
+      refresh -> ``RefreshExpiredError``) so those paths keep their existing
+      semantics and never surface an unhandled error.
+    """
+
+
 class InvalidCredentialsError(Exception):
     """A username/password pair was rejected by a password provider.
 
