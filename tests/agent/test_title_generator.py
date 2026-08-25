@@ -9,6 +9,8 @@ from agent.title_generator import (
     auto_title_session,
     maybe_auto_title,
     _title_language,
+    _retitle_config,
+    _retitle_enabled,
 )
 from hermes_state import SessionDB
 
@@ -597,3 +599,89 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+class TestRetitleConfig:
+    """Unit tests for _retitle_config() and _retitle_enabled()."""
+
+    DEFAULT_KEYS = {
+        "enabled": True,
+        "auto_at_turn": 10,
+        "turns_window": 10,
+        "slash_command": True,
+        "cli_command": True,
+        "touch_platform_names": False,
+        "provider": "",
+        "model": "",
+        "base_url": "",
+        "api_key": "",
+        "timeout": 30,
+        "max_concurrency": 2,
+        "prefer_fast_model": None,
+    }
+
+    def test_retitle_config_returns_defaults_when_block_missing(self):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("hermes_cli.config.load_config_readonly", return_value={}):
+            cfg = _retitle_config()
+        for key, expected in self.DEFAULT_KEYS.items():
+            assert cfg[key] == expected, f"default for {key} lost"
+
+    def test_retitle_config_merges_partial_user_overrides(self):
+        user_cfg = {
+            "auxiliary": {
+                "title_generation": {
+                    "retitle": {
+                        "enabled": False,
+                        "auto_at_turn": 20,
+                        # None must be treated as "use default"
+                        "provider": None,
+                    }
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=user_cfg), \
+             patch("hermes_cli.config.load_config_readonly", return_value=user_cfg):
+            cfg = _retitle_config()
+
+        assert cfg["enabled"] is False
+        assert cfg["auto_at_turn"] == 20
+        # None override was skipped → default preserved
+        assert cfg["provider"] == ""
+        # Untouched keys keep defaults
+        assert cfg["turns_window"] == 10
+        assert cfg["slash_command"] is True
+        assert cfg["timeout"] == 30
+        assert cfg["max_concurrency"] == 2
+        assert cfg["prefer_fast_model"] is None
+
+    def test_retitle_config_returns_empty_dict_on_config_error(self):
+        with patch("hermes_cli.config.load_config",
+                   side_effect=RuntimeError("bad config")), \
+             patch("hermes_cli.config.load_config_readonly",
+                   side_effect=RuntimeError("bad config")):
+            assert _retitle_config() == {}
+
+    def test_retitle_enabled_true_by_default(self):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("hermes_cli.config.load_config_readonly", return_value={}):
+            assert _retitle_enabled() is True
+
+    def test_retitle_enabled_false_when_disabled(self):
+        user_cfg = {
+            "auxiliary": {
+                "title_generation": {
+                    "retitle": {"enabled": False}
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=user_cfg), \
+             patch("hermes_cli.config.load_config_readonly", return_value=user_cfg):
+            assert _retitle_enabled() is False
+
+    def test_retitle_enabled_true_when_config_broken(self):
+        with patch("hermes_cli.config.load_config",
+                   side_effect=RuntimeError("bad config")), \
+             patch("hermes_cli.config.load_config_readonly",
+                   side_effect=RuntimeError("bad config")):
+            assert _retitle_enabled() is True

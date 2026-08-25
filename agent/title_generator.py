@@ -184,6 +184,65 @@ def _auto_title_enabled() -> bool:
         return True
 
 
+# Defaults for auxiliary.title_generation.retitle. Kept in sync with
+# hermes_cli/config_defaults.py — the merge below preserves any key the user
+# omitted and skips explicit ``None`` overrides so a YAML ``null`` cannot blank
+# out a default. Explicit ``false`` / ``0`` / ``""`` DO override.
+_RETITLE_DEFAULTS = {
+    "enabled": True,
+    "auto_at_turn": 10,
+    "turns_window": 10,
+    "slash_command": True,
+    "cli_command": True,
+    "touch_platform_names": False,
+    "provider": "",
+    "model": "",
+    "base_url": "",
+    "api_key": "",
+    "timeout": 30,
+    "max_concurrency": 2,
+    "prefer_fast_model": None,
+}
+
+
+def _retitle_config() -> dict:
+    """Return the merged ``auxiliary.title_generation.retitle`` config.
+
+    Defaults from ``_RETITLE_DEFAULTS`` are merged with any user overrides.
+    User keys whose value is ``None`` are treated as "use default" so a YAML
+    ``null`` does not blank out a baked-in default. Returns ``{}`` on any
+    config error (fail-open at call sites).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        title_config = (config.get("auxiliary") or {}).get("title_generation") or {}
+        user = title_config.get("retitle") or {}
+        merged = dict(_RETITLE_DEFAULTS)
+        if isinstance(user, dict):
+            for key, value in user.items():
+                if value is None:
+                    continue
+                merged[key] = value
+        return merged
+    except Exception:
+        logger.debug("Failed to read title_generation.retitle", exc_info=True)
+        return {}
+
+
+def _retitle_enabled() -> bool:
+    """Return whether the retitle feature is enabled (default True)."""
+    try:
+        from utils import is_truthy_value
+
+        cfg = _retitle_config()
+        return is_truthy_value(cfg.get("enabled"), default=True)
+    except Exception:
+        logger.debug("Failed to read title_generation.retitle.enabled", exc_info=True)
+        return True
+
+
 def strip_control_wrappers(text: str) -> str:
     """Remove leading machine-authored control wrappers, including nested ones.
 
