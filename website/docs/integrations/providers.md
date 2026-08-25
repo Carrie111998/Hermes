@@ -1181,7 +1181,7 @@ OpenAI-compatible endpoint and a single API key.
 
 ```yaml
 model:
-  default: claude-sonnet-5
+  default: gpt-5.6-sol
   provider: custom
   base_url: https://aihubmix.com/v1
   api_key: your-aihubmix-key

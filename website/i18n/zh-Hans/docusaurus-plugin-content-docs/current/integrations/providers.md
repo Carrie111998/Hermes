@@ -1046,7 +1046,7 @@ ClawRouter 需要在 Base 或 Solana 上有 USDC 充值的钱包用于支付。�
 
 ```yaml
 model:
-  default: claude-sonnet-5
+  default: gpt-5.6-sol
   provider: custom
   base_url: https://aihubmix.com/v1
   api_key: your-aihubmix-key
