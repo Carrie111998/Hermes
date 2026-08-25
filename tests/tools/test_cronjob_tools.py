@@ -1,5 +1,6 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
+import inspect
 import json
 import pytest
 
@@ -8,6 +9,18 @@ from tools.cronjob_tools import (
     check_cronjob_requirements,
     cronjob,
 )
+
+
+def test_cronjob_new_paused_parameters_preserve_existing_positional_order():
+    """New options must not rebind the legacy task/session positional slots."""
+    names = list(inspect.signature(cronjob).parameters)
+
+    assert names[-4:] == [
+        "task_id",
+        "session_id",
+        "initial_paused",
+        "paused_reason",
+    ]
 
 
 # =========================================================================

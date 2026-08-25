@@ -1283,6 +1283,8 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    initial_paused: bool = False,
+    paused_reason: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -1293,6 +1295,8 @@ def cronjob(
         if normalized == "create":
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
+            if type(initial_paused) is not bool:
+                return tool_error("initial_paused must be a boolean", success=False)
             canonical_skills = _canonical_skills(skill, skills)
             _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
@@ -1393,6 +1397,8 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    initial_paused=initial_paused,
+                    paused_reason=paused_reason,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1416,6 +1422,7 @@ def cronjob(
                 "repeat": _repeat_display(job),
                 "deliver": job.get("deliver", "local"),
                 "next_run_at": job["next_run_at"],
+                "state": job["state"],
                 "job": _format_job(job),
                 "message": _create_message,
                 **_gateway_liveness_notice(),
@@ -1812,6 +1819,16 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "initial_paused": {
+                "type": "boolean",
+                "default": False,
+                "description": "Create the job paused from its first durable write. The scheduler is not armed and next_run_at is null. Resume remains a separate explicit action.",
+            },
+            "paused_reason": {
+                "type": "string",
+                "maxLength": 240,
+                "description": "Optional reason recorded only when initial_paused=True. Omit for the explicit default 'created paused'.",
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1911,6 +1928,8 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        initial_paused=args.get("initial_paused", False),
+        paused_reason=args.get("paused_reason"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),

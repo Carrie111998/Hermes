@@ -116,6 +116,8 @@ _fire_fence_locks_guard = threading.Lock()
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+MAX_PAUSED_REASON_LENGTH = 240
+DEFAULT_INITIAL_PAUSED_REASON = "created paused"
 
 
 @dataclass(frozen=True)
@@ -264,14 +266,21 @@ def _job_running_in_this_process(job_id: str) -> bool:
         return True
 
 
+class JobsLockError(RuntimeError):
+    """Raised when a mutation requires an unavailable cross-process lock."""
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
     return _current_cron_store().cron_dir / ".jobs.lock"
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
+
+    ``require_cross_process`` is reserved for closed-manifest transactions that
+    must fail without the OS advisory lock rather than enter degraded mode.
 
     Combines the in-process threading lock (cheap mutual exclusion between
     the gateway's parallel tick threads) with a cross-process advisory file
@@ -291,6 +300,10 @@ def _jobs_lock():
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(
+            _jobs_lock_state, "cross_process_held", False
+        ):
+            raise JobsLockError("cross_process_lock_required")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -306,6 +319,7 @@ def _jobs_lock():
         # section read it. Reset on entry/exit so stale stamps from unlocked
         # loads or prior sections can never suppress a needed merge.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.cross_process_held = False
         lock_fd = None
         try:
             try:
@@ -331,9 +345,16 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            _jobs_lock_state.cross_process_held = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
+                                if require_cross_process:
+                                    lock_fd.close()
+                                    lock_fd = None
+                                    raise JobsLockError(
+                                        "cross_process_lock_timeout"
+                                    ) from None
                                 logger.error(
                                     "Timed out after %.0fs waiting for the cron "
                                     "jobs lock (%s) — another process is holding "
@@ -351,7 +372,17 @@ def _jobs_lock():
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _jobs_lock_state.cross_process_held = True
+                elif require_cross_process:
+                    lock_fd.close()
+                    lock_fd = None
+                    raise JobsLockError("cross_process_lock_unavailable")
             except (OSError, IOError) as e:
+                if require_cross_process:
+                    if lock_fd is not None:
+                        lock_fd.close()
+                        lock_fd = None
+                    raise JobsLockError("cross_process_lock_unavailable") from None
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
@@ -372,6 +403,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.cross_process_held = False
 
 
 @contextlib.contextmanager
@@ -729,9 +761,14 @@ def parse_duration(s: str) -> int:
     return value * multipliers[unit]
 
 
-def parse_schedule(schedule: str) -> Dict[str, Any]:
+def parse_schedule(
+    schedule: str, *, relative_base: Optional[datetime] = None
+) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
+
+    ``relative_base`` deterministically anchors duration one-shots; omitted
+    callers retain the normal current-time behavior.
     
     Returns dict with:
         - kind: "once" | "interval" | "cron"
@@ -811,7 +848,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     # Duration like "30m", "2h", "1d" → one-shot from now
     try:
         minutes = parse_duration(schedule)
-        run_at = _hermes_now() + timedelta(minutes=minutes)
+        run_at = (relative_base or _hermes_now()) + timedelta(minutes=minutes)
         return {
             "kind": "once",
             "run_at": run_at.isoformat(),
@@ -1912,7 +1949,7 @@ def _validate_job_mode_invariants(
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
 
-def create_job(
+def _build_job_record(
     prompt: Optional[str],
     schedule: str,
     name: Optional[str] = None,
@@ -1933,9 +1970,16 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    initial_paused: bool = False,
+    paused_reason: Optional[str] = None,
+    *,
+    job_id: Optional[str] = None,
+    created_at: Optional[str] = None,
+    validate_oneshot_eligibility: bool = True,
+    relative_schedule_base: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    Create a new cron job.
+    Validate inputs and build a new cron job record without persisting it.
 
     Args:
         prompt: The prompt to run (must be self-contained, or a task instruction when skill is set).
@@ -2000,11 +2044,28 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        relative_schedule_base: Optional immutable base for resolving a
+                relative one-shot schedule. Existing callers default to now.
 
     Returns:
         The created job dict
     """
-    parsed_schedule = parse_schedule(schedule)
+    if type(initial_paused) is not bool:
+        raise ValueError("initial_paused must be a boolean")
+    if paused_reason is not None and not isinstance(paused_reason, str):
+        raise ValueError("paused_reason must be a string or null")
+    if not initial_paused and paused_reason is not None:
+        raise ValueError("paused_reason requires initial_paused=True")
+    normalized_paused_reason = (paused_reason or "").strip()
+    if len(normalized_paused_reason) > MAX_PAUSED_REASON_LENGTH:
+        raise ValueError(
+            f"paused_reason must be at most {MAX_PAUSED_REASON_LENGTH} characters"
+        )
+    if initial_paused and not normalized_paused_reason:
+        normalized_paused_reason = DEFAULT_INITIAL_PAUSED_REASON
+
+    now = created_at or _hermes_now().isoformat()
+    parsed_schedule = parse_schedule(schedule, relative_base=relative_schedule_base)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
@@ -2018,8 +2079,7 @@ def create_job(
     if deliver is None:
         deliver = "origin" if origin else "local"
 
-    job_id = uuid.uuid4().hex[:12]
-    now = _hermes_now().isoformat()
+    job_id = job_id or uuid.uuid4().hex[:12]
 
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_model = _normalize_job_optional_text(model)
@@ -2082,7 +2142,11 @@ def create_job(
     )
 
     next_run_at = compute_next_run(parsed_schedule)
-    if parsed_schedule.get("kind") == "once" and next_run_at is None:
+    if (
+        validate_oneshot_eligibility
+        and parsed_schedule.get("kind") == "once"
+        and next_run_at is None
+    ):
         run_at = parsed_schedule.get("run_at") or schedule
         logger.warning(
             "Rejecting one-shot cron job '%s': run_at %s is outside the %ss grace window",
@@ -2123,12 +2187,12 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
+        "enabled": not initial_paused,
+        "state": "paused" if initial_paused else "scheduled",
+        "paused_at": now if initial_paused else None,
+        "paused_reason": normalized_paused_reason if initial_paused else None,
         "created_at": now,
-        "next_run_at": next_run_at,
+        "next_run_at": None if initial_paused else next_run_at,
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
@@ -2150,11 +2214,66 @@ def create_job(
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
 
+    return job
+
+
+def create_job(
+    prompt: Optional[str],
+    schedule: str,
+    name: Optional[str] = None,
+    repeat: Optional[int] = None,
+    deliver: Optional[str] = None,
+    origin: Optional[Dict[str, Any]] = None,
+    skill: Optional[str] = None,
+    skills: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    script: Optional[str] = None,
+    context_from: Optional[Union[str, List[str]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    workdir: Optional[str] = None,
+    no_agent: bool = False,
+    attach_to_session: Optional[bool] = None,
+    monitor_script: Optional[str] = None,
+    monitor_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    initial_paused: bool = False,
+    paused_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create and durably persist one cron job under the jobs-file lock.
+
+    ``initial_paused=True`` is an atomic create-paused operation: the first
+    persisted record is disabled/paused and has no ``next_run_at``.
+    """
+    job = _build_job_record(
+        prompt=prompt,
+        schedule=schedule,
+        name=name,
+        repeat=repeat,
+        deliver=deliver,
+        origin=origin,
+        skill=skill,
+        skills=skills,
+        model=model,
+        provider=provider,
+        base_url=base_url,
+        script=script,
+        context_from=context_from,
+        enabled_toolsets=enabled_toolsets,
+        workdir=workdir,
+        no_agent=no_agent,
+        attach_to_session=attach_to_session,
+        monitor_script=monitor_script,
+        monitor_url=monitor_url,
+        reasoning_effort=reasoning_effort,
+        initial_paused=initial_paused,
+        paused_reason=paused_reason,
+    )
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
-
     return job
 
 

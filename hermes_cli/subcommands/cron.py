@@ -71,6 +71,17 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--paused",
+        dest="initial_paused",
+        action="store_true",
+        default=False,
+        help="Create paused atomically; never arm the first scheduler trigger.",
+    )
+    cron_create.add_argument(
+        "--paused-reason",
+        help="Reason for --paused (maximum 240 characters).",
+    )
+    cron_create.add_argument(
         "--monitor-script",
         dest="monitor_script",
         help=(
