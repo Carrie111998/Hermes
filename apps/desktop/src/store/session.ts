@@ -141,10 +141,46 @@ export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId:
   return (hint?.targetProfile ?? hint?.profile)?.trim() || undefined
 }
 
+const ownerScopeKey = (connectionId: string, profile: string): string => JSON.stringify([connectionId, profile])
+
+/**
+ * Fold what a corroborating claim knows into the winning one, filling only the
+ * fields the winner lacks. A hint outranks the row it agrees with because it
+ * carries `targetProfile`, which no row can express — but the row still knows
+ * one thing the hint may not: whether that backend is local. Precedence must not
+ * silently drop it. The two agree on connection and profile by construction, or
+ * they would not share a key, so neither side can invent an owner here.
+ */
+function mergeOwnerEvidence(winner: SessionProfileRoute, other: SessionProfileRoute): SessionProfileRoute {
+  const mode = winner.mode ?? other.mode
+  const targetProfile = winner.targetProfile ?? other.targetProfile
+
+  return {
+    connectionId: winner.connectionId,
+    ...(mode ? { mode } : {}),
+    profile: winner.profile,
+    ...(targetProfile ? { targetProfile } : {})
+  }
+}
+
 /**
  * Resolve the strongest owner identity available for a session. A connection-
  * scoped row or open-time hint must stay a route object; reducing it to a bare
  * profile name sends same-named sessions to the primary connection.
+ *
+ * Hints and rows are peers, not a hierarchy. Neither can overrule the other:
+ * a hint has no invalidation path (setSessionOwnerHint only ever adds), and the
+ * session list is a paginated WINDOW, so a row's absence is never evidence that
+ * a backend does not own the session. With no side able to prove the other
+ * wrong, contradiction returns `{ ambiguous: true }` rather than a guess —
+ * picking one dispatches the RPC at a machine that may never have held the
+ * session, which is the whole failure class this module exists to prevent.
+ *
+ * Ambiguity is a verdict, not a dead end: the caller that holds a cross-profile
+ * probe (contrib/wiring) asks the backends, which is the only authority that can
+ * actually settle it. See sessionOwnerNeedsProbe — an ambiguous verdict is a
+ * truthy object, so a caller checking only `!owner` skips that escape hatch and
+ * leaves the session unroutable for the life of the process.
  */
 export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: null | string): SessionOwnerScope {
   if (!sessionId) {
@@ -156,7 +192,7 @@ export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: n
   const profileOnlyOwners = new Set<string>()
 
   for (const hint of hints) {
-    qualifiedOwners.set(JSON.stringify([hint.connectionId, hint.profile]), hint)
+    qualifiedOwners.set(ownerScopeKey(hint.connectionId, hint.profile), hint)
   }
 
   for (const row of sessions.filter(session => sessionMatchesStoredId(session, sessionId))) {
@@ -170,19 +206,22 @@ export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: n
       continue
     }
 
-    if (connectionId) {
-      const key = JSON.stringify([connectionId, profile])
-
-      if (!qualifiedOwners.has(key)) {
-        qualifiedOwners.set(key, {
-          connectionId,
-          ...(row.source === 'local' ? { mode: 'local' as const } : {}),
-          profile
-        })
-      }
-    } else {
+    if (!connectionId) {
       profileOnlyOwners.add(profile)
+
+      continue
     }
+
+    const key = ownerScopeKey(connectionId, profile)
+    const claimed = qualifiedOwners.get(key)
+
+    const rowOwner: SessionProfileRoute = {
+      connectionId,
+      ...(row.source === 'local' ? { mode: 'local' as const } : {}),
+      profile
+    }
+
+    qualifiedOwners.set(key, claimed ? mergeOwnerEvidence(claimed, rowOwner) : rowOwner)
   }
 
   if (qualifiedOwners.size > 0) {

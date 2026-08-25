@@ -77,10 +77,9 @@ import {
   $messages,
   $selectedStoredSessionId,
   $sessions,
-  getSessionOwnerHints,
+  knownSessionOwner,
   rememberedSessionProfile,
   requestSessionResume,
-  sessionMatchesStoredId,
   setResumeExhaustedSessionId,
   setSessionOwnerHint
 } from '@/store/session'
@@ -154,31 +153,18 @@ const $focusedSessionOwner = computed(
       return fallback
     }
 
-    const hints = getSessionOwnerHints(focused)
+    // ONE owner ladder for the whole app: this used to reconcile hints and rows
+    // on its own rules (a lone hint won outright, rows were never consulted),
+    // which meant the plugin bridge and the session-RPC router could name
+    // different backends for the same session. knownSessionOwner is that ladder;
+    // anything it cannot pin to a connection fails closed here, exactly as it
+    // does there. A bare profile name carries no connection identity, so it is
+    // no more routable for a per-bot readout than an ambiguous verdict is.
+    const owner = knownSessionOwner(sessions, focused)
 
-    if (hints.length === 1) {
-      return {
-        connectionId: hints[0].connectionId,
-        profile: normalizeProfileKey(hints[0].profile)
-      }
-    }
-
-    if (hints.length > 1) {
-      return null
-    }
-
-    const owners = new Map<string, PluginFocusedSessionOwner>()
-
-    for (const row of sessions.filter(session => sessionMatchesStoredId(session, focused))) {
-      const connectionId = String(row.connection_id || '').trim()
-      const profile = normalizeProfileKey(row.profile)
-
-      if (connectionId) {
-        owners.set(`${connectionId}::${profile}`, { connectionId, profile })
-      }
-    }
-
-    return owners.size === 1 ? [...owners.values()][0] : null
+    return owner && typeof owner === 'object' && 'connectionId' in owner
+      ? { connectionId: owner.connectionId, profile: normalizeProfileKey(owner.profile) }
+      : null
   }
 )
 

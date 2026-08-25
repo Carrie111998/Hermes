@@ -36,7 +36,15 @@ const normKey = (profile: null | string | undefined): string => (profile ?? '').
 const isRoute = (owner: SessionOwnerScope): owner is SessionProfileRoute =>
   Boolean(owner && typeof owner === 'object' && 'connectionId' in owner)
 
-const isAmbiguousOwner = (owner: SessionOwnerScope): owner is AmbiguousSessionOwner =>
+/**
+ * True when the evidence names no single backend. Exported because the decision
+ * of what to do about it belongs to the caller, not here: a caller holding a
+ * cross-profile probe (contrib/wiring) resolves the owner against the backends
+ * and routes; one without a probe has nothing left to try and surfaces the
+ * rejection below. Neither may fall through to ambient — that is the exact
+ * wrong-backend dispatch the whole module exists to prevent.
+ */
+export const isAmbiguousOwner = (owner: SessionOwnerScope): owner is AmbiguousSessionOwner =>
   Boolean(owner && typeof owner === 'object' && 'ambiguous' in owner)
 
 function routeParams(route: SessionProfileRoute, params: Record<string, unknown>): Record<string, unknown> {
@@ -57,6 +65,14 @@ function routeParams(route: SessionProfileRoute, params: Record<string, unknown>
  * fresh draft with no session, or global chrome) routes ambient.
  */
 export function sessionRpcNeedsProfileRoute(ownerProfile: SessionOwnerScope | undefined): boolean {
+  if (isAmbiguousOwner(ownerProfile)) {
+    // Unroutable, but emphatically NOT ambient: an ambiguous owner is one we
+    // could not pin, never a session that has no owner. requestForSessionProfile
+    // rejects it before any dispatch; answering false here would invite a
+    // future caller to send it down the ambient path instead.
+    return true
+  }
+
   if (isRoute(ownerProfile)) {
     // A descriptor is an immutable ownership claim. Even an explicitly local
     // route must not collapse to the ambient request: another connection can

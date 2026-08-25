@@ -1001,9 +1001,9 @@ describe('knownSessionOwner reconciliation', () => {
 
     setSessionOwnerHint('partial-confirmation', hint)
 
-    expect(knownSessionOwner([session({ id: 'partial-confirmation', profile: 'default' })], 'partial-confirmation')).toEqual(
-      hint
-    )
+    expect(
+      knownSessionOwner([session({ id: 'partial-confirmation', profile: 'default' })], 'partial-confirmation')
+    ).toEqual(hint)
   })
 
   it('reconciles a qualified row with a same-profile profile-only row', () => {
@@ -1027,6 +1027,59 @@ describe('knownSessionOwner reconciliation', () => {
         'contradictory-connections'
       )
     ).toEqual({ ambiguous: true })
+  })
+
+  it('fails closed when two qualified rows disagree', () => {
+    // Contradiction with no hint involved at all. A paginated list cannot prove
+    // either row wrong, so refuse rather than dispatch at a backend that may
+    // never have held the session; contrib/wiring probes this case instead.
+    expect(
+      knownSessionOwner(
+        [
+          session({ connection_id: 'source-a', id: 'contradictory-rows', profile: 'worker' }),
+          session({ connection_id: 'source-b', id: 'contradictory-rows', profile: 'worker' })
+        ],
+        'contradictory-rows'
+      )
+    ).toEqual({ ambiguous: true })
+  })
+
+  it('keeps a hint targetProfile that the corroborating row cannot express', () => {
+    setSessionOwnerHint('enriched-row', {
+      connectionId: 'source-a',
+      mode: 'remote',
+      profile: 'worker',
+      targetProfile: 'backend-worker'
+    })
+
+    expect(
+      knownSessionOwner([session({ connection_id: 'source-a', id: 'enriched-row', profile: 'worker' })], 'enriched-row')
+    ).toEqual({
+      connectionId: 'source-a',
+      mode: 'remote',
+      profile: 'worker',
+      targetProfile: 'backend-worker'
+    })
+  })
+
+  it("keeps a local row's mode when the corroborating hint omits it", () => {
+    // Hint-first precedence used to drop this: the row that knows the backend
+    // is local was skipped wholesale once a hint claimed the same key.
+    setSessionOwnerHint('local-row', { connectionId: 'local', profile: 'worker' })
+
+    expect(
+      knownSessionOwner(
+        [session({ connection_id: 'local', id: 'local-row', profile: 'worker', source: 'local' })],
+        'local-row'
+      )
+    ).toEqual({ connectionId: 'local', mode: 'local', profile: 'worker' })
+  })
+
+  it('fails closed for contradictory hints when no row corroborates either', () => {
+    setSessionOwnerHint('contradictory-hints', { connectionId: 'source-a', profile: 'worker' })
+    setSessionOwnerHint('contradictory-hints', { connectionId: 'source-b', profile: 'worker' })
+
+    expect(knownSessionOwner([], 'contradictory-hints')).toEqual({ ambiguous: true })
   })
 
   it('fails closed when profile-only evidence contradicts the qualified owner', () => {

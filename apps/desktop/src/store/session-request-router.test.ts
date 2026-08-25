@@ -53,7 +53,8 @@ const {
   setPrimaryGateway
 } = await import('./gateway')
 
-const { requestForSessionProfile, sessionRpcNeedsProfileRoute } = await import('./session-request-router')
+const { isAmbiguousOwner, requestForSessionProfile, sessionRpcNeedsProfileRoute } =
+  await import('./session-request-router')
 
 function installDesktop(): void {
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
@@ -148,6 +149,22 @@ describe('sessionRpcNeedsProfileRoute', () => {
   it('pins a route owner with a connectionId', () => {
     expect(sessionRpcNeedsProfileRoute({ connectionId: 'local', profile: 'developer' })).toBe(true)
     expect(sessionRpcNeedsProfileRoute({ connectionId: '', profile: 'developer' })).toBe(false)
+  })
+})
+
+describe('isAmbiguousOwner', () => {
+  it('separates an unresolvable verdict from a real route', () => {
+    expect(isAmbiguousOwner({ ambiguous: true })).toBe(true)
+    expect(isAmbiguousOwner({ connectionId: 'local', profile: 'developer' })).toBe(false)
+    expect(isAmbiguousOwner('developer')).toBe(false)
+    expect(isAmbiguousOwner(undefined)).toBe(false)
+    expect(isAmbiguousOwner(null)).toBe(false)
+  })
+
+  it('reports an ambiguous owner as needing a route, never as ambient-safe', () => {
+    // `false` here would read as "no owner, ambient is fine" — the exact
+    // wrong-backend dispatch this module exists to prevent.
+    expect(sessionRpcNeedsProfileRoute({ ambiguous: true })).toBe(true)
   })
 })
 

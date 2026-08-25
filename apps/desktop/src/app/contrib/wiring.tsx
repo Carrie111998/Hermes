@@ -152,7 +152,12 @@ import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
-import { findStoredIdForRuntimeId, resolveKnownSessionRpcOwner, resolveRoutingSessionId } from './wiring-routing'
+import {
+  findStoredIdForRuntimeId,
+  resolveKnownSessionRpcOwner,
+  resolveRoutingSessionId,
+  sessionOwnerNeedsProbe
+} from './wiring-routing'
 
 // Overlay views the controller mounts over the shell — lazy, load on demand.
 // The workspace-route full-page views (skills/messaging/artifacts) are the
@@ -361,12 +366,20 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined
       )
 
-      if (!owner && routingSessionId) {
+      if (routingSessionId && sessionOwnerNeedsProbe(owner)) {
         // Unknown owner for a REAL session: probe across profiles (REST, not the
         // gateway socket, so no recursion) rather than defaulting to active. A
         // hit stamps ownership + caches a hint; a miss leaves owner undefined
         // and the request falls to ambient, exactly as an unroutable session did
         // before — but only after we tried, never as a silent active fallback.
+        //
+        // An AMBIGUOUS owner probes too: contradictory local evidence is exactly
+        // the case the backends can settle and we cannot, and this dispatcher is
+        // the one caller that holds the probe. Without this the object is truthy,
+        // the probe is skipped, and every RPC for that session rejects for the
+        // life of the process — the local contradiction never re-resolves on its
+        // own. A miss keeps `owner` ambiguous and still fails closed below; it
+        // never degrades to ambient.
         const probed = await resolveSessionProfile(routingSessionId)
 
         if (probed) {

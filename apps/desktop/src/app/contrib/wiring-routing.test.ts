@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { findStoredIdForRuntimeId, resolveKnownSessionRpcOwner, resolveRoutingSessionId } from './wiring-routing'
+import {
+  findStoredIdForRuntimeId,
+  resolveKnownSessionRpcOwner,
+  resolveRoutingSessionId,
+  sessionOwnerNeedsProbe
+} from './wiring-routing'
 
 describe('resolveKnownSessionRpcOwner', () => {
   it('keeps the production dispatcher pinned to a connection-qualified row owner', () => {
@@ -10,6 +15,26 @@ describe('resolveKnownSessionRpcOwner', () => {
         'ordinary-session'
       )
     ).toEqual({ connectionId: 'remote-source', profile: 'default' })
+  })
+})
+
+describe('sessionOwnerNeedsProbe', () => {
+  it('probes an unresolved owner', () => {
+    expect(sessionOwnerNeedsProbe(undefined)).toBe(true)
+    expect(sessionOwnerNeedsProbe(null)).toBe(true)
+    expect(sessionOwnerNeedsProbe('')).toBe(true)
+  })
+
+  it('probes an ambiguous owner instead of skipping it as truthy', () => {
+    // The regression this guards: `{ambiguous: true}` is an object, so a plain
+    // `!owner` check treats it as resolved, skips the probe, and leaves every
+    // RPC for that session rejecting with no way to re-resolve it.
+    expect(sessionOwnerNeedsProbe({ ambiguous: true })).toBe(true)
+  })
+
+  it('never spends a probe on an owner that is already pinned', () => {
+    expect(sessionOwnerNeedsProbe({ connectionId: 'remote-source', profile: 'default' })).toBe(false)
+    expect(sessionOwnerNeedsProbe('worker')).toBe(false)
   })
 })
 

@@ -6,7 +6,7 @@
  */
 
 import { knownSessionOwner } from '@/store/session'
-import type { SessionOwnerScope, SessionProfileRoute } from '@/store/session-request-router'
+import { isAmbiguousOwner, type SessionOwnerScope, type SessionProfileRoute } from '@/store/session-request-router'
 import type { SessionInfo } from '@/types/hermes'
 
 export function resolveKnownSessionRpcOwner(
@@ -15,6 +15,21 @@ export function resolveKnownSessionRpcOwner(
   tileOwner?: SessionProfileRoute
 ): SessionOwnerScope {
   return tileOwner ?? knownSessionOwner(sessions, routingSessionId)
+}
+
+/**
+ * True when a real session's owner is worth spending a cross-profile probe on.
+ *
+ * An UNKNOWN owner has never been resolved. An AMBIGUOUS one was resolved to
+ * contradictory local evidence — which is exactly what the backends can settle
+ * and the renderer cannot — so it probes too. The distinction matters because an
+ * ambiguous verdict is a truthy object: a bare `!owner` check skips the probe
+ * for it, and since nothing re-resolves that contradiction on its own, every
+ * session-scoped RPC for that session then rejects until the app restarts.
+ * A probe miss changes nothing here; the caller still fails closed.
+ */
+export function sessionOwnerNeedsProbe(owner: SessionOwnerScope): boolean {
+  return !owner || isAmbiguousOwner(owner)
 }
 
 /**
