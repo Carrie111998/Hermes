@@ -1826,6 +1826,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
+        # Cached prompts are also adopted by compression and background-review
+        # paths. Restore at the single lazy-execution choke point so every
+        # consumer observes the policy frozen in those prompt bytes.
+        from agent.system_prompt import restore_context_file_scan_policy
+
+        restore_context_file_scan_policy(
+            agent, getattr(agent, "_cached_system_prompt", None)
+        )
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         _emit_context_file_notices(agent)
         if subdir_hints:

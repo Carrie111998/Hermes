@@ -58,6 +58,8 @@ from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+_CONTEXT_SCAN_POLICY_MARKER = "Context file scanning policy: "
+_VALID_CONTEXT_SCAN_POLICIES = frozenset({"enforce", "warn", "off"})
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
@@ -263,6 +265,25 @@ def _restore_plugin_prompt_sections(prompt: str) -> tuple:
 def restore_plugin_prompt_sections(agent: Any, prompt: str) -> None:
     """Seed a resumed agent's frozen snapshot from persisted prompt bytes."""
     agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(prompt)
+
+
+def restore_context_file_scan_policy(agent: Any, prompt: str) -> str:
+    """Restore the lazy scanner policy frozen in persisted prompt bytes.
+
+    The core marker is the final prompt line, so project, memory, or plugin text
+    cannot spoof it. Legacy and malformed prompts fail closed to ``enforce``.
+    """
+    policy = "enforce"
+    if isinstance(prompt, str):
+        marker = f"\n\n{_CONTEXT_SCAN_POLICY_MARKER}"
+        if marker in prompt:
+            configured = prompt.rsplit(marker, 1)[-1]
+            if configured in _VALID_CONTEXT_SCAN_POLICIES:
+                policy = configured
+    tracker = getattr(agent, "_subdirectory_hints", None)
+    if tracker is not None:
+        tracker.set_scan_policy(policy)
+    return policy
 
 
 def _plugin_section_blocks(sections: tuple, position: str) -> List[str]:
@@ -933,6 +954,10 @@ def build_system_prompt_parts(
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
+    # Persist the authoritative policy in the prompt itself. Gateway turns
+    # construct a fresh AIAgent and restore these exact bytes, so process-local
+    # tracker state alone cannot carry the policy across turns.
+    volatile_parts.append(f"{_CONTEXT_SCAN_POLICY_MARKER}{_context_scan_policy}")
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
@@ -1069,5 +1094,6 @@ __all__ = [
     "build_system_prompt",
     "invalidate_system_prompt",
     "restore_plugin_prompt_sections",
+    "restore_context_file_scan_policy",
     "format_tools_for_system_message",
 ]
