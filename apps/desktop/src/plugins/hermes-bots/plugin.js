@@ -12756,7 +12756,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       r.running = false
       return r
     })
-    host.notify({ kind: 'success', message: '已停止全部 bot 任务' })
+    host.notify({ kind: 'success', message: 'Stopped all bot tasks' })
   }
 
   const activityPanel = jsxs('div', {
@@ -12796,8 +12796,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                 onClick: () => void stopAllBots(),
                 children: [
                   jsx(Codicon, { name: 'debug-stop', className: 'shrink-0 text-[0.75rem]' }),
-                  '停止'
-                ]
+                  'Stop'
+                  ]
               })
             : null
         ]
@@ -12834,7 +12834,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                               onClick: () => void stopAllBots(),
                               children: [
                                 jsx(Codicon, { name: 'debug-stop', className: 'shrink-0 text-[0.7rem]' }),
-                                '停止'
+                                'Stop'
                               ]
                             })
                           : null
