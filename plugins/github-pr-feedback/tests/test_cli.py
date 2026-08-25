@@ -152,13 +152,32 @@ def test_kanban_client_dispatches_an_opted_in_repair_as_ready() -> None:
     from github_pr_feedback.cli import KanbanSubprocessClient
 
     runner = RecordingKanbanRunner('{"id": "task-123"}')
-    task = replace(kanban_task(), initial_status="ready")
+    task = replace(kanban_task(), initial_status="running", max_retries=3)
 
     task_id = KanbanSubprocessClient(runner).create_or_get_task(task)
 
     assert task_id == "task-123"
     status_index = runner.calls[0].index("--initial-status") + 1
-    assert runner.calls[0][status_index] == "ready"
+    assert runner.calls[0][status_index] == "running"
+    retries_index = runner.calls[0].index("--max-retries") + 1
+    assert runner.calls[0][retries_index] == "3"
+
+
+def test_auto_dispatch_argv_is_accepted_by_the_real_kanban_parser() -> None:
+    from github_pr_feedback.cli import _kanban_create_argv
+    from hermes_cli.kanban import build_parser
+
+    root = argparse.ArgumentParser()
+    subcommands = root.add_subparsers(dest="command", required=True)
+    build_parser(subcommands)
+    task = replace(kanban_task(), initial_status="running", max_retries=3)
+
+    parsed = root.parse_args(_kanban_create_argv(task)[1:])
+
+    assert parsed.command == "kanban"
+    assert parsed.kanban_action == "create"
+    assert parsed.initial_status == "running"
+    assert parsed.max_retries == 3
 
 
 @pytest.mark.parametrize("stdout", ["{}", "[]", '{"id": ""}', '{"id": 17}', "not json"])

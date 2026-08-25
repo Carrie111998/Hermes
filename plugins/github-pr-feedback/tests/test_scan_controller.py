@@ -228,7 +228,8 @@ def test_auto_dispatch_starts_an_admitted_exact_head_repair_ready_with_push_and_
 
     assert result.created == 1
     task = kanban.tasks[0]
-    assert getattr(task, "initial_status", None) == "ready"
+    assert getattr(task, "initial_status", None) == "running"
+    assert getattr(task, "max_retries", None) == 3
     assert "commit and push" in task.instructions
     assert "post a factual PR reply" in task.instructions
     assert "Do not merge" in task.instructions

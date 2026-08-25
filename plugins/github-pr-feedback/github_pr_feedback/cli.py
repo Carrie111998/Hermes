@@ -229,7 +229,7 @@ def _kanban_create_argv(task: KanbanTask) -> list[str]:
         "--idempotency-key",
         task.idempotency_key,
         "--max-retries",
-        "1",
+        str(task.max_retries),
         "--initial-status",
         task.initial_status,
         "--json",

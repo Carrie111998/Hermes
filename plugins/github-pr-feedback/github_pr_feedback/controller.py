@@ -119,6 +119,7 @@ class KanbanTask:
     idempotency_key: str
     evidence: Mapping[str, object]
     initial_status: str = "blocked"
+    max_retries: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,7 +549,10 @@ def _task(
         branch=prepared.branch,
         idempotency_key=_receipt_idempotency_key(receipt),
         evidence=evidence,
-        initial_status="ready" if auto_dispatch else "blocked",
+        # Kanban's public create CLI calls its dispatchable default "running";
+        # create_task resolves that to a ready card until a worker claims it.
+        initial_status="running" if auto_dispatch else "blocked",
+        max_retries=3 if auto_dispatch else 1,
     )
 
 
