@@ -133,3 +133,100 @@ class TestDenyOrdering:
         assert "git push --force*" in msg
         assert "retry" in msg.lower()
         assert "rephrase" in msg.lower()
+
+
+class TestDenyRespectsReadOnlySearch:
+    """Issue #94747 — approvals.deny must not block read-only search/read tools
+    when the denied word appears only as the search PATTERN (not as the
+    command name or an actual flag/argument the shell executes as code).
+
+    Read-only tools like grep/rg/ag/ack/find/ls/cat/echo only READ files —
+    they do not execute code. A denied word inside their pattern operand is
+    DATA being looked for, not a command the agent is trying to run. The
+    built-in dangerous-pattern detector already respects this via
+    ``_grep_safe_detection_variant``; user deny rules must do the same.
+    """
+
+    # -- The headline reproductions from the issue --
+
+    def test_grep_unquoted_pattern_with_deny_token_passes(self, deny_config):
+        """``grep -n docker file.sh`` — unquoted ``docker`` is the search PATTERN
+        (first non-flag argument), not the command being run."""
+        deny_config(["*docker *", "*systemctl*"])
+        assert mod._match_user_deny_rule("grep -n docker file.sh") is None
+
+    def test_rg_unquoted_pattern_with_deny_token_passes(self, deny_config):
+        """``rg -n systemctl file.sh`` — ripgrep's first non-flag arg is pattern."""
+        deny_config(["*docker *", "*systemctl*"])
+        assert mod._match_user_deny_rule("rg -n systemctl file.sh") is None
+
+    def test_grep_quoted_pattern_with_deny_token_passes(self, deny_config):
+        """``grep -nE "systemctl (enable|start)" file.sh`` — quoted pattern."""
+        deny_config(["*docker *", "*systemctl*"])
+        assert mod._match_user_deny_rule(
+            'grep -nE "systemctl (enable|start)" file.sh'
+        ) is None
+
+    def test_egrep_quoted_pattern_with_deny_token_passes(self, deny_config):
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule(
+            'egrep "systemctl restart" file.sh'
+        ) is None
+
+    def test_ag_first_arg_is_pattern_passes(self, deny_config):
+        """The silver-searcher (ag) — first non-flag arg is the pattern."""
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule("ag systemctl file.sh") is None
+
+    def test_ack_first_arg_is_pattern_passes(self, deny_config):
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule("ack systemctl file.sh") is None
+
+    def test_fgrep_passes(self, deny_config):
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule("fgrep systemctl file.sh") is None
+
+    def test_grep_with_e_flag_pattern_passes(self, deny_config):
+        """``grep -e pattern file.sh`` — pattern is the arg to -e."""
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule("grep -e systemctl file.sh") is None
+
+    def test_grep_with_e_quoted_passes(self, deny_config):
+        """``grep -e "pattern" file.sh`` — pattern is the arg to -e, quoted."""
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule('grep -e "systemctl restart" file.sh') is None
+
+    # -- The negative controls — deny MUST still fire when the token is the
+    #    command name itself, not a pattern in a read-only tool. --
+
+    def test_docker_command_still_blocked(self, deny_config):
+        """Sanity: when ``docker`` is the command, the deny rule still applies."""
+        deny_config(["*docker *"])
+        assert mod._match_user_deny_rule("docker ps") is not None
+
+    def test_systemctl_command_still_blocked(self, deny_config):
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule("systemctl restart nginx") is not None
+
+    def test_non_search_tool_with_deny_token_still_blocked(self, deny_config):
+        """A token appears in a command argument of a NON-read-only tool —
+        deny rule still applies."""
+        deny_config(["*docker*"])
+        assert mod._match_user_deny_rule("ssh user@host docker run x") is not None
+
+    # -- End-to-end via the public check_dangerous_command path --
+
+    def test_grep_in_check_dangerous_command_path_passes(
+            self, deny_config, clean_env):
+        deny_config(["*docker *", "*systemctl*"])
+        result = mod.check_dangerous_command("grep -n docker file.sh", "local")
+        assert result["approved"] is True
+        assert not result.get("user_deny")
+
+    def test_grep_quoted_in_check_dangerous_command_path_passes(
+            self, deny_config, clean_env):
+        deny_config(["*docker *", "*systemctl*"])
+        result = mod.check_dangerous_command(
+            'grep -nE "systemctl (enable|start)" file.sh', "local")
+        assert result["approved"] is True
+        assert not result.get("user_deny")
