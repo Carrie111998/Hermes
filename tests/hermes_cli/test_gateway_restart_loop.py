@@ -1996,6 +1996,16 @@ class TestLifecycleGuardGitDataExemption:
         # Attached short form and long form.
         'git commit -m"clip: hermes gateway stop steps"',
         'git commit --message="hermes gateway restart tips"',
+        # Clustered short-flag groups ending in `m` (`-am` is THE most common
+        # real commit invocation). Both detached value and glued-on value.
+        'git commit -am "clip: how to run hermes gateway restart"',
+        'git commit -am"clip: hermes gateway restart steps"',
+        'git commit -vam "clip: systemctl restart hermes-gateway"',
+        # Windows git binaries (`git.exe`/`git.cmd`) get the same exemption.
+        'git.exe commit -m "clip: hermes gateway restart"',
+        'git.cmd commit -am "clip: hermes gateway stop"',
+        # `-m` whose VALUE is a literal `--` (message text, not a separator).
+        'git commit -m -- "notes: systemctl restart hermes-gateway"',
         # `--` pathspec: filenames are inert data to git.
         'git add -- "clips/hermes gateway restart guide.md"',
         'git add -- "01_sources/pkill hermes gateway note.md"',
@@ -2015,6 +2025,11 @@ class TestLifecycleGuardGitDataExemption:
         'git config alias.x "!hermes gateway restart"',
         # `-C` takes a commit-ish, not free text — must not be masked.
         'git commit -C "hermes gateway restart"',
+        # Uppercase `-M` in a cluster is NOT a message flag (its value stays
+        # visible) — only a lowercase-`m`-terminated cluster is exempted.
+        'git commit -aM "hermes gateway restart"',
+        # Top-level `-c` visibility wins even alongside a masked message.
+        'git -c core.pager="systemctl restart hermes-gateway" commit -m "benign"',
     ])
     def test_git_execution_vectors_still_blocked(self, command):
         assert self._scan(command, cwd="/tmp") is True
