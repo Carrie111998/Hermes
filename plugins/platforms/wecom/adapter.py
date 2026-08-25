@@ -228,15 +228,12 @@ class WeComAdapter(BasePlatformAdapter):
         # WeCom stream lifetime: server rejects updates after ~6 minutes
         # (errcode 846608). Keepalives do NOT extend it. Use 330s for margin.
         self.THINKING_STREAM_MAX_S = 330.0
-        # Turn-ended fence: chat_id -> monotonic ts of the final delivery of
-        # the last turn (stream finish OR markdown fallback). send_typing
-        # refuses to open a fresh bubble shortly after an end with no new
-        # inbound message — stale progress-loop stragglers would otherwise
-        # orphan a placeholder nobody closes.
-        self._turn_ended_at: Dict[str, float] = {}
-        # chat_id -> monotonic ts when the latest inbound message was seen
-        # (re-arms the fence above).
-        self._req_seen_at: Dict[str, float] = {}
+        # Per-chat active-turn flag: True while a turn is running and its
+        # thinking bubble is expected. send() marks it False on final
+        # delivery; inbound messages re-arm it. send_typing refuses to open
+        # a bubble when it's False — that's a progress-loop tail call after
+        # the turn ended, which would otherwise orphan a placeholder.
+        self._turn_active: Dict[str, bool] = {}
         # Opt-out switch: platforms.wecom.extra.thinking_bubble (default on).
         self._thinking_bubble_enabled = bool(extra.get("thinking_bubble", True))
 
@@ -1005,9 +1002,8 @@ class WeComAdapter(BasePlatformAdapter):
         self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
             self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
-        # A genuinely new inbound message re-arms the turn-ended fence.
-        self._req_seen_at[normalized_chat_id] = time.monotonic()
-        self._turn_ended_at.pop(normalized_chat_id, None)
+        # A genuinely new inbound message starts a fresh turn.
+        self._turn_active[normalized_chat_id] = True
 
     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
         normalized = str(reply_to or "").strip()
@@ -1467,59 +1463,50 @@ class WeComAdapter(BasePlatformAdapter):
 
         Thinking-bubble semantics (single-stream-per-turn, mirrors the
         official openclaw plugin): while a bubble is open for this chat,
-        every send writes into that SAME stream with ``finish=false`` —
-        mid-turn texts update the bubble in place instead of spawning new
-        messages. The FINAL send (metadata ``_wecom_final=True``) closes the
-        stream with ``finish=true``, replacing the bubble with the answer.
-        If no bubble is open (disabled/expired/never opened), everything
-        falls through to normal markdown as before.
+        every send writes into that SAME stream with ``finish=false`` — the
+        bubble shows the live draft and stays "thinking". The FINAL send
+        (metadata ``_wecom_final=True``) NEVER writes the answer into the
+        bubble; it just closes the bubble (neutral finish) and the answer
+        is delivered as a STANDALONE markdown message. This keeps the
+        bubble a pure "thinking" indicator and avoids orphaned placeholders.
+
+        Busy-acks / receipts for a NEW message carry ``_wecom_no_stream``
+        (deliver standalone, never touch the open bubble). A redirect ack
+        carries ``_wecom_redirect`` — it closes the open bubble with the
+        "adjusted" notice.
         """
-        is_final = bool(metadata and metadata.get("_wecom_final"))
-        # Busy-ack and similar receipts for a NEW message must not touch the
-        # still-running turn's stream — deliver as standalone markdown.
         no_stream = bool(metadata and metadata.get("_wecom_no_stream"))
-        # A redirect ack CLOSES the old visual turn: finish the open bubble
-        # with the "adjusted" notice so the next send_typing opens a fresh
-        # bubble that carries the redirected answer.
         is_redirect_ack = bool(metadata and metadata.get("_wecom_redirect"))
+        is_final = bool(metadata and metadata.get("_wecom_final"))
 
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
+        # Redirect ack: close the old bubble (if any) with the notice. The
+        # next send_typing (new turn) opens a fresh bubble naturally.
         if is_redirect_ack:
             from agent.i18n import t
-            closed = await self._finish_thinking(
+            await self._finish_thinking(
                 chat_id, t("gateway.busy_ack.redirect_short"))
-            if not closed:
-                # No live bubble (or expired) — fall through to a standalone
-                # message so the receipt still reaches the user.
-                pass
-            else:
-                return SendResult(success=True)
+            return SendResult(success=True)
 
-        # Live bubble open → write into it. Mid-turn: finish=false (bubble
-        # content updates, stays "thinking"); final: finish=true (replaced by
-        # the answer). Either way SKIP markdown — one message per turn.
+        # Live bubble open → write into it. Mid-turn: finish=false (draft /
+        # live progress). Final: finish=true writes the ANSWER into the
+        # bubble (normal path — bubble becomes the answer). Past the stream
+        # lifetime the write fails and we fall through to standalone markdown.
         st = None if no_stream else self._thinking_streams.get(chat_id)
         if st is not None:
-            ok = await self._write_stream(
-                chat_id, content, finish=is_final)
+            ok = await self._write_stream(chat_id, content, finish=is_final)
             if ok:
-                if is_final:
-                    self._turn_ended_at[chat_id] = time.monotonic()
-                return SendResult(
-                    success=True,
-                    message_id=st["id"],
-                )
-            # Write failed (expired/ws closed) → state already cleaned;
-            # fall through to markdown below.
+                return SendResult(success=True, message_id=st["id"])
+            # Expired/ws closed → state cleaned; fall through to markdown.
 
+        # Standalone markdown: the final answer when the bubble expired or
+        # was never opened (timeout path), or non-final no_stream receipts.
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
-
             if not reply_req_id and chat_id in self._last_chat_req_ids:
                 reply_req_id = self._last_chat_req_ids[chat_id]
-
             if reply_req_id:
                 response = await self._send_reply_markdown(reply_req_id, content)
             else:
@@ -1540,12 +1527,6 @@ class WeComAdapter(BasePlatformAdapter):
         error = self._response_error(response)
         if error:
             return SendResult(success=False, error=error)
-
-        # Final markdown delivery (incl. expired-stream fallback) ends the
-        # turn visually — arm the fence so straggler send_typing calls don't
-        # open an orphan bubble. Mid-turn markdown (no _wecom_final) doesn't.
-        if is_final:
-            self._turn_ended_at[chat_id] = time.monotonic()
         return SendResult(
             success=True,
             message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
@@ -1662,21 +1643,16 @@ class WeComAdapter(BasePlatformAdapter):
         st = self._thinking_streams.get(chat_id)
         if st is not None:
             return  # already open; its keepalive task is running
-        # Turn-ended fence: if the previous turn's final delivery just happened
-        # (stream finish OR markdown fallback) and no NEW inbound message has
-        # arrived since, a send_typing here is a stale progress-loop straggler —
-        # opening a bubble now would orphan a placeholder nobody will ever
-        # close. The fence clears when the next inbound message re-arms
-        # _last_chat_req_ids (line ~996), i.e. a genuinely new turn began.
-        ended = self._turn_ended_at.get(chat_id)
-        if ended is not None:
-            if time.monotonic() - ended < 15.0 and \
-                    self._req_seen_at.get(chat_id, 0.0) < ended:
-                logger.debug(
-                    "[%s] suppressing typing bubble: turn for %s already "
-                    "delivered; no new inbound since", self.name, chat_id)
-                return
-            self._turn_ended_at.pop(chat_id, None)
+        # Turn-active fence: once the previous turn's final answer has been
+        # delivered (send() set _turn_active[chat]=False), a straggler
+        # send_typing from the progress loop must NOT open a fresh bubble —
+        # it would orphan a placeholder nobody closes. A new inbound message
+        # re-arms _turn_active=True, so a genuinely new turn opens normally.
+        if not self._turn_active.get(chat_id, True):
+            logger.debug(
+                "[%s] suppressing typing bubble: turn for %s already "
+                "delivered; no new inbound since", self.name, chat_id)
+            return
 
         stream_id = f"stream_{uuid.uuid4().hex[:16]}"
 
@@ -1685,8 +1661,9 @@ class WeComAdapter(BasePlatformAdapter):
 
             Self-terminates when the stream exceeds its ~6min server lifetime
             (further frames would be rejected anyway) or when finished. At the
-            deadline it writes one visible hint frame first, so the user sees
-            "still working" instead of the bubble silently going blank.
+            deadline it writes one "still working" hint frame (finish=false)
+            first, so the user sees progress instead of the placeholder going
+            blank — the eventual answer then arrives as a standalone message.
             """
             from agent.i18n import t
             deadline = time.monotonic() + self.THINKING_STREAM_MAX_S
@@ -1696,8 +1673,6 @@ class WeComAdapter(BasePlatformAdapter):
                 if cur is None or cur["id"] != stream_id:
                     return  # finished or replaced
                 if time.monotonic() > deadline:
-                    # One last VISIBLE frame before giving up: replace the
-                    # blank placeholder with a still-working notice.
                     try:
                         if self._ws and not self._ws.closed:
                             await self._ws.send_json({
@@ -1849,7 +1824,10 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _finish_thinking(self, chat_id: str, content: str) -> bool:
         """Close the open bubble with finish=true. Thin wrapper over
-        _write_stream(finish=True); kept for abort-path callers."""
+        _write_stream(finish=True); shared by the normal-answer, redirect,
+        and abort paths. Marks the turn inactive so a progress-loop
+        straggler send_typing won't reopen an orphan placeholder."""
+        self._turn_active[chat_id] = False
         return await self._write_stream(chat_id, content, finish=True)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
