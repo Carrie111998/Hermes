@@ -17,6 +17,13 @@ DEFAULT_CONFIG = {
     # request, never while the agent executes tools / reads files / runs
     # subprocesses / waits. Children and the main agent share this capacity.
     "provider_max_concurrent_requests": None,
+    # Optional per-provider REQUEST-concurrency overrides. Keys are provider
+    # names (e.g. "openrouter", "nous", "anthropic"); values are int > 0 or
+    # None. A provider with an entry here uses its own independent semaphore,
+    # overriding the global ``provider_max_concurrent_requests``. This keeps
+    # REQUEST-level limits independent per provider (still separate from the
+    # AGENT-level delegation cap). Unset/empty = no per-provider override.
+    "provider_request_concurrency": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
