@@ -33,6 +33,10 @@ export interface ModelSelection {
   /** Runtime id of the surface that opened the menu. When set, the switch
    *  targets that session (a tile) instead of the primary `$activeSessionId`. */
   sessionId?: null | string
+  /** Set by the selection-guard confirm dialog's retry after the user accepted
+   *  the warning — resends the same config.set value with the flag the gateway
+   *  honours inline or stores on its deferred (busy-session) queue. */
+  confirmExpensiveModel?: boolean
 }
 
 interface ModelMenuPanelProps {

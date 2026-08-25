@@ -2936,6 +2936,12 @@ export const zh: Translations = {
     wasPrice: '原价'
   },
 
+  modelSwitchConfirm: {
+    title: '切换模型需要确认',
+    confirm: '仍然切换',
+    failed: '模型切换未能完成。'
+  },
+
   modelVisibility: {
     title: '模型',
     search: '搜索模型',

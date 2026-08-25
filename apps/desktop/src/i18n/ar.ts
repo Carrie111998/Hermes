@@ -2190,6 +2190,11 @@ export const ar = defineLocale({
     freeTier: 'طبقة مجانية',
     priceTitle: 'السعر'
   },
+  modelSwitchConfirm: {
+    title: 'تأكيد تبديل النموذج',
+    confirm: 'تبديل على أي حال',
+    failed: 'لم يتم تبديل النموذج.'
+  },
   modelVisibility: {
     title: 'النماذج',
     search: 'بحث في النماذج',

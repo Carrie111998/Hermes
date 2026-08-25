@@ -12638,6 +12638,26 @@ def _respond(rid, params, key, *, allow_expired=False):
 # NOTE: config.set intentionally stays in server.py for now — the in-flight
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
+# Selection-guard evaluation for a deferred (busy-session) model switch.
+# Mirrors the guard gate in _apply_model_switch: a contributor-tier / expensive
+# pick must not ride through a deferred queue silently — the queued switch is
+# applied at next turn start WITHOUT re-running the guards, so this is the only
+# chance to require the explicit confirm. Returns None when no guard fired.
+def _deferred_switch_selection_warning(raw_value: str):
+    try:
+        from hermes_cli.model_selection_guards import combined_selection_warning
+        from hermes_cli.model_switch import parse_model_switch_args
+
+        parsed = parse_model_switch_args(raw_value)
+        try:
+            pending_model = parsed.model_input
+        except Exception:
+            pending_model = str(raw_value)
+        return combined_selection_warning(pending_model)
+    except Exception:
+        return None
+
+
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
@@ -12661,6 +12681,29 @@ def _(rid, params: dict) -> dict:
                 # The user gets to pick, keep typing, and send the next turn on
                 # the new model without waiting for the swap or interrupting.
                 if session.get("running"):
+                    # Guard the queued pick BEFORE accepting it. The deferred
+                    # apply (_apply_pending_model_switch) honours a stored
+                    # confirm but has no interactive surface left to ask with,
+                    # so an unconfirmed guarded pick must bounce here —
+                    # otherwise the client's optimistic paint survives while
+                    # the switch silently never lands (the "picker reverts to
+                    # the previous model" report).
+                    _deferred_warning = _deferred_switch_selection_warning(value)
+                    if (
+                        _deferred_warning is not None
+                        and not params.get("confirm_expensive_model", False)
+                    ):
+                        return _ok(
+                            rid,
+                            {
+                                "key": key,
+                                "value": value,
+                                "warning": "",
+                                "confirm_required": True,
+                                "confirm_message": _deferred_warning.message,
+                                "scope": "session",
+                            },
+                        )
                     parsed = parse_model_switch_args(value)
                     try:
                         pending_model = parsed.model_input

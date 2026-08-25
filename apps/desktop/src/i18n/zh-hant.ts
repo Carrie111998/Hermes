@@ -2351,6 +2351,12 @@ export const zhHant = defineLocale({
     wasPrice: '原價'
   },
 
+  modelSwitchConfirm: {
+    title: '切換模型需要確認',
+    confirm: '仍要切換',
+    failed: '模型切換未能完成。'
+  },
+
   modelVisibility: {
     title: '模型',
     search: '搜尋模型',

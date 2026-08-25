@@ -2337,6 +2337,13 @@ export interface Translations {
     wasPrice: string
   }
 
+  modelSwitchConfirm: {
+    /** Dialog title shown when a selection guard (cost / data-training tier) fires. */
+    title: string
+    confirm: string
+    failed: string
+  }
+
   modelVisibility: {
     title: string
     search: string

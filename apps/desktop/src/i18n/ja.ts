@@ -2439,6 +2439,12 @@ export const ja = defineLocale({
     wasPrice: '旧価格'
   },
 
+  modelSwitchConfirm: {
+    title: 'モデル切り替えに確認が必要です',
+    confirm: 'それでも切り替える',
+    failed: 'モデルの切り替えが完了しませんでした。'
+  },
+
   modelVisibility: {
     title: 'モデル',
     search: 'モデルを検索',

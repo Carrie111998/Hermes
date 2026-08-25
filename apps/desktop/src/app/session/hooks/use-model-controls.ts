@@ -7,6 +7,10 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
 import { notifyError } from '@/store/notifications'
+import {
+  $pendingModelSwitchConfirm,
+  setPendingModelSwitchConfirm
+} from '@/store/model-switch-confirm'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
@@ -234,19 +238,48 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
         const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
         const scope = persistsAsDefault ? '--global' : '--session'
+        const confirmed = selection.confirmExpensiveModel === true
 
-        const result = await requestGateway<{ deferred?: boolean }>('config.set', {
+        const result = await requestGateway<{
+          deferred?: boolean
+          confirm_required?: boolean
+          confirm_message?: string
+        }>('config.set', {
           session_id: liveSessionId,
           key: 'model',
-          value: `${selection.model} --provider ${selection.provider} ${scope}`
+          value: `${selection.model} --provider ${selection.provider} ${scope}`,
+          // Only ever set by the retry from the selection-guard dialog — the
+          // gateway treats an unflagged request as "ask before applying".
+          ...(confirmed ? { confirm_expensive_model: true } : {})
         })
+
+        // A selection guard fired (cost threshold, Meta contributor-tier data
+        // training, …). The backend did NOT apply the switch. Without this gate
+        // the optimistic paint above survives until the catalog re-fetch repaints
+        // the still-live previous model — the "picker keeps reverting" bug.
+        if (result?.confirm_required) {
+          const message = (result.confirm_message ?? '').trim()
+
+          if (!message || $pendingModelSwitchConfirm.get()) {
+            throw new Error(message || copy.modelSwitchFailed)
+          }
+
+          setPendingModelSwitchConfirm({
+            rawValue: `${selection.model} --provider ${selection.provider} ${scope}`,
+            message,
+            provider: selection.provider,
+            model: selection.model,
+            sessionId: liveSessionId,
+            persistsAsDefault
+          })
+        }
 
         // A pick made DURING a turn is queued by the gateway and applied at the
         // next turn start (`deferred`). Re-fetching now would answer with the
         // model still running and repaint the old name over the user's choice —
         // the switch publishes session.info when it lands, and that is what
         // re-syncs every surface.
-        if (!result?.deferred) {
+        if (!result?.confirm_required && !result?.deferred) {
           void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
         }
 

@@ -2771,6 +2771,12 @@ export const en: Translations = {
     wasPrice: 'was'
   },
 
+  modelSwitchConfirm: {
+    title: 'Model switch needs confirmation',
+    confirm: 'Switch anyway',
+    failed: 'The model switch did not go through.'
+  },
+
   modelVisibility: {
     title: 'Models',
     search: 'Search models',
