@@ -227,3 +227,60 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
 
     assert result.status == "unavailable"
     assert "hermes auth" in result.message
+
+
+ANTHROPIC_EXTRA_USAGE_PAYLOAD = {
+    "five_hour": None,
+    "seven_day": None,
+    "extra_usage": {
+        "is_enabled": True,
+        "monthly_limit": 30000,
+        "used_credits": 10587.0,
+        "utilization": 35.29,
+        "currency": "USD",
+        "decimal_places": 2,
+        "spend_limit_reached": False,
+    },
+    "spend": {
+        "used": {"amount_minor": 10587, "currency": "USD", "exponent": 2},
+        "limit": {"amount_minor": 30000, "currency": "USD", "exponent": 2},
+        "percent": 35,
+        "enabled": True,
+    },
+}
+
+
+def test_fetch_anthropic_usage_renders_extra_usage_in_dollars(monkeypatch):
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_anthropic_token",
+        lambda: "sk-ant-oat-test-token",
+    )
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient([], ANTHROPIC_EXTRA_USAGE_PAYLOAD),
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    # OAuth-style token → real usage API path (not the API-key-only notice).
+    assert snapshot is not None
+    assert snapshot.source == "oauth_usage_api"
+    assert "Extra usage: 105.87 / 300.00 USD" in snapshot.details
+
+
+def test_fetch_anthropic_usage_api_key_has_no_limits(monkeypatch):
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "sk-ant-api03-test")
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: (_ for _ in ()).throw(AssertionError("no HTTP for API keys")),
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    assert snapshot.source == "oauth_usage_api"
+    assert snapshot.unavailable_reason is not None
+    assert "OAuth-backed" in snapshot.unavailable_reason
