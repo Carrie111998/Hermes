@@ -1237,6 +1237,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "dispatch",
     "daemon",
     "repair",
+    "repair-assignees",
     "heartbeat",
     "notify-subscribe",
     "notify-unsubscribe",

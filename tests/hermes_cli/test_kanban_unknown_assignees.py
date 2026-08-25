@@ -259,6 +259,39 @@ def test_explicit_archive_is_terminal_and_never_reassigns(kanban_home):
     assert task.assignee == "agent"
 
 
+def test_delegated_child_cli_rejects_assignee_archive_before_mutation(
+    kanban_home, capsys
+):
+    from agent.delegation_context import delegated_child_context
+
+    with kb.connect_closing() as conn:
+        _insert_unknown(conn, "t_archive", assignee="agent")
+        task_before = kb.get_task(conn, "t_archive")
+        events_before = kb.list_events(conn, "t_archive")
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    kanban_cli.build_parser(subparsers)
+    args = parser.parse_args(
+        ["kanban", "repair-assignees", "--task", "t_archive", "--archive"]
+    )
+    with delegated_child_context():
+        result = kanban_cli.kanban_command(args)
+
+    assert result == 1
+    assert (
+        "delegate_task child contexts cannot mutate Kanban tasks via the CLI"
+        in capsys.readouterr().err
+    )
+    with kb.connect_closing() as conn:
+        task_after = kb.get_task(conn, "t_archive")
+        events_after = kb.list_events(conn, "t_archive")
+
+    assert task_before is not None
+    assert task_after == task_before
+    assert events_after == events_before
+
+
 def test_cross_board_report_uses_qualified_ids_and_requires_explicit_action(
     kanban_home, capsys
 ):
