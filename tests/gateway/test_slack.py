@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 import pytest
 
 import agent.secret_scope as secret_scope
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.platforms.base import (
     MessageEvent,
@@ -32,6 +32,8 @@ from gateway.platforms.base import (
     SendResult,
     is_host_excluded_by_no_proxy,
 )
+from gateway.session import AsyncSessionStore, SessionStore
+from gateway.slash_commands import GatewaySlashCommandsMixin
 
 
 # ---------------------------------------------------------------------------
@@ -1271,6 +1273,147 @@ class TestBangPrefixCommands:
             evt["thread_ts"] = thread_ts
         return evt
 
+    def _production_autoreset_adapter(self, tmp_path):
+        config = PlatformConfig(enabled=True, token="***", typing_indicator=False)
+        config.extra["require_mention"] = False
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._bot_user_id = "U_BOT"
+        adapter._running = True
+        adapter._has_active_session_for_thread = MagicMock(return_value=True)
+        adapter._resolve_user_name = AsyncMock(return_value="Test User")
+        adapter._resolve_channel_name = AsyncMock(return_value="test-channel")
+        adapter._fetch_thread_parent_text = AsyncMock(return_value=None)
+
+        gateway_config = GatewayConfig()
+        gateway_config.sessions_dir = tmp_path
+        store = SessionStore(tmp_path, gateway_config)
+        store._db = None
+        runner = GatewaySlashCommandsMixin()
+        runner.session_store = store
+        runner.async_session_store = AsyncSessionStore(store)
+        runner.adapters = {Platform.SLACK: adapter}
+        dispatches = asyncio.Queue()
+
+        async def dispatch(event):
+            response = await runner._handle_autoreset_command(event)
+            await dispatches.put((event, response, asyncio.current_task()))
+
+        adapter.set_message_handler(dispatch)
+        return adapter, store, dispatches
+
+    async def _dispatch_autoreset(
+        self, adapter, dispatches, command, *, team_id, ts
+    ):
+        event = self._make_event(
+            command,
+            thread_ts="1712345678.000001",
+            channel_type="channel",
+            channel="C123",
+        )
+        event.update(type="message", ts=ts, client_msg_id=f"client-{team_id}-{ts}")
+
+        await adapter._handle_slack_message(event, {"team_id": team_id})
+        message, response, task = await asyncio.wait_for(dispatches.get(), timeout=2)
+        await asyncio.wait_for(task, timeout=2)
+        return message, response
+
+    @pytest.mark.asyncio
+    async def test_bang_autoreset_commands_dispatch_with_slack_thread_scope(
+        self, tmp_path
+    ):
+        adapter, _store, dispatches = self._production_autoreset_adapter(tmp_path)
+        cases = [
+            ("status", "Automatic reset: disabled (inherited policy)."),
+            ("on", "Automatic reset: daily at 04:00 (thread override)."),
+            ("daily 08:07", "Automatic reset: daily at 08:07 (thread override)."),
+            ("off", "Automatic reset: disabled (thread override)."),
+            ("inherit", "Automatic reset: disabled (inherited policy)."),
+        ]
+
+        for index, (args, expected_response) in enumerate(cases, start=1):
+            message, response = await self._dispatch_autoreset(
+                adapter,
+                dispatches,
+                f"!autoreset {args}",
+                team_id="T_WORKSPACE",
+                ts=f"1712345679.00000{index}",
+            )
+
+            assert message.text == f"/autoreset {args}"
+            assert message.message_type == MessageType.COMMAND
+            assert message.source.scope_id == "T_WORKSPACE"
+            assert message.source.chat_id == "C123"
+            assert message.source.thread_id == "1712345678.000001"
+            assert response == expected_response
+
+    @pytest.mark.asyncio
+    async def test_adapter_derived_slack_sources_persist_workspace_isolation(
+        self, tmp_path
+    ):
+        adapter, _store, dispatches = self._production_autoreset_adapter(tmp_path)
+        workspace_a, response_a = await self._dispatch_autoreset(
+            adapter,
+            dispatches,
+            "!autoreset daily 06:15",
+            team_id="T_A",
+            ts="1712345679.100001",
+        )
+        workspace_b, response_b = await self._dispatch_autoreset(
+            adapter,
+            dispatches,
+            "!autoreset off",
+            team_id="T_B",
+            ts="1712345679.100002",
+        )
+
+        assert response_a == "Automatic reset: daily at 06:15 (thread override)."
+        assert response_b == "Automatic reset: disabled (thread override)."
+        assert workspace_a.source.scope_id == "T_A"
+        assert workspace_b.source.scope_id == "T_B"
+        assert workspace_a.source.chat_id == workspace_b.source.chat_id == "C123"
+        assert (
+            workspace_a.source.thread_id
+            == workspace_b.source.thread_id
+            == "1712345678.000001"
+        )
+
+        reloaded = SessionStore(tmp_path, GatewayConfig())
+        reloaded._db = None
+        policy_a, resolution_a = reloaded.get_effective_reset_policy(
+            source=workspace_a.source
+        )
+        policy_b, resolution_b = reloaded.get_effective_reset_policy(
+            source=workspace_b.source
+        )
+        assert (policy_a.mode, policy_a.at_hour, policy_a.at_minute, resolution_a) == (
+            "daily",
+            6,
+            15,
+            "override",
+        )
+        assert (policy_b.mode, resolution_b) == ("none", "override")
+
+
+    @pytest.mark.asyncio
+    async def test_bang_autoreset_reaches_normal_thread_command_handler(self, adapter):
+        adapter.config.extra["require_mention"] = False
+        adapter._has_active_session_for_thread = MagicMock(return_value=True)
+        evt = self._make_event(
+            "!autoreset daily 08:07",
+            thread_ts="1111111111.000001",
+            channel_type="channel",
+            channel="C123",
+        )
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/autoreset daily 08:07"
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.source.chat_id == "C123"
+        assert msg_event.source.chat_type == "group"
+        assert msg_event.source.thread_id == "1111111111.000001"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
