@@ -3269,6 +3269,8 @@ def launchd_gateway_labels_for_install() -> list[str]:
     from hermes_cli.profiles import list_profiles
     from hermes_constants import get_default_hermes_root
 
+    # All profiles of this install share one root, so one root hash — not
+    # a per-profile one — is folded into every label below.
     root = get_default_hermes_root().resolve()
     root_label: list[str] = []
     profile_labels: list[str] = []
