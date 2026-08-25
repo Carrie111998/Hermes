@@ -4,6 +4,9 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+import os
+
+import pytest
 from unittest.mock import MagicMock
 
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
@@ -480,6 +483,10 @@ class TestWaitForProcessDrain:
     bash exits even when a grandchild still holds the pipe open).
     """
 
+    pytestmark = pytest.mark.skipif(
+        os.name != "posix", reason="POSIX-only drain path (needs /bin/bash)"
+    )
+
     def _run(self, bash_script):
         import subprocess
 
@@ -505,12 +512,10 @@ class TestWaitForProcessDrain:
 
         # Raise the soft fd limit so we can push a pipe fd past 1024.  Skip on
         # hosts whose hard limit cannot reach 2048 (the bug cannot manifest).
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         try:
-            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 2048), hard))
         except (ValueError, OSError):
-            import pytest
-
             pytest.skip("cannot raise RLIMIT_NOFILE past FD_SETSIZE")
 
         held = []
@@ -528,6 +533,12 @@ class TestWaitForProcessDrain:
         finally:
             for fd in held:
                 os.close(fd)
+            # Restore the original process-wide fd limit (do not leak the
+            # raised policy to later tests in the same worker).
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+            except (ValueError, OSError):
+                pass
 
     def test_drain_captures_output_at_normal_fd(self):
         """Low-fd path keeps capturing full stdout (no regression)."""
