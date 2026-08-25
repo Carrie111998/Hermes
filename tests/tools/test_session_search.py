@@ -429,6 +429,23 @@ class TestScrollPattern:
         assert result["mode"] == "scroll"
         assert ids[2] in [m["id"] for m in result["messages"]]
 
+    def test_scroll_string_anchor_still_scrolls(self, db):
+        """Review on #94801: _scroll coerces string anchors (\"4408\"
+        scrolls on main), so the zero-anchor gate must coerce before
+        comparing — a naive `> 0` on the raw value raised TypeError and
+        broke every string-anchor scroll."""
+        db.create_session("s_str", source="cli")
+        ids = []
+        for i in range(3):
+            ids.append(db.append_message("s_str", role="user", content=f"str {i}"))
+
+        result = json.loads(session_search(
+            session_id="s_str", around_message_id=str(ids[1]), window=2, db=db
+        ))
+        assert result["success"] is True
+        assert result["mode"] == "scroll"
+        assert ids[1] in [m["id"] for m in result["messages"]]
+
 
 # =========================================================================
 # Shape precedence
