@@ -35,7 +35,7 @@ from hermes_cli.colors import Colors, color
 from hermes_cli.models import _HERMES_USER_AGENT
 from hermes_cli.vercel_auth import describe_vercel_auth
 from hermes_constants import OPENROUTER_MODELS_URL
-from utils import base_url_host_matches
+from utils import base_url_host_matches, base_url_hostname
 
 
 _PROVIDER_ENV_HINTS = (
@@ -264,6 +264,48 @@ def _termux_install_all_fallback_notes() -> list[str]:
 def _has_provider_env_config(content: str) -> bool:
     """Return True when ~/.hermes/.env contains provider auth/base URL settings."""
     return any(key in content for key in _PROVIDER_ENV_HINTS)
+
+
+def _configured_model_uses_keyless_local_endpoint(config_path: Path) -> bool:
+    """Return True when the selected provider is configured on loopback.
+
+    A local OpenAI-compatible endpoint such as Ollama does not need an API key,
+    so Doctor must not recommend the setup wizard solely because its .env file
+    is intentionally empty.
+    """
+    if not config_path.exists():
+        return False
+
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        config = read_user_config_raw(config_path)
+        model = config.get("model") or {}
+        provider_name = str(model.get("provider") or "").strip().lower()
+        providers = config.get("providers") or {}
+        if not provider_name or not isinstance(providers, dict):
+            return False
+
+        provider_config = next(
+            (
+                value
+                for name, value in providers.items()
+                if str(name).strip().lower() == provider_name and isinstance(value, dict)
+            ),
+            None,
+        )
+        if not provider_config:
+            return False
+
+        endpoint = str(
+            provider_config.get("api")
+            or provider_config.get("base_url")
+            or model.get("base_url")
+            or ""
+        ).strip()
+        return base_url_hostname(endpoint) in {"localhost", "127.0.0.1", "::1"}
+    except Exception:
+        return False
 
 
 def _honcho_is_configured_for_doctor() -> bool:
@@ -1253,6 +1295,7 @@ def run_doctor(args):
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()
     # Check ~/.hermes/.env (primary location for user config)
+    config_path = HERMES_HOME / 'config.yaml'
     env_path = HERMES_HOME / '.env'
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
@@ -1266,6 +1309,8 @@ def run_doctor(args):
             content = env_path.read_text(encoding="latin-1")
         if _has_provider_env_config(content):
             check_ok("API key or custom endpoint configured")
+        elif _configured_model_uses_keyless_local_endpoint(config_path):
+            check_info("No API key needed for configured local endpoint")
         else:
             check_warn(f"No API key found in {_DHH}/.env")
             issues.append("Run 'hermes setup' to configure API keys")
@@ -1294,7 +1339,6 @@ def run_doctor(args):
                 issues.append("Run 'hermes setup' to create .env")
     
     # Check ~/.hermes/config.yaml (primary) or project cli-config.yaml (fallback)
-    config_path = HERMES_HOME / 'config.yaml'
     if config_path.exists():
         check_ok(f"{_DHH}/config.yaml exists")
 
@@ -2877,38 +2921,43 @@ def run_doctor(args):
     _probes.append(("AWS Bedrock", _probe_bedrock))
     _probes.append(("Azure Foundry (Entra ID)", _probe_azure_entra))
 
-    # Print a single status line so users see something happening, then
-    # fan out. ``\r`` clears it once the first real result line lands.
-    print(f"  {color(f'Running {len(_probes)} connectivity checks in parallel…', Colors.DIM)}",
-          end="", flush=True)
+    _offline = bool(getattr(args, "offline", False))
+    if _offline:
+        print(color("  Skipped provider connectivity probes (--offline).", Colors.DIM))
+        _results = []
+    else:
+        # Print a single status line so users see something happening, then
+        # fan out. ``\r`` clears it once the first real result line lands.
+        print(f"  {color(f'Running {len(_probes)} connectivity checks in parallel…', Colors.DIM)}",
+              end="", flush=True)
 
-    # Disable boto3's EC2 instance-metadata-service probe for the duration
-    # of the parallel block. boto's default credential chain tries
-    # 169.254.169.254 with a multi-second timeout when we're not on EC2,
-    # which dominated the section's wall time before this fix
-    # (~2s on a developer laptop, even with the rest parallelized).
-    # Set on the parent thread before submitting work so the env-var
-    # mutation never races with another worker. has_aws_credentials() in
-    # the bedrock probe already gates on real env-var creds, so IMDS is
-    # never the legitimate source for `hermes doctor`.
-    _imds_prev = os.environ.get("AWS_EC2_METADATA_DISABLED")
-    os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
-    try:
-        # 8 workers is plenty — each probe is a single HTTP call plus a TLS
-        # handshake. More than that wastes thread-startup cost and risks
-        # noisy output if anything ever printed from inside a worker.
-        with _futures.ThreadPoolExecutor(max_workers=8,
-                                         thread_name_prefix="doctor-probe") as _ex:
-            _futures_in_order = [_ex.submit(_fn) for _, _fn in _probes]
-            _results = [_f.result() for _f in _futures_in_order]
-    finally:
-        if _imds_prev is None:
-            os.environ.pop("AWS_EC2_METADATA_DISABLED", None)
-        else:
-            os.environ["AWS_EC2_METADATA_DISABLED"] = _imds_prev
+        # Disable boto3's EC2 instance-metadata-service probe for the duration
+        # of the parallel block. boto's default credential chain tries
+        # 169.254.169.254 with a multi-second timeout when we're not on EC2,
+        # which dominated the section's wall time before this fix
+        # (~2s on a developer laptop, even with the rest parallelized).
+        # Set on the parent thread before submitting work so the env-var
+        # mutation never races with another worker. has_aws_credentials() in
+        # the bedrock probe already gates on real env-var creds, so IMDS is
+        # never the legitimate source for `hermes doctor`.
+        _imds_prev = os.environ.get("AWS_EC2_METADATA_DISABLED")
+        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+        try:
+            # 8 workers is plenty — each probe is a single HTTP call plus a TLS
+            # handshake. More than that wastes thread-startup cost and risks
+            # noisy output if anything ever printed from inside a worker.
+            with _futures.ThreadPoolExecutor(max_workers=8,
+                                             thread_name_prefix="doctor-probe") as _ex:
+                _futures_in_order = [_ex.submit(_fn) for _, _fn in _probes]
+                _results = [_f.result() for _f in _futures_in_order]
+        finally:
+            if _imds_prev is None:
+                os.environ.pop("AWS_EC2_METADATA_DISABLED", None)
+            else:
+                os.environ["AWS_EC2_METADATA_DISABLED"] = _imds_prev
 
-    # Clear the "Running …" line and print all results in submission order.
-    print("\r" + " " * 70 + "\r", end="")
+        # Clear the "Running …" line and print all results in submission order.
+        print("\r" + " " * 70 + "\r", end="")
     for _r in _results:
         for _glyph, _label, _detail in _r.lines:
             if _detail:
