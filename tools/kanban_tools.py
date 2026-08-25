@@ -1313,7 +1313,15 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=(
+                    # Spec 042 §6 discriminator fix: a card filed by a
+                    # dispatched worker must not stamp the bare profile name
+                    # (workers and humans share `default` since spec 019) —
+                    # that made every agent-filed card read human-side.
+                    f"worker:{os.environ['HERMES_KANBAN_TASK']}"
+                    if os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                    else (os.environ.get("HERMES_PROFILE") or "worker")
+                ),
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)

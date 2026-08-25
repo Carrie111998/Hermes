@@ -82,6 +82,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
         "runner": t.runner,
+        "effective_runner": kb.task_runner(t),
         "prompt_template": t.prompt_template,
         "permission_mode": t.permission_mode,
         "routed_by": t.routed_by,
@@ -537,6 +538,46 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
+
+    # --- set-runner / set-prompt / set-swarm / preview (spec 042 §8) ---
+    p_set_runner = sub.add_parser(
+        "set-runner",
+        help="Swap a task's runner post-filing (mutable until claim)",
+    )
+    p_set_runner.add_argument("task_id")
+    p_set_runner.add_argument(
+        "runner", nargs="?", default=None,
+        help="Runner to pin (" + "|".join(sorted(kb.VALID_RUNNERS))
+             + "), or 'none' to clear the pin",
+    )
+
+    p_set_prompt = sub.add_parser(
+        "set-prompt",
+        help="Set or clear a task's kickoff prompt template "
+             "(mutable until claim)",
+    )
+    p_set_prompt.add_argument("task_id")
+    p_set_prompt.add_argument(
+        "template", nargs="?", default=None,
+        help="Template string ('none' clears; supports {{task_id}}, "
+             "{{title}}, {{body}}, {{branch}}, {{workspace_path}})",
+    )
+
+    p_set_swarm = sub.add_parser(
+        "set-swarm",
+        help="Set or clear a task's swarm preset (mutable until claim)",
+    )
+    p_set_swarm.add_argument("task_id")
+    p_set_swarm.add_argument(
+        "preset", nargs="?", default=None,
+        help="Preset name, or 'none' to clear",
+    )
+
+    p_preview = sub.add_parser(
+        "preview",
+        help="Print the byte-exact kickoff prompt the worker would receive",
+    )
+    p_preview.add_argument("task_id")
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -1093,6 +1134,10 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "set-runner": _cmd_set_runner,
+            "set-prompt": _cmd_set_prompt,
+            "set-swarm": _cmd_set_swarm,
+            "preview":  _cmd_preview,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1144,7 +1189,20 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
+    """Best-effort author name for an interactive CLI call.
+
+    Spec 042 §6 discriminator fix (factory/hooks/README.md KNOWN GAP): when
+    this process IS a dispatched kanban worker (``HERMES_KANBAN_TASK`` set —
+    the same pin the MCP bridge keys its tool gating on), the author is NOT
+    the profile name. Workers and humans share ``default`` since spec 019,
+    so a bare profile name made every agent-filed card read as human-side.
+    A worker stamps ``worker:<task_id>`` instead, which no HUMAN_SIDE list
+    contains, so downstream gates (curator intake, routed_by honesty) can
+    finally tell an agent filing from a human one.
+    """
+    worker_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if worker_task:
+        return f"worker:{worker_task}"
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
         v = os.environ.get(env)
         if v:
@@ -1755,11 +1813,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
-    # Spec 042 execution contract. Print the effective runner even when the
-    # column is NULL (NULL → hermes) so the dispatcher's choice is visible
-    # on every card; the other fields only appear when set.
-    _runner = task.runner or "hermes"
-    print(f"  runner:    {_runner}" + ("" if task.runner else " (default)"))
+    # Spec 042 execution contract. Print the CONFIG-RESOLVED runner even
+    # when the column is NULL so the dispatcher's actual choice is visible
+    # on every card: card pin → kanban.default_runner → hermes. The other
+    # fields only appear when set.
+    _runner = kb.task_runner(task)
+    _pin_note = "" if task.runner else \
+        f" (default; pin is NULL → {_runner})" if _runner != "hermes" else " (default)"
+    print(f"  runner:    {_runner}{_pin_note}")
     if task.permission_mode:
         print(f"  permission: {task.permission_mode}")
     if task.prompt_template:
@@ -1900,6 +1961,94 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
+    return 0
+
+
+def _none_to_clear(value: Optional[str]) -> Optional[str]:
+    if value is not None and value.strip().lower() in {"none", "-", "null", ""}:
+        return None
+    return value
+
+
+def _cmd_set_runner(args: argparse.Namespace) -> int:
+    runner = _none_to_clear(args.runner)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_task_runner(conn, args.task_id, runner)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if runner:
+        print(f"Set runner on {args.task_id}: {runner}")
+    else:
+        print(
+            f"Cleared runner pin on {args.task_id} "
+            "(resolves via kanban.default_runner → hermes)"
+        )
+    return 0
+
+
+def _cmd_set_prompt(args: argparse.Namespace) -> int:
+    template = _none_to_clear(args.template)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_prompt_template(conn, args.task_id, template)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if template:
+        print(f"Set prompt template on {args.task_id}")
+    else:
+        print(
+            f"Cleared prompt template on {args.task_id} "
+            "(worker gets the runner's default kickoff)"
+        )
+    return 0
+
+
+def _cmd_set_swarm(args: argparse.Namespace) -> int:
+    preset = _none_to_clear(args.preset)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_swarm_preset(conn, args.task_id, preset)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if preset:
+        print(f"Set swarm preset on {args.task_id}: {preset}")
+    else:
+        print(f"Cleared swarm preset on {args.task_id}")
+    return 0
+
+
+def _cmd_preview(args: argparse.Namespace) -> int:
+    """Print the byte-exact kickoff under the card's current resolution."""
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+    if task is None:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    workspace = task.workspace_path or f"<workspaces>/{task.id}"
+    prompt = kb.render_worker_prompt(task, workspace)
+    runner = kb.task_runner(task)
+    argv = kb.runner_argv_summary(task, prompt)
+    print(prompt)
+    print()
+    print(f"-- runner:   {runner}")
+    print(f"-- argv:     {argv}")
+    if task.prompt_template is None:
+        print("-- template: (runner default)")
+    else:
+        print("-- template: (card override)")
     return 0
 
 

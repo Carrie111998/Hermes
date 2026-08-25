@@ -77,6 +77,7 @@ import os
 import re
 import random
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -3671,6 +3672,90 @@ def set_model_override(
         return True
 
 
+def _set_execution_contract_field(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    column: str,
+    event_kind: str,
+    value: Optional[str],
+    validate=None,
+    label: str = "value",
+) -> bool:
+    """Shared body of the post-filing contract mutators (spec 042 §8).
+
+    Mutable until claim: a ``running`` or ``archived`` card rejects the
+    write (the worker already has its kickoff; mutating under it would
+    desynchronize the recorded contract from the spawned process).
+    Writes the column and appends a task event so `kanban log` shows who
+    changed what. Returns True on success.
+    """
+    if validate is not None and value is not None:
+        validate(value)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        status = row["status"]
+        if status == "archived":
+            raise RuntimeError(f"cannot set {label} on archived task {task_id}")
+        if status == "running":
+            raise RuntimeError(
+                f"cannot set {label} on running task {task_id} "
+                "(mutable until claim — reclaim first)"
+            )
+        conn.execute(
+            f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id)
+        )
+        _append_event(conn, task_id, event_kind, {column: value})
+        return True
+
+
+def set_task_runner(conn, task_id, runner):
+    """Set (or clear) a card's runner pin (spec 042 §8 ``kanban set-runner``).
+
+    ``runner=None`` clears the pin — the card falls back to the configured
+    ``kanban.default_runner`` then hermes.
+    """
+    runner_norm = (runner or "").strip().lower() or None
+    if runner_norm is not None and runner_norm not in VALID_RUNNERS:
+        raise ValueError(
+            f"unknown runner {runner!r} — one of {sorted(VALID_RUNNERS)}"
+        )
+    return _set_execution_contract_field(
+        conn, task_id, column="runner", event_kind="runner_set",
+        value=runner_norm, label="runner",
+    )
+
+
+def set_prompt_template(conn, task_id, template):
+    """Set (or clear) a card's kickoff prompt template (``set-prompt``).
+
+    No placeholder is mandatory: ``render_worker_prompt`` substitutes what
+    it finds, and the runner default already carries the lifecycle
+    contract when the operator leaves the template NULL.
+    """
+    template = (template or "").strip() or None
+    return _set_execution_contract_field(
+        conn, task_id, column="prompt_template",
+        event_kind="prompt_template_set", value=template,
+        label="prompt template",
+    )
+
+
+def set_swarm_preset(conn, task_id, preset):
+    """Set (or clear) a card's swarm preset (``set-swarm``)."""
+    preset = (preset or "").strip() or None
+    if preset and preset.lower() in {"none", "-", "null"}:
+        preset = None
+    return _set_execution_contract_field(
+        conn, task_id, column="swarm_preset", event_kind="swarm_preset_set",
+        value=preset, label="swarm preset",
+    )
+
+
 def set_reasoning_effort(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4320,6 +4405,28 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _auto_promote_enabled() -> bool:
+    """Read ``kanban.auto_promote`` from config (spec 042 §6 operator gate).
+
+    Default ``True`` upstream — the historical auto-promote behaviour.  A
+    deployment that sets it to ``false`` makes ``recompute_ready`` a no-op
+    for ``todo`` promotion: nothing reaches ``ready`` except through an
+    explicit :func:`promote_task` (the operator's hand).  Parent-completion
+    bookkeeping still runs; only the automatic promotion is suppressed.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("kanban") or {}).get("auto_promote")
+    except Exception:
+        return True
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4347,12 +4454,19 @@ def recompute_ready(
     disagree about when a task is permanently blocked:
 
       1. per-task ``max_retries`` if set
-      2. caller-supplied ``failure_limit`` (the dispatcher passes the
+      2. ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    When the deployment sets ``kanban.auto_promote: false`` (the spec 042
+    operator gate), this function promotes NOTHING: every candidate is
+    skipped and the caller gets back 0.  The only path to ``ready`` left
+    standing is :func:`promote_task` — an explicit operator verb.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if not _auto_promote_enabled():
+        return 0
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -9444,6 +9558,58 @@ def _omp_worker_argv(task: "Task", prompt: str) -> list[str]:
     if task.max_runtime_seconds is not None:
         cmd.extend(["--max-time", str(int(task.max_runtime_seconds))])
     return cmd
+
+
+def runner_argv_summary(task: "Task", prompt: str) -> str:
+    """Human-readable argv line for ``kanban preview`` (spec 042 §8).
+
+    Mirrors the per-runner shapes in the spawn legs without running any
+    pre-flight — this renders under the card's CURRENT resolution
+    (card pin → ``kanban.default_runner`` → hermes) so the operator sees
+    exactly how the worker will launch. The binary is shown as the
+    configured/PATH name, not resolved, so preview works on a host where
+    the target runner isn't installed.
+    """
+    runner = task_runner(task)
+    if runner == "kimi":
+        binary = os.environ.get(KIMI_BINARY_PATH_ENV, "").strip() or DEFAULT_KIMI_BINARY
+        argv = [binary, "-p", "<prompt>", "--output-format=stream-json"]
+        if task.model_override:
+            argv.extend(["--model", task.model_override])
+    elif runner == "omp":
+        override = os.environ.get(OMP_BINARY_PATH_ENV, "").strip()
+        binary = override or "omp"
+        effort = (task.reasoning_effort or "").strip().lower()
+        if effort:
+            effort = {"none": "off", "ultra": "max"}.get(effort, effort)
+        else:
+            effort = DEFAULT_OMP_THINKING
+        argv = [
+            binary, "-p", "<prompt>", "--no-session",
+            "--model", task.model_override or DEFAULT_OMP_MODEL,
+            "--thinking", effort,
+        ]
+        if task.max_runtime_seconds is not None:
+            argv.extend(["--max-time", str(int(task.max_runtime_seconds))])
+    else:
+        argv = [
+            "hermes", "-p", task.assignee or "<assignee>", "--cli",
+            "--accept-hooks",
+        ]
+        if task.skills:
+            for sk in task.skills:
+                if sk:
+                    argv.extend(["--skills", sk])
+        if task.model_override:
+            argv.extend(["-m", task.model_override])
+            if task.provider_override:
+                argv.extend(["--provider", task.provider_override])
+        if task.reasoning_effort:
+            argv.extend(["--reasoning", task.reasoning_effort])
+        argv.extend(["chat", "-q", "<prompt>"])
+        if task.goal_mode:
+            argv.append("-Q")
+    return " ".join(shlex.quote(part) for part in argv)
 
 
 def _default_spawn(
