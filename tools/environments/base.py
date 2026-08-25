@@ -448,9 +448,13 @@ def _load_json_store(path: Path) -> dict:
 
 
 def _save_json_store(path: Path, data: dict) -> None:
-    """Write *data* as pretty-printed JSON to *path*."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    """Write a remote-sandbox pointer store with the shared durable helper."""
+    # Lazy import keeps the low-level environment module free of an eager
+    # dependency on the broader utility surface while reusing its fsync,
+    # symlink, ownership, permissions, and Windows replacement handling.
+    from utils import atomic_json_write
+
+    atomic_json_write(path, data)
 
 
 def _file_mtime_key(host_path: str) -> tuple[float, int] | None:
@@ -492,13 +496,23 @@ class _ThreadedProcessHandle:
     thread and exposes a ProcessHandle-compatible interface.  An optional
     ``cancel_fn`` is invoked on ``kill()`` for backend-specific cancellation
     (e.g. Modal sandbox.terminate, Daytona sandbox.stop).
+
+    Backends whose SDK delivers output incrementally should pass
+    ``stream_exec_fn`` instead: ``stream_exec_fn(write) -> exit_code`` calls
+    ``write(chunk)`` as each chunk arrives, so output flows through the pipe
+    into ``_wait_for_process``'s bounded collector while the command is still
+    running instead of being materialized in one string first.
     """
 
     def __init__(
         self,
-        exec_fn: Callable[[], tuple[str, int]],
+        exec_fn: Callable[[], tuple[str, int]] | None = None,
         cancel_fn: Callable[[], None] | None = None,
+        *,
+        stream_exec_fn: Callable[[Callable[[str], None]], int] | None = None,
     ):
+        if (exec_fn is None) == (stream_exec_fn is None):
+            raise ValueError("provide exactly one of exec_fn or stream_exec_fn")
         self._cancel_fn = cancel_fn
         self._done = threading.Event()
         self._returncode: int | None = None
@@ -511,13 +525,14 @@ class _ThreadedProcessHandle:
 
         def _worker():
             try:
-                output, exit_code = exec_fn()
-                self._returncode = exit_code
-                # Write output into the pipe so drain thread picks it up.
-                try:
-                    os.write(self._write_fd, output.encode("utf-8", errors="replace"))
-                except OSError:
-                    pass
+                if stream_exec_fn is not None:
+                    self._returncode = stream_exec_fn(self._emit_output)
+                else:
+                    assert exec_fn is not None
+                    output, exit_code = exec_fn()
+                    self._returncode = exit_code
+                    # Write output into the pipe so drain thread picks it up.
+                    self._emit_output(output)
             except Exception as exc:
                 self._error = exc
                 self._returncode = 1
@@ -530,6 +545,22 @@ class _ThreadedProcessHandle:
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
+
+    def _emit_output(self, text: str) -> None:
+        """Write *text* fully into the pipe, tolerating a closed read end.
+
+        A blocking pipe write larger than PIPE_BUF may return short when
+        interrupted, so loop until the whole chunk is delivered.
+        """
+        if not text:
+            return
+        view = memoryview(text.encode("utf-8", errors="replace"))
+        while view:
+            try:
+                written = os.write(self._write_fd, view)
+            except OSError:
+                return
+            view = view[written:]
 
     @property
     def stdout(self):

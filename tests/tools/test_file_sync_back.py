@@ -1,8 +1,10 @@
 """Tests for FileSyncManager.sync_back() — pull remote changes to host."""
 
+import copy
 import io
 import logging
 import os
+import shutil
 import signal
 import tarfile
 from pathlib import Path
@@ -498,8 +500,9 @@ class TestSyncBackSizeCap:
         # Cap at 1 byte so any non-empty tar exceeds it
         with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
             with patch("tools.environments.file_sync._SYNC_BACK_MAX_BYTES", 1):
-                mgr.sync_back(hermes_home=tmp_path / ".hermes")
+                result = mgr.sync_back(hermes_home=tmp_path / ".hermes")
 
+        assert result is False
         # Host file should be untouched because extraction was skipped
         assert Path(skill_host).read_bytes() == b"original"
         # Warning should mention the cap
@@ -520,3 +523,337 @@ class TestSyncBackSizeCap:
         # Default cap (2 GiB) is far above our tiny tar; extraction should proceed
         mgr.sync_back(hermes_home=tmp_path / ".hermes")
         assert Path(host_file).read_bytes() == b"remote_version"
+
+
+class TestSyncBackResult:
+    """sync_back() reports completion so callers can gate persistence."""
+
+    def test_sync_back_returns_true_on_success(self, tmp_path):
+        mgr = _make_manager(tmp_path, bulk_download_fn=_make_download_fn({}))
+        assert mgr.sync_back(hermes_home=tmp_path / ".hermes") is True
+
+    @patch("tools.environments.file_sync._sleep")
+    def test_sync_back_returns_false_after_retries_exhausted(self, _sleep, tmp_path):
+        def always_fail(dest: Path):
+            raise RuntimeError("persistent failure")
+
+        mgr = _make_manager(tmp_path, bulk_download_fn=always_fail)
+        assert mgr.sync_back(hermes_home=tmp_path / ".hermes") is False
+
+    def test_sync_back_returns_false_when_skipped_without_prior_sync(self, tmp_path):
+        mgr = _make_manager(
+            tmp_path, bulk_download_fn=MagicMock(), seed_pushed_state=False
+        )
+        assert mgr.sync_back(hermes_home=tmp_path / ".hermes") is False
+
+    def test_require_prior_sync_false_pulls_from_uninitialized_manager(self, tmp_path):
+        """The resume-recovery path treats every remote file as remote-authored."""
+        host_file = tmp_path / "host" / "skills" / "existing.py"
+        _write_file(host_file, b"stale host copy")
+        mapping = [(str(host_file), "/root/.hermes/skills/existing.py")]
+        download_fn = _make_download_fn(
+            {"root/.hermes/skills/existing.py": b"remote truth"}
+        )
+
+        mgr = FileSyncManager(
+            get_files_fn=lambda: mapping,
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=download_fn,
+        )
+
+        assert (
+            mgr.sync_back(hermes_home=tmp_path / ".hermes", require_prior_sync=False)
+            is True
+        )
+        assert host_file.read_bytes() == b"remote truth"
+
+    def test_restrict_to_roots_ignores_prefix_inference(self, tmp_path):
+        """Baseline-less recovery may only write under declared roots.
+
+        A remote file mappable solely through sibling-prefix inference (the
+        credential channel) must be skipped, while a file under a declared
+        root is still recovered.
+        """
+        host_cred = tmp_path / "host" / "credentials" / "other.json"
+        _write_file(host_cred, b"kept")
+        skills_root = tmp_path / "host" / "skills"
+        mapping = [(str(host_cred), "/root/.hermes/credentials/other.json")]
+        download_fn = _make_download_fn(
+            {
+                "root/.hermes/credentials/token.json": b"tampered",
+                "root/.hermes/skills/agent-made/SKILL.md": b"agent skill",
+            }
+        )
+
+        mgr = FileSyncManager(
+            get_files_fn=lambda: mapping,
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=download_fn,
+            sync_back_roots=[(str(skills_root), "/root/.hermes/skills")],
+        )
+
+        assert (
+            mgr.sync_back(
+                hermes_home=tmp_path / ".hermes",
+                require_prior_sync=False,
+                restrict_to_roots=True,
+            )
+            is True
+        )
+        assert (skills_root / "agent-made" / "SKILL.md").read_bytes() == b"agent skill"
+        assert not (tmp_path / "host" / "credentials" / "token.json").exists()
+        assert host_cred.read_bytes() == b"kept"
+
+
+class TestCommittedStateSnapshot:
+    """export_state()/load_state() carry the baseline across processes."""
+
+    def test_state_round_trip_restores_baseline(self, tmp_path):
+        host_file = _write_file(tmp_path / "host" / "skill.md", b"v1")
+        remote_path = "/root/.hermes/skill.md"
+        mapping = [(str(host_file), remote_path)]
+
+        first = FileSyncManager(
+            get_files_fn=lambda: mapping,
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+        )
+        assert first.sync(force=True)
+        snapshot = first.export_state()
+
+        second = FileSyncManager(
+            get_files_fn=lambda: mapping,
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+        )
+        assert second.load_state(snapshot) is True
+        assert second._pushed_hashes == first._pushed_hashes
+        assert second._synced_files == first._synced_files
+
+        # An unchanged host produces no upload work against the loaded baseline.
+        upload = MagicMock()
+        second._upload_fn = upload
+        second._bulk_upload_fn = None
+        assert second.sync(force=True)
+        upload.assert_not_called()
+
+    def test_loaded_baseline_detects_host_deletion(self, tmp_path):
+        host_file = _write_file(tmp_path / "host" / "cred.json", b"secret")
+        remote_path = "/root/.hermes/cred.json"
+
+        first = FileSyncManager(
+            get_files_fn=lambda: [(str(host_file), remote_path)],
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+        )
+        assert first.sync(force=True)
+        snapshot = first.export_state()
+
+        Path(host_file).unlink()
+        deleted: list[list[str]] = []
+        second = FileSyncManager(
+            get_files_fn=lambda: [],
+            upload_fn=MagicMock(),
+            delete_fn=deleted.append,
+        )
+        assert second.load_state(snapshot) is True
+        assert second.sync(force=True)
+        assert deleted == [[remote_path]]
+
+    def test_load_state_rejects_malformed_snapshots(self, tmp_path):
+        mgr = _make_manager(tmp_path, seed_pushed_state=False)
+        assert mgr.load_state(None) is False
+        assert mgr.load_state({"synced_files": []}) is False
+        assert mgr.load_state(
+            {"synced_files": {"/r": ["bad", "key"]}, "pushed_hashes": {}}
+        ) is False
+
+    def test_on_state_committed_fires_on_sync_and_sync_back(self, tmp_path):
+        host_file = _write_file(tmp_path / "host" / "skill.md", b"v1")
+        remote_path = "/root/.hermes/skill.md"
+        snapshots: list[dict] = []
+
+        download_fn = _make_download_fn({"root/.hermes/skill.md": b"v2 remote"})
+        mgr = FileSyncManager(
+            get_files_fn=lambda: [(str(host_file), remote_path)],
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=download_fn,
+            on_state_committed=snapshots.append,
+        )
+
+        assert mgr.sync(force=True)
+        assert len(snapshots) == 1
+        assert remote_path in snapshots[0]["pushed_hashes"]
+
+        assert mgr.sync_back(hermes_home=tmp_path / ".hermes") is True
+        assert len(snapshots) == 2
+        # The applied remote edit folded into the committed baseline, so a
+        # later recovery pass will not re-treat it as a remote change.
+        assert snapshots[1]["pushed_hashes"][remote_path] == _sha256_bytes(b"v2 remote")
+        assert Path(host_file).read_bytes() == b"v2 remote"
+
+    def test_write_ahead_snapshot_precedes_remote_mutation(self, tmp_path):
+        host_file = _write_file(tmp_path / "host" / "skill.md", b"v1")
+        remote_path = "/root/.hermes/skill.md"
+        events: list[str] = []
+
+        def pending(_state: dict) -> None:
+            events.append("pending")
+
+        def upload(_host: str, _remote: str) -> None:
+            assert events == ["pending"]
+            events.append("upload")
+
+        def committed(_state: dict) -> None:
+            events.append("committed")
+
+        mgr = FileSyncManager(
+            get_files_fn=lambda: [(host_file, remote_path)],
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            on_state_pending=pending,
+            on_state_committed=committed,
+        )
+
+        assert mgr.sync(force=True) is True
+        assert events == ["pending", "upload", "committed"]
+
+    def test_pending_upload_hash_does_not_overwrite_newer_host_on_resume(
+        self,
+        tmp_path,
+    ):
+        """A crash between remote upload and baseline promotion is recoverable."""
+        host = tmp_path / "host" / "skills" / "skill.md"
+        _write_file(host, b"version-one")
+        remote_path = "/root/.hermes/skills/skill.md"
+        remote: dict[str, bytes] = {}
+        durable: dict[str, dict] = {}
+        fail_promotion = False
+
+        def upload(host_path: str, target: str) -> None:
+            remote[target] = Path(host_path).read_bytes()
+
+        def pending(state: dict) -> None:
+            durable["pending"] = copy.deepcopy(state)
+
+        def committed(state: dict) -> None:
+            if fail_promotion:
+                raise OSError("disk full")
+            durable["committed"] = copy.deepcopy(state)
+            durable.pop("pending", None)
+
+        first = FileSyncManager(
+            get_files_fn=lambda: [(str(host), remote_path)],
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            on_state_pending=pending,
+            on_state_committed=committed,
+        )
+        assert first.sync(force=True) is True
+        committed_v1 = copy.deepcopy(durable["committed"])
+
+        host.write_bytes(b"version-two-from-host")
+        fail_promotion = True
+        assert first.sync(force=True) is False
+        assert remote[remote_path] == b"version-two-from-host"
+        assert durable["committed"] == committed_v1
+        pending_v2 = copy.deepcopy(durable["pending"])
+
+        # A newer host edit happens before the next process resumes.
+        host.write_bytes(b"version-three-newer-host")
+
+        def download(dest: Path) -> None:
+            _make_tar(
+                {remote_path.lstrip("/"): remote[remote_path]},
+                dest,
+            )
+
+        resumed = FileSyncManager(
+            get_files_fn=lambda: [(str(host), remote_path)],
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=download,
+        )
+        assert resumed.load_state(
+            committed_v1,
+            pending_state=pending_v2,
+        ) is True
+        assert resumed.sync_back(hermes_home=tmp_path / ".hermes") is True
+        assert host.read_bytes() == b"version-three-newer-host"
+
+    def test_interrupted_sync_back_replays_every_pending_pull(self, tmp_path):
+        """A crash between host copies must not mark later files recovered."""
+        host_a = tmp_path / "host" / "skills" / "a.md"
+        host_b = tmp_path / "host" / "skills" / "b.md"
+        _write_file(host_a, b"a-v1")
+        _write_file(host_b, b"b-v1")
+        remote_a = "/root/.hermes/skills/a.md"
+        remote_b = "/root/.hermes/skills/b.md"
+        mapping = [(str(host_a), remote_a), (str(host_b), remote_b)]
+        durable: dict[str, dict] = {}
+
+        def pending(state: dict) -> None:
+            durable["pending"] = copy.deepcopy(state)
+
+        def committed(state: dict) -> None:
+            durable["committed"] = copy.deepcopy(state)
+            durable.pop("pending", None)
+
+        download = _make_download_fn(
+            {
+                remote_a.lstrip("/"): b"a-v2-remote",
+                remote_b.lstrip("/"): b"b-v2-remote",
+            }
+        )
+        first = FileSyncManager(
+            get_files_fn=lambda: mapping,
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=download,
+            on_state_pending=pending,
+            on_state_committed=committed,
+        )
+        assert first.sync(force=True) is True
+        committed_v1 = copy.deepcopy(durable["committed"])
+
+        real_copy2 = shutil.copy2
+        copy_count = 0
+
+        def crash_after_first_copy(src: str, dst: str):
+            nonlocal copy_count
+            real_copy2(src, dst)
+            copy_count += 1
+            if copy_count == 1:
+                raise KeyboardInterrupt
+
+        with patch(
+            "tools.environments.file_sync.shutil.copy2",
+            side_effect=crash_after_first_copy,
+        ), pytest.raises(KeyboardInterrupt):
+            first._sync_back_impl()
+
+        pending_pull = copy.deepcopy(durable["pending"])
+        assert pending_pull["pending_operation"] == "pull"
+        assert sum(
+            (
+                host_a.read_bytes() == b"a-v2-remote",
+                host_b.read_bytes() == b"b-v2-remote",
+            )
+        ) == 1
+
+        resumed = FileSyncManager(
+            get_files_fn=lambda: mapping,
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=download,
+        )
+        assert resumed.load_state(
+            committed_v1,
+            pending_state=pending_pull,
+        ) is True
+        assert resumed.sync_back(hermes_home=tmp_path / ".hermes") is True
+        assert host_a.read_bytes() == b"a-v2-remote"
+        assert host_b.read_bytes() == b"b-v2-remote"
