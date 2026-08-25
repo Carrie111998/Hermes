@@ -1422,6 +1422,24 @@ def _flush_one_shot_session_store(cli) -> None:
         db.end_session(session_id, "cli_close")
     except Exception:
         logger.debug("one-shot end_session failed", exc_info=True)
+    if getattr(cli, "_ephemeral_success", False):
+        try:
+            from agent.session_retention import (
+                accept_temporary_child_result,
+                is_explicitly_temporary,
+            )
+            from hermes_constants import get_hermes_home
+
+            row = db.get_session(session_id)
+            if is_explicitly_temporary(row):
+                accept_temporary_child_result(
+                    db,
+                    session_id,
+                    policy="delete",
+                    sessions_dir=get_hermes_home() / "sessions",
+                )
+        except Exception:
+            logger.debug("ephemeral one-shot session cleanup failed", exc_info=True)
 
 
 def _wait_for_oneshot_background_completions(cli) -> None:
@@ -21613,6 +21631,8 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
+                        else:
+                            cli._ephemeral_success = True
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"
                             ) in ("rate_limit", "billing"):
@@ -21648,6 +21668,7 @@ def main(
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
+                cli._ephemeral_success = True
                 cli._print_exit_summary(clear_screen=False)
         finally:
             _finalize_single_query(cli)

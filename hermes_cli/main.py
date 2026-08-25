@@ -3201,6 +3201,10 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    # --ephemeral: explicit disposable ownership for this process's session.
+    if getattr(args, "ephemeral", False):
+        os.environ["HERMES_EPHEMERAL_SESSION"] = "1"
+
     _pin_kanban_board_env()
     _confirm_startup_expensive_model_override(args)
 

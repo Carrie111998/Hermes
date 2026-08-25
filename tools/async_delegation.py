@@ -441,7 +441,39 @@ def restore_undelivered_completions(target_queue) -> int:
                 evt["restored"] = True
             target_queue.put(evt)
             restored += 1
+    try:
+        from agent.session_retention import default_session_db, sweep_accepted_temporary_sessions
+
+        sweep_accepted_temporary_sessions(default_session_db())
+    except Exception:
+        logger.debug("temporary session retention sweep failed", exc_info=True)
     return restored
+
+
+def _release_child_sessions_after_delivery(delegation_id: str) -> None:
+    """Parent accepted the durable completion — now apply child retention."""
+    if not delegation_id:
+        return
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            row = conn.execute(
+                "SELECT result_json FROM async_delegations WHERE delegation_id=?",
+                (delegation_id,),
+            ).fetchone()
+        payload = None
+        if row is not None:
+            raw = row[0] if not hasattr(row, "keys") else row["result_json"]
+            if raw:
+                payload = json.loads(raw)
+        from agent.session_retention import accept_from_delegation_result, default_session_db
+
+        accept_from_delegation_result(default_session_db(), payload)
+    except Exception:
+        logger.debug(
+            "temporary child retention after delivery failed for %s",
+            delegation_id,
+            exc_info=True,
+        )
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -453,7 +485,10 @@ def mark_completion_delivered(delegation_id: str) -> bool:
                WHERE delegation_id=? AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
-        return cur.rowcount == 1
+        delivered = cur.rowcount == 1
+    if delivered:
+        _release_child_sessions_after_delivery(delegation_id)
+    return delivered
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -557,7 +592,10 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
         )
-        return cur.rowcount == 1
+        delivered = cur.rowcount == 1
+    if delivered:
+        _release_child_sessions_after_delivery(delegation_id)
+    return delivered
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
