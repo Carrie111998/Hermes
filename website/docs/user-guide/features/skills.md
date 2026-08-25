@@ -587,10 +587,17 @@ skills:
   write_approval: false     # false = write freely (default) | true = require approval
 ```
 
-When `write_approval: true`, every `skill_manage` write (create / edit /
-patch / delete / write_file / remove_file) is **staged** instead of committed —
-a SKILL.md is too large to review inline, so staging applies regardless of
-whether the write came from a foreground turn or the background review.
+When `write_approval: true`, an eligible `skill_manage` write (create / edit /
+patch / write_file / remove_file) is **staged** instead of committed —
+a SKILL.md is too large to review inline, so staging applies to both foreground
+turns and the background review. Before staging a background edit, patch, or
+update/removal of an existing supporting file, Hermes requires that review turn
+to have loaded the exact target; otherwise it refuses the proposal without
+creating a pending record. The resulting read proof is covered by the pending
+record's integrity hash and survives approval in a fresh command context, while
+older background records without that proof remain fail-closed.
+Delete is refused before staging while the approval gate is enabled because a
+portable descriptor-bound directory unlink cannot be replayed safely.
 Staged writes survive restarts under `~/.hermes/pending/skills/` and are
 reviewed with the same familiar approve/deny flow as dangerous commands:
 
@@ -636,9 +643,8 @@ Platforms where Hermes cannot enforce an owner-only pending store fail closed
 instead of staging or applying records. Hermes claims a record into a
 non-replayable quarantine before apply and refuses to list, approve, or reject
 legacy, tampered, linked, non-owner-only, oversized, or otherwise invalid
-records. Approved skill deletes fail closed without mutating the target because
-portable POSIX APIs cannot unlink a directory by held inode/descriptor; reject
-the record or perform a separate explicit delete. Approval fails closed if the
+records. Older or manually staged skill deletes also fail closed at approval
+without mutating the target. Approval fails closed if the
 target tree changed after staging. Restage the proposal against the current
 target instead of repairing an unsafe record in place. Memory writes have the
 same gate under `memory.write_approval` — see [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).

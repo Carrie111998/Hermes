@@ -697,6 +697,68 @@ def test_descriptor_anchored_publish_rejects_late_regular_replacement(
     assert "updated body" not in skill_md.read_text(encoding="utf-8")
 
 
+def test_skill_delete_is_refused_before_approval_staging(hermes_home, monkeypatch):
+    """An operation that cannot be safely replayed must not create dead pending work."""
+    from pathlib import Path
+    from tools import skill_manager_tool as sm
+    from tools import write_approval as wa
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(wa, "collect_session_context", lambda **_kwargs: dict(_SESSION_CONTEXT))
+    _set_approval("skills", True)
+
+    result = json.loads(
+        sm.skill_manage(action="delete", name="demo", absorbed_into="")
+    )
+
+    assert result["success"] is False
+    assert result["_fail_closed"] is True
+    assert "cannot be safely replayed" in result["error"]
+    assert skill_md.read_text(encoding="utf-8") == _SKILL
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+@pytest.mark.linux_only
+def test_approved_write_fails_closed_when_owner_cannot_be_preserved(
+    hermes_home, monkeypatch
+):
+    """Descriptor publish must never silently change an existing file's owner."""
+    from pathlib import Path
+    from tools import skill_manager_tool as sm
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(
+        sm.os,
+        "fchown",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+    expected = sm._target_tree_pre_image_hash("demo")
+
+    result = json.loads(
+        sm.apply_skill_pending(
+            {
+                "action": "edit",
+                "name": "demo",
+                "content": _SKILL.replace("body", "edited body"),
+            },
+            expected_target_tree_pre_image_hash=expected,
+        )
+    )
+
+    assert result["success"] is False
+    assert skill_md.read_text(encoding="utf-8") == _SKILL
+
+
 def test_descriptor_approved_delete_fails_closed_without_mutation(
     hermes_home, monkeypatch
 ):
@@ -1179,6 +1241,39 @@ def test_scanner_rejected_create_removes_unchanged_hermes_tree(
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize("scan_kind", ["existing", "new"])
+def test_enabled_skill_scanner_exception_fails_closed(
+    hermes_home, monkeypatch, scan_kind
+):
+    """An enabled scanner outage is a rejection, never implicit approval."""
+    from pathlib import Path
+    from tools import skill_manager_tool as sm
+
+    monkeypatch.setattr(sm, "_GUARD_AVAILABLE", True)
+    monkeypatch.setattr(sm, "_guard_agent_created_enabled", lambda: True)
+    monkeypatch.setattr(sm, "_guard_agent_created_enabled_readonly", lambda: True)
+    if scan_kind == "existing":
+        skill_dir = Path(hermes_home) / "skills" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(_SKILL, encoding="utf-8")
+        monkeypatch.setattr(
+            sm,
+            "scan_skill",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+        )
+        error = sm._security_scan_skill(skill_dir)
+    else:
+        monkeypatch.setattr(
+            sm,
+            "scan_skill_content",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+        )
+        error = sm._security_scan_new_skill_content("demo", _SKILL)
+
+    assert error is not None
+    assert "failed" in error.lower()
+
+
 def test_scanner_rejected_create_is_scanned_before_publish(
     hermes_home, monkeypatch
 ):
@@ -1827,6 +1922,63 @@ def test_background_review_write_without_read_is_not_staged(hermes_home, monkeyp
 
     origin_token = set_current_write_origin(BACKGROUND_REVIEW)
     try:
+        result = json.loads(
+            sm.skill_manage(
+                action="patch",
+                name="demo",
+                old_string="body",
+                new_string="patched body",
+            )
+        )
+    finally:
+        reset_current_write_origin(origin_token)
+
+    assert result["success"] is False
+    assert result["_read_before_write_required"] is True
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_background_review_changed_after_read_is_not_staged(hermes_home, monkeypatch):
+    """A pathname mark cannot authorize bytes that changed after the review read."""
+    from pathlib import Path
+    from tools import skill_manager_tool as sm
+    from tools import skill_usage
+    from tools import write_approval as wa
+    from tools.skill_provenance import (
+        BACKGROUND_REVIEW,
+        reset_current_write_origin,
+        set_current_write_origin,
+    )
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(wa, "collect_session_context", lambda **_kwargs: dict(_SESSION_CONTEXT))
+    monkeypatch.setattr(skill_usage, "is_protected_builtin", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_hub_installed", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_bundled", lambda _name: False)
+    monkeypatch.setattr(
+        skill_usage,
+        "load_usage",
+        lambda: {"demo": {"created_by": "agent"}},
+    )
+    monkeypatch.setattr(
+        skill_usage,
+        "get_record",
+        lambda _name: {"created_by": "agent", "pinned": False},
+    )
+    _set_approval("skills", True)
+
+    origin_token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        sm.mark_background_review_skill_read(skill_md)
+        skill_md.write_text(
+            _SKILL.replace("# Test", "# Changed after read"),
+            encoding="utf-8",
+        )
         result = json.loads(
             sm.skill_manage(
                 action="patch",

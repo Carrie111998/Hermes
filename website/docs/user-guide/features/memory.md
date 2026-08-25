@@ -368,9 +368,12 @@ skills:
   write_approval: false     # false = write freely (default) | true = require approval
 ```
 
-When `write_approval: true`, skill writes (create / edit / patch / write_file /
-delete) always **stage** regardless of origin. You review the one-line gist
-inline, but the full diff stays out-of-band:
+When `write_approval: true`, eligible skill writes (create / edit / patch /
+write_file / remove_file) **stage** for both origins. Existing-target background
+mutations must first prove the exact bytes were loaded in that review turn;
+otherwise they are refused before staging. Delete is also refused before staging
+because it cannot be replayed with a portable descriptor-bound directory unlink.
+You review the one-line gist inline, but the full diff stays out-of-band:
 
 ```
 /skills pending             # list staged skill writes + a one-line gist each

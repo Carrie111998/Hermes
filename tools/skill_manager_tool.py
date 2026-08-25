@@ -62,15 +62,15 @@ class _BackgroundReviewReadMarks:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._paths: set[str] = set()
+        self._digests: Dict[str, str] = {}
 
-    def add(self, path: str) -> None:
+    def add(self, path: str, digest: str) -> None:
         with self._lock:
-            self._paths.add(path)
+            self._digests[path] = digest
 
-    def contains(self, path: str) -> bool:
+    def contains(self, path: str, digest: str) -> bool:
         with self._lock:
-            return path in self._paths
+            return self._digests.get(path) == digest
 
 
 _background_review_read_paths: (
@@ -78,15 +78,10 @@ _background_review_read_paths: (
 ) = _ctxvars.ContextVar("background_review_read_paths", default=None)
 
 
-def mark_background_review_skill_read(path: Path) -> None:
-    """Record that the active background-review fork has read a skill file.
-
-    The autonomous review fork is allowed to evolve skills, but it must not
-    patch or rewrite content it has only inferred from the transcript.  The
-    skill_view tool calls this after returning file content to the model; write
-    paths below require the corresponding target path to be present when the
-    current origin is ``background_review``.
-    """
+def mark_background_review_skill_read(
+    path: Path, *, content_digest: Optional[str] = None
+) -> None:
+    """Record the exact bytes read by the active background-review fork."""
     try:
         from tools.skill_provenance import is_background_review
         if not is_background_review():
@@ -94,6 +89,13 @@ def mark_background_review_skill_read(path: Path) -> None:
     except Exception:
         return
 
+    if content_digest is None:
+        try:
+            content_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return
+    if not re.fullmatch(r"[0-9a-f]{64}", content_digest):
+        return
     try:
         resolved = str(path.resolve())
     except Exception:
@@ -102,16 +104,20 @@ def mark_background_review_skill_read(path: Path) -> None:
     if marks is None:
         marks = _BackgroundReviewReadMarks()
         _background_review_read_paths.set(marks)
-    marks.add(resolved)
+    marks.add(resolved, content_digest)
 
 
 def _background_review_has_read(path: Path) -> bool:
+    try:
+        current_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return False
     try:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
     marks = _background_review_read_paths.get()
-    return marks is not None and marks.contains(resolved)
+    return marks is not None and marks.contains(resolved, current_digest)
 
 
 def _reset_background_review_read_marks() -> None:
@@ -173,12 +179,12 @@ def _security_scan_skill(
 
     No-op when skills.guard_agent_created is disabled (the default).
     """
-    if not _GUARD_AVAILABLE:
-        return None
     if guard_enabled is None:
         guard_enabled = _guard_agent_created_enabled()
     if not guard_enabled:
         return None
+    if not _GUARD_AVAILABLE:
+        return "Security scan failed closed: scanner is unavailable."
     try:
         result = scan_skill(skill_dir, source="agent-created")
         allowed, reason = should_allow_install(result)
@@ -194,13 +200,12 @@ def _security_scan_skill(
             return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
+        return "Security scan failed closed; the skill write was rejected."
     return None
 
 
 def _security_scan_new_skill_content(name: str, content: str) -> Optional[str]:
     """Scan exact proposed SKILL.md bytes before they become discoverable."""
-    if not _GUARD_AVAILABLE:
-        return None
     guard_enabled = None
     if _pending_target_anchor.get() is not None:
         # Approval replay must not let load_config() materialize an absent
@@ -210,6 +215,8 @@ def _security_scan_new_skill_content(name: str, content: str) -> Optional[str]:
         guard_enabled = _guard_agent_created_enabled()
     if not guard_enabled:
         return None
+    if not _GUARD_AVAILABLE:
+        return "Security scan failed closed: scanner is unavailable."
     try:
         result = scan_skill_content(
             content,
@@ -222,6 +229,7 @@ def _security_scan_new_skill_content(name: str, content: str) -> Optional[str]:
             return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
         logger.warning("Security scan failed for proposed skill %s: %s", name, e, exc_info=True)
+        return "Security scan failed closed; the proposed skill was rejected."
     return None
 
 
@@ -2347,11 +2355,20 @@ def _pending_atomic_write_text(
             )
             if hasattr(os, "fchmod"):
                 os.fchmod(fd, publish_mode)
-            if existing is not None and hasattr(os, "fchown"):
-                try:
-                    os.fchown(fd, existing.st_uid, existing.st_gid)
-                except PermissionError:
-                    pass
+            if existing is not None:
+                if not hasattr(os, "fchown"):
+                    raise PermissionError(
+                        "pending skill target ownership cannot be preserved"
+                    )
+                os.fchown(fd, existing.st_uid, existing.st_gid)
+                temp_owner = os.fstat(fd)
+                if (
+                    temp_owner.st_uid != existing.st_uid
+                    or temp_owner.st_gid != existing.st_gid
+                ):
+                    raise PermissionError(
+                        "pending skill target ownership was not preserved"
+                    )
             data = content.encode("utf-8")
             view = memoryview(data)
             while view:
@@ -2678,6 +2695,19 @@ def _apply_skill_write_gate(
         return None
     if decision.blocked:
         return tool_error(decision.message, success=False)
+    if action == "delete":
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Skill delete cannot be safely replayed after approval; "
+                    "no pending record was created. Disable the approval gate "
+                    "only for a separate explicit delete."
+                ),
+                "_fail_closed": True,
+            },
+            ensure_ascii=False,
+        )
 
     # stage — record the full skill_manage kwargs so approval can replay it.
     payload = {"action": action, "name": name}
