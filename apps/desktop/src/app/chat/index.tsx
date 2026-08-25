@@ -62,6 +62,7 @@ import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from './composer/scope'
 import type { ChatBarState } from './composer/types'
+import { FileCheckpointsButton } from './file-checkpoints-panel'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { shouldShowIntro } from './intro-visibility'
@@ -70,9 +71,7 @@ import { isRouteSessionMismatch } from './route-session-state'
 import { useRuntimeMessageRepository } from './runtime-repository'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { useSessionView } from './session-view'
-import { FileCheckpointsButton } from './file-checkpoints-panel'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
-import { useFileCheckpointFirstUse } from './use-file-checkpoint-first-use'
 import { threadLoadingState } from './thread-loading'
 import {
   backfillOlderTranscriptPage,
@@ -80,6 +79,7 @@ import {
   transcriptBackfillAvailable
 } from './transcript-backfill'
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
+import { useFileCheckpointFirstUse } from './use-file-checkpoint-first-use'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null

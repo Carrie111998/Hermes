@@ -8,7 +8,6 @@ import { getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
 import {
   type FileCheckpoint,
-  isCheckpointsEnabledInConfig,
   parseFileCheckpointList,
   restoreFileCheckpointParams,
   withCheckpointsEnabled
@@ -34,13 +33,18 @@ export function FileCheckpointsPanel({ open, onOpenChange, sessionId }: FileChec
   const refresh = useCallback(async () => {
     if (!sessionId) {
       setList(parseFileCheckpointList(null))
+
       return
     }
+
     const gateway = activeGateway()
+
     if (!gateway) {
       return
     }
+
     setLoading(true)
+
     try {
       const raw = await gateway.request('rollback.list', { session_id: sessionId })
       setList(parseFileCheckpointList(raw))
@@ -73,13 +77,17 @@ export function FileCheckpointsPanel({ open, onOpenChange, sessionId }: FileChec
         destructive: true,
         title: copy.revertTitle
       })
+
       if (!ok) {
         return
       }
+
       const gateway = activeGateway()
+
       if (!gateway) {
         return
       }
+
       try {
         await gateway.request('rollback.restore', restoreFileCheckpointParams(sessionId, row.hash))
         await refresh()
