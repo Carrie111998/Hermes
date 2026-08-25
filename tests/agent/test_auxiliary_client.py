@@ -1217,6 +1217,10 @@ class TestVisionClientFallback:
     def test_nous_excluded_from_vision_AUTO_but_kept_for_explicit_routing(self):
         """The two vision tuples must not be collapsed back into one.
 
+        STRICT is non-empty while AUTO is empty -- that asymmetry IS the
+        contract, so a "cleanup" that unifies them would silently restore
+        automatic probing of three uncredentialed providers.
+
         `_VISION_STRICT_BACKENDS` decides ROUTING for an explicit
         `auxiliary.vision.provider`; `_VISION_AUTO_PROVIDER_ORDER` decides
         what AUTO probes. Nous belongs in the first and not the second: it
@@ -1230,14 +1234,15 @@ class TestVisionClientFallback:
             _VISION_STRICT_BACKENDS,
             _VISION_AUTO_PROVIDER_ORDER,
         )
-        for dead in ("nous", "openrouter"):
+        # Every strict backend is uncredentialed on this machine, so AUTO is
+        # empty while STRICT still carries all of them for explicit routing.
+        assert _VISION_AUTO_PROVIDER_ORDER == ()
+        for dead in ("nous", "openrouter", "deepinfra"):
             assert dead in _VISION_STRICT_BACKENDS, dead
             assert dead not in _VISION_AUTO_PROVIDER_ORDER, dead
-        # AUTO must otherwise stay a faithful subset, in the same order.
-        assert list(_VISION_AUTO_PROVIDER_ORDER) == [
-            p for p in _VISION_STRICT_BACKENDS
-            if p not in {"nous", "openrouter"}
-        ]
+        # AUTO must remain a subset of STRICT: a name may only be probed
+        # automatically if it also has a strict backend to be probed with.
+        assert set(_VISION_AUTO_PROVIDER_ORDER) <= set(_VISION_STRICT_BACKENDS)
 
     def test_vision_auto_includes_active_provider_when_configured(self, monkeypatch):
         """Active provider appears in available backends when credentials exist."""
@@ -4574,9 +4579,21 @@ class TestVisionAutoSkipsKimiCoding:
     """
 
     def test_kimi_coding_skipped_falls_through_to_aggregator(self, monkeypatch):
-        """kimi-coding as main + vision auto → the aggregator chain, not kimi."""
-        fake_or_client = MagicMock(name="openrouter_client")
+        """kimi-coding as main + vision auto → the aggregator chain, not kimi.
 
+        The aggregator is pinned to a SENTINEL rather than whatever the live
+        roster happens to contain. What matters here is that kimi-coding is
+        never handed to a vision backend, not which provider catches it --
+        and the live roster is empty today, which would otherwise make this
+        test vacuous (the fall-through loop would never run, so the guards
+        below could not fire).
+        """
+        fake_or_client = MagicMock(name="aggregator_client")
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._VISION_AUTO_PROVIDER_ORDER",
+            ("sentinel-aggregator",),
+        )
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding",
         )
@@ -4594,14 +4611,14 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         def fake_strict(provider, model=None):
-            # kimi-coding must never reach the strict backend; whichever
-            # aggregator AUTO still carries is the legitimate fall-through.
-            if provider == "kimi-coding":
+            # kimi-coding must never reach the strict backend; the pinned
+            # sentinel is the legitimate fall-through.
+            if provider in {"kimi-coding", "kimi-coding-cn"}:
                 raise AssertionError(
                     "strict vision backend should not be called for "
                     "kimi-coding when it is the main provider"
                 )
-            if provider == "deepinfra":
+            if provider == "sentinel-aggregator":
                 return fake_or_client, "google/gemini-3-flash-preview"
             return None, None
         monkeypatch.setattr(
@@ -4610,14 +4627,18 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         provider, client, model = resolve_vision_provider_client()
-        assert provider == "deepinfra"
+        assert provider == "sentinel-aggregator"
         assert client is fake_or_client
         assert model == "google/gemini-3-flash-preview"
 
     def test_kimi_coding_cn_skipped_too(self, monkeypatch):
         """Same skip applies to the CN variant."""
-        fake_or_client = MagicMock(name="openrouter_client")
+        fake_or_client = MagicMock(name="aggregator_client")
 
+        monkeypatch.setattr(
+            "agent.auxiliary_client._VISION_AUTO_PROVIDER_ORDER",
+            ("sentinel-aggregator",),
+        )
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding-cn",
         )
@@ -4632,12 +4653,12 @@ class TestVisionAutoSkipsKimiCoding:
         monkeypatch.setattr(
             "agent.auxiliary_client._resolve_strict_vision_backend",
             lambda p, m=None: (fake_or_client, "gemini")
-            if p == "deepinfra"
+            if p == "sentinel-aggregator"
             else (None, None),
         )
 
         provider, client, _ = resolve_vision_provider_client()
-        assert provider == "deepinfra"
+        assert provider == "sentinel-aggregator"
         assert client is fake_or_client
 
     def test_explicit_override_to_kimi_coding_still_honored(self, monkeypatch):
