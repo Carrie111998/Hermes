@@ -819,13 +819,23 @@ class TestFTS5Search:
         db.append_message("s1", role="assistant", content="projectionneedle")
         db.append_message("s1", role="user", content="after")
 
+        from contextlib import contextmanager
+
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        original_read_ctx = db._read_ctx
+
+        @contextmanager
+        def traced_read_ctx():
+            # _read_ctx() now borrows from a bounded pool, so tracing one
+            # connection before the call can miss the connection selected.
+            with original_read_ctx() as conn:
+                conn.set_trace_callback(statements.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
+
+        db._read_ctx = traced_read_ctx
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -850,8 +860,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+            db._read_ctx = original_read_ctx
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -2909,6 +2918,27 @@ class TestVacuum:
         db.append_message(session_id="s1", role="user", content="hi")
         # Should not raise, even though there's nothing significant to reclaim.
         db.vacuum()
+
+    def test_auto_maintenance_preserves_old_pinned_sessions(self, db):
+        cutoff = time.time() - 100 * 86400
+        for session_id, pinned in (("pinned-old", 1), ("ordinary-old", 0)):
+            db.create_session(session_id=session_id, source="cli")
+            db.end_session(session_id, end_reason="done")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, pinned = ? WHERE id = ?",
+                (cutoff, pinned, session_id),
+            )
+        db._conn.commit()
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90,
+            min_interval_hours=0,
+            vacuum=False,
+        )
+
+        assert result["pruned"] == 1
+        assert db.get_session("ordinary-old") is None
+        assert db.get_session("pinned-old") is not None
 
     def test_auto_maintenance_records_successful_vacuum(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)

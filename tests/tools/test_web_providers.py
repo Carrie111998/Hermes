@@ -88,6 +88,27 @@ class TestPerCapabilityBackendSelection:
         assert web_tools._get_search_backend() == "tavily"
 
 
+    def test_explicit_extract_backend_is_preserved_when_unavailable(self, monkeypatch):
+        """An explicit backend must surface its own credential error.
+
+        Falling through to a search-only backend such as DDGS masks the real
+        setup problem and makes web_extract report the wrong provider.
+        """
+        from tools import web_tools
+
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {
+            "backend": "",
+            "search_backend": "ddgs",
+            "extract_backend": "tavily",
+        })
+        monkeypatch.setattr(
+            web_tools, "_is_backend_available", lambda _backend: False
+        )
+        monkeypatch.setattr(web_tools, "_get_backend", lambda: "ddgs")
+
+        assert web_tools._get_extract_backend() == "tavily"
+
+
     def test_fully_backward_compatible_with_web_backend_only(self, monkeypatch):
         from tools import web_tools
 
