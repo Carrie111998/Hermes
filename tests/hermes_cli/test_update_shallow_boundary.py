@@ -266,3 +266,128 @@ class TestCheckUpdateShallowPassive:
         assert ls_remote_urls == [upstream_url]
         out = capsys.readouterr().out
         assert "1 commit behind upstream/main" in out
+
+    def _offline_run(self, calls, refs, upstream_url=None):
+        """subprocess.run fake for offline scenarios: ls-remote is patched to
+        fail (returns None), so _check_update_shallow must consult stale refs.
+        ``refs`` maps ref name -> sha ('' means the ref does not exist)."""
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            key = " ".join(cmd)
+            if "get-url" in key and "upstream" in key:
+                if upstream_url:
+                    return MagicMock(stdout=upstream_url, returncode=0)
+                return MagicMock(stdout="", returncode=1)
+            if "get-url" in key and "origin" in key:
+                return MagicMock(
+                    stdout="https://github.com/NousResearch/hermes-agent.git",
+                    returncode=0,
+                )
+            for ref, sha in refs.items():
+                if key.endswith(f"rev-parse {ref}") or key.endswith(
+                    f"rev-parse --verify --quiet {ref}"
+                ):
+                    return MagicMock(stdout=sha, returncode=0 if sha else 1)
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        return fake_run
+
+    def test_shallow_check_offline_falls_back_to_stale_refs(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """ls-remote unreachable must not hard-exit (exit code 1): fall back
+        to the stale FETCH_HEAD, same graceful degradation as the banner."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        calls = []
+        with (
+            patch(
+                "hermes_cli.update_cmd.subprocess.run",
+                side_effect=self._offline_run(
+                    calls, {"FETCH_HEAD": "c" * 40, "HEAD": "a" * 40}
+                ),
+            ),
+            patch("hermes_cli.banner._ls_remote_tip", return_value=None),
+            patch("hermes_cli.banner._github_compare_behind", return_value=None),
+            patch(
+                "hermes_cli.config.recommended_update_command",
+                return_value="hermes update",
+            ),
+        ):
+            update_cmd._check_update_shallow(["git"], "main")
+
+        joined = [" ".join(c) for c in calls]
+        assert not any("fetch" in j for j in joined), f"must not fetch: {calls}"
+        out = capsys.readouterr().out
+        assert "Update available (behind origin/main" in out
+        assert "last-known ref" in out
+
+    def test_shallow_check_offline_stale_ref_matches_head(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Offline with the stale ref equal to HEAD reports up to date
+        instead of failing (mirrors the banner's stale-ref comparison)."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        calls = []
+        with (
+            patch(
+                "hermes_cli.update_cmd.subprocess.run",
+                side_effect=self._offline_run(
+                    calls, {"FETCH_HEAD": "a" * 40, "HEAD": "a" * 40}
+                ),
+            ),
+            patch("hermes_cli.banner._ls_remote_tip", return_value=None),
+            patch(
+                "hermes_cli.config.recommended_update_command",
+                return_value="hermes update",
+            ),
+        ):
+            update_cmd._check_update_shallow(["git"], "main")
+
+        joined = [" ".join(c) for c in calls]
+        assert not any("fetch" in j for j in joined), f"must not fetch: {calls}"
+        out = capsys.readouterr().out
+        assert "Already up to date" in out
+
+    def test_shallow_check_offline_no_refs_reports_failure(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Only a checkout with no usable refs at all (no FETCH_HEAD, no
+        remote tracking ref) reports a hard failure — there is nothing to
+        compare against."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        calls = []
+        with (
+            patch(
+                "hermes_cli.update_cmd.subprocess.run",
+                side_effect=self._offline_run(
+                    calls,
+                    {
+                        "FETCH_HEAD": "",
+                        "origin/main": "",
+                        "HEAD": "a" * 40,
+                    },
+                ),
+            ),
+            patch("hermes_cli.banner._ls_remote_tip", return_value=None),
+            patch(
+                "hermes_cli.config.recommended_update_command",
+                return_value="hermes update",
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            update_cmd._check_update_shallow(["git"], "main")
+
+        assert exc_info.value.code == 1
+        joined = [" ".join(c) for c in calls]
+        assert not any("fetch" in j for j in joined), f"must not fetch: {calls}"
+        out = capsys.readouterr().out
+        assert "Could not reach origin" in out

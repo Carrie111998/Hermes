@@ -3658,6 +3658,13 @@ def _check_update_shallow(git_cmd, branch: str) -> None:
     zero local commits. Instead, compare HEAD against the remote tip via
     ls-remote (honouring the upstream-remote preference for ``main``) and
     recover the exact behind-count from the GitHub compare API.
+
+    When ls-remote cannot reach the remote (offline / transient network
+    error), degrade the same way the banner does (``_check_via_local_git``):
+    compare against the last-known ref (``FETCH_HEAD``, then
+    ``<remote>/<branch>``, then ``origin/<branch>`` for forks whose upstream
+    ref was never fetched) instead of failing hard. Only a checkout with no
+    usable refs at all reports failure.
     """
     remote_name = "origin"
     if branch == "main":
@@ -3687,9 +3694,27 @@ def _check_update_shallow(git_cmd, branch: str) -> None:
     from hermes_cli.config import recommended_update_command
 
     target_sha = _ls_remote_tip(remote_url, branch)
+    stale = False
     if not target_sha:
-        print(f"✗ Could not reach {remote_name} to check for updates.")
-        sys.exit(1)
+        # Offline or no usable remote — mirror the banner's stale-ref
+        # fallback: compare against whatever we already have. Never a fetch
+        # here — that would move the shallow boundary (#94477).
+        candidates = ["FETCH_HEAD", f"{remote_name}/{branch}"]
+        if remote_name != "origin":
+            candidates.append(f"origin/{branch}")
+        for ref in candidates:
+            out = (
+                subprocess.run(
+                    git_cmd + ["rev-parse", ref],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                ).stdout.strip()
+            )
+            if out:
+                target_sha = out
+                break
+        stale = bool(target_sha)
     head_sha = (
         subprocess.run(
             git_cmd + ["rev-parse", "HEAD"],
@@ -3698,7 +3723,10 @@ def _check_update_shallow(git_cmd, branch: str) -> None:
             text=True, encoding="utf-8", errors="replace",
         ).stdout.strip()
     )
-    if head_sha and head_sha == target_sha:
+    if not head_sha or not target_sha:
+        print(f"✗ Could not reach {remote_name} to check for updates.")
+        sys.exit(1)
+    if head_sha == target_sha:
         print("✓ Already up to date.")
         return
     counted = _github_compare_behind(head_sha, target_sha)
@@ -3714,6 +3742,8 @@ def _check_update_shallow(git_cmd, branch: str) -> None:
         )
     else:
         print(f"⚕ Update available (behind {remote_name}/{branch}).")
+    if stale:
+        print(f"  (could not reach {remote_name} — using last-known ref)")
     print(f"  Run '{recommended_update_command()}' to install.")
 
 
