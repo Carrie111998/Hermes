@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   REMOTE_LIVENESS_FAILURE_LIMIT,
   REMOTE_LIVENESS_FAILURE_WINDOW_MS,
+  REMOTE_LIVENESS_POOLED_FAILURE_WINDOW_MS,
   REMOTE_LIVENESS_TIMEOUT_MS,
   RemoteLivenessTracker,
   RemoteRevalidationCoordinator,
@@ -61,6 +62,42 @@ describe('RemoteLivenessTracker', () => {
     expect(tracker.recordFailure('https://gateway.example.com')).toEqual({ failures: 1, shouldReset: false })
     now += REMOTE_LIVENESS_FAILURE_WINDOW_MS + 1
     expect(tracker.recordFailure('https://gateway.example.com')).toEqual({ failures: 1, shouldReset: false })
+  })
+
+  it('reproduces the #94381 leak: tick-spaced failures reset a 60s-window streak forever', () => {
+    let now = 0
+    const tracker = new RemoteLivenessTracker(3, REMOTE_LIVENESS_FAILURE_WINDOW_MS, () => now)
+
+    // #94381: pooled revalidation probes arrive on a multi-minute tick
+    // (observed ~4 min apart in the issue's desktop.log), so every observation
+    // falls outside the primary connection's 60s failure window and the streak
+    // resets to 1 on each tick — the indefinite "(1/3); keeping descriptor for
+    // retry." line. The dead descriptor is never dropped.
+    for (let tick = 1; tick <= 12; tick += 1) {
+      now += 4 * 60_000
+
+      expect(tracker.recordFailure('https://gateway.example.com')).toEqual({ failures: 1, shouldReset: false })
+    }
+  })
+
+  it('accumulates tick-spaced failures under the pooled failure window (#94381)', () => {
+    let now = 0
+    const tracker = new RemoteLivenessTracker(3, REMOTE_LIVENESS_POOLED_FAILURE_WINDOW_MS, () => now)
+
+    now += 4 * 60_000
+    expect(tracker.recordFailure('https://gateway.example.com')).toEqual({ failures: 1, shouldReset: false })
+    now += 4 * 60_000
+    expect(tracker.recordFailure('https://gateway.example.com')).toEqual({ failures: 2, shouldReset: false })
+    now += 4 * 60_000
+    expect(tracker.recordFailure('https://gateway.example.com')).toEqual({ failures: 3, shouldReset: true })
+  })
+
+  it('calibrates the pooled failure window to the revalidation tick (#94381)', () => {
+    // Suggested fix for #94381: the pooled tracker needs a window ≥ 2× the
+    // multi-minute revalidation tick so three consecutive tick failures
+    // accumulate; ~4 min was the observed probe cadence in the issue report.
+    expect(REMOTE_LIVENESS_POOLED_FAILURE_WINDOW_MS).toBeGreaterThanOrEqual(2 * 4 * 60_000)
+    expect(REMOTE_LIVENESS_POOLED_FAILURE_WINDOW_MS).toBeGreaterThan(REMOTE_LIVENESS_FAILURE_WINDOW_MS)
   })
 
   it('clears all failure streaks when the connection state resets', () => {
@@ -292,8 +329,8 @@ describe('revalidatePooledRemoteBackends', () => {
       probe,
       stopBackend,
       unreachable,
-      run: (tracker: RemoteLivenessTracker) =>
-        revalidatePooledRemoteBackends({ entries, log, probe, stopBackend, tracker })
+      run: (tracker?: RemoteLivenessTracker) =>
+        revalidatePooledRemoteBackends({ entries, log, probe, stopBackend, ...(tracker ? { tracker } : {}) })
     }
   }
 
@@ -387,6 +424,22 @@ describe('revalidatePooledRemoteBackends', () => {
 
     await expect(pool.run(tracker)).resolves.toEqual({ dropped: ['coder'] })
     expect(pool.stopBackend).toHaveBeenCalledTimes(1)
+    expect(pool.stopBackend).toHaveBeenCalledWith('coder')
+  })
+
+  it('drops a stale pooled descriptor under the default pooled policy (#94381)', async () => {
+    // No explicit tracker: the pooled path must own a tick-tolerant policy
+    // instead of reusing the primary connection's 60s-window tracker, which
+    // never accumulates a streak of tick-spaced failures (#94381).
+    const pool = harness([['coder', { process: null, remoteBaseUrl: 'https://remote.example.com' }]])
+    pool.unreachable.add('https://remote.example.com')
+
+    for (let attempt = 1; attempt < REMOTE_LIVENESS_FAILURE_LIMIT; attempt += 1) {
+      await expect(pool.run()).resolves.toEqual({ dropped: [] })
+      expect(pool.stopBackend).not.toHaveBeenCalled()
+    }
+
+    await expect(pool.run()).resolves.toEqual({ dropped: ['coder'] })
     expect(pool.stopBackend).toHaveBeenCalledWith('coder')
   })
 })
