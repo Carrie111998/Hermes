@@ -84,6 +84,11 @@ def _norm_base_url(value: Optional[str]) -> str:
     return (value or "").strip().rstrip("/").lower()
 
 
+def _norm_credential(value: Optional[str]) -> str:
+    """Fingerprint-only normalizer: strip+lowercase (fingerprints are lowercase hex). NOT _norm_provider: that helper canonicalizes provider LABELS and may grow alias/prefix handling, silently mangling fingerprints (review finding on #91078)."""
+    return (value or "").strip().lower()
+
+
 def credential_fingerprint(secret: Optional[str]) -> str:
     """Stable non-reversible fingerprint of one explicit credential.
 
@@ -131,7 +136,7 @@ class BackendIdentity:
             provider=_norm_provider(provider),
             model=_norm_model(model),
             base_url=_norm_base_url(base_url),
-            credential=_norm_provider(credential),
+            credential=_norm_credential(credential),
         )
 
 

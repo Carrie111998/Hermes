@@ -2511,9 +2511,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # Credential fingerprints (#91077): two explicit different keys under one
     # provider+model+URL are two deployments (per-account quota plans), so
     # the failed primary's key and the entry's key must both reach the
-    # predicate. ``agent.api_key`` may be callable (Entra ID); an unresolvable
-    # side simply contributes no fingerprint (non-distinguishing). The
-    # entry side prefers the resolved key, else the stable ``key_env`` name.
+    # predicate. Both sides contribute RESOLVED static keys only: an
+    # unresolvable side (entry key_env not set, or ``agent.api_key`` being
+    # callable on the Entra ID path) contributes no fingerprint
+    # (non-distinguishing). KNOWN LIMITATION (review on #91078): with a
+    # callable ``agent.api_key`` the primary side never fingerprints, so two
+    # Entra accounts behind one endpoint still collapse into one deployment;
+    # per-account fallback pools require static keys today.
     from agent.backend_identity import credential_fingerprint
     from hermes_cli.fallback_config import resolve_entry_api_key
 
