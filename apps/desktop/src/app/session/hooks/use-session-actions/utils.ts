@@ -1,7 +1,7 @@
 import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
-import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { normalizePersonalityValue, runtimeWorkspaceStatePatch } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { parseErrorSurface } from '@/lib/error-surface'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -36,7 +36,7 @@ export { sessionMatchesStoredId }
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
 import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo } from '@/types/hermes'
 
-import type { ClientSessionState } from '../../../types'
+import type { SessionRuntimeStatePatch } from '../../../types'
 
 function withAppendedText(message: ChatMessage, suffix: string): ChatMessage {
   let appended = false
@@ -1255,7 +1255,7 @@ export function upsertOptimisticSession(
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
     // lane immediately (the overlay groups by path); fall back to the workspace
     // the session was just started in when the create response omits it.
-    cwd: created.info?.cwd ?? ($currentCwd.get().trim() || null),
+    cwd: created.info?.cwd_owned === false ? null : (created.info?.cwd ?? ($currentCwd.get().trim() || null)),
     ended_at: null,
     id,
     input_tokens: 0,
@@ -1277,11 +1277,12 @@ export function upsertOptimisticSession(
   setSessions(prev => [session, ...prev.filter(s => s.id !== id)])
 }
 
-export function patchSessionWorkspace(sessionId: string, cwd: string | undefined) {
-  if (!cwd) {
+export function patchSessionWorkspace(sessionId: string, runtimeInfo: SessionRuntimeStatePatch | null) {
+  if (!runtimeInfo || runtimeInfo.cwd === undefined) {
     return
   }
 
+  const cwd = runtimeInfo.cwdOwned === false ? null : runtimeInfo.cwd || null
   setSessions(prev => prev.map(session => (session.id === sessionId ? { ...session, cwd } : session)))
 }
 
@@ -1424,13 +1425,6 @@ export async function resolveSessionProfile(storedSessionId: null | string): Pro
   return profile || undefined
 }
 
-type SessionRuntimeStatePatch = Partial<
-  Pick<
-    ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
-  >
->
-
 interface ApplyRuntimeInfoOptions {
   /**
    * Whether this runtime belongs to the session the MAIN pane is showing.
@@ -1459,7 +1453,9 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.cwd !== undefined) {
-    if (state.cwd) {
+    // Missing cwdOwned preserves compatibility with older backends, where a
+    // non-empty cwd was the only ownership signal.
+    if (state.cwd && state.cwdOwned !== false) {
       // The runtime named a real folder for the session in the main pane, so
       // that conversation owns the path.
       commitWorkspaceCwdForSelectedSession(state.cwd)
@@ -1526,14 +1522,12 @@ export function applyRuntimeInfo(
     sessionState.provider = info.provider
   }
 
-  // Empty string is authoritative, not "no opinion": a detached/bare session
-  // reports `cwd: ''`, and the truthy-only test left `$currentCwd` — and so the
-  // Files pane — pinned to the PREVIOUS project for the rest of the session
-  // (#71254). Empty is routed through ownership release below rather than
-  // persisted, so the pane hides a path it no longer owns instead of blanking.
-  if (typeof info.cwd === 'string') {
-    sessionState.cwd = info.cwd
-  }
+  // A detached session can report a non-empty execution cwd without owning it.
+  // Project that neutral path to empty workspace state so the Files pane
+  // releases the PREVIOUS project rather than claiming the backend fallback
+  // (#71254). Older backends have no explicit flag, so retain their non-empty
+  // cwd-as-owned contract.
+  Object.assign(sessionState, runtimeWorkspaceStatePatch(info))
 
   if (info.branch !== undefined) {
     sessionState.branch = info.branch || ''

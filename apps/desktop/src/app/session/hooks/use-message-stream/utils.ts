@@ -1,14 +1,7 @@
 import type { GatewayEventPayload } from '@/lib/chat-messages'
-import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { normalizePersonalityValue, runtimeWorkspaceStatePatch } from '@/lib/chat-runtime'
 
-import type { ClientSessionState } from '../../../types'
-
-type SessionRuntimeStatePatch = Partial<
-  Pick<
-    ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
-  >
->
+import type { SessionRuntimeStatePatch } from '../../../types'
 
 export function sessionInfoStatePatch(payload: GatewayEventPayload | undefined): SessionRuntimeStatePatch {
   const patch: SessionRuntimeStatePatch = {}
@@ -21,8 +14,8 @@ export function sessionInfoStatePatch(payload: GatewayEventPayload | undefined):
     patch.provider = payload.provider || ''
   }
 
-  if (typeof payload?.cwd === 'string') {
-    patch.cwd = payload.cwd
+  if (payload) {
+    Object.assign(patch, runtimeWorkspaceStatePatch(payload))
   }
 
   if (typeof payload?.branch === 'string') {

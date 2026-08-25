@@ -32,7 +32,9 @@ def _(rid, params: dict) -> dict:
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
-    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    source = _resolve_session_source(
+        str(params.get("source") or "").strip() or None
+    )
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -86,6 +88,7 @@ def _(rid, params: dict) -> dict:
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
+            "cwd_owned": explicit_cwd or source not in _LAUNCH_CWD_NOT_A_WORKSPACE,
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
@@ -149,9 +152,7 @@ def _(rid, params: dict) -> dict:
                 ),
                 "tools": {},
                 "skills": {},
-                "cwd": _sessions[sid]["cwd"],
-                "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
-                "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+                **_session_workspace_info(_sessions[sid]),
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
@@ -382,6 +383,7 @@ def _(rid, params: dict) -> dict:
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     defer_history = is_truthy_value(params.get("defer_history", False))
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
@@ -477,6 +479,7 @@ def _(rid, params: dict) -> dict:
                             "message_count": len(history),
                             "messages": [] if omit_messages else _history_to_messages(history),
                             "info": {
+                                **_session_workspace_info(live),
                                 "model": _resolve_model(),
                                 "lazy": True,
                                 "profile_name": profile or "",
@@ -591,9 +594,24 @@ def _(rid, params: dict) -> dict:
                 target, exc,
             )
 
-        profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
-            profile_home
+        resume_cwd, resume_cwd_owned, resume_explicit_cwd = _reconstruct_session_cwd(
+            found, profile_home, request_source=source
         )
+        # Heal legacy terminal rows once at the shared resume boundary so
+        # deferred and eager builders see the same durable cwd. Detached
+        # Desktop rows remain NULL by ownership contract.
+        if resume_cwd_owned and not str(found.get("cwd") or "").strip():
+            try:
+                db.update_session_cwd(
+                    target,
+                    resume_cwd,
+                    _git_branch_for_cwd(resume_cwd),
+                    _git_common_repo_root_for_cwd(resume_cwd),
+                    replace_git_meta=True,
+                )
+                found["cwd"] = resume_cwd
+            except Exception:
+                logger.debug("failed to heal legacy resumed session cwd", exc_info=True)
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
             payload = _live_session_payload(
@@ -652,7 +670,6 @@ def _(rid, params: dict) -> dict:
         # (resume_session_id keeps the upgrade on the stored conversation).
         if is_truthy_value(params.get("lazy", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             try:
                 db.reopen_session(target)
@@ -669,17 +686,18 @@ def _(rid, params: dict) -> dict:
                 if lease is not None:
                     lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
-            cwd = profile_resume_cwd or _default_session_cwd()
             record = _deferred_session_record(
                 target,
                 cols=cols,
-                cwd=cwd,
+                cwd=resume_cwd,
                 history=history,
                 lease=lease,
                 source=source,
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                explicit_cwd=resume_explicit_cwd,
+                cwd_owned=resume_cwd_owned,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -708,7 +726,7 @@ def _(rid, params: dict) -> dict:
                     "message_count": len(display_history) if omit_messages else len(messages),
                     "messages": messages,
                     "messages_omitted": omit_messages,
-                    "info": _lazy_resume_info(cwd, profile=profile),
+                    "info": _lazy_resume_info(record, profile=profile),
                     "inflight": None,
                     "running": child_running,
                     "session_key": target,
@@ -731,16 +749,14 @@ def _(rid, params: dict) -> dict:
         # governs the response shape of the non-deferred paths.
         if defer_history and not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             _enable_gateway_prompts()
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
-            cwd = profile_resume_cwd or _default_session_cwd()
             record = _deferred_session_record(
                 target,
                 cols=cols,
-                cwd=cwd,
+                cwd=resume_cwd,
                 history=[],
                 lease=lease,
                 source=source,
@@ -748,6 +764,8 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                explicit_cwd=resume_explicit_cwd,
+                cwd_owned=resume_cwd_owned,
             )
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
@@ -770,7 +788,7 @@ def _(rid, params: dict) -> dict:
                     "messages": [],
                     "hydrating": True,
                     "info": _lazy_resume_info(
-                        cwd,
+                        record,
                         model=model_override.get("model") or "",
                         provider=overrides.get("provider_override") or "",
                         profile=profile,
@@ -798,7 +816,6 @@ def _(rid, params: dict) -> dict:
         # session's persisted runtime identity, and is a real (upgradable) session.
         if not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             # Interactive resume routes approvals/clarify through gateway prompts;
             # the deferred build wires the remaining per-session callbacks.
@@ -831,11 +848,10 @@ def _(rid, params: dict) -> dict:
             # the build drops the provider ("No LLM provider configured").
             overrides = _stored_session_runtime_overrides(found) or {}
             model_override = overrides.get("model_override") or {}
-            cwd = profile_resume_cwd or _default_session_cwd()
             record = _deferred_session_record(
                 target,
                 cols=cols,
-                cwd=cwd,
+                cwd=resume_cwd,
                 history=history,
                 lease=lease,
                 source=source,
@@ -844,6 +860,8 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                explicit_cwd=resume_explicit_cwd,
+                cwd_owned=resume_cwd_owned,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -860,7 +878,7 @@ def _(rid, params: dict) -> dict:
                 "messages": messages,
                 "messages_omitted": omit_messages,
                 "info": _lazy_resume_info(
-                    cwd,
+                    record,
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
                     profile=profile,
@@ -880,7 +898,6 @@ def _(rid, params: dict) -> dict:
         # _session_resume_lock across it would stall session.close on the main
         # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
         sid = uuid.uuid4().hex[:8]
-        source = _resolve_session_source(str(params.get("source") or "").strip() or None)
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         _enable_gateway_prompts()
         home_token = (
@@ -975,9 +992,12 @@ def _(rid, params: dict) -> dict:
                         agent,
                         history,
                         cols=cols,
-                        cwd=profile_resume_cwd,
+                        cwd=resume_cwd,
                         session_db=db,
                         source=source,
+                        profile_home=str(profile_home) if profile_home is not None else None,
+                        explicit_cwd=resume_explicit_cwd,
+                        cwd_owned=resume_cwd_owned,
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
@@ -1093,12 +1113,11 @@ def _(rid, params: dict) -> dict:
     except ValueError as e:
         return _err(rid, 4017, str(e))
     agent = session.get("agent")
-    info = _session_info(agent, session) if agent is not None else {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-    }
+    info = (
+        _session_info(agent, session)
+        if agent is not None
+        else {**_session_workspace_info(session), "lazy": True}
+    )
     _emit("session.info", params.get("session_id", ""), info)
     return _ok(rid, info)
 
@@ -1153,7 +1172,34 @@ def _(rid, params: dict) -> dict:
         row_exists = bool(db.get_session(target))
         if not row_exists and live is None:
             return _err(rid, 4007, "session not found")
-        if row_exists:
+        if live is not None:
+            history_lock = live.get("history_lock")
+            lock_context = (
+                history_lock
+                if history_lock is not None
+                else contextlib.nullcontext()
+            )
+            try:
+                # This bounded SQLite write and the matching live publication
+                # are one topology commit at the same boundary used by host
+                # completion and queued-turn framing. A completion carrying an
+                # older generation therefore waits until it can observe either
+                # the fully committed move or, on DB failure, the untouched old
+                # topology. Connection setup, row lookup, and Git probes stay
+                # outside the lock; update_session_cwd has no session callbacks.
+                with lock_context:
+                    if row_exists:
+                        db.update_session_cwd(
+                            target,
+                            resolved,
+                            branch,
+                            root,
+                            replace_git_meta=True,
+                        )
+                    _publish_explicit_session_cwd_locked(live, resolved)
+            except Exception as e:
+                return _err(rid, 5007, f"move failed: {e}")
+        elif row_exists:
             try:
                 db.update_session_cwd(
                     target, resolved, branch, root, replace_git_meta=True
@@ -1162,17 +1208,16 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5007, f"move failed: {e}")
 
     if live is not None:
-        try:
-            _set_session_cwd(live, resolved)
-        except ValueError as e:
-            return _err(rid, 4017, str(e))
+        # The DB-backed path already committed the authoritative row inside the
+        # history-lock boundary. A draft has no row to update yet and will
+        # inherit this published cwd when its first row is created.
+        _finish_explicit_session_cwd_change(live, resolved, persist=False)
         agent = live.get("agent")
-        info = _session_info(agent, live) if agent is not None else {
-            "cwd": resolved,
-            "branch": branch,
-            "project": _project_info_for_cwd(resolved),
-            "lazy": True,
-        }
+        info = (
+            _session_info(agent, live)
+            if agent is not None
+            else {**_session_workspace_info(live), "lazy": True}
+        )
         _emit("session.info", live_sid, info)
 
     return _ok(rid, {"cwd": resolved, "branch": branch, "git_repo_root": root})
@@ -2749,7 +2794,9 @@ def _(rid, params: dict) -> dict:
     usage = _session_usage_snapshot(session)
     provider = getattr(agent, "provider", None) or mirror.get("provider") or "unknown"
     model = getattr(agent, "model", None) or mirror.get("model") or "(unknown)"
-    project = _project_info_for_cwd(_display_session_cwd(session))
+    # Status intentionally heals a deleted local cwd while reporting it. The
+    # shared projection persists owned paths and leaves neutral DB rows NULL.
+    project = _session_workspace_info(session)["project"]
     lines = [
         "Hermes TUI Status",
         "",
@@ -2874,7 +2921,7 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
         if ack.get("type") in {"control.error", "error"}:
             return _err(rid, 4009, str(ack.get("message") or "compute-host compress failed"))
-        _apply_compute_host_metadata_mirror(session, ack)
+        _apply_compute_host_control_metadata(sid, session, ack)
         host_result = ack.get("result")
         if isinstance(host_result, dict):
             # The host owns the isolated session's agent/history, so preserve
@@ -3186,7 +3233,7 @@ def _(rid, params: dict) -> dict:
                 # thing that surfaces TUI branches. See issue #20856.
                 model_config={"_branched_from": old_key},
                 parent_session_id=old_key,
-                cwd=_session_cwd(session),
+                cwd=_persisted_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not
                 # just the parent-backfill) so it holds even when the parent row
                 # predates the profile_name column.
@@ -3286,6 +3333,8 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                explicit_cwd=bool(session.get("explicit_cwd")),
+                cwd_owned=_session_owns_cwd(session),
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is

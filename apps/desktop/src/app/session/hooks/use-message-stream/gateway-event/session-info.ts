@@ -9,6 +9,7 @@ import {
   $currentProvider,
   $selectedStoredSessionId,
   $sessions,
+  releaseWorkspaceCwdOwner,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwdTransient,
@@ -120,28 +121,33 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       // Active-session model/provider still flows through the session state
       // cache via updateSessionState → syncRuntimeMetadataToView below.
 
-      if (typeof payload?.cwd === 'string' && sessionInfoDescribesSelectedSession(payload.stored_session_id)) {
+      if (statePatch.cwd !== undefined && sessionInfoDescribesSelectedSession(payload?.stored_session_id)) {
         // The active session's agent can relocate itself (new repo/worktree
         // via the terminal). When the SAME active session's cwd actually
         // moves, follow it — refresh the project tree + scope so the sidebar
         // tracks the live thread. A fresh selection (different session id)
         // is a switch, not a move, so it refreshes data without yanking scope.
-        const cwdMoved = payload.cwd !== $currentCwd.get()
-        const sameSession = !!sessionId && sessionId === lastCwdInfoSessionRef.current
+        if (statePatch.cwd && statePatch.cwdOwned !== false) {
+          const cwdMoved = statePatch.cwd !== $currentCwd.get()
+          const sameSession = !!sessionId && sessionId === lastCwdInfoSessionRef.current
 
-        lastCwdInfoSessionRef.current = sessionId
-        setCurrentCwdTransient(payload.cwd)
+          lastCwdInfoSessionRef.current = sessionId
+          setCurrentCwdTransient(statePatch.cwd)
 
-        // The backend just confirmed the selected conversation's real
-        // workspace, so it owns the path we wrote. Without the claim the
-        // marker keeps naming whoever held it before — including the
-        // released state a detached resume leaves behind — and the primary
-        // workspace-derived surfaces stay hidden against a folder the
-        // backend has confirmed (#71254).
-        setWorkspaceCwdOwner($selectedStoredSessionId.get())
+          // The backend just confirmed the selected conversation's real
+          // workspace, so it owns the path we wrote. Without the claim the
+          // marker keeps naming whoever held it before — including the
+          // released state a detached resume leaves behind — and the primary
+          // workspace-derived surfaces stay hidden against a folder the
+          // backend has confirmed (#71254).
+          setWorkspaceCwdOwner($selectedStoredSessionId.get())
 
-        if (cwdMoved && sameSession) {
-          void followActiveSessionCwd(payload.cwd)
+          if (cwdMoved && sameSession) {
+            void followActiveSessionCwd(statePatch.cwd)
+          }
+        } else {
+          lastCwdInfoSessionRef.current = sessionId
+          releaseWorkspaceCwdOwner()
         }
       }
 
