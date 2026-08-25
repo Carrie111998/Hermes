@@ -719,6 +719,21 @@ Blocked files show a warning:
 [BLOCKED: AGENTS.md contained potential prompt injection (prompt_injection). Content not loaded.]
 ```
 
+### Configuring context file scanning
+
+The scanner's reaction is configurable via `security.context_file_scanning` in `config.yaml`:
+
+```yaml
+security:
+  context_file_scanning: enforce   # enforce | warn | off
+```
+
+- **`enforce`** (default) — blocked files are replaced with the `[BLOCKED: ...]` placeholder shown above. Nothing from a flagged file reaches the agent.
+- **`warn`** — flagged files load, and each one carries a visible notice into context naming the file and the patterns it matched (also logged at WARNING). Use this while debugging a false positive: you keep your persona/project file working and can see exactly which pattern tripped.
+- **`off`** — context files skip scanning entirely. Only recommended for trusted, single-user machines; the agent's system prompt then includes context files verbatim.
+
+An invalid value falls back to `enforce`. The setting is read per scan, so config changes take effect on the next session without restarting any process.
+
 ## Best Practices for Production Deployment
 
 ### Gateway Deployment Checklist

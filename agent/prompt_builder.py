@@ -57,6 +57,47 @@ logger = logging.getLogger(__name__)
 
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
+# ---------------------------------------------------------------------------
+# Config gate for context-file scanning (issue #94902).
+#
+# `security.context_file_scanning` in config.yaml:
+#   enforce (default) — block-with-placeholder, current behavior
+#   warn              — load the content, log a WARNING naming the file and
+#                       findings, and inject a visible notice into context so
+#                       the user sees the downgrade at session start
+#   off               — skip scanning entirely (user's explicit choice,
+#                       scoped to their own context files)
+#
+# Secure default: the gate only ever *downgrades* protection when the user
+# writes it explicitly, and `warn` keeps a visible trace of every finding.
+# Read lazily at scan time (never cached at import) so config edits take
+# effect on the next session without a process restart.
+# ---------------------------------------------------------------------------
+
+_CONTEXT_SCAN_MODES = ("enforce", "warn", "off")
+
+
+def _get_context_scan_mode() -> str:
+    """Resolve security.context_file_scanning from config.yaml. Defaults to enforce."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        raw = cfg_get(
+            load_config_readonly() or {},
+            "security", "context_file_scanning",
+            default="enforce",
+        )
+        # YAML 1.1 parses bare off/on/yes/no as booleans; a user writing
+        # `context_file_scanning: off` means off, full stop (#94902).
+        if raw is False:
+            return "off"
+        if raw is True:
+            return "enforce"
+        mode = str(raw).strip().lower()
+    except Exception:
+        return "enforce"  # config unreadable → secure default, never crash startup
+    return mode if mode in _CONTEXT_SCAN_MODES else "enforce"
+
 
 def _scan_context_content(content: str, filename: str) -> str:
     """Scan context file content for injection. Returns sanitized content.
@@ -68,7 +109,14 @@ def _scan_context_content(content: str, filename: str) -> str:
     cloned repo (security research, infra docs).  Content matching is
     BLOCKED at this layer because the file would otherwise enter the
     system prompt verbatim and the user has no chance to intervene.
+
+    Reaction is governed by ``security.context_file_scanning``:
+    enforce (default) | warn | off — see the module comment above (#94902).
     """
+    mode = _get_context_scan_mode()
+    if mode == "off":
+        return content
+
     # Editors (Windows Notepad, PowerShell Out-File without -Encoding
     # utf8NoBOM, some VS Code profiles) prefix a UTF-8 BOM as an encoding
     # artifact, not a prompt injection. Strip a leading U+FEFF silently so a
@@ -78,11 +126,24 @@ def _scan_context_content(content: str, filename: str) -> str:
         content = content[1:]
 
     findings = _scan_for_threats(content, scope="context")
-    if findings:
-        logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
-        return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
+    if not findings:
+        return content
 
-    return content
+    logger.warning(
+        "Context file %s flagged by injection scanner (%s); mode=%s",
+        filename, ", ".join(findings), mode,
+    )
+    if mode == "warn":
+        # Load the real content, but leave a visible trace in context itself:
+        # silent degradation is the harm this gate exists to fix (#94902).
+        notice = (
+            f"[context-file-scanner] {filename} matched injection patterns "
+            f"({', '.join(findings)}) but loaded because "
+            f"security.context_file_scanning is 'warn'."
+        )
+        return f"{notice}\n\n{content}"
+
+    return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
 
 
 def _find_git_root(start: Path) -> Optional[Path]:
