@@ -92,12 +92,21 @@ def resolve_exec_command(project_root: Optional[Path] = None) -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly. Keep the LEXICAL path
+            # (abspath, not resolve()): on uv-managed venvs .venv/bin/python
+            # symlinks to a base interpreter outside the venv tree, and the
+            # dereferenced path is where pyvenv.cfg stops being adjacent —
+            # the exact failure #80547's review identified (#94443 case 2).
+            argv = [os.path.abspath(sys.executable), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [
+            os.path.abspath(sys.executable),
+            "-m",
+            "hermes_cli.main",
+            "desktop",
+        ]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
@@ -167,26 +176,36 @@ def _resolve_hermes_bin_for_desktop_entry(
     finally:
         sys.argv[0] = original_argv0
 
-    if rerouted is None:
-        # PATH had no `hermes` — common in stripped systemd user sessions
-        # and autostart relaunches where ~/.local/bin is absent from PATH.
-        # The installer's wrapper lives at a known XDG location; probe it
+    primary = resolve_fn()
+
+    # A primary that is NOT checkout-internal and not the invoking
+    # interpreter is an external launcher (e.g. /opt/.../bin/hermes from
+    # another install method, or a venv console script). It must be
+    # evaluated BEFORE any known-location probing: probing first could
+    # silently switch the entry to a different installation (#94443
+    # review case 3).
+    if primary and not _inside_checkout(primary):
+        return primary
+
+    if primary and _inside_checkout(primary) and rerouted:
+        return rerouted
+
+    if rerouted is None and primary:
+        # argv[0] was checkout-internal AND PATH had no `hermes` — common
+        # in stripped systemd user sessions and autostart relaunches.
+        # The installer's wrapper lives at known locations; probe them
         # directly before giving up, otherwise we'd silently persist the
-        # uv-pinned interpreter form this fix exists to prevent.
+        # checkout-internal form this fix exists to prevent. The probe
+        # runs only after the primary was proven non-durable above.
         probe = _known_wrapper_candidates()
         for candidate in probe:
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return str(candidate)
-
-    primary = resolve_fn()
-    if primary and _inside_checkout(primary) and rerouted:
-        return rerouted
-    if primary and _inside_checkout(primary):
-        # argv[0] was checkout-internal AND no durable wrapper exists
-        # anywhere (PATH miss, known locations miss). Persisting the
-        # interpreter itself would produce an unrunnable `<python>
-        # desktop`; dropping to None lets resolve_exec_command emit its
-        # runnable `sys.executable -m hermes_cli.main desktop` fallback.
+        # No durable wrapper exists anywhere (PATH miss, known locations
+        # miss). Persisting the checkout-internal primary would produce
+        # an entry that regenerates itself or dies on the venv escape;
+        # dropping to None lets resolve_exec_command emit its runnable
+        # module fallback.
         return None
     return primary
 
@@ -234,7 +253,11 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    # Compare the LEXICAL interpreter directory (abspath, not resolve()):
+    # on uv venvs the resolved parent is the base interpreter's dir, which
+    # makes a perfectly valid ``.venv/bin/python`` shebang look foreign
+    # (#94443 review case 1).
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     return exe_dir not in shebang
 
 
