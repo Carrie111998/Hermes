@@ -2208,8 +2208,6 @@ class AIAgent:
                 if not isinstance(seed_ids, set):
                     seed_ids = set()
             self._flushed_db_message_session_id = current_session_id
-            if flushed_session_id != current_session_id:
-                self._db_flush_scan_prefix = None
             history_ids = {
                 id(item) for item in (conversation_history or [])
                 if isinstance(item, dict)

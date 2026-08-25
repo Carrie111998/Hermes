@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import ContextCompressor, _DB_PERSISTED_MARKER
 from hermes_state import SessionDB
 
 
@@ -207,7 +207,9 @@ class TestWorkspaceMetadataFollowsRotation:
 
 
 class TestRotationChildFlushDedup:
-    def test_live_user_anchor_is_persisted_once_in_child(self, tmp_path: Path):
+    def test_summary_handoff_row_is_persisted_once_in_child(
+        self, tmp_path: Path
+    ):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_ROT_LIVE_USER"
         db.create_session(parent, source="cli")
@@ -220,16 +222,103 @@ class TestRotationChildFlushDedup:
         agent = _build_agent_with_db(db, parent)
         agent._persist_user_message_idx = len(messages) - 1
         agent.context_compressor.compress.return_value = [
-            {"role": "assistant", "content": "s"},
+            {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
         ]
 
         returned, _ = agent._compress_context(messages, "sys", approx_tokens=120_000)
-        agent._flush_messages_to_session_db(returned)
+        assert any(
+            isinstance(msg, dict)
+            and msg.get("content") == "[CONTEXT COMPACTION] summary"
+            and msg.get(_DB_PERSISTED_MARKER)
+            for msg in returned
+        )
+        assert any(
+            isinstance(msg, dict)
+            and msg.get("content") == "live question"
+            and msg.get(_DB_PERSISTED_MARKER)
+            for msg in returned
+        )
+
+    def test_rotation_flush_of_original_live_list_keeps_user_once(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ROT_ORIGINAL_LIVE"
+        db.create_session(parent, source="cli")
+        db.append_message(parent, "user", "persisted question")
+        db.append_message(parent, "assistant", "persisted answer")
+
+        loaded = db.get_messages_as_conversation(parent)
+        messages = [*loaded, {"role": "user", "content": "live question"}]
+
+        agent = _build_agent_with_db(db, parent)
+        agent._persist_user_message_idx = len(messages) - 1
+        agent.context_compressor.compress.return_value = [
+            {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+        ]
+
+        real_flush = agent._flush_messages_to_session_db
+        with patch.object(
+            agent,
+            "_flush_messages_to_session_db",
+            side_effect=RuntimeError("simulated parent flush failure"),
+        ):
+            returned, _ = agent._compress_context(
+                messages, "sys", approx_tokens=120_000
+            )
+
+        assert agent.session_id != parent
+        real_flush(returned)
 
         child_rows = db.get_messages_as_conversation(
             agent.session_id, include_inactive=True
         )
         assert _count_rows(child_rows, content="live question", role="user") == 1
+        assert _count_rows(
+            child_rows, content="[CONTEXT COMPACTION] summary", role="assistant"
+        ) == 1
+
+    def test_failed_publish_leaves_live_user_unmarked_for_later_flush(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ROT_PUBLISH_FAIL"
+        db.create_session(parent, source="cli")
+        db.append_message(parent, "user", "persisted question")
+        db.append_message(parent, "assistant", "persisted answer")
+
+        loaded = db.get_messages_as_conversation(parent)
+        messages = [*loaded, {"role": "user", "content": "live question"}]
+        live_user = messages[-1]
+
+        agent = _build_agent_with_db(db, parent)
+        agent._persist_user_message_idx = len(messages) - 1
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "assistant", "content": "tail"},
+        ]
+
+        real_flush = agent._flush_messages_to_session_db
+        with patch.object(
+            db,
+            "publish_compression_child",
+            side_effect=RuntimeError("simulated publish failure"),
+        ):
+            returned, _ = agent._compress_context(
+                messages, "sys", approx_tokens=120_000
+            )
+
+        assert _DB_PERSISTED_MARKER not in live_user
+
+        retry_session = "PARENT_ROT_PUBLISH_RETRY"
+        db.create_session(retry_session, source="cli")
+        agent.session_id = retry_session
+        real_flush([live_user])
+
+        retry_rows = db.get_messages_as_conversation(
+            retry_session, include_inactive=True
+        )
+        assert _count_rows(retry_rows, content="live question", role="user") == 1
 
     def test_mid_tool_loop_rows_do_not_duplicate_after_failed_parent_flush(
         self, tmp_path: Path
@@ -808,7 +897,14 @@ class TestTodoSnapshotScaffoldingTails:
             _msgs(), "sys", approx_tokens=120_000
         )
 
-        assert [{k: v for k, v in m.items() if k != "_row_id"} for m in compressed] == expected
+        assert [
+            {
+                k: v
+                for k, v in m.items()
+                if k not in {"_row_id", _DB_PERSISTED_MARKER}
+            }
+            for m in compressed
+        ] == expected
         assert not any(
             TODO_INJECTION_HEADER in str(message.get("content") or "")
             for message in compressed

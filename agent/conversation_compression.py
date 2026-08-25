@@ -3784,19 +3784,6 @@ def compress_context(
                         f"{uuid.uuid4().hex[:6]}"
                     )
                     from agent.context_compressor import _DB_PERSISTED_MARKER
-
-                    current_idx = getattr(agent, "_persist_user_message_idx", None)
-                    if (
-                        compressed_user_turn_outcome in {"inserted", "merged"}
-                        and isinstance(current_idx, int)
-                        and 0 <= current_idx < len(messages)
-                    ):
-                        _live_user_message = messages[current_idx]
-                        if (
-                            isinstance(_live_user_message, dict)
-                            and _live_user_message.get("role") == "user"
-                        ):
-                            _live_user_message[_DB_PERSISTED_MARKER] = True
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
@@ -3817,33 +3804,32 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
-                    def _handoff_signature(message: Any) -> Any:
-                        if not isinstance(message, dict):
-                            return None
-                        return json.dumps(
-                            {
-                                key: value
-                                for key, value in message.items()
-                                if not str(key).startswith("_")
-                            },
-                            sort_keys=True,
-                            default=str,
-                            separators=(",", ":"),
-                        )
-
-                    _live_message_signatures = {
-                        _handoff_signature(_message)
-                        for _message in messages
-                        if isinstance(_message, dict)
-                    }
-                    for _handoff_message in compressed:
+                    current_idx = getattr(agent, "_persist_user_message_idx", None)
+                    if (
+                        compressed_user_turn_outcome in {"inserted", "merged"}
+                        and isinstance(current_idx, int)
+                        and 0 <= current_idx < len(messages)
+                    ):
+                        _live_user_message = messages[current_idx]
                         if (
-                            isinstance(_handoff_message, dict)
-                            and _handoff_signature(_handoff_message)
-                            in _live_message_signatures
+                            isinstance(_live_user_message, dict)
+                            and _live_user_message.get("role") == "user"
                         ):
+                            _live_user_message[_DB_PERSISTED_MARKER] = True
+                            _session_messages = getattr(agent, "_session_messages", None)
+                            if isinstance(_session_messages, list) and _session_messages is not messages:
+                                if 0 <= current_idx < len(_session_messages):
+                                    _session_live_user_message = _session_messages[current_idx]
+                                    if (
+                                        isinstance(_session_live_user_message, dict)
+                                        and _session_live_user_message.get("role") == "user"
+                                    ):
+                                        _session_live_user_message[_DB_PERSISTED_MARKER] = True
+                    for _handoff_message in compressed:
+                        if isinstance(_handoff_message, dict):
                             _handoff_message[_DB_PERSISTED_MARKER] = True
                     agent.session_id = new_session_id
+                    agent._db_flush_scan_prefix = None
                     try:
                         from gateway.session_context import set_current_session_id
 
