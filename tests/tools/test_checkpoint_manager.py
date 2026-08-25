@@ -113,6 +113,37 @@ class TestStoreInit:
         # Idempotent.
         assert _init_store(store, str(work_dir)) is None
 
+    def test_default_excludes_engine_cache_dirs(self):
+        from tools.checkpoint_manager import DEFAULT_EXCLUDES
+
+        # Machine-generated VM/engine caches: never project content, and
+        # commonly root-owned 0600 on shared/container filesystems, which
+        # fails plain `git add -A` outright (#78888).
+        for pattern in ("node-compile-cache/", "__pycache__/"):
+            assert pattern in DEFAULT_EXCLUDES
+
+    def test_init_store_refreshes_stale_excludes(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """A store initialized by an older Hermes gets current excludes."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+
+        # Simulate an older-version store: init, then strip the new patterns.
+        assert _init_store(store, str(work_dir)) is None
+        exclude_path = store / "info" / "exclude"
+        stale = "\n".join(
+            line for line in exclude_path.read_text().splitlines()
+            if "node-compile-cache" not in line and "__pycache__" not in line
+        ) + "\n"
+        exclude_path.write_text(stale, encoding="utf-8")
+
+        # Re-init on the existing store must refresh the excludes.
+        assert _init_store(store, str(work_dir)) is None
+        refreshed = exclude_path.read_text()
+        assert "node-compile-cache/" in refreshed
+        assert "__pycache__/" in refreshed
+
     def test_legacy_migration_archives_prev2_repos(
         self, checkpoint_base, work_dir,
     ):
@@ -268,6 +299,60 @@ class TestRealPruning:
         names = set(files.splitlines())
         assert "small.py" in names
         assert "weights.bin" not in names  # filtered by size cap
+
+
+# =========================================================================
+# Unreadable files must not disable checkpointing (#78888)
+# =========================================================================
+
+class TestUnreadableFiles:
+    @pytest.mark.skipif(
+        os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="permission bits are not enforceable on Windows or as root",
+    )
+    def test_unreadable_file_does_not_kill_checkpointing(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """A single unreadable file must not zero out the whole snapshot.
+
+        Regression for #78888: one root-owned 0600 cache file inside the
+        working dir made ``git add -A`` fail fatally (rc=128, empty index),
+        so every checkpoint silently returned False forever.
+        """
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "main.py").write_text("print('hello')\n")
+        locked = wd / "locked.bin"
+        locked.write_bytes(b"secret")
+        locked.chmod(0o000)
+        cache = wd / "node-compile-cache"
+        cache.mkdir()
+        (cache / "junk").write_bytes(b"x")
+
+        m = CheckpointManager(enabled=True, max_snapshots=5)
+        try:
+            assert m.ensure_checkpoint(str(wd), "initial") is True
+
+            store = _store_path(checkpoint_base)
+            ok, files, _ = _run_git(
+                ["ls-tree", "-r", "--name-only", _ref_name(_project_hash(str(wd)))],
+                store, str(wd),
+            )
+            assert ok
+            names = set(files.splitlines())
+            assert "main.py" in names                      # readable content staged
+            assert "node-compile-cache/junk" not in names  # excluded by pattern
+            assert "locked.bin" not in names               # unreadable, skipped
+
+            # And checkpointing keeps working on later turns.
+            m.new_turn()
+            (wd / "main.py").write_text("print('changed')\n")
+            assert m.ensure_checkpoint(str(wd), "second turn") is True
+            cps = m.list_checkpoints(str(wd))
+            assert len(cps) >= 2
+        finally:
+            locked.chmod(0o644)
 
 
 # =========================================================================

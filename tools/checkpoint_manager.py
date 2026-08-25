@@ -141,6 +141,16 @@ DEFAULT_EXCLUDES = [
     # OS junk
     ".DS_Store",
     "Thumbs.db",
+    # Engine/VM bytecode caches. These are machine-generated, never
+    # project content, and are commonly created by *other* users (e.g.
+    # a root-owned V8 compile cache baked into a container image) with
+    # 0600 permissions the hermes user cannot read — one unreadable file
+    # used to fail the whole ``git add -A`` and zero out checkpointing
+    # for that working directory (#78888).
+    "node-compile-cache/",
+    "__pycache__/",
+    ".mypy_cache/",
+    ".ruff_cache/",
     # Logs
     "*.log",
 ]
@@ -490,6 +500,10 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         _migrate_legacy_store(base)
 
     if (store / "HEAD").exists():
+        # Existing store: make sure its exclude file tracks the current
+        # DEFAULT_EXCLUDES (stores initialized by older versions keep stale
+        # excludes forever otherwise — see _refresh_store_excludes).
+        _refresh_store_excludes(store)
         return None
 
     store.mkdir(parents=True, exist_ok=True)
@@ -539,6 +553,30 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
 
     logger.debug("Initialised checkpoint store at %s", store)
     return None
+
+
+def _refresh_store_excludes(store: Path) -> None:
+    """Keep an existing store's ``info/exclude`` current with the code.
+
+    ``info/exclude`` is written once at init, so stores created by older
+    Hermes versions keep their stale exclude list forever — including
+    missing patterns added later (e.g. engine cache dirs whose unreadable,
+    root-owned files fail every ``git add -A``, silently disabling
+    checkpointing for that working directory, #78888).
+
+    The file is manager-owned: whenever its content drifts from the shipped
+    ``DEFAULT_EXCLUDES`` it is rewritten verbatim.
+    """
+    exclude_path = store / "info" / "exclude"
+    desired = "\n".join(DEFAULT_EXCLUDES) + "\n"
+    try:
+        if exclude_path.read_text(encoding="utf-8") == desired:
+            return
+        exclude_path.parent.mkdir(exist_ok=True)
+        exclude_path.write_text(desired, encoding="utf-8")
+        logger.info("Refreshed checkpoint store excludes at %s", exclude_path)
+    except OSError as exc:
+        logger.debug("Could not refresh checkpoint excludes: %s", exc)
 
 
 def _volume_evidence(workdir: Path) -> Dict:
@@ -1284,8 +1322,32 @@ class CheckpointManager:
             timeout=_GIT_TIMEOUT * 2, index_file=index_file,
         )
         if not ok:
-            logger.debug("Checkpoint git-add failed: %s", err)
-            return False
+            # A single unreadable path (e.g. another user's 0600 cache file
+            # inside the workdir) fails plain ``git add -A`` outright with a
+            # fatal error and a stale/empty index, which used to silently
+            # disable checkpointing for the whole directory. Retry with
+            # ``--ignore-errors`` so every readable file still stages; that
+            # variant exits 1 when it had to skip paths — the snapshot just
+            # omits files we could not read (#78888).
+            logger.warning(
+                "Checkpoint git-add failed (%s); retrying with --ignore-errors",
+                (err or "").strip().splitlines()[-1] if err else "unknown error",
+            )
+            ok, _, err = _run_git(
+                ["add", "--ignore-errors", "-A"], store, working_dir,
+                timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+                allowed_returncodes={1},  # rc=1 = skipped paths, not fatal
+            )
+            if not ok:
+                # ``_run_git`` reports strict rc==0, so a benign rc=1 lands
+                # here too. Decide by whether the index is actually usable.
+                index_ok, _, _ = _run_git(
+                    ["diff", "--cached", "--name-only"], store, working_dir,
+                    timeout=_GIT_TIMEOUT, index_file=index_file,
+                )
+                if not index_ok:
+                    logger.debug("Checkpoint git-add failed: %s", err)
+                    return False
 
         if self.max_file_size_mb > 0:
             self._drop_oversize_from_index(store, working_dir, index_file)
