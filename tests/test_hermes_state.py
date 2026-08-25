@@ -734,6 +734,8 @@ class TestFTS5Search:
         finally:
             for conn in traced_connections:
                 conn.set_trace_callback(None)
+            if read_conn is not db._conn:
+                read_conn.close()
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -4365,6 +4367,8 @@ class TestPerformancePragmasEndToEnd:
             assert rconn is not None, "WAL reader expected on local filesystem"
             assert self._read(rconn) == self.CONFIGURED
         finally:
+            if locals().get("rconn") is not None and rconn is not db._conn:
+                rconn.close()
             db.close()
 
         # Read-only cross-profile attach.
@@ -4388,6 +4392,8 @@ class TestPerformancePragmasEndToEnd:
             if rconn is not None:
                 assert self._read(rconn) == defaults
         finally:
+            if locals().get("rconn") is not None and rconn is not db._conn:
+                rconn.close()
             db.close()
 
         ro = SessionDB(db_path=db_path, read_only=True)

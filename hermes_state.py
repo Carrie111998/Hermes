@@ -2505,12 +2505,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # registry, not the database file, so mode=ro is fine.
             if self._fts_cjk_loaded:
                 load_fts5_cjk_extension(conn)
-        except sqlite3.Error:
+        except BaseException as exc:
             if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     logger.warning("read-conn close failed for %s", self.db_path, exc_info=True)
+            if not isinstance(exc, sqlite3.Error):
+                raise
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)

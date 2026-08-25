@@ -871,7 +871,8 @@ def session_search(
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
-    if db is None:
+    own_db = db is None
+    if own_db:
         try:
             from hermes_state import SessionDB
             db = SessionDB()
@@ -881,6 +882,7 @@ def session_search(
             return tool_error(format_session_db_unavailable(), success=False)
 
     # Track whether we opened profile_db so we can close it in the finally block.
+    owned_db = db
     profile_db = None
     try:
         # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
@@ -980,6 +982,11 @@ def session_search(
                 profile_db.close()
             except Exception as e:
                 logging.debug("profile_db.close() failed: %s", e)
+        if own_db and owned_db is not profile_db:
+            try:
+                owned_db.close()
+            except Exception as e:
+                logging.debug("session_search db.close() failed: %s", e)
 
 
 def check_session_search_requirements() -> bool:

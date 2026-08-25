@@ -237,3 +237,31 @@ def test_session_search_closes_profile_db_even_on_exception(monkeypatch, tmp_pat
         assert (
             opened_id in closed_ids
         ), f"SessionDB {opened_id} was not closed after exception (exception safety)"
+
+
+def test_session_search_closes_default_db(monkeypatch, tmp_path):
+    """The fallback DB opened when no shared agent DB is supplied is owned here."""
+    closed_ids = _track_sessiondb_closes(monkeypatch)
+
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_default_db_path",
+        lambda: tmp_path / "state.db",
+    )
+    opened_id = None
+    from hermes_state import SessionDB
+
+    original_init = SessionDB.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        nonlocal opened_id
+        original_init(self, *args, **kwargs)
+        opened_id = id(self)
+
+    monkeypatch.setattr(SessionDB, "__init__", tracking_init)
+    session_search_tool.session_search(query="not present")
+
+    assert opened_id is not None
+    assert opened_id in closed_ids
