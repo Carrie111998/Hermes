@@ -1705,6 +1705,33 @@ class TestExecuteToolCalls:
         assert statuses == ["lazy scanner notice"]
         assert drain_context_file_notices() == []
 
+    @pytest.mark.parametrize("policy", ["warn", "off"])
+    def test_sequential_lazy_context_restores_adopted_prompt_policy(
+        self, agent, policy
+    ):
+        agent._cached_system_prompt = (
+            "adopted prompt\n\nContext file scanning policy: " + policy
+        )
+        agent._subdirectory_hints.set_scan_policy("enforce")
+        tool_call = _mock_tool_call(
+            name="web_search", arguments='{"q":"pkg/file.py"}', call_id="c1"
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        def assert_restored_policy(*_args, **_kwargs):
+            assert agent._subdirectory_hints._scan_policy == policy
+            return None
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(
+                agent._subdirectory_hints,
+                "check_tool_call",
+                side_effect=assert_restored_policy,
+            ),
+        ):
+            agent._execute_tool_calls_sequential(message, [], "task-1")
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(

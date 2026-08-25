@@ -2757,6 +2757,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
+        # Adopted cached prompts (for example background-review agents) carry
+        # the parent session's frozen scan policy in their final marker. Keep
+        # the sequential path aligned with concurrent execution before lazy
+        # context discovery.
+        from agent.system_prompt import restore_context_file_scan_policy
+
+        restore_context_file_scan_policy(
+            agent, getattr(agent, "_cached_system_prompt", None)
+        )
+
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
         _emit_context_file_notices(agent)
