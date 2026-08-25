@@ -4592,7 +4592,17 @@ function useRoster() {
 
   return useQuery({
     queryKey: [...ROSTER_KEY, activeConnectionId],
-    queryFn: async () => {
+    queryFn: () => fetchRoster(activeConnectionId),
+    refetchInterval: 5000,
+    staleTime: 5000,
+    // Remote (SSH) gateways connect slowly and drop on sleep/wake; keep
+    // retrying instead of latching a terminal error card.
+    retry: true,
+    retryDelay: attempt => Math.min(15000, 1000 * 2 ** attempt)
+  })
+}
+
+async function fetchRoster(activeConnectionId) {
       // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
       // against each bot's last local meta write, and a fetch issued before
       // a write can only carry pre-write ui_meta. (Issue time is the
@@ -4647,14 +4657,6 @@ function useRoster() {
       }
 
       return { ...(local && typeof local === 'object' ? local : {}), fetchedAt: issuedAt }
-    },
-    refetchInterval: 5000,
-    staleTime: 5000,
-    // Remote (SSH) gateways connect slowly and drop on sleep/wake; keep
-    // retrying instead of latching a terminal error card.
-    retry: true,
-    retryDelay: attempt => Math.min(15000, 1000 * 2 ** attempt)
-  })
 }
 
 /** Synchronous union-roster read for the composer surfaces (autocomplete
@@ -4701,6 +4703,35 @@ function cachedUnionRoster() {
   }
 
   return null
+}
+
+/** Cold cache (no Bots surface mounted yet): fetch once and seed the query
+ *  cache so the popup answers on the next keystroke. */
+const warmingRosterFor = new Set()
+
+function warmUnionRoster() {
+  if (typeof queryClient === 'undefined' || !queryClient?.setQueryData) {
+    return
+  }
+
+  const connectionId = String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
+
+  if (warmingRosterFor.has(connectionId)) {
+    return
+  }
+
+  warmingRosterFor.add(connectionId)
+
+  fetchRoster(connectionId)
+    .then(roster => {
+      if (Array.isArray(roster?.profiles)) {
+        queryClient.setQueryData([...ROSTER_KEY, connectionId], roster)
+      }
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      warmingRosterFor.delete(connectionId)
+    })
 }
 
 /** Merge the union agent roster (host.agents) over the active gateway's
@@ -4822,6 +4853,7 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
     profiles.push({
       name: profile,
       handle: agent.handle,
+      ...(agent.displayName ? { display_name: agent.displayName } : {}),
       connectionId,
       connectionKind: agent.connectionKind,
       connectionLabel: agent.connectionLabel,
@@ -5889,7 +5921,14 @@ function displayName(bot, meta) {
   // "Hermes". Annotated active rows carry sourceScoped too, and keying this
   // off sourceScoped renamed the user's main agent to an IP-derived label
   // (community report, Aug 17 2026).
-  if (bot?.remoteSource && (bot.name || '').trim().toLowerCase() === 'default' && bot.connectionLabel && !alias && !meta?.title?.trim()) {
+  if (
+    bot?.remoteSource &&
+    (bot.name || '').trim().toLowerCase() === 'default' &&
+    bot.connectionLabel &&
+    !alias &&
+    !meta?.title?.trim() &&
+    !(typeof bot?.display_name === 'string' && bot.display_name.trim())
+  ) {
     return bot.connectionLabel
   }
 
@@ -14846,6 +14885,8 @@ export default {
           const profiles = Array.isArray(roster?.profiles) ? roster.profiles : []
 
           if (!profiles.length) {
+            warmUnionRoster()
+
             return []
           }
 
@@ -14868,11 +14909,12 @@ export default {
             // renamed slug when one exists, the profile handle otherwise.
             const tag = botMentionTag(profile)
 
+            // Substring, not prefix: "@scout" must find "default-scout".
             if (
               q &&
-              !tag.toLowerCase().startsWith(q) &&
-              !handle.toLowerCase().startsWith(q) &&
-              !display.toLowerCase().startsWith(q)
+              !tag.toLowerCase().includes(q) &&
+              !handle.toLowerCase().includes(q) &&
+              !display.toLowerCase().includes(q)
             ) {
               continue
             }

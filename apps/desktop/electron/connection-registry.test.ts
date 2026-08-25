@@ -544,6 +544,24 @@ test('roster: unique profiles keep bare handles; duplicates get @name-device', (
   assert.equal(roster.length, 4)
 })
 
+test('roster: display names ride the row; absent when the backend reports none', () => {
+  const local = { id: 'local', kind: 'local' as const, label: 'This device' }
+  const homelab = { id: 'homelab', kind: 'remote' as const, label: 'Homelab', url: 'http://h:1' }
+
+  const roster = buildAgentRoster([
+    { connection: local, profiles: ['default'], displayNames: { default: 'Scout' } },
+    { connection: homelab, profiles: ['default'] }
+  ])
+
+  const byId = new Map(roster.map(a => [a.connectionId, a]))
+
+  assert.equal(byId.get('local')?.displayName, 'Scout')
+  assert.equal(byId.get('homelab')?.displayName, undefined)
+  // Disambiguation still keys off the profile name, not the display name.
+  assert.equal(byId.get('local')?.handle, 'default-this-device')
+  assert.equal(byId.get('homelab')?.handle, 'default-homelab')
+})
+
 test('rememberSshEnumeration: live list wins, cache then seed default', () => {
   assert.deepEqual(rememberSshEnumeration({ profiles: ['bob', 'kai'] }, ['stale'], 'ssh'), {
     profiles: ['bob', 'kai']
