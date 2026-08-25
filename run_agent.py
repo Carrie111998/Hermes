@@ -797,6 +797,12 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        try:
+            from agent.session_budget_guardrail import reset_state as _reset_session_budget_guardrail
+
+            _reset_session_budget_guardrail(self)
+        except Exception:
+            pass
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0

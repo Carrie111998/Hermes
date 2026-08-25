@@ -128,6 +128,21 @@ _MGMT_RELOAD_TIMEOUT = 15
 # DNS at the iron-proxy IP.  This greatly simplifies wiring.
 _DEFAULT_TUNNEL_PORT = 9090
 
+# HTTP methods the secrets transform should enforce on.  Do NOT include CONNECT:
+# the CONNECT request carries only the tunnel target, not the inner provider
+# Authorization/x-api-key/query token.  If a host-only secret rule with
+# ``require: true`` matches CONNECT, iron-proxy rejects the tunnel before MITM
+# can inspect and rewrite the real HTTPS request.
+_SECRET_RULE_HTTP_METHODS: Tuple[str, ...] = (
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "HEAD",
+    "OPTIONS",
+)
+
 # Hosts allowed by default for AI inference traffic.  Anything else is 403'd.
 _DEFAULT_ALLOWED_HOSTS: Tuple[str, ...] = (
     "openrouter.ai",
@@ -1184,7 +1199,10 @@ def build_proxy_config(
                 # TransformRequest — verified present in the pinned version).
                 "require": True,
             },
-            "rules": [{"host": h} for h in m.upstream_hosts],
+            "rules": [
+                {"host": h, "methods": list(_SECRET_RULE_HTTP_METHODS)}
+                for h in m.upstream_hosts
+            ],
         })
 
     # SSRF protection: default-deny cloud metadata + loopback + RFC1918.

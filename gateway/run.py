@@ -16458,6 +16458,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "queue": self._busy_queue_command,
                 "steer": self._busy_steer_command,
                 "egress": self._busy_egress_command,
+                "checkpoint": self._busy_checkpoint_command,
                 "goal": self._busy_goal_command,
                 "loop": self._busy_loop_command,
             }.get(handler_key)
@@ -16504,6 +16505,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             f"mid-turn. Wait for the current response or `/stop` first."
         )
 
+    async def _resolve_checkpoint_session_id(
+        self,
+        event: MessageEvent,
+        *,
+        route_key: str | None = None,
+        source: SessionSource | None = None,
+    ) -> str:
+        """Resolve slash checkpoint state to the native session id.
+
+        Gateway routing keys are stable chat/thread keys. Checkpoint state must
+        be keyed by the actual SessionDB session id, otherwise packets analyse
+        zero messages and write metadata under the wrong key.
+        """
+        try:
+            if source is not None:
+                entry = await self.async_session_store.get_or_create_session(
+                    source,
+                    touch_activity=False,
+                )
+                if entry and entry.session_id:
+                    return entry.session_id
+        except Exception:
+            logger.debug("checkpoint session-id resolution from source failed", exc_info=True)
+        key = route_key or getattr(event, "session_key", "") or ""
+        if key:
+            try:
+                entry = await self.async_session_store.lookup_by_session_key(key)
+                if entry and entry.session_id:
+                    return entry.session_id
+            except Exception:
+                logger.debug("checkpoint session-id resolution from route key failed", exc_info=True)
+        return key
+
+    async def _handle_checkpoint_command(
+        self,
+        event: MessageEvent,
+        session_id: str | None = None,
+        source: SessionSource | None = None,
+    ):
+        from hermes_cli.commands import resolve_command
+        from hermes_cli.checkpoint_commands import run_checkpoint_command
+
+        raw_command = event.get_command() or ""
+        cmd_def = resolve_command(raw_command)
+        canonical = cmd_def.name if cmd_def else raw_command
+        resolved_session_id = await self._resolve_checkpoint_session_id(
+            event,
+            route_key=session_id,
+            source=source,
+        )
+        result = run_checkpoint_command(
+            f"/{canonical}",
+            session_id=resolved_session_id,
+            args=(event.get_command_args() or "").strip(),
+        )
+        return result.text
+
     async def _handle_pause_command(self, event: MessageEvent):
         """`/pause [reason]` engages the global emergency stop; `/pause off`
         (aliases: resume/stop) lifts it.
@@ -16545,6 +16603,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.proxy_cli import format_status_text
 
         return format_status_text()
+
+    async def _busy_checkpoint_command(self, event: MessageEvent, quick_key: str, source):
+        return await self._handle_checkpoint_command(event, session_id=quick_key, source=source)
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # /stop must hard-kill the session when an agent is running.
@@ -17637,6 +17698,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli.proxy_cli import format_status_text
 
             return format_status_text()
+
+        if canonical in {"lock-this-chat-into-law", "promote-since-last-checkpoint"}:
+            return await self._handle_checkpoint_command(event, session_id=_quick_key, source=source)
 
         if canonical == "context":
             return await self._handle_context_command(event)

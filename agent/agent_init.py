@@ -963,6 +963,19 @@ def init_agent(
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
+    try:
+        from hermes_cli.config import load_config_readonly as _load_sbg_cfg
+        from agent.session_budget_guardrail import initialize_agent as _init_session_budget_guardrail
+
+        _init_session_budget_guardrail(agent, _load_sbg_cfg() or {})
+    except Exception:
+        # Guardrail setup must never break agent construction. The feature is
+        # fail-closed at its enforcement boundary when configured but the ask
+        # callback is unavailable; init failures stay a no-op.
+        from agent.session_budget_guardrail import reset_state as _reset_session_budget_guardrail
+
+        agent.session_budget_guardrail_config = {"enabled": False}
+        _reset_session_budget_guardrail(agent)
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     

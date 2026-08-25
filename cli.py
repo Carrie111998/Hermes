@@ -12281,6 +12281,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 execute_command("egress", CommandContext(surface="cli")).text,
                 highlight=False, markup=False,
             )
+        elif canonical in {"lock-this-chat-into-law", "promote-since-last-checkpoint"}:
+            from hermes_cli.checkpoint_commands import run_checkpoint_command
+
+            typed = cmd_original.split(None, 1)
+            args = typed[1].strip() if len(typed) > 1 else ""
+            result = run_checkpoint_command(
+                f"/{canonical}",
+                session_id=getattr(self, "session_id", "") or "",
+                args=args,
+            )
+            self._console_print(result.text, highlight=False, markup=False)
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"

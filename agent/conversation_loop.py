@@ -97,6 +97,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_finalizer import finalize_turn
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
+from agent import session_budget_guardrail as _session_budget_guardrail
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -2050,6 +2051,47 @@ def run_conversation(
                     f"the review tool loop before the next provider call."
                 )
             break
+
+        # Additive session budget guardrail: usage is recorded after a
+        # successful provider response, but enforcement happens here before the
+        # next provider call can spend more tokens. Missing clarify callback
+        # fails safe to Stop inside the guardrail module.
+        if _session_budget_guardrail.has_pending_breach(agent):
+            _guardrail_choice = _session_budget_guardrail.ask_for_decision(agent)
+            if _guardrail_choice == _session_budget_guardrail.CHOICE_CONTINUE_ONCE:
+                _session_budget_guardrail.clear_pending_for_continue_once(agent)
+            elif _guardrail_choice == _session_budget_guardrail.CHOICE_COMPRESS_THEN_CONTINUE:
+                _pre_guardrail_messages = messages
+                messages, active_system_prompt = agent._compress_context(
+                    messages,
+                    system_message,
+                    approx_tokens=int(getattr(agent, "session_prompt_tokens", 0) or 0),
+                    task_id=effective_task_id,
+                    force=True,
+                )
+                conversation_history = conversation_history_after_compression(
+                    agent, messages, conversation_history
+                )
+                if messages is _pre_guardrail_messages and compression_skipped_due_to_lock(agent):
+                    _turn_exit_reason = "session_budget_guardrail_compression_deferred"
+                    agent._persist_session(messages, conversation_history)
+                    return _compression_deferred_result(agent, messages, api_call_count)
+                _session_budget_guardrail.clear_pending_after_compress(agent)
+                continue
+            else:
+                _turn_exit_reason = "session_budget_guardrail_stopped"
+                _final_response = "Session budget guardrail stopped before the next provider call."
+                close_interrupted_tool_sequence(messages, _final_response)
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": _final_response,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": False,
+                    "partial": True,
+                    "error": _final_response,
+                }
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -4300,6 +4342,11 @@ def run_conversation(
                             pass
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+                    _session_budget_guardrail.record_usage(
+                        agent,
+                        prompt_tokens=prompt_tokens,
+                        projected_cost_usd=getattr(agent, "session_estimated_cost_usd", 0.0),
+                    )
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
