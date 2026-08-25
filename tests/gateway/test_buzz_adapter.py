@@ -421,6 +421,44 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
 
+    @pytest.mark.asyncio
+    async def test_send_image_file_uses_native_file_flag_and_thread_metadata(self, tmp_path):
+        img = tmp_path / "preview.jpg"
+        img.write_bytes(b"\xff\xd8\xff fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image_file(
+            CHANNEL,
+            str(img),
+            caption="preview",
+            metadata={"thread_id": "root-event"},
+        )
+
+        assert result.success is True
+        args, stdin_text = cli.calls[0]
+        assert args[args.index("--file") + 1] == str(img)
+        assert args[args.index("--reply-to") + 1] == "root-event"
+        assert stdin_text == "preview"
+
+    @pytest.mark.asyncio
+    async def test_send_document_uses_native_file_flag(self, tmp_path):
+        document = tmp_path / "package.zip"
+        document.write_bytes(b"PK fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt128", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document), caption="files")
+
+        assert result.success is True
+        args, stdin_text = cli.calls[0]
+        assert args[args.index("--file") + 1] == str(document)
+        assert stdin_text == "files"
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
