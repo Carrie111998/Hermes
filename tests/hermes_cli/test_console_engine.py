@@ -13,6 +13,37 @@ from hermes_cli.console_engine import (
 )
 
 
+def _stub_run_one_job(monkeypatch, body):
+    """Install a ``cron.scheduler.run_one_job`` stub that honours its real contract.
+
+    Two things a naive ``def _fake(job)`` gets wrong:
+
+    1. SIGNATURE. ``tools/cronjob_tools._execute_job_now`` calls
+       ``run_one_job(job, _dispatch_admission=admission)`` — the kwarg was added
+       by 410c57ddc9 (fail-closed quarantine controls) and these stubs were not
+       updated, so every console ``cron run`` test raised TypeError inside
+       ``_execute_job_now``'s except-handler and reported the job as failed.
+    2. THE ADMISSION HANDOFF. ``_execute_job_now`` sets ``handed_off = True``
+       before the call and stops tracking the admission — releasing it is
+       ``run_one_job``'s job. A stub that accepts the kwarg but drops it leaves
+       ``_DISPATCH_DEPTH.admissions`` pinned and the quarantine store's kernel
+       lock held for the rest of the process, which is a far quieter failure
+       than the TypeError it replaces.
+
+    ``body(job)`` is the per-test behaviour; the release happens either way.
+    """
+
+    def _fake_run_one_job(job, *, _dispatch_admission=None, **_kwargs):
+        try:
+            return body(job)
+        finally:
+            if _dispatch_admission is not None:
+                _dispatch_admission.__exit__(None, None, None)
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+    return _fake_run_one_job
+
+
 EXPECTED_CONSOLE_COMMANDS = {
     ("status",),
     ("doctor",),
@@ -706,13 +737,13 @@ def test_cron_pause_resume_and_run_require_confirmation(
     # Local `cron run` now executes immediately (CLI/LLM parity); stub the real
     # agent-run boundary so this confirmation-flow test doesn't depend on — or
     # attempt — an actual agent execution.
-    def _fake_run_one_job(job):
+    def _run(job):
         from cron.jobs import mark_job_run
 
         mark_job_run(job["id"], True)
         return True
 
-    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+    _stub_run_one_job(monkeypatch, _run)
 
     job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
     engine = HermesConsoleEngine()
@@ -759,7 +790,13 @@ def test_cron_run_attributes_trigger_to_console(
 
     # Local `cron run` executes immediately; stub the agent-run boundary so the
     # attribution assertions don't depend on a real agent execution.
-    monkeypatch.setattr("cron.scheduler.run_one_job", lambda job: True)
+    def _run(job):
+        from cron.jobs import mark_job_run
+
+        mark_job_run(job["id"], True)
+        return True
+
+    _stub_run_one_job(monkeypatch, _run)
 
     job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
     engine = HermesConsoleEngine()
@@ -796,14 +833,14 @@ def test_cron_run_executes_immediately_in_local_context(
     # that it fired and mark the job ok so the console reports success.
     ran: dict = {}
 
-    def _fake_run_one_job(job):
+    def _run(job):
         from cron.jobs import mark_job_run
 
         ran["job_id"] = job["id"]
         mark_job_run(job["id"], True)
         return True
 
-    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+    _stub_run_one_job(monkeypatch, _run)
 
     job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
     engine = HermesConsoleEngine()  # default context == "local"
@@ -836,7 +873,7 @@ def test_cron_run_reports_skip_when_claim_lost_in_local_context(
         "tools.cronjob_tools.claim_job_for_fire", lambda job_id: False
     )
 
-    def _must_not_run(job):
+    def _must_not_run(job, **_kwargs):
         raise AssertionError("run_one_job must not fire when the claim is lost")
 
     monkeypatch.setattr("cron.scheduler.run_one_job", _must_not_run)
@@ -877,14 +914,14 @@ def test_cron_run_executes_in_background_in_hosted_context(
     # (HERMES_HOME env + monkeypatched globals are process-global).
     ran: dict = {}
 
-    def _fake_run_one_job(job):
+    def _run(job):
         from cron.jobs import mark_job_run
 
         ran["job_id"] = job["id"]
         mark_job_run(job["id"], True)
         return True
 
-    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+    _stub_run_one_job(monkeypatch, _run)
 
     # The test owns the background executor so it can join deterministically
     # (no sleeps): shutdown(wait=True) blocks until the fire completes.
@@ -941,7 +978,7 @@ def test_cron_run_hosted_dispatch_is_non_blocking(
     started = threading.Event()
     gate = threading.Event()
 
-    def _blocking_run_one_job(job):
+    def _blocking_run(job):
         from cron.jobs import mark_job_run
 
         started.set()
@@ -950,7 +987,7 @@ def test_cron_run_hosted_dispatch_is_non_blocking(
         mark_job_run(job["id"], True)
         return True
 
-    monkeypatch.setattr("cron.scheduler.run_one_job", _blocking_run_one_job)
+    _stub_run_one_job(monkeypatch, _blocking_run)
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     monkeypatch.setattr(
@@ -1018,7 +1055,7 @@ def test_cron_run_hosted_returns_started_ack_even_when_claim_lost(
         "tools.cronjob_tools.claim_job_for_fire", lambda job_id: False
     )
 
-    def _must_not_run(job):
+    def _must_not_run(job, **_kwargs):
         raise AssertionError("run_one_job must not fire when the claim is lost")
 
     monkeypatch.setattr("cron.scheduler.run_one_job", _must_not_run)
@@ -1074,14 +1111,14 @@ def test_cron_run_hosted_background_fire_inherits_profile_home(
 
     seen: dict = {}
 
-    def _fake_run_one_job(job):
+    def _run(job):
         from cron.jobs import _get_hermes_home, mark_job_run
 
         seen["home"] = str(_get_hermes_home().resolve())
         mark_job_run(job["id"], True)
         return True
 
-    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+    _stub_run_one_job(monkeypatch, _run)
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     monkeypatch.setattr(
