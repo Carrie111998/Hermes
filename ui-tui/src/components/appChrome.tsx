@@ -533,7 +533,13 @@ const cronDaysMatch = (day: number, days: string): boolean => {
       hi = 0
     }
 
-    if (lo <= day && day <= hi) {
+    if (lo <= hi) {
+      if (lo <= day && day <= hi) {
+        return true
+      }
+    } else if (day >= lo || day <= hi) {
+      // Wraparound range (e.g. "5-7" = Fri..Sun): matches the late days and
+      // the early days after the week rolls over.
       return true
     }
   }

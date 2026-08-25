@@ -596,6 +596,14 @@ describe('isInPeakWindow', () => {
     expect(isInPeakWindow(mondayMorning(), '1-5,7', weekdayWindow)).toBe(true)
   })
 
+  it('handles wraparound ranges (5-7 = Fri through Sun)', () => {
+    // 2026-08-22 is a Saturday.
+    const saturdayMorning = () => new Date(Date.UTC(2026, 7, 22, 2, 30))
+    expect(isInPeakWindow(saturdayMorning(), '5-7', weekdayWindow)).toBe(true)
+    expect(isInPeakWindow(sundayMorning(), '5-7', weekdayWindow)).toBe(true)
+    expect(isInPeakWindow(mondayMorning(), '5-7', weekdayWindow)).toBe(false)
+  })
+
   it('ignores malformed times instead of matching', () => {
     expect(isInPeakWindow(mondayMorning(), '1-5', [{ from: 'nope', to: '04:00' }])).toBe(false)
     // Overnight wraparound is unsupported in v1: to <= from is a no-op.
