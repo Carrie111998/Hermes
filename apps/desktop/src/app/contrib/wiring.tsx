@@ -54,9 +54,11 @@ import {
   $profileScope,
   ALL_PROFILES,
   ensureGatewayProfile,
+  type NewChatOwner,
   newSessionInProfile,
   normalizeProfileKey,
-  refreshActiveProfile
+  refreshActiveProfile,
+  setNewChatOwner
 } from '@/store/profile'
 import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
 import {
@@ -126,7 +128,7 @@ import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
-import { startWorkspaceSession } from '../session/workspace-session-target'
+import { handleStartWorkSessionRequest, startWorkspaceSession } from '../session/workspace-session-target'
 import { PluginInstallModal } from '../settings/plugin-install-modal'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
@@ -622,10 +624,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // "branch off into a new worktree" flow keeps the fresh-draft path — it
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
-    (path: null | string, options?: { openTab?: boolean }) => {
+    (path: null | string, options?: { openTab?: boolean; owner?: NewChatOwner }) => {
       setWorkspaceScope('sessions')
 
       if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
+        if (options.owner !== undefined) {
+          setNewChatOwner(options.owner)
+        }
+
         void openNewSessionTile('center', { cwd: path, listed: false })
 
         return
@@ -635,6 +641,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         activeSessionIdRef,
         followActiveSessionCwd,
         onExplicitWorkspace: restoreWorktree,
+        owner: options?.owner,
         path,
         requestGateway,
         startFreshSessionDraft
@@ -655,11 +662,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
-    startSessionInWorkspace(startWorkSessionRequest.path, { openTab: startWorkSessionRequest.openTab })
-
-    if (startWorkSessionRequest.draft) {
-      requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })
-    }
+    handleStartWorkSessionRequest(startWorkSessionRequest, startSessionInWorkspace, draft =>
+      requestComposerInsert(draft, { target: 'main' })
+    )
   }, [startSessionInWorkspace, startWorkSessionRequest])
 
   const composer = useComposerActions({ activeSessionId, currentCwd, requestGateway })

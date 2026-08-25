@@ -18,7 +18,7 @@ import {
   $workspaceCwdOwner,
   workspaceCwdBelongsToSelectedSession
 } from './session'
-import { $focusedRuntimeId, $sessionStates } from './session-states'
+import { $focusedRuntimeId, $focusedStoredSessionId, $sessionStates, knownOwnerForSession } from './session-states'
 import { $workspaceChangeTick } from './workspace-events'
 
 // Live working-tree status for every git surface on screen — the data backbone
@@ -518,9 +518,10 @@ export async function resolveWorktreeRepoPath(): Promise<string> {
 }
 
 export async function openWorktreeDialog(options?: { base?: string; repoPath?: string }): Promise<void> {
+  const owner = knownOwnerForSession($focusedStoredSessionId.get())
   const repoPath = options?.repoPath?.trim() || (await resolveWorktreeRepoPath())
 
   if (repoPath) {
-    $worktreeDialog.set({ base: options?.base, repoPath })
+    $worktreeDialog.set({ base: options?.base, ...(owner ? { owner } : {}), repoPath })
   }
 }

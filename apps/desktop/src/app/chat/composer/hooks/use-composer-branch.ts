@@ -1,6 +1,9 @@
 import { type MutableRefObject, useCallback } from 'react'
 
 import { listRepoBranches, requestStartWorkSession, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
+import { $selectedStoredSessionId } from '@/store/session'
+import type { SessionOwnerScope } from '@/store/session-request-router'
+import { knownOwnerForSession } from '@/store/session-states'
 
 import { useComposerScope } from '../scope'
 
@@ -20,17 +23,38 @@ interface UseComposerBranchOptions {
 export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBranchOptions) {
   const scope = useComposerScope()
 
+  const surfaceOwner = useCallback(() => {
+    if (scope.owner) {
+      return scope.owner
+    }
+
+    const storedSessionId =
+      scope.target === 'main'
+        ? $selectedStoredSessionId.get()
+        : scope.target.startsWith('tile:')
+          ? scope.target.slice('tile:'.length)
+          : null
+
+    return knownOwnerForSession(storedSessionId)
+  }, [scope.owner, scope.target])
+
+  const handOffWorktree = useCallback(
+    (path: string, owner: SessionOwnerScope) => {
+      const text = draftRef.current
+
+      clearDraft()
+      scope.attachments.clear()
+      requestStartWorkSession(path, text, owner ? { owner } : undefined)
+    },
+    [clearDraft, draftRef, scope.attachments]
+  )
+
   // Hand a worktree off to the controller: open a fresh session anchored there,
   // carrying the composer draft as its first turn. Clearing here means the draft
   // travels to the new session instead of getting stashed under this one.
   const openInWorktree = useCallback(
-    (path: string) => {
-      const text = draftRef.current
-      clearDraft()
-      scope.attachments.clear()
-      requestStartWorkSession(path, text)
-    },
-    [clearDraft, draftRef]
+    (path: string) => handOffWorktree(path, surfaceOwner()),
+    [handOffWorktree, surfaceOwner]
   )
 
   // Branch off into a NEW worktree (base = branch name, or current HEAD). A
@@ -39,13 +63,14 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
   const handleBranchOff = useCallback(
     async (branch: string, base?: string) => {
       const repoPath = cwd?.trim()
+      const owner = surfaceOwner()
       const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
 
       if (result) {
-        openInWorktree(result.path)
+        handOffWorktree(result.path, owner)
       }
     },
-    [cwd, openInWorktree]
+    [cwd, handOffWorktree, surfaceOwner]
   )
 
   // Convert an EXISTING branch into a fresh worktree + session (no new branch).
@@ -53,8 +78,10 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
   // anchored there carrying the draft.
   const handleConvertBranch = useCallback(
     async (branch: string, path?: null | string, isDefault?: boolean) => {
+      const owner = surfaceOwner()
+
       if (path?.trim()) {
-        openInWorktree(path)
+        handOffWorktree(path, owner)
 
         return
       }
@@ -63,7 +90,7 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
 
       if (repoPath && isDefault) {
         await switchBranchInRepo(repoPath, branch)
-        openInWorktree(repoPath)
+        handOffWorktree(repoPath, owner)
 
         return
       }
@@ -71,10 +98,10 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const result = repoPath && (await startWorkInRepo(repoPath, { existingBranch: branch }))
 
       if (result) {
-        openInWorktree(result.path)
+        handOffWorktree(result.path, owner)
       }
     },
-    [cwd, openInWorktree]
+    [cwd, handOffWorktree, surfaceOwner]
   )
 
   const handleListBranches = useCallback(async () => {

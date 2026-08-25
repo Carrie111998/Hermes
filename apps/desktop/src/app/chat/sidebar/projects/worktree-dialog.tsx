@@ -153,7 +153,7 @@ export function WorktreeDialog() {
 
   // Give the new worktree to a fresh session, then close the dialog.
   const started = (path: string) => {
-    requestStartWorkSession(path)
+    requestStartWorkSession(path, undefined, state?.owner ? { owner: state.owner } : undefined)
     closeWorktreeDialog()
   }
 

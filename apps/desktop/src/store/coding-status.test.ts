@@ -7,13 +7,16 @@ import {
   $repoStatusByCwd,
   $repoStatusLoading,
   _resetCodingStatusForTests,
+  openWorktreeDialog,
   refreshAllRepoStatuses,
   refreshRepoStatus,
   registerRepoStatusCwd,
   repoChangeKindForPath,
   repoStatusForCwd
 } from './coding-status'
-import { $currentCwd, $selectedStoredSessionId } from './session'
+import { $worktreeDialog } from './projects'
+import { $currentCwd, $selectedStoredSessionId, $sessions, setActiveSessionId } from './session'
+import { $sessionStates } from './session-states'
 
 const sampleStatus: HermesRepoStatus = {
   branch: 'feature/login',
@@ -254,6 +257,78 @@ describe('refreshRepoStatus', () => {
     expect(repoStatusForCwd('/main').get()).toEqual(sampleStatus)
 
     release?.()
+  })
+})
+
+describe('worktree dialog ownership', () => {
+  afterEach(() => {
+    $worktreeDialog.set(null)
+    setActiveSessionId(null)
+    $selectedStoredSessionId.set(null)
+    $sessionStates.set({})
+    $sessions.set([])
+    delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+  })
+
+  it('keeps the owner of the surface that opened it after focus changes', async () => {
+    let resolveProbe!: (status: HermesRepoStatus | null) => void
+
+    stubProbe(
+      () =>
+        new Promise(resolve => {
+          resolveProbe = resolve
+        })
+    )
+    $sessions.set([
+      {
+        connection_id: 'source-itb',
+        ended_at: null,
+        id: 'itb-source',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 1,
+        message_count: 1,
+        model: null,
+        output_tokens: 0,
+        preview: null,
+        profile: 'itb',
+        source: 'desktop',
+        started_at: 1,
+        title: 'ITB source',
+        tool_call_count: 0
+      },
+      {
+        connection_id: 'source-default',
+        ended_at: null,
+        id: 'other-source',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 1,
+        message_count: 1,
+        model: null,
+        output_tokens: 0,
+        preview: null,
+        profile: 'default',
+        source: 'desktop',
+        started_at: 1,
+        title: 'Other source',
+        tool_call_count: 0
+      }
+    ])
+    $selectedStoredSessionId.set('itb-source')
+    setActiveSessionId('runtime-itb')
+    $sessionStates.set({ 'runtime-itb': { cwd: 'C:/repo', storedSessionId: 'itb-source' } as never })
+
+    const opening = openWorktreeDialog()
+
+    $selectedStoredSessionId.set('other-source')
+    resolveProbe(sampleStatus)
+    await opening
+
+    expect($worktreeDialog.get()).toMatchObject({
+      owner: { connectionId: 'source-itb', profile: 'itb' },
+      repoPath: 'C:/repo'
+    })
   })
 })
 

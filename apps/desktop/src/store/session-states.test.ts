@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
+import type * as GatewayModule from '@/store/gateway'
+import { requestGatewayForAgent } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $selectedStoredSessionId, setSessions } from '@/store/session'
+import { $selectedStoredSessionId, setSessionOwnerHint, setSessions } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
   $sessionStates,
@@ -27,6 +29,11 @@ import {
   setSessionTileDelegate,
   setSessionTileWorkspaceScope
 } from '@/store/session-states'
+
+vi.mock('@/store/gateway', async importActual => ({
+  ...(await importActual<typeof GatewayModule>()),
+  requestGatewayForAgent: vi.fn()
+}))
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
@@ -243,6 +250,15 @@ describe('SessionTile workspace scope', () => {
       workspaceMode: 'bots',
       workspaceOwnerKey: 'connection-b::default'
     })
+  })
+
+  it('keeps a regular tile owner route when a plain Sessions focus re-scopes it', () => {
+    const ownerRoute = { connectionId: 'source-a', mode: 'remote' as const, profile: 'worker' }
+
+    openSessionTile('remote-chat', 'center', undefined, undefined, { ownerRoute, workspaceMode: 'sessions' })
+
+    expect(setSessionTileWorkspaceScope('remote-chat', { workspaceMode: 'sessions' })).toBe(false)
+    expect(sessionTileOwnerRoute('remote-chat')).toEqual(ownerRoute)
   })
 
   it('preserves workspace scope while dropping a stale runtime binding', () => {
@@ -571,6 +587,19 @@ describe('sessionTileOwnerRoute', () => {
     expect(sessionTileOwnerRoute('plain')).toBeUndefined()
   })
 
+  it('persists an exact route for a regular session tile when one is known', () => {
+    openSessionTile('remote-plain', 'center', undefined, undefined, {
+      ownerRoute: { connectionId: 'source-a', mode: 'remote', profile: 'worker' },
+      workspaceMode: 'sessions'
+    })
+
+    expect(sessionTileOwnerRoute('remote-plain')).toEqual({
+      connectionId: 'source-a',
+      mode: 'remote',
+      profile: 'worker'
+    })
+  })
+
   it('returns undefined when the session has no tile', () => {
     $sessionTiles.set([])
 
@@ -588,6 +617,7 @@ describe('knownOwnerForSession / requestForOwnedSession (#91684 client half)', (
   afterEach(() => {
     $sessionTiles.set([])
     setSessions([])
+    vi.mocked(requestGatewayForAgent).mockReset()
   })
 
   it('resolves the tile owner route first, translating a runtime id to its stored id', () => {
@@ -607,6 +637,48 @@ describe('knownOwnerForSession / requestForOwnedSession (#91684 client half)', (
     setSessions([{ id: 'stored-2', profile: 'loki' } as never])
 
     expect(knownOwnerForSession('stored-2')).toBe('loki')
+  })
+
+  it('preserves a unique connection-qualified session row owner', () => {
+    setSessions([{ connection_id: 'source-a', id: 'stored-remote', profile: 'worker' } as never])
+
+    expect(knownOwnerForSession('stored-remote')).toEqual({ connectionId: 'source-a', profile: 'worker' })
+  })
+
+  it('routes an ordinary connection-qualified session through its exact owner', async () => {
+    const params = { choice: 'once', session_id: 'runtime-remote' }
+    const ambient = vi.fn()
+
+    setSessions([{ connection_id: 'source-a', id: 'stored-remote', profile: 'worker' } as never])
+    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({ ok: true } as never)
+
+    await requestForOwnedSession('stored-remote', ambient as never, 'approval.respond', params)
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'worker', 'approval.respond', params)
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('preserves a unique exact owner hint including its backend target', () => {
+    const route = {
+      connectionId: 'source-b',
+      mode: 'remote' as const,
+      profile: 'worker',
+      targetProfile: 'backend-worker'
+    }
+
+    setSessionOwnerHint('stored-hinted', route)
+    setSessions([{ connection_id: 'source-b', id: 'stored-hinted', profile: 'worker' } as never])
+
+    expect(knownOwnerForSession('stored-hinted')).toEqual(route)
+  })
+
+  it('fails closed when the same stored id has conflicting connection owners', () => {
+    setSessions([
+      { connection_id: 'source-a', id: 'stored-ambiguous', profile: 'worker' } as never,
+      { connection_id: 'source-b', id: 'stored-ambiguous', profile: 'worker' } as never
+    ])
+
+    expect(knownOwnerForSession('stored-ambiguous')).toBeUndefined()
   })
 
   it('returns undefined (ambient) when no owner is known, and for null ids', () => {
