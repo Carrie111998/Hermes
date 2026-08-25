@@ -4,6 +4,14 @@ export const REMOTE_LIVENESS_FAILURE_LIMIT = 3
 // about 48s apart (ticket mint + socket open + backoff + the next status probe).
 // One minute keeps a continuous outage together without carrying old failures.
 export const REMOTE_LIVENESS_FAILURE_WINDOW_MS = 60_000
+// Pooled remote descriptors are probed only by the revalidation tick, which
+// runs on a multi-minute cadence (observed ~4 min apart in #94381). The
+// primary's 60s window above is shorter than that tick, so sharing it resets
+// the failure streak on every probe and a dead pooled descriptor is never
+// retired (#94381). Ten minutes is ~2.5× the observed tick: three consecutive
+// tick failures accumulate, while a probe-free gap (e.g. app sleep) still
+// decays a stale streak exactly as the primary policy does.
+export const REMOTE_LIVENESS_POOLED_FAILURE_WINDOW_MS = 10 * 60_000
 
 export interface RemoteLivenessFailure {
   failures: number
@@ -117,6 +125,15 @@ export class RemoteLivenessTracker {
   }
 }
 
+// Default policy for pooled remote descriptors: the tick-tolerant window above,
+// keyed per base URL and independent of the primary connection's 60s-window
+// tracker. Passing the primary tracker here would reset the streak on every
+// tick-spaced probe and permanently keep a dead descriptor pooled (#94381).
+const pooledRemoteLiveness = new RemoteLivenessTracker(
+  REMOTE_LIVENESS_FAILURE_LIMIT,
+  REMOTE_LIVENESS_POOLED_FAILURE_WINDOW_MS
+)
+
 export interface PooledRemoteEntry<TConnection extends RemoteConnectionDescriptor = RemoteConnectionDescriptor> {
   connectionPromise?: null | Promise<TConnection>
   process?: unknown
@@ -128,7 +145,14 @@ export interface RevalidatePooledRemoteBackendsOptions<TConnection extends Remot
   log: (message: string) => void
   probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
   stopBackend: (profile: string) => void
-  tracker: RemoteLivenessTracker
+  /**
+   * Failure policy for the pooled entries. Defaults to a tick-tolerant tracker
+   * (REMOTE_LIVENESS_POOLED_FAILURE_WINDOW_MS): pooled probes arrive on a
+   * multi-minute revalidation tick, so the primary connection's 60s window
+   * would reset the streak on every probe and never retire a dead descriptor
+   * (#94381). Pass on only to share an explicit policy.
+   */
+  tracker?: RemoteLivenessTracker
 }
 
 /**
@@ -139,15 +163,19 @@ export interface RevalidatePooledRemoteBackendsOptions<TConnection extends Remot
  * keepalive touch keeps the idle reaper off it. Without this the pool serves a
  * descriptor for an unreachable host indefinitely.
  *
- * Entries share the primary's failure policy, keyed per base URL, so a profile
- * pointing at the same host as another does not burn the streak twice as fast.
+ * Failure streaks are keyed per base URL, so profiles pointing at the same host
+ * share one budget instead of burning the pool three times as fast. The
+ * default policy uses the pooled failure window (see above): the window is
+ * sized to the revalidation tick, not the primary connection's 60s window,
+ * because tick-spaced probes must accumulate into a streak for #72835's
+ * retirement path to ever fire.
  */
 export async function revalidatePooledRemoteBackends<TConnection extends RemoteConnectionDescriptor>({
   entries,
   log,
   probe,
   stopBackend,
-  tracker
+  tracker = pooledRemoteLiveness
 }: RevalidatePooledRemoteBackendsOptions<TConnection>): Promise<{ dropped: string[] }> {
   const remotes = [...entries].filter(([, entry]) => !entry.process && entry.remoteBaseUrl)
   const dropped: string[] = []

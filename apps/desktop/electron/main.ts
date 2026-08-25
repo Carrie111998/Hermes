@@ -12605,13 +12605,16 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 // Pooled remote descriptors get the same treatment as the primary: they have no
 // child process to signal their host's death, and the renderer's keepalive touch
 // spares them from the idle reaper, so nothing else can retire a dead one.
+// The pooled path owns its own failure policy (#94381): revalidation probes
+// are tick-spaced (multi-minute), far outside the primary connection's 60s
+// failure window, so sharing `remoteLiveness` would reset the streak on every
+// probe and never drop the stale descriptor.
 function revalidatePool() {
   return revalidatePooledRemoteBackends({
     entries: backendPool.entries(),
     log: rememberLog,
     probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
-    stopBackend: stopPoolBackend,
-    tracker: remoteLiveness
+    stopBackend: stopPoolBackend
   })
 }
 
