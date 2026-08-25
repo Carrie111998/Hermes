@@ -2,8 +2,11 @@
 
 Two caches, both TTL-bounded (default 20 minutes, ``web.cache_ttl_minutes``):
 
-* **Search memo** — in-memory, per-process. Keyed by (provider, normalized
-  query, bucketed limit). Concurrent identical queries are single-flighted:
+* **Search memo** — in-memory, per-process. Keyed by (profile, provider,
+  normalized query, bucketed limit) — the profile component keeps a
+  multiplexed gateway serving several profiles from one process from
+  handing one profile's cached results (and paid-provider attribution) to
+  another. Concurrent identical queries are single-flighted:
   the first caller performs the paid request while the rest wait and share
   the response. Requested limits are bucketed up to 10/20/50/100 so
   near-identical requests (limit=5 vs limit=8) share one entry; callers get
@@ -111,7 +114,13 @@ class SearchMemo:
         self._key_locks: Dict[tuple, threading.Lock] = {}
 
     def _key(self, provider: str, query: str, limit: int) -> tuple:
-        return (provider, normalize_query(query), bucket_limit(limit))
+        # Scope by profile: this store is a process-global singleton, but a
+        # multiplexed gateway serves several profiles from one process, each
+        # with its own provider credentials. Without the profile component,
+        # profile B's query would silently hit profile A's cached response
+        # within the TTL — content A paid its own provider account for.
+        from hermes_constants import hermes_home_key
+        return (hermes_home_key(), provider, normalize_query(query), bucket_limit(limit))
 
     def lookup(self, provider: str, query: str, limit: int) -> Optional[dict]:
         if not cache_enabled():
