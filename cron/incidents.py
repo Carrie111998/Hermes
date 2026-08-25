@@ -5,10 +5,15 @@ groups the *failures* into durable incidents keyed by ``(job_id, error
 signature)`` so the same job failing with the same error does not re-ping the
 operator every run once they have acknowledged it.
 
-Lifecycle: ``detected`` → ``alerted`` → ``reviewed`` → ``closed``. Closing
+Lifecycle: ``detected`` → ``alerted`` → ``closed``. Closing
 (acking) an incident is per-signature: the same job + same normalized error
 keeps resolving to the SAME incident id, so a closed incident stays closed (no
 re-alert) until the error text changes, which mints a brand-new incident.
+``detected`` means the failure was recorded; ``alerted`` means at least one
+failure ping for the signature actually reached the operator. Richer states
+(e.g. a dv9.6 ``reviewed``) are deliberately NOT reserved here — state
+validity lives in ``INCIDENT_STATES`` (Python), not a SQLite CHECK, exactly
+so a future slice can add states without a table rebuild.
 
 Incidents live in the SAME ``cron/executions.db`` as ``cron.executions`` so
 there is one durable cron store per profile. The schema is lazily created on
@@ -31,7 +36,7 @@ from hermes_time import now as _hermes_now
 # Optional test override (mirrors ``cron.executions.EXECUTIONS_FILE``).
 EXECUTIONS_FILE: Optional[Path] = None
 
-INCIDENT_STATES = ("detected", "alerted", "reviewed", "closed")
+INCIDENT_STATES = ("detected", "alerted", "closed")
 _FAILURE_TYPE_ORDER = (
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
@@ -85,8 +90,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              id            TEXT PRIMARY KEY,
              job_id        TEXT NOT NULL,
              error_sig     TEXT NOT NULL,
-             state         TEXT NOT NULL CHECK(state IN
-                           ('detected','alerted','reviewed','closed')),
+             state         TEXT NOT NULL,
              failure_type  TEXT NOT NULL DEFAULT 'unknown',
              first_seen_at TEXT NOT NULL,
              last_seen_at  TEXT NOT NULL,
@@ -217,10 +221,9 @@ def upsert_incident(
 def set_incident_state(incident_id: str, state: str) -> bool:
     """Transition an incident's lifecycle state; return whether it changed.
 
-    ``closed``/``reviewed`` may only be reached from a non-closed state — a
-    closed (acked) incident is terminal for that signature (re-open happens by
-    the error changing and minting a NEW incident). Unknown states are
-    rejected (no-op, ``False``).
+    ``closed`` is terminal for that signature: no transition (including back
+    to ``alerted``) leaves it — re-open happens by the error changing and
+    minting a NEW incident. Unknown states are rejected (no-op, ``False``).
     """
     if state not in INCIDENT_STATES:
         return False
@@ -231,7 +234,7 @@ def set_incident_state(incident_id: str, state: str) -> bool:
         ).fetchone()
         if row is None or row["state"] == state:
             return False
-        if state in ("closed", "reviewed") and row["state"] == "closed":
+        if row["state"] == "closed":
             return False
         if state == "closed":
             conn.execute(

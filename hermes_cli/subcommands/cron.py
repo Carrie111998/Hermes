@@ -290,7 +290,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_incidents.add_argument(
         "--state",
-        choices=["detected", "alerted", "reviewed", "closed"],
+        choices=["detected", "alerted", "closed"],
         help="Filter incidents by lifecycle state",
     )
     cron_incidents.add_argument(

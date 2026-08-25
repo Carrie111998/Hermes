@@ -165,14 +165,13 @@ def test_lifecycle_transitions(monkeypatch, tmp_path):
 
     assert inc.get_incident(inc_id)["state"] == "detected"
     assert inc.set_incident_state(inc_id, "alerted") is True
-    assert inc.set_incident_state(inc_id, "reviewed") is True
     assert inc.set_incident_state(inc_id, "closed") is True
     row = inc.get_incident(inc_id)
     assert row["state"] == "closed"
     assert row["acked_at"] and row["closed_at"]
 
     # Closed is terminal for that signature: no re-open, no re-transition.
-    assert inc.set_incident_state(inc_id, "reviewed") is False
+    assert inc.set_incident_state(inc_id, "alerted") is False
     assert inc.set_incident_state(inc_id, "closed") is False
     assert inc.ack_incident(inc_id) is False
     assert inc.get_incident(inc_id)["state"] == "closed"
@@ -257,12 +256,30 @@ def test_ack_suppresses_alert_until_signature_changes(monkeypatch, tmp_path):
         assert inc.count_incidents() == 2
 
 
+def test_mark_incident_alerted_sets_state_never_resurrects(monkeypatch, tmp_path):
+    """The post-delivery 'alerted' transition records that a ping went out,
+    and is a no-op on a closed (acked) incident — it can never resurrect one."""
+    inc = _point_db(monkeypatch, tmp_path)
+
+    inc_id, _ = inc.upsert_incident("job-1", "boom")
+    sched._mark_incident_alerted(inc_id)
+    assert inc.get_incident(inc_id)["state"] == "alerted"
+
+    inc.ack_incident(inc_id)
+    sched._mark_incident_alerted(inc_id)
+    assert inc.get_incident(inc_id)["state"] == "closed"
+
+    # Best-effort: bad/missing ids never raise.
+    sched._mark_incident_alerted(None)
+    sched._mark_incident_alerted("nonexistent")
+
+
 def test_best_effort_incident_store_failure_returns_false(monkeypatch, tmp_path):
     """An incident-store error must never break the cron delivery path."""
     _point_db(monkeypatch, tmp_path)
     with patch("cron.incidents.upsert_incident",
                side_effect=RuntimeError("db locked")):
-        assert sched._upsert_incident_for_failure(_job(), "boom") is False
+        assert sched._upsert_incident_for_failure(_job(), "boom") == (False, None)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
