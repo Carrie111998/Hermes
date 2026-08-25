@@ -616,6 +616,33 @@ def test_sanitize_drops_result_with_no_preceding_call():
     assert [m for m in out if m.get("role") == "tool"] == []
 
 
+def test_sanitize_preserves_leading_tool_row_with_no_usable_id():
+    """A leading ``role=tool`` row with no usable id is preserved opaquely.
+
+    The positional pairing pass is only entered from an assistant message, so a
+    leading id-less tool row is handled by the outer loop's non-assistant branch
+    and never reaches the ``batches[-1]`` append — it must not raise IndexError
+    and must survive verbatim. Regression guard against the false-positive
+    crash concern raised on PR #94731.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "tool", "tool_call_id": "", "content": "legacy no-id row"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    # The id-less legacy row survives opaquely (not treated as an orphan).
+    assert any(
+        m.get("role") == "tool" and m.get("content") == "legacy no-id row"
+        for m in out
+    )
+
+
 def test_sanitize_drops_empty_tool_calls_array():
     """sanitize_api_messages strips ``tool_calls: []`` from assistant messages.
 
