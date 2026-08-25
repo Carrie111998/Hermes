@@ -441,6 +441,7 @@ function findPendingClarifyLocation(
 ): PendingClarifyLocation | null {
   const stableId = toolId(payload)
   const matchValues = toolPayloadMatchValues(payload)
+  const requestId = toolPayloadRequestId(payload)
   let solePending: PendingClarifyLocation | null = null
   let pendingCount = 0
 
@@ -451,6 +452,15 @@ function findPendingClarifyLocation(
       const part = message.parts[partIndex]
 
       if (part.type !== 'tool-call' || part.toolName !== 'clarify' || part.result !== undefined) {
+        continue
+      }
+
+      const partRequestId = toolPartRequestId(part)
+
+      // An already-bound row belongs to that exact request. Identical question
+      // text can recur, so a newer clarify.request must create/re-arm its own
+      // row instead of stealing the older card.
+      if (requestId && partRequestId && requestId !== partRequestId) {
         continue
       }
 
@@ -592,13 +602,29 @@ export function restorePendingClarifyToolCall(
 
   if (location) {
     const message = messages[location.messageIndex]
+    const part = message.parts[location.partIndex]
+    const requestId = toolPayloadRequestId(clarifyPayload)
+    const currentRequestId = toolPartRequestId(part)
+    const mustBindRequest = Boolean(requestId && requestId !== currentRequestId && part.type === 'tool-call')
 
-    if (message.pending) {
+    if (message.pending && !mustBindRequest) {
       return { messages, streamId: message.id }
     }
 
+    const parts = mustBindRequest
+      ? message.parts.map((candidate, index) =>
+          index === location.partIndex && candidate.type === 'tool-call'
+            ? {
+                ...candidate,
+                args: { ...parseMaybeJsonObject(candidate.args), request_id: requestId },
+                argsText: JSON.stringify({ ...parseMaybeJsonObject(candidate.args), request_id: requestId })
+              }
+            : candidate
+        )
+      : message.parts
+
     const next = [...messages]
-    next[location.messageIndex] = { ...message, pending: true }
+    next[location.messageIndex] = { ...message, parts, pending: true }
 
     return { messages: next, streamId: message.id }
   }

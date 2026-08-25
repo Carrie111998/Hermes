@@ -90,16 +90,18 @@ export function pendingClarifyToolPayload(request: ClarifyRequest): GatewayEvent
   return {
     args: request.questions?.length
       ? {
+          request_id: request.requestId,
           questions: request.questions.map(question => ({
             choices: question.choices ?? undefined,
-            multi_select: question.multiSelect || undefined,
+            ...(question.multiSelect ? { multi_select: true } : {}),
             question: question.question
           }))
         }
       : {
           choices: request.choices ?? [],
           ...(request.multiSelect ? { multi_select: true } : {}),
-          question: request.question
+          question: request.question,
+          request_id: request.requestId
         },
     tool_id: request.toolCallId ?? request.requestId
   }

@@ -176,7 +176,8 @@ describe('pendingClarifyToolPayload', () => {
       })
     ).toEqual({
       args: {
-        questions: [{ choices: ['Yes', 'No'], question: 'Proceed?' }]
+        questions: [{ choices: ['Yes', 'No'], question: 'Proceed?' }],
+        request_id: 'rid'
       },
       tool_id: 'rid'
     })

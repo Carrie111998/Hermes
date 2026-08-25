@@ -292,20 +292,19 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
 }
 
 function ClarifyToolLive(props: ToolCallMessagePartProps) {
-  const messageRunning = useAuiState(selectMessageRunning)
   const sessionId = useStore(useSessionView().$runtimeId)
   const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
   const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
   const requestMatches = Boolean(request && fromArgs.requestId && fromArgs.requestId === request.requestId)
 
-  // A hydrated message may already be marked complete while the gateway still
-  // owns this exact live request. Whenever a request is present, require its
-  // exact identity even while the message is running: question text is not an
-  // identity and duplicate old cards must stay inert. The sole exception is
-  // the brief tool.start -> clarify.request race, where no request exists yet;
-  // the running card may mount its non-interactive spinner until it arrives.
-  if (!requestMatches && (request || !messageRunning)) {
+  // Whenever a request is present, require its exact identity even while the
+  // message is running: question text is not an identity and duplicate old
+  // cards must stay inert. With no request, leave the decision to
+  // ClarifyToolPending: it owns the submit latch that keeps an answered card
+  // mounted through the request-clear -> tool.complete gap, and demotes an
+  // unanswered stopped card itself.
+  if (request && !requestMatches) {
     return <ToolFallback {...props} />
   }
 
