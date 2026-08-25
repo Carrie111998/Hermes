@@ -109,6 +109,12 @@ const FIELD_COPY: Record<string, { advanced?: boolean }> = {
   QQ_ALLOW_ALL_USERS: { advanced: true },
   QQBOT_HOME_CHANNEL: { advanced: true },
   QQBOT_HOME_CHANNEL_NAME: { advanced: true },
+  ONEBOT_WS_MODE: { advanced: true },
+  ONEBOT_WS_LISTEN: { advanced: true },
+  ONEBOT_ACCESS_TOKEN: { advanced: true },
+  ONEBOT_GROUP_ALLOW_FROM: { advanced: true },
+  ONEBOT_REQUIRE_AT: { advanced: true },
+  ONEBOT_HOME_CHANNEL: { advanced: true },
   WHATSAPP_ENABLED: { advanced: true },
   WHATSAPP_MODE: { advanced: true }
 }

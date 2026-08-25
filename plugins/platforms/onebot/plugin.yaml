@@ -1,0 +1,48 @@
+name: onebot-platform
+label: OneBot 11 (QQ)
+kind: platform
+version: 0.1.0
+description: >-
+  QQ gateway adapter for Hermes Agent via the OneBot v11 protocol
+  (NapCat, Lagrange, go-cqhttp).
+author: Nous Research
+# ``requires_env`` entries are surfaced in ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+requires_env:
+  - name: ONEBOT_WS_URL
+    description: "OneBot WebSocket URL (forward mode), e.g. ws://127.0.0.1:3001"
+    prompt: "OneBot WebSocket URL"
+    password: false
+  - name: ONEBOT_HTTP_URL
+    description: "OneBot HTTP API URL, e.g. http://127.0.0.1:3000"
+    prompt: "OneBot HTTP API URL"
+    password: false
+optional_env:
+  - name: ONEBOT_WS_MODE
+    description: "Connection mode: forward (default) or backward"
+    prompt: "Connection mode (forward/backward)"
+    password: false
+  - name: ONEBOT_WS_LISTEN
+    description: "Listen address for backward mode"
+    prompt: "Backward WS listen address"
+    password: false
+  - name: ONEBOT_ACCESS_TOKEN
+    description: "Access token if enabled on the framework"
+    prompt: "OneBot access token"
+    password: true
+  - name: ONEBOT_ALLOW_FROM
+    description: "Allowed QQ user IDs (comma-separated). Empty = deny all."
+    prompt: "Allowed QQ user IDs"
+    password: false
+  - name: ONEBOT_GROUP_ALLOW_FROM
+    description: "Allowed group IDs (comma-separated). Empty = deny all groups."
+    prompt: "Allowed group IDs"
+    password: false
+  - name: ONEBOT_REQUIRE_AT
+    description: "Require @mention to respond in groups (default: true)"
+    prompt: "Require @ in groups?"
+    password: false
+  - name: ONEBOT_HOME_CHANNEL
+    description: "QQ user ID for cron / notification delivery"
+    prompt: "Home QQ user ID"
+    password: false
