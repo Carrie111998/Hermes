@@ -271,7 +271,7 @@ import {
   type RegistrySessionSource,
   spliceRegistrySessionRows
 } from './profile-session-routing'
-import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import { createQuickEntryShortcut, hasQuickEntryFlag, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
@@ -12213,10 +12213,15 @@ function spawnQuickEntryWindow() {
   // resurrect itself over the app, but its loss belongs in desktop.log.
   installWindowRendererLifecycle(win, { kind: 'quick', callbacks: { log: rememberLog } })
 
-  // Hide on blur. The window must never hold the user's focus captive — losing
-  // focus is the cheapest, least surprising dismiss (matches Spotlight).
+  // Hide on blur on X11/macOS. On Wayland, Electron can emit blur immediately
+  // after `show()` because niri does not grant focus to this always-on-top
+  // helper window; hiding there makes Quick Entry appear for a moment and then
+  // vanish before the user can type.
+  const waylandSession =
+    process.platform === 'linux' &&
+    (process.env.XDG_SESSION_TYPE === 'wayland' || Boolean(process.env.WAYLAND_DISPLAY))
   win.on('blur', () => {
-    if (!win.isDestroyed()) {
+    if (!waylandSession && !win.isDestroyed()) {
       win.hide()
     }
   })
@@ -15424,8 +15429,20 @@ if (!isPrimaryInstance) {
   app.on('second-instance', (_event, argv) => {
     const url = _extractDeepLink(argv)
 
+    // Deep link first: an argv that carries both a URL and the quick-entry flag
+    // must not drop the link. (Practically unreachable — the compositor command
+    // is fixed — but ordering by precedence here costs nothing.)
     if (url) {
       handleDeepLink(url)
+    }
+
+    // niri/Wayland workaround: wlroots compositors do not implement the
+    // GlobalShortcuts portal, so the OS-level quick-entry shortcut never
+    // fires. Bind it in the compositor instead and route here:
+    // `hermes desktop --quick-entry`.
+    if (hasQuickEntryFlag(argv)) {
+      toggleQuickEntryWindow()
+      return
     }
 
     ensureMainWindow(mainWindow, {
@@ -15497,6 +15514,14 @@ app.whenReady().then(() => {
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
   applyQuickEntrySettings(readQuickEntrySettings())
+
+  // niri/Wayland workaround (see 'second-instance' above): a cold start with
+  // the --quick-entry flag opens the floating composer immediately. This is
+  // show, not toggle, on purpose — there is no prior window to toggle away on
+  // a fresh launch; don't "unify" the two call sites.
+  if (hasQuickEntryFlag(process.argv)) {
+    showQuickEntryWindow()
+  }
 
   if (IS_MAC) {
     const reposition = () => wakeIndicatorController.reposition()

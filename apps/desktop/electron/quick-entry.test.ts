@@ -4,6 +4,7 @@ import {
   createQuickEntryShortcut,
   DEFAULT_QUICK_ENTRY_SHORTCUT,
   type GlobalShortcutLike,
+  hasQuickEntryFlag,
   parseQuickEntryShortcut,
   quickEntryWindowBounds,
   sanitizeQuickEntrySettings
@@ -236,5 +237,23 @@ describe('quickEntryWindowBounds', () => {
 
   it('falls back to the origin without a work area', () => {
     expect(quickEntryWindowBounds()).toEqual({ height: 168, width: 640, x: 0, y: 0 })
+  })
+})
+
+describe('hasQuickEntryFlag', () => {
+  it('detects the compositor-keybind summon flag', () => {
+    expect(hasQuickEntryFlag(['Hermes', '--quick-entry'])).toBe(true)
+    expect(hasQuickEntryFlag(['Hermes', '--quick-entry', '--source'])).toBe(true)
+  })
+
+  it('accepts the --quick-entry=<value> form Electron passes through verbatim', () => {
+    expect(hasQuickEntryFlag(['Hermes', '--quick-entry=1'])).toBe(true)
+    expect(hasQuickEntryFlag(['--quick-entry=true'])).toBe(true)
+  })
+
+  it('ignores other argv and empty argv', () => {
+    expect(hasQuickEntryFlag(['Hermes'])).toBe(false)
+    expect(hasQuickEntryFlag(['--quick'])).toBe(false)
+    expect(hasQuickEntryFlag([])).toBe(false)
   })
 })

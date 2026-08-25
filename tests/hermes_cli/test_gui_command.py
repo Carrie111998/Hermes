@@ -57,6 +57,7 @@ def _ns(**kw):
         ignore_existing=False,
         hermes_root=None,
         cwd=None,
+        quick_entry=False,
     )
     defaults.update(kw)
     return argparse.Namespace(**defaults)
@@ -130,6 +131,34 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
     assert mock_run.call_args_list[1].args[0] == [str(packaged_exe)]
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
+
+
+def test_gui_quick_entry_flag_forwards_to_packaged_exe(tmp_path, monkeypatch):
+    """`hermes desktop --quick-entry` must reach the Electron binary as a real
+    argv element so the single-instance handler can summon the floating
+    composer. Without this, the wrapper rejects the unknown flag entirely and
+    wlroots/Wayland users have no compositor-keybind path at all."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+
+    pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe), "--quick-entry"], 0)
+
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=pack_ok), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
+         patch("hermes_cli.main._register_linux_desktop_entry"), \
+         patch("hermes_cli.main.subprocess.run", side_effect=[pack_ok, launch_ok]) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(quick_entry=True))
+
+    assert exc.value.code == 0
+    launch_args = mock_run.call_args_list[1].args[0]
+    assert launch_args == [str(packaged_exe), "--quick-entry"]
 
 
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
