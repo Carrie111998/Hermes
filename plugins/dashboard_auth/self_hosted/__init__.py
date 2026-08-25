@@ -611,14 +611,27 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
     def _verify_id_token(self, id_token: str) -> Dict[str, Any]:
         import jwt  # lazy import — keeps startup fast for the ungated path
 
+        # Reject tokens that are not even structurally valid JWTs before any
+        # discovery/JWKS I/O. PyJWKClient otherwise reports some malformed
+        # inputs as lookup failures, which makes middleware misclassify a bad
+        # bearer as a retryable provider outage (503 instead of 401).
+        try:
+            header = jwt.get_unverified_header(id_token)
+        except jwt.InvalidTokenError as exc:
+            raise InvalidCodeError("ID token is malformed") from exc
+        if header.get("alg") not in _ALLOWED_ID_TOKEN_ALGS:
+            raise InvalidCodeError("ID token uses an unsupported algorithm")
+
         disco = self._get_discovery()
 
         try:
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 id_token
             )
-        except jwt.PyJWKClientError as exc:
+        except jwt.PyJWKClientConnectionError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
+        except jwt.PyJWKClientError as exc:
+            raise InvalidCodeError("ID token signing key is unknown") from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 
@@ -653,7 +666,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 )
             except Exception:
                 pass
-            raise ProviderError(
+            raise InvalidCodeError(
                 f"ID token verification failed: {exc}{details}"
             ) from exc
 

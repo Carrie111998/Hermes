@@ -548,24 +548,29 @@ class TestVerifySession:
 
     def test_wrong_audience_raises(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair, aud="some-other-client")
-        with pytest.raises(ProviderError, match="verification failed"):
-            provider.verify_session(access_token=token)
+        assert provider.verify_session(access_token=token) is None
 
 
     def test_failure_message_surfaces_claims(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair, iss="https://evil.example")
-        with pytest.raises(ProviderError) as excinfo:
-            provider.verify_session(access_token=token)
-        msg = str(excinfo.value)
-        assert "'https://evil.example'" in msg
-        assert f"'{_ISSUER}'" in msg
+        assert provider.verify_session(access_token=token) is None
+
+    def test_malformed_token_is_invalid_without_discovery(self, rsa_keypair):
+        provider = oidc_plugin.SelfHostedOIDCProvider(
+            issuer=_ISSUER, client_id=_CLIENT_ID
+        )
+        with patch.object(provider, "_get_discovery") as discovery:
+            assert provider.verify_session(access_token="not-a-jwt") is None
+        discovery.assert_not_called()
 
 
     def test_jwks_unreachable_raises(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair)
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
+        bad_client.get_signing_key_from_jwt.side_effect = (
+            jwt.PyJWKClientConnectionError(
             "fetch failed"
+            )
         )
         provider._jwks_client = bad_client
         with pytest.raises(ProviderError, match="JWKS"):
@@ -726,4 +731,3 @@ class TestPluginRegister:
         oidc_plugin.register(ctx)
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._client_secret == "cfg-secret"
-

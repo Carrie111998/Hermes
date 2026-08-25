@@ -251,8 +251,8 @@ async def auth_login(request: Request, provider: str, next: str = ""):
 # ---------------------------------------------------------------------------
 
 
-def _validate_loopback_redirect_uri(raw: str) -> str:
-    """Return ``raw`` if it is a safe loopback redirect_uri, else raise.
+def _validate_native_redirect_uri(request: Request, raw: str) -> str:
+    """Return ``raw`` if it is an accepted native redirect, else raise.
 
     RFC 8252 §7.3 restricts native-app redirects to the loopback interface.
     We accept only ``http://127.0.0.1[:port]/...`` and ``http://[::1][:port]/...``
@@ -264,27 +264,29 @@ def _validate_loopback_redirect_uri(raw: str) -> str:
     authorize`` (a public route) turn the gateway's authenticated callback
     into an open redirect that leaks a live authorization code to an
     arbitrary origin — so this check is a security boundary, not ergonomics.
+    Operators may additionally configure exact private-use installed-app
+    callbacks. Those values are validated once before the server starts and
+    kept as an immutable set on app state. Request matching is byte-for-byte;
+    no scheme-only, prefix, suffix, or normalised matching is permitted.
     """
-    from urllib.parse import urlparse
-
     if not raw:
         raise HTTPException(status_code=400, detail="redirect_uri required")
-    parsed = urlparse(raw)
-    if parsed.scheme != "http":
-        raise HTTPException(
-            status_code=400,
-            detail="native redirect_uri must be http:// on the loopback interface",
-        )
-    host = (parsed.hostname or "").lower()
-    if host not in ("127.0.0.1", "::1"):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "native redirect_uri host must be a loopback IP literal "
-                "(127.0.0.1 / ::1)"
-            ),
-        )
-    return raw
+    from hermes_cli.dashboard_auth.native_redirects import (
+        is_allowed_native_redirect_uri,
+    )
+
+    configured = getattr(
+        request.app.state, "native_redirect_uris", frozenset()
+    )
+    if is_allowed_native_redirect_uri(raw, configured):
+        return raw
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "native redirect_uri must use a loopback IP literal "
+            "(127.0.0.1 / ::1) or an exact configured private-use callback"
+        ),
+    )
 
 
 @router.get("/auth/native/authorize", name="auth_native_authorize")
@@ -323,7 +325,7 @@ async def auth_native_authorize(
         )
     if not code_challenge:
         raise HTTPException(status_code=400, detail="code_challenge required")
-    _validate_loopback_redirect_uri(redirect_uri)
+    _validate_native_redirect_uri(request, redirect_uri)
 
     # Resolve the provider. With exactly one brokerable session provider
     # registered (the common hosted case) an empty ``provider`` selects it,
@@ -1021,7 +1023,7 @@ async def auth_native_token(request: Request, body: _NativeTokenBody):
 
 class _NativeRefreshBody(BaseModel):
     refresh_token: str
-    provider: str = ""
+    provider: str
 
 
 @router.post("/auth/native/refresh", name="auth_native_refresh")
@@ -1030,39 +1032,39 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
 
     The desktop owns its refresh token (OS keychain) rather than a cookie, so
     it rotates here instead of relying on the gate's transparent cookie
-    rotation. Mirrors the middleware's ``_attempt_refresh`` provider stacking:
-    tries each session provider until one rotates the token, returning the new
-    access/refresh pair **in the JSON body**.
+    rotation. The provider returned by token redemption is authoritative: the
+    refresh token is sent to that provider only and never probed against other
+    configured providers.
 
     Failure modes:
-      * every provider rejects the RT (dead/expired/reuse-detected) → 401
+      * the named provider rejects the RT (dead/expired/reuse-detected) → 401
         ``session_expired`` so the desktop starts a fresh native login;
-      * a provider's IDP is unreachable and none rotated → 503.
+      * the named provider's IDP is unreachable → 503.
     """
-    from hermes_cli.dashboard_auth import list_session_providers
     from hermes_cli.dashboard_auth.base import RefreshExpiredError
 
     if not body.refresh_token:
         raise HTTPException(status_code=400, detail="refresh_token required")
+    if not body.provider:
+        raise HTTPException(status_code=400, detail="provider required")
 
-    providers = list_session_providers()
-    if body.provider:
-        providers.sort(key=lambda p: p.name != body.provider)
-
-    unreachable: str | None = None
-    for provider in providers:
-        try:
-            session = provider.refresh_session(refresh_token=body.refresh_token)
-        except RefreshExpiredError:
-            continue
-        except ProviderError as e:
-            if unreachable is None:
-                unreachable = provider.name
-            _log.warning(
-                "dashboard-auth: provider %r unreachable during native refresh: %s",
-                provider.name, e,
-            )
-            continue
+    provider = get_provider(body.provider)
+    if provider is None or not getattr(provider, "supports_session", True):
+        raise HTTPException(status_code=400, detail="Unknown session provider")
+    try:
+        session = provider.refresh_session(refresh_token=body.refresh_token)
+    except RefreshExpiredError:
+        session = None
+    except ProviderError as e:
+        _log.warning(
+            "dashboard-auth: provider %r unreachable during native refresh: %s",
+            provider.name, e,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Auth provider {provider.name!r} unreachable",
+        )
+    if session is not None:
         audit_log(
             AuditEvent.REFRESH_SUCCESS,
             provider=session.provider,
@@ -1078,14 +1080,10 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
             "user_id": session.user_id,
         }
 
-    if unreachable is not None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Auth provider {unreachable!r} unreachable",
-        )
     audit_log(
         AuditEvent.REFRESH_FAILURE,
-        reason="all_providers_rejected_rt",
+        provider=provider.name,
+        reason="provider_rejected_rt",
         ip=_client_ip(request),
     )
     return JSONResponse(
@@ -1095,3 +1093,45 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
         },
         status_code=401,
     )
+
+
+class _NativeLogoutBody(BaseModel):
+    refresh_token: str
+    provider: str
+
+
+@router.post("/auth/native/logout", name="auth_native_logout")
+async def auth_native_logout(request: Request, body: _NativeLogoutBody):
+    """Best-effort revocation for a native-app-owned refresh token.
+
+    Access-token authentication is intentionally not required: logout must
+    remain possible after access-token expiry. Possession authorises revocation
+    of the supplied token only. The token is sent solely to the named provider,
+    and provider or network failure never prevents the app from clearing its
+    local credential.
+    """
+    if not body.refresh_token:
+        raise HTTPException(status_code=400, detail="refresh_token required")
+    if not body.provider:
+        raise HTTPException(status_code=400, detail="provider required")
+    provider = get_provider(body.provider)
+    if provider is None or not getattr(provider, "supports_session", True):
+        raise HTTPException(status_code=400, detail="Unknown session provider")
+
+    outcome = "attempted"
+    try:
+        provider.revoke_session(refresh_token=body.refresh_token)
+    except Exception as exc:  # noqa: BLE001 — revocation is best-effort
+        outcome = "provider_error"
+        _log.warning(
+            "dashboard-auth: provider %r native revocation failed: %s",
+            provider.name,
+            type(exc).__name__,
+        )
+    audit_log(
+        AuditEvent.REVOKE,
+        provider=provider.name,
+        reason=outcome,
+        ip=_client_ip(request),
+    )
+    return {"ok": True}

@@ -19483,6 +19483,21 @@ def start_server(
         host, app.state.trusted_public_hosts
     )
 
+    # Parse installed-app callbacks once before the listener is started. An
+    # invalid allowlist is an operator configuration error and must fail closed
+    # rather than being discovered only after an authorization attempt.
+    from hermes_cli.dashboard_auth.native_redirects import (
+        NativeRedirectConfigurationError,
+        configured_native_redirect_uris,
+    )
+
+    try:
+        app.state.native_redirect_uris = configured_native_redirect_uris(
+            load_config()
+        )
+    except NativeRedirectConfigurationError as exc:
+        raise SystemExit(f"Invalid native redirect configuration: {exc}") from exc
+
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
     # dashboards). If a caller still passes it, warn that it is now a no-op

@@ -31,7 +31,12 @@ from hermes_cli.dashboard_auth import (
     register_provider,
 )
 from hermes_cli.dashboard_auth import native_flow
-from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth.base import RefreshExpiredError, Session
+from hermes_cli.dashboard_auth.native_redirects import (
+    NativeRedirectConfigurationError,
+    configured_native_redirect_uris,
+    parse_native_redirect_uris,
+)
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
@@ -91,12 +96,16 @@ def _reset_broker():
     prev_required = getattr(web_server.app.state, "auth_required", None)
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_redirects = getattr(
+        web_server.app.state, "native_redirect_uris", frozenset()
+    )
     yield
     native_flow._reset_for_tests()
     clear_providers()
     web_server.app.state.auth_required = prev_required
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
+    web_server.app.state.native_redirect_uris = prev_redirects
 
 
 def _stub_session(exp_offset: int = 3600) -> Session:
@@ -131,9 +140,18 @@ def gated_client():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_redirects = getattr(
+        web_server.app.state, "native_redirect_uris", frozenset()
+    )
     web_server.app.state.bound_host = "fly-app.fly.dev"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
+    web_server.app.state.native_redirect_uris = frozenset(
+        {
+            "com.uzairansar.hermesmobile:/oauth/callback",
+            "com.uzairansar.hermesmobile.branch:/oauth/callback",
+        }
+    )
     # follow_redirects=False so we can inspect each 302 leg of the flow.
     client = TestClient(
         web_server.app, base_url="https://fly-app.fly.dev",
@@ -144,6 +162,7 @@ def gated_client():
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.native_redirect_uris = prev_redirects
 
 
 def _walk_native_login(client, *, redirect_uri, challenge, state="cli-state"):
@@ -205,6 +224,100 @@ def test_native_authorize_rejects_non_loopback_redirect(gated_client):
     )
     assert r.status_code == 400
     assert "loopback" in r.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "com.uzairansar.hermesmobile:/oauth/callback",
+        "com.uzairansar.hermesmobile.branch:/oauth/callback",
+    ],
+)
+def test_native_authorize_accepts_exact_configured_private_callback(
+    gated_client, redirect_uri
+):
+    verifier, challenge = _make_pkce()
+    code, state = _walk_native_login(
+        gated_client,
+        redirect_uri=redirect_uri,
+        challenge=challenge,
+        state="ios-state",
+    )
+    callback = gated_client.post(
+        "/auth/native/token",
+        json={"code": code, "code_verifier": verifier},
+    )
+    assert callback.status_code == 200, callback.text
+    assert callback.json()["provider"] == "stub"
+    assert state == "ios-state"
+    assert "set-cookie" not in callback.headers
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "com.uzairansar.hermesmobile:/oauth/callback/extra",
+        "com.uzairansar.hermesmobile:/oauth/callback?next=evil",
+        "com.uzairansar.hermesmobile:/oauth/callback#fragment",
+        "COM.UZAIRANSAR.HERMESMOBILE:/oauth/callback",
+        "com.uzairansar.hermesmobile:/oauth/%63allback",
+        "hermes-agent:/oauth/callback",
+    ],
+)
+def test_native_authorize_rejects_private_callback_lookalikes_before_state(
+    gated_client, redirect_uri
+):
+    _verifier, challenge = _make_pkce()
+    before = len(native_flow._pending)
+    response = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": redirect_uri,
+            "state": "ios-state",
+        },
+    )
+    assert response.status_code == 400
+    assert len(native_flow._pending) == before
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://app.example/callback",
+        "file:/callback",
+        "javascript:/callback",
+        "com.example://authority/callback",
+        "com.example:relative",
+        "com.example:/callback?query=yes",
+        "com.example:/callback#fragment",
+        "comexample:/callback",
+        " com.example:/callback",
+    ],
+)
+def test_native_redirect_configuration_rejects_unsafe_entries(value):
+    with pytest.raises(NativeRedirectConfigurationError):
+        parse_native_redirect_uris([value])
+
+
+def test_native_redirect_configuration_is_immutable_and_empty_by_default():
+    assert configured_native_redirect_uris({}) == frozenset()
+    with pytest.raises(NativeRedirectConfigurationError, match="YAML list"):
+        parse_native_redirect_uris("com.example.hermex:/oauth/callback")
+    configured = configured_native_redirect_uris(
+        {
+            "dashboard": {
+                "oauth": {
+                    "native_redirect_uris": [
+                        "com.example.hermex:/oauth/callback"
+                    ]
+                }
+            }
+        }
+    )
+    assert configured == frozenset({"com.example.hermex:/oauth/callback"})
 
 
 # ---------------------------------------------------------------------------
@@ -596,3 +709,80 @@ def test_native_refresh_dead_token_returns_401(gated_client):
     )
     assert r.status_code == 401
     assert r.json()["error"] == "session_expired"
+
+
+class _RejectingRecipientProvider(StubAuthProvider):
+    name = "recipient-a"
+
+    def __init__(self):
+        super().__init__()
+        self.refresh_tokens: list[str] = []
+        self.revoked_tokens: list[str] = []
+
+    def refresh_session(self, *, refresh_token: str) -> Session:
+        self.refresh_tokens.append(refresh_token)
+        raise RefreshExpiredError("rejected")
+
+    def revoke_session(self, *, refresh_token: str) -> None:
+        self.revoked_tokens.append(refresh_token)
+
+
+class _UntargetedProvider(StubAuthProvider):
+    name = "recipient-b"
+
+    def __init__(self):
+        super().__init__()
+        self.refresh_calls = 0
+        self.revoke_calls = 0
+
+    def refresh_session(self, *, refresh_token: str) -> Session:
+        self.refresh_calls += 1
+        return super().refresh_session(refresh_token=refresh_token)
+
+    def revoke_session(self, *, refresh_token: str) -> None:
+        self.revoke_calls += 1
+
+
+def test_native_refresh_routes_only_to_named_provider(gated_client):
+    clear_providers()
+    target = _RejectingRecipientProvider()
+    other = _UntargetedProvider()
+    register_provider(target)
+    register_provider(other)
+
+    response = gated_client.post(
+        "/auth/native/refresh",
+        json={"refresh_token": "recipient-secret", "provider": target.name},
+    )
+    assert response.status_code == 401
+    assert target.refresh_tokens == ["recipient-secret"]
+    assert other.refresh_calls == 0
+
+
+def test_native_logout_is_public_and_routes_only_to_named_provider(gated_client):
+    clear_providers()
+    target = _RejectingRecipientProvider()
+    other = _UntargetedProvider()
+    register_provider(target)
+    register_provider(other)
+
+    response = gated_client.post(
+        "/auth/native/logout",
+        json={"refresh_token": "recipient-secret", "provider": target.name},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert target.revoked_tokens == ["recipient-secret"]
+    assert other.revoke_calls == 0
+    assert "set-cookie" not in response.headers
+    assert "recipient-secret" not in response.text
+
+
+@pytest.mark.parametrize("path", ["/auth/native/refresh", "/auth/native/logout"])
+def test_native_credential_lifecycle_rejects_unknown_provider(gated_client, path):
+    response = gated_client.post(
+        path,
+        json={"refresh_token": "recipient-secret", "provider": "missing"},
+    )
+    assert response.status_code == 400
+    assert "recipient-secret" not in response.text
