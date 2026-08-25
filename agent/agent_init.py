@@ -104,6 +104,51 @@ def _ra():
     return run_agent
 
 
+def _credential_pool_billing_error(provider: str, pool: Any) -> Optional[str]:
+    """Describe a confirmed exhausted billing pool without exposing its payload."""
+    if not provider or pool is None:
+        return None
+    if str(getattr(pool, "provider", "") or "").strip().lower() != provider:
+        return None
+    try:
+        entries = pool.entries()
+    except Exception:
+        return None
+    if not entries or any(
+        getattr(entry, "last_status", None) != "exhausted" for entry in entries
+    ):
+        return None
+
+    billing_entries = [
+        entry
+        for entry in entries
+        if getattr(entry, "last_error_code", None) == 402
+        or str(getattr(entry, "last_error_reason", "") or "").strip().lower()
+        == "billing"
+    ]
+    if not billing_entries:
+        return None
+
+    status_codes = sorted(
+        {
+            code
+            for entry in billing_entries
+            if isinstance((code := getattr(entry, "last_error_code", None)), int)
+        }
+    )
+    status_hint = (
+        f" (HTTP {', '.join(str(code) for code in status_codes)})"
+        if status_codes
+        else ""
+    )
+    return (
+        f"Provider '{provider}' has no usable credentials because its credential "
+        f"pool is exhausted by a billing or credit error{status_hint}. Add credits "
+        "or update billing with that provider, then retry; alternatively select a "
+        "different provider with `hermes model`."
+    )
+
+
 def _moa_reference_output_allowed(agent: Any) -> bool:
     """Keep MoA display events off only the machine-readable ``-Q`` surface."""
     return not (
@@ -1388,6 +1433,9 @@ def init_agent(
                 # but no credentials were found, fail fast with a clear
                 # message instead of silently routing through OpenRouter.
                 _explicit = (agent.provider or "").strip().lower()
+                _pool_billing_error = _credential_pool_billing_error(
+                    _explicit, agent._credential_pool
+                )
                 if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                     # Look up the actual env var name from the provider
                     # config — some providers use non-standard names
@@ -1445,12 +1493,16 @@ def init_agent(
                             _fb_resolved = True
                             break
                     if not _fb_resolved:
+                        if _pool_billing_error:
+                            raise RuntimeError(_pool_billing_error)
                         raise RuntimeError(
                             f"Provider '{_explicit}' is set in config.yaml but no API key "
                             f"was found. Set the {_env_hint} environment "
                             f"variable, or switch to a different provider with `hermes model`."
                         )
                 if not getattr(agent, "_fallback_activated", False):
+                    if _pool_billing_error:
+                        raise RuntimeError(_pool_billing_error)
                     # No provider configured — reject with a clear message.
                     raise RuntimeError(
                         "No LLM provider configured. Run `hermes model` to "
