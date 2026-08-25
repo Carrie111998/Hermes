@@ -63,6 +63,44 @@ class TestInterpretExitCode:
 
     # ---- pipeline / chain handling ----
 
+    @pytest.mark.parametrize("cmd", [
+        "crontab -l | grep -c parlami-queue-health.py",
+        "false | grep needle",
+        "false || grep needle",
+        "false && grep needle",
+        "false & grep needle",
+        "false; grep needle",
+        'grep "$(printf needle | cat)" file.txt',
+        "grep `printf needle` file.txt",
+        "grep needle <(printf needle)",
+        r"grep 'a\' file.txt | grep needle",
+        r"grep $'a\'b' file.txt | grep needle",
+        "grep missing file.txt 2>&1",
+        "grep missing file.txt &>/tmp/grep.out",
+        "grep missing file.txt 3</dev/null 0<&3",
+        "grep missing file.txt >| /tmp/grep.out",
+        "grep needle /dev/null > /missing-dir/out",
+    ])
+    def test_masking_compound_commands_do_not_get_benign_grep_meaning(self, cmd):
+        """A final grep status cannot prove earlier segments succeeded."""
+        assert _interpret_exit_code(cmd, 1) is None
+
+
+    @pytest.mark.parametrize("cmd", [
+        "grep 'a|b' file.txt",
+        'grep "a;b" file.txt',
+        "grep 'a&&b' file.txt",
+        r"grep a\|b file.txt",
+        r"grep a\;b file.txt",
+        "grep $'a|b' file.txt",
+        "grep missing file.txt # | ignored",
+        "grep missing \\\nfile.txt",
+    ])
+    def test_inert_operators_and_redirections_keep_simple_grep_semantics(self, cmd):
+        result = _interpret_exit_code(cmd, 1)
+        assert result is not None
+        assert "no matches" in result.lower()
+
 
     # ---- full paths ----
 
