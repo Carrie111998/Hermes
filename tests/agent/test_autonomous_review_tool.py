@@ -143,6 +143,30 @@ def test_async_review_sets_boundary_but_sync_fallback_does_not(monkeypatch):
     assert not hasattr(sync_parent, "_review_yield_requested")
 
 
+def test_review_dispatch_converts_unexpected_start_errors_to_tool_error(monkeypatch):
+    from run_agent import AIAgent
+
+    def fail_start_review(*args, **kwargs):
+        raise RuntimeError("review backend unavailable")
+
+    monkeypatch.setattr(review_engine_module, "start_review", fail_start_review)
+
+    parent = object.__new__(AIAgent)
+    setattr(parent, "_delegate_depth", 0)
+    result = json.loads(
+        AIAgent._dispatch_review_current_work(
+            parent,
+            {},
+            [{"role": "user", "content": "review"}],
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "review backend unavailable",
+    }
+
+
 def test_segmented_batch_cancels_every_segment_after_review(monkeypatch):
     from agent import tool_executor as executor
     from agent.tool_dispatch_helpers import _plan_tool_batch_segments

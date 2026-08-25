@@ -8,7 +8,7 @@ REVIEW_CURRENT_WORK_SCHEMA = {
     "description": (
         "Dispatch the existing full-tool Hermes reviewer against the current "
         "work. Use at earned security, migration, architecture, provider-boundary, "
-        "or consequential pre-RED gates. If dispatched asynchronously, this is "
+        "or other consequential review points. If dispatched asynchronously, this is "
         "a hard boundary for the current tool batch and the review returns to "
         "the parent conversation when complete."
     ),

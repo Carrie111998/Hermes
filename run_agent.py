@@ -8417,7 +8417,7 @@ class AIAgent:
                 user_prompt=str(function_args.get("focus") or ""),
                 autonomous=True,
             )
-        except ValueError as exc:
+        except Exception as exc:
             return json.dumps({"status": "error", "error": str(exc)})
 
         if result.get("status") == "dispatched":
