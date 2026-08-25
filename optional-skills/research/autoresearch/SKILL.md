@@ -9,7 +9,7 @@ metadata:
   hermes:
     tags: [research, autonomous, experiments, git, cron]
     category: research
-    related_skills: [arxiv, ml-paper-writing]
+    related_skills: [arxiv, research-paper-writing]
 ---
 
 # Autoresearch Skill
