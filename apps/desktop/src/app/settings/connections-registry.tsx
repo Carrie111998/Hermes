@@ -712,26 +712,25 @@ export function ConnectionsRegistrySection() {
                       {s.makePrimary}
                     </Button>
                   )}
+                  {/* Local entry: label is editable (registry rule), never removable. */}
+                  <Button
+                    aria-label={s.editConnection}
+                    onClick={() => openEditor(editorFromConnection(conn))}
+                    size="icon-sm"
+                    variant="ghost"
+                  >
+                    <Pencil className="size-3.5" />
+                  </Button>
                   {conn.kind !== 'local' && (
-                    <>
-                      <Button
-                        aria-label={s.editConnection}
-                        onClick={() => openEditor(editorFromConnection(conn))}
-                        size="icon-sm"
-                        variant="ghost"
-                      >
-                        <Pencil className="size-3.5" />
-                      </Button>
-                      <Button
-                        aria-label={s.removeConnection}
-                        disabled={busy}
-                        onClick={() => setRemoveTarget(conn)}
-                        size="icon-sm"
-                        variant="ghost"
-                      >
-                        {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
-                      </Button>
-                    </>
+                    <Button
+                      aria-label={s.removeConnection}
+                      disabled={busy}
+                      onClick={() => setRemoveTarget(conn)}
+                      size="icon-sm"
+                      variant="ghost"
+                    >
+                      {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+                    </Button>
                   )}
                 </div>
               }

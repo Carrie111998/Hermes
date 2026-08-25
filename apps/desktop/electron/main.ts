@@ -13257,13 +13257,29 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
             ? body.profiles.map(p => String(p?.name || '').trim()).filter(Boolean)
             : []
 
+          const displayNames: Record<string, string> = {}
+
+          for (const p of Array.isArray(body?.profiles) ? body.profiles : []) {
+            const name = String(p?.name || '').trim()
+            const displayName = String(p?.display_name || '').trim()
+
+            if (name && displayName) {
+              displayNames[name] = displayName
+            }
+          }
+
           // The root HERMES_HOME is an agent too; enumerations that omit it
           // (older backends list only named profiles) still get a default row.
           if (!profiles.includes('default')) {
             profiles.unshift('default')
           }
 
-          raw = { connection, profiles, ...(installId ? { installId } : {}) }
+          raw = {
+            connection,
+            profiles,
+            ...(Object.keys(displayNames).length ? { displayNames } : {}),
+            ...(installId ? { installId } : {})
+          }
         }
       } catch (error: any) {
         raw = { connection, profiles: null, error: String(error?.message || error) }

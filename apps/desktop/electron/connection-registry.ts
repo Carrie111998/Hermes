@@ -415,6 +415,8 @@ export interface ConnectionAgents {
   profiles: null | string[]
   /** Present when profiles is null: why enumeration was skipped. */
   error?: string
+  /** Profile display names (`hermes profile rename`), keyed by trimmed profile name. */
+  displayNames?: Record<string, string>
   /** Stable backend identity from the connection's /api/status (`install_id`).
    * Two connections reporting the same id are the SAME physical install
    * registered under two addresses (hostname + Tailscale IP), so the roster
@@ -433,6 +435,8 @@ export interface RosterAgent {
   /** Bare profile name, or `<profile>-<label-slug>` when the profile name
    * exists on more than one registered source (the @name-device rule). */
   handle: string
+  /** Profile display name (`hermes profile rename`), when the backend reports one. */
+  displayName?: string
 }
 
 /**
@@ -534,13 +538,14 @@ export function buildAgentRoster(
 
   let order = 0
 
-  for (const { connection, installId, profiles } of enumerations) {
+  for (const { connection, displayNames, installId, profiles } of enumerations) {
     for (const profile of profiles || []) {
       const name = String(profile || '').trim() || 'default'
       const key = `${connection.id}\0${name}`
 
       if (!identities.has(key)) {
-        identities.set(key, { connection, installId, order, profile: name })
+        const displayName = String(displayNames?.[name] || '').trim()
+        identities.set(key, { connection, installId, order, profile: name, ...(displayName ? { displayName } : {}) })
       }
     }
 
@@ -551,16 +556,19 @@ export function buildAgentRoster(
   // are the SAME physical install registered under two addresses, so their
   // (install, profile) rows are one bot, not two. Connections without an id
   // (older backends, undialed ssh) keep a per-connection key — no collapse.
-  const backends = new Map<string, { connection: RegistryConnection; order: number; profile: string }[]>()
+  const backends = new Map<
+    string,
+    { connection: RegistryConnection; displayName?: string; order: number; profile: string }[]
+  >()
 
-  for (const { connection, installId, order: rank, profile } of identities.values()) {
+  for (const { connection, displayName, installId, order: rank, profile } of identities.values()) {
     const key = installId ? `id:${installId}\0${profile}` : `conn:${connection.id}\0${profile}`
     const group = backends.get(key)
 
     if (group) {
-      group.push({ connection, order: rank, profile })
+      group.push({ connection, displayName, order: rank, profile })
     } else {
-      backends.set(key, [{ connection, order: rank, profile }])
+      backends.set(key, [{ connection, displayName, order: rank, profile }])
     }
   }
 
@@ -577,14 +585,15 @@ export function buildAgentRoster(
 
   const roster: RosterAgent[] = []
 
-  for (const { connection, profile } of rows) {
+  for (const { connection, displayName, profile } of rows) {
     roster.push({
       connectionId: connection.id,
       connectionKind: connection.kind,
       connectionLabel: connection.label,
       profile,
       targetProfile: connection.remoteProfile || profile,
-      handle: agentHandle(profile, connection.label, (counts.get(profile) || 0) > 1)
+      handle: agentHandle(profile, connection.label, (counts.get(profile) || 0) > 1),
+      ...(displayName ? { displayName } : {})
     })
   }
 
