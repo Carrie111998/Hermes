@@ -35,6 +35,7 @@ from agent.prompt_builder import (
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
+from agent.memory_routing import MemoryScope, classify_memory_scope, is_memory_intent
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
@@ -67,6 +68,40 @@ class TestGuidanceConstants:
         assert "session_search" in MEMORY_GUIDANCE
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
+
+    def test_memory_guidance_routes_scoped_memory(self):
+        assert "AGENTS.md" in MEMORY_GUIDANCE
+        assert "USER.md" in MEMORY_GUIDANCE
+        assert "MEMORY.md" in MEMORY_GUIDANCE
+        assert "clarify" in MEMORY_GUIDANCE
+
+    @pytest.mark.parametrize(
+        ("content", "scope"),
+        [
+            ("이 프로젝트에서 API 응답은 항상 {data,error,meta} 구조를 사용한다.", MemoryScope.PROJECT),
+            ("설명은 짧게 하고 코드를 먼저 보여줘.", MemoryScope.USER),
+            ("이 머신에서는 uv를 공통 Python package manager로 사용한다.", MemoryScope.GLOBAL),
+            ("지금 테스트 서버 포트가 8123이야.", MemoryScope.TEMPORARY),
+            ("앞으로 기본 모델은 Terra로 써.", MemoryScope.AMBIGUOUS),
+        ],
+    )
+    def test_memory_scope_routing_policy(self, content, scope):
+        assert classify_memory_scope(content) is scope
+
+    @pytest.mark.parametrize(
+        ("content", "has_memory_intent", "scope"),
+        [
+            ("기억해. 이 프로젝트에서는 PostgreSQL을 사용해.", True, MemoryScope.PROJECT),
+            ("기억해. 설명은 짧게 해줘.", True, MemoryScope.USER),
+            ("정식 CPython으로 .venv-dev를 만들고 pytest 설치해서 테스트해.", False, None),
+            ("앞으로 WindowsApps Python은 쓰지 말고 정식 CPython으로 테스트해.", False, None),
+            ("기억해. 앞으로 모든 프로젝트에서 uv 대신 정식 CPython을 기본으로 사용할 거야.", True, MemoryScope.GLOBAL),
+        ],
+    )
+    def test_memory_intent_gate_regressions(self, content, has_memory_intent, scope):
+        assert is_memory_intent(content) is has_memory_intent
+        if has_memory_intent:
+            assert classify_memory_scope(content) is scope
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
@@ -1073,5 +1108,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
