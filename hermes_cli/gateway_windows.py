@@ -570,7 +570,12 @@ def _write_task_script() -> Path:
     vbs_content = _build_gateway_vbs_script(python_path, working_dir, hermes_home, profile_arg)
     vbs_path = script_path.with_suffix(".vbs")
     vbs_tmp = vbs_path.with_name(vbs_path.name + ".tmp")
-    vbs_tmp.write_text(vbs_content, encoding="utf-8", newline="")
+    # wscript/cscript decode .vbs as ANSI (cp1252 on Western locales) unless the
+    # file carries a UTF-16 BOM. UTF-8-no-BOM mangles any non-ASCII path baked
+    # into string literals (HERMES_HOME with é/ü/CJK usernames), so the
+    # launcher's own FileExists guard silently quits at every logon. Same
+    # reasoning as the utf-16 task XML below.
+    vbs_tmp.write_text(vbs_content, encoding="utf-16", newline="")
     vbs_tmp.replace(vbs_path)
     return script_path
 
@@ -707,7 +712,9 @@ def _install_startup_entry(script_path: Path) -> Path:
     entry = get_startup_entry_path()
     entry.parent.mkdir(parents=True, exist_ok=True)
     tmp = entry.with_suffix(".tmp")
-    tmp.write_text(_build_startup_launcher(script_path), encoding="utf-8", newline="")
+    # utf-16 with BOM so wscript decodes non-ASCII path literals correctly
+    # (see the comment in _write_task_script).
+    tmp.write_text(_build_startup_launcher(script_path), encoding="utf-16", newline="")
     tmp.replace(entry)
     legacy_entry = _legacy_startup_entry_path()
     try:
