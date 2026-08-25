@@ -64,11 +64,39 @@ def test_fetch_link_title_rejects_non_url_before_renderer_window():
     # Extract the function body up to the next top-level function.
     body_start = fn_match.start()
     next_fn = src.find("\nfunction faviconCacheKey", body_start)
+    assert next_fn != -1, (
+        "function-body extraction failed: faviconCacheKey marker not found — "
+        "main.ts was refactored and this test must be re-anchored, not "
+        "silently widened to the whole file"
+    )
     body = src[body_start:next_fn]
 
-    assert re.search(r"https\?:", body), (
+    # Structural assertion: the guard must be a regex literal testing the
+    # rawUrl parameter INSIDE fetchLinkTitle, before any use of it — not a
+    # comment or an unrelated string mentioning https?:.
+    guard = re.search(r"if \(!/\^https\\?:\\+/\\+//i\.test\(\w+\)\)", body) or re.search(
+        r"\^https\?:\\+/\\+//i\.test", body
+    )
+    assert guard, (
         "pre-fix state: fetchLinkTitle performs no http(s) validation of "
         "rawUrl before spawning curl / the hidden title window (#93893)"
+    )
+
+    # The gate must run before the pipeline continues past it: the next
+    # consumer is the canonicalTitleCacheKey call. (The only loadURL mention
+    # inside fetchLinkTitle is a comment; the hidden window lives elsewhere —
+    # matching call sites, not comments, by stripping comment lines first.)
+    code_lines = [ln for ln in body.splitlines() if not ln.strip().startswith("//")]
+    code_body = "\n".join(code_lines)
+    first_use = re.search(r"canonicalTitleCacheKey\(", code_body)
+    guard_line_idx = next((i for i, ln in enumerate(code_lines) if "/^https" in ln), -1)
+    guard_code_pos = (
+        len("\n".join(code_lines[:guard_line_idx])) if guard_line_idx != -1 else -1
+    )
+
+    assert first_use and 0 <= guard_code_pos < first_use.start(), (
+        "the scheme guard must precede the first downstream consumer "
+        "(canonicalTitleCacheKey) — a guard after the call is dead code"
     )
 
 
