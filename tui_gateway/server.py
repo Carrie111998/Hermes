@@ -6271,6 +6271,8 @@ def _load_peak_windows() -> dict | None:
     label_active = str(pw.get("label_active") or "").strip()
     label_idle = str(pw.get("label_idle") or "").strip()
     color = str(pw.get("color") or "").strip()
+    # Optional; defaults to weekdays so weekends are off-peak without config.
+    days = str(pw.get("days") or "").strip() or "1-5"
     windows_utc = pw.get("windows_utc")
     if not (label_active and label_idle and color and isinstance(windows_utc, list) and windows_utc):
         return None
@@ -6278,6 +6280,7 @@ def _load_peak_windows() -> dict | None:
         "label_active": label_active,
         "label_idle": label_idle,
         "color": color,
+        "days": days,
         "windows_utc": windows_utc,
     }
 

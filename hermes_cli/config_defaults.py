@@ -1434,20 +1434,20 @@ DEFAULT_CONFIG = {
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,
         # Opt-in TUI status-bar "cost/peak window" segment. When configured
-        # (null/absent = hidden), the TUI renders a self-ticking PEAK/OFF-PEAK
-        # pill in the status bar, colored by the named theme tone, flipping
-        # whenever the current UTC time enters/exits any of `windows_utc`.
-        # Windows are provider-agnostic and purely config-driven:
+        # (null/absent = hidden), the TUI renders a PEAK/OFF-PEAK pill in the
+        # status bar, colored by the named theme tone, based on the current UTC
+        # time vs `windows_utc`. Provider-agnostic and purely config-driven:
         #   peak_windows:
         #     label_active: "PEAK"
         #     label_idle: "OFF-PEAK"
         #     color: "error"              # any theme color tone, e.g. warn/accent
         #     windows_utc:
-        #       - { days: "1-5", from: "01:00", to: "04:00" }   # cron-style days
-        #       - { days: "1-5", from: "06:00", to: "10:00" }
-        # `days` is cron-style ("0"/"7" = Sunday … "6" = Saturday), comma lists
-        # and ranges ("0,6", "1-5,7") supported. `from`/`to` are "HH:MM" UTC and
-        # must be within the same day (no overnight wraparound in v1).
+        #       - { from: "01:00", to: "04:00" }   # HH:MM UTC, same-day (no overnight wrap)
+        #       - { from: "06:00", to: "10:00" }
+        # `days` (optional) restricts which weekdays the windows apply to;
+        # default "1-5" = Mon-Fri, so weekends are off-peak by default. It is
+        # cron-style ("0"/"7" = Sunday … "6" = Saturday); comma lists and
+        # ranges ("0,6", "1-5,7") are supported.
         "peak_windows": None,
         # Focus view (/focus): display-only reduced-output mode. When true the
         # CLI/TUI pins tool_progress to "off" (reusing the existing suppression

@@ -528,7 +528,8 @@ describe('StatusRule cost-window segment', () => {
     label_active: 'PEAK',
     label_idle: 'OFF-PEAK',
     color: 'error',
-    windows_utc: [{ days: '1-5', from: '01:00', to: '04:00' }]
+    days: '1-5',
+    windows_utc: [{ from: '01:00', to: '04:00' }]
   }
 
   it('renders nothing when costWindow is null/unconfigured', () => {
@@ -545,7 +546,7 @@ describe('StatusRule cost-window segment', () => {
     expect(findComponentByName(element, 'CostWindow')).toBeNull()
   })
 
-  it('renders the self-ticking cost pill when a window is configured', () => {
+  it('renders the cost pill when a window is configured', () => {
     const element = StatusRule({ ...baseProps, costWindow })
 
     const pill = findComponentByName(element, 'CostWindow')
@@ -559,45 +560,45 @@ describe('StatusRule cost-window segment', () => {
 
     const pill = findComponentByName(element, 'CostWindow')
 
-    // The pill owns its colour internally (via useState) and falls back to
-    // `warn` when the tone doesn't exist — never a hardcoded hex.
+    // The pill falls back to `warn` when the tone doesn't exist — never a
+    // hardcoded hex.
     expect(pill).not.toBeNull()
     expect(pill!.props.t).toBe(DEFAULT_THEME)
   })
 })
 
 describe('isInPeakWindow', () => {
-  const weekdayWindow = [{ days: '1-5', from: '01:00', to: '04:00' }]
+  const weekdayWindow = [{ from: '01:00', to: '04:00' }]
   // 2026-08-24 is a Monday; 2026-08-23 is a Sunday.
   const mondayMorning = () => new Date(Date.UTC(2026, 7, 24, 2, 30))
   const mondayOffPeak = () => new Date(Date.UTC(2026, 7, 24, 6, 0))
   const sundayMorning = () => new Date(Date.UTC(2026, 7, 23, 2, 30))
 
   it('matches inside the window on a listed weekday', () => {
-    expect(isInPeakWindow(mondayMorning(), weekdayWindow)).toBe(true)
+    expect(isInPeakWindow(mondayMorning(), '1-5', weekdayWindow)).toBe(true)
   })
 
   it('does not match outside the hour range', () => {
-    expect(isInPeakWindow(mondayOffPeak(), weekdayWindow)).toBe(false)
+    expect(isInPeakWindow(mondayOffPeak(), '1-5', weekdayWindow)).toBe(false)
   })
 
   it('does not match on a day outside the window', () => {
-    expect(isInPeakWindow(sundayMorning(), weekdayWindow)).toBe(false)
+    expect(isInPeakWindow(sundayMorning(), '1-5', weekdayWindow)).toBe(false)
   })
 
   it('supports comma-separated days and Sunday spelled as 0 or 7', () => {
-    expect(isInPeakWindow(sundayMorning(), [{ days: '0,6', from: '01:00', to: '04:00' }])).toBe(true)
-    expect(isInPeakWindow(sundayMorning(), [{ days: '7', from: '01:00', to: '04:00' }])).toBe(true)
-    expect(isInPeakWindow(sundayMorning(), weekdayWindow)).toBe(false)
+    expect(isInPeakWindow(sundayMorning(), '0,6', weekdayWindow)).toBe(true)
+    expect(isInPeakWindow(sundayMorning(), '7', weekdayWindow)).toBe(true)
+    expect(isInPeakWindow(sundayMorning(), '1-5', weekdayWindow)).toBe(false)
   })
 
   it('supports day ranges', () => {
-    expect(isInPeakWindow(mondayMorning(), [{ days: '1-5,7', from: '01:00', to: '04:00' }])).toBe(true)
+    expect(isInPeakWindow(mondayMorning(), '1-5,7', weekdayWindow)).toBe(true)
   })
 
   it('ignores malformed times instead of matching', () => {
-    expect(isInPeakWindow(mondayMorning(), [{ days: '1-5', from: 'nope', to: '04:00' }])).toBe(false)
+    expect(isInPeakWindow(mondayMorning(), '1-5', [{ from: 'nope', to: '04:00' }])).toBe(false)
     // Overnight wraparound is unsupported in v1: to <= from is a no-op.
-    expect(isInPeakWindow(mondayMorning(), [{ days: '1-5', from: '23:00', to: '01:00' }])).toBe(false)
+    expect(isInPeakWindow(mondayMorning(), '1-5', [{ from: '23:00', to: '01:00' }])).toBe(false)
   })
 })

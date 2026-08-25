@@ -499,9 +499,10 @@ def test_load_peak_windows_parses_configured_block(monkeypatch):
                     "label_active": "PEAK",
                     "label_idle": "OFF-PEAK",
                     "color": "error",
+                    "days": "1-5",
                     "windows_utc": [
-                        {"days": "1-5", "from": "01:00", "to": "04:00"},
-                        {"days": "1-5", "from": "06:00", "to": "10:00"},
+                        {"from": "01:00", "to": "04:00"},
+                        {"from": "06:00", "to": "10:00"},
                     ],
                 }
             }
@@ -512,11 +513,35 @@ def test_load_peak_windows_parses_configured_block(monkeypatch):
         "label_active": "PEAK",
         "label_idle": "OFF-PEAK",
         "color": "error",
+        "days": "1-5",
         "windows_utc": [
-            {"days": "1-5", "from": "01:00", "to": "04:00"},
-            {"days": "1-5", "from": "06:00", "to": "10:00"},
+            {"from": "01:00", "to": "04:00"},
+            {"from": "06:00", "to": "10:00"},
         ],
     }
+
+
+def test_load_peak_windows_defaults_days_to_weekdays(monkeypatch):
+    # `days` is optional and defaults to "1-5" (Mon-Fri) so weekends are
+    # off-peak without any extra config.
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "display": {
+                "peak_windows": {
+                    "label_active": "PEAK",
+                    "label_idle": "OFF-PEAK",
+                    "color": "warn",
+                    "windows_utc": [{"from": "01:00", "to": "04:00"}],
+                }
+            }
+        },
+    )
+
+    parsed = server._load_peak_windows()
+    assert parsed is not None
+    assert parsed["days"] == "1-5"
 
 
 def test_load_peak_windows_none_when_unconfigured_or_malformed(monkeypatch):
@@ -533,7 +558,7 @@ def test_load_peak_windows_none_when_unconfigured_or_malformed(monkeypatch):
                 "label_active": "",
                 "label_idle": "OFF-PEAK",
                 "color": "error",
-                "windows_utc": [{"days": "1-5", "from": "01:00", "to": "04:00"}],
+                "windows_utc": [{"from": "01:00", "to": "04:00"}],
             }
         }
     }
@@ -568,7 +593,8 @@ def test_session_info_pushes_cost_window_when_configured_and_none_otherwise(monk
                 "label_active": "PEAK",
                 "label_idle": "OFF-PEAK",
                 "color": "warn",
-                "windows_utc": [{"days": "0,6", "from": "01:00", "to": "04:00"}],
+                "days": "0,6",
+                "windows_utc": [{"from": "01:00", "to": "04:00"}],
             }
         }
     }
@@ -578,7 +604,8 @@ def test_session_info_pushes_cost_window_when_configured_and_none_otherwise(monk
         "label_active": "PEAK",
         "label_idle": "OFF-PEAK",
         "color": "warn",
-        "windows_utc": [{"days": "0,6", "from": "01:00", "to": "04:00"}],
+        "days": "0,6",
+        "windows_utc": [{"from": "01:00", "to": "04:00"}],
     }
 
     monkeypatch.setattr(server, "_load_cfg", lambda: {})

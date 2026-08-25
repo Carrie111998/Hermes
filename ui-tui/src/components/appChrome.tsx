@@ -463,12 +463,20 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   return <Text color={color}>♥</Text>
 }
 
-// True when `d`'s UTC time falls inside any of the configured peak windows.
-// `days` is cron-style ("0"/"7" = Sunday … "6" = Saturday), supporting comma
-// lists and ranges ("0,6", "1-5,7"). `from`/`to` are "HH:MM" UTC; v1 assumes
-// from < to (no overnight wraparound — a window spanning midnight is a no-op).
-export function isInPeakWindow(d: Date, windows: CostWindowConfig['windows_utc']): boolean {
-  const day = d.getUTCDay()
+// True when `d`'s UTC time is inside one of the configured peak windows on a
+// day matching `days` (cron-style: "0"/"7" = Sunday … "6" = Saturday; comma
+// lists and ranges "0,6", "1-5,7" supported). `from`/`to` are "HH:MM" UTC; v1
+// assumes from < to (no overnight wraparound — a window spanning midnight is
+// a no-op).
+export function isInPeakWindow(
+  d: Date,
+  days: string,
+  windows: CostWindowConfig['windows_utc'],
+): boolean {
+  if (!cronDaysMatch(d.getUTCDay(), days)) {
+    return false
+  }
+
   const nowMin = d.getUTCHours() * 60 + d.getUTCMinutes()
 
   for (const w of windows) {
@@ -479,11 +487,7 @@ export function isInPeakWindow(d: Date, windows: CostWindowConfig['windows_utc']
       continue
     }
 
-    if (nowMin < from || nowMin >= to) {
-      continue
-    }
-
-    if (cronDaysMatch(day, w.days)) {
+    if (nowMin >= from && nowMin < to) {
       return true
     }
   }
@@ -537,20 +541,13 @@ const cronDaysMatch = (day: number, days: string): boolean => {
   return false
 }
 
-// Self-ticking cost/peak pill. Recomputes on a fixed cadence (not a per-minute
-// render) so the segment stays cheap; the label flips when the current UTC time
-// enters/exits a configured window. Rendered in the theme tone named by the
-// config (`color`), falling back to `warn` when the tone doesn't exist — never
-// a hardcoded hex.
+// Peak/off-peak pill. `active` is derived fresh on every render — the status
+// chrome re-renders on each session update, so no timer is needed and the label
+// is correct whenever the model is actually generating. Rendered in the theme
+// tone named by the config (`color`), falling back to `warn` when the tone
+// doesn't exist — never a hardcoded hex.
 function CostWindow({ config, t }: { config: CostWindowConfig; t: Theme }) {
-  const [active, setActive] = useState(() => isInPeakWindow(new Date(), config.windows_utc))
-
-  useEffect(() => {
-    const id = setInterval(() => setActive(isInPeakWindow(new Date(), config.windows_utc)), 15_000)
-
-    return () => clearInterval(id)
-  }, [config.windows_utc])
-
+  const active = isInPeakWindow(new Date(), config.days, config.windows_utc)
   const tone = config.color as keyof ThemeColors
   const color = tone in t.color ? t.color[tone] : t.color.warn
 

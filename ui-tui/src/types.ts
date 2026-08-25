@@ -186,7 +186,8 @@ export interface CostWindowConfig {
   label_active: string
   label_idle: string
   color: string
-  windows_utc: { days: string; from: string; to: string }[]
+  days: string
+  windows_utc: { from: string; to: string }[]
 }
 
 export interface SessionInfo {
