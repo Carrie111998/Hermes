@@ -12020,7 +12020,9 @@ def list_profiles_on_disk() -> list[str]:
     """Return the set of assignee/profile names discovered on disk.
 
     Includes:
-    - named profile directories under ``<default-root>/profiles/<name>/``
+    - named profiles under ``<default-root>/profiles/<name>/`` with a stock
+      profile marker (``config.yaml`` or the per-profile ``.env`` seeded by
+      current profile creation)
     - the implicit ``default`` profile when the default Hermes root exists
 
     Reads profile paths directly so this module has no import dependency on
@@ -12043,7 +12045,8 @@ def list_profiles_on_disk() -> list[str]:
             for entry in sorted(profiles_dir.iterdir()):
                 if not entry.is_dir():
                     continue
-                names.add(entry.name)
+                if (entry / "config.yaml").is_file() or (entry / ".env").is_file():
+                    names.add(entry.name)
         except OSError:
             pass
 
@@ -12130,11 +12133,12 @@ def quarantine_unknown_assignees(
     if not unknown:
         return quarantined
     with write_txn(conn):
+        # The profile may have been re-installed after the read-only scan.
+        # Take one fresh snapshot under the transaction and reuse it for every
+        # candidate so the board lock does not cover one directory scan per row.
+        installed = set(list_profiles_on_disk())
         for row in unknown:
-            # The profile may have been re-installed after the read-only scan.
-            # Re-check immediately before the CAS update so reconciliation can
-            # never quarantine a card whose target now exists.
-            if row["assignee"] in set(list_profiles_on_disk()):
+            if row["assignee"] in installed:
                 continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'triage', block_kind = NULL, "

@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli.profiles import create_profile
 
 
 pytestmark = pytest.mark.real_kanban_profile_registry
@@ -62,6 +63,41 @@ def test_shared_create_boundary_rejects_unknown_profile_without_inserting(kanban
     assert "never treats generic words" in message
 
 
+@pytest.mark.parametrize("junk_file", [None, "scratch.txt"])
+def test_incomplete_profile_directory_is_rejected_and_quarantined(
+    kanban_home, junk_file
+):
+    incomplete = kanban_home / "profiles" / "incomplete"
+    incomplete.mkdir(parents=True)
+    if junk_file is not None:
+        (incomplete / junk_file).write_text("not a profile\n", encoding="utf-8")
+
+    with kb.connect_closing() as conn:
+        with pytest.raises(kb.UnknownKanbanAssigneeError):
+            kb.create_task(conn, title="bad route", assignee="incomplete")
+
+        _insert_unknown(conn, "t_incomplete", assignee="incomplete")
+        quarantined = kb.quarantine_unknown_assignees(conn)
+        task = kb.get_task(conn, "t_incomplete")
+
+    assert quarantined == [("t_incomplete", "incomplete", "ready")]
+    assert task is not None
+    assert task.status == "triage"
+
+
+def test_fresh_profile_without_config_is_still_an_installed_assignee(kanban_home):
+    profile = create_profile("fresh", no_alias=True)
+
+    assert not (profile / "config.yaml").exists()
+    assert (profile / ".env").is_file()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="fresh route", assignee="fresh")
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.assignee == "fresh"
+
+
 def test_shared_boundary_preserves_default_and_installed_named_profiles(kanban_home):
     _install_profile(kanban_home, "engineer")
     with kb.connect_closing() as conn:
@@ -107,6 +143,93 @@ def test_dispatch_quarantines_profile_removed_after_creation_without_spawning(ka
     assert task.status == "triage"
     assert task.assignee == "ephemeral"
     assert any(event.kind == "unknown_assignee_quarantined" for event in events)
+
+
+def test_quarantine_reuses_one_fresh_profile_snapshot_for_all_rows(
+    kanban_home, monkeypatch
+):
+    original_list_profiles = kb.list_profiles_on_disk
+    scan_count = 0
+    transaction_states = []
+
+    def reinstall_after_outer_scan():
+        nonlocal scan_count
+        scan_count += 1
+        transaction_states.append(conn.in_transaction)
+        installed = original_list_profiles()
+        if scan_count == 1:
+            _install_profile(kanban_home, "recovered")
+        return installed
+
+    monkeypatch.setattr(kb, "list_profiles_on_disk", reinstall_after_outer_scan)
+    with kb.connect_closing() as conn:
+        _insert_unknown(conn, "t_missing", assignee="missing")
+        _insert_unknown(conn, "t_recovered", assignee="recovered")
+
+        quarantined = kb.quarantine_unknown_assignees(conn)
+        missing = kb.get_task(conn, "t_missing")
+        recovered = kb.get_task(conn, "t_recovered")
+
+    assert scan_count == 2
+    assert transaction_states == [False, True]
+    assert quarantined == [("t_missing", "missing", "ready")]
+    assert missing is not None
+    assert missing.status == "triage"
+    assert recovered is not None
+    assert recovered.status == "ready"
+
+
+def test_quarantine_cas_preserves_claimed_rerouted_and_moved_cards(
+    kanban_home, monkeypatch
+):
+    original_list_profiles = kb.list_profiles_on_disk
+    scan_count = 0
+
+    def mutate_candidates_during_fresh_scan():
+        nonlocal scan_count
+        scan_count += 1
+        if scan_count == 2:
+            assert conn.in_transaction
+            conn.execute(
+                "UPDATE tasks SET claim_lock = 'worker' WHERE id = 't_claimed'"
+            )
+            conn.execute(
+                "UPDATE tasks SET assignee = 'rerouted' WHERE id = 't_rerouted'"
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'running' WHERE id = 't_moved'"
+            )
+        return original_list_profiles()
+
+    monkeypatch.setattr(
+        kb, "list_profiles_on_disk", mutate_candidates_during_fresh_scan
+    )
+    with kb.connect_closing() as conn:
+        _insert_unknown(conn, "t_claimed", assignee="missing")
+        _insert_unknown(conn, "t_rerouted", assignee="missing")
+        _insert_unknown(conn, "t_moved", assignee="missing")
+
+        quarantined = kb.quarantine_unknown_assignees(conn)
+        claimed = kb.get_task(conn, "t_claimed")
+        rerouted = kb.get_task(conn, "t_rerouted")
+        moved = kb.get_task(conn, "t_moved")
+        quarantine_events = [
+            event
+            for task_id in ("t_claimed", "t_rerouted", "t_moved")
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "unknown_assignee_quarantined"
+        ]
+
+    assert quarantined == []
+    assert claimed is not None
+    assert claimed.claim_lock == "worker"
+    assert claimed.status == "ready"
+    assert rerouted is not None
+    assert rerouted.assignee == "rerouted"
+    assert rerouted.status == "ready"
+    assert moved is not None
+    assert moved.status == "running"
+    assert quarantine_events == []
 
 
 def test_explicit_repair_reassigns_and_restores_quarantined_lane(kanban_home):
