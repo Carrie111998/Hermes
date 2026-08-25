@@ -2784,6 +2784,18 @@ DEFAULT_CONFIG = {
         # Env scrubbing (strips *_API_KEY, *_TOKEN, *_SECRET, ...) and the
         # tool whitelist apply identically in both modes.
         "mode": "project",
+        # Kernel lifetime:
+        #   per-call (default) — a fresh child process per execute_code call;
+        #     no state carries over. Today's behavior.
+        #   session            — one persistent kernel per (task, mode,
+        #     interpreter, cwd, tool-set): variables, imports, and loaded data
+        #     survive across calls, so multi-step data work stops re-loading
+        #     its inputs. A timed-out or interrupted cell kills the kernel
+        #     (state lost, next call starts fresh), and the child environment
+        #     is frozen at kernel spawn — pass reset=true after changing env
+        #     passthrough. Security scrubbing, the tool whitelist, and output
+        #     redaction are identical in both modes.
+        "kernel_mode": "per-call",
     },
 
     # Tool Search (progressive disclosure for large tool surfaces).
