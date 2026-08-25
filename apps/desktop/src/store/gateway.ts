@@ -202,6 +202,12 @@ export function setPrimaryGatewayConnection(connection: Pick<HermesConnection, '
   g.primaryConnectionId = connection?.connectionId?.trim() || null
 }
 
+function isPrimaryRegistryRoute(connectionId: null | string, profile: string): boolean {
+  const id = String(connectionId ?? '').trim()
+
+  return normKey(profile) === g.primaryProfile && Boolean(id) && Boolean(g.primaryConnectionId) && id === g.primaryConnectionId
+}
+
 export function isActivePrimary(): boolean {
   return g.activeKey === g.primaryProfile
 }
@@ -688,11 +694,7 @@ export async function requestGatewayForAgent<T>(
   // "session not found" while REST history from the primary remains visible.
   // Require both owner identities to agree before collapsing the route; a
   // different source or profile must retain its isolated secondary.
-  if (
-    key === g.primaryProfile &&
-    Boolean(g.primaryConnectionId) &&
-    g.primaryConnectionId === String(connectionId).trim()
-  ) {
+  if (isPrimaryRegistryRoute(connectionId, key)) {
     return requestGatewayForProfile<T>(key, method, params, timeoutMs, signal)
   }
 
@@ -896,7 +898,7 @@ export async function openGatewayForProfile(profile: string): Promise<void> {
 export async function openGatewayForAgent(connectionId: null | string, profile: string): Promise<void> {
   const scope = registryBackendScopeKey(connectionId, profile)
 
-  if (scope === normKey(profile)) {
+  if (scope === normKey(profile) || isPrimaryRegistryRoute(connectionId, profile)) {
     return openGatewayForProfile(profile)
   }
 
@@ -916,7 +918,7 @@ export async function openGatewayForAgent(connectionId: null | string, profile: 
 export async function ensureGatewayForAgent(connectionId: null | string, profile: string): Promise<boolean> {
   const scope = registryBackendScopeKey(connectionId, profile)
 
-  if (scope === normKey(profile)) {
+  if (scope === normKey(profile) || isPrimaryRegistryRoute(connectionId, profile)) {
     await ensureGatewayForProfile(profile)
 
     return true
