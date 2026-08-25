@@ -231,7 +231,7 @@ def _kanban_create_argv(task: KanbanTask) -> list[str]:
         "--max-retries",
         "1",
         "--initial-status",
-        "blocked",
+        task.initial_status,
         "--json",
     ]
 

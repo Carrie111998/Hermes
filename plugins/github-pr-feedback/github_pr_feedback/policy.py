@@ -151,6 +151,7 @@ class PluginPolicy:
     reviewer_associations: frozenset[str]
     include_self_feedback: bool
     include_bot_feedback: bool
+    auto_dispatch: bool
     not_before: datetime | None
     assignee: str | None
     board: str | None
@@ -277,7 +278,7 @@ def load_policy(raw: object) -> PluginPolicy:
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be a boolean")
     if not enabled:
-        return PluginPolicy(False, {}, frozenset(), frozenset(), False, False, None, None, None)
+        return PluginPolicy(False, {}, frozenset(), frozenset(), False, False, False, None, None, None)
     required = {
         "enabled",
         "repositories",
@@ -287,12 +288,22 @@ def load_policy(raw: object) -> PluginPolicy:
         "assignee",
         "board",
     }
-    optional = {"include_self_feedback", "include_bot_feedback", "assignee_rules"}
+    optional = {
+        "include_self_feedback",
+        "include_bot_feedback",
+        "auto_dispatch",
+        "assignee_rules",
+    }
     if not required.issubset(raw) or set(raw) - required - optional:
         raise ValueError("enabled configuration has missing or unknown fields")
     include_self_feedback = raw.get("include_self_feedback", False)
     include_bot_feedback = raw.get("include_bot_feedback", False)
-    if not isinstance(include_self_feedback, bool) or not isinstance(include_bot_feedback, bool):
+    auto_dispatch = raw.get("auto_dispatch", False)
+    if (
+        not isinstance(include_self_feedback, bool)
+        or not isinstance(include_bot_feedback, bool)
+        or not isinstance(auto_dispatch, bool)
+    ):
         raise ValueError("feedback inclusion settings must be booleans")
     repositories = raw["repositories"]
     if isinstance(repositories, (str, bytes)) or not isinstance(repositories, Sequence):
@@ -324,6 +335,7 @@ def load_policy(raw: object) -> PluginPolicy:
         reviewer_associations,
         include_self_feedback,
         include_bot_feedback,
+        auto_dispatch,
         _not_before(raw["not_before"]),
         _nonempty_string(raw["assignee"], "assignee"),
         _nonempty_string(raw["board"], "board"),

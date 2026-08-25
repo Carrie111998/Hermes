@@ -208,6 +208,34 @@ def test_scan_routes_actionable_feedback_to_the_best_configured_specialist(
     ledger.close()
 
 
+def test_auto_dispatch_starts_an_admitted_exact_head_repair_ready_with_push_and_reply_scope(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        auto_dispatch=True,
+    )
+    github = FakeGitHub(
+        admitted_pull_request(sha),
+        (feedback("actionable", body="[P1] Fix the confirmed runtime regression."),),
+    )
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 1
+    task = kanban.tasks[0]
+    assert getattr(task, "initial_status", None) == "ready"
+    assert "commit and push" in task.instructions
+    assert "post a factual PR reply" in task.instructions
+    assert "Do not merge" in task.instructions
+    assert "still equals the expected receipt SHA" in task.instructions
+    ledger.close()
+
+
 def test_scan_suppresses_high_confidence_self_resolution_receipts(tmp_path: Path) -> None:
     local_path, sha = initialized_repository(tmp_path)
     policy = configured_policy(local_path, not_before="2026-08-24T00:00:00Z")
@@ -891,7 +919,7 @@ def git_output(path: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def configured_policy(local_path: Path, *, not_before: str):
+def configured_policy(local_path: Path, *, not_before: str, auto_dispatch: bool = False):
     return load_policy(
         {
             "enabled": True,
@@ -908,6 +936,7 @@ def configured_policy(local_path: Path, *, not_before: str):
             "reviewer_associations": [],
             "include_self_feedback": True,
             "include_bot_feedback": True,
+            "auto_dispatch": auto_dispatch,
             "not_before": not_before,
             "assignee": "repair-agent",
             "board": "repairs",

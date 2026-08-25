@@ -254,6 +254,22 @@ def test_enabled_policy_parses_bounded_assignee_rules_and_uses_fallback_on_a_tie
     assert policy.assignee_for("Performance and runtime regression") == "repair-agent"
 
 
+def test_enabled_policy_requires_explicit_opt_in_for_automatic_worker_dispatch(
+    tmp_path: Path,
+) -> None:
+    repository_path = tmp_path / "widgets"
+    initialize_git_worktree(repository_path)
+    default_raw = enabled_raw_config(repository_path)
+    opted_in_raw = dict(default_raw)
+    opted_in_raw["auto_dispatch"] = True
+
+    default_policy = load_policy(default_raw)
+    opted_in_policy = load_policy(opted_in_raw)
+
+    assert getattr(default_policy, "auto_dispatch", None) is False
+    assert getattr(opted_in_policy, "auto_dispatch", None) is True
+
+
 @pytest.mark.parametrize(
     "assignee_rules",
     [

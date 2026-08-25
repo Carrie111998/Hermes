@@ -41,6 +41,7 @@ plugins:
         reviewer_associations: []
         include_self_feedback: false
         include_bot_feedback: false
+        auto_dispatch: false
         not_before: "2026-01-01T00:00:00Z"
         # Fallback when no rule wins uniquely, including ambiguous ties.
         assignee: task-orchestrator
@@ -70,16 +71,24 @@ hermes github-pr-feedback status
 hermes github-pr-feedback scan
 ```
 
-`scan` is safe to repeat. It records durable receipt state and may create one
-`blocked` Kanban intake card only for feedback that passes all admission
-checks. It never starts a coding worker and selects no skill. Before creating
+`scan` is safe to repeat. It records durable receipt state and creates one
+Kanban card only for feedback that passes all admission checks. By default the
+card starts `blocked`. With the explicit `auto_dispatch: true` opt-in, it starts
+`ready` on the deterministically selected specialist profile. Before creating
 the card, the plugin synchronously creates or verifies a deterministic linked
 Git worktree at the admitted receipt SHA and passes that concrete directory as
 `dir:/absolute/path`. If that exact commit is absent locally, or the prepared
 worktree `HEAD` differs, the scan fails degraded and never substitutes a local
 branch tip. Its body keeps the bounded GitHub text in an explicitly untrusted
-JSON evidence envelope. Push, reply, merge, and starting repair work remain
-operator decisions.
+JSON evidence envelope.
+
+In `auto_dispatch` mode, the worker must independently validate the finding,
+re-read the canonical PR immediately before any GitHub write, and require that
+the head still equals the receipt SHA. A confirmed bounded repair may be
+committed, pushed to the verified PR head branch, and followed by a factual PR
+reply containing the commit and test evidence. Merge always remains
+operator-gated. Without `auto_dispatch`, starting repair work and every GitHub
+write remain operator decisions.
 
 Claimed receipts carry a durable lease owner, UTC claim time, and monotonic
 lease version. A later scan may reclaim a stale claim only after rereading and

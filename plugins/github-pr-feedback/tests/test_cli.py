@@ -148,6 +148,19 @@ def test_kanban_client_creates_only_a_blocked_card_with_inert_hostile_evidence()
     assert "github-code-review" not in runner.calls[0]
 
 
+def test_kanban_client_dispatches_an_opted_in_repair_as_ready() -> None:
+    from github_pr_feedback.cli import KanbanSubprocessClient
+
+    runner = RecordingKanbanRunner('{"id": "task-123"}')
+    task = replace(kanban_task(), initial_status="ready")
+
+    task_id = KanbanSubprocessClient(runner).create_or_get_task(task)
+
+    assert task_id == "task-123"
+    status_index = runner.calls[0].index("--initial-status") + 1
+    assert runner.calls[0][status_index] == "ready"
+
+
 @pytest.mark.parametrize("stdout", ["{}", "[]", '{"id": ""}', '{"id": 17}', "not json"])
 def test_kanban_client_fails_closed_on_an_invalid_create_response(stdout: str) -> None:
     from github_pr_feedback.cli import KanbanSubprocessClient
