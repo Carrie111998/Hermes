@@ -149,6 +149,9 @@ def build_dashboard_parser(
     serve_parser.add_argument(
         "--no-open", action="store_true", help=argparse.SUPPRESS
     )
+    # ``--ssh-session-token-file`` and ``--ssh-owner-nonce`` together mark the
+    # private Desktop SSH tunnel transport and must never be set by ordinary
+    # serve/dashboard callers.
     serve_parser.add_argument(
         "--ssh-session-token-file",
         dest="ssh_session_token_file",

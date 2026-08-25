@@ -753,9 +753,11 @@ def _is_isolated_desktop_ssh_backend(
 
     This process is distinct from the operator's browser-facing dashboard: it
     binds an ephemeral loopback port, serves no SPA, and is protected by a
-    per-launch session token plus owner nonce.  A configured public dashboard
-    URL must not switch this private transport to cookie/OAuth mode because the
-    Desktop client authenticates its WebSocket with that session token.
+    per-launch session token plus owner nonce (``ssh_session_token`` and
+    ``ssh_owner_nonce`` together mark this private Desktop SSH transport and
+    must never be set by ordinary serve/dashboard callers).  A configured public
+    dashboard URL must not switch this private transport to cookie/OAuth mode
+    because the Desktop client authenticates its WebSocket with that session token.
 
     Keep every marker mandatory so ordinary dashboard/serve invocations cannot
     use this path to bypass the public-dashboard auth gate.
@@ -19303,8 +19305,9 @@ def start_server(
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
     the banner announces the bind rather than a browser URL.
 
-    ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
-    bootstrap state. Neither is persisted or exported to child processes.
+    ``ssh_session_token`` and ``ssh_owner_nonce`` together mark the private
+    Desktop SSH tunnel transport and must never be set by ordinary serve/dashboard
+    callers. Neither is persisted or exported to child processes.
     """
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
@@ -19342,6 +19345,11 @@ def start_server(
         ssh_session_token=ssh_session_token,
         ssh_owner_nonce=ssh_owner_nonce,
     )
+    if _private_desktop_ssh:
+        _log.info(
+            "Desktop SSH backend active: using session-token authentication; "
+            "public-dashboard auth gate is not inherited"
+        )
     # This ephemeral backend is not the browser-facing dashboard named by
     # dashboard.public_url.  Do not inherit that dashboard's Host/Origin trust
     # declaration or cookie/OAuth gate; the SSH tunnel uses its per-launch
@@ -19542,7 +19550,10 @@ def start_server(
         # proxy).  When the OAuth gate is active we are explicitly running
         # behind a TLS terminator (Fly.io) and need X-Forwarded-Proto to
         # decide cookie Secure flags, so we flip proxy_headers on for that
-        # mode.
+        # mode. Threat-model assumption: isolated Desktop SSH backends keep
+        # auth_required=False and proxy_headers=False because the backend
+        # communicates directly through an isolated tunnel and must not
+        # rely on X-Forwarded-* / proxy headers.
         proxy_headers=bool(app.state.auth_required),
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never

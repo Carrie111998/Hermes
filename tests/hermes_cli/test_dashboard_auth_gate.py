@@ -291,13 +291,7 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         clear_providers()
 
 
-def test_isolated_desktop_ssh_backend_keeps_session_token_auth(monkeypatch):
-    """A private Desktop SSH child must not inherit public dashboard OAuth.
-
-    Desktop connects to this ephemeral loopback-only backend through an SSH
-    tunnel and authenticates HTTP/WS with the per-launch session token.  The
-    machine may simultaneously expose its regular dashboard at ``public_url``.
-    """
+def _setup_desktop_ssh_test_env(monkeypatch):
     from hermes_cli.dashboard_auth import clear_providers
 
     monkeypatch.setenv(
@@ -317,19 +311,32 @@ def test_isolated_desktop_ssh_backend_keeps_session_token_auth(monkeypatch):
         "bound_port",
         "trusted_public_hosts",
     )
+    return captured
 
-    web_server.start_server(
-        host="127.0.0.1",
-        port=0,
-        open_browser=False,
-        headless=True,
-        ssh_session_token="desktop-session-token",
-        ssh_owner_nonce="desktop-owner-nonce",
-    )
+
+def test_isolated_desktop_ssh_backend_keeps_session_token_auth(monkeypatch, caplog):
+    """A private Desktop SSH child must not inherit public dashboard OAuth.
+
+    Desktop connects to this ephemeral loopback-only backend through an SSH
+    tunnel and authenticates HTTP/WS with the per-launch session token.  The
+    machine may simultaneously expose its regular dashboard at ``public_url``.
+    """
+    captured = _setup_desktop_ssh_test_env(monkeypatch)
+
+    with caplog.at_level("INFO", logger="hermes_cli.web_server"):
+        web_server.start_server(
+            host="127.0.0.1",
+            port=0,
+            open_browser=False,
+            headless=True,
+            ssh_session_token="desktop-session-token",
+            ssh_owner_nonce="desktop-owner-nonce",
+        )
 
     assert web_server.app.state.auth_required is False
     assert web_server.app.state.trusted_public_hosts == frozenset()
     assert captured["kwargs"].get("proxy_headers") is False
+    assert "Desktop SSH backend active" in caplog.text
     reason, credential = web_server._ws_auth_reason(
         SimpleNamespace(query_params={"token": "desktop-session-token"})
     )
@@ -351,21 +358,7 @@ def test_desktop_ssh_auth_exception_requires_every_private_marker(
     monkeypatch, overrides
 ):
     """Dropping any private-backend marker keeps the public auth gate on."""
-    from hermes_cli.dashboard_auth import clear_providers
-
-    monkeypatch.setenv(
-        "HERMES_DASHBOARD_PUBLIC_URL",
-        "https://dashboard.example.test:9443",
-    )
-    clear_providers()
-    _stub_uvicorn_run(monkeypatch)
-    _restore_app_state_after_test(
-        monkeypatch,
-        "auth_required",
-        "bound_host",
-        "bound_port",
-        "trusted_public_hosts",
-    )
+    _setup_desktop_ssh_test_env(monkeypatch)
     kwargs = {
         "host": "127.0.0.1",
         "port": 0,
