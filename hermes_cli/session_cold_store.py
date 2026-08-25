@@ -86,6 +86,12 @@ class _StorePlan:
     source_fingerprint: str
 
 
+@dataclass(frozen=True)
+class _StorePlanInputs:
+    message_limit: int
+    source_store_key: str
+
+
 def _source_store_key(conn: sqlite3.Connection) -> str:
     """Return a non-secret stable namespace for this file-backed SQLite store."""
     for row in conn.execute("PRAGMA database_list").fetchall():
@@ -127,8 +133,9 @@ def _rows(conn: sqlite3.Connection, query: str, params: tuple[Any, ...]) -> list
     ]
 
 
-def _enforce_message_limit(conn: sqlite3.Connection, physical_ids: tuple[str, ...]) -> None:
-    limit = resolved_max_export_messages()
+def _enforce_message_limit(
+    conn: sqlite3.Connection, physical_ids: tuple[str, ...], limit: int
+) -> None:
     if limit <= 0:
         return
     seen = 0
@@ -604,7 +611,11 @@ def _require_supported_platform() -> None:
         raise OSError("cold store is not yet supported on Windows")
 
 
-def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
+def _build_store_plan(
+    conn: sqlite3.Connection,
+    terminal_id: str,
+    inputs: _StorePlanInputs,
+) -> _StorePlan:
     lineage = _raw_compression_lineage(conn, terminal_id)
     if lineage[-1] != terminal_id:
         raise ValueError("store requires the terminal compression session ID")
@@ -626,7 +637,7 @@ def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
     if started_at is None:
         raise ValueError("terminal session must have a start time before cold storage")
 
-    _enforce_message_limit(conn, lineage)
+    _enforce_message_limit(conn, lineage, inputs.message_limit)
     records = _records(conn, lineage)
     _validate_sqlite_values(records)
     try:
@@ -640,9 +651,17 @@ def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
         terminal_id=terminal_id,
         physical_ids=lineage,
         started_at=validated_started_at,
-        source_store_key=_source_store_key(conn),
+        source_store_key=inputs.source_store_key,
         records=records,
         source_fingerprint=_fingerprint(records),
+    )
+
+
+def _store_plan_inputs(conn: sqlite3.Connection) -> _StorePlanInputs:
+    """Resolve config and file identity before any SQLite transaction."""
+    return _StorePlanInputs(
+        message_limit=resolved_max_export_messages(),
+        source_store_key=_source_store_key(conn),
     )
 
 
@@ -650,9 +669,10 @@ def _read_store_plan(db: SessionDB, terminal_id: str) -> _StorePlan:
     """Build one transactionally consistent Store plan using SELECTs only."""
     conn = _connection(db)
     with db._lock:
+        inputs = _store_plan_inputs(conn)
         conn.execute("SAVEPOINT cold_store_snapshot")
         try:
-            return _build_store_plan(conn, terminal_id)
+            return _build_store_plan(conn, terminal_id, inputs)
         finally:
             conn.execute("RELEASE SAVEPOINT cold_store_snapshot")
 
@@ -1050,19 +1070,23 @@ def _reject_uncovered_session_references(
 
 
 def _build_sqlite_purge_reference_plan(
-    conn: sqlite3.Connection, terminal_id: str
+    conn: sqlite3.Connection,
+    terminal_id: str,
+    inputs: _StorePlanInputs,
 ) -> _StorePlan:
     """Build the source plan and reject references stored in SQLite."""
-    plan = _build_store_plan(conn, terminal_id)
+    plan = _build_store_plan(conn, terminal_id, inputs)
     _reject_uncovered_session_references(conn, plan.physical_ids)
     return plan
 
 
 def _build_purge_reference_plan(
-    conn: sqlite3.Connection, terminal_id: str
+    conn: sqlite3.Connection,
+    terminal_id: str,
+    inputs: _StorePlanInputs,
 ) -> _StorePlan:
     """Build the source plan and reject SQLite plus legacy-file references."""
-    plan = _build_sqlite_purge_reference_plan(conn, terminal_id)
+    plan = _build_sqlite_purge_reference_plan(conn, terminal_id, inputs)
     _reject_legacy_routing_references(plan.physical_ids)
     return plan
 
@@ -1072,42 +1096,57 @@ def preflight_purge_archived_lineage(db: SessionDB, terminal_id: str) -> None:
     _require_supported_platform()
     conn = _connection(db)
     with db._lock:
+        inputs = _store_plan_inputs(conn)
         conn.execute("SAVEPOINT cold_purge_reference_preflight")
         try:
-            _build_purge_reference_plan(conn, terminal_id)
+            _build_purge_reference_plan(conn, terminal_id, inputs)
         finally:
             conn.execute("RELEASE SAVEPOINT cold_purge_reference_preflight")
 
 
 def _validated_purge_plan(
-    conn: sqlite3.Connection, terminal_id: str, archive_root: Path
+    conn: sqlite3.Connection,
+    terminal_id: str,
+    archive_root: Path,
+    inputs: _StorePlanInputs,
 ) -> tuple[_StorePlan, Path]:
-    plan = _build_purge_reference_plan(conn, terminal_id)
+    plan = _build_purge_reference_plan(conn, terminal_id, inputs)
     snapshot_dir = _verify_plan_snapshot(archive_root, plan)
     return plan, snapshot_dir
+
+
+def _validate_purge_with_inputs(
+    db: SessionDB, terminal_id: str, archive_root: Path
+) -> tuple[VerifiedLineage, _StorePlanInputs]:
+    _require_supported_platform()
+    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
+    conn = _connection(db)
+    with db._lock:
+        inputs = _store_plan_inputs(conn)
+        conn.execute("SAVEPOINT cold_purge_snapshot")
+        try:
+            plan, snapshot_dir = _validated_purge_plan(
+                conn, terminal_id, archive_root, inputs
+            )
+        finally:
+            conn.execute("RELEASE SAVEPOINT cold_purge_snapshot")
+    return (
+        VerifiedLineage(
+            plan.terminal_id,
+            plan.physical_ids,
+            plan.source_fingerprint,
+            snapshot_dir,
+        ),
+        inputs,
+    )
 
 
 def validate_purge_archived_lineage(
     db: SessionDB, terminal_id: str, archive_root: Path
 ) -> VerifiedLineage:
     """Run the final Purge eligibility gate without deleting any rows."""
-    _require_supported_platform()
-    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
-    conn = _connection(db)
-    with db._lock:
-        conn.execute("SAVEPOINT cold_purge_snapshot")
-        try:
-            plan, snapshot_dir = _validated_purge_plan(
-                conn, terminal_id, archive_root
-            )
-        finally:
-            conn.execute("RELEASE SAVEPOINT cold_purge_snapshot")
-    return VerifiedLineage(
-        plan.terminal_id,
-        plan.physical_ids,
-        plan.source_fingerprint,
-        snapshot_dir,
-    )
+    verified, _inputs = _validate_purge_with_inputs(db, terminal_id, archive_root)
+    return verified
 
 
 def purge_archived_lineage(
@@ -1126,14 +1165,14 @@ def purge_archived_lineage(
     if not db.flush_token_counts():
         raise RuntimeError("cold purge could not flush pending token accounting")
 
-    verified = validate_purge_archived_lineage(db, terminal_id, archive_root)
+    verified, inputs = _validate_purge_with_inputs(db, terminal_id, archive_root)
 
     def _purge(conn: sqlite3.Connection) -> PurgedLineage:
         # Keep this final transaction SQLite-only and short. Supported gateway
         # route persistence writes SQLite before its legacy mirror: a write that
         # committed before BEGIN is visible here, while one that starts later is
         # blocked and then rejected by the tombstone trigger after commit.
-        plan = _build_sqlite_purge_reference_plan(conn, terminal_id)
+        plan = _build_sqlite_purge_reference_plan(conn, terminal_id, inputs)
         if (
             plan.terminal_id != verified.terminal_id
             or plan.physical_ids != verified.physical_ids
@@ -1237,6 +1276,11 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         )
         if existing is True:
             _validate_directory_chain(edges)
+            # A prior publication may have made this exact snapshot visible
+            # before its parent-directory fsync failed. Idempotent success must
+            # establish the missing rename durability barrier, not merely trust
+            # the visible directory entry.
+            os.fsync(snapshot_parent_fd)
             return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
 
         staging_name, staging_fd = _create_staging_directory(snapshot_parent_fd)

@@ -814,6 +814,11 @@ class SessionSchemaMixin:
             "FROM gateway_routing_legacy_pk ORDER BY updated_at ASC"
         )
         cursor.execute("DROP TABLE gateway_routing_legacy_pk")
+        # Renaming the legacy table retargets its triggers to the temporary
+        # name, and dropping that table drops those triggers. Reapply the
+        # idempotent schema DDL now so the replacement table is fenced before
+        # this first post-upgrade connection can be used.
+        cursor.executescript(SCHEMA_SQL)
 
     def _heal_session_model_usage_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``session_model_usage`` when its PRIMARY KEY lacks ``task``.

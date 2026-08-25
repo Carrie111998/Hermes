@@ -112,8 +112,10 @@ def test_purge_finishes_filesystem_reads_before_final_write_transaction(
         stored = store_archived_lineage(db, "terminal", archive_root)
 
         final_write_started = False
-        filesystem_reads: list[str] = []
+        external_reads: list[str] = []
         original_execute_write = db._execute_write
+        original_message_limit = cold_store.resolved_max_export_messages
+        original_source_store_key = cold_store._source_store_key
         original_verify_snapshot = cold_store._verify_plan_snapshot
         original_legacy_routes = cold_store._reject_legacy_routing_references
 
@@ -122,17 +124,31 @@ def test_purge_finishes_filesystem_reads_before_final_write_transaction(
             final_write_started = True
             return original_execute_write(callback)
 
+        def tracked_message_limit():
+            assert not final_write_started, "config read ran inside final write"
+            external_reads.append("config")
+            return original_message_limit()
+
+        def tracked_source_store_key(*args, **kwargs):
+            assert not final_write_started, "source-store stat ran inside final write"
+            external_reads.append("source-store")
+            return original_source_store_key(*args, **kwargs)
+
         def tracked_verify_snapshot(*args, **kwargs):
             assert not final_write_started, "snapshot verification ran inside final write"
-            filesystem_reads.append("snapshot")
+            external_reads.append("snapshot")
             return original_verify_snapshot(*args, **kwargs)
 
         def tracked_legacy_routes(*args, **kwargs):
             assert not final_write_started, "legacy-route read ran inside final write"
-            filesystem_reads.append("legacy-routes")
+            external_reads.append("legacy-routes")
             return original_legacy_routes(*args, **kwargs)
 
         monkeypatch.setattr(db, "_execute_write", tracked_execute_write)
+        monkeypatch.setattr(
+            cold_store, "resolved_max_export_messages", tracked_message_limit
+        )
+        monkeypatch.setattr(cold_store, "_source_store_key", tracked_source_store_key)
         monkeypatch.setattr(cold_store, "_verify_plan_snapshot", tracked_verify_snapshot)
         monkeypatch.setattr(
             cold_store, "_reject_legacy_routing_references", tracked_legacy_routes
@@ -140,7 +156,12 @@ def test_purge_finishes_filesystem_reads_before_final_write_transaction(
 
         result = purge_archived_lineage(db, "terminal", archive_root)
 
-        assert filesystem_reads == ["legacy-routes", "snapshot"]
+        assert external_reads == [
+            "config",
+            "source-store",
+            "legacy-routes",
+            "snapshot",
+        ]
         assert result.snapshot_dir == stored.snapshot_dir
         assert db.get_session("terminal") is None
     finally:
@@ -1263,6 +1284,69 @@ def test_store_restores_current_snapshot_when_replacement_publish_fails(
             if path.name.startswith((".stale-", ".staging-"))
         }
         assert leftovers == set()
+    finally:
+        db.close()
+
+
+def test_store_retry_requires_successful_parent_fsync_after_publication_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="durable payload")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        real_rename = os.rename
+        real_fsync = os.fsync
+        published = False
+        fail_publication_fsync = True
+        retrying = False
+        retry_fsyncs = 0
+
+        def track_publication_rename(
+            src: str,
+            dst: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            nonlocal published
+            real_rename(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+            if src.startswith(".staging-"):
+                published = True
+
+        def fail_once_after_publication(descriptor: int) -> None:
+            nonlocal fail_publication_fsync, retry_fsyncs
+            if published and fail_publication_fsync:
+                fail_publication_fsync = False
+                raise OSError(errno.EIO, "injected snapshot parent fsync failure")
+            if retrying:
+                retry_fsyncs += 1
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(os, "rename", track_publication_rename)
+        monkeypatch.setattr(os, "fsync", fail_once_after_publication)
+
+        with pytest.raises(OSError, match="injected snapshot parent fsync failure"):
+            store_archived_lineage(db, "terminal", archive_root)
+
+        assert published
+        visible_snapshot = next(archive_root.rglob("metadata.json")).parent
+        assert visible_snapshot.is_dir()
+
+        retrying = True
+        result = store_archived_lineage(db, "terminal", archive_root)
+
+        assert result.snapshot_dir == visible_snapshot
+        assert retry_fsyncs == 1
     finally:
         db.close()
 
