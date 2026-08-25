@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -527,11 +528,11 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     assert exec_line == f'"{spaced}" desktop'
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Symlinks require elevated privileges on Windows"
+)
 def test_running_interpreter_keeps_venv_semantic_path(tmp_path, monkeypatch):
     """Lexical preserved only when pyvenv.cfg marks the path as a venv."""
-    import os as _os
-    import sys as _sys
-
     # venv layout: bin/python symlink -> base, pyvenv.cfg at venv root
     base = tmp_path / "base" / "python3.11"
     base.parent.mkdir(parents=True)
