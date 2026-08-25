@@ -25381,11 +25381,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _transport_profile = str(evt.get("transport_profile") or "").strip() or None
         _provenance_is_default = _transport_profile == TRANSPORT_PROFILE_DEFAULT
         # Owner map plus slot is exact: it names the one adapter the turn
-        # arrived on, so no alias resolution runs. Without the slot, a default
-        # owner and a relay-fronted platform are indistinguishable from a
-        # native one, and resolve_delivery_transport picks the native adapter
-        # by contract — a completion out of a different bot and credential.
+        # arrived on, so no alias resolution runs. Without it a default owner
+        # cannot tell a relay-fronted platform from a native one, and
+        # resolve_delivery_transport answers out of the native bot by contract.
         _transport_slot = str(evt.get("transport_slot") or "").strip() or None
+        if _transport_slot and _transport_slot not in (
+            platform_name, Platform.RELAY.value,
+        ):
+            # Capture only ever records the logical platform's own slot or
+            # relay, so a third value is a damaged record: fall back to the
+            # chain below instead of delivering out of an unrelated platform.
+            logger.debug(
+                "Ignoring transport slot %r: not a slot the %s turn could "
+                "have arrived on",
+                _transport_slot, platform_name,
+            )
+            _transport_slot = None
         if _transport_slot:
             try:
                 adapter = self._adapter_for_transport_slot(

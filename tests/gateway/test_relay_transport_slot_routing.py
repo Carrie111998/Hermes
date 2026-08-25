@@ -254,3 +254,37 @@ async def test_relay_slot_survives_a_gateway_restart(tmp_path, monkeypatch):
     assert await runner._inject_watch_notification("[task finished]", evt) is True
     assert relay.handle_message.await_count == 1
     assert native.handle_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_slot_the_turn_could_not_have_arrived_on_is_ignored():
+    """A damaged record must not deliver through an unrelated platform."""
+    discord = _Adapter("discord")
+    native = _Adapter("slack-native")
+    runner = _runner({Platform.SLACK: native, Platform.DISCORD: discord})
+
+    result = await runner._inject_watch_notification(
+        "[task finished]", _slack_event(transport_slot="discord")
+    )
+
+    assert result is True
+    assert discord.handle_message.await_count == 0, (
+        "a Slack completion left through the Discord adapter because the "
+        "recorded slot was taken on trust"
+    )
+    assert native.handle_message.await_count == 1
+
+
+def test_relay_ingress_outranks_a_native_registration_on_the_same_source():
+    """The relay flag decides the slot, not the order of the lookups."""
+    relay = _RelayAdapter()
+    native = _Adapter("slack-native")
+    runner = _runner({Platform.SLACK: native, Platform.RELAY: relay})
+    source = SimpleNamespace(
+        platform=Platform.SLACK,
+        profile="",
+        delivered_via_upstream_relay=True,
+    )
+    source._transport_adapter_ref = weakref.ref(native)
+
+    assert runner._ingress_transport_slot(source) == "relay"

@@ -246,13 +246,16 @@ class GatewayAuthorizationMixin:
         (``GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS``). ``None`` means no live
         transport provenance, so the caller keeps alias resolution.
         """
+        # relay ingress is the authoritative fact and is checked first: the
+        # adapter sits under ``Platform.RELAY``, so a native adapter serving
+        # the same logical platform must never claim the slot.
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            return Platform.RELAY.value
         if self._registered_transport_adapter(source) is not None:
             # Registration was found under the source's own platform key.
             platform = getattr(source, "platform", None)
             value = getattr(platform, "value", platform)
             return str(value) if value else None
-        if getattr(source, "delivered_via_upstream_relay", False) is True:
-            return Platform.RELAY.value
         return None
 
     def _adapter_for_transport_slot(self, transport_slot, transport_profile):
