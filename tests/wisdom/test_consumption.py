@@ -66,7 +66,16 @@ class Client:
             }
         ]
 
-    def content(self, _skill_id, _version):
+    def content(
+        self,
+        _skill_id,
+        _version,
+        *,
+        installation_id,
+        takedown_generation,
+    ):
+        assert installation_id.startswith("hwi_")
+        assert takedown_generation == self.takedown_generation
         _records, content_hash = verify_content_files(self.files)
         return SimpleNamespace(content_hash=content_hash), self.files
 

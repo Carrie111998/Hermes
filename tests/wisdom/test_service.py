@@ -9,7 +9,9 @@ from hermes_wisdom.client import Draft, WisdomValidationError
 from hermes_wisdom.contract import (
     PackageManifest,
     SystemSpecification,
+    author_description_hash,
     canonical_json_bytes,
+    sha256_address,
 )
 from hermes_wisdom.package import PackagePolicyError, verify_content_files
 from hermes_wisdom.service import WisdomService
@@ -80,7 +82,16 @@ class InstallClient:
         manifest = json.loads(self.files[1][2])
         return SimpleNamespace(version={"system_spec": manifest["requirements"]})
 
-    def content(self, _skill_id, _version):
+    def content(
+        self,
+        _skill_id,
+        _version,
+        *,
+        installation_id,
+        takedown_generation,
+    ):
+        assert installation_id.startswith("hwi_")
+        assert takedown_generation == 0
         _records, content_hash = verify_content_files(self.files)
         return SimpleNamespace(content_hash=content_hash), self.files
 
@@ -103,6 +114,99 @@ class SetupClient:
 
     def register_identity(self, installation_id):
         return {"installation_id": installation_id, "state": "active"}
+
+
+class ReviewClient:
+    identity = {"owner": "user-1"}
+
+    def __init__(self):
+        manifest = canonical_json_bytes(
+            PackageManifest(
+                name="reviewed-skill",
+                requirements=SystemSpecification.model_validate(
+                    {"hermes": {"minimum_version": "0.1.0"}}
+                ),
+            ).model_dump(mode="json")
+        )
+        self.files = [
+            ("SKILL.md", "file", b"# Reviewed skill\n"),
+            ("skill.manifest.json", "file", manifest),
+        ]
+        self.description = "Resolve incidents safely."
+        self.revision = "revision-1"
+        self.approvals: list[dict] = []
+        self.publications = 0
+
+    def _draft(self):
+        _records, content_hash = verify_content_files(self.files)
+        manifest = next(body for path, _, body in self.files if path == "skill.manifest.json")
+        return Draft(
+            id="draft-review",
+            orgId="org-1",
+            ownerUserId="user-1",
+            slug="reviewed-skill",
+            draftCommit="sha256:" + "a" * 64,
+            contentHash=content_hash,
+            authorDescription=self.description,
+            authorDescriptionHash=author_description_hash(self.description),
+            state="ready",
+            packageManifestHash=sha256_address(manifest),
+            packageManifestSchemaVersion=1,
+            systemSpec=None,
+            scan={"verdict": "pass", "findings": []},
+            scanVerdict="pass",
+            explanation="Mechanical facts.",
+            updatedAt=self.revision,
+        )
+
+    def reconstruct_draft(self, _draft_id):
+        draft = self._draft()
+        records, content_hash = verify_content_files(self.files)
+        return SimpleNamespace(
+            detail=SimpleNamespace(
+                draft=draft,
+                effective_policy={"publication_policy": "open", "policy_version": 1},
+            ),
+            files=self.files,
+            content_files=records,
+            content_hash=content_hash,
+        )
+
+    def approve(self, _draft_id, **hashes):
+        self.approvals.append(hashes)
+        return self._draft().model_copy(update={"state": "owner_approved"})
+
+    def publish(self, _draft_id, *, content_hash):
+        self.publications += 1
+        return {"state": "published", "content_hash": content_hash}
+
+
+def _review_service(tmp_path: Path, *, client: ReviewClient):
+    store = WisdomStore(tmp_path / "state")
+    skill_path = tmp_path / "skills" / "reviewed-skill"
+    skill_path.mkdir(parents=True)
+    skill_id = store.register_skill(
+        skill_path,
+        content_hash=client._draft().contentHash,
+        source_kind="local",
+    )
+    draft = client._draft()
+    store.record_draft(
+        {
+            "id": draft.id,
+            "skill_id": skill_id,
+            "source_hash": draft.contentHash,
+            "overlay_path": str(skill_path),
+            "draft_commit": draft.draftCommit,
+            "server_revision": draft.updatedAt,
+            "state": draft.state,
+            "description": draft.authorDescription or "",
+            "content_hash": draft.contentHash,
+            "description_hash": draft.authorDescriptionHash or "",
+            "manifest_hash": draft.packageManifestHash or "",
+        }
+    )
+    return WisdomService(store=store, client=client)
 
 
 def _install_service(monkeypatch, tmp_path: Path, *, client: InstallClient):
@@ -277,6 +381,63 @@ def test_org_change_switches_marker_before_local_ledger(monkeypatch, tmp_path: P
 
     assert (skills / "_wisdom" / ".active_org").read_text() == "org-2\n"
     assert store.active_org_id() == "org-1"
+
+
+def test_approval_requires_a_complete_review_receipt(tmp_path: Path):
+    service = _review_service(tmp_path, client=ReviewClient())
+
+    with pytest.raises(PackagePolicyError, match="fresh complete-package review"):
+        service.approve("draft-review")
+
+
+@pytest.mark.parametrize("mutation", ["content", "description", "manifest", "revision"])
+def test_approval_rejects_each_stale_receipt_binding(tmp_path: Path, mutation: str):
+    client = ReviewClient()
+    service = _review_service(tmp_path, client=client)
+    service.review("draft-review", acknowledge=True)
+
+    if mutation == "content":
+        client.files[0] = ("SKILL.md", "file", b"# Mutated content\n")
+    elif mutation == "description":
+        client.description = "Changed owner copy."
+    elif mutation == "manifest":
+        changed = json.loads(client.files[1][2])
+        changed["name"] = "changed-manifest"
+        client.files[1] = (
+            "skill.manifest.json",
+            "file",
+            canonical_json_bytes(changed),
+        )
+    else:
+        client.revision = "revision-2"
+
+    with pytest.raises(PackagePolicyError, match="receipt is stale"):
+        service.approve("draft-review")
+    assert client.approvals == []
+    assert client.publications == 0
+
+
+def test_successful_approval_consumes_receipt_and_replay_is_denied(tmp_path: Path):
+    client = ReviewClient()
+    service = _review_service(tmp_path, client=client)
+    store = service.store
+    reviewed = service.review("draft-review", acknowledge=True)
+
+    result = service.approve("draft-review")
+
+    assert result["publication"]["state"] == "published"
+    assert client.approvals == [
+        {
+            "content_hash": reviewed["hashes"]["content"],
+            "description_hash": reviewed["hashes"]["author_description"],
+            "manifest_hash": reviewed["hashes"]["package_manifest"],
+        }
+    ]
+    assert client.publications == 1
+    assert store.receipt("draft-review") is None
+    with pytest.raises(PackagePolicyError, match="fresh complete-package review"):
+        service.approve("draft-review")
+    assert client.publications == 1
 
 
 def test_setup_rejects_an_unsafe_org_path_before_writing_marker(

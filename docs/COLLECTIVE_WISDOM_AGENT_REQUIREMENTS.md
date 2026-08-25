@@ -2,15 +2,15 @@
 
 This ledger covers the Agent-owned portion of the canonical design in
 [Gateway PR #215](https://github.com/NousResearch/gateway-gateway/pull/215) at
-`ee7b6123a08ef2379ef1641ed8e6defa10329eaa`. The implementation is one unified
+`600bbf5f181a89e5e54f8ed494c94aa8f8687b01`. The implementation is one unified
 [Hermes Agent PR #94266](https://github.com/NousResearch/hermes-agent/pull/94266).
 
 ## Pinned contract and QA catalog
 
 | Artifact | Immutable pin |
 | --- | --- |
-| Gateway implementation | PR #213 at `ce5553002217cf36769e8017bccba69ef47eae16` |
-| Gateway OpenAPI | SHA-256 `11b5b08a60069a3b79c902e4a9b0d3efad90c5b5628332280ec8890d1500f368` |
+| Gateway implementation | PR #213 at `fda8bd80fb8ca461966d14a79dda4ed0e07fb4d4` |
+| Gateway OpenAPI | SHA-256 `1c38e43df6fdb83705cd9d14d58655bf3eab08b84f41198272821866c8d2f603` |
 | Package-manifest schema | SHA-256 `64d0010eada1d79fa16309e9fd715faf77b6186360ea0b095182b2bdaeec5714` |
 | Canonical hash vectors | SHA-256 `e2b28c708f69e99b342de1df48498d96efde68867857391590bc964a609a730b` |
 | `DOGFOOD_QA_TEST_IDS.json` | schema 3, 369 IDs, SHA-256 `0cccb3502cf168046ed2a6a9f924162249f3fe935919cfc2dd3ed4d6008a6276` |

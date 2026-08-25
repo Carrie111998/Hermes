@@ -803,8 +803,27 @@ class WisdomService:
     def versions(self, skill_id: str) -> list[dict[str, Any]]:
         return self.client.skill(skill_id).versions
 
+    def _content_authority(self) -> str:
+        installation_id = self.store.existing_installation_identity()
+        if not installation_id:
+            raise PackagePolicyError(
+                "run `hermes wisdom setup` before downloading managed content"
+            )
+        return installation_id
+
     def version_content(self, skill_id: str, version: int) -> dict[str, Any]:
-        response, files = self.client.content(skill_id, version)
+        detail = self.client.skill(skill_id)
+        generation = int(detail.skill.get("takedown_generation", -1))
+        if generation < 0:
+            raise WisdomValidationError(
+                "Gateway omitted the content authorization generation"
+            )
+        response, files = self.client.content(
+            skill_id,
+            version,
+            installation_id=self._content_authority(),
+            takedown_generation=generation,
+        )
         return {
             "commit": response.commit,
             "content_hash": response.content_hash,
@@ -852,7 +871,17 @@ class WisdomService:
             int(item["version"]) for item in versions
         )
         version_detail = self.client.version(skill_id, version_number)
-        content, files = self.client.content(skill_id, version_number)
+        takedown_generation = int(detail.skill.get("takedown_generation", -1))
+        if takedown_generation < 0:
+            raise WisdomValidationError(
+                "Gateway omitted the install authorization generation"
+            )
+        content, files = self.client.content(
+            skill_id,
+            version_number,
+            installation_id=self._content_authority(),
+            takedown_generation=takedown_generation,
+        )
         manifest_body = next(
             (body for path, _mode, body in files if path == "skill.manifest.json"),
             None,
@@ -883,7 +912,7 @@ class WisdomService:
             "version": version_number,
             "content_hash": content.content_hash,
             "manifest_hash": sha256_address(manifest_body),
-            "takedown_generation": int(detail.skill.get("takedown_generation", 0)),
+            "takedown_generation": takedown_generation,
             "update_mode": update_mode,
             "compatibility": asdict(compatibility),
             "allowed": allowed,
@@ -948,7 +977,12 @@ class WisdomService:
             raise PackagePolicyError(
                 "install authorization changed after planning; create a new plan"
             )
-        response, files = self.client.content(plan["skill_id"], int(plan["version"]))
+        response, files = self.client.content(
+            plan["skill_id"],
+            int(plan["version"]),
+            installation_id=self._content_authority(),
+            takedown_generation=int(plan["takedown_generation"]),
+        )
         exact_records, exact_hash = verify_content_files(files)
         if exact_hash != response.content_hash or exact_hash != str(
             plan.get("content_hash")

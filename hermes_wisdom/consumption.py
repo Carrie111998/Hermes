@@ -136,6 +136,21 @@ class WisdomConsumption:
             str(item["skill_id"]): item for item in self.client.installations(identity)
         }
 
+    def _content(
+        self, skill_id: str, version: int, takedown_generation: int
+    ) -> tuple[Any, list[tuple[str, str, bytes]]]:
+        installation_id = self.store.existing_installation_identity()
+        if not installation_id:
+            raise PackagePolicyError(
+                "run `hermes wisdom setup` before downloading managed content"
+            )
+        return self.client.content(
+            skill_id,
+            version,
+            installation_id=installation_id,
+            takedown_generation=takedown_generation,
+        )
+
     def check(self, *, apply_automatic: bool = False) -> dict[str, Any]:
         qualification_events = process_due_stability_jobs(store=self.store)
         feed = self.poll_feed()
@@ -223,7 +238,13 @@ class WisdomConsumption:
                 "state": "current",
                 "installed_version": installation["version"],
             }
-        response, files = self.client.content(skill_id, version)
+        try:
+            generation = int(authoritative["takedown_generation"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PackagePolicyError(
+                "Gateway returned incomplete update authorization"
+            ) from exc
+        response, files = self._content(skill_id, version, generation)
         records, content_hash = verify_content_files(files)
         if content_hash != response.content_hash:
             raise WisdomValidationError("update content failed integrity validation")
@@ -293,7 +314,7 @@ class WisdomConsumption:
             "previous_installation": installation,
             "target_path": str(target),
             "staging_path": str(staging),
-            "takedown_generation": int(authoritative.get("takedown_generation") or 0),
+            "takedown_generation": generation,
             "update_mode": mode,
             "modified": modified,
             "sensitive_expansion": sensitive,
@@ -470,8 +491,10 @@ class WisdomConsumption:
             raise PackagePolicyError(
                 "update authority or policy changed after planning; create a new plan"
             )
-        response, remote_files = self.client.content(
-            str(plan["skill_id"]), int(plan["version"])
+        response, remote_files = self._content(
+            str(plan["skill_id"]),
+            int(plan["version"]),
+            remote_generation,
         )
         records, remote_hash = verify_content_files(remote_files)
         remote_baseline = {record.path: record.hash for record in records}

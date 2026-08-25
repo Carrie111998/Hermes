@@ -1,4 +1,6 @@
 import json
+import base64
+import hashlib
 
 import pytest
 
@@ -9,6 +11,7 @@ from hermes_wisdom.client import (
     WisdomNotFound,
     WisdomValidationError,
 )
+from hermes_wisdom.package import verify_content_files
 
 
 def _draft(**overrides):
@@ -132,6 +135,51 @@ def test_approve_exact_three_hash_body():
         "content_hash": "c",
         "author_description_hash": "d",
         "package_manifest_hash": "m",
+    }
+
+
+def test_content_fetch_is_bound_to_installation_identity_and_takedown_generation():
+    skill = b"# Skill\n"
+    manifest = b'{"schema_version":1,"name":"skill","requirements":{"hermes":{"minimum_version":"0.1.0"}}}'
+    files = [
+        ("SKILL.md", "file", skill),
+        ("skill.manifest.json", "file", manifest),
+    ]
+    _records, content_hash = verify_content_files(files)
+    value = client(
+        Response(
+            200,
+            {
+                "commit": "sha256:" + "a" * 64,
+                "content_hash": content_hash,
+                "files": [
+                    {
+                        "path": path,
+                        "mode": mode,
+                        "hash": "sha256:" + hashlib.sha256(body).hexdigest(),
+                        "content_base64": base64.b64encode(body).decode("ascii"),
+                    }
+                    for path, mode, body in files
+                ],
+            },
+        )
+    )
+
+    value.content(
+        "skill-1",
+        2,
+        installation_id="hwi_1234567890123456",
+        takedown_generation=7,
+    )
+
+    method, url, request = value.session.calls[0]
+    assert (method, url) == (
+        "GET",
+        "https://gateway.example/v1/sync/wisdom/skills/skill-1/versions/2/content",
+    )
+    assert request["params"] == {
+        "installation_id": "hwi_1234567890123456",
+        "takedown_generation": 7,
     }
 
 

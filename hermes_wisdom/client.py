@@ -497,12 +497,21 @@ class WisdomClient:
         )
 
     def content(
-        self, skill_id: str, version: int
+        self,
+        skill_id: str,
+        version: int,
+        *,
+        installation_id: str,
+        takedown_generation: int,
     ) -> tuple[VersionContent, list[tuple[str, str, bytes]]]:
         response = self._request(
             "GET",
             f"skills/{quote(skill_id, safe='')}/versions/{version}/content",
             model=VersionContent,
+            params={
+                "installation_id": installation_id,
+                "takedown_generation": takedown_generation,
+            },
         )
         decoded: list[tuple[str, str, bytes]] = []
         for item in response.files:
