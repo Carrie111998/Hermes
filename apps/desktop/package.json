@@ -55,7 +55,7 @@
     "smoke:local-ai": "node scripts/local-ai-real-smoke.mjs",
     "verify:platform-artifacts": "node scripts/verify-platform-artifacts.mjs",
     "check:brand-separation": "node scripts/check-brand-separation.mjs",
-    "test:release-auth": "node --test scripts/desktop-release-oidc.test.mjs",
+    "test:release-auth": "node --test scripts/desktop-release-oidc.contract.mjs",
     "typecheck": "tsc -p . --noEmit && tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.e2e.json --noEmit",
     "lint": "eslint src/ electron/",
     "lint:fix": "eslint src/ electron/ --fix",
