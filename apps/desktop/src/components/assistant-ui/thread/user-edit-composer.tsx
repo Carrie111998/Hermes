@@ -108,6 +108,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const [triggerPlacement, setTriggerPlacement] = useState<'bottom' | 'top'>('top')
   const [focusRequestId, setFocusRequestId] = useState(0)
   const [submitting, setSubmitting] = useState(false)
+  const submitCooldownTimerRef = useRef<number | null>(null)
   // True while OS-drop files are being staged/uploaded into the session. Blocks
   // submit and shows a spinner so confirming the edit can't race the async
   // upload and drop the gateway-side ref before it lands in the draft.
@@ -124,6 +125,11 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   // cleanup so keyboard routing falls back to the visible chat composer.
   useEffect(
     () => () => {
+      if (submitCooldownTimerRef.current !== null) {
+        window.clearTimeout(submitCooldownTimerRef.current)
+        submitCooldownTimerRef.current = null
+      }
+
       notifyThreadEditClose()
       releaseActiveComposer('edit')
     },
@@ -596,16 +602,23 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     // click). Reset `submitting` on failure so the arrow can't wedge on `true`
     // and leave revert as the only way out (#49903 is the same unguarded-core
     // hazard on the main composer).
+    // Clear latch after cooldown to allow re-submission. This prevents rapid
+    // double-Enter but doesn't require tracking when onEdit settles (which may
+    // be synchronous or async, and whose promise we don't have access to).
+    // Register before send() so a synchronous composer teardown can clear it.
+    submitCooldownTimerRef.current = window.setTimeout(() => {
+      submitCooldownTimerRef.current = null
+      setSubmitting(false)
+    }, 200)
+
     try {
       aui.composer().send()
-
-      // Clear latch after cooldown to allow re-submission. This prevents rapid
-      // double-Enter but doesn't require tracking when onEdit settles (which may
-      // be synchronous or async, and whose promise we don't have access to).
-      window.setTimeout(() => {
-        setSubmitting(false)
-      }, 200)
     } catch {
+      if (submitCooldownTimerRef.current !== null) {
+        window.clearTimeout(submitCooldownTimerRef.current)
+        submitCooldownTimerRef.current = null
+      }
+
       setSubmitting(false)
     }
   }

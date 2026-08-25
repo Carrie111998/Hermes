@@ -20,6 +20,8 @@ stubThreadEnvironment()
 
 afterEach(() => {
   cleanup()
+  vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 stubThreadViewportSize()
@@ -198,6 +200,33 @@ describe('Enter submission and latch behavior', () => {
     await waitFor(() => {
       expect(onEdit).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it('does not leave a submission cooldown timer after the edit unmounts', async () => {
+    const onEdit = vi.fn(async () => {})
+    const { unmount } = render(<IncrementalHarness onEdit={onEdit} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }))
+
+    const editor = await screen.findByRole('textbox', { name: 'Edit message' })
+    editor.textContent = 'edit that will close the composer'
+    fireEvent.input(editor)
+
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+    const clearTimeoutSpy = vi.spyOn(window, 'clearTimeout')
+    fireEvent.keyDown(editor, { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(onEdit).toHaveBeenCalledTimes(1)
+    })
+
+    const cooldownIndex = setTimeoutSpy.mock.calls.findIndex(([, delay]) => delay === 200)
+    expect(cooldownIndex).toBeGreaterThanOrEqual(0)
+    const cooldownTimer = setTimeoutSpy.mock.results[cooldownIndex]?.value
+
+    unmount()
+
+    expect(clearTimeoutSpy).toHaveBeenCalledWith(cooldownTimer)
   })
 
   it('clears the submitting latch after onEdit resolves, allowing second edit session', async () => {
