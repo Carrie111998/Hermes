@@ -9275,6 +9275,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             f"Tokens: {total_tokens:,}",
             f"Agent Running: {'Yes' if is_running else 'No'}",
         ])
+        try:
+            from agent.runtime_identity import get_runtime_identity
+            r_ident = get_runtime_identity(public=False)
+            if r_ident.get("hermes_home_digest"):
+                lines.append(f"Home Digest: {r_ident['hermes_home_digest']}")
+            if r_ident.get("commit_sha"):
+                lines.append(f"Commit: {r_ident['commit_sha'][:8]}")
+        except Exception:
+            pass
         self._console_print("\n".join(lines), highlight=False, markup=False)
     
     def _fast_command_available(self) -> bool:
