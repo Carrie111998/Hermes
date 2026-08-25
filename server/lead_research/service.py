@@ -40,8 +40,9 @@ from .storage import EvidenceRepository
 from .verdicts import SourceCoverage, evaluate_verdict, terminal_value
 
 
-def _domain(url: str) -> str:
-    parsed = urlparse(url)
+def _domain(url: str | None) -> str:
+    """The registrable host of a public URL, or "" for internal evidence."""
+    parsed = urlparse(url or "")
     return (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.")
 
 
@@ -1137,7 +1138,7 @@ class LeadResearchService:
 
         spent = 0
         seen = {
-            source.provenance_url
+            source.locator
             for _, bundle in bundles for source in bundle.sources
         }
         extra = []
@@ -1158,10 +1159,10 @@ class LeadResearchService:
             spent += bundle.requests
             if bundle.candidate_source_record_id != candidate.source_record_id:
                 continue
-            fresh = [source for source in bundle.sources if source.provenance_url not in seen]
+            fresh = [source for source in bundle.sources if source.locator not in seen]
             if not fresh:
                 continue
-            seen.update(source.provenance_url for source in fresh)
+            seen.update(source.locator for source in fresh)
             extra.append((source_id, bundle.model_copy(update={"sources": fresh})))
 
         completed_fields = fact_fields | {

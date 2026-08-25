@@ -1,0 +1,15 @@
+{
+  "purpose": "curated_buyers",
+  "asserted_fields": [
+    "company_identity",
+    "target_presence",
+    "product_sector_relevance",
+    "buyer_membership"
+  ],
+  "sector_ids": ["household-appliances"],
+  "product_terms": [],
+  "publisher_label": "Kitchen appliance customer list",
+  "curated_at": 1787616000.0,
+  "freshness_unknown": false,
+  "curation_note": "Sanitized company-only export buyer list; personal contact columns excluded."
+}

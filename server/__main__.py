@@ -113,6 +113,12 @@ def main(argv=None) -> None:
         "--owner-company-id",
         help="Keep this corpus private to one company",
     )
+    candidates.add_argument(
+        "--assertion-manifest", type=Path,
+        help="JSON file stating what this dataset version asserts about every "
+             "row. Without it the corpus is selection-only: rows can be picked "
+             "as candidates but never carry evidence for themselves.",
+    )
     backfill = sub.add_parser(
         "backfill-candidate-search",
         help="Fill search_text for corpora imported before that column existed",
@@ -209,10 +215,15 @@ def main(argv=None) -> None:
         settings = Settings.load()
         db = create_database(settings)
         try:
+            manifest = (
+                json.loads(args.assertion_manifest.read_text(encoding="utf-8"))
+                if args.assertion_manifest else None
+            )
             report = CandidateRepository(db).import_file(
                 args.dataset_id, args.version, args.file.name, args.file.read_bytes(),
                 owner_company_id=args.owner_company_id,
                 visibility="tenant_private" if args.owner_company_id else "service_public",
+                assertion_manifest=manifest,
             )
             # Candidate rows are intentionally never echoed to stdout.
             print(json.dumps({

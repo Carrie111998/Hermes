@@ -15,6 +15,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from ..db import json_dump, json_load, now
+from .models import DatasetAssertionManifest
 from ..quality import normalize_name
 
 
@@ -162,6 +163,9 @@ class CandidateRecord:
     country: str
     domain: str | None
     data: dict[str, Any]
+    # What the dataset version this row came from asserts about it. None for a
+    # legacy corpus, which therefore stays candidate supply and never evidence.
+    assertion_manifest: DatasetAssertionManifest | None = None
 
 
 @dataclass(frozen=True)
@@ -412,6 +416,7 @@ class CandidateRepository:
         *,
         owner_company_id: str | None = None,
         visibility: CandidateVisibility = "service_public",
+        assertion_manifest: dict | DatasetAssertionManifest | None = None,
     ) -> CandidateImportReport:
         dataset_id, version = _clean(dataset_id), _clean(version)
         if not dataset_id or not version:
@@ -424,15 +429,32 @@ class CandidateRepository:
             raise CandidateImportValidationError("private candidate datasets require an owner company")
         candidates = _parse_rows(filename, content)
         digest = hashlib.sha256(content).hexdigest()
+        manifest_json = None
+        if assertion_manifest is not None:
+            try:
+                manifest = (
+                    assertion_manifest
+                    if isinstance(assertion_manifest, DatasetAssertionManifest)
+                    else DatasetAssertionManifest.model_validate(assertion_manifest)
+                )
+            except Exception as exc:
+                raise CandidateImportValidationError(
+                    f"invalid dataset assertion manifest: {exc}"
+                ) from exc
+            # The digest is ours to set, never the operator's to claim: the
+            # assertion is about these exact bytes.
+            manifest_json = json_dump(
+                manifest.model_copy(update={"snapshot_hash": digest}).model_dump(mode="json")
+            )
         try:
             with self.db.transaction() as conn:
                 conn.execute(
                     "INSERT INTO candidate_datasets("
                     "dataset_id,version,owner_company_id,visibility,source_filename,raw_hash,"
-                    "imported_at,record_count) VALUES(?,?,?,?,?,?,?,?)",
+                    "imported_at,record_count,assertion_manifest) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         dataset_id, version, owner_company_id, visibility, filename,
-                        digest, now(), len(candidates),
+                        digest, now(), len(candidates), manifest_json,
                     ),
                 )
                 for record in candidates:
@@ -518,6 +540,29 @@ class CandidateRepository:
             if dataset_id not in newest or rank(version) > rank(newest[dataset_id]):
                 newest[dataset_id] = version
         return newest
+
+    def _manifests(self) -> dict[tuple[str, str], DatasetAssertionManifest]:
+        """Every dataset version's operator assertion, keyed by identity.
+
+        One query per selection rather than a join per row: there are a handful
+        of dataset versions and tens of thousands of rows, and an unreadable
+        manifest must degrade that version to selection-only rather than fail
+        the whole search.
+        """
+        output: dict[tuple[str, str], DatasetAssertionManifest] = {}
+        for row in self.db.all(
+            "SELECT dataset_id,version,assertion_manifest FROM candidate_datasets "
+            "WHERE assertion_manifest IS NOT NULL", ()
+        ):
+            try:
+                output[(row["dataset_id"], row["version"])] = (
+                    DatasetAssertionManifest.model_validate(
+                        json_load(row["assertion_manifest"], {})
+                    )
+                )
+            except Exception:
+                continue
+        return output
 
     def term_match_counts(
         self, *, countries: list[str], product_terms: list[str], company_id: str | None = None
@@ -652,6 +697,7 @@ class CandidateRepository:
         # are content hashes, so this interleaves datasets evenly and stays
         # deterministic.
         query += " ORDER BY source_record_id,dataset_id,version"
+        manifests = self._manifests()
         results: list[CandidateRecord] = []
         for row in self.db.all(query, tuple(params)):
             data = json_load(row["data"], {})
@@ -671,6 +717,7 @@ class CandidateRepository:
                 dataset_id=row["dataset_id"], version=row["version"], source_record_id=row["source_record_id"],
                 company_name=row["company_name"], normalized_name=row["normalized_name"], country=row["country"],
                 domain=row["domain"], data=data,
+                assertion_manifest=manifests.get((row["dataset_id"], row["version"])),
             ))
             if len(results) == limit:
                 break

@@ -142,8 +142,8 @@ class EvidenceRepository:
             "ORDER BY retrieved_at",
             (self.company_id, *sorted(cutoff_by_source), min(cutoff_by_source.values())),
         )
-        # provenance_url is the identity of a source within a bundle, so a later
-        # row for the same URL supersedes an earlier one.
+        # The locator is the identity of a source within a bundle, so a later
+        # row for the same URL or dataset reference supersedes an earlier one.
         accepted_fingerprints = (
             {query_fingerprint} if isinstance(query_fingerprint, str) else query_fingerprint
         )
@@ -160,11 +160,15 @@ class EvidenceRepository:
             # candidate id containing a colon still round-trips.
             candidate_id = str(row["source_record_id"]).rsplit(":", 1)[0]
             try:
+                reference = payload.get("source_reference") or None
                 source = VerificationSource(
-                    provenance_url=row["provenance_url"] or "",
+                    provenance_url=row["provenance_url"] or None,
+                    source_reference=reference,
                     raw_hash=row["raw_hash"],
                     classification=payload.get("classification", "independent"),
-                    retrieved_via=payload.get("retrieved_via") or row["provenance_url"] or "",
+                    retrieved_via=(
+                        payload.get("retrieved_via") or row["provenance_url"] or reference or ""
+                    ),
                     facts=payload.get("facts") or {},
                     retrieved_at=row["retrieved_at"],
                     snapshot_content=payload.get("snapshot_content") or "",
@@ -180,13 +184,13 @@ class EvidenceRepository:
                 # must not be silently treated as evidence either.
                 continue
             collected.setdefault((row["source_id"], candidate_id), {})[
-                source.provenance_url
+                source.locator
             ] = source
         bundles: dict[tuple[str, str], VerificationBundle] = {}
         for (source_id, candidate_id), sources in collected.items():
             ordered = list(sources.values())
             independent = {
-                source.provenance_url for source in ordered
+                source.locator for source in ordered
                 if source.classification == "independent"
             }
             bundles[(source_id, candidate_id)] = VerificationBundle(
@@ -238,10 +242,10 @@ class EvidenceRepository:
             snapshot_id = f"snap_{hashlib.sha256(seed).hexdigest()[:20]}"
             evidence_seed = (
                 f"{self.company_id}:{source_id}:{bundle.candidate_source_record_id}:"
-                f"{source.provenance_url}:{source.raw_hash}"
+                f"{source.locator}:{source.raw_hash}"
             ).encode()
             evidence_id = f"ev_{hashlib.sha256(evidence_seed).hexdigest()[:20]}"
-            record_seed = hashlib.sha256(source.provenance_url.encode()).hexdigest()[:16]
+            record_seed = hashlib.sha256(source.locator.encode()).hexdigest()[:16]
             envelope = EvidenceEnvelope(
                 evidence_id=evidence_id,
                 source_id=source_id,
@@ -259,6 +263,10 @@ class EvidenceRepository:
                     "facts": source.facts,
                     "classification": source.classification,
                     "retrieved_via": source.retrieved_via,
+                    # Kept in the payload rather than in `provenance_url`: that
+                    # column is the public link a customer may follow, and an
+                    # internal reference is not one.
+                    "source_reference": source.source_reference,
                     # What question this answered. Reuse requires a match; see
                     # `query_fingerprint`.
                     "query_fingerprint": query_fingerprint,
@@ -312,6 +320,7 @@ class EvidenceRepository:
                         1,
                         json_dump({
                             "provenance_url": source.provenance_url,
+                            "source_reference": source.source_reference,
                             "retrieved_via": source.retrieved_via,
                             "classification": source.classification,
                             "snapshot_content": source.snapshot_content,

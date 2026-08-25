@@ -365,3 +365,68 @@ def test_anything_that_changes_extraction_changes_the_fingerprint(change):
         EvidenceRepository.query_fingerprint(_query(**change))
         != EvidenceRepository.query_fingerprint(_query())
     )
+
+
+# --- Internal dataset references are first-class evidence identities --------
+#
+# A curated corpus row has no public page to cite, so its evidence is addressed
+# by an immutable internal reference. Storage must derive identity from that
+# reference exactly as it does from a URL, keep the public URL null, and hand
+# the reference back so a customer receipt can show where the claim came from.
+
+def _dataset_source():
+    snapshot = json.dumps({"company_name": ["Atlas Kitchens GmbH"], "country": ["DE"]})
+    import hashlib as _hashlib
+
+    from server.lead_research.quotes import spans_for_facts
+
+    facts = {"company_name": ["Atlas Kitchens GmbH"], "country": ["DE"]}
+    return VerificationSource(
+        source_reference="dataset:kitchen-appliances:3:atlas-1",
+        raw_hash=_hashlib.sha256(snapshot.encode()).hexdigest(),
+        classification="independent",
+        retrieved_via="dataset:kitchen-appliances:3:atlas-1",
+        facts=facts,
+        snapshot_content=snapshot,
+        fact_spans=spans_for_facts(snapshot, facts),
+    )
+
+
+def test_dataset_reference_evidence_has_a_stable_identity_and_no_public_url(tmp_path):
+    db = Database(tmp_path / "reference.db")
+    repo = EvidenceRepository(db, "cmp_1")
+    bundle = VerificationBundle(
+        candidate_source_record_id="atlas-1", sources=[_dataset_source()],
+    )
+
+    first = repo.prepare_verification(bundle, "customer-list-corpus", "fp")
+    second = repo.prepare_verification(bundle, "customer-list-corpus", "fp")
+
+    (prepared,) = first
+    assert [item["evidence_id"] for item in first] == [item["evidence_id"] for item in second]
+    envelope = prepared["envelope"]
+    assert envelope.provenance_url is None
+    assert envelope.payload["source_reference"] == "dataset:kitchen-appliances:3:atlas-1"
+
+
+def test_a_verification_source_needs_exactly_one_locator():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        VerificationSource(
+            raw_hash="0" * 64, classification="independent",
+            retrieved_via="https://x.example",
+        )
+    with _pytest.raises(ValueError):
+        VerificationSource(
+            provenance_url="https://x.example/a",
+            source_reference="dataset:a:1:b",
+            raw_hash="0" * 64, classification="independent",
+            retrieved_via="https://x.example",
+        )
+    with _pytest.raises(ValueError):
+        VerificationSource(
+            source_reference="file:///etc/passwd",
+            raw_hash="0" * 64, classification="independent",
+            retrieved_via="file:///etc/passwd",
+        )

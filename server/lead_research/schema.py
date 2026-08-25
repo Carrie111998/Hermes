@@ -229,6 +229,9 @@ CREATE TABLE IF NOT EXISTS candidate_datasets (
     raw_hash TEXT NOT NULL,
     imported_at REAL NOT NULL,
     record_count INTEGER NOT NULL,
+    -- The operator's immutable assertion about this version's rows, or NULL for
+    -- a dataset imported before manifests existed. NULL stays selection-only.
+    assertion_manifest TEXT,
     PRIMARY KEY(dataset_id, version)
 );
 CREATE TABLE IF NOT EXISTS candidate_records (

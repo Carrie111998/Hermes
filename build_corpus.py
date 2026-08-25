@@ -144,9 +144,24 @@ def self_check() -> None:
 
     assert len(rows) == 2, rows
     assert {r["country"] for r in rows} == {"MY", "VE"}, rows
-    # The whole point of this script: no person survives the trip.
+    assert sorted(rows[0]) == [
+        "categories", "company_name", "country", "source_record_id"
+    ], rows[0]
+    # The whole point of this script: no person survives the trip. Every column
+    # of the raw contact list is named here, not just the obviously personal
+    # ones, because the corpus is shared across tenants and `data` keeps
+    # unknown columns verbatim -- a header that survives becomes a published
+    # field. The two identity columns are re-emitted under their own snake_case
+    # names, so the raw spellings must be gone too.
     out_text = ",".join(sorted(rows[0]) + [v for r in rows for v in r.values()])
-    for leaked in ("Jane", "Roe", "@acme.example", "Buyer", "Title"):
+    raw_columns = (
+        "Country", "Company Name", "Name", "Title", "Primary Email",
+        "Other Emails", "Telephone Numbers", "Fax",
+    )
+    sample_values = (
+        "Jane", "Roe", "John", "Doe", "@acme.example", "Buyer", "Head",
+    )
+    for leaked in (*raw_columns, *sample_values):
         assert leaked not in out_text, f"PII leaked: {leaked}"
     # Same input must give the same ids, or a re-import stops being idempotent.
     assert rows[0]["source_record_id"] == rows[0]["source_record_id"]

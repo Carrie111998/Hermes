@@ -325,3 +325,77 @@ def test_each_dataset_keeps_its_own_newest_version(db, candidate_csv):
     assert {(r.dataset_id, r.version) for r in selected} == {
         ("kitchen-appliances", "2"), ("ted-appliances", "1"),
     }
+
+
+# --- Immutable dataset assertion manifests ---------------------------------
+#
+# A curated buyer list is not a directory of names: the operator who supplied it
+# is asserting something checkable about every row. The manifest records that
+# assertion once, immutably, beside the dataset version, so the corpus verifier
+# can speak for a row without inventing authority the file never claimed.
+
+MANIFEST = {
+    "purpose": "curated_buyers",
+    "asserted_fields": [
+        "company_identity", "target_presence",
+        "product_sector_relevance", "buyer_membership",
+    ],
+    "sector_ids": ["household-appliances"],
+    "product_terms": [],
+    "publisher_label": "Curated appliance buyer list",
+    "curated_at": 1787616000.0,
+    "freshness_unknown": False,
+    "curation_note": "Named wholesale prospects supplied for appliance sales.",
+}
+
+
+@pytest.fixture()
+def sector_csv():
+    return (
+        b"source_record_id,company_name,country,categories,buyer_types\n"
+        b"atlas-1,Atlas Kitchens GmbH,DE,household-appliances,importer\n"
+    )
+
+
+def test_manifest_is_immutable_dataset_evidence_and_reaches_selected_rows(db, sector_csv):
+    CandidateRepository(db).import_file(
+        "buyers", "3", "buyers.csv", sector_csv, assertion_manifest=MANIFEST,
+    )
+
+    (selected,) = CandidateRepository(db).select(
+        countries=["DE"], product_terms=["household-appliances"], limit=5,
+    )
+
+    assert selected.assertion_manifest.purpose == "curated_buyers"
+    assert selected.assertion_manifest.publisher_label == "Curated appliance buyer list"
+    assert selected.assertion_manifest.sector_ids == ["household-appliances"]
+    assert selected.assertion_manifest.snapshot_hash == hashlib.sha256(sector_csv).hexdigest()
+
+
+def test_legacy_dataset_without_manifest_remains_selection_only(db, sector_csv):
+    CandidateRepository(db).import_file("legacy", "1", "legacy.csv", sector_csv)
+
+    (selected,) = CandidateRepository(db).select(
+        countries=["DE"], product_terms=["household-appliances"], limit=5,
+    )
+
+    assert selected.assertion_manifest is None
+
+
+def test_a_manifest_must_declare_its_freshness_exactly_once(db, sector_csv):
+    both = {**MANIFEST, "freshness_unknown": True}
+    neither = {**MANIFEST, "curated_at": None}
+    for manifest in (both, neither):
+        with pytest.raises(CandidateImportValidationError):
+            CandidateRepository(db).import_file(
+                "buyers", "3", "buyers.csv", sector_csv, assertion_manifest=manifest,
+            )
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_datasets")["n"] == 0
+
+
+def test_a_curated_buyer_manifest_without_a_sector_is_rejected(db, sector_csv):
+    with pytest.raises(CandidateImportValidationError):
+        CandidateRepository(db).import_file(
+            "buyers", "3", "buyers.csv", sector_csv,
+            assertion_manifest={**MANIFEST, "sector_ids": []},
+        )

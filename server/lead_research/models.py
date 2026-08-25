@@ -121,6 +121,51 @@ class DatasetDefinition(ApiModel):
         return self
 
 
+class DatasetAssertionManifest(ApiModel):
+    """What the operator who supplied a corpus is asserting about every row.
+
+    A candidate file on its own is a list of names, and a name cannot vouch for
+    itself. What makes a curated buyer list evidence is the assertion that came
+    with it: someone checked these companies exist, sell in these markets, and
+    buy in this sector. That assertion used to live in an operator's head, so
+    the verifier had nothing to read and abstained on every uncited row --
+    which meant a real, hand-checked customer list scored the same as noise.
+
+    Recorded once, immutably, beside the dataset version. A correction ships as
+    a new version with its own manifest; this row is never edited, so evidence
+    already derived from it keeps meaning what it meant.
+    """
+
+    purpose: Literal[
+        "directory", "curated_buyers", "curated_prospects", "discovered_candidates"
+    ]
+    asserted_fields: set[Literal[
+        "company_identity", "target_presence", "product_sector_relevance",
+        "buyer_membership", "contact_channel",
+    ]]
+    sector_ids: list[str] = Field(default_factory=list)
+    product_terms: list[str] = Field(default_factory=list)
+    publisher_label: str = Field(min_length=1, max_length=160)
+    curated_at: float | None = None
+    freshness_unknown: bool = False
+    curation_note: str = Field(min_length=1, max_length=500)
+    # The digest of the candidate file this manifest was imported with. Set by
+    # the repository, not the operator: it is what ties the assertion to the
+    # exact bytes it was made about.
+    snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def freshness_is_explicit(self):
+        # Silence about age is the one thing a curated list must not be allowed
+        # to be. Either the operator knows when it was curated or they say they
+        # do not; "no value" would read downstream as "fresh".
+        if (self.curated_at is None) == (not self.freshness_unknown):
+            raise ValueError("set curated_at or freshness_unknown, but not both")
+        if self.purpose in {"curated_buyers", "curated_prospects"} and not self.sector_ids:
+            raise ValueError("curated buyer datasets require a sector")
+        return self
+
+
 class SourceCapability(ApiModel):
     source_id: str
     candidate_discovery: bool = False
@@ -266,11 +311,20 @@ class EvidenceSpan(ApiModel):
 
 
 class VerificationSource(ApiModel):
-    provenance_url: str
+    # Exactly one of these locates the evidence. A web page has a public URL; a
+    # curated corpus row has no page to cite, so it carries an immutable
+    # internal reference instead. Requiring a URL forced every internal source
+    # to either invent one or abstain, which is why a hand-checked customer
+    # list could never be evidence for its own rows.
+    provenance_url: str | None = None
+    source_reference: str | None = None
     raw_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     classification: Literal["official", "independent"]
     retrieved_via: str
-    facts: dict[str, list[str]] = Field(default_factory=dict)
+    # Values stay in the type the provider observed them in. A dimension claim
+    # is a number, and stringifying it made `_claim_score` read "90" as a bare
+    # truthy value worth 100.
+    facts: dict[str, list[str | int | float]] = Field(default_factory=dict)
     snapshot_content: str = ""
     fact_spans: dict[str, list[EvidenceSpan]] = Field(default_factory=dict)
     source_language: str = "en"
@@ -281,12 +335,28 @@ class VerificationSource(ApiModel):
     # be measured at all.
     retrieved_at: float | None = None
 
-    @field_validator("provenance_url", "retrieved_via")
-    @classmethod
-    def require_https_url(cls, value: str) -> str:
-        if not value.startswith("https://"):
-            raise ValueError("verification sources must use https URLs")
-        return value
+    @property
+    def locator(self) -> str:
+        """Where this evidence lives; the identity storage hashes and dedupes on."""
+        return self.provenance_url or self.source_reference or ""
+
+    @model_validator(mode="after")
+    def has_one_locator(self):
+        if bool(self.provenance_url) == bool(self.source_reference):
+            raise ValueError("verification source requires exactly one locator")
+        if self.provenance_url and not self.provenance_url.startswith("https://"):
+            raise ValueError("verification source URLs must use https")
+        if self.source_reference and not self.source_reference.startswith("dataset:"):
+            raise ValueError("internal evidence references must use dataset:")
+        # Retrieval must be describable in the same two vocabularies and no
+        # others: an http fetch or a local file path would both be evidence
+        # nobody can re-derive.
+        if not (
+            self.retrieved_via.startswith("https://")
+            or self.retrieved_via == self.source_reference
+        ):
+            raise ValueError("retrieved_via must be an https URL or this source's reference")
+        return self
 
 
 class VerificationBundle(ApiModel):
