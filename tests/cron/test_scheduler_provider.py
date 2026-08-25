@@ -703,3 +703,51 @@ def test_multiplex_ticker_does_not_recreate_archived_profile(tmp_path):
     assert not p2.exists(), "archived profile directory must not be recreated by the ticker"
 
 
+def test_multiplex_ticker_resumes_after_profile_unarchived(tmp_path):
+    """Recreating a previously-archived profile's directory must let the
+    ticker resume ticking it on the next cycle (the self-heal behavior
+    ``_start_multiplex``'s docstring claims for the ``is_dir()`` guard, #94590).
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "research"
+    for d in (p1, p2):
+        (d / "cron").mkdir(parents=True)
+
+    profile_homes = [("default", p1), ("research", p2)]
+
+    class _StepStopEvent:
+        def __init__(self, iterations, on_wait):
+            self._remaining = iterations
+            self._on_wait = on_wait
+
+        def is_set(self):
+            return self._remaining <= 0
+
+        def wait(self, timeout=None):
+            self._remaining -= 1
+            self._on_wait()
+            return False
+
+    calls = {"n": 0}
+
+    def _archive_then_unarchive():
+        import shutil
+
+        calls["n"] += 1
+        if calls["n"] == 1:
+            shutil.rmtree(p2)  # iteration 2 must skip "research"
+        elif calls["n"] == 2:
+            (p2 / "cron").mkdir(parents=True, exist_ok=True)  # iteration 3 must resume it
+
+    stop = _StepStopEvent(iterations=3, on_wait=_archive_then_unarchive)
+    prov = InProcessCronScheduler()
+
+    with patch("cron.scheduler.tick", return_value=0):
+        prov.start(stop, interval=0, profile_homes=profile_homes)
+
+    assert (p2 / "cron" / "ticker_heartbeat").exists(), \
+        "un-archived profile must be ticked again once its directory reappears"
+
+
