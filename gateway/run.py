@@ -23242,6 +23242,30 @@ def _booting_incumbent_blocks_replace(existing_pid: int) -> Optional[float]:
 # into the same shutdown-handler invocation a real SIGTERM produces on POSIX.
 # ``--replace`` now uses it too, and force-kills only if the incumbent refuses.
 _REPLACE_DRAIN_CEILING_S = 600.0
+
+# Headroom for TEARDOWN, on top of a budget that only covers the DRAIN.
+#
+# `_windows_stop_drain_timeout` is ordered past the shutdown-watchdog leash,
+# which bounds the drain -- but Python's post-loop teardown (thread joins,
+# adapter close, atexit) runs AFTER that and is not covered by it. Observed
+# live 2026-08-25: gateway 14572 was asked to stop at 02:02:39, wrote
+# `gateway.exit_clean` at 02:03:52 (73s, well inside the then-100s budget) and
+# was still alive at 02:04:49, so the escalation force-killed the tail of its
+# own shutdown. It never wrote its `atexit.hook`; the gateway it had replaced
+# minutes earlier did.
+#
+# Sized from the data rather than picked: across 582 teardowns in
+# logs/gateway-exit-diag.log the exit-record -> final-atexit gap is p50 0.0s
+# and p90 0.0s, so this costs nothing in the overwhelming majority of restarts
+# -- `_wait_for_pid_exit` polls and returns the moment the PID is gone. The
+# non-wedge outliers reach ~46s and 14572's exceeded 57s, so 60s of headroom
+# covers the real tail with room to spare.
+#
+# Deliberately NOT sized for the 356s/362s/753s wedges in the same data. A
+# budget that waits out a wedge is not caution, it is a twelve-minute outage;
+# a gateway that will not die is exactly what the force-kill escalation is for.
+_REPLACE_TEARDOWN_MARGIN_S = 60.0
+
 _IS_WINDOWS = sys.platform == "win32"
 
 
@@ -23292,6 +23316,10 @@ def _replace_drain_timeout() -> float:
         # Outlast the incumbent's own budget rather than matching it exactly;
         # a drain that finishes at the buzzer still needs to write its records.
         granted *= 1.5
+
+    # Both sources bound the DRAIN. Teardown runs after it and needs its own
+    # headroom -- see _REPLACE_TEARDOWN_MARGIN_S for the measurement.
+    granted += _REPLACE_TEARDOWN_MARGIN_S
 
     return max(15.0, min(granted, _REPLACE_DRAIN_CEILING_S))
 

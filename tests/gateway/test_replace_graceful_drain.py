@@ -110,6 +110,49 @@ def test_replace_drain_timeout_is_bounded():
     assert gateway_run._replace_drain_timeout() <= 600.0
 
 
+def test_replace_budget_covers_teardown_not_just_the_drain():
+    """The drain finishing is not the process being GONE.
+
+    Observed live 2026-08-25: gateway 14572 was asked to stop at 02:02:39,
+    wrote ``gateway.exit_clean`` at 02:03:52 -- 73s, comfortably inside the
+    then-100s budget -- and was still alive at 02:04:49, so the escalation
+    force-killed the tail of its own shutdown. It never wrote its
+    ``atexit.hook``; the gateway it had replaced minutes earlier did.
+
+    ``_windows_stop_drain_timeout`` is ordered past the shutdown-watchdog
+    LEASH, which bounds the drain. Python's post-loop teardown -- thread
+    joins, adapter close, atexit -- runs AFTER that and is not covered by it.
+    Measured over 582 teardowns in gateway-exit-diag.log the tail is p50 0.0s
+    and p90 0.0s, so this costs nothing in the normal case; the non-wedge
+    outliers reach ~46s, and 14572's exceeded 57s.
+
+    So the replace budget must clear the leash by enough to absorb that tail.
+    Deliberately NOT enough to absorb the 356s/362s/753s wedges also present in
+    that data -- those are what the force-kill is FOR, and waiting them out
+    would turn a restart into a twelve-minute outage.
+    """
+    from hermes_cli.gateway_windows import _windows_stop_drain_timeout
+
+    granted = gateway_run._replace_drain_timeout()
+    leash_based = float(_windows_stop_drain_timeout())
+
+    assert granted >= leash_based + 50.0, (
+        f"replace grants {granted}s against a leash-derived {leash_based}s -- "
+        "too thin to absorb the post-drain teardown tail"
+    )
+    # The live failure needed >130s end to end. Pin that specific case.
+    assert granted >= 130.0, "must cover the observed 2026-08-25 teardown"
+
+
+def test_replace_budget_does_not_wait_out_a_wedge():
+    """Bounded well under the 356-753s wedges seen in the same data.
+
+    A budget that covers a wedge is not caution, it is an outage: the whole
+    point of the escalation is that a gateway which will not die gets killed.
+    """
+    assert gateway_run._replace_drain_timeout() <= 300.0
+
+
 # --------------------------------------------------------------------------
 # Windows: marker, never a signal
 # --------------------------------------------------------------------------
