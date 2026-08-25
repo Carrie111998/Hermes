@@ -558,7 +558,10 @@ class TestPauseResumeJob:
         `paused: True` + `enabled: True` + `state: "scheduled"` — running jobs
         that any `grep paused` audit reads as contained. Clearing them took a
         hand-written guarded sweep (MemPalace jobflow/
-        bridge-business-state-rollback-2026-08-23).
+        bridge-business-state-rollback-2026-08-23). The other two of the eight
+        (jobflow-tracker-cycle, jobflow-reconcile) were enabled=False +
+        state=paused in that same snapshot, so THEIR flag was coherent — see
+        test_genuinely_paused_records_keep_their_flag.
 
         Note there is nothing to archive here: the WHY was already destroyed by
         the earlier resume, before this code existed. Re-resuming must still
@@ -582,6 +585,58 @@ class TestPauseResumeJob:
         assert resumed["enabled"] is True
         assert resumed["state"] == "scheduled"
         assert "paused_history" not in resumed
+
+    def test_legacy_paused_flag_stays_in_lockstep_across_a_round_trip(
+        self, tmp_cron_dir
+    ):
+        """Clearing the flag on resume must not simply INVERT the hazard.
+
+        Both false readings are equally bad for an audit that greps the field:
+          paused=True  + enabled=True  + state=scheduled -> live job read as contained
+          paused=False + enabled=False + state=paused    -> contained job read as live
+        Fixing only the un-pause side produced the second one on the very next
+        pause. The invariant is `paused == (state == "paused")` at every step.
+        """
+        job = create_job(prompt="Round trip", schedule="every 1h")
+        update_job(
+            job["id"],
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused": True,
+                "paused_at": "2026-08-23T21:51:01-04:00",
+                "paused_reason": "containment",
+            },
+        )
+
+        def _coherent(record):
+            return record["paused"] is (record["state"] == "paused")
+
+        assert _coherent(get_job(job["id"]))
+        assert _coherent(resume_job(job["id"]))
+        assert _coherent(pause_job(job["id"], reason="second pause"))
+        assert _coherent(resume_job(job["id"]))
+
+    def test_genuinely_paused_records_keep_their_flag(self, tmp_cron_dir):
+        """The negative control for the stale-flag sweep.
+
+        In the 2026-08-24T04:20 store snapshot, six of the eight records
+        carrying `paused` were hazard-shaped, but jobflow-tracker-cycle and
+        jobflow-reconcile were enabled=False + state=paused — their
+        `paused: True` is COHERENT. A fix that clears the flag must not touch
+        those; only an actual resume may.
+        """
+        job = create_job(prompt="Genuinely paused", schedule="every 1h")
+        paused = pause_job(job["id"], reason="containment")
+        # A plain pause_job does not introduce the key at all...
+        assert "paused" not in paused
+
+        # ...and on a record that already carries it, pause keeps it True.
+        update_job(job["id"], {"paused": True})
+        repaused = pause_job(job["id"], reason="containment again")
+        assert repaused["paused"] is True
+        assert repaused["enabled"] is False
+        assert repaused["state"] == "paused"
 
     def test_resume_leaves_records_that_never_had_paused_flag_alone(self, tmp_cron_dir):
         """Don't grow every record a key it never carried."""

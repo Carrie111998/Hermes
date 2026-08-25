@@ -1890,15 +1890,24 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     if not job:
         return None
     normalized_reason = (reason or "").strip() or None
-    return update_job(
-        job["id"],
-        {
-            "enabled": False,
-            "state": "paused",
-            "paused_at": _hermes_now().isoformat(),
-            "paused_reason": normalized_reason,
-        },
-    )
+    updates: Dict[str, Any] = {
+        "enabled": False,
+        "state": "paused",
+        "paused_at": _hermes_now().isoformat(),
+        "paused_reason": normalized_reason,
+    }
+
+    # Mirror of ``_unpause_updates``: keep the legacy ``paused`` bool in
+    # lockstep with the lifecycle whenever the record carries it. Without this,
+    # clearing the flag on resume just inverts the hazard — a job paused again
+    # afterwards would sit at ``paused: False`` + ``enabled: False`` +
+    # ``state: "paused"``, and an audit grepping for a false flag would read a
+    # genuinely contained job as live. Same only-when-already-present rule, so
+    # records that never carried the key stay byte-identical.
+    if "paused" in job:
+        updates["paused"] = True
+
+    return update_job(job["id"], updates)
 
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
