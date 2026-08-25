@@ -261,6 +261,129 @@ def _cua_no_overlay() -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Windows HiDPI coordinate normalization (#94538)
+# ---------------------------------------------------------------------------
+#
+# cua-driver's Windows backend captures screenshots in physical pixels while
+# its input dispatch (SendInput) operates in logical units. On a scaled
+# display (e.g. 150%) a click at screenshot coordinate [x, y] therefore lands
+# at [x * scale, y * scale] — the input pipeline multiplies by the DPI scale
+# — and misses the intended element. The wrapper divides coordinate inputs
+# by the display scale factor (DPI / 96) before dispatching, mirroring what
+# Anthropic's reference computer-use implementation does with its
+# display_width_px / screen_width normalization.
+
+_CUA_NO_DPI_NORMALIZATION_ENV = "HERMES_CUA_NO_DPI_NORMALIZATION"
+
+# Sanity bounds for a plausible Windows display scale (25% .. 800%). Values
+# outside this range are probe garbage, not a real DPI setting; treating
+# them as scale would send clicks to nonsense coordinates.
+_MIN_WINDOWS_SCALE = 0.25
+_MAX_WINDOWS_SCALE = 8.0
+
+
+def _cua_dpi_normalization_disabled() -> bool:
+    """True when coordinate DPI normalization is explicitly turned off.
+
+    Normalization is automatic on Windows scaled displays. This is the
+    escape hatch for hosts/drivers that already normalize server-side:
+    ``HERMES_CUA_NO_DPI_NORMALIZATION`` (any truthy value) or
+    ``computer_use.dpi_normalization: false`` in config.
+    """
+    raw = os.environ.get(_CUA_NO_DPI_NORMALIZATION_ENV, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return _computer_use_cfg().get("dpi_normalization") is False
+
+
+def _normalize_coordinate(value: Any, scale: Any) -> int:
+    """Map a screenshot-space coordinate into the driver's input space.
+
+    Identity when ``scale`` is 1.0 or unavailable; otherwise divides by the
+    display scale and rounds to the nearest integer (SendInput coordinates
+    are integral).
+    """
+    try:
+        if not isinstance(scale, (int, float)) or scale == 1.0:
+            return int(value)
+        return int(round(float(value) / float(scale)))
+    except (TypeError, ValueError):
+        return int(value)
+
+
+def _win32_hwnd_for_pid(user32: Any, pid: int) -> Optional[int]:
+    """Best-effort HWND of the first visible top-level window of ``pid``."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        found = []
+
+        def _enum_cb(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                proc_id = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+                if proc_id.value == pid:
+                    found.append(hwnd)
+                    return False  # found — stop enumeration
+            except Exception:
+                return False
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+        return int(found[0]) if found else None
+    except Exception:
+        return None
+
+
+def _win32_dpi_scale(pid: Optional[int]) -> Optional[float]:
+    """Display scale factor (DPI / 96) for a Windows target process, or None.
+
+    Prefers ``GetDpiForWindow`` for a visible top-level window of ``pid``
+    (per-monitor DPI); falls back to ``GetDpiForSystem``. Returns None when
+    the platform is not Windows or no DPI could be read, which callers
+    treat as "no normalization". See #94538.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = None
+        if pid:
+            hwnd = _win32_hwnd_for_pid(user32, int(pid))
+        dpi = 0
+        if hwnd:
+            try:
+                dpi = int(user32.GetDpiForWindow(hwnd))
+            except Exception:
+                dpi = 0
+        if dpi <= 0:
+            try:
+                dpi = int(user32.GetDpiForSystem())
+            except Exception:
+                dpi = 0
+        if dpi <= 0:
+            return None
+        scale = dpi / 96.0
+        if not (_MIN_WINDOWS_SCALE <= scale <= _MAX_WINDOWS_SCALE):
+            logger.warning(
+                "computer_use: implausible Windows DPI %s ignored for "
+                "coordinate normalization",
+                dpi,
+            )
+            return None
+        return scale
+    except Exception as exc:
+        logger.debug("computer_use: Windows DPI probe failed: %s", exc)
+        return None
+
+
 def _cua_telemetry_disabled() -> bool:
     """True when Hermes should disable cua-driver telemetry for this user.
 
@@ -2625,6 +2748,11 @@ class CuaDriverBackend(ComputerUseBackend):
         # element. Cleared whenever a fresh capture overwrites the
         # snapshot context.
         self._snapshot_tokens: Dict[int, str] = {}
+        # Windows HiDPI (#94538): cached DPI scale per active target pid.
+        # None means "probe failed / not applicable" and disables
+        # normalization; populated lazily so __new__-constructed test
+        # backends behave identically.
+        self._dpi_scale_cache: Dict[Optional[int], Optional[float]] = {}
         # Per-instance public cua-driver session label. The MCP transport owns
         # the private lifecycle and releases it when the connection closes.
         # start_session/end_session attach this stable label to cursor,
@@ -2779,6 +2907,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_app = None
         self._last_target = None
         self._snapshot_tokens = {}
+        self._dpi_scale_cache = {}
 
     def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
         """Return an empty capture after disarming any prior target context."""
@@ -3476,6 +3605,35 @@ class CuaDriverBackend(ComputerUseBackend):
             }
         return result
 
+    def _coordinate_scale(self) -> float:
+        """Scale factor to divide coordinate inputs by before dispatch.
+
+        Windows HiDPI (#94538): cua-driver captures screenshots in physical
+        pixels while its input dispatch operates in logical units, so raw
+        screenshot coordinates drift by the DPI scale. Dividing by the
+        display scale maps the screenshot space onto the driver's native
+        input space. Returns 1.0 (a no-op identical to pre-fix behavior)
+        when normalization is disabled, the host is not Windows, or the
+        DPI probe fails.
+        """
+        if _cua_dpi_normalization_disabled():
+            return 1.0
+        pid = self._active_pid
+        cache = getattr(self, "_dpi_scale_cache", None)
+        if cache is None:
+            cache = {}
+            self._dpi_scale_cache = cache
+        if pid in cache:
+            return cache[pid] or 1.0
+        try:
+            scale = _win32_dpi_scale(pid)
+        except Exception:
+            scale = None
+        if not isinstance(scale, (int, float)) or scale <= 0:
+            scale = None
+        cache[pid] = scale
+        return scale or 1.0
+
     def click(
         self,
         *,
@@ -3518,6 +3676,16 @@ class CuaDriverBackend(ComputerUseBackend):
             if self._active_window_id is None:
                 return ActionResult(ok=False, action=tool,
                                     message="No active window_id for coordinate click.")
+            scale = self._coordinate_scale()
+            if scale != 1.0:
+                norm_x = _normalize_coordinate(x, scale)
+                norm_y = _normalize_coordinate(y, scale)
+                logger.debug(
+                    "computer_use: click coordinates normalized for Windows "
+                    "DPI (scale=%.3f): (%s, %s) -> (%s, %s)",
+                    scale, x, y, norm_x, norm_y,
+                )
+                x, y = norm_x, norm_y
             args["x"] = x
             args["y"] = y
             args["window_id"] = self._active_window_id
@@ -3557,8 +3725,15 @@ class CuaDriverBackend(ComputerUseBackend):
             if self._active_window_id is None:
                 return ActionResult(ok=False, action="drag",
                                     message="No active window_id for coordinate drag.")
-            args["from_x"], args["from_y"] = int(from_xy[0]), int(from_xy[1])
-            args["to_x"], args["to_y"] = int(to_xy[0]), int(to_xy[1])
+            scale = self._coordinate_scale()
+            args["from_x"], args["from_y"] = (
+                _normalize_coordinate(from_xy[0], scale),
+                _normalize_coordinate(from_xy[1], scale),
+            )
+            args["to_x"], args["to_y"] = (
+                _normalize_coordinate(to_xy[0], scale),
+                _normalize_coordinate(to_xy[1], scale),
+            )
             args["window_id"] = self._active_window_id
         else:
             return ActionResult(ok=False, action="drag",
@@ -3602,8 +3777,9 @@ class CuaDriverBackend(ComputerUseBackend):
             if self._session.supports_capability(
                 "input.scroll.coordinates", tool="scroll"
             ):
-                args["x"] = x
-                args["y"] = y
+                scale = self._coordinate_scale()
+                args["x"] = _normalize_coordinate(x, scale)
+                args["y"] = _normalize_coordinate(y, scale)
             args["window_id"] = self._active_window_id
         return self._run_input_action("scroll", args, delivery_mode, bring_to_front)
 
