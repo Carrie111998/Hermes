@@ -585,7 +585,7 @@ def collect_debug_report(
 
 
 _PUBLIC_DUMP_FIELDS = frozenset(
-    {"version", "os", "python", "openai_sdk", "model", "provider", "terminal"}
+    {"version", "os", "python", "openai_sdk", "terminal"}
 )
 
 

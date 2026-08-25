@@ -831,6 +831,31 @@ class TestBuildDebugShare:
         assert "logs:             excluded" in payload
         assert set(result.urls) == {"Report"}
 
+    def test_public_payload_excludes_user_configurable_identity_fields(self):
+        from hermes_cli.debug import build_debug_share
+
+        uploaded = []
+        dump = "\n".join(
+            (
+                "version: 1.2.3",
+                "model: C:/Users/Alice/private-profile/model.gguf",
+                "provider: profile-Alice",
+            )
+        )
+
+        with patch("hermes_cli.debug._capture_dump", return_value=dump), patch(
+            "hermes_cli.debug.upload_to_pastebin",
+            side_effect=lambda content, expiry_days=7: uploaded.append(content)
+            or "https://paste.rs/x",
+        ), patch("hermes_cli.debug._schedule_auto_delete"):
+            build_debug_share(redact=True)
+
+        assert len(uploaded) == 1
+        assert "version: 1.2.3" in uploaded[0]
+        assert "model:" not in uploaded[0]
+        assert "provider:" not in uploaded[0]
+        assert "Alice" not in uploaded[0]
+
     def test_public_upload_refuses_redaction_opt_out(self):
         from hermes_cli.debug import build_debug_share
 
