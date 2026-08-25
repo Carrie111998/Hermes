@@ -153,6 +153,23 @@ def test_redact_api_error_text_scrubs_registered_secret():
     assert secret in _redact_api_error_text(f"echo {secret}")
 
 
+def test_redact_ignores_short_common_secret_values():
+    """Short common values must NOT be force-scrubbed (over-redaction guard).
+
+    A secret-keyed value such as "true"/"admin"/"prod" would otherwise strike
+    identical substrings in legitimate agent output and corrupt it.
+    """
+    from agent.redact import set_extra_literal_secrets, reset_extra_literal_secrets
+    from gateway.platforms.api_server import _redact_api_error_text
+
+    tok = set_extra_literal_secrets(["true", "admin", "prod"])
+    try:
+        out = _redact_api_error_text("the flag is true and the admin approved prod")
+        assert "true" in out and "admin" in out and "prod" in out
+    finally:
+        reset_extra_literal_secrets(tok)
+
+
 # --- HTTP integration: POST /v1/runs validation at the real endpoint ------
 def _runs_app():
     from tests.gateway.test_api_server import _make_adapter, _create_app

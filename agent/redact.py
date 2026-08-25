@@ -83,6 +83,9 @@ _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "t
 # API server registers per-run env secret values here so they never surface in
 # gateway output, without persisting them or mutating os.environ. Task-local via
 # ContextVar -> concurrent runs cannot see each other's registrations.
+# Minimum length for a value to be force-scrubbed: real secrets are long, and
+# scrubbing a short common value would corrupt legitimate output.
+_MIN_LITERAL_SECRET_LEN = 8
 _EXTRA_LITERAL_SECRETS: ContextVar = ContextVar(
     "hermes_extra_literal_secrets", default=()
 )
@@ -92,12 +95,15 @@ def set_extra_literal_secrets(values) -> Token:
     """Register task-local literal secret values to redact everywhere.
 
     Returns a token; pass it to ``reset_extra_literal_secrets`` in a finally.
-    Values under 4 chars are ignored (avoid over-masking); registered
+    Short common values (e.g. "true", "admin", "prod") are ignored: real
+    secrets are long and high-entropy, whereas a short value -- even under a
+    secret-looking key -- would strike identical substrings in legitimate
+    output and corrupt it. Values under 8 chars are skipped; registered
     longest-first so overlapping secrets mask cleanly.
     """
     cleaned = tuple(
         sorted(
-            {v for v in values if isinstance(v, str) and len(v) >= 4},
+            {v for v in values if isinstance(v, str) and len(v) >= _MIN_LITERAL_SECRET_LEN},
             key=len,
             reverse=True,
         )
