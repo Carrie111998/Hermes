@@ -4182,6 +4182,7 @@ class AIAgent:
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
           - Active child subagents (per-turn artefacts; safe to drop)
+          - Owned SQLite session_db (prevent fd exhaustion on cache eviction)
 
         Safe to call multiple times.  Distinct from close() — which is the
         hard teardown for actual session boundaries (/new, /reset, session
@@ -4201,6 +4202,21 @@ class AIAgent:
                         child.close()
                     except Exception:
                         pass
+        except Exception:
+            pass
+
+        # Close the owned session_db to release SQLite file descriptors on cache
+        # eviction. The gateway passes a shared session_db so _owns_session_db
+        # defaults False (no-op here). But agents created outside the gateway
+        # (cron, CLI, local) may own their own session_db; leaving it open
+        # accumulates fds until GC runs, and on a long-running gateway this can
+        # exhaust RLIMIT_NOFILE. Closing here ensures per-process lifecycles are
+        # respected without blocking the cache-eviction path on slow teardown.
+        session_db = getattr(self, "_session_db", None)
+        try:
+            if getattr(self, "_owns_session_db", False) and session_db is not None:
+                self._owns_session_db = False
+                session_db.close()
         except Exception:
             pass
 

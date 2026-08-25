@@ -111,6 +111,14 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
         current = getattr(sys, attr, None)
         if proxy is not None and current is proxy:
             return proxy
+        # Close the old sink if the proxy is being replaced (e.g., because
+        # sys.stdout was reassigned by an external context manager). If the old
+        # proxy's sink is not closed here, file descriptors accumulate.
+        if proxy is not None and hasattr(proxy, "_sink"):
+            try:
+                proxy._sink.close()
+            except Exception:
+                pass
         # Capture whatever is currently bound as the passthrough. If a prior
         # global redirect_stdout is active, route non-silenced threads to that
         # stream to preserve the old behavior.
