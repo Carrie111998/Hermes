@@ -292,10 +292,15 @@ def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
     non-interactive run, where the prompt has nobody to answer it and the
     call dies on approval timeout instead of attaching.
 
+    Foreground delivery remains a separate visible-side-effect approval scope;
+    config authorization only stands in for the background action prompt.
     Outside bounded mode, scope stays deliberately narrow: only the
     existing-profile prepare, only when the grant is present. Any resolution
     failure falls closed to prompting.
     """
+    if args.get("delivery_mode") == "foreground":
+        return False
+
     try:
         from tools.computer_use.cua_backend import (
             _cua_capability_manifest,

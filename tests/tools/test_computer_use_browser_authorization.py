@@ -265,6 +265,56 @@ def test_bounded_v3_manifest_preauthorizes_native_mutation(tmp_path, monkeypatch
     assert approvals == []
 
 
+def test_bounded_v3_manifest_foreground_denial_blocks_backend(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from tools.computer_use import tool as cu_tool
+    from tools.computer_use.backend import ActionResult
+
+    manifest = tmp_path / "cua-capabilities.yaml"
+    manifest.write_text("version: 3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {
+            "permission_mode": "bounded",
+            "capability_manifest": str(manifest),
+        },
+    )
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.calls: list[Dict[str, Any]] = []
+
+        def click(self, **kwargs: Any) -> ActionResult:
+            self.calls.append(dict(kwargs))
+            return ActionResult(ok=True, action="click", effect="confirmed")
+
+    backend = _Backend()
+    approvals: list[str] = []
+    monkeypatch.setattr(cu_tool, "_get_backend", lambda session_id="": backend)
+    cu_tool.set_approval_callback(
+        lambda action, args, summary: approvals.append(action) or "deny"
+    )
+
+    result = json.loads(
+        cu_tool.handle_computer_use(
+            {
+                "action": "click",
+                "coordinate": [20, 30],
+                "delivery_mode": "foreground",
+            },
+            session_id="bounded-reviewer",
+        )
+    )
+
+    assert result["error"] == "denied by user"
+    assert approvals == ["click"]
+    assert backend.calls == []
+
+
 def test_bounded_preauthorization_requires_readable_v3_manifest(
     tmp_path, monkeypatch
 ):
@@ -411,8 +461,13 @@ def test_bounded_manifest_keeps_foreground_approval_independent(
         },
     )
     approvals: list[str] = []
+
+    def approve_foreground_action_only(action, args, summary):
+        approvals.append(action)
+        return "approve_once" if action == "click" else "deny"
+
     cu_tool.set_approval_callback(
-        lambda action, args, summary: approvals.append(action) or "deny"
+        approve_foreground_action_only
     )
 
     result = json.loads(
@@ -427,7 +482,7 @@ def test_bounded_manifest_keeps_foreground_approval_independent(
     )
 
     assert result["error"] == "denied by user"
-    assert approvals == ["bring_to_front"]
+    assert approvals == ["click", "bring_to_front"]
 
 
 def test_config_grant_preauthorizes_existing_profile_prepare(monkeypatch):
