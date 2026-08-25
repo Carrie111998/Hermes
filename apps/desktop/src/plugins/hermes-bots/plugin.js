@@ -7222,6 +7222,10 @@ function clearGroupClarify(group) {
  *    keyed by session + request_id — the same wire the 1:1 approval card
  *    and native notifications use. */
 async function answerGroupClarify(entry, member, answers) {
+  // Intentionally do NOT join groupMemberTurnFlights here. These RPCs
+  // unblock the member turn that currently owns that flight; queueing the
+  // response behind the blocked turn would deadlock until its timeout.
+  // They also do not submit prompts or inspect the session transcript.
   if (entry.kind === 'approval') {
     await requestForBot(member, 'approval.respond', {
       session_id: entry.sessionId || undefined,
@@ -7264,6 +7268,50 @@ function groupMemberTurnFlightKey(group, member) {
   return `${group}::${groupMemberKey(member)}`
 }
 
+/** Serialize every transcript-reading/submitting operation for one member's
+ *  room session. Clarify/approval responses deliberately bypass this helper:
+ *  they unblock the operation that currently owns the flight. */
+async function runGroupMemberSessionFlight(group, member, start) {
+  const key = groupMemberTurnFlightKey(group, member)
+  const prior = groupMemberTurnFlights.get(key)
+  // A failed earlier operation must release ownership and must not poison the
+  // next one. Its original caller still observes the failure independently.
+  const flight = prior ? prior.catch(() => undefined).then(start) : start()
+  groupMemberTurnFlights.set(key, flight)
+
+  try {
+    return await flight
+  } finally {
+    if (groupMemberTurnFlights.get(key) === flight) {
+      groupMemberTurnFlights.delete(key)
+    }
+  }
+}
+
+/** A queued turn can become obsolete before it ever starts. Re-check the
+ *  room at flight acquisition so a newer send in the SAME thread cancels it
+ *  without spending an inference. Cross-thread sends must not cancel it:
+ *  their thread-scoped loop will never regenerate this turn. */
+function queuedGroupTurnIsCurrent(group, thread, epochAtEnqueue, anchorId) {
+  const room = $groupChats.get()[group] || { log: [] }
+
+  if (room.tombstone) {
+    return false
+  }
+
+  if ((room.epoch || 0) === epochAtEnqueue) {
+    return true
+  }
+
+  const log = Array.isArray(room.log) ? room.log : []
+  const anchorIdx = anchorId === null ? -1 : log.findIndex(entry => entry.id === anchorId)
+  // If history trimming removed the anchor, every surviving entry may be
+  // newer, so scanning the retained log is the conservative exact choice.
+  const queuedTail = anchorIdx >= 0 ? log.slice(anchorIdx + 1) : log
+
+  return !queuedTail.some(entry => entry.from?.kind === 'user' && groupThreadOf(entry) === thread)
+}
+
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
@@ -7272,9 +7320,14 @@ function groupMemberTurnFlightKey(group, member) {
  *  records a stranded marker so the finished reply can be harvested into
  *  the room at the member's next turn instead of being lost. */
 async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
-  const key = groupMemberTurnFlightKey(group, member)
-  const prior = groupMemberTurnFlights.get(key)
+  const roomAtEnqueue = $groupChats.get()[group] || { log: [] }
+  const epochAtEnqueue = roomAtEnqueue.epoch || 0
+  const anchorId = roomAtEnqueue.log?.length ? roomAtEnqueue.log[roomAtEnqueue.log.length - 1].id : null
   const start = async () => {
+    if (!queuedGroupTurnIsCurrent(group, thread, epochAtEnqueue, anchorId)) {
+      return null
+    }
+
     // #93602: hold the member's route socket for the whole turn. Without the
     // lease, every RPC below rides its own request-scoped socket lease; the
     // socket that minted `runtime` can close between RPCs, the gateway reaps
@@ -7287,18 +7340,8 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
       releaseTurnLease()
     }
   }
-  // A failed earlier turn must release ownership and must not poison the next
-  // thread. Its original caller still observes the failure independently.
-  const flight = prior ? prior.catch(() => undefined).then(start) : start()
-  groupMemberTurnFlights.set(key, flight)
 
-  try {
-    return await flight
-  } finally {
-    if (groupMemberTurnFlights.get(key) === flight) {
-      groupMemberTurnFlights.delete(key)
-    }
-  }
+  return runGroupMemberSessionFlight(group, member, start)
 }
 
 async function runGroupChatMemberTurnLeased(group, member, prompt, thread, images) {
@@ -7455,6 +7498,10 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
  *  after we stopped waiting. Called at the member's next turn boundary and
  *  on user sends, so long-running work is delivered late rather than lost. */
 async function harvestStrandedGroupReply(group, member) {
+  return runGroupMemberSessionFlight(group, member, () => harvestStrandedGroupReplyOwned(group, member))
+}
+
+async function harvestStrandedGroupReplyOwned(group, member) {
   const memberKey = groupMemberKey(member)
   const room = $groupChats.get()[group] || {}
   const marker = room.stranded?.[memberKey]

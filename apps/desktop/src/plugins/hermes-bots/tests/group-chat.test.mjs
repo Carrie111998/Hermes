@@ -433,6 +433,110 @@ test('one member cannot run two turns concurrently across threads in the same ro
   assert.equal(gc.calls[1].prompt, 'second thread')
 })
 
+test('a queued member turn is dropped before inference when its thread is superseded', async () => {
+  let releaseFirst
+  let markFirstStarted
+  const firstGate = new Promise(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve })
+  const gc = load(async (_profile, prompt) => {
+    if (prompt === 'blocking turn') {
+      markFirstStarted()
+      await firstGate
+    }
+    return `${prompt} reply`
+  })
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch = 1
+    room.log.push({ id: 'user:1', from: { kind: 'user', name: 'You' }, text: 'old', at: 1, thread: 'thread-a' })
+    return room
+  })
+
+  const first = gc.runGroupChatMemberTurn('Room', member, 'blocking turn', 'thread-b', [])
+  await firstStarted
+  const queued = gc.runGroupChatMemberTurn('Room', member, 'obsolete turn', 'thread-a', [])
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch += 1
+    room.log.push({ id: 'user:2', from: { kind: 'user', name: 'You' }, text: 'newer', at: 2, thread: 'thread-a' })
+    return room
+  })
+
+  releaseFirst()
+  assert.deepEqual(await Promise.all([first, queued]), ['blocking turn reply', null])
+  assert.equal(gc.calls.length, 1, 'the superseded queued turn must spend no inference')
+})
+
+test('a cross-thread epoch bump preserves queued work for the original thread', async () => {
+  let releaseFirst
+  let markFirstStarted
+  const firstGate = new Promise(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve })
+  const gc = load(async (_profile, prompt) => {
+    if (prompt === 'blocking turn') {
+      markFirstStarted()
+      await firstGate
+    }
+    return `${prompt} reply`
+  })
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch = 1
+    room.log.push({ id: 'user:1', from: { kind: 'user', name: 'You' }, text: 'old', at: 1, thread: 'thread-a' })
+    return room
+  })
+
+  const first = gc.runGroupChatMemberTurn('Room', member, 'blocking turn', 'thread-b', [])
+  await firstStarted
+  const queued = gc.runGroupChatMemberTurn('Room', member, 'still current', 'thread-a', [])
+
+  gc.updateGroupChat('Room', room => {
+    room.epoch += 1
+    room.log.push({ id: 'user:2', from: { kind: 'user', name: 'You' }, text: 'other thread', at: 2, thread: 'thread-c' })
+    return room
+  })
+
+  releaseFirst()
+  assert.deepEqual(await Promise.all([first, queued]), ['blocking turn reply', 'still current reply'])
+  assert.equal(gc.calls.length, 2)
+})
+
+test('stranded harvesting waits for the member session flight', async () => {
+  let releaseTurn
+  let markTurnStarted
+  const turnGate = new Promise(resolve => { releaseTurn = resolve })
+  const turnStarted = new Promise(resolve => { markTurnStarted = resolve })
+  const gc = load(async () => {
+    markTurnStarted()
+    await turnGate
+    return 'finished'
+  })
+  const member = { name: 'research', title: '' }
+
+  const turn = gc.runGroupChatMemberTurn('Room', member, 'work', 'thread-a', [])
+  await turnStarted
+  gc.updateGroupChat('Room', room => {
+    room.stranded = { research: { before: 999, thread: 'thread-a' } }
+    return room
+  })
+
+  const resumesBeforeHarvest = gc.requests.filter(request => request.method === 'session.resume').length
+  const harvest = gc.harvestStrandedGroupReply('Room', member)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(
+    gc.requests.filter(request => request.method === 'session.resume').length,
+    resumesBeforeHarvest,
+    'harvest must not inspect the transcript while a member turn owns it'
+  )
+
+  releaseTurn()
+  await turn
+  await harvest
+  assert.equal(gc.$groupChats.get().Room.stranded.research, undefined)
+})
+
 test('recreating a same-name group after disband mints fresh member sessions', async () => {
   const gc = load(() => '(pass)')
   const member = { name: 'research', title: '' }
