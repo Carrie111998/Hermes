@@ -712,3 +712,107 @@ def test_multiplex_ticker_refreshes_deleted_and_recreated_profiles(tmp_path):
     assert not thread.is_alive()
 
 
+def test_multiplex_ticker_recovers_from_membership_enumeration_failure(tmp_path):
+    """A transient live-membership failure must not kill the ticker thread."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / "default"
+    (default_home / "cron").mkdir(parents=True)
+    membership_calls = 0
+    tick_calls = 0
+    heartbeat_calls: list[bool] = []
+    resumed_tick = threading.Event()
+    release_resumed_tick = threading.Event()
+
+    def profile_homes():
+        nonlocal membership_calls
+        membership_calls += 1
+        if membership_calls == 3:
+            raise OSError("transient profiles directory failure")
+        return [("default", default_home)]
+
+    def tracking_tick(*_args, **_kwargs):
+        nonlocal tick_calls
+        tick_calls += 1
+        if tick_calls >= 2:
+            resumed_tick.set()
+            release_resumed_tick.wait(timeout=5)
+        return 0
+
+    def tracking_heartbeat(*, success=False):
+        heartbeat_calls.append(success)
+
+    stop = threading.Event()
+    provider = InProcessCronScheduler()
+
+    with patch("cron.scheduler.tick", side_effect=tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", side_effect=tracking_heartbeat):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={"interval": 0.01, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        thread.start()
+
+        assert resumed_tick.wait(timeout=5)
+        assert membership_calls >= 4
+        # The initial liveness write is the only heartbeat before recovery:
+        # the failed post-tick membership refresh skipped all profile writes.
+        assert heartbeat_calls == [False]
+        assert thread.is_alive()
+        stop.set()
+        release_resumed_tick.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
+def test_multiplex_heartbeat_excludes_profile_not_ticked_in_cycle(tmp_path):
+    """A profile discovered after ticking cannot receive a success marker."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / "default"
+    new_home = tmp_path / "new"
+    for home in (default_home, new_home):
+        (home / "cron").mkdir(parents=True)
+
+    membership_calls = 0
+    ticked: list[Path] = []
+    successful_heartbeats: list[Path] = []
+    stop = threading.Event()
+
+    def profile_homes():
+        nonlocal membership_calls
+        membership_calls += 1
+        if membership_calls <= 2:
+            return [("default", default_home)]
+        return [("default", default_home), ("new", new_home)]
+
+    def tracking_tick(*_args, **_kwargs):
+        ticked.append(get_hermes_home().resolve())
+        return 0
+
+    def tracking_heartbeat(*, success=False):
+        if success:
+            successful_heartbeats.append(get_hermes_home().resolve())
+            stop.set()
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", side_effect=tracking_heartbeat):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={"interval": 0.01, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert ticked == [default_home.resolve()]
+    assert successful_heartbeats == [default_home.resolve()]
+
+

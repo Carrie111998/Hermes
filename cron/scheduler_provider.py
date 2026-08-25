@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import threading
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
@@ -655,7 +656,11 @@ class InProcessCronScheduler(CronScheduler):
             entries = profile_homes() if callable(profile_homes) else profile_homes
             return list(entries)
 
-        initial_profile_homes = current_profile_homes()
+        try:
+            initial_profile_homes = current_profile_homes()
+        except BaseException as e:
+            logger.error("Cron profile membership error: %s", e, exc_info=True)
+            initial_profile_homes = []
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s",
             len(initial_profile_homes),
@@ -683,12 +688,17 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             _tick_error = None
+            ticked_homes = {}
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in current_profile_homes():
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        # Record the identity before entering tick(): a failed
+                        # tick still needs a liveness/error heartbeat, but only
+                        # if this home remains in authoritative membership.
+                        ticked_homes[Path(home).resolve()] = home
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
@@ -713,8 +723,30 @@ class InProcessCronScheduler(CronScheduler):
             # Resolve membership again here: profile deletion can happen while
             # a tick is running, and touching its stale startup Path would make
             # ensure_dirs() recreate the deleted profile as a cron-only ghost.
-            for entry in current_profile_homes():
-                home = entry[1] if isinstance(entry, tuple) else entry
+            heartbeat_homes = []
+            if ticked_homes:
+                try:
+                    refreshed_homes = {
+                        Path(entry[1] if isinstance(entry, tuple) else entry).resolve():
+                        entry[1] if isinstance(entry, tuple) else entry
+                        for entry in current_profile_homes()
+                    }
+                except BaseException as e:
+                    logger.error("Cron profile membership error: %s", e, exc_info=True)
+                    if _tick_error is None:
+                        consecutive_failures = _note_tick_failure(e, consecutive_failures)
+                    _tick_error = f"{type(e).__name__}: {e}"
+                    ok = False
+                else:
+                    # A profile created between the tick and heartbeat
+                    # snapshots has not actually ticked yet. Conversely, a
+                    # deleted profile must not be touched by heartbeat writes.
+                    heartbeat_homes = [
+                        refreshed_homes[identity]
+                        for identity in ticked_homes
+                        if identity in refreshed_homes
+                    ]
+            for home in heartbeat_homes:
                 home_token = set_hermes_home_override(str(home))
                 try:
                     with use_cron_store(home):
