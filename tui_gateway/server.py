@@ -9165,6 +9165,26 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def _explicit_reasoning_override(
+    reasoning_config_override: dict | None,
+    profile_reasoning_config: dict | None,
+) -> bool:
+    """Is a ``session.create`` effort a deliberate per-session user pick?
+
+    The Desktop composer seeds its effort selector from the profile default
+    and (before the omit-inherited fix, or from older clients) ships it on
+    every ``session.create``. An override that merely mirrors the
+    profile-resolved config is inherited state, not a user choice — treating
+    it as explicit would silently disable adaptive reasoning escalation for
+    every ordinary new Desktop session. Only a *distinct* value counts. An
+    absent profile value compares as the backend fallback (medium).
+    """
+    if reasoning_config_override is None:
+        return False
+    baseline = profile_reasoning_config or {"enabled": True, "effort": "medium"}
+    return reasoning_config_override != baseline
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -9326,6 +9346,7 @@ def _make_agent(
             if reasoning_config_override is not None
             else _load_reasoning_config(str(model or ""))
         ),
+        adaptive_reasoning=(cfg.get("agent") or {}).get("adaptive_reasoning"),
         service_tier=(
             service_tier_override
             if service_tier_override is not None
@@ -9360,6 +9381,13 @@ def _make_agent(
         )
     agent._context_cwd_is_launch_artifact = bool(
         context_cwd_is_launch_artifact
+    )
+
+    # A distinct per-session effort pick (Desktop model menu / session.create
+    # reasoning_effort) is a user choice — suppress adaptive escalation. An
+    # override equal to the profile default is composer-seeded inheritance.
+    agent.reasoning_user_override = _explicit_reasoning_override(
+        reasoning_config_override, _load_reasoning_config(str(model or ""))
     )
     return agent
 
@@ -15118,6 +15146,10 @@ def _(rid, params: dict) -> dict:
                 session["create_reasoning_override"] = parsed
             if session and session.get("agent") is not None:
                 session["agent"].reasoning_config = parsed
+                # Session-scoped picks are explicit user overrides and
+                # suppress adaptive escalation; a global write is a new
+                # baseline, so escalation (if enabled) stays active.
+                session["agent"].reasoning_user_override = not global_scope
                 _persist_live_session_runtime(session)
                 _emit(
                     "session.info",
