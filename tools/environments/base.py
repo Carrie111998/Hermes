@@ -1178,10 +1178,25 @@ class BaseEnvironment(ABC):
                         pass
                 return
             idle_after_exit = 0
+            # Wait for readability with poll(), NOT select.select(): a
+            # long-lived backend (Desktop/gateway) can accumulate >1024 open
+            # fds, and CPython's select.select() raises
+            # ``ValueError: filedescriptor out of range in select()`` the
+            # moment a pipe fd is >= FD_SETSIZE (1024). That ValueError landed
+            # in the ``break`` below and silently discarded ALL output —
+            # terminal/read_file returned an empty string with the correct
+            # exit code, losing data with no error signal (issue #94928).
+            # poll() has no FD_SETSIZE ceiling. POLLHUP/POLLERR count as
+            # readable so the os.read() below observes the real EOF (b"").
             try:
-                while True:
+                poller = select.poll()
+                poller.register(fd, select.POLLIN)
+            except (ValueError, OSError):
+                poller = None  # fd already closed — nothing to drain
+            try:
+                while poller is not None:
                     try:
-                        ready, _, _ = select.select([fd], [], [], 0.1)
+                        ready = bool(poller.poll(100))
                     except (ValueError, OSError):
                         break  # fd already closed
                     if ready:
