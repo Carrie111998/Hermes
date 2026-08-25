@@ -115,8 +115,7 @@ class TestSingleWriterLoop:
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
     def test_consume_loop_stops_when_superseded_mid_stream(self, _close, mock_create):
-        """The real streaming loop bails out the moment a newer attempt claims
-        the sink, so a superseded stream cannot interleave into the turn."""
+        """A stale writer cannot emit deltas, but its terminal marker survives."""
         agent = _make_agent()
         delivered = []
         agent.stream_delta_callback = lambda t: delivered.append(t)
@@ -132,10 +131,12 @@ class TestSingleWriterLoop:
         mock_client.chat.completions.create.return_value = stream_gen()
         mock_create.return_value = mock_client
 
-        agent._interruptible_streaming_api_call({})
+        response = agent._interruptible_streaming_api_call({})
 
         assert "".join(delivered) == "first"
         assert "-stale-tail" not in "".join(delivered)
+        assert response.choices[0].finish_reason == "stop"
+        assert response.choices[0].message.content == "first-stale-tail"
 
     def test_chat_parser_failure_closes_managed_stream(self):
         agent = _make_agent()

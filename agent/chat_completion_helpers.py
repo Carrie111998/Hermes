@@ -3992,6 +3992,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._check_openrouter_cache_status(response)
             _writer_token["value"] = claim_stream_writer(agent)
 
+        def _stream_chunk_finish_reason(_chunk: Any) -> Any:
+            try:
+                choices = getattr(_chunk, "choices", None)
+                return getattr(choices[0], "finish_reason", None) if choices else None
+            except Exception:
+                return None
+
+        def _stream_writer_is_active() -> bool:
+            token = _writer_token["value"]
+            return token is None or stream_writer_is_current(agent, token)
+
         def _accept_stream_chunk(_chunk: Any) -> bool:
             # A stale-attempt fence can win while Relay is handing an
             # already-received tool-call chunk back to Hermes. Preserve only
@@ -4005,10 +4016,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     provider_tool_in_flight["yes"] = True
             except Exception:
                 pass
+            # A provider terminal chunk cannot add any later output. Preserve
+            # its completion marker even if a concurrent stream just won the
+            # writer fence; dropping it turns a complete response into a false
+            # mid-stream failure.
+            if _stream_chunk_finish_reason(_chunk) is not None:
+                return True
             if not _stream_attempt_is_active(stream_attempt_id):
                 return False
-            token = _writer_token["value"]
-            if token is not None and not stream_writer_is_current(agent, token):
+            if not _stream_writer_is_active():
                 logger.warning(
                     "Streaming attempt superseded by a newer stream; stopping "
                     "consumption to preserve the single-writer invariant "
@@ -4099,6 +4115,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         ):
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
+            chunk_finish_reason = _stream_chunk_finish_reason(chunk)
+            terminal_chunk_crossed_fence = (
+                chunk_finish_reason is not None
+                and (
+                    not _stream_attempt_is_active(stream_attempt_id)
+                    or not _stream_writer_is_active()
+                )
+            )
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -4142,7 +4166,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         )
                 break
 
-            if not _stream_attempt_is_active(stream_attempt_id):
+            if (
+                not _stream_attempt_is_active(stream_attempt_id)
+                and chunk_finish_reason is None
+            ):
                 _discard_stale_stream_chunk(stream_attempt_id, chunk)
                 continue
 
@@ -4194,14 +4221,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     reasoning_text,
                 )
                 reasoning_parts.append(reasoning_text)
-                _fire_first_delta()
-                agent._fire_reasoning_delta(reasoning_text)
+                if not terminal_chunk_crossed_fence:
+                    _fire_first_delta()
+                    agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
             delta_content = getattr(delta, "content", None)
             if delta_content:
                 content_parts.append(delta_content)
-                if not tool_calls_acc:
+                if not tool_calls_acc and not terminal_chunk_crossed_fence:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
                         pending_text_parts.append(delta.content)
                         pending_text = "".join(pending_text_parts)
@@ -4223,7 +4251,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
+                elif agent.stream_delta_callback and not terminal_chunk_crossed_fence:
                     try:
                         agent.stream_delta_callback(delta_content)
                         agent._record_streamed_assistant_text(delta_content)
@@ -4314,7 +4342,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # discarding the attempted action.
                         result["partial_tool_names"].append(name)
 
-            chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
             if chunk_finish_reason:
                 finish_reason = chunk_finish_reason
 
