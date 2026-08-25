@@ -149,7 +149,8 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked",
+    "to_be_worked", "review", "done",
 ]
 
 
@@ -611,6 +612,7 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    initial_status: str = "running"
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     # Per-task thinking depth (none|minimal|…|ultra). None = inherit the
@@ -643,6 +645,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            initial_status=payload.initial_status,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
@@ -908,6 +911,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+            elif s == "to_be_worked":
+                ok, _error = kanban_db.shelf_task(
+                    conn,
+                    task_id,
+                    actor="dashboard",
+                    reason=payload.block_reason,
+                )
             elif s == "review":
                 # Manual "request review" from the board. Routes through
                 # request_review so it is NOT a
@@ -928,7 +938,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # status set. "Changes requested" (review -> ready) goes through
                 # reopen_review_task via _reopen_if_review.
                 current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
+                if current and current.status == "to_be_worked":
+                    ok, _error = kanban_db.unshelf_task(
+                        conn, task_id, actor="dashboard", dest="ready",
+                        reason=payload.block_reason,
+                    )
+                elif current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     reopened = _reopen_if_review(conn, task_id, current)
@@ -944,9 +959,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             elif s in ("todo", "triage", "scheduled"):
                 # Only a review task moving to 'todo' needs the reopen
                 # transition; fetch lazily so triage/scheduled skip the query.
-                current = kanban_db.get_task(conn, task_id) if s == "todo" else None
-                reopened = _reopen_if_review(conn, task_id, current)
-                ok = reopened if reopened is not None else _set_status_direct(conn, task_id, s)
+                current = kanban_db.get_task(conn, task_id)
+                if current and current.status == "to_be_worked" and s == "triage":
+                    ok, _error = kanban_db.unshelf_task(
+                        conn, task_id, actor="dashboard", dest="triage",
+                        reason=payload.block_reason,
+                    )
+                else:
+                    reopened = _reopen_if_review(conn, task_id, current)
+                    ok = reopened if reopened is not None else _set_status_direct(conn, task_id, s)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
@@ -1141,6 +1162,9 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+
+        if prev["status"] == "to_be_worked" or new_status == "to_be_worked":
             return False
 
         if prev["status"] == "running" and new_status == "ready":
@@ -1359,9 +1383,17 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             # Bulk dashboard action: explicit human override.
                             force=True,
                         )
+                    elif s == "to_be_worked":
+                        ok, _error = kanban_db.shelf_task(
+                            conn, tid, actor="dashboard",
+                        )
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
-                        if cur and cur.status in ("blocked", "scheduled"):
+                        if cur and cur.status == "to_be_worked":
+                            ok, _error = kanban_db.unshelf_task(
+                                conn, tid, actor="dashboard", dest="ready",
+                            )
+                        elif cur and cur.status in ("blocked", "scheduled"):
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
                             reopened = _reopen_if_review(conn, tid, cur)
@@ -1380,9 +1412,14 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         ok = kanban_db.schedule_task(conn, tid)
                     elif s in {"todo", "triage"}:
                         # Fetch lazily: only review->todo needs reopen.
-                        cur = kanban_db.get_task(conn, tid) if s == "todo" else None
-                        reopened = _reopen_if_review(conn, tid, cur)
-                        ok = reopened if reopened is not None else _set_status_direct(conn, tid, s)
+                        cur = kanban_db.get_task(conn, tid)
+                        if cur and cur.status == "to_be_worked" and s == "triage":
+                            ok, _error = kanban_db.unshelf_task(
+                                conn, tid, actor="dashboard", dest="triage",
+                            )
+                        else:
+                            reopened = _reopen_if_review(conn, tid, cur)
+                            ok = reopened if reopened is not None else _set_status_direct(conn, tid, s)
                     else:
                         entry.update(ok=False, error=f"unknown status {s!r}")
                         results.append(entry)

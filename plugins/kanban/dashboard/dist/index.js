@@ -87,16 +87,18 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "scheduled", "ready", "running", "blocked", "to_be_worked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    to_be_worked: "to be worked",
     review: "Review",
     done: "Done",
     archived: "Archived",
@@ -104,9 +106,11 @@
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Waiting on time; dispatcher will not claim",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    to_be_worked: "Shelf. Marcin decides. Dispatcher will not claim.",
     review: "Implementation complete — awaiting review",
     done: "Completed",
     archived: "Archived",
@@ -169,12 +173,24 @@
     return tx(t, key, FALLBACK_DIAGNOSTIC_EVENT_LABELS[kind]);
   }
 
+  function isAllowedShelfMove(fromStatus, toStatus) {
+    if (toStatus === "to_be_worked") {
+      return fromStatus === "blocked" || fromStatus === "ready";
+    }
+    if (fromStatus === "to_be_worked") {
+      return toStatus === "triage" || toStatus === "ready";
+    }
+    return true;
+  }
+
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
+    to_be_worked: "hermes-kanban-dot-to-be-worked",
     review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
@@ -941,6 +957,17 @@
     // Single-task card move. Drives confirmation + completion summary
     // dialogs via the hook, then dispatches via performMoveTask.
     const moveTask = useCallback(function (taskId, newStatus) {
+      let sourceStatus = null;
+      for (const col of (boardData && boardData.columns) || []) {
+        if ((col.tasks || []).some(function (task) { return task.id === taskId; })) {
+          sourceStatus = col.name;
+          break;
+        }
+      }
+      if (!isAllowedShelfMove(sourceStatus, newStatus)) {
+        setError("The to-be-worked shelf only accepts ready/blocked cards and only exits to triage/ready.");
+        return;
+      }
       requestMoveConfirm(newStatus, 1)
         .then(function (r1) {
           if (!r1.confirmed) return null;
@@ -954,7 +981,7 @@
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [boardData, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -963,6 +990,14 @@
     }, []);
     const moveSelected = useCallback(function (newStatus) {
       if (selectedIds.size === 0) return;
+      for (const col of (boardData && boardData.columns) || []) {
+        for (const task of col.tasks || []) {
+          if (selectedIds.has(task.id) && !isAllowedShelfMove(col.name, newStatus)) {
+            setError("The to-be-worked shelf only accepts ready/blocked cards and only exits to triage/ready.");
+            return;
+          }
+        }
+      }
       const count = selectedIds.size;
       const taskId = Array.from(selectedIds)[0]; // representative id for performMoveTask's single-task branch
       requestMoveConfirm(newStatus, count)
@@ -978,7 +1013,7 @@
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [selectedIds, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [boardData, selectedIds, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
 
     const createTask = useCallback(function (body) {
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
@@ -3192,6 +3227,9 @@
         priority: Number(priority) || 0,
         triage: props.columnName === "triage",
       };
+      if (props.columnName === "to_be_worked") {
+        body.initial_status = "to_be_worked";
+      }
       if (parent) body.parents = [parent];
       // Parse comma-separated skills into a clean list. Blank = no
       // extras (omit key so backend leaves it null). The dispatcher

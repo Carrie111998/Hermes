@@ -73,7 +73,10 @@ def test_board_empty(client):
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
     assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for expected in (
+        "triage", "todo", "scheduled", "ready", "running", "blocked",
+        "to_be_worked", "review", "done",
+    ):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
@@ -114,6 +117,94 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_task_can_land_directly_on_to_be_worked_shelf(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "decide later",
+            "assignee": "default",
+            "initial_status": "to_be_worked",
+        },
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["status"] == "to_be_worked"
+
+    board = client.get("/api/plugins/kanban/board").json()
+    columns = {column["name"]: column["tasks"] for column in board["columns"]}
+    assert [row["id"] for row in columns["to_be_worked"]] == [task["id"]]
+    assert all(
+        task["id"] not in {row["id"] for row in columns[name]}
+        for name in ("ready", "todo", "blocked")
+    )
+
+
+def test_dashboard_routes_shelf_moves_through_distinct_events(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "human shelf", "assignee": "default"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "to_be_worked", "block_reason": "pull off hot door"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "to_be_worked"
+
+    # The shelf cannot be started, completed, or archived directly.
+    for forbidden in ("running", "done", "archived"):
+        refused = client.patch(
+            f"/api/plugins/kanban/tasks/{task['id']}",
+            json={"status": forbidden},
+        )
+        assert refused.status_code in {400, 409}, refused.text
+        current = client.get(
+            f"/api/plugins/kanban/tasks/{task['id']}"
+        ).json()["task"]
+        assert current["status"] == "to_be_worked"
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "triage"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "triage"
+
+    with kb.connect() as conn:
+        kinds = [event.kind for event in kb.list_events(conn, task["id"])]
+    assert "shelved" in kinds
+    assert "unshelved" in kinds
+    assert "unblocked" not in kinds
+    assert "promoted_manual" not in kinds
+
+
+def test_dashboard_bulk_routes_shelf_and_unshelf(client):
+    tasks = [
+        client.post(
+            "/api/plugins/kanban/tasks", json={"title": f"bulk shelf {index}"},
+        ).json()["task"]
+        for index in range(2)
+    ]
+    ids = [task["id"] for task in tasks]
+
+    shelved = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": ids, "status": "to_be_worked"},
+    )
+    assert shelved.status_code == 200, shelved.text
+    assert all(row["ok"] for row in shelved.json()["results"])
+
+    unshelved = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": ids, "status": "ready"},
+    )
+    assert unshelved.status_code == 200, unshelved.text
+    assert all(row["ok"] for row in unshelved.json()["results"])
+    with kb.connect() as conn:
+        assert {kb.get_task(conn, task_id).status for task_id in ids} == {"ready"}
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
