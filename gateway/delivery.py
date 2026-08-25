@@ -398,7 +398,10 @@ class DeliveryRouter:
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Save content to local files."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Microsecond precision: a retried or rapidly re-triggered job could
+        # otherwise produce the same second-resolution filename and silently
+        # truncate the earlier delivery.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
         if job_id:
             output_path = self.output_dir / job_id / f"{timestamp}.md"
@@ -438,7 +441,9 @@ class DeliveryRouter:
     
     def _save_full_output(self, content: str, job_id: str) -> Path:
         """Save full cron output to disk and return the file path."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Microsecond precision prevents same-second double-fires from
+        # silently overwriting the earlier run's full output.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         out_dir = get_hermes_home() / "cron" / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{job_id}_{timestamp}.txt"
