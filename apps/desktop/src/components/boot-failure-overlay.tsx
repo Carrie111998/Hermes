@@ -177,7 +177,11 @@ export function BootFailureOverlay() {
     setBusy('signin')
 
     try {
-      await window.hermesDesktop?.oauthLogoutConnectionConfig?.()
+      // Scope the pre-login clear to THIS gateway's origin only. Passing no
+      // argument clears every cookie of every hostname in the shared
+      // `persist:hermes-remote-oauth` partition — i.e. a global sign-out that
+      // silently deletes the other registered gateways' sessions (#94856).
+      await window.hermesDesktop?.oauthLogoutConnectionConfig?.(remoteReauth.url)
       const result = await window.hermesDesktop?.oauthLoginConnectionConfig(remoteReauth.url)
 
       if (result?.connected) {
