@@ -11561,6 +11561,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     watcher_argv,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                     env=watcher_env,
                     **windows_detach_popen_kwargs(),
                 )
@@ -11570,6 +11571,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         watcher_argv,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
                         env=watcher_env,
                         creationflags=windows_detach_flags_without_breakaway(),
                     )
@@ -11615,6 +11617,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 [setsid_bin, "bash", "-lc", shell_cmd],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
                 env=watcher_env,
                 start_new_session=True,
             )
@@ -11623,6 +11626,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ["bash", "-lc", shell_cmd],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
                 env=watcher_env,
                 start_new_session=True,
             )
