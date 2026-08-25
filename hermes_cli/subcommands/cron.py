@@ -154,6 +154,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "run", help="Run a job on the next scheduler tick"
     )
     cron_run.add_argument("job_id", help="Job ID to trigger")
+    cron_run.add_argument(
+        "--reason",
+        help=(
+            "Why the job is being triggered. Recorded on the cron_triggered "
+            "audit event alongside the caller, so an off-schedule fire can be "
+            "attributed after the fact."
+        ),
+    )
     add_accept_hooks_flag(cron_run)
 
     cron_remove = cron_subparsers.add_parser(

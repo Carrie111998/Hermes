@@ -125,6 +125,57 @@ class TestCronCommandLifecycle:
 
         assert "Paused:    (no reason recorded)" in capsys.readouterr().out
 
+    def test_run_reason_from_the_real_parser_reaches_the_audit_event(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """`hermes cron run <id> --reason ...` attributes the off-schedule fire.
+
+        The dispatch always forwarded ``args.reason`` into CRON_TRIGGERED, but
+        the run subparser had no ``--reason``, so from a terminal the field was
+        unreachable and every hand-triggered run wrote an unattributed event.
+        Driven through the REAL parser on purpose — a hand-built Namespace
+        cannot catch a missing flag.
+        """
+        import argparse
+
+        from events.bus import EventBus
+        from events.schema import EventType
+        from hermes_cli.subcommands.cron import build_cron_parser
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="Check server status", schedule="every 1h")
+
+        parser = argparse.ArgumentParser(prog="hermes")
+        build_cron_parser(parser.add_subparsers(dest="command"), cmd_cron=lambda a: 0)
+        args = parser.parse_args(
+            ["cron", "run", job["id"], "--reason", "manual retry after CPU spike"]
+        )
+        assert args.reason == "manual retry after CPU spike"
+
+        assert cron_command(args) == 0
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert len(events) == 1
+        assert events[0].payload["caller"] == "hermes_cli:cron_run"
+        assert events[0].payload["reason"] == "manual retry after CPU spike"
+
+    def test_run_blank_reason_is_recorded_as_none(self, tmp_cron_dir, monkeypatch):
+        """Whitespace is not attribution — same normalization as pause."""
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(Namespace(cron_command="run", job_id=job["id"], reason="   "))
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert len(events) == 1
+        assert events[0].payload["reason"] is None
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",

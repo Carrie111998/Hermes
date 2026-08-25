@@ -425,6 +425,11 @@ def cron_edit(args):
     return 0
 
 
+def _clean_reason(raw: Optional[str]) -> Optional[str]:
+    """Normalize a ``--reason`` value: whitespace is not a reason."""
+    return (raw or "").strip() or None
+
+
 def _job_action(
     action: str,
     job_id: str,
@@ -492,9 +497,12 @@ def cron_command(args):
         return cron_edit(args)
 
     if subcmd == "pause":
-        raw_reason = getattr(args, "reason", None)
-        reason = (raw_reason or "").strip() or None
-        return _job_action("pause", args.job_id, "Paused", reason=reason)
+        return _job_action(
+            "pause",
+            args.job_id,
+            "Paused",
+            reason=_clean_reason(getattr(args, "reason", None)),
+        )
 
     if subcmd == "resume":
         return _job_action("resume", args.job_id, "Resumed")
@@ -504,7 +512,7 @@ def cron_command(args):
             "run",
             args.job_id,
             "Triggered",
-            reason=getattr(args, "reason", None),
+            reason=_clean_reason(getattr(args, "reason", None)),
             caller="hermes_cli:cron_run",
         )
 
