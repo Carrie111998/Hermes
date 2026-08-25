@@ -391,7 +391,12 @@ INVALIDATE_SCHEMA = {
             },
             "reason": {
                 "type": "string",
-                "description": "Why this memory is being invalidated (for audit trail)."
+                "description": (
+                    "Why this memory is being invalidated. REQUIRED when "
+                    "invalidating (restore=false) — recorded as the "
+                    "invalidation_reason for the audit trail. Not needed "
+                    "when restoring."
+                ),
             },
             "restore": {
                 "type": "boolean",
@@ -1895,7 +1900,13 @@ class HindsightMemoryProvider(MemoryProvider):
                 return tool_error("Provide query to search or memory_id to mutate")
             restore_bool = _coerce_bool(args.get("restore", False))
             state = "valid" if restore_bool else "invalidated"
-            reason = args.get("reason", "")
+            reason = (args.get("reason") or "").strip()
+
+            if state == "invalidated" and not reason:
+                return tool_error(
+                    "reason is required when invalidating a memory "
+                    "(recorded as the invalidation_reason for the audit trail)"
+                )
 
             try:
                 UpdateMemoryRequest = self._try_import_update_memory_request()
@@ -1916,10 +1927,20 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._http_patch_memory(memory_id, state, reason=reason or None)
 
                 action = "restored" if state == "valid" else "invalidated"
+                logger.info(
+                    "hindsight_invalidate: %s memory %s (reason=%r)",
+                    action, memory_id, reason or None,
+                )
                 return json.dumps({"result": f"Memory {memory_id} {action}."})
             except Exception as e:
                 logger.warning("hindsight_invalidate failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to curate memory: {e}")
+                err = f"Failed to curate memory: {e}"
+                # Redirect on observation refusal: observations regenerate from
+                # their source facts, so name the curatable sources instead.
+                source_hint = self._observation_source_hint(memory_id, str(e))
+                if source_hint:
+                    err += f"\n{source_hint}"
+                return tool_error(err)
 
         return tool_error(f"Unknown tool: {tool_name}")
 
@@ -2019,6 +2040,63 @@ class HindsightMemoryProvider(MemoryProvider):
                 len(items), total,
             )
         return matched
+
+    def _http_get_memory(self, memory_id: str) -> dict:
+        """GET /v1/default/banks/{bank_id}/memories/{memory_id}.
+
+        Returns the parsed single-memory body, including ``source_memories``
+        (full objects: id + text + type) when the unit is an observation.
+        """
+        import urllib.error
+        import urllib.request
+        import urllib.parse
+
+        encoded_id = urllib.parse.quote(memory_id, safe="")
+        url = (
+            f"{self._probe_url().rstrip('/')}"
+            f"/v1/default/banks/{self._bank_id}/memories/{encoded_id}"
+        )
+        req = urllib.request.Request(url, headers={})
+        if self._api_key:
+            req.add_header("Authorization", f"Bearer {self._api_key}")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body_raw = e.read().decode(errors="replace")
+            raise RuntimeError(f"HTTP {e.code}: {body_raw[:300]}") from None
+
+    def _observation_source_hint(self, memory_id: str, error_text: str) -> str:
+        """Return a redirect hint when *error_text* is an observation refusal.
+
+        Observations cannot be curated directly; they regenerate from their
+        source facts.  On an observation refusal, fetch the unit and name its
+        ``source_memories`` so the agent can retire one of those instead.
+        Returns an empty string when the error is unrelated or no sources
+        are found (never raises — a hint is best-effort).
+        """
+        lowered = error_text.lower()
+        if "observation" not in lowered or "world/experience" not in lowered:
+            return ""
+        try:
+            unit = self._http_get_memory(memory_id)
+        except Exception as e:
+            logger.debug("hindsight_invalidate: source fetch failed: %s", e)
+            return ""
+        sources = unit.get("source_memories") if isinstance(unit, dict) else None
+        if not sources:
+            return ""
+        parts = []
+        for s in sources:
+            if not isinstance(s, dict):
+                continue
+            sid = s.get("id", "?")
+            text = (s.get("text") or "").strip()
+            parts.append(f"{sid} ({text[:80]})")
+        if not parts:
+            return ""
+        return "Retire one of its source facts instead: " + "; ".join(parts)
 
     def on_session_switch(
         self,
