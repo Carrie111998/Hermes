@@ -130,6 +130,18 @@ class TestSubscribe:
         assert "closed" not in _load_subscriptions()
         assert capsys.readouterr().out == "Error: Could not read --secret-fd.\n"
 
+    def test_secret_fd_rejects_out_of_platform_range_without_traceback(self, capsys):
+        webhook_command(
+            _make_args(
+                webhook_action="subscribe",
+                name="out-of-range",
+                secret_fd=1 << 63,
+            )
+        )
+
+        assert "out-of-range" not in _load_subscriptions()
+        assert capsys.readouterr().out == "Error: Could not read --secret-fd.\n"
+
     def test_secret_fd_rejects_oversize_without_echoing_input(self, tmp_path, capsys):
         secret_file = tmp_path / "oversize-secret"
         secret_file.write_bytes(b"x" * 4097)

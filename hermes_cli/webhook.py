@@ -147,7 +147,7 @@ def _read_secret_fd(fd: int) -> str | None:
             if not chunk:
                 break
             data.extend(chunk)
-    except OSError:
+    except (OSError, OverflowError):
         print("Error: Could not read --secret-fd.")
         return None
 
