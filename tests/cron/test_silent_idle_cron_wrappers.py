@@ -48,27 +48,46 @@ def _iteration_json(out: str):
     return json.loads(body)
 
 
+def _stub_children(monkeypatch, mod, rc_sync=0, rc_export=0, out="", err="",
+                   export_out=None, export_err=None):
+    """Replace both child processes with a canned (returncode, stdout, stderr).
+
+    ``export_out`` / ``export_err`` default to the bridge's, preserving the
+    original single-payload behaviour. Pass them when a test counts lines: the
+    two children are separate processes in production and do NOT echo each
+    other, so feeding one payload to both would double every line.
+    """
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(cmd)
+        first = len(calls) == 1
+        rc = rc_sync if first else rc_export
+        return SimpleNamespace(
+            returncode=rc,
+            stdout=out if first or export_out is None else export_out,
+            stderr=err if first or export_err is None else export_err,
+        )
+
+    monkeypatch.setattr(mod.subprocess, "run", _run)
+    monkeypatch.setattr(mod.Path, "exists", lambda self: True)
+    monkeypatch.setattr(
+        mod,
+        "fetch_alias_snapshot",
+        lambda _directory: pathlib.Path("jobflow-alias-snapshot.json"),
+    )
+    return calls
+
+
 class TestPostgresSync:
     @pytest.fixture
     def mod(self):
         return _load("postgres_sync")
 
-    def _fake_run(self, monkeypatch, mod, rc_sync=0, rc_export=0, out="", err=""):
-        calls = []
-
-        def _run(cmd, **kwargs):
-            calls.append(cmd)
-            rc = rc_sync if len(calls) == 1 else rc_export
-            return SimpleNamespace(returncode=rc, stdout=out, stderr=err)
-
-        monkeypatch.setattr(mod.subprocess, "run", _run)
-        monkeypatch.setattr(mod.Path, "exists", lambda self: True)
-        monkeypatch.setattr(
-            mod,
-            "fetch_alias_snapshot",
-            lambda _directory: pathlib.Path("jobflow-alias-snapshot.json"),
-        )
-        return calls
+    def _fake_run(self, monkeypatch, mod, rc_sync=0, rc_export=0, out="", err="",
+                  export_out=None, export_err=None):
+        return _stub_children(monkeypatch, mod, rc_sync, rc_export, out, err,
+                              export_out, export_err)
 
     def test_successful_tick_is_silent(self, mod, monkeypatch, capsys):
         self._fake_run(monkeypatch, mod, out="synced 0 rows\n")
@@ -99,6 +118,113 @@ class TestPostgresSync:
         assert mod.main() == 1
         # Diagnostic goes to stderr; a non-zero rc is what surfaces the failure.
         assert "target script missing" in capsys.readouterr().err
+
+
+class TestPostgresSyncWarningEscape:
+    """A WARNING on an exit-0 tick must escape to stdout.
+
+    The bridge's silent-rollback detector (hermes-postgres-bridge.py, commit
+    5cf02a1a) prints "WARNING: business-state rollback:" naming each operator
+    approval it is about to discard, and then exits 0 -- a rollback is not a
+    lane failure. Before this contract that line was unreachable in production:
+    the idle contract below routed ALL child output to stderr on exit 0, and
+    ``agent-src/cron/scheduler.py:_run_job_script`` attaches stderr ONLY on a
+    non-zero return code, discarding it on success. Measured 2026-08-24: all 50
+    files in profiles/main/cron/output/9823bee8f270 were 0 bytes and the string
+    "business-state" appeared nowhere in the gateway logs, whose window covered
+    every post-commit run.
+
+    A rollback WARNING is one-shot, not a repeating alarm: the discard writes
+    EXCLUDED.current_business_state AND EXCLUDED.updated_at, so the row matches
+    canonical afterwards and ``incoming_rank == existing_rank`` drops it from
+    the diagnostics entirely on the next tick. Delivering it therefore cannot
+    spam.
+    """
+
+    ROLLBACK = (
+        "WARNING: business-state rollback: count=2 window_min=120 "
+        "sample=k1:approved_for_tailor<-materials_ready truncated=0 "
+        "-- canonical pipeline.json never caught up to these Postgres states; "
+        "each is being overwritten now."
+    )
+    HELD = (
+        "  business-state held: count=5 window_min=120 "
+        "sample=k9:approved_for_tailor<-materials_ready truncated=0"
+    )
+
+    @pytest.fixture
+    def mod(self):
+        return _load("postgres_sync")
+
+    def _fake_run(self, monkeypatch, mod, rc_sync=0, rc_export=0, out="", err="",
+                  export_out=None, export_err=None):
+        return _stub_children(monkeypatch, mod, rc_sync, rc_export, out, err,
+                              export_out, export_err)
+
+    def test_rollback_warning_reaches_stdout(self, mod, monkeypatch, capsys):
+        self._fake_run(monkeypatch, mod, out=f"synced 10 rows\n{self.ROLLBACK}\n")
+
+        assert mod.main() == 0
+        assert self.ROLLBACK in capsys.readouterr().out
+
+    def test_rollback_warning_tick_reports_itself_as_a_warning(
+        self, mod, monkeypatch, capsys
+    ):
+        # Only the bridge emits the rollback line; the export child is quiet.
+        self._fake_run(monkeypatch, mod, out=f"{self.ROLLBACK}\n", export_out="")
+
+        assert mod.main() == 0
+        payload = _iteration_json(capsys.readouterr().out)
+        assert payload is not None, "a warning tick must carry an iteration summary"
+        assert payload["reason"] == "warning"
+        assert payload["counters"]["exit_code"] == 0
+        assert payload["counters"]["warnings"] == 1
+
+    def test_warning_arriving_on_child_stderr_also_escapes(
+        self, mod, monkeypatch, capsys
+    ):
+        """The bridge prints to stdout, but never rely on which pipe carried it."""
+        self._fake_run(monkeypatch, mod, err=f"{self.ROLLBACK}\n")
+
+        assert mod.main() == 0
+        assert self.ROLLBACK in capsys.readouterr().out
+
+    def test_held_line_alone_keeps_the_tick_silent(self, mod, monkeypatch, capsys):
+        """A healthy hold is the expected steady state -- it must stay quiet."""
+        self._fake_run(monkeypatch, mod, out=f"{self.HELD}\n")
+
+        assert mod.main() == 0
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "business-state held" in captured.err
+
+    def test_non_warning_diagnostics_stay_off_stdout(self, mod, monkeypatch, capsys):
+        self._fake_run(monkeypatch, mod, out=f"{self.HELD}\n{self.ROLLBACK}\n")
+
+        assert mod.main() == 0
+        captured = capsys.readouterr()
+        assert "business-state held" not in captured.out
+        assert "business-state held" in captured.err
+
+    def test_warning_is_not_echoed_to_both_streams(self, mod, monkeypatch, capsys):
+        """Duplicating it would double-report the same lost approval."""
+        self._fake_run(monkeypatch, mod, out=f"{self.ROLLBACK}\n")
+
+        assert mod.main() == 0
+        captured = capsys.readouterr()
+        assert self.ROLLBACK in captured.out
+        assert "business-state rollback" not in captured.err
+
+    def test_failure_path_is_unchanged_by_the_warning_contract(
+        self, mod, monkeypatch, capsys
+    ):
+        """A real lane failure still wins: rc propagates and reason stays error."""
+        self._fake_run(monkeypatch, mod, rc_sync=3, out=f"{self.ROLLBACK}\n")
+
+        assert mod.main() == 3
+        payload = _iteration_json(capsys.readouterr().out)
+        assert payload["reason"] == "error"
+        assert payload["counters"]["exit_code"] == 3
 
 
 class TestJobflowApprovedRelease:
