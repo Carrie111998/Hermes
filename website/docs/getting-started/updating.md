@@ -67,7 +67,7 @@ updates:
   # non_interactive_local_changes: discard  # throw local source edits away
 ```
 
-- `stash` (default) — auto-stash, pull, then ask through the gateway before restoring. The remote default is to keep the stash parked (`[y/N]`), so a timeout cannot silently re-apply a risky local edit. If an explicit restore hits conflicts or fails the restored-source health proof, Hermes keeps the stash and resets to the clean updated tree; an unproven tree is not restarted.
+- `stash` (default) — auto-stash, pull, then ask through the gateway before restoring. The remote default is to keep the stash parked (`[y/N]`), so a timeout cannot silently re-apply a risky local edit. If an explicit restore hits conflicts or fails the restored-source health proof, Hermes keeps the stash and resets to the clean updated tree; an unproven tree is not restarted. After a restart, the new gateway runs an isolated `run_agent` import probe before the success notification is allowed.
 - `discard` — auto-stash and drop the stash after the pull, so the update always lands on a clean tree. Use this only on machines where you never intend to keep local edits to the Hermes source. It stash-drops (not `git reset --hard` + `git clean -fd`), so ignored paths like `node_modules`, `venv`, and build outputs are never touched.
 
 In the desktop app this is **Settings → Advanced → In-App Update Local Changes**.

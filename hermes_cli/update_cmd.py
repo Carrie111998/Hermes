@@ -478,6 +478,8 @@ def _critical_module_import_failures(
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
+        probe_env = os.environ.copy()
+        probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
@@ -486,6 +488,7 @@ def _critical_module_import_failures(
             encoding="utf-8",
             errors="replace",
             timeout=120,
+            env=probe_env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         if strict:
@@ -1519,10 +1522,22 @@ def _print_update_summary(
         _print_update_completion(_update_complete_message(pre_update_version))
 
 
-def _write_gateway_update_exit_code(ok: bool) -> None:
+_GATEWAY_UPDATE_EXIT_PENDING = "2"
+
+
+def _write_gateway_update_exit_code(
+    ok: bool, *, pending_restart: bool = False, only_if_pending: bool = False
+) -> None:
     path = get_hermes_home() / ".update_exit_code"
     try:
-        path.write_text("0" if ok else "1", encoding="utf-8")
+        if only_if_pending and path.read_text(encoding="utf-8").strip() != _GATEWAY_UPDATE_EXIT_PENDING:
+            return
+        value = (
+            _GATEWAY_UPDATE_EXIT_PENDING
+            if pending_restart and ok
+            else ("0" if ok else "1")
+        )
+        path.write_text(value, encoding="utf-8")
     except OSError:
         pass
 
@@ -2175,6 +2190,124 @@ def _untracked_paths(
     return set(paths), error
 
 
+def _stash_untracked_blob_ids(
+    git_cmd: list[str], cwd: Path, stash_ref: str
+) -> tuple[dict[str, str], str | None]:
+    """Return the paths and blob IDs captured as untracked stash content.
+
+    ``git stash push --include-untracked`` stores untracked files in the third
+    parent of the stash commit.  The parent is the authority for cleanup after
+    a failed restore; comparing only the current working-tree inventory with a
+    pre-restore snapshot would also match a file created concurrently by the
+    user and could delete data that never came from the stash.
+    """
+    command = git_cmd + ["cat-file", "-p", stash_ref]
+    try:
+        commit = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError as exc:
+        return {}, f"{command!r} could not run: {exc}"
+    if commit.returncode != 0:
+        detail = (commit.stderr or "").strip()
+        suffix = f": {detail.splitlines()[0][:400]}" if detail else ""
+        return {}, f"{command!r} exited with status {commit.returncode}{suffix}"
+
+    parents = [
+        line.split(maxsplit=1)[1]
+        for line in (commit.stdout or "").splitlines()
+        if line.startswith("parent ") and len(line.split(maxsplit=1)) == 2
+    ]
+    if len(parents) < 3:
+        return {}, None
+
+    tree_command = git_cmd + ["ls-tree", "-r", "-z", parents[2]]
+    try:
+        tree = subprocess.run(
+            tree_command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError as exc:
+        return {}, f"{tree_command!r} could not run: {exc}"
+    if tree.returncode != 0:
+        detail = (tree.stderr or "").strip()
+        suffix = f": {detail.splitlines()[0][:400]}" if detail else ""
+        return {}, f"{tree_command!r} exited with status {tree.returncode}{suffix}"
+
+    entries: dict[str, str] = {}
+    for raw_entry in (tree.stdout or "").split("\0"):
+        if not raw_entry:
+            continue
+        metadata, separator, path = raw_entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[1] != "blob" or not path:
+            return {}, "git stash untracked-file inventory contained an invalid entry"
+        entries[path] = fields[2]
+    return entries, None
+
+
+def _safe_restored_untracked_paths(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: str,
+    preexisting_untracked: set[str],
+) -> tuple[set[str], str | None]:
+    """Return only untracked paths proven to have come from ``stash_ref``.
+
+    A path is removable only when it is present in the stash's untracked tree,
+    was absent before restore, and its current content hashes to the exact blob
+    captured by the stash.  If a user or another process created or modified a
+    same-named file while the restore ran, the hash mismatch leaves it in place
+    instead of treating a name collision as ownership proof.
+    """
+    stash_entries, error = _stash_untracked_blob_ids(git_cmd, cwd, stash_ref)
+    if error:
+        return set(), error
+    if not stash_entries:
+        return set(), None
+
+    current_untracked, error = _untracked_paths(git_cmd, cwd)
+    if error:
+        return set(), error
+
+    candidates = set(stash_entries) & current_untracked - preexisting_untracked
+    removable: set[str] = set()
+    ambiguous: list[str] = []
+    for path in sorted(candidates):
+        try:
+            hash_result = subprocess.run(
+                git_cmd + ["hash-object", f"--path={path}", "--", path],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="surrogateescape",
+            )
+        except OSError:
+            ambiguous.append(path)
+            continue
+        if hash_result.returncode == 0 and hash_result.stdout.strip() == stash_entries[path]:
+            removable.add(path)
+        else:
+            ambiguous.append(path)
+
+    if ambiguous:
+        return removable, (
+            "could not prove ownership of concurrent untracked path(s): "
+            + ", ".join(ambiguous[:8])
+        )
+    return removable, None
+
+
 def _restored_python_paths(
     git_cmd: list[str], cwd: Path
 ) -> tuple[tuple[str, ...], str | None]:
@@ -2218,12 +2351,14 @@ def _reject_unsafe_stash_restore(
         for line in str(detail).splitlines()[:6]:
             print(f"    {line}")
 
-    current_untracked, inventory_error = _untracked_paths(git_cmd, cwd)
+    restored_untracked, inventory_error = _safe_restored_untracked_paths(
+        git_cmd,
+        cwd,
+        stash_ref,
+        preexisting_untracked,
+    )
     if inventory_error:
         print(f"  Cleanup inventory failed: {inventory_error}")
-        restored_untracked: set[str] = set()
-    else:
-        restored_untracked = current_untracked - preexisting_untracked
 
     try:
         reset = subprocess.run(
@@ -7668,7 +7803,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Desktop rebuild failure must not be reported as "0" — the gateway's
         # /update watcher (gateway/run.py) polls this file.
         if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+            _write_gateway_update_exit_code(
+                desktop_build_ok, pending_restart=True
+            )
 
         gateway_fleet_restart_incomplete = False
         # Snapshot of gateways running before we touch anything. Stays empty
@@ -8373,11 +8510,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if failed_or_stale_units:
                 gateway_fleet_restart_incomplete = True
                 if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
+                    _write_gateway_update_exit_code(False)
             _warn_incomplete_gateway_fleet_restart(failed_or_stale_units)
 
             try:
@@ -8459,11 +8592,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 gateway_fleet_restart_incomplete = True
                 _warn_gateway_restart_phase_aborted(e, _surviving)
                 if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
+                    _write_gateway_update_exit_code(False)
             try:
                 from hermes_cli.update_receipt import record_gateway_restart
 
@@ -8624,6 +8753,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as _receipt_exc:
             logger.debug("Update receipt finalize failed: %s", _receipt_exc)
 
+        if gateway_mode:
+            # The pending marker is consumed by the restarted gateway's
+            # post-start agent health probe. When no gateway was running, this
+            # process is the only verifier and can finalize the outcome here.
+            _write_gateway_update_exit_code(
+                not gateway_fleet_restart_incomplete,
+                only_if_pending=True,
+            )
+
         if gateway_fleet_restart_incomplete:
             # Code update itself succeeded, but at least one gateway still
             # runs pre-update modules — surface that as a failed update so
@@ -8667,6 +8805,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 finalize_update_receipt("failed")
             except Exception:
                 pass
+            if gateway_mode:
+                _write_gateway_update_exit_code(False)
             sys.exit(1)
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
