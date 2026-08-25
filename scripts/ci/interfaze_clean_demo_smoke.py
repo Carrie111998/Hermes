@@ -33,6 +33,126 @@ OPERATIONAL_COLLECTIONS = (
 INITIAL_EMPTY_COLLECTIONS = ("/api/v1/products", *OPERATIONAL_COLLECTIONS)
 PROTECTED_DEMO_EMAILS = frozenset({"efe@anexa-arelvia.com"})
 
+# The sanitized acceptance corpus: five markets, twenty curated buyer rows, and
+# the exclusion cases. It carries the same shape as the real kitchen-appliance
+# export and none of its content — no person, no real domain.
+FIXTURE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "tests" / "server" / "fixtures" / "curated_appliance_buyers.jsonl"
+)
+# The same assertion an operator files for the real corpus. Kept beside the
+# fixture rather than derived from it, because a manifest the test computed from
+# the rows would prove nothing about the rows.
+ACCEPTANCE_MANIFEST = {
+    "purpose": "curated_buyers",
+    "asserted_fields": [
+        "company_identity", "target_presence",
+        "product_sector_relevance", "buyer_membership",
+    ],
+    "sector_ids": ["household-appliances"],
+    "product_terms": [],
+    "publisher_label": "Acceptance appliance buyer list",
+    "curated_at": 1787616000.0,
+    "freshness_unknown": False,
+    "curation_note": "Fictional company-only acceptance corpus; no contact columns.",
+}
+ACCEPTANCE_MARKETS = ("DE", "ES", "FR", "PL", "RO")
+# Published contract, restated here so the acceptance gate fails if the engine
+# quietly changes it.
+RESULT_TARGET_MIN = 5
+RESULT_LIMIT = 15
+
+
+def load_acceptance_corpus() -> tuple[bytes, bytes]:
+    """The fixture split into its manifest-bearing and legacy datasets.
+
+    Two datasets because the distinction is the point: a curated buyer list is
+    evidence for its rows, and a list nobody made an assertion about is not, so
+    the same run has to contain both to prove the boundary holds.
+    """
+    curated: list[str] = []
+    legacy: list[str] = []
+    for line in FIXTURE_PATH.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        target = curated if entry["dataset"] == "curated" else legacy
+        target.append(json.dumps(entry["row"], ensure_ascii=False))
+    return "\n".join(curated).encode(), "\n".join(legacy).encode()
+
+
+def assert_balanced_primary_list(
+    *,
+    active: list[dict[str, Any]],
+    review: list[dict[str, Any]],
+    overflow: list[dict[str, Any]],
+    metrics: dict[str, Any],
+) -> None:
+    """The acceptance relationships for one run's customer-visible outcome.
+
+    Shared by the in-process release gate and the HTTP smoke run so a live
+    deployment is held to the same statements the test suite is. Every check is
+    a relationship between what the run reported and what it persisted; none of
+    them assumes a particular corpus.
+    """
+    qualified = int(metrics.get("qualified_leads", 0) or 0)
+    pool = int(metrics.get("strong_fit_pool", 0) or 0)
+    if qualified != len(active):
+        raise SmokeFailure(
+            f"metrics report {qualified} qualified leads but {len(active)} are displayed"
+        )
+    if qualified > RESULT_LIMIT:
+        raise SmokeFailure(f"{qualified} displayed leads exceeds the limit of {RESULT_LIMIT}")
+    if pool < qualified:
+        raise SmokeFailure(f"strong-fit pool {pool} is smaller than the {qualified} displayed")
+    if any(row.get("verdict") != "strong_fit" for row in active):
+        raise SmokeFailure("the primary list contains a verdict other than strong_fit")
+    if any(not (row.get("selection") or {}).get("displayed") for row in active):
+        raise SmokeFailure("the primary list contains an undisplayed result")
+    if any(not row.get("evidence") for row in active):
+        raise SmokeFailure("a displayed lead has no evidence receipt")
+    ranks = [(row.get("selection") or {}).get("display_rank") for row in active]
+    if ranks != sorted(rank for rank in ranks if rank is not None) or None in ranks:
+        raise SmokeFailure("the primary list is not in saved rank order")
+    if any(row.get("lead_id") is not None for row in review):
+        raise SmokeFailure("a review candidate was materialized as a lead")
+    if any((row.get("selection") or {}).get("displayed") for row in overflow):
+        raise SmokeFailure("an overflow strong fit is marked displayed")
+    if any(row.get("lead_id") is not None for row in overflow):
+        raise SmokeFailure("an overflow strong fit was materialized as a lead")
+
+    counts: dict[str, int] = {}
+    for row in active:
+        code = str(row.get("country") or "").upper()
+        counts[code] = counts.get(code, 0) + 1
+    reported = {
+        str(key).upper(): int(value)
+        for key, value in (metrics.get("leads_by_country") or {}).items()
+    }
+    if reported and reported != counts:
+        raise SmokeFailure(
+            f"metrics report {reported} per country but the list shows {counts}"
+        )
+    # The balance rule, stated directly: nobody takes a fourth while a
+    # represented market is still under three and has a candidate waiting.
+    waiting = {
+        str(row.get("country") or "").upper() for row in overflow
+    }
+    for country, count in counts.items():
+        if count < 4:
+            continue
+        starved = [
+            other for other, other_count in counts.items()
+            if other_count < 3 and other in waiting
+        ]
+        if starved:
+            raise SmokeFailure(
+                f"{country} took {count} while {sorted(starved)} had unselected candidates"
+            )
+    shortfall = int(metrics.get("result_shortfall", 0) or 0)
+    if shortfall != max(0, RESULT_TARGET_MIN - qualified):
+        raise SmokeFailure(f"reported shortfall {shortfall} does not match {qualified} qualified")
+
 
 class SmokeFailure(RuntimeError):
     """A release-gate assertion failed."""
@@ -219,7 +339,9 @@ def run(args: argparse.Namespace) -> None:
     status, campaign = client.request("POST", "/api/v1/research-campaigns", payload={
         "name": "Release gate appliance buyers",
         "seller_countries": ["TR"],
-        "target_countries": [args.country.upper()],
+        "target_countries": [
+            value.strip().upper() for value in str(args.country).split(",") if value.strip()
+        ],
         "sector_ids": ["household-appliances"],
         "buyer_types": ["importer", "distributor", "retailer", "wholesaler"],
         "enabled_source_ids": [source_id],
@@ -242,6 +364,22 @@ def run(args: argparse.Namespace) -> None:
     _, rejected = client.request(
         "GET", f"/api/v1/research-campaigns/{campaign_id}/results?view=rejected",
     )
+    _, review = client.request(
+        "GET", f"/api/v1/research-campaigns/{campaign_id}/results?view=review",
+    )
+    _, overflow = client.request(
+        "GET", f"/api/v1/research-campaigns/{campaign_id}/results?view=outside_limit",
+    )
+    _, metric_rows = client.request(
+        "GET", f"/api/v1/research-campaigns/{campaign_id}/metrics",
+    )
+    metrics = next(
+        (row for row in (metric_rows or []) if row.get("dimension") == "overall"),
+        (metric_rows or [{}])[0],
+    )
+    assert_balanced_primary_list(
+        active=active, review=review, overflow=overflow, metrics=metrics,
+    )
     if not active:
         raise SmokeFailure("research produced no active results")
     if any(row.get("verdict") == "reject" for row in active):
@@ -255,17 +393,26 @@ def run(args: argparse.Namespace) -> None:
             raise SmokeFailure(f"active result {row['id']} has no source IDs")
         _, claims = client.request("GET", f"/api/v1/research/results/{row['id']}/claims")
         evidence = [item for claim in claims for item in claim.get("evidence", [])]
+        # A receipt is either a public page or an immutable internal dataset
+        # reference. Requiring a URL rejected the curated-corpus path outright,
+        # which is exactly the evidence this release is about.
         incomplete = any(
-            not item.get("provenance_url", "").startswith("https://")
+            not (
+                str(item.get("provenance_url") or "").startswith("https://")
+                or str(item.get("source_reference") or "").startswith("dataset:")
+            )
             or not item.get("snapshot_id")
             or not item.get("raw_hash")
             for item in evidence
         )
         if not evidence or incomplete:
             raise SmokeFailure(
-                f"active result {row['id']} lacks complete HTTPS evidence metadata"
+                f"active result {row['id']} lacks a complete evidence receipt"
             )
-    print(f"clean demo smoke passed ({len(active)} active, {len(rejected)} rejected)")
+    print(
+        f"clean demo smoke passed ({len(active)} displayed, {len(review)} review, "
+        f"{len(overflow)} not selected, {len(rejected)} rejected)"
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -288,7 +435,10 @@ def parser() -> argparse.ArgumentParser:
         "--source-id",
         help="configured verifier source; defaults to the first available",
     )
-    result.add_argument("--country", default="DE", help="ISO alpha-2 target country (default: DE)")
+    result.add_argument(
+        "--country", default="DE",
+        help="comma-separated ISO alpha-2 target markets (default: DE)",
+    )
     return result
 
 

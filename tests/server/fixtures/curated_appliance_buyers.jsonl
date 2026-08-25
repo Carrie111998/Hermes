@@ -1,0 +1,25 @@
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Nordwind Hausgeraete GmbH", "country": "DE", "source_record_id": "de-buyer-1"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Elbtal Kuechenhandel GmbH", "country": "DE", "source_record_id": "de-buyer-2"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Rheinbogen Weissware AG", "country": "DE", "source_record_id": "de-buyer-3"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Harzblick Grosshandel GmbH", "country": "DE", "source_record_id": "de-buyer-4"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Marisol Electrodomesticos SL", "country": "ES", "source_record_id": "es-buyer-1"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Duero Cocinas SA", "country": "ES", "source_record_id": "es-buyer-2"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Levante Blanco SL", "country": "ES", "source_record_id": "es-buyer-3"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Altamar Distribucion SL", "country": "ES", "source_record_id": "es-buyer-4"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Comptoir Belleroche SAS", "country": "FR", "source_record_id": "fr-buyer-1"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Maison Valfleur SARL", "country": "FR", "source_record_id": "fr-buyer-2"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Atelier Grandbois SAS", "country": "FR", "source_record_id": "fr-buyer-3"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Distribution Clairval SAS", "country": "FR", "source_record_id": "fr-buyer-4"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Wislan Sprzet Domowy Sp z oo", "country": "PL", "source_record_id": "pl-buyer-1"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Bialogora Handel Sp z oo", "country": "PL", "source_record_id": "pl-buyer-2"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Karpatia Bielizna SA", "country": "PL", "source_record_id": "pl-buyer-3"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Nadmorska Dystrybucja Sp z oo", "country": "PL", "source_record_id": "pl-buyer-4"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Muresana Electrocasnice SRL", "country": "RO", "source_record_id": "ro-buyer-1"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Carpatin Distributie SRL", "country": "RO", "source_record_id": "ro-buyer-2"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Doborul Comert SRL", "country": "RO", "source_record_id": "ro-buyer-3"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["household-appliances"], "company_name": "Valea Alba Grup SRL", "country": "RO", "source_record_id": "ro-buyer-4"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["industrial-machinery"], "company_name": "Sudwerk Industrieventile GmbH", "country": "DE", "explicit_product_ranges": ["industrial valves", "pressure fittings"], "source_record_id": "de-out-of-range-1"}}
+{"dataset": "curated", "row": {"buyer_types": ["distributor"], "categories": ["industrial-machinery"], "company_name": "Forges Ternay SAS", "country": "FR", "explicit_product_ranges": ["hydraulic cylinders"], "source_record_id": "fr-out-of-range-2"}}
+{"dataset": "legacy", "row": {"categories": ["household-appliances"], "company_name": "Fabrica Solano SA", "country": "ES", "source_record_id": "legacy-seller_only-1"}}
+{"dataset": "legacy", "row": {"categories": ["household-appliances"], "company_name": "Zaklad Dawny Sp z oo", "country": "PL", "source_record_id": "legacy-closed-2"}}
+{"dataset": "legacy", "row": {"categories": ["household-appliances"], "company_name": "Anonim Vechi SRL", "country": "RO", "source_record_id": "legacy-selection_only-3"}}

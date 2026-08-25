@@ -2270,7 +2270,7 @@ class LeadResearchService:
                                     *_claimed_values(claims, "buyer_role"),
                                 ])),
                                 "official_domains": sorted(official_domains),
-                                "independent_domain_count": len(independent_domains),
+                                "independent_domain_count": _independent_source_count(bundles),
                                 "lifecycle_status": next(
                                     iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
                                 ),

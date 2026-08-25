@@ -1,8 +1,22 @@
-"""Release gate for a genuinely empty tenant's first research run."""
+"""Release gate for a genuinely empty tenant's first research run.
+
+The success proof here is the manifest-bearing corpus path, not a two-row
+deterministic verifier. That matters because the deployed system's evidence
+comes from a curated customer list with no public pages: a gate that only ever
+passed on synthetic web citations proved nothing about the run an operator
+actually makes.
+
+The fixture is five markets of fictional companies. Twenty can clear the
+strong-fit floor, which is more than the list holds, so the gate exercises the
+cap and the country balance rather than asserting that everything found is
+shown.
+"""
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,12 +27,16 @@ from scripts.ci import interfaze_clean_demo_smoke as smoke
 from server.agent_service import StubRunExecutor
 from server.app import create_app
 from server.config import Settings
-from server.db import Database
+from server.db import Database, json_load
 from server.lead_research.candidates import CandidateRepository
+from server.lead_research.models import ProviderHealth, VerificationBundle
+from server.lead_research.providers.corpus import CorpusProvider, corpus_definition
 from server.lead_research.registry import ProviderRegistry
 from server.lead_research.service import LeadResearchService
 from server.provisioning import provision_demo_account
-from tests.server.lead_research.fakes import deterministic_provider, fixture_definition
+from tests.server.lead_research.fakes import (
+    cited_source, deterministic_provider, fixture_definition,
+)
 from tests.server.test_api_mvp import TEST_CREDENTIAL_KEY
 
 
@@ -31,6 +49,67 @@ def fake_verifier() -> ProviderRegistry:
     definition = fixture_definition()
     provider = deterministic_provider(definition)
     return ProviderRegistry([definition], {definition.source_id: provider})
+
+
+class LifecycleFixture:
+    """Speaks only about the two legacy rows the curated manifest does not cover.
+
+    A curated buyer list cannot state that a company has closed or that it only
+    manufactures, so the fixture that can is a separate source — which is also
+    how the deployed system is shaped. It abstains on everything else so the
+    curated rows' scores stay the corpus provider's own.
+    """
+
+    SELLER_ONLY = "legacy-seller_only-1"
+    CLOSED = "legacy-closed-2"
+
+    def __init__(self, definition):
+        self.definition = definition
+
+    def health(self):
+        return ProviderHealth(status="active")
+
+    def verify(self, query, candidate):
+        del query
+        record = candidate.source_record_id
+        if record not in {self.SELLER_ONLY, self.CLOSED}:
+            return VerificationBundle(candidate_source_record_id=record)
+        facts = {
+            "company_name": [candidate.company_name],
+            "country": [candidate.country],
+            "buyer_role": ["manufacturer"],
+            "product_term": ["household-appliances"],
+        }
+        if record == self.CLOSED:
+            facts["lifecycle_status"] = ["closed"]
+        return VerificationBundle(
+            candidate_source_record_id=record,
+            sources=[cited_source(
+                provenance_url=f"https://registry.example.test/{record}",
+                classification="independent",
+                retrieved_via="https://search.example.test",
+                facts=facts,
+            )],
+            independent_source_count=1,
+            requests=1,
+        )
+
+
+@pytest.fixture()
+def acceptance_registry() -> ProviderRegistry:
+    """The real corpus verifier plus the one fixture the legacy rows need."""
+    corpus = corpus_definition().model_copy(update={"default_enabled": True})
+    lifecycle = fixture_definition().model_copy(update={
+        "source_id": "legacy-lifecycle",
+        "display_name": "Legacy lifecycle fixture",
+        "emits": ["company_name", "country", "buyer_role", "product_term"],
+    })
+    provider = CorpusProvider()
+    provider.definition = corpus
+    return ProviderRegistry(
+        [corpus, lifecycle],
+        {corpus.source_id: provider, lifecycle.source_id: LifecycleFixture(lifecycle)},
+    )
 
 
 @pytest.fixture()
@@ -49,8 +128,14 @@ def candidate_csv() -> bytes:
     )
 
 
-def make_clean_demo(tmp_path: Path, fake_verifier: ProviderRegistry):
-    db = Database(tmp_path / "clean-demo.db")
+def make_clean_demo(
+    tmp_path: Path,
+    fake_verifier: ProviderRegistry,
+    *,
+    target_countries: tuple[str, ...] = ("DE",),
+    db_name: str = "clean-demo.db",
+):
+    db = Database(tmp_path / db_name)
     provisioned = provision_demo_account(
         db,
         email=TEST_EMAIL,
@@ -62,7 +147,7 @@ def make_clean_demo(tmp_path: Path, fake_verifier: ProviderRegistry):
         }],
     )
     settings = Settings(
-        database_path=tmp_path / "clean-demo.db",
+        database_path=tmp_path / db_name,
         upload_dir=tmp_path / "uploads",
         credential_key=TEST_CREDENTIAL_KEY,
         chat_enabled=False,
@@ -96,7 +181,7 @@ def make_clean_demo(tmp_path: Path, fake_verifier: ProviderRegistry):
                 "emphasis": 1,
             }],
             "market_preferences": {
-                "target_countries": ["DE"],
+                "target_countries": list(target_countries),
                 "languages": ["de", "en"],
             },
             "playbook_versions": {"household-appliances": "1"},
@@ -345,3 +430,168 @@ def test_operational_smoke_full_mode_runs_real_api_and_evidence_path(
         headers=headers,
     ).json()
     assert active and rejected
+
+
+def test_clean_demo_balanced_primary_list(
+    tmp_path: Path,
+    acceptance_registry: ProviderRegistry,
+):
+    """The release gate for the contract this change ships.
+
+    Five markets, twenty candidates that can clear the floor, and a list that
+    holds fifteen. What is asserted is the set of relationships a customer
+    depends on: the list never exceeds its limit, it never takes a fourth from
+    one market while another is short, reviews are visible and unmaterialized,
+    the metrics agree with the rows, and the run left a durable trail.
+    """
+    curated, legacy = smoke.load_acceptance_corpus()
+    db, client, headers, company_id = make_clean_demo(
+        tmp_path, acceptance_registry,
+        target_countries=smoke.ACCEPTANCE_MARKETS,
+        db_name="balanced-demo.db",
+    )
+    repository = CandidateRepository(db)
+    assert repository.import_file(
+        "acceptance-appliance-buyers", "1", "curated.jsonl", curated,
+        assertion_manifest=smoke.ACCEPTANCE_MANIFEST,
+    ).record_count == 22
+    # No manifest: these rows stay candidate supply, and only the lifecycle
+    # source can say anything about them.
+    assert repository.import_file(
+        "acceptance-legacy-list", "1", "legacy.jsonl", legacy,
+    ).record_count == 3
+    assert client.get("/api/v1/leads", headers=headers).json() == []
+
+    created = client.post("/api/v1/research-campaigns", headers=headers, json={
+        "name": "Five-market appliance buyers",
+        "seller_countries": ["TR"],
+        "target_countries": list(smoke.ACCEPTANCE_MARKETS),
+        "sector_ids": ["household-appliances"],
+        "buyer_types": ["importer", "distributor", "retailer", "wholesaler"],
+        "enabled_source_ids": ["customer-list-corpus", "legacy-lifecycle"],
+    })
+    assert created.status_code == 201, created.text
+    campaign = created.json()
+    started = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
+    )
+    assert started.status_code == 202, started.text
+    settled = client.app.state.lead_research.wait_until_settled(
+        company_id, campaign["id"], timeout=120,
+    )
+    assert settled is not None, "the campaign never reached a terminal state"
+    assert settled["status"] in {"succeeded", "partial"}, settled
+
+    def view(name):
+        response = client.get(
+            f"/api/v1/research-campaigns/{campaign['id']}/results?view={name}",
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    primary_results = view("active")
+    review_results = view("review")
+    overflow_results = view("outside_limit")
+    rejected_results = view("rejected")
+    metrics = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/metrics", headers=headers,
+    ).json()[0]
+
+    assert 5 <= metrics["qualified_leads"] <= 15
+    assert metrics["qualified_leads"] == len(primary_results)
+    assert metrics["strong_fit_pool"] >= len(primary_results)
+    assert len({row["country"] for row in primary_results}) == 5
+    assert max(Counter(row["country"] for row in primary_results).values()) <= 3
+    assert all(row["evidence"] for row in primary_results)
+    assert all(row["selection"]["displayed"] for row in primary_results)
+    assert all(row["lead_id"] is None for row in review_results)
+    assert all(row["lead_id"] is None for row in overflow_results)
+
+    # The same relationships the operational smoke run holds a live deployment
+    # to, so the gate and the tool cannot drift apart.
+    smoke.assert_balanced_primary_list(
+        active=primary_results, review=review_results,
+        overflow=overflow_results, metrics=metrics,
+    )
+
+    # Evidence is an immutable dataset reference, not an invented URL.
+    citations = [item for row in primary_results for item in row["evidence"]]
+    assert citations
+    assert any(item["source_reference"] for item in citations)
+    assert all(
+        item["provenance_url"] is None
+        for item in citations if item["source_reference"]
+    )
+    assert all(
+        item["publisher_label"] == "Acceptance appliance buyer list"
+        for item in citations if item["source_reference"]
+    )
+
+    # The exclusion cases, each for its own named reason.
+    rejected_names = {row["company_name"] for row in rejected_results}
+    assert "Zaklad Dawny Sp z oo" in rejected_names, "a closed company is rejected"
+    assert "Fabrica Solano SA" in rejected_names, "a seller-only company is rejected"
+    assert "Anonim Vechi SRL" not in {
+        row["company_name"] for row in
+        primary_results + review_results + overflow_results + rejected_results
+    }, "an unasserted legacy row nothing verified produces no result"
+    assert not ({"Sudwerk Industrieventile GmbH", "Forges Ternay SAS"} & {
+        row["company_name"] for row in
+        primary_results + review_results + overflow_results + rejected_results
+    }), "a row whose own product range is out of scope is never researched"
+
+    # /leads is the primary list and nothing else.
+    leads = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/leads", headers=headers,
+    ).json()
+    assert [row["id"] for row in leads] == [row["lead_id"] for row in primary_results]
+    assert db.one(
+        "SELECT COUNT(*) AS n FROM leads WHERE company_id=?", (company_id,),
+    )["n"] == len(primary_results)
+
+    durable_events = [
+        dict(row) for row in db.all(
+            "SELECT kind,data FROM run_events WHERE run_id=? ORDER BY id",
+            (settled["run_id"],),
+        )
+    ]
+    assert durable_events[0]["kind"] == "lead_research_started"
+    assert durable_events[-1]["kind"] == "lead_research_completed"
+    ranked = next(
+        json_load(row["data"], {}) for row in durable_events
+        if row["kind"] == "lead_research_ranked"
+    )
+    assert ranked["qualified_leads"] == metrics["qualified_leads"]
+    trail = "\n".join(row["data"] for row in durable_events)
+    assert "Nordwind" not in trail and "@" not in trail
+
+
+def test_the_acceptance_fixture_carries_no_person_and_no_real_domain():
+    """A fixture is committed forever. Nothing personal may be in it.
+
+    The real corpus is built from a customer's contact list, and a fixture
+    derived from one by hand is exactly where a name or an address survives
+    without anybody noticing.
+    """
+    entries = [
+        json.loads(line)
+        for line in smoke.FIXTURE_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert len(entries) == 25
+    assert {entry["dataset"] for entry in entries} == {"curated", "legacy"}
+    permitted = {
+        "source_record_id", "company_name", "country", "categories",
+        "buyer_types", "explicit_product_ranges",
+    }
+    for entry in entries:
+        row = entry["row"]
+        assert set(row) <= permitted, sorted(set(row) - permitted)
+        assert row["country"] in smoke.ACCEPTANCE_MARKETS
+    text = smoke.FIXTURE_PATH.read_text(encoding="utf-8")
+    for forbidden in ("@", "+", "http", "www.", ".com", ".net", "tel:", "fax"):
+        assert forbidden not in text, forbidden
+    identities = {(row["row"]["company_name"], row["row"]["country"]) for row in entries}
+    assert len(identities) == len(entries), "every fixture company is distinct"
