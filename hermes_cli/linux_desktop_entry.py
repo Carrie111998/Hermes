@@ -77,12 +77,16 @@ def resolve_exec_command() -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly. Do NOT resolve() it: in a
+            # venv, ``venv/bin/python`` is a symlink to the base interpreter
+            # (uv always lays it out this way), and following it escapes the
+            # venv — the entry then dies on the first third-party import
+            # (#94564), silently, since Terminal=false.
+            argv = [sys.executable, str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [sys.executable, "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
@@ -98,15 +102,19 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # Native binary (uv tool shim, PyInstaller, distro package) — its own
         # loader is self-sufficient.
         return False
-    shebang = head.decode("utf-8", errors="replace").strip().lower()
-    if "python" not in shebang:
+    shebang = head.decode("utf-8", errors="replace").strip()
+    if "python" not in shebang.lower():
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    # a system path) would escape the venv when spawned by the DE. Compare
+    # against the unresolved bin dir: the venv python is typically a symlink,
+    # and its resolve()d location (the base interpreter) is outside the venv.
+    # Case-sensitively — Linux paths are, and lowercasing broke the match
+    # for any environment path with uppercase characters.
+    exe_dir = str(Path(sys.executable).parent)
     return exe_dir not in shebang
 
 

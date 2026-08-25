@@ -107,10 +107,39 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    # The prefix must be sys.executable as-is, NOT its resolve()d target:
+    # in a venv, resolve() follows the python symlink out to the base
+    # interpreter, which has no venv site-packages (#94564).
+    assert exec_line.split(" ")[0].strip('"') == sys.executable
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
+
+
+# #94564: uv lays venvs out with ``venv/bin/python`` as a symlink to the
+# managed base interpreter. resolve()ing sys.executable follows that link
+# out of the venv, so the entry ran a python with no venv site-packages →
+# ModuleNotFoundError on the first third-party import, silent again.
+def test_exec_keeps_symlinked_venv_interpreter_unresolved(tmp_path, xdg_home, monkeypatch):
+    import sys
+
+    root = _make_project(tmp_path)
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(Path(sys.executable).resolve())
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
@@ -135,8 +164,7 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
-    hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.write_text(f"#!{sys.executable}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
