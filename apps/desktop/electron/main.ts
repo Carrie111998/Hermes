@@ -282,6 +282,7 @@ import {
 } from './remote-liveness'
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { createScreenAnnotationsController, registerScreenAnnotationsIpc } from './screen-annotations-window'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -11461,6 +11462,26 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
 })
 
+// The agent's on-screen marks (annotate_screen tool): a transparent,
+// click-through, always-on-top overlay covering the display of whatever
+// window the marks anchor to. Gateway-less like the wake cue — the chat
+// renderer that received the tool's request forwards it over IPC
+// (hermes:screen:annotate) and this controller does the native work.
+const screenAnnotationsController = createScreenAnnotationsController({
+  devServer: DEV_SERVER,
+  isMac: IS_MAC,
+  loadWindowUrl,
+  log: rememberLog,
+  preloadPath: PRELOAD_PATH,
+  rendererIndex: resolveRendererIndex,
+  titlesAvailable: () => (IS_MAC ? systemPreferences.getMediaAccessStatus?.('screen') === 'granted' : true),
+  // Same opt-out as the other helper overlays: global UI zoom would rescale
+  // the renderer and drag every mark off its screen coordinate.
+  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('petOverlay'))
+})
+
+registerScreenAnnotationsIpc(screenAnnotationsController)
+
 // The pet overlay: a single transparent, frameless, always-on-top window that
 // hosts ONLY the floating mascot. Shift-clicking the in-window pet "pops it out"
 // here so it can leave the app's bounds and stay visible while Hermes is
@@ -15642,6 +15663,10 @@ app.on('before-quit', event => {
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
   wakeIndicatorController.close()
+
+  // Same for the agent's screen-annotation overlay — marks floating over a
+  // quit app would be pure ghost UI.
+  screenAnnotationsController.close()
 
   // Same for the HUD — an always-on-top panel outliving the app would leave a
   // floating composer with nothing behind it. Close it directly rather than via

@@ -4101,6 +4101,7 @@ def _block(
         "window.read.request",
         "mcp.setup.request",
         "tour.request",
+        "screen.annotate.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -4233,6 +4234,69 @@ def _tour_request(sid: str, payload: dict) -> str:
         session["tour_bridge"] = "unanswered"
 
     return answer or _TOUR_BRIDGE_UNAVAILABLE
+
+
+# A screen annotation is a native round-trip the renderer forwards to its main
+# process — enumerate windows, position a transparent overlay, paint. Fast on
+# a working client; the deadline only pays for a first-time overlay window
+# spawn on a slow machine.
+_ANNOTATE_SCREEN_TIMEOUT_S = 30
+# Same probe discipline as the tour bridge: until this session's client has
+# answered once, hold it to a deadline a working renderer cannot miss.
+_ANNOTATE_SCREEN_PROBE_TIMEOUT_S = 10
+
+_ANNOTATE_SCREEN_BRIDGE_UNAVAILABLE = json.dumps(
+    {
+        "success": False,
+        "error": (
+            "No Hermes Desktop window answered the screen-annotation request. "
+            "The overlay is drawn by the desktop app, which updates separately "
+            "from this backend, so an app build older than the annotate_screen "
+            "tool has nothing listening. Update the Hermes Desktop app and "
+            "start a new session. Do not retry annotate_screen in this session."
+        ),
+    }
+)
+
+
+def _annotate_screen_request(sid: str, payload: dict) -> str:
+    """Bridge the annotate_screen tool callback onto _block, without paying for
+    a client that cannot answer it.
+
+    Same shape as ``_tour_request`` and for the same reason (#89620): the
+    renderer's ``screen.annotate.request`` handler ships in the desktop bundle,
+    the tool ships in this backend, and the two update on different clocks. A
+    session's first action gets the probe deadline; an unanswered probe marks
+    the bridge unavailable for the session so later calls fail fast with the
+    real fix instead of stacking timeouts.
+    """
+    # A detached caller has no session record; the throwaway keeps it on the
+    # plain bridge, unprobed.
+    session = _sessions.get(sid)
+    if session is None:
+        session = {}
+    state = session.get("screen_annotate_bridge")
+
+    if state == "unanswered":
+        return _ANNOTATE_SCREEN_BRIDGE_UNAVAILABLE
+
+    answer = _block(
+        "screen.annotate.request",
+        sid,
+        dict(payload),
+        timeout=(
+            _ANNOTATE_SCREEN_TIMEOUT_S
+            if state == "answered"
+            else _ANNOTATE_SCREEN_PROBE_TIMEOUT_S
+        ),
+    )
+
+    if answer:
+        session["screen_annotate_bridge"] = "answered"
+    elif state != "answered":
+        session["screen_annotate_bridge"] = "unanswered"
+
+    return answer or _ANNOTATE_SCREEN_BRIDGE_UNAVAILABLE
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -6997,6 +7061,13 @@ def _agent_cbs(sid: str) -> dict:
         # preview pane's webview — and answers tour.respond with the outcome
         # (did the selector match, which step is active).
         "tour_callback": lambda payload: _tour_request(sid, payload),
+        # annotate_screen tool (desktop GUI): the renderer forwards the shapes
+        # to its main process, which resolves the target window and paints a
+        # transparent click-through overlay, then answers
+        # screen.annotate.respond with the outcome.
+        "annotate_screen_callback": lambda payload: _annotate_screen_request(
+            sid, payload
+        ),
     }
 
     # Interim assistant commentary (text alongside tool calls, or the attempted

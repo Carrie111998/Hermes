@@ -19,6 +19,7 @@ from toolsets import TOOLSETS, resolve_toolset
 
 GUI_TOOLS = {
     "annotate_preview",
+    "annotate_screen",
     "close_preview",
     "drive_preview",
     "close_terminal",
