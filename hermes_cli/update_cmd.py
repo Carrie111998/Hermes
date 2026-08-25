@@ -512,6 +512,10 @@ def _critical_module_import_failures(
             errors="replace",
             timeout=120,
         )
+    except subprocess.TimeoutExpired:
+        return {
+            "critical-module probe": "timed out before reporting import health"
+        }
     except (OSError, subprocess.SubprocessError):
         # Can't run the probe — don't block the update on our own tooling.
         return {}
@@ -2155,8 +2159,8 @@ def _park_stashed_changes(stash_ref: str) -> None:
     print(f"  Restore manually with: git stash apply {stash_ref}")
 
 
-def _git_untracked_paths(git_cmd: list[str], cwd: Path) -> set[str]:
-    """Return untracked, non-ignored paths without Git's quoting ambiguity."""
+def _git_untracked_paths(git_cmd: list[str], cwd: Path) -> set[str] | None:
+    """Return untracked paths, or ``None`` when Git cannot enumerate them."""
     result = subprocess.run(
         git_cmd + ["ls-files", "--others", "--exclude-standard", "-z"],
         cwd=cwd,
@@ -2170,7 +2174,7 @@ def _git_untracked_paths(git_cmd: list[str], cwd: Path) -> set[str]:
             "  ⚠ Could not enumerate untracked files while validating the "
             "restored stash."
         )
-        return set()
+        return None
     return {path for path in result.stdout.split("\0") if path}
 
 
@@ -2189,7 +2193,9 @@ def _restored_python_paths(git_cmd: list[str], cwd: Path) -> tuple[str, ...]:
         errors="surrogateescape",
     )
     paths = set(changed.stdout.split("\0")) if changed.returncode == 0 else set()
-    paths.update(path for path in _git_untracked_paths(git_cmd, cwd) if path.endswith(".py"))
+    untracked = _git_untracked_paths(git_cmd, cwd)
+    if untracked is not None:
+        paths.update(path for path in untracked if path.endswith(".py"))
     paths.discard("")
     return tuple(sorted(paths))
 
@@ -2210,7 +2216,12 @@ def _reject_unsafe_stash_restore(
         for line in str(detail).splitlines()[:6]:
             print(f"    {line}")
 
-    restored_untracked = _git_untracked_paths(git_cmd, cwd) - preexisting_untracked
+    current_untracked = _git_untracked_paths(git_cmd, cwd)
+    restored_untracked = (
+        current_untracked - preexisting_untracked
+        if current_untracked is not None
+        else set()
+    )
     subprocess.run(
         git_cmd + ["reset", "--hard", "HEAD"], cwd=cwd, capture_output=True
     )
@@ -2220,6 +2231,9 @@ def _reject_unsafe_stash_restore(
             cwd=cwd,
             capture_output=True,
         )
+    elif current_untracked is None:
+        print("  ⚠ Untracked restore leftovers could not be cleaned automatically.")
+        print("    Inspect `git status` before retrying the stash.")
 
     print("  The clean updated tree has been restored; the gateway was not restarted.")
     print("  Platform connectivity alone does not mean the agent can execute turns.")
@@ -2266,6 +2280,10 @@ def _restore_stashed_changes(
             return False
 
     preexisting_untracked = _git_untracked_paths(git_cmd, cwd)
+    if preexisting_untracked is None:
+        print("  The stash was not restored because its cleanup baseline is unknown.")
+        print(f"  Restore manually with: git stash apply {stash_ref}")
+        return False
     clean_import_failures = _critical_module_import_failures(
         cwd, report_runtime_errors=True
     )
