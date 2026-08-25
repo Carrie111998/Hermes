@@ -35,10 +35,6 @@ import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } fro
 import { appIconCandidates, resolveAppIcon } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
-  teardownSshConnectionProcessTree,
-  teardownSshConnectionWithProcessTree
-} from './ssh-process-teardown'
-import {
   type BackendOutputTail,
   claimDecision,
   createBackendOutputTail,
@@ -349,6 +345,10 @@ import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
+import {
+  teardownSshConnectionProcessTree,
+  teardownSshConnectionWithProcessTree
+} from './ssh-process-teardown'
 import { createStreamThrottle } from './stream-throttle'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
@@ -10147,11 +10147,13 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     // teardownSshConnection).
     teardownSshConnectionProcessTree(sshConnections.get(scope), { forceKillProcessTree })
     sshConnections.delete(scope)
+
     try {
       await ssh.close()
     } catch {
       void 0
     }
+
     ssh = null
   }
 

@@ -3,9 +3,9 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  type SshConnectionStateLike,
   teardownSshConnectionProcessTree,
-  teardownSshConnectionWithProcessTree,
-  type SshConnectionStateLike
+  teardownSshConnectionWithProcessTree
 } from './ssh-process-teardown'
 
 // Pins the deleted-bot python leak (#94959): when a bot/profile is torn
