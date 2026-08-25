@@ -110,6 +110,19 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
     return any(marker in err_text for marker in _SUMMARY_PERMANENT_QUOTA_MARKERS)
 
 
+class SummaryEmptyContentError(RuntimeError):
+    """The summarizer returned HTTP 200 with empty/whitespace-only content.
+
+    Raised by the empty-content guard in ``_generate_summary`` so the failure
+    keeps its identity when it reaches the exception handler: it is a
+    degraded-provider signal (same class as #11978's null-body proxies) and
+    must be classified into the network-failure abort carve-out instead of
+    the generic summary-failure path, which commits the destructive
+    static fallback under the stock ``abort_on_summary_failure=False``
+    and permanently drops the middle window (#94448).
+    """
+
+
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 
 
@@ -5043,8 +5056,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Treat empty content as a failure so it routes through the same
             # main-model fallback + cooldown machinery as a transport error,
             # rather than replacing real context with an empty summary.
+            # SummaryEmptyContentError (not bare RuntimeError) keeps the
+            # degraded-provider identity intact so the exception handler can
+            # classify it into the network-failure abort carve-out (#94448).
             if not content.strip():
-                raise RuntimeError(
+                raise SummaryEmptyContentError(
                     "Context compression LLM returned empty content "
                     f"(provider={self.provider or 'auto'} "
                     f"model={self.summary_model or self.model})"
@@ -5150,6 +5166,17 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # Keep the established field name for caller compatibility;
                 # it now represents the broader terminal access/quota class.
                 self._last_summary_auth_failure = True
+            if isinstance(e, SummaryEmptyContentError):
+                # An HTTP 200 with an empty body is the same degraded-provider
+                # signal as a dropped connection: the transport answered but
+                # the provider failed at the compaction moment (#11978-class
+                # proxies; opencode-go in #94448). Classify it into the
+                # network-failure carve-out so compress() ABORTS and preserves
+                # the session instead of committing the destructive static
+                # fallback under the stock abort_on_summary_failure=false —
+                # retrying once the provider recovers is strictly better than
+                # permanently dropping the middle window (#94448).
+                self._last_summary_network_failure = True
             if _is_json_decode and not _is_model_not_found and not _is_timeout:
                 logger.error(
                     "Context compression failed: auxiliary LLM returned a "

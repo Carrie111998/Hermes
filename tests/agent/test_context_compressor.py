@@ -1127,6 +1127,111 @@ class TestStreamingClosedFallback:
 
 
 
+class TestEmptyContentSummaryFailureAborts:
+    """Regression #94448: an HTTP-200 empty-content summary response from a
+    degraded provider must be classified into the network-failure carve-out
+    (abort) instead of falling into the generic failure path, which commits
+    the destructive Phase-4 fallback under the stock default
+    ``abort_on_summary_failure=False`` and permanently deletes the middle
+    window of the session.
+
+    The empty-content guard (#11978) already refuses to store the empty body;
+    what was missing was the abort classification, so ``compress()`` still
+    dropped every uncompacted turn for a static placeholder marker.
+    """
+
+    def _msgs(self, n=12):
+        msgs = [{"role": "user", "content": "do something"}]
+        for i in range(n - 1):
+            msgs.append({"role": "assistant", "content": f"reply {i}"})
+            msgs.append({"role": "user", "content": f"follow-up {i}"})
+        return msgs
+
+    @staticmethod
+    def _empty_response(content=""):
+        mock = MagicMock()
+        mock.choices = [MagicMock()]
+        mock.choices[0].message.content = content
+        return mock
+
+    def test_generate_summary_flags_network_failure(self):
+        """Empty content raises the guard error; it must be classified
+        as a network-class failure so the abort carve-out fires."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=self._empty_response(),
+        ):
+            result = c._generate_summary(self._msgs())
+        assert result is None
+        assert c._last_summary_network_failure is True
+        assert c._last_summary_auth_failure is False
+        # Transient cooldown engaged so we don't hammer the degraded provider.
+        assert c._summary_failure_cooldown_until > 0
+
+    def test_whitespace_only_content_also_flags_network_failure(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=self._empty_response(content="   \n\t"),
+        ):
+            result = c._generate_summary(self._msgs())
+        assert result is None
+        assert c._last_summary_network_failure is True
+
+    def test_compress_aborts_and_preserves_middle_window(self):
+        """The core contract: with the stock default
+        ``abort_on_summary_failure=False``, an empty-content summarizer
+        response must leave the session UNCHANGED (retryable), never commit
+        the destructive fallback that drops the middle window."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=self._empty_response(),
+        ):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result == msgs  # session preserved unchanged — retry later
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+
+    def test_aux_model_empty_content_still_gets_main_retry_before_abort(self):
+        """The one-shot fallback to the main model still runs first — abort
+        only kicks in once the main model also returns empty content."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="broken-aux-model",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._empty_response(), self._empty_response()],
+        ) as mock_call:
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert mock_call.call_count == 2  # aux attempt + main-model retry
+        assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+
+
 class TestAuxModelFallbackSurfacedToCallers:
     """When summary_model fails but retry-on-main succeeds, compress() must
     expose the aux-model failure via _last_aux_model_failure_{model,error}
