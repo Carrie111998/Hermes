@@ -1,3 +1,4 @@
+import { Codicon } from '@/components/ui/codicon'
 import {
   DropdownMenuItem,
   DropdownMenuLabel,
@@ -73,6 +74,8 @@ interface ModelEditSubmenuProps {
   fastControl: FastControl
   /** Whether this row's model is the active one. */
   isActive: boolean
+  /** Whether this row's model is pinned to the top of the catalog. */
+  isPinned?: boolean
   /** This row's model id. */
   model: string
   /** Switch to a specific model id (used to swap base ⇄ -fast variant). */
@@ -82,6 +85,9 @@ interface ModelEditSubmenuProps {
    *  controller decides what an edit means. That's what lets the same submenu
    *  drive a live chat session and a detached per-task override. */
   onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
+  /** Toggle the pin for this row. The submenu stays pure: it reports the
+   *  intent, the owning surface owns the store write. */
+  onTogglePin?: () => void
   /** This row's provider slug. */
   provider: string
   /** Whether this model supports reasoning effort. */
@@ -107,8 +113,10 @@ function ModelEditSubmenuBody({
   effort,
   fastControl,
   isActive,
+  isPinned = false,
   onSelectModel,
   onSetOptions,
+  onTogglePin,
   reasoning
 }: ModelEditSubmenuProps) {
   const { t } = useI18n()
@@ -139,12 +147,25 @@ function ModelEditSubmenuBody({
 
   const hasFast = fastControl.kind !== 'none'
   const fastOn = fastControl.kind === 'none' ? false : fastControl.on
+  const showPin = Boolean(onTogglePin)
 
-  return !hasFast && !reasoning ? (
+  return !showPin && !hasFast && !reasoning ? (
     <div className="px-2.5 py-3 text-xs text-(--ui-text-tertiary)">{copy.noOptions}</div>
   ) : (
     <>
       <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.options}</DropdownMenuLabel>
+      {showPin ? (
+        <DropdownMenuItem
+          className={dropdownMenuRow}
+          onSelect={event => {
+            event.preventDefault()
+            onTogglePin?.()
+          }}
+        >
+          {isPinned ? copy.unpinModel : copy.pinModel}
+          <Codicon className="ml-auto text-(--ui-text-tertiary)" name={isPinned ? 'pinned' : 'pin'} size="0.75rem" />
+        </DropdownMenuItem>
+      ) : null}
       {showThinkingToggle ? (
         <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
           {copy.thinking}
