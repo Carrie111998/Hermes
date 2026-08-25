@@ -110,4 +110,30 @@ describe('skinToDesktopTheme', () => {
     // …and the light slot carries the overlay's canvas.
     expect(luminance(theme.colors.background)).toBeGreaterThan(0.4)
   })
+
+  it('mirrors for a light-authored base with only dark_colors', () => {
+    // The inverse of the dark-base case: a light base is the light slot itself,
+    // and the dark_colors overlay lands in the dark slot.
+    const theme = skinToDesktopTheme({
+      name: 'lightfirst',
+      colors: { background: '#fafafa', ui_accent: '#b8860b', banner_text: '#222222' },
+      dark_colors: { background: '#0b0b0b', banner_text: '#ffffff', ui_accent: '#ffcc00' }
+    })!
+
+    expect(theme.colors).not.toBe(theme.darkColors)
+    // Light slot keeps the light base; the dark slot carries the overlay's canvas.
+    expect(luminance(theme.colors.background)).toBeGreaterThan(0.4)
+    expect(luminance(theme.darkColors!.background)).toBeLessThan(0.4)
+  })
+
+  it('treats an empty paired block as single-mode', () => {
+    const theme = skinToDesktopTheme({
+      name: 'emptyoverlay',
+      colors: { background: '#101020', ui_accent: '#ff33aa' },
+      light_colors: {}
+    })!
+
+    // No real tokens in the overlay: keep the single shared palette behavior.
+    expect(theme.colors).toBe(theme.darkColors)
+  })
 })
