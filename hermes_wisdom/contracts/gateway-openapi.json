@@ -7876,7 +7876,7 @@
     "/v1/sync/wisdom/skills/{id}/versions/{v}/content": {
       "get": {
         "summary": "Installable content of a published version (wisdom:install).",
-        "description": "The files of the version, read from the org scope and integrity-checked against the published content hash — a wisdom-scoped consumer never needs the admin-gated org-object endpoints (round 1 P6). Round 3: files carry RAW BYTES (content_base64) plus the tree-entry mode (file|exec) so binary assets and executable bits survive install losslessly; each blob's address is recomputed from the served bytes before responding. Inline base64; drafts are size-capped at submission so responses are bounded.",
+        "description": "The files of the version, read from the org scope and integrity-checked against the published content hash — a wisdom-scoped consumer never needs the admin-gated org-object endpoints (round 1 P6). Round 3: files carry RAW BYTES (content_base64) plus the tree-entry mode (file|exec) so the exact validated UTF-8 bytes and mode survive transport losslessly; each blob's address is recomputed from the served bytes before responding. Inline base64; drafts are size-capped at submission so responses are bounded.",
         "tags": [
           "wisdom"
         ],

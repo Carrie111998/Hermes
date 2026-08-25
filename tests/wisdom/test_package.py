@@ -1,8 +1,10 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+import hermes_wisdom.package as package_module
 from hermes_wisdom.package import (
     PackagePolicyError,
     prepare_package,
@@ -44,6 +46,23 @@ def test_preparation_creates_only_instruction_overlay_and_hashes(tmp_path: Path)
     assert package.content_hash.startswith("sha256:")
 
 
+@pytest.mark.parametrize("extension", [".txt", ".md", ".rst", ".adoc", ".asciidoc"])
+def test_allowlisted_inert_text_references_are_accepted(tmp_path: Path, extension: str):
+    skill = make_skill(tmp_path)
+    (skill / "assets" / f"guide{extension}").parent.mkdir(exist_ok=True)
+    (skill / "assets" / f"guide{extension}").write_text(
+        "Static reference material.\n", encoding="utf-8"
+    )
+    package = prepare_package(
+        skill,
+        overlay_root=tmp_path / "overlays",
+        author_description="A valid description.",
+        owner="owner",
+        installation_id="installation-123456",
+    )
+    assert f"assets/guide{extension}" in {item.path for item in package.files}
+
+
 @pytest.mark.parametrize(
     "relative,content",
     [
@@ -51,6 +70,15 @@ def test_preparation_creates_only_instruction_overlay_and_hashes(tmp_path: Path)
         ("templates/active.md", "active"),
         ("package.json", "{}"),
         ("refs/package.json", "{}"),
+        ("refs/run.sh", "echo nope"),
+        ("refs/template.j2", "{{ active }}"),
+        ("refs/config.yaml", "active: true"),
+        ("refs/.github/workflows/note.md", "inert-looking text"),
+        ("assets/hooks/readme.txt", "inert-looking text"),
+        ("assets/page.html", "<script>active</script>"),
+        ("assets/logo.svg", "<svg></svg>"),
+        ("assets/archive.zip", "not really an archive"),
+        ("refs/README", "unknown extension"),
     ],
 )
 def test_unsupported_content_is_rejected_not_silently_omitted(
@@ -82,6 +110,171 @@ def test_download_rejects_hostile_paths_modes_and_binary():
         ])
     with pytest.raises(PackagePolicyError):
         verify_content_files(base + [("assets/image.bin", "file", b"\xff\xfe")])
+    with pytest.raises(PackagePolicyError, match="NUL"):
+        verify_content_files(
+            base + [("refs/padded.txt", "file", b"a" * 1024 + b"\x00")]
+        )
+    with pytest.raises(PackagePolicyError, match="shebang"):
+        verify_content_files(
+            base + [("refs/run.txt", "file", b"#!/bin/sh\necho unsafe")]
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/absolute.txt",
+        "refs//empty.txt",
+        "refs/./dot.txt",
+        "refs/../escape.txt",
+        "refs/%2e%2e/escape.txt",
+        "refs/%252e%252e/escape.txt",
+        "refs/%2fescape.txt",
+        "refs\\escape.txt",
+        "refs/control\x00.txt",
+        "refs/control\x1f.txt",
+        "refs/control\x7f.txt",
+        "refs/trailing.txt.",
+        "refs/trailing.txt ",
+        "refs/NUL.txt",
+        "refs/com1.notes.txt",
+        "refs/bad:name.txt",
+        "refs/cafe\u0301.txt",
+        "refs/a/b/c/d.txt",
+    ],
+)
+def test_download_rejects_nonportable_or_noncanonical_paths(path: str):
+    base = [
+        ("SKILL.md", "file", b"# test"),
+        ("skill.manifest.json", "file", b'{"schema_version":1}'),
+    ]
+    with pytest.raises(PackagePolicyError):
+        verify_content_files(base + [(path, "file", b"reference")])
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "refs/run.sh",
+        "assets/template.jinja",
+        "refs/config.toml",
+        "assets/page.html",
+        "assets/logo.svg",
+        "assets/image.png",
+        "refs/archive.tar",
+        "refs/unknown",
+        "refs/SKILL.md",
+        "assets/skill.manifest.json",
+    ],
+)
+def test_download_rejects_every_file_outside_the_text_allowlist(path: str):
+    base = [
+        ("SKILL.md", "file", b"# test"),
+        ("skill.manifest.json", "file", b'{"schema_version":1}'),
+    ]
+    with pytest.raises(PackagePolicyError):
+        verify_content_files(base + [(path, "file", b"apparently harmless")])
+
+
+def test_download_rejects_install_target_collisions():
+    base = [
+        ("SKILL.md", "file", b"# test"),
+        ("skill.manifest.json", "file", b'{"schema_version":1}'),
+    ]
+    with pytest.raises(PackagePolicyError, match="collision"):
+        verify_content_files(
+            base
+            + [
+                ("refs/Notes.txt", "file", b"one"),
+                ("refs/notes.txt", "file", b"two"),
+            ]
+        )
+
+
+def test_download_enforces_file_count_per_file_and_total_caps(monkeypatch):
+    base = [
+        ("SKILL.md", "file", b"# test"),
+        ("skill.manifest.json", "file", b'{"schema_version":1}'),
+    ]
+    too_many = base + [
+        (f"refs/{number}.txt", "file", b"x")
+        for number in range(package_module.MAX_FILES - len(base) + 1)
+    ]
+    with pytest.raises(PackagePolicyError, match="exceeds 32 files"):
+        verify_content_files(too_many)
+
+    with pytest.raises(PackagePolicyError, match="file exceeds"):
+        verify_content_files(
+            base
+            + [
+                (
+                    "refs/large.txt",
+                    "file",
+                    b"x" * (package_module.MAX_FILE_BYTES + 1),
+                )
+            ]
+        )
+
+    monkeypatch.setattr(package_module, "MAX_TREE_BYTES", 32)
+    with pytest.raises(PackagePolicyError, match="total bytes"):
+        verify_content_files(base + [("refs/total.txt", "file", b"x" * 16)])
+
+
+def test_local_preparation_enforces_file_size_cap(tmp_path: Path, monkeypatch):
+    skill = make_skill(tmp_path)
+    monkeypatch.setattr(package_module, "MAX_FILE_BYTES", 64)
+    (skill / "refs" / "large.txt").write_bytes(b"x" * 65)
+    with pytest.raises(PackagePolicyError, match="file exceeds"):
+        prepare_package(
+            skill,
+            overlay_root=tmp_path / "overlays",
+            author_description="A valid description.",
+            owner="owner",
+            installation_id="installation-123456",
+        )
+
+
+def test_local_preparation_rejects_duplicate_manifest_keys(tmp_path: Path):
+    skill = make_skill(tmp_path)
+    manifest = (
+        b'{"schema_version":1,"schema_version":1,"name":"duplicate","requirements":{}}'
+    )
+    (skill / "skill.manifest.json").write_bytes(manifest)
+    with pytest.raises(PackagePolicyError, match="manifest is invalid"):
+        prepare_package(
+            skill,
+            overlay_root=tmp_path / "overlays",
+            author_description="A valid description.",
+            owner="owner",
+            installation_id="installation-123456",
+        )
+
+
+def test_local_preparation_rejects_hard_links(tmp_path: Path):
+    skill = make_skill(tmp_path)
+    os.link(skill / "refs" / "notes.txt", skill / "refs" / "alias.txt")
+    with pytest.raises(PackagePolicyError, match="hard-linked"):
+        prepare_package(
+            skill,
+            overlay_root=tmp_path / "overlays",
+            author_description="A valid description.",
+            owner="owner",
+            installation_id="installation-123456",
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform has no FIFO support")
+def test_local_preparation_rejects_special_files(tmp_path: Path):
+    skill = make_skill(tmp_path)
+    os.mkfifo(skill / "refs" / "special.txt")
+    with pytest.raises(PackagePolicyError, match="special filesystem"):
+        prepare_package(
+            skill,
+            overlay_root=tmp_path / "overlays",
+            author_description="A valid description.",
+            owner="owner",
+            installation_id="installation-123456",
+        )
 
 
 def test_referenced_script_requires_explicit_instruction_only_fork(tmp_path: Path):

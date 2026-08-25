@@ -26,7 +26,7 @@ from tools.skills_sync_client import (
     wire_address,
 )
 
-from .contract import ContentFile, PackageManifest, SystemSpecification
+from .contract import ContentFile, SystemSpecification, parse_manifest_bytes
 from .package import PackagePolicyError, verify_content_files
 
 logger = logging.getLogger(__name__)
@@ -528,8 +528,8 @@ class WisdomClient:
         if manifest_body is None:
             raise WisdomValidationError("version content has no package manifest")
         try:
-            PackageManifest.model_validate_json(manifest_body)
-        except ValidationError as exc:
+            parse_manifest_bytes(manifest_body)
+        except (UnicodeDecodeError, ValueError) as exc:
             raise WisdomValidationError("version package manifest is invalid") from exc
         return response, decoded
 

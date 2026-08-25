@@ -21,7 +21,12 @@ from .client import (
     WisdomValidationError,
 )
 from .compatibility import detect_local_capabilities, evaluate
-from .contract import PackageManifest, SystemSpecification, sha256_address
+from .contract import (
+    PackageManifest,
+    SystemSpecification,
+    parse_manifest_bytes,
+    sha256_address,
+)
 from .package import PackagePolicyError, verify_content_files
 from .qualification import process_due_stability_jobs
 from .store import WisdomStore
@@ -44,9 +49,7 @@ def _tree_hashes(root: Path) -> dict[str, str]:
 
 def _manifest(root: Path) -> PackageManifest:
     try:
-        return PackageManifest.model_validate_json(
-            (root / "skill.manifest.json").read_bytes()
-        )
+        return parse_manifest_bytes((root / "skill.manifest.json").read_bytes())
     except (OSError, ValueError) as exc:
         raise PackagePolicyError(
             "managed package manifest is missing or invalid"
@@ -133,7 +136,7 @@ class WisdomConsumption:
             str(item["skill_id"]): item for item in self.client.installations(identity)
         }
 
-    def check(self, *, apply_automatic: bool = True) -> dict[str, Any]:
+    def check(self, *, apply_automatic: bool = False) -> dict[str, Any]:
         qualification_events = process_due_stability_jobs(store=self.store)
         feed = self.poll_feed()
         decisions = self.poll_owner_decisions()
@@ -148,8 +151,11 @@ class WisdomConsumption:
                 continue
             skill_state = str(authoritative.get("skill_state") or "active")
             if skill_state == "taken_down":
-                self._quarantine_takedown(local)
-                results.append({"skill_id": local["skill_id"], "state": "taken_down"})
+                results.append({
+                    "skill_id": local["skill_id"],
+                    "state": "taken_down",
+                    "local_installation_preserved": True,
+                })
                 continue
             if skill_state == "archived":
                 results.append({"skill_id": local["skill_id"], "state": "archived"})
@@ -797,20 +803,6 @@ class WisdomConsumption:
             finally:
                 self.store.release_operation_lock(entity_id, lock)
         return recovered
-
-    def _quarantine_takedown(self, installation: dict[str, Any]) -> None:
-        target = _safe_target(self.store, installation)
-        quarantine = (
-            self.store.root
-            / "takedown"
-            / str(installation["skill_id"])
-            / uuid.uuid4().hex
-            / str(installation["slug"])
-        )
-        quarantine.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if target.exists() and not quarantine.exists():
-            os.replace(target, quarantine)
-        self.store.deactivate_install(str(installation["skill_id"]))
 
     def poll_feed(self) -> dict[str, Any]:
         cursor = self.store.feed_cursor()

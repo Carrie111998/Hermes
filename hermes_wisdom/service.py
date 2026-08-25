@@ -35,6 +35,7 @@ from .contract import (
     SystemSpecification,
     author_description_hash,
     canonical_json_bytes,
+    parse_manifest_bytes,
     sha256_address,
 )
 from .package import (
@@ -51,6 +52,13 @@ WISDOM_DISCLOSURE = (
     "Candidate signals stay on this profile. Only owner-approved private draft bytes, "
     "author copy, manifest metadata, and managed-install state reach the Gateway."
 )
+
+
+def _parse_package_manifest(raw: bytes) -> PackageManifest:
+    try:
+        return parse_manifest_bytes(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PackagePolicyError("package manifest is invalid") from exc
 
 
 def _config() -> dict[str, Any]:
@@ -519,7 +527,7 @@ class WisdomService:
                 ),
             }
         if description is None:
-            manifest = PackageManifest.model_validate_json(
+            manifest = _parse_package_manifest(
                 (Path(prepared["overlay_path"]) / "skill.manifest.json").read_bytes()
             )
             return {
@@ -535,7 +543,7 @@ class WisdomService:
                 "submission requires explicit owner approval of the System Specification"
             )
         overlay = Path(prepared["overlay_path"])
-        existing_manifest = PackageManifest.model_validate_json(
+        existing_manifest = _parse_package_manifest(
             (overlay / "skill.manifest.json").read_bytes()
         )
         approved_manifest = PackageManifest(
@@ -785,7 +793,7 @@ class WisdomService:
         )
         if manifest_body is None:
             raise WisdomValidationError("version content has no package manifest")
-        manifest = PackageManifest.model_validate_json(manifest_body)
+        manifest = _parse_package_manifest(manifest_body)
         declared_specification = version_detail.version.get("system_spec")
         if (
             not isinstance(declared_specification, dict)
@@ -890,7 +898,7 @@ class WisdomService:
             raise WisdomValidationError(
                 "package manifest changed after install planning"
             )
-        manifest = PackageManifest.model_validate_json(manifest_body)
+        manifest = _parse_package_manifest(manifest_body)
         compatibility = evaluate(
             manifest.requirements,
             detect_local_capabilities(manifest.requirements),
@@ -1044,7 +1052,7 @@ class WisdomService:
             }
         raise PackagePolicyError(f"unsupported install recovery phase: {phase}")
 
-    def check(self, *, apply_automatic: bool = True) -> dict[str, Any]:
+    def check(self, *, apply_automatic: bool = False) -> dict[str, Any]:
         return self.consumption.check(apply_automatic=apply_automatic)
 
     def update_plan(self, skill_id: str) -> dict[str, Any]:

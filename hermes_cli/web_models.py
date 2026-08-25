@@ -331,7 +331,7 @@ class WisdomInstallApplyRequest(BaseModel):
 
 
 class WisdomCheckRequest(BaseModel):
-    apply_automatic: bool = True
+    apply_automatic: bool = False
     profile: Optional[str] = None
 
 

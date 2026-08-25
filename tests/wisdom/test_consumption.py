@@ -408,6 +408,26 @@ def test_uninstall_validates_target_and_preserves_recoverable_trash(
     assert client.deactivated == [(manager.store.installation_identity(), "skill-1")]
 
 
+def test_takedown_check_preserves_existing_local_installation(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(_files(2))
+    client.skill_state = "taken_down"
+    manager, target = _manager(monkeypatch, tmp_path, client=client)
+
+    result = manager.check()
+
+    assert result["installations"] == [
+        {
+            "skill_id": "skill-1",
+            "state": "taken_down",
+            "local_installation_preserved": True,
+        }
+    ]
+    assert target.is_dir()
+    assert manager.store.installation("skill-1")["state"] == "active"
+
+
 def test_feed_cursor_is_durable_deduplicated_and_telegram_uses_home_target(
     monkeypatch, tmp_path: Path
 ):

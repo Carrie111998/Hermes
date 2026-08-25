@@ -389,7 +389,7 @@ async def _wisdom_checker_loop(interval: int = 300) -> None:
             if isinstance(wisdom, dict) and wisdom.get("enabled"):
                 from hermes_wisdom.service import WisdomService
 
-                await asyncio.to_thread(WisdomService().check, apply_automatic=True)
+                await asyncio.to_thread(WisdomService().check, apply_automatic=False)
         except asyncio.CancelledError:
             raise
         except Exception:

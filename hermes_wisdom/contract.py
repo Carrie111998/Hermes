@@ -30,8 +30,8 @@ class ContractPin:
 
 
 CONTRACT_PIN = ContractPin(
-    gateway_commit="f1c1e8418bbd1efdae67d7ac9e0d40f47fe35b42",
-    openapi_sha256="9494bb423f08c5259d91588f589f1d6fcf9d8c02897cb72b1615eea047e58780",
+    gateway_commit="4c14e448187a70e814ed76e2e74396277120d2c8",
+    openapi_sha256="11b5b08a60069a3b79c902e4a9b0d3efad90c5b5628332280ec8890d1500f368",
     manifest_schema_sha256="64d0010eada1d79fa16309e9fd715faf77b6186360ea0b095182b2bdaeec5714",
     canonical_vectors_sha256="e2b28c708f69e99b342de1df48498d96efde68867857391590bc964a609a730b",
     requirements_pr="NousResearch/gateway-gateway#215",
@@ -53,7 +53,9 @@ class HermesRequirement(StrictModel):
 
 class ModelRequirement(StrictModel):
     capabilities: list[str] = Field(default_factory=list, max_length=64)
-    minimum_context_window: int | None = Field(default=None, ge=1)
+    minimum_context_window: int | None = Field(
+        default=None, ge=1, le=9_007_199_254_740_991
+    )
 
 
 class ToolRequirement(StrictModel):
@@ -176,9 +178,32 @@ def author_description_hash(canonical_description: str) -> str:
     return sha256_address(canonical_description.encode("utf-8"))
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_number(value: str) -> None:
+    raise ValueError(f"non-finite JSON number is not permitted: {value}")
+
+
+def parse_manifest_bytes(raw: bytes) -> PackageManifest:
+    """Parse a manifest without JSON last-key-wins or non-finite values."""
+    value = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_nonfinite_number,
+    )
+    return PackageManifest.model_validate(value)
+
+
 def load_manifest(path: Path) -> tuple[PackageManifest, bytes]:
     raw = path.read_bytes()
-    parsed = PackageManifest.model_validate_json(raw)
+    parsed = parse_manifest_bytes(raw)
     # The bytes themselves are consented. We validate but never rewrite them.
     return parsed, raw
 
