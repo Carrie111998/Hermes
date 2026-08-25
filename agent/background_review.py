@@ -1218,21 +1218,6 @@ def _run_review_in_thread(
             # folds the same key into extra_body.reasoning there).
             if not _routed:
                 _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
-            else:
-                _routed_effort = task_cfg.get("reasoning_effort") if task_cfg else None
-                if _routed_effort is not None and _routed_effort != "":
-                    from hermes_constants import parse_reasoning_effort
-
-                    _parsed = parse_reasoning_effort(_routed_effort)
-                    if _parsed is not None:
-                        _fork_kwargs["reasoning_config"] = _parsed
-                    else:
-                        logger.warning(
-                            "auxiliary.background_review.reasoning_effort %r "
-                            "is not a valid level (none, minimal, low, medium, "
-                            "high, xhigh, max, ultra) — ignoring",
-                            _routed_effort,
-                        )
                 # Gateway session context is appended to the parent's cached
                 # system prompt at API-call time through this field.  Preserve
                 # it on same-model forks so the complete effective system
@@ -1270,6 +1255,27 @@ def _run_review_in_thread(
                     _pref_val = getattr(agent, _pref_attr, None)
                     if _pref_val:
                         _fork_kwargs[_pref_attr] = _pref_val
+            else:
+                # The user may still pin the effort FOR THIS TASK on the
+                # routed model: auxiliary.background_review.reasoning_effort
+                # is declared config (#64597) and an explicit value must win
+                # over provider defaults (#94825), same wire contract as
+                # every other auxiliary task (_get_task_extra_body folds the
+                # same key into extra_body.reasoning there).
+                _routed_effort = task_cfg.get("reasoning_effort") if task_cfg else None
+                if _routed_effort is not None and _routed_effort != "":
+                    from hermes_constants import parse_reasoning_effort
+
+                    _parsed = parse_reasoning_effort(_routed_effort)
+                    if _parsed is not None:
+                        _fork_kwargs["reasoning_config"] = _parsed
+                    else:
+                        logger.warning(
+                            "auxiliary.background_review.reasoning_effort %r "
+                            "is not a valid level (none, minimal, low, medium, "
+                            "high, xhigh, max, ultra) — ignoring",
+                            _routed_effort,
+                        )
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
                 max_iterations=_REVIEW_MAX_ITERATIONS,
