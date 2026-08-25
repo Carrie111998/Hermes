@@ -309,7 +309,6 @@ def test_blocked_context_file_surfaces_status_notice(monkeypatch, tmp_path):
             "run_agent._context_file_scanning_policy", return_value="enforce"
         ) as resolve_policy,
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
     ):
         prompt = build_system_prompt(agent)
@@ -355,10 +354,7 @@ def test_bare_thread_uses_agent_profile_scan_policy(monkeypatch, tmp_path):
         def build_on_bare_thread():
             result["prompt"] = build_system_prompt(agent)
 
-        with (
-            patch("run_agent.build_nous_subscription_prompt", return_value=""),
-            patch("run_agent.build_environment_hints", return_value=""),
-        ):
+        with patch("run_agent.build_environment_hints", return_value=""):
             thread = threading.Thread(target=build_on_bare_thread)
             thread.start()
             thread.join()
@@ -395,10 +391,7 @@ def test_lazy_context_uses_frozen_agent_profile_scan_policy(monkeypatch, tmp_pat
         _session_db=SimpleNamespace(db_path=agent_home / "state.db"),
         _subdirectory_hints=tracker,
     )
-    with (
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
-        patch("run_agent.build_environment_hints", return_value=""),
-    ):
+    with patch("run_agent.build_environment_hints", return_value=""):
         build_system_prompt(agent)
 
     # Later config edits and read-only prompt projections must not change the
@@ -436,7 +429,6 @@ def test_persisted_prompt_restores_frozen_lazy_scan_policy(monkeypatch, tmp_path
         )
         with (
             patch("run_agent._context_file_scanning_policy", return_value=policy),
-            patch("run_agent.build_nous_subscription_prompt", return_value=""),
             patch("run_agent.build_environment_hints", return_value=""),
         ):
             stored_prompt = build_system_prompt(original)
@@ -502,9 +494,10 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
+    expected_home = str(Path("/hermes"))
     expected_profile = (
         "Active Hermes profile: default. Other profiles (if any) live "
-        "under /hermes/profiles/<name>/. Each profile has its own skills/, "
+        f"under {expected_home}/profiles/<name>/. Each profile has its own skills/, "
         "plugins/, cron/, and memories/ that affect a different session than "
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
