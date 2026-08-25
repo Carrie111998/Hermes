@@ -4216,3 +4216,82 @@ def test_factory_strips_inherited_claude_code_environment(
     assert env["PATH_SENTINEL_FOR_TEST"] == "must-survive"
     # The host's own environment must not be mutated on the way past.
     assert os.environ["CLAUDE_CODE_SESSION_ID"] == "host-session-id"
+
+
+# --- terminate() must not report failure for a process that did exit --------
+#
+# Measured against a real ConPTY on 2026-08-25, reproducing at 8 of 12 runs.
+# _process.terminate(force=True) raises PermissionError [WinError 5] when the
+# kill races the child's own exit; the except handler recorded terminated=False
+# and the loop then returned `terminated is not False` -- False -- even though
+# the very next isalive() said the process was gone and exitstatus was 2.
+#
+# A spurious False is not cosmetic: _launch sets lifecycle_verified from it, and
+# a false lifecycle_verified skips the transcript-recovery poll, converting an
+# attempt that would have committed into a wasted paid attempt.
+
+
+class _RacedKillProcess:
+    """terminate() raises Access Denied, then the child exits on its own."""
+
+    def __init__(self, alive_polls: int = 2):
+        self._alive_polls = alive_polls
+        self.exitstatus = 2
+        self.pid = None
+        self.terminate_calls = 0
+
+    def terminate(self, force: bool = False) -> bool:
+        self.terminate_calls += 1
+        raise PermissionError(5, "Access is denied")
+
+    def isalive(self) -> bool:
+        if self._alive_polls > 0:
+            self._alive_polls -= 1
+            return True
+        return False
+
+
+def test_terminate_confirms_death_when_the_kill_raced_the_exit() -> None:
+    process = _WinPtyProcess(_RacedKillProcess())
+
+    assert process.terminate(2.0) is True
+
+
+def test_terminate_still_reports_failure_for_a_process_that_stays_alive() -> None:
+    """Control: confirmed-alive with no pid to taskkill must still be False."""
+
+    class Immortal:
+        pid = None
+        exitstatus = None
+
+        def terminate(self, force: bool = False) -> bool:
+            return False
+
+        def isalive(self) -> bool:
+            return True
+
+    assert _WinPtyProcess(Immortal()).terminate(0.05) is False
+
+
+def test_is_dead_trusts_the_exit_status_when_the_liveness_probe_raises() -> None:
+    """A liveness probe that RAISES is weak evidence of death, never of life."""
+
+    class ReapedHandle:
+        exitstatus = 0
+
+        def isalive(self) -> bool:
+            raise OSError("handle is invalid")
+
+    assert _WinPtyProcess(ReapedHandle())._is_dead() is True
+
+
+def test_is_dead_stays_false_when_liveness_is_genuinely_unknown() -> None:
+    """No exit status and no usable probe means unknown, which is not dead."""
+
+    class Opaque:
+        exitstatus = None
+
+        def isalive(self) -> bool:
+            raise OSError("handle is invalid")
+
+    assert _WinPtyProcess(Opaque())._is_dead() is False
