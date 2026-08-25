@@ -19,10 +19,11 @@ def clone_honcho_for_profile(
     profile_name: str,
     *,
     config_path: Path | None = None,
+    source_host: str = HOST,
 ) -> bool:
-    """Auto-clone Honcho config for a new profile from the default host block.
+    """Clone Honcho config for a new profile from the selected source host.
 
-    Called during profile creation. If Honcho is configured on the default
+    Called during profile creation. If Honcho is configured for the source
     host, creates a new host block for the profile with inherited settings
     and auto-derived workspace/aiPeer.
 
@@ -33,9 +34,9 @@ def clone_honcho_for_profile(
         return False
 
     hosts = cfg.get("hosts", {})
-    default_block = hosts.get(HOST, {})
+    default_block = hosts.get(source_host, {})
 
-    # No default host block and no root-level API key = Honcho not configured
+    # No source host block and no root-level API key = Honcho not configured
     has_key = bool(cfg.get("apiKey") or os.environ.get("HONCHO_API_KEY"))
     if not default_block and not has_key:
         return False
@@ -68,12 +69,16 @@ def clone_honcho_for_profile(
     # AI peers stay profile-specific unless the operator explicitly opted
     # into one shared AI identity for cloned single-operator profiles.
     if cfg.get("shareAiPeerAcrossProfiles") is True:
-        new_block["aiPeer"] = default_block.get("aiPeer") or cfg.get("aiPeer") or HOST
+        new_block["aiPeer"] = (
+            default_block.get("aiPeer") or cfg.get("aiPeer") or source_host
+        )
     else:
         # Use the bare profile name as the peer identity (not the host key)
         # because Honcho's peer ID pattern is ^[a-zA-Z0-9_-]+$ (no dots).
         new_block["aiPeer"] = profile_name
-    new_block["workspace"] = default_block.get("workspace") or cfg.get("workspace") or HOST
+    new_block["workspace"] = (
+        default_block.get("workspace") or cfg.get("workspace") or source_host
+    )
     new_block["enabled"] = default_block.get("enabled", True)
 
     cfg.setdefault("hosts", {})[new_host] = new_block

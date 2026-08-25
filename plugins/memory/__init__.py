@@ -381,49 +381,70 @@ def clone_memory_provider_profile(
     plugin.yaml so their hook can probe that state without coupling profile
     creation to a provider-specific filename or resolver.
     """
-    provider_names: list[str] = []
-    config_path = source_dir / "config.yaml"
-    if config_path.exists():
-        token = set_hermes_home_override(source_dir)
-        try:
-            config = load_config_readonly()
-            configured = cfg_get(config, "memory", "provider") or None
-            if configured:
-                provider_names.append(configured)
-        except Exception:
-            pass
-        finally:
-            reset_hermes_home_override(token)
+    token = set_hermes_home_override(source_dir)
+    try:
+        provider_names: list[str] = []
+        config_path = source_dir / "config.yaml"
+        if config_path.exists():
+            try:
+                config = load_config_readonly()
+                configured = cfg_get(config, "memory", "provider") or None
+                if configured:
+                    provider_names.append(configured)
+            except Exception:
+                logger.debug(
+                    "Failed to read memory provider from clone source %s",
+                    source_dir,
+                    exc_info=True,
+                )
 
-    for candidate, provider_dir in _iter_provider_dirs():
-        manifest_path = provider_dir / "plugin.yaml"
-        if not manifest_path.exists():
-            continue
-        try:
-            import yaml
+        for candidate, provider_dir in _iter_provider_dirs():
+            manifest_path = provider_dir / "plugin.yaml"
+            if not manifest_path.exists():
+                continue
+            try:
+                import yaml
 
-            manifest = yaml.safe_load(
-                manifest_path.read_text(encoding="utf-8-sig")
-            ) or {}
-        except Exception:
-            continue
-        if manifest.get("profile_clone") is True and candidate not in provider_names:
-            provider_names.append(candidate)
+                manifest = yaml.safe_load(
+                    manifest_path.read_text(encoding="utf-8-sig")
+                ) or {}
+                if not isinstance(manifest, dict):
+                    raise TypeError("plugin manifest must be a mapping")
+            except Exception:
+                logger.debug(
+                    "Failed to inspect profile-clone manifest for memory provider '%s'",
+                    candidate,
+                    exc_info=True,
+                )
+                continue
+            if manifest.get("profile_clone") is True and candidate not in provider_names:
+                provider_names.append(candidate)
 
-    results = []
-    for provider_name in provider_names:
-        provider = load_memory_provider(provider_name, register_skills=False)
-        if provider is None:
-            continue
-        result = provider.clone_profile(
-            profile_name,
-            source_dir=source_dir,
-            profile_dir=profile_dir,
-            clone_all=clone_all,
-        )
-        if result is not None:
-            results.append(result)
-    return results or None
+        results = []
+        for provider_name in provider_names:
+            provider = load_memory_provider(provider_name, register_skills=False)
+            if provider is None:
+                continue
+            try:
+                result = provider.clone_profile(
+                    profile_name,
+                    source_dir=source_dir,
+                    profile_dir=profile_dir,
+                    clone_all=clone_all,
+                )
+            except Exception:
+                logger.debug(
+                    "Memory provider '%s' failed to clone profile '%s'",
+                    provider_name,
+                    profile_name,
+                    exc_info=True,
+                )
+                continue
+            if result is not None:
+                results.append(result)
+        return results or None
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _load_provider_from_entry_point(

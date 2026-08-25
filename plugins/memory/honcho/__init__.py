@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -288,11 +289,37 @@ class HonchoMemoryProvider(MemoryProvider):
             clone_honcho_for_profile,
             cloned_profile_ai_peer,
         )
+        from plugins.memory.honcho.client import (
+            resolve_active_host,
+            resolve_config_path,
+        )
+        from hermes_cli.profiles import get_active_profile_name
 
-        config_path = profile_dir / "honcho.json" if clone_all else None
-        if config_path is not None and not config_path.exists():
-            config_path = None
-        if not clone_honcho_for_profile(profile_name, config_path=config_path):
+        source_config_path = resolve_config_path()
+        source_host = resolve_active_host()
+        source_is_named = get_active_profile_name() != "default"
+        target_config_path = profile_dir / "honcho.json"
+
+        if clone_all and target_config_path.exists():
+            config_path = target_config_path
+        elif source_is_named and source_config_path == source_dir / "honcho.json":
+            # A named profile's local Honcho config is invisible to its clone.
+            # Copy it before adding the target host so provider-owned identity
+            # state follows config-only clones without mutating the source.
+            shutil.copy2(source_config_path, target_config_path)
+            config_path = target_config_path
+        else:
+            # Named profiles may resolve a shared default/global store; update
+            # that exact fallback so the target can see its new host block.
+            # The default profile keeps the legacy no-path flow, which reads a
+            # global config but migrates writes into ~/.hermes/honcho.json.
+            config_path = source_config_path if source_is_named else None
+
+        if not clone_honcho_for_profile(
+            profile_name,
+            config_path=config_path,
+            source_host=source_host,
+        ):
             return None
         return {
             "ai_peer": cloned_profile_ai_peer(

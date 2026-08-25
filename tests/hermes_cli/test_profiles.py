@@ -248,6 +248,46 @@ class TestCreateProfile:
         assert "Memory provider profile-clone integration failed for 'coder'" in caplog.text
         assert "RuntimeError: provider clone failed" in caplog.text
 
+    def test_clone_from_named_profile_copies_local_honcho_identity(
+        self, profile_env, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_HONCHO_HOST", raising=False)
+        source_dir = create_profile("source", no_alias=True)
+        (source_dir / "config.yaml").write_text(
+            "memory:\n  provider: honcho\n",
+            encoding="utf-8",
+        )
+        source_honcho = {
+            "apiKey": "***",
+            "shareAiPeerAcrossProfiles": True,
+            "hosts": {
+                "hermes_source": {
+                    "aiPeer": "source-assistant",
+                    "workspace": "source-workspace",
+                },
+            },
+        }
+        source_honcho_path = source_dir / "honcho.json"
+        source_honcho_path.write_text(json.dumps(source_honcho), encoding="utf-8")
+        monkeypatch.setattr(
+            honcho_cli,
+            "_ensure_peer_exists",
+            lambda host_key=None, **kwargs: True,
+        )
+
+        target_dir = create_profile(
+            "target",
+            clone_from="source",
+            clone_config=True,
+            no_alias=True,
+        )
+
+        target_honcho = json.loads((target_dir / "honcho.json").read_text())
+        target_block = target_honcho["hosts"]["hermes_target"]
+        assert target_block["aiPeer"] == "source-assistant"
+        assert target_block["workspace"] == "source-workspace"
+        assert json.loads(source_honcho_path.read_text()) == source_honcho
+
 
 # ===================================================================
 # TestNoSkillsOptOut

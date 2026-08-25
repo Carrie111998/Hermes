@@ -315,3 +315,92 @@ def test_profile_clone_runs_provider_declared_by_manifest(tmp_path, monkeypatch)
             "clone_all": True,
         },
     )]
+
+
+def test_profile_clone_loads_provider_from_explicit_source_profile(
+    tmp_path, monkeypatch
+):
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    source_dir.mkdir()
+    profile_dir.mkdir()
+    (source_dir / "config.yaml").write_text(
+        "memory:\n  provider: sourceclone\n",
+        encoding="utf-8",
+    )
+    provider_dir = source_dir / "plugins" / "sourceclone"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(
+        PROVIDER_SOURCE.format(name="sourceclone").replace(
+            "    def get_tool_schemas(self):\n        return []\n",
+            "    def get_tool_schemas(self):\n"
+            "        return []\n\n"
+            "    def clone_profile(self, profile_name, **kwargs):\n"
+            "        (kwargs['profile_dir'] / 'sourceclone.txt').write_text(profile_name)\n"
+            "        return 'source-cloned'\n",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", tmp_path / "bundled")
+
+    from hermes_constants import get_hermes_home
+
+    ambient_home = get_hermes_home()
+    result = memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+    )
+
+    assert result == ["source-cloned"]
+    assert (profile_dir / "sourceclone.txt").read_text() == "coder"
+    assert get_hermes_home() == ambient_home
+
+
+def test_profile_clone_isolates_bad_manifests_and_failing_hooks(
+    tmp_path, monkeypatch, caplog
+):
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    source_dir.mkdir()
+    profile_dir.mkdir()
+
+    provider_dirs = []
+    for name, manifest in (
+        ("malformed", "- not-a-mapping\n"),
+        ("failing", "profile_clone: true\n"),
+        ("working", "profile_clone: true\n"),
+    ):
+        provider_dir = tmp_path / name
+        provider_dir.mkdir()
+        (provider_dir / "plugin.yaml").write_text(manifest, encoding="utf-8")
+        provider_dirs.append((name, provider_dir))
+    monkeypatch.setattr(memory_plugins, "_iter_provider_dirs", lambda: provider_dirs)
+
+    class FailingProvider:
+        def clone_profile(self, profile_name, **kwargs):
+            raise RuntimeError("broken clone hook")
+
+    class WorkingProvider:
+        def clone_profile(self, profile_name, **kwargs):
+            return "working-cloned"
+
+    def load_provider(name, **kwargs):
+        if name == "failing":
+            return FailingProvider()
+        if name == "working":
+            return WorkingProvider()
+        return None
+
+    monkeypatch.setattr(memory_plugins, "load_memory_provider", load_provider)
+
+    with caplog.at_level("DEBUG", logger="plugins.memory"):
+        result = memory_plugins.clone_memory_provider_profile(
+            "coder",
+            source_dir=source_dir,
+            profile_dir=profile_dir,
+        )
+
+    assert result == ["working-cloned"]
+    assert "profile-clone manifest for memory provider 'malformed'" in caplog.text
+    assert "Memory provider 'failing' failed to clone profile 'coder'" in caplog.text
