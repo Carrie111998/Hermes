@@ -225,6 +225,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._finished_streams: Dict[str, Dict[str, Any]] = {}
         self.THINKING_KEEPALIVE_S = 2.5
         self.MAX_THINKING_STREAMS = 64
+        # WeCom stream lifetime: server rejects updates after ~6 minutes
+        # (errcode 846608). Keepalives do NOT extend it. Use 330s for margin.
+        self.THINKING_STREAM_MAX_S = 330.0
         # Opt-out switch: platforms.wecom.extra.thinking_bubble (default on).
         self._thinking_bubble_enabled = bool(extra.get("thinking_bubble", True))
 
@@ -1613,12 +1616,19 @@ class WeComAdapter(BasePlatformAdapter):
         stream_id = f"stream_{uuid.uuid4().hex[:16]}"
 
         async def _keepalive() -> None:
-            """Independent heartbeat — same role as bridge's setInterval."""
+            """Independent heartbeat — same role as bridge's setInterval.
+
+            Self-terminates when the stream exceeds its ~6min server lifetime
+            (further frames would be rejected anyway) or when finished.
+            """
+            deadline = time.monotonic() + self.THINKING_STREAM_MAX_S
             while True:
                 await asyncio.sleep(self.THINKING_KEEPALIVE_S)
                 cur = self._thinking_streams.get(chat_id)
                 if cur is None or cur["id"] != stream_id:
                     return  # finished or replaced
+                if time.monotonic() > deadline:
+                    return  # stream expired server-side; stop feeding frames
                 try:
                     if self._ws and not self._ws.closed:
                         await self._ws.send_json({
@@ -1638,7 +1648,8 @@ class WeComAdapter(BasePlatformAdapter):
                                                  "content": "<think></think>"}},
             )
             self._thinking_streams[chat_id] = {"id": stream_id, "req": reply_req_id,
-                                               "ts": time.monotonic()}
+                                               "ts": time.monotonic(),
+                                               "opened_at": time.monotonic()}
             self._thinking_keepalives[chat_id] = asyncio.create_task(_keepalive())
             while len(self._thinking_streams) > self.MAX_THINKING_STREAMS:
                 # Evict the STALEST chat by ts, stop its heartbeat and
@@ -1698,7 +1709,16 @@ class WeComAdapter(BasePlatformAdapter):
         and awaiting one times out after the frame was already delivered,
         which used to double-render: stream content + follow-up markdown).
 
-        Returns True when a bubble existed and the finish frame was sent
+        Stream lifetime guard: a WeCom stream can only be updated for ~6
+        minutes after it opens (server-side; keepalives do NOT extend it —
+        errcode 846608). For turns longer than that the finish frame would be
+        silently dropped by the server, so we DON'T take the stream path at
+        all: return False and let send() deliver via normal markdown /
+        proactive send. The stale bubble is cancelled client-side (it will
+        show the native timeout state, same as official openclaw's expired-
+        stream fallback).
+
+        Returns True when a LIVE bubble existed and the finish frame was sent
         (caller should then SKIP the normal markdown reply).
         """
         st = self._thinking_streams.pop(chat_id, None)
@@ -1706,6 +1726,13 @@ class WeComAdapter(BasePlatformAdapter):
         if ka:
             ka.cancel()
         if st is None:
+            return False
+        # 6-minute stream lifetime guard (WeCom server-side limit).
+        if time.monotonic() - st["opened_at"] > self.THINKING_STREAM_MAX_S:
+            logger.warning(
+                "[%s] thinking stream %s exceeded %.0fs lifetime — skipping "
+                "finish frame (would be dropped); falling back to markdown",
+                self.name, st["id"], time.monotonic() - st["opened_at"])
             return False
         self._finished_streams[chat_id] = {"id": st["id"], "req": st["req"]}
         body = {"msgtype": "stream", "stream": {"id": st["id"], "finish": True,
