@@ -112,7 +112,7 @@ class TestCamofoxNavigate:
         from requests import ConnectionError as RequestsConnectionError
 
         mock_post.side_effect = RequestsConnectionError("camofox unavailable")
-        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:19999")
+        monkeypatch.setenv("CAMOFOX_URL", "http://camofox.test")
         result = json.loads(camofox_navigate("https://example.com", task_id="t_err"))
         assert result["success"] is False
         assert "Cannot connect" in result["error"]
