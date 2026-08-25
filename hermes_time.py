@@ -27,11 +27,19 @@ except ImportError:
     # Python 3.8 fallback (shouldn't be needed — Hermes requires 3.9+)
     from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
 
-# Cached state — resolved once, reused on every call.
-# Call reset_cache() to force re-resolution (e.g. after config changes).
-_cached_tz: Optional[ZoneInfo] = None
-_cached_tz_name: Optional[str] = None
-_cache_resolved: bool = False
+# Cached ZoneInfo (or None for server-local), keyed by the resolution context.
+#
+# The timezone is resolved from two profile-sensitive inputs: the
+# ``HERMES_TIMEZONE`` env var and ``config.yaml`` at ``get_config_path()`` —
+# and the latter is ``get_hermes_home() / "config.yaml"``, which the
+# multiplexed gateway scopes per profile via ``set_hermes_home_override()``
+# (a ContextVar). A single process-global cache resolved once at first use
+# would freeze whichever zone the *first* ``now()`` saw — typically the root
+# home at unscoped startup — and hand it to every profile forever, ignoring
+# each profile's own ``timezone:`` key. Keying by (env, resolved config path)
+# lets each profile resolve and cache its own zone independently.
+# Call reset_cache() to force re-resolution (e.g. after a config edit).
+_tz_cache: dict = {}
 
 
 def _resolve_timezone_name() -> str:
@@ -93,17 +101,31 @@ def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
         return None
 
 
+def _tz_cache_key() -> str:
+    """Identity of the current timezone-resolution context.
+
+    Both inputs to :func:`_resolve_timezone_name` are folded in: the
+    ``HERMES_TIMEZONE`` env var and the resolved ``config.yaml`` path (which is
+    profile-scoped via ``get_hermes_home()``). Two profiles with distinct homes
+    get distinct keys, so one profile's zone can never be served to another.
+    """
+    try:
+        config_path = str(get_config_path())
+    except Exception:
+        config_path = ""
+    return f"{os.getenv('HERMES_TIMEZONE', '').strip()}\x00{config_path}"
+
+
 def get_timezone() -> Optional[ZoneInfo]:
     """Return the user's configured ZoneInfo, or None (meaning server-local).
 
-    Resolved once and cached. Call ``reset_cache()`` after config changes.
+    Cached per resolution context (env + profile-scoped config path). Call
+    ``reset_cache()`` after config changes.
     """
-    global _cached_tz, _cached_tz_name, _cache_resolved
-    if not _cache_resolved:
-        _cached_tz_name = _resolve_timezone_name()
-        _cached_tz = _get_zoneinfo(_cached_tz_name)
-        _cache_resolved = True
-    return _cached_tz
+    key = _tz_cache_key()
+    if key not in _tz_cache:
+        _tz_cache[key] = _get_zoneinfo(_resolve_timezone_name())
+    return _tz_cache[key]
 
 
 def reset_cache() -> None:
@@ -113,10 +135,7 @@ def reset_cache() -> None:
     config edit or ``HERMES_TIMEZONE`` update) to force ``get_timezone()`` /
     ``now()`` to read the new value instead of the value cached at first use.
     """
-    global _cached_tz, _cached_tz_name, _cache_resolved
-    _cached_tz = None
-    _cached_tz_name = None
-    _cache_resolved = False
+    _tz_cache.clear()
 
 
 def now() -> datetime:

@@ -21,10 +21,8 @@ import hermes_time
 
 
 def _reset_hermes_time_cache():
-    """Reset the hermes_time module cache (replacement for removed reset_cache)."""
-    hermes_time._cached_tz = None
-    hermes_time._cached_tz_name = None
-    hermes_time._cache_resolved = False
+    """Reset the hermes_time module cache between tests."""
+    hermes_time.reset_cache()
 
 
 # =========================================================================
@@ -272,3 +270,61 @@ class TestCronTimezone:
 
         next_run = datetime.fromisoformat(job["next_run_at"])
         assert next_run.tzinfo is not None
+
+
+class TestPerProfileTimezoneCache:
+    """The timezone cache must be keyed by resolution context, not frozen once
+    per process. The multiplexed gateway scopes each profile tick with
+    ``set_hermes_home_override()``; a process-global cache would freeze the
+    zone the first ``now()`` saw (typically the root home at unscoped startup)
+    and serve it to every profile forever (#94945)."""
+
+    def setup_method(self):
+        _reset_hermes_time_cache()
+
+    def teardown_method(self):
+        _reset_hermes_time_cache()
+        os.environ.pop("HERMES_TIMEZONE", None)
+
+    def _home(self, tmp_path, name, tz):
+        home = tmp_path / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(f"timezone: {tz}\n", encoding="utf-8")
+        return home
+
+    def test_profile_zone_not_frozen_by_unscoped_startup(self, tmp_path, monkeypatch):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
+        root = self._home(tmp_path, "root", "UTC")
+        alpha = self._home(tmp_path / "root" / "profiles", "alpha", "Europe/Paris")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+
+        # First now()/get_timezone() happens unscoped, at the root home.
+        assert hermes_time.get_timezone() == ZoneInfo("UTC")
+
+        # A profile tick scopes to the profile home — it must see its OWN zone,
+        # not the root zone frozen by the unscoped startup call.
+        tok = set_hermes_home_override(str(alpha))
+        try:
+            assert hermes_time.get_timezone() == ZoneInfo("Europe/Paris")
+        finally:
+            reset_hermes_home_override(tok)
+
+        # Back outside the scope, the root zone is still correct (and cached).
+        assert hermes_time.get_timezone() == ZoneInfo("UTC")
+
+    def test_reset_cache_reresolves_after_config_edit(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
+        home = self._home(tmp_path, "h", "UTC")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        assert hermes_time.get_timezone() == ZoneInfo("UTC")
+
+        # Same path, edited content — the per-key cache holds until reset.
+        (home / "config.yaml").write_text("timezone: Asia/Tokyo\n", encoding="utf-8")
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone() == ZoneInfo("Asia/Tokyo")
