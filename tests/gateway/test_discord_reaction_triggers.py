@@ -237,6 +237,58 @@ def test_shadow_warning_fires_once_per_disagreement_pair(monkeypatch, caplog):
     assert len(warnings) == 1
 
 
+def test_shadow_rewarns_after_agreement_then_same_disagreement_returns(monkeypatch, caplog):
+    # Cycle: warn -> user fixes YAML so sources parse-agree -> user reverts
+    # YAML to the original value. The guard key must CLEAR on parsed
+    # agreement so the same previously-warned disagreement re-warns instead
+    # of staying silently suppressed forever.
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍")
+    _set_rt_extra(adapter, "✅")
+    with caplog.at_level(logging.WARNING):
+        adapter._reaction_trigger_config()
+        assert len([r for r in caplog.records if "overrides config.yaml" in r.message]) == 1
+        # User edits config.yaml: allowlist now agrees with env mod spacing.
+        _set_rt_extra(adapter, " 👍 ")
+        adapter._reaction_trigger_config()  # parsed agreement — silent, clears guard
+        assert len([r for r in caplog.records if "overrides config.yaml" in r.message]) == 1
+        # User reverts config.yaml to the ORIGINAL disagreeing value.
+        _set_rt_extra(adapter, "✅")
+        adapter._reaction_trigger_config()
+    warnings = [r for r in caplog.records if "overrides config.yaml" in r.message]
+    assert len(warnings) == 2  # re-warned despite identical (env, extra) pair
+
+
+def test_shadow_bool_scalar_yaml_value_sane(monkeypatch, caplog):
+    # YAML `reaction_triggers: true` surfaces as a bool scalar in extra. The
+    # isinstance(extra, dict)/str() guards keep this sane: no crash, scalar
+    # parses to (True, None) i.e. all-emoji, and when env disagrees with the
+    # scalar's parsed form the warning still fires (once).
+    adapter = _make_adapter()
+    monkeypatch.delenv("DISCORD_REACTION_TRIGGERS", raising=False)
+    adapter.config.extra["reaction_triggers"] = True
+    assert adapter._reaction_trigger_config() == (True, None)
+
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍")
+    with caplog.at_level(logging.WARNING):
+        # env still wins (legacy precedence); YAML scalar parses differently
+        assert adapter._reaction_trigger_config() == (True, {"👍"})
+        adapter._reaction_trigger_config()  # Gate 4 repeat — no spam
+    warnings = [r for r in caplog.records if "overrides config.yaml" in r.message]
+    assert len(warnings) == 1
+
+
+def test_shadow_non_dict_extra_treated_as_absent(monkeypatch, caplog):
+    # config.extra itself not a dict (e.g. None): the guard treats YAML as
+    # absent — env-only resolution proceeds, no crash, zero warning noise.
+    adapter = _make_adapter()
+    adapter.config.extra = None
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍")
+    with caplog.at_level(logging.WARNING):
+        assert adapter._reaction_trigger_config() == (True, {"👍"})
+    assert not [r for r in caplog.records if "overrides config.yaml" in r.message]
+
+
 def test_hydration_remember_and_lookup():
     adapter = _make_adapter()
     adapter._remember_outbound_snippet("111", "hello world")

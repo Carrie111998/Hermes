@@ -1130,6 +1130,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # the owning profile's runtime scope during connect(). None until then;
         # accessors fall back to live scope-aware reads (issue #72348).
         self._gate_env_snapshot: Optional[Dict[str, str]] = None
+        # Spam-guard key for the reaction-trigger env/YAML shadow warning:
+        # None until a disagreement warns; cleared again on parsed agreement.
+        self._rt_shadow_warned_key: Optional[tuple] = None
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -3437,9 +3440,10 @@ class DiscordAdapter(BasePlatformAdapter):
         stale .env/shell value makes edits to discord.reaction_triggers in
         config.yaml appear dead with zero feedback. Fires only when BOTH
         sources exist AND they PARSE differently ('true' vs 'TRUE' or equal
-        allowlists are agreement, not shadowing). Once per (env, extra) pair —
-        re-warns only if either value changes, so per-reaction Gate 4
-        resolution cannot spam the log.
+        allowlists are agreement, not shadowing). Warns once per disagreement
+        state: the remembered key clears when the sources parse-agree, so a
+        return to a previously warned disagreement re-warns exactly once,
+        while per-reaction Gate 4 resolution cannot spam the log.
         """
         env_raw = self._gate_env("DISCORD_REACTION_TRIGGERS")
         extra = getattr(getattr(self, "config", None), "extra", None)
@@ -3451,7 +3455,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if warned_key == pair_key:
             return  # already warned for this exact disagreement state
         if self._reaction_triggers_parsed(env_raw) == self._reaction_triggers_parsed(extra_raw):
-            return  # parsed agreement — silent
+            # Parsed agreement is not shadowing — clear any stale guard key so
+            # a later return to a previously warned disagreement re-warns
+            # instead of being silently suppressed.
+            self._rt_shadow_warned_key = None
+            return
         self._rt_shadow_warned_key = pair_key
         logger.warning(
             "[%s] DISCORD_REACTION_TRIGGERS env (%r) overrides config.yaml "
