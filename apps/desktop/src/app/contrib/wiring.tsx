@@ -360,6 +360,26 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
         knownSessionProfile($sessions.get(), routingSessionId)
 
+      // knownSessionProfile only ever returns the bare profile NAME off the
+      // session row (session.ts:128) — it predates multi-connection routing
+      // and never looks at row.connection_id. A bare profile name is ambiguous
+      // the instant two connections expose the same profile (local + SSH both
+      // have "default"): requestForSessionProfile falls through to
+      // requestGatewayForProfile(name), which resolves whichever backend is
+      // ACTIVE for that name rather than the one that actually owns this
+      // session — a false "session not found" the moment the active gateway
+      // isn't the session's real owner. The row already carries the true
+      // owner (stampConnectionOwner stamps it on every refresh); promote the
+      // bare string into an explicit route so routing pins to that connection
+      // instead of guessing.
+      if (typeof owner === 'string' && routingSessionId) {
+        const ownerRow = $sessions.get().find(s => s.id === routingSessionId)
+
+        if (ownerRow?.connection_id) {
+          owner = { connectionId: ownerRow.connection_id, profile: owner }
+        }
+      }
+
       if (!owner && routingSessionId) {
         // Unknown owner for a REAL session: probe across profiles (REST, not the
         // gateway socket, so no recursion) rather than defaulting to active. A
