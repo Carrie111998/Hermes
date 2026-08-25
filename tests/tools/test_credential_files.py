@@ -21,13 +21,14 @@ from tools.credential_files import (
 
 @pytest.fixture(autouse=True)
 def _clean_state():
-    """Reset module state between tests."""
-    import tools.credential_files as _cred_mod
+    """Reset module state between tests.
+
+    ``clear_credential_files`` now also drops the per-home config cache, so it
+    is the single reset both surfaces need.
+    """
     clear_credential_files()
-    _cred_mod._config_files = None
     yield
     clear_credential_files()
-    _cred_mod._config_files = None
 
 
 class TestRegisterCredentialFiles:
@@ -359,6 +360,58 @@ class TestConfigMasterStoreDenylist:
 
         # Config path must refuse it too.
         self._write_config(hermes_home, ["auth.json"])
+        assert get_credential_file_mounts() == []
+
+
+class TestConfigCacheProfileBoundary:
+    """The config-file cache must not transplant one profile's approved
+    credential path into another profile's sandbox. In a multiplexed gateway
+    the active HERMES_HOME is profile-scoped while the module-global cache
+    outlives any single scope, so the cache is keyed by resolved home."""
+
+    def _write_config(self, hermes_home: Path, cred_files: list):
+        import yaml
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(yaml.dump({"terminal": {"credential_files": cred_files}}), encoding="utf-8")
+
+    def _profile(self, tmp_path: Path, name: str, token: str) -> Path:
+        home = tmp_path / name / ".hermes"
+        home.mkdir(parents=True)
+        (home / token).write_text("{}", encoding="utf-8")
+        self._write_config(home, [token])
+        return home
+
+    def test_second_profile_never_receives_first_profiles_token(self, tmp_path, monkeypatch):
+        """Profile A then profile B in the same process, no manual cache clear:
+        B must see only B's token and never A's host path."""
+        home_a = self._profile(tmp_path, "a", "a_token.json")
+        home_b = self._profile(tmp_path, "b", "b_token.json")
+
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        mounts_a = get_credential_file_mounts()
+        assert [m["host_path"] for m in mounts_a] == [str((home_a / "a_token.json").resolve())]
+
+        # Switch to profile B WITHOUT clearing the cache.
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        mounts_b = get_credential_file_mounts()
+        host_paths_b = [m["host_path"] for m in mounts_b]
+        assert host_paths_b == [str((home_b / "b_token.json").resolve())]
+        assert str((home_a / "a_token.json").resolve()) not in host_paths_b
+
+    def test_refresh_boundary_observes_config_change(self, tmp_path, monkeypatch):
+        """clear_credential_files() is the declared refresh boundary: after a
+        config entry is removed, the next load past the boundary drops it."""
+        home = self._profile(tmp_path, "p", "svc.json")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        assert len(get_credential_file_mounts()) == 1
+
+        # Remove the entry from config; the cached snapshot is still stale...
+        self._write_config(home, [])
+        assert len(get_credential_file_mounts()) == 1
+
+        # ...until the declared refresh boundary re-reads config.
+        clear_credential_files()
         assert get_credential_file_mounts() == []
 
 

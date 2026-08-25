@@ -50,8 +50,16 @@ def _get_registered() -> Dict[str, str]:
         return val
 
 
-# Cache for config-based file list (loaded once per process).
-_config_files: List[Dict[str, str]] | None = None
+# Cache for the config-based file list, keyed by the resolved HERMES_HOME the
+# entries were loaded for. In a multiplexed gateway the active home is
+# profile-scoped (``hermes_constants.set_hermes_home_override``), while this
+# module-global cache outlives any single profile scope. Keying by home keeps
+# one profile's approved credential paths from being handed to another profile's
+# sandbox — the same cross-session bleed the ContextVar-backed skill registry
+# above guards against. Resolving the paths per-home also survives the
+# set/reset-in-place override pattern (a plain unkeyed cache would not, since the
+# home token reset does not reset this cache).
+_config_files_by_home: Dict[str, List[Dict[str, str]]] = {}
 
 
 def _resolve_hermes_home() -> Path:
@@ -189,10 +197,15 @@ def register_credential_files(
 
 
 def _load_config_files() -> List[Dict[str, str]]:
-    """Load ``terminal.credential_files`` from config.yaml (cached)."""
-    global _config_files
-    if _config_files is not None:
-        return _config_files
+    """Load ``terminal.credential_files`` from config.yaml (cached per home).
+
+    The cache is keyed by the resolved ``HERMES_HOME`` so that a later profile
+    with a different home never receives an earlier profile's cached host paths.
+    """
+    home_key = str(_resolve_hermes_home())
+    cached = _config_files_by_home.get(home_key)
+    if cached is not None:
+        return cached
 
     result: List[Dict[str, str]] = []
     try:
@@ -219,8 +232,8 @@ def _load_config_files() -> List[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not read terminal.credential_files from config: %s", e)
 
-    _config_files = result
-    return _config_files
+    _config_files_by_home[home_key] = result
+    return result
 
 
 def get_credential_file_mounts() -> List[Dict[str, str]]:
@@ -602,7 +615,13 @@ def iter_cache_files(
 
 
 def clear_credential_files() -> None:
-    """Reset the skill-scoped registry (e.g. on session reset)."""
+    """Reset the skill-scoped registry (e.g. on session reset).
+
+    Also drops the config-file cache so a session reset re-reads
+    ``terminal.credential_files`` — picking up config rotation/removal instead
+    of serving a stale per-home snapshot.
+    """
     _get_registered().clear()
+    _config_files_by_home.clear()
 
 
