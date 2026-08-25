@@ -4,7 +4,10 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { ProjectMenu } from './project-menu'
 import type { SidebarProjectTree } from './workspace-groups'
 
-afterEach(cleanup)
+afterEach(() => {
+  showAllProfilesMock.value = false
+  cleanup()
+})
 
 // Steerable stand-in for the nanostores atom so individual tests can toggle
 // the unified "All profiles" sidebar view.
@@ -153,5 +156,18 @@ describe('ProjectMenu', () => {
     // Per-profile RPCs cannot be scoped with no active profile, so the
     // destructive action must be disabled instead of failing silently.
     expect(deleteItem.getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('does not open Delete confirmation when activated with Enter in all-profiles view', async () => {
+    showAllProfilesMock.value = true
+    render(<ProjectMenu isActive={false} project={project} />)
+
+    const trigger = screen.getByRole('button', { name: 'Actions' })
+    openTriggerMenu(trigger)
+
+    const deleteItem = await screen.findByRole('menuitem', { name: 'Delete…' })
+    fireEvent.keyDown(deleteItem, { key: 'Enter' })
+
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 })
