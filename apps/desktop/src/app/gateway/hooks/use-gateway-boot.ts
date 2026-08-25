@@ -43,11 +43,14 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
+  $selectedStoredSessionId,
   $sessions,
   ensureDefaultWorkspaceCwd,
+  sessionMatchesStoredId,
   setConnection,
   setCurrentBranch,
   setCurrentCwd,
+  setSelectedStoredSessionId,
   setSessionsLoading
 } from '@/store/session'
 import {
@@ -472,10 +475,12 @@ export function useGatewayBoot({
 
     // Soft gateway-mode apply: main tore down the primary without reloading.
     // Wipe session lists so skeletons retrigger, then re-dial in place.
-    const softSwitch = async () => {
+    const softSwitch = async (preserveSelection = false) => {
       if (cancelled) {
         return
       }
+
+      const selectedStoredSessionId = preserveSelection ? $selectedStoredSessionId.get() : null
 
       $gatewaySwitching.set(true)
       clearReconnectTimer()
@@ -486,7 +491,7 @@ export function useGatewayBoot({
       escalated = false
       reauthNotified = false
       callbacksRef.current.beforeConnectionSwitch()
-      wipeSessionListsForGatewaySwitch()
+      wipeSessionListsForGatewaySwitch({ preserveSelectedSessionId: selectedStoredSessionId })
 
       try {
         gateway.close()
@@ -531,6 +536,12 @@ export function useGatewayBoot({
           callbacksRef.current.refreshHermesConfig().catch(() => undefined),
           callbacksRef.current.refreshSessions().catch(() => undefined)
         ])
+        setSelectedStoredSessionId(current =>
+          selectedStoredSessionId &&
+          $sessions.get().some(session => sessionMatchesStoredId(session, selectedStoredSessionId))
+            ? selectedStoredSessionId
+            : null
+        )
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {
@@ -676,7 +687,10 @@ export function useGatewayBoot({
     // window regaining focus/visibility. Each nudges an immediate reconnect.
     const forceReconnectNow = () => reconnectNow({ forceOpenSocket: true })
     const offPowerResume = desktop.onPowerResume?.(() => void forceReconnectNow())
-    const offConnectionApplied = desktop.onConnectionApplied?.(() => void softSwitch())
+
+    const offConnectionApplied = desktop.onConnectionApplied?.(
+      payload => void softSwitch(payload?.preserveSession === true)
+    )
     const offGatewayReconnect = registerGatewayReconnect(forceReconnectNow)
 
     // Registry lifecycle: a removed connection's secondaries must close NOW
