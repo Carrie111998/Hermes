@@ -451,10 +451,11 @@ def _(rid, params: dict) -> dict:
                 windows_hide_flags,
             )
 
-            # argv-first when the command has no shell syntax; shell fallback
-            # for explicit shell operators (&&, pipes, redirects, …). A quick
-            # command is a user-defined snippet from config.yaml, so a `;` or
-            # `|` smuggled into an argument can't become a second command.
+            # argv-first hardening: commands with no shell syntax run without
+            # a shell, so metacharacters in arguments stay inert; commands the
+            # operator wrote with explicit shell operators (&&, pipes,
+            # redirects, …) run through the shell unchanged. A quick command
+            # is a trusted user-defined snippet from config.yaml.
             r = run_configured_command(
                 qc.get("command", ""),
                 capture_output=True,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import ssl
@@ -20,7 +21,21 @@ def _coerce_insecure(ssl_verify: Any) -> bool:
     return False
 
 
-_IPV4_LOCAL_PREFIXES = ("127.", "10.", "192.168.", "169.254.", "100.64.")
+# Operator-controlled address space (RFC1918, link-local, RFC6598 shared CGNAT).
+# Classified against explicit networks rather than ``IPv4Address.is_private`` /
+# ``is_shared`` because those properties are version-divergent (``is_shared``
+# only landed in Python 3.11's typeshed) and ``is_private`` is over-broad for
+# IPv6 — CPython reports the *documentation* range 2001:db8::/32 as private,
+# yet that prefix is not a network the operator controls.
+PRIVATE_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local
+    ipaddress.ip_network("100.64.0.0/10"),  # RFC6598 shared CGNAT
+    ipaddress.ip_network("fc00::/7"),  # IPv6 unique-local
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
+)
 
 
 def _is_local_host(host: str) -> bool:
@@ -35,29 +50,38 @@ def _is_local_host(host: str) -> bool:
     This predicate is shared by every TLS resolution path (httpx chat client,
     urllib and requests ``/models`` probes) so the whole bug class is guarded
     in one place.
+
+    Classification parses literal addresses with :mod:`ipaddress` and checks
+    them against the explicit private/link-local/shared networks above.  DNS
+    names that merely *look* like a private address (``127.attacker.example``,
+    ``172.16.attacker.example``) are never treated as local — only actual
+    literal IP addresses and single-label (LAN/container) hostnames are.
     """
     host = (host or "").strip().lower().rstrip(".")
     if not host:
         return False
-    if host in {"localhost", "::1", "0.0.0.0"} or host.startswith(_IPV4_LOCAL_PREFIXES):
+    # Exact localhost names and single-label hostnames (``ollama``, ``vllm``,
+    # ``llama-cpp``) are LAN or container names — the operator controls that
+    # endpoint.  Dotted names could resolve publicly, so they require
+    # ``ssl_ca_cert``.
+    if host in {"localhost", "0.0.0.0", "::1"} or ("." not in host and ":" not in host):
         return True
-    if host.startswith("172."):
-        try:
-            second = int(host.split(".", 2)[1])
-        except (IndexError, ValueError):
-            second = -1
-        if 16 <= second <= 31:  # 172.16.0.0/12
-            return True
-    if ":" in host:
-        # IPv6 loopback / unique-local (fc00::/7) / link-local (fe80::/10)
-        if host == "::1" or host.startswith(("fc", "fd", "fe8")):
-            return True
-    # Single-label hostnames (``ollama``, ``vllm``, ``llama-cpp``) are LAN or
-    # container names, not public DNS — the operator controls that endpoint.
-    # Dotted names could resolve publicly, so they require ``ssl_ca_cert``.
-    if "." not in host and ":" not in host:
+    # Strip IPv6 zone id (``fe80::1%eth0``) before parsing.
+    if ":" in host and "%" in host:
+        host = host.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        # Not a literal IP — a DNS name (even one that *looks* like a private
+        # address, e.g. ``127.attacker.example``) is not local.
+        return False
+    # IPv4-mapped IPv6 addresses (``::ffff:192.168.0.1``) classify by their
+    # embedded IPv4 address.
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.is_loopback or addr.is_unspecified:
         return True
-    return False
+    return any(addr in network for network in PRIVATE_NETWORKS)
 
 
 def _host_of(base_url: str) -> str:

@@ -17990,8 +17990,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     env=sanitized_env,
                                 )
                             else:
-                                # argv-first: a `;`/`|` smuggled into an
-                                # argument can't become a second command.
+                                # argv-first hardening: no shell is spawned, so
+                                # metacharacters in arguments stay inert.
                                 proc = await asyncio.create_subprocess_exec(
                                     *split_command_line(exec_cmd),
                                     stdout=asyncio.subprocess.PIPE,

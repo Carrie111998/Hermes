@@ -170,6 +170,22 @@ export async function mediaExternalLink(path: string): Promise<string> {
     if (signed) {
       return signed
     }
+
+    // Mint failed — fall back to the legacy authenticated ?token= URL. For a
+    // token-bearing remote the URL still authenticates and the gateway accepts
+    // it during the deprecation window.
+    return mediaExternalUrl(path)
+  }
+
+  // Tokenless remote (OAuth/cookie): no renderer token, so no signed link can
+  // be minted here. Never return a gateway-local file:// URL — the file lives
+  // on the gateway, so opening that path locally is a dead click (the exact
+  // bug #94833 removes). Callers route remote opens through the authenticated
+  // desktop bridge (downloadGatewayMediaFile) before reaching this module;
+  // returning the raw path guarantees a tokenless remote can never produce a
+  // file:// URL for openExternal().
+  if (isRemoteGateway() && !/^https?:/i.test(path)) {
+    return path
   }
 
   return mediaExternalUrl(path)

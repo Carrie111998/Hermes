@@ -70,6 +70,19 @@ class TestCommandNeedsShell:
         assert command_needs_shell("ls | grep foo") is True
         assert command_needs_shell("cd /tmp && ls") is True
 
+    def test_unquoted_operator_string_runs_through_shell_completely(self):
+        # Contract boundary (not a sandbox): the strings are operator-authored
+        # config, so an unquoted `;` is a real operator choice and the WHOLE
+        # string — both parts — runs through the shell. This is the scenario
+        # an earlier draft mislabeled as "fixed"; the honest contract is that
+        # a simple command with no shell syntax never spawns a shell, while
+        # operator-written shell syntax is preserved exactly.
+        with patch("hermes_cli._subprocess_compat.subprocess.run") as mock_run:
+            run_configured_command("echo hello; id")
+        args, kwargs = mock_run.call_args
+        assert args[0] == "echo hello; id"
+        assert kwargs.get("shell") is True
+
 
 # ──────────────────────────────────────────────────────────────────────
 # run_configured_command

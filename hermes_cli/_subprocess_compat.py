@@ -81,12 +81,23 @@ _SHELL_RAW_ONLY_CHARS: tuple[str, ...] = ("\n", "\r", "#")
 def command_needs_shell(command: str) -> bool:
     """Return True when *command* uses shell syntax that argv can't express.
 
-    ``split_command_line()`` + ``subprocess.run(argv)`` is the safe default for
-    user-configured commands: no shell is spawned, so nothing in the string is
-    interpreted. When the command genuinely needs a shell (pipes, redirects,
-    ``&&``/``;`` chains, ``$VAR``, globs, tilde, …) this returns True so the
-    caller can fall back to ``shell=True`` and keep the exact behavior the
-    operator wrote.
+    ``split_command_line()`` + ``subprocess.run(argv)`` is the hardened default
+    for user-configured commands: no shell is spawned, so metacharacters in
+    arguments stay inert. When the command genuinely needs a shell (pipes,
+    redirects, ``&&``/``;`` chains, ``$VAR``, globs, tilde, …) this returns
+    True so the caller can fall back to ``shell=True`` and keep the exact
+    behavior the operator wrote.
+
+    This is argv-first *hardening for simple commands*, not a shell-injection
+    sandbox. The command strings are operator-authored config (quick_commands,
+    goal gates, MCP bootstrap steps) — trusted programs, not untrusted input.
+    A helper cannot tell operator-written shell syntax from an injected
+    unquoted operator once both are in one string, so an unquoted ``;`` or
+    ``|`` forces the shell and the whole string runs exactly as written. The
+    property this delivers: commands without shell syntax never touch a shell
+    (metacharacters in their arguments are inert), and shell syntax inside
+    quotes stays data (``echo 'a;b'`` prints ``a;b``, never runs a second
+    command).
 
     Detection is token-based (shlex with ``punctuation_chars=True``): shell
     operators only count OUTSIDE quotes. ``echo "a;b"`` stays argv (the ``;``
@@ -123,6 +134,13 @@ def run_configured_command(command: str, **kwargs) -> "subprocess.CompletedProce
     exactly as before — this preserves every existing quick command / goal gate
     / MCP bootstrap while removing the shell from the common simple-command
     path.
+
+    This is argv-first hardening for simple commands, not an injection
+    sandbox: the strings are operator-authored config, so an unquoted ``;``
+    (a real operator choice) runs through the shell with both parts, exactly
+    as the operator wrote them. What is guaranteed: a command with no shell
+    syntax never spawns a shell, so metacharacters in its arguments are
+    inert.
 
     All ``**kwargs`` are forwarded to ``subprocess.run`` (``cwd``, ``env``,
     ``timeout``, ``capture_output``, ``encoding``, ``creationflags``, …).

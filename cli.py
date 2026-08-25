@@ -12534,14 +12534,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
-                            # argv-first when the command has no shell syntax;
-                            # shell fallback for explicit shell operators (&&,
-                            # pipes, redirects, …). quick_commands are
-                            # user-defined snippets from config.yaml — a `;` or
-                            # `|` smuggled into an argument can't become a
-                            # second command. Sanitize env to prevent credential
-                            # leakage — quick commands run in the CLI process
-                            # which has all API keys in os.environ.
+                            # argv-first hardening: commands with no shell
+                            # syntax run without a shell, so metacharacters in
+                            # arguments stay inert. Commands the operator wrote
+                            # with explicit shell operators (&&, pipes,
+                            # redirects, …) run through the shell unchanged.
+                            # quick_commands are trusted user-defined snippets
+                            # from config.yaml. Sanitize env to prevent
+                            # credential leakage — quick commands run in the
+                            # CLI process which has all API keys in os.environ.
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
                             from hermes_cli._subprocess_compat import (

@@ -154,6 +154,24 @@ describe('mediaExternalLink', () => {
     await expect(mediaExternalLink('/tmp/a.png')).resolves.toBe('file:///tmp/a.png')
     expect(fetchMock).not.toHaveBeenCalled()
   })
+
+  // Regression: a tokenless OAuth remote exposes no renderer token, so the
+  // signed-link endpoint is unreachable. The function must NOT return a
+  // gateway-local file:// URL (the file lives on the gateway — opening that
+  // path locally is a dead click, the exact bug #94833 removes). The caller
+  // routes tokenless remote opens through the authenticated desktop bridge
+  // (downloadGatewayMediaFile) instead.
+  it('never returns a gateway-local file:// on a tokenless remote', async () => {
+    const fetchMock = vi.fn()
+
+    vi.stubGlobal('fetch', fetchMock)
+    $connection.set({ authMode: 'oauth', mode: 'remote', token: null } as never)
+
+    const result = await mediaExternalLink('/srv/merittas/report.png')
+
+    expect(result).toBe('/srv/merittas/report.png')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
 })
 
 describe('mediaGatewayStreamUrl', () => {

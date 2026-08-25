@@ -274,17 +274,18 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       try {
         // A gateway-local file resolves to file:// in remote mode (the file
         // lives on the gateway, not this disk). Opening that locally fails —
-        // and an OAuth remote connection has no query token to build a download
-        // URL. Fetch the bytes over the authenticated fs bridge instead.
-        if (isRemoteGateway() && /^file:/i.test(href)) {
+        // and an OAuth remote connection has no query token to build a signed
+        // link. Fetch the bytes over the authenticated fs bridge instead:
+        // every remote non-http target routes here, token-bearing or not.
+        if (isRemoteGateway() && !/^https?:/i.test(href)) {
           await downloadGatewayMediaFile(href)
 
           return
         }
 
-        // Resolve a short-lived signed link so the session token never rides
-        // in the URL handed to the system browser (legacy artifact hrefs
-        // carry it as ?token= on /api/files/download).
+        // http(s) targets: re-mint legacy artifact hrefs that carry ?token=
+        // on /api/files/download into a short-lived signed link so the
+        // session token never rides in the URL handed to the system browser.
         const url = await mediaExternalLink(href)
 
         if (window.hermesDesktop?.openExternal) {
