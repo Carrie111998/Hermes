@@ -555,12 +555,21 @@ CREATE TABLE IF NOT EXISTS session_external_turns (
     target_session_key TEXT NOT NULL,
     body TEXT NOT NULL,
     source TEXT NOT NULL,
+    -- PENDING -> CLAIMED -> STARTED -> FINISHED. The last two are what let a
+    -- producer tell "still being reasoned about" from "the turn died", which is
+    -- indistinguishable in the transcript and which its own liveness used to
+    -- answer back when it submitted the turn itself.
     state TEXT NOT NULL DEFAULT 'PENDING',
+    -- Minted per claim. Every later transition is compare-and-swapped against
+    -- it, so two processes recovering one dead claim cannot both proceed.
+    claim_id TEXT,
     owner_pid INTEGER,
     owner_started_at REAL,
     claimed_at REAL,
     created_at REAL NOT NULL,
-    consumed_at REAL,
+    started_at REAL,
+    finished_at REAL,
+    outcome TEXT,
     last_error TEXT
 );
 

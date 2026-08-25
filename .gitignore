@@ -217,3 +217,4 @@ native/fts5_cjk/*.so
 .probe-home/
 .probe-home-ext/
 .probe-dbg*/
+.probe-home-crash*/

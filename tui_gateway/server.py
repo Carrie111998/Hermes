@@ -786,6 +786,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
         history_ready.set()
+    # A session closing mid-turn ends that turn. Without this the row stays
+    # STARTED under a pid still alive for OTHER sessions, and a producer waits on
+    # a turn that no longer exists.
+    _finish_external_turn_if_idle(session, outcome="session_closed")
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
@@ -10786,6 +10790,33 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _finish_external_turn_if_idle(session: dict, outcome: str = "completed") -> None:
+    """Close the lifecycle of an external turn this session started.
+
+    A producer cannot tell a turn still being reasoned about from one that died:
+    both show a marker with no assistant reply. Its own liveness used to answer
+    that, back when it submitted the turn itself. On this rail the turn is hosted
+    by somebody else, so the end of it is recorded explicitly.
+
+    Observed rather than hooked, because _run_prompt_submit returns as soon as
+    the turn thread starts; the honest end-of-turn signal available here is the
+    session going idle again.
+    """
+    in_flight = session.get("_external_turn_in_flight")
+    if not in_flight:
+        return
+    if session.get("running") and not session.get("_finalized"):
+        return
+    event_id, claim_id = in_flight
+    session["_external_turn_in_flight"] = None
+    try:
+        from tools.session_external_turns import mark_external_turn_finished
+
+        mark_external_turn_finished(event_id, claim_id, outcome)
+    except Exception:
+        logger.debug("Failed to close external turn %s", event_id, exc_info=True)
+
+
 def _maybe_consume_external_turn(sid: str, session: dict) -> None:
     """Take at most one queued external activation for this session, if we may.
 
@@ -10816,13 +10847,15 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
     person typed, and rendering it as their speech would be a lie about who said
     what.
     """
+    _finish_external_turn_if_idle(session)
+
     key = str(session.get("session_key") or "")
     if not key or session.get("running") or session.get("_finalized"):
         return
 
     from tools.session_external_turns import (
         claim_external_turn,
-        mark_external_turn_consumed,
+        mark_external_turn_started,
         pending_external_turns,
         release_external_turn,
     )
@@ -10850,7 +10883,8 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
     # claim-then-release below pure churn.
     if session.get("running") or session.get("_finalized"):
         return
-    if not claim_external_turn(event_id):
+    claim_id = claim_external_turn(event_id)
+    if not claim_id:
         return
 
     started = False
@@ -10861,19 +10895,19 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
     if not started:
         # A real turn began between the idle check and the claim. Put it back;
         # the next pass will find the session idle again.
-        release_external_turn(event_id, "session became busy before dispatch")
+        release_external_turn(event_id, claim_id, "session became busy before dispatch")
         return
 
-    # Consumed only once a turn ACTUALLY started. _run_prompt_submit returns
-    # False from its early exits -- a closing session, a superseded queued
-    # generation -- without persisting anything, and marking the row beforehand
-    # turned that into a silently swallowed event: the row said delivered, the
-    # transcript held nothing, and the producer had been told to stop retrying.
+    # Marked STARTED only once a turn ACTUALLY launched. _run_prompt_submit
+    # returns False from its early exits -- a closing session, a superseded
+    # queued generation, a session no longer registered -- without persisting
+    # anything, and marking beforehand turned that into a silently swallowed
+    # event: the row said delivered, the transcript held nothing, and the
+    # producer had been told to stop retrying.
     #
-    # Re-delivery after a crash between dispatch and this mark is the safe
-    # direction of that trade, and it is already handled a layer up: the
-    # producer's marker plus canonical history decide whether the event landed,
-    # and a duplicate is visible there in a way a lost event never is.
+    # It returns as soon as the turn THREAD is running, not when the turn ends,
+    # which is exactly the STARTED boundary. FINISHED is recorded later, by this
+    # poller, when it next sees the session idle.
     dispatched = False
     try:
         _emit("message.start", sid)
@@ -10889,14 +10923,19 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
     except Exception as exc:
         with session["history_lock"]:
             session["running"] = False
-        release_external_turn(event_id, f"dispatch raised: {type(exc).__name__}")
+        release_external_turn(event_id, claim_id, f"dispatch raised: {type(exc).__name__}")
         raise
     if dispatched:
-        mark_external_turn_consumed(event_id)
+        mark_external_turn_started(event_id, claim_id)
+        # Remembered so this poller can close the lifecycle when the turn ends.
+        # If this process dies first the row stays STARTED with a dead owner,
+        # which is the producer's signal to reconcile against history rather
+        # than wait forever or read it as a partial delivery.
+        session["_external_turn_in_flight"] = (event_id, claim_id)
     else:
-        # Both early exits reset ``running`` themselves; the row goes back so a
+        # Every early exit resets ``running`` itself; the row goes back so a
         # later pass can try again.
-        release_external_turn(event_id, "dispatch did not start a turn")
+        release_external_turn(event_id, claim_id, "dispatch did not start a turn")
 
 
 def _notification_poller_loop(
@@ -15628,8 +15667,16 @@ def _(rid, params: dict) -> dict:
     worse than no capability at all, because it is believed.
     """
     from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
+    from tools.session_external_turns import SESSION_EXTERNAL_TURNS_V1
 
-    return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT)})
+    # Two separate guarantees, and a producer needs both named. The lease proves
+    # only that concurrent writers to a session are fenced; a build can do that
+    # and still have no inbox, in which case enqueued events would sit forever
+    # with nothing to consume them.
+    return _ok(rid, {
+        "per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT),
+        "session_external_turns_v1": bool(SESSION_EXTERNAL_TURNS_V1),
+    })
 
 
 @method("ping")

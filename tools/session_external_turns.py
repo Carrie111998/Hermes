@@ -22,26 +22,49 @@ transport from the answer. That answer is stale the moment it is read: an owner
 can appear or die in the gap before delivery, and one of the two branches is
 then wrong in a way that either loses the event or writes it twice.
 
-Enqueueing first removes the branch. There is one durable event and a rule
-about who may take it, and the active-session lease -- not a preflight guess --
-decides that at the moment of consumption:
+Enqueueing first removes the branch. There is one durable event and a rule about
+who may take it, and the active-session lease -- not a preflight guess -- decides
+that at the moment of consumption:
 
     A owns S   -> re-enters its own lease -> claims the event
     B does not -> SESSION_NOT_OWNED       -> leaves it alone
 
-If A dies before consuming, its lease is pruned as a dead owner and a later
-process may take the event. If a person opens the conversation just as a
-fallback gateway starts, exactly one of them holds the lease and the other
-declines. The race still happens; there is no longer an unsafe outcome of it.
+The race still happens; there is no longer an unsafe outcome of it.
+
+THE LIFECYCLE IS ABOUT THE TURN, NOT ONLY ABOUT INGRESS
+
+    PENDING -> CLAIMED -> STARTED -> FINISHED
+
+A producer reading canonical history has to tell two situations apart that look
+identical in the transcript: its marker is present with no assistant reply
+because the turn is still being reasoned about, and its marker is present with
+no assistant reply because the turn died. Under a direct submit those were
+distinguishable, because the submitting process's own liveness answered it.
+Under this rail the turn is hosted by somebody else entirely, so the inbox has to
+say so:
+
+    STARTED  + owner live   -> still going; do not judge it yet
+    STARTED  + owner dead   -> reconcile against history; never guess
+    FINISHED                -> the turn ended, and history is now complete
+
+Without that distinction a healthy long turn reads as a partial delivery.
+
+EVERY TRANSITION IS BOUND TO A CLAIM
+
+``claim_id`` is minted per successful claim and every later mutation is
+compare-and-swapped against it. Two processes that both saw the same dead claim
+can both try to recover it; only one wins, and the loser's later "mark started"
+or "release" cannot land on the winner's claim. The active-session lease makes
+that race hard to reach through the current consumer, but this module advertises
+its own mutual exclusion, so it provides it rather than borrowing an invariant
+from its caller.
 
 WHAT THIS IS NOT
 
 It is not a second delivery ledger. The producer's own outbox remains the
-delivery authority, and canonical Hermes history remains the record of what
-actually happened. This table only needs enough claim durability that two
-Hermes processes cannot consume one row. ``event_id`` is the PRODUCER's
-identity for the event, so re-enqueueing after an ambiguous outcome is
-idempotent here by construction.
+delivery authority and canonical Hermes history remains the record of what was
+said. ``event_id`` is the PRODUCER's identity for the event, so re-enqueueing
+after an ambiguous outcome is idempotent here by construction.
 """
 
 from __future__ import annotations
@@ -50,6 +73,7 @@ import logging
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -59,7 +83,15 @@ logger = logging.getLogger(__name__)
 
 PENDING = "PENDING"
 CLAIMED = "CLAIMED"
-CONSUMED = "CONSUMED"
+STARTED = "STARTED"
+FINISHED = "FINISHED"
+
+# Advertised through the gateway. Distinct from the active-session lease
+# capability on purpose: that one proves only that concurrent writers to a
+# session are fenced, which a build can do without having this inbox or the
+# poller that drains it. A producer that conflated them would enqueue events
+# into a build where nothing would ever consume them.
+SESSION_EXTERNAL_TURNS_V1 = True
 
 
 def _db_path():
@@ -91,11 +123,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             body TEXT NOT NULL,
             source TEXT NOT NULL,
             state TEXT NOT NULL DEFAULT 'PENDING',
+            claim_id TEXT,
             owner_pid INTEGER,
             owner_started_at REAL,
             claimed_at REAL,
             created_at REAL NOT NULL,
-            consumed_at REAL,
+            started_at REAL,
+            finished_at REAL,
+            outcome TEXT,
             last_error TEXT
         )"""
     )
@@ -126,7 +161,7 @@ def _process_start_time(pid: int) -> Optional[float]:
 
 
 def _claimer_alive(pid: Any, started_at: Any) -> bool:
-    """Is the process that claimed this row still running?
+    """Is the process holding this row still running?
 
     Identity is (pid, process start time) for the same reason the active-session
     registry uses it: a pid on its own is reused, and a recycled one would keep
@@ -166,8 +201,8 @@ def enqueue_external_turn(
     """Queue one activation for a stored session. Returns False if already queued.
 
     Idempotent on ``event_id``: a producer that could not tell whether its last
-    attempt landed may safely enqueue the same event again, and will not create
-    a second turn. Nothing here delivers -- see the module docstring for why the
+    attempt landed may safely enqueue the same event again, and will not create a
+    second turn. Nothing here delivers -- see the module docstring for why the
     producer must not also choose the transport.
     """
     key = str(target_session_key or "").strip()
@@ -184,13 +219,41 @@ def enqueue_external_turn(
         return bool(cur.rowcount)
 
 
-def pending_external_turns(target_session_key: str, limit: int = 16) -> List[Dict[str, Any]]:
-    """Rows this session may consume, oldest first.
+def get_external_turn(event_id: str) -> Optional[Dict[str, Any]]:
+    """The row as it stands, plus whether whoever holds it is still alive.
 
-    Includes rows whose claimer has died. A process that claimed a row and was
-    then killed must not take the event with it -- the person is still waiting
-    to be told, and the producer will not re-send an event it believes it handed
-    over.
+    ``owner_alive`` is what lets a producer read STARTED correctly: with a live
+    owner the turn is still being reasoned about and must not be judged; with a
+    dead one the transcript is all there is, and the producer reconciles against
+    it rather than guessing from this table.
+    """
+    with _transaction() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM session_external_turns WHERE event_id = ?", (str(event_id),)
+        ).fetchone()
+    if row is None:
+        return None
+    record = dict(row)
+    record["owner_alive"] = bool(
+        record.get("state") in (CLAIMED, STARTED)
+        and _claimer_alive(record.get("owner_pid"), record.get("owner_started_at"))
+    )
+    return record
+
+
+def pending_external_turns(target_session_key: str, limit: int = 16) -> List[Dict[str, Any]]:
+    """Rows this session may still consume, oldest first.
+
+    PENDING rows, and CLAIMED rows whose holder died before dispatching: a
+    process killed between claiming and starting must not take the event with
+    it, because the producer believes it handed the event over and will not
+    re-send it.
+
+    A dead STARTED row is deliberately NOT offered. A turn began, so the marker
+    may already be in the transcript, and re-dispatching would announce one thing
+    twice. Whether that turn actually said anything is a question about canonical
+    history, which is the producer's to answer.
     """
     key = str(target_session_key or "").strip()
     if not key:
@@ -213,61 +276,136 @@ def pending_external_turns(target_session_key: str, limit: int = 16) -> List[Dic
     return rows
 
 
-def claim_external_turn(event_id: str) -> bool:
-    """Take ownership of one row for THIS process. False if somebody else has it.
+def claim_external_turn(event_id: str) -> Optional[str]:
+    """Take ownership of one row for THIS process; returns a claim id, or None.
 
-    The UPDATE is the whole mutual exclusion: it matches only a row still in the
-    state this caller just observed, so two processes racing on one event cannot
-    both come away believing they own it. SQLite serialises the write; the loser
-    sees rowcount 0.
+    The UPDATE is the whole mutual exclusion. It matches only the exact state AND
+    claim this caller just observed, so two processes recovering the same dead
+    claim cannot both come away believing they own it: SQLite serialises the
+    write and the loser sees rowcount 0. The returned id must be presented for
+    every later transition on this row.
     """
     eid = str(event_id or "").strip()
     if not eid:
-        return False
+        return None
     pid = os.getpid()
     started = _process_start_time(pid)
+    claim_id = uuid.uuid4().hex
     now = time.time()
     with _transaction() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT state, owner_pid, owner_started_at FROM session_external_turns WHERE event_id = ?",
+            "SELECT state, claim_id, owner_pid, owner_started_at "
+            "FROM session_external_turns WHERE event_id = ?",
             (eid,),
         ).fetchone()
-        if row is None or row["state"] == CONSUMED:
-            return False
+        if row is None or row["state"] in (STARTED, FINISHED):
+            return None
         if row["state"] == CLAIMED and _claimer_alive(row["owner_pid"], row["owner_started_at"]):
-            return False
+            return None
+        # Bind to the observed claim as well as the observed state: recovering a
+        # dead claim must fail if somebody else recovered it first.
+        prior = row["claim_id"]
         cur = conn.execute(
             """UPDATE session_external_turns
-               SET state = 'CLAIMED', owner_pid = ?, owner_started_at = ?, claimed_at = ?
-               WHERE event_id = ? AND state = ?""",
-            (pid, started, now, eid, row["state"]),
+               SET state = 'CLAIMED', claim_id = ?, owner_pid = ?, owner_started_at = ?,
+                   claimed_at = ?
+               WHERE event_id = ? AND state = ? AND claim_id IS ?""",
+            (claim_id, pid, started, now, eid, row["state"], prior),
+        )
+        return claim_id if cur.rowcount else None
+
+
+def mark_external_turn_started(event_id: str, claim_id: str) -> bool:
+    """A turn actually launched for this event.
+
+    Recorded only once dispatch is CONFIRMED. ``_run_prompt_submit`` returns
+    False from its early exits without persisting anything, and marking
+    optimistically turned a refused dispatch into a silently swallowed event: the
+    row said delivered, the transcript held nothing, and the producer had been
+    told to stop retrying.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE session_external_turns
+               SET state = 'STARTED', started_at = ?
+               WHERE event_id = ? AND state = 'CLAIMED' AND claim_id = ?""",
+            (time.time(), str(event_id), str(claim_id)),
         )
         return bool(cur.rowcount)
 
 
-def mark_external_turn_consumed(event_id: str) -> None:
-    """A turn actually started for this event. The row is finished.
+def mark_external_turn_finished(event_id: str, claim_id: str, outcome: str = "completed") -> bool:
+    """That turn has ended, so canonical history is now complete for this event.
 
-    Called once the dispatch is CONFIRMED, never before it. Whether the
-    assistant then replied is decided by canonical history, not by this table --
-    but whether a turn began at all is decided here, and marking optimistically
-    turns a refused dispatch into a silently swallowed event.
+    This is the signal that makes "marker present, no assistant reply" mean
+    something definite. Until it lands, that shape is simply a turn still in
+    progress.
     """
     with _transaction() as conn:
-        conn.execute(
-            "UPDATE session_external_turns SET state = 'CONSUMED', consumed_at = ? WHERE event_id = ?",
-            (time.time(), str(event_id)),
+        cur = conn.execute(
+            """UPDATE session_external_turns
+               SET state = 'FINISHED', finished_at = ?, outcome = ?
+               WHERE event_id = ? AND state = 'STARTED' AND claim_id = ?""",
+            (time.time(), str(outcome), str(event_id), str(claim_id)),
         )
+        return bool(cur.rowcount)
 
 
-def release_external_turn(event_id: str, error: str = "") -> None:
+def release_external_turn(event_id: str, claim_id: str, error: str = "") -> bool:
     """Put a claimed row back, because this process could not run it after all."""
     with _transaction() as conn:
-        conn.execute(
+        cur = conn.execute(
             """UPDATE session_external_turns
-               SET state = 'PENDING', owner_pid = NULL, owner_started_at = NULL,
-                   claimed_at = NULL, last_error = ?
-               WHERE event_id = ? AND state = 'CLAIMED'""",
-            (str(error)[:500] or None, str(event_id)),
+               SET state = 'PENDING', claim_id = NULL, owner_pid = NULL,
+                   owner_started_at = NULL, claimed_at = NULL, last_error = ?
+               WHERE event_id = ? AND state = 'CLAIMED' AND claim_id = ?""",
+            (str(error)[:500] or None, str(event_id), str(claim_id)),
         )
+        return bool(cur.rowcount)
+
+
+def reopen_external_turn(event_id: str, reason: str = "") -> bool:
+    """Make a dead STARTED event deliverable again. The PRODUCER decides this.
+
+    There is a real window in which STARTED is durable and the marker is not:
+    _run_prompt_submit returns as soon as the turn thread is running, and that
+    thread persists the user row afterwards. A process killed in between leaves a
+    row saying a turn started and a transcript containing no evidence of it.
+
+    The inbox cannot resolve that on its own, and must not try -- deciding
+    whether the event landed means reading canonical history, which is the
+    producer's authority, not this table's. So the producer reconciles and then
+    says so here, and only for an event whose owner is gone:
+
+        marker present -> the turn spoke, or partly spoke; ordinary
+                          reconciliation applies and this is NOT called
+        marker absent  -> nothing was ever written; reopen and let a live owner
+                          deliver it
+
+    Refuses while the owner is alive, so it can never yank an event out of a turn
+    that is still being reasoned about.
+    """
+    eid = str(event_id or "").strip()
+    if not eid:
+        return False
+    with _transaction() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT state, claim_id, owner_pid, owner_started_at "
+            "FROM session_external_turns WHERE event_id = ?",
+            (eid,),
+        ).fetchone()
+        if row is None or row["state"] != STARTED:
+            return False
+        if _claimer_alive(row["owner_pid"], row["owner_started_at"]):
+            return False
+        cur = conn.execute(
+            """UPDATE session_external_turns
+               SET state = 'PENDING', claim_id = NULL, owner_pid = NULL,
+                   owner_started_at = NULL, claimed_at = NULL, started_at = NULL,
+                   last_error = ?
+               WHERE event_id = ? AND state = 'STARTED' AND claim_id IS ?""",
+            (str(reason)[:500] or "reopened after owner died", eid, row["claim_id"]),
+        )
+        return bool(cur.rowcount)

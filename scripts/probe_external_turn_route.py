@@ -134,12 +134,18 @@ def main() -> int:
         # ── one event, two eligible-looking processes ────────────────────
         body = "WAKE-MARKER-7f3a done - fixed the run filter"
         check("event enqueued", enqueue(PROBE_HOME, "E1", key, body) == "True")
-        consumed = wait_for(lambda: (inbox(PROBE_HOME, "E1") or {}).get("state") == "CONSUMED", 60)
+        consumed = wait_for(
+            lambda: (inbox(PROBE_HOME, "E1") or {}).get("state") in ("STARTED", "FINISHED"), 60
+        )
         row = inbox(PROBE_HOME, "E1") or {}
-        check("the event was consumed", consumed, str(row.get("state")))
+        check("the event started a turn", consumed, str(row.get("state")))
         check("the OWNER consumed it, not the bystander", row.get("owner_pid") == a_pid,
               f"consumer={row.get('owner_pid')} owner={a_pid}")
 
+        # The marker is persisted by the TURN THREAD, after dispatch returns, so
+        # it is eventually consistent with STARTED rather than simultaneous. That
+        # gap is exactly the window a killed owner can be caught in.
+        wait_for(lambda: len(turns(PROBE_HOME, key, "WAKE-MARKER-7f3a")) >= 1, 30)
         got = turns(PROBE_HOME, key, "WAKE-MARKER-7f3a")
         check("exactly one turn resulted from one event", len(got) == 1, f"{len(got)} rows")
         if got:
@@ -168,18 +174,22 @@ def main() -> int:
             snap = inbox(PROBE_HOME, "E3") or {}
             seen.append((snap.get("state"), snap.get("owner_pid")))
         states = {st for st, _ in seen}
-        check("it is never delivered while the owner is busy", "CONSUMED" not in states,
-              " ".join(sorted(states)))
+        check("it is never delivered while the owner is busy",
+              not ({"STARTED", "FINISHED"} & states), " ".join(sorted(str(x) for x in states)))
         stealers = {pid for st, pid in seen if st == "CLAIMED" and pid not in (None, a_pid)}
         check("and no process but the owner ever claims it", not stealers, str(stealers))
         check("and no turn was forced into the running one",
               len(turns(PROBE_HOME, key, "WAKE-MARKER-c55e")) == 0)
 
         a.call("session.interrupt", {"session_id": sid_a})
-        drained = wait_for(lambda: (inbox(PROBE_HOME, "E3") or {}).get("state") == "CONSUMED", 60)
+        drained = wait_for(
+            lambda: (inbox(PROBE_HOME, "E3") or {}).get("state") in ("STARTED", "FINISHED"), 60
+        )
         check("and is delivered once the owner goes idle", drained,
               str((inbox(PROBE_HOME, "E3") or {}).get("state")))
-        check("as exactly one turn", len(turns(PROBE_HOME, key, "WAKE-MARKER-c55e")) == 1)
+        wait_for(lambda: len(turns(PROBE_HOME, key, "WAKE-MARKER-c55e")) >= 1, 30)
+        check("as exactly one turn", len(turns(PROBE_HOME, key, "WAKE-MARKER-c55e")) == 1,
+              str(len(turns(PROBE_HOME, key, "WAKE-MARKER-c55e"))))
 
         # ── the owner dies; the bystander becomes eligible ───────────────
         a.call("session.interrupt", {"session_id": sid_a})
@@ -187,13 +197,17 @@ def main() -> int:
         a.proc.wait(timeout=30)
         body2 = "WAKE-MARKER-b209 second event after the owner died"
         check("second event enqueued", enqueue(PROBE_HOME, "E2", key, body2) == "True")
-        took = wait_for(lambda: (inbox(PROBE_HOME, "E2") or {}).get("state") == "CONSUMED", 90)
+        took = wait_for(
+            lambda: (inbox(PROBE_HOME, "E2") or {}).get("state") in ("STARTED", "FINISHED"), 90
+        )
         row2 = inbox(PROBE_HOME, "E2") or {}
         check("the successor consumed it once A's lease was stale", took, str(row2.get("state")))
         check("and the successor is B, not the dead owner", row2.get("owner_pid") not in (None, a_pid),
               f"consumer={row2.get('owner_pid')} dead owner={a_pid}")
+        wait_for(lambda: len(turns(PROBE_HOME, key, "WAKE-MARKER-b209")) >= 1, 30)
         check("exactly one turn for the second event",
-              len(turns(PROBE_HOME, key, "WAKE-MARKER-b209")) == 1)
+              len(turns(PROBE_HOME, key, "WAKE-MARKER-b209")) == 1,
+              str(len(turns(PROBE_HOME, key, "WAKE-MARKER-b209"))))
     finally:
         if b is not None:
             b.close()
