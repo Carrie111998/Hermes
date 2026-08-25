@@ -2233,6 +2233,44 @@ def _ensure_compressed_has_user_turn(
     return "placeholder_appended"
 
 
+def _messages_match_scoped_identity(left: Any, right: Any) -> bool:
+    """Compare the live turn identity we care about for rotation stamping."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if left.get("role") != right.get("role"):
+        return False
+    if left.get("content") != right.get("content"):
+        return False
+    left_timestamp = left.get("timestamp")
+    right_timestamp = right.get("timestamp")
+    if left_timestamp is not None and right_timestamp is not None:
+        return left_timestamp == right_timestamp
+    return True
+
+
+def _stamp_persisted_user_message(
+    messages: Any,
+    message_idx: Any,
+    *,
+    reference_message: Any = None,
+) -> None:
+    """Mark the indexed user dict only when it still refers to the same turn."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+
+    if not isinstance(messages, list) or not isinstance(message_idx, int):
+        return
+    if not (0 <= message_idx < len(messages)):
+        return
+    candidate = messages[message_idx]
+    if not _is_real_user_message(candidate):
+        return
+    if reference_message is not None and not _messages_match_scoped_identity(
+        candidate, reference_message
+    ):
+        return
+    candidate[_DB_PERSISTED_MARKER] = True
+
+
 _PENDING_CONTEXT_ENGINE_NOTIFICATION = (
     "_pending_context_engine_compression_notification"
 )
@@ -3805,26 +3843,41 @@ def compress_context(
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
                     current_idx = getattr(agent, "_persist_user_message_idx", None)
+                    _live_user_message = None
+                    if isinstance(current_idx, int) and 0 <= current_idx < len(messages):
+                        _live_user_message = messages[current_idx]
+                    _matching_handoff_user = None
+                    if (
+                        compressed_user_turn_outcome == "already_present"
+                        and _is_real_user_message(_live_user_message)
+                    ):
+                        for _handoff_message in compressed:
+                            if (
+                                _is_real_user_message(_handoff_message)
+                                and _messages_match_scoped_identity(
+                                    _live_user_message, _handoff_message
+                                )
+                            ):
+                                _matching_handoff_user = _handoff_message
+                                break
                     if (
                         compressed_user_turn_outcome in {"inserted", "merged"}
-                        and isinstance(current_idx, int)
-                        and 0 <= current_idx < len(messages)
+                        or _matching_handoff_user is not None
                     ):
-                        _live_user_message = messages[current_idx]
+                        _stamp_persisted_user_message(
+                            messages,
+                            current_idx,
+                        )
+                        _session_messages = getattr(agent, "_session_messages", None)
                         if (
-                            isinstance(_live_user_message, dict)
-                            and _live_user_message.get("role") == "user"
+                            isinstance(_session_messages, list)
+                            and _session_messages is not messages
                         ):
-                            _live_user_message[_DB_PERSISTED_MARKER] = True
-                            _session_messages = getattr(agent, "_session_messages", None)
-                            if isinstance(_session_messages, list) and _session_messages is not messages:
-                                if 0 <= current_idx < len(_session_messages):
-                                    _session_live_user_message = _session_messages[current_idx]
-                                    if (
-                                        isinstance(_session_live_user_message, dict)
-                                        and _session_live_user_message.get("role") == "user"
-                                    ):
-                                        _session_live_user_message[_DB_PERSISTED_MARKER] = True
+                            _stamp_persisted_user_message(
+                                _session_messages,
+                                current_idx,
+                                reference_message=_live_user_message,
+                            )
                     for _handoff_message in compressed:
                         if isinstance(_handoff_message, dict):
                             _handoff_message[_DB_PERSISTED_MARKER] = True
@@ -3935,6 +3988,7 @@ def compress_context(
                     # parent live and discard the stale compacted snapshot.
                     old_session_id = None
                     messages[:] = copy.deepcopy(messages_before_compression)
+                    agent._db_flush_scan_prefix = None
                     compressed = messages
                     _compression_made_progress = False
                     # Restore ONLY the prune runway, not the full attempt

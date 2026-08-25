@@ -17,6 +17,7 @@ These tests drive the real ``compress_context`` path against a real SessionDB.
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 from pathlib import Path
@@ -239,7 +240,7 @@ class TestRotationChildFlushDedup:
             for msg in returned
         )
 
-    def test_rotation_flush_of_original_live_list_keeps_user_once(
+    def test_rotation_flush_of_original_live_list_keeps_user_once_when_handoff_already_contains_user(
         self, tmp_path: Path
     ):
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -249,12 +250,18 @@ class TestRotationChildFlushDedup:
         db.append_message(parent, "assistant", "persisted answer")
 
         loaded = db.get_messages_as_conversation(parent)
-        messages = [*loaded, {"role": "user", "content": "live question"}]
+        live_user = {
+            "role": "user",
+            "content": "live question",
+            "timestamp": 1234.5,
+        }
+        messages = [*loaded, live_user]
 
         agent = _build_agent_with_db(db, parent)
         agent._persist_user_message_idx = len(messages) - 1
         agent.context_compressor.compress.return_value = [
             {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+            copy.deepcopy(live_user),
         ]
 
         real_flush = agent._flush_messages_to_session_db
@@ -268,7 +275,8 @@ class TestRotationChildFlushDedup:
             )
 
         assert agent.session_id != parent
-        real_flush(returned)
+        assert _DB_PERSISTED_MARKER in live_user
+        real_flush(messages, conversation_history=loaded)
 
         child_rows = db.get_messages_as_conversation(
             agent.session_id, include_inactive=True
@@ -356,20 +364,20 @@ class TestRotationChildFlushDedup:
         agent = _build_agent_with_db(db, parent)
         agent._persist_user_message_idx = len(loaded)
         agent.context_compressor.compress.return_value = [
-            assistant_turn,
-            tool_turn,
+            copy.deepcopy(assistant_turn),
+            copy.deepcopy(tool_turn),
         ]
 
         with patch.object(
             agent,
             "_flush_messages_to_session_db",
-            return_value=False,
+            side_effect=RuntimeError("simulated parent flush failure"),
         ):
             returned, _ = agent._compress_context(
                 messages, "sys", approx_tokens=120_000
             )
 
-        agent._flush_messages_to_session_db(returned)
+        agent._flush_messages_to_session_db(messages, conversation_history=loaded)
 
         child_rows = db.get_messages_as_conversation(
             agent.session_id, include_inactive=True
@@ -379,11 +387,11 @@ class TestRotationChildFlushDedup:
         ) == 1
         assert _count_rows(child_rows, content="tool result", role="tool") == 1
 
-    def test_existing_handoff_user_turn_still_writes_live_child_user_once(
+    def test_rotation_stamps_diverged_session_messages_entry_only_when_it_matches(
         self, tmp_path: Path
     ):
         db = SessionDB(db_path=tmp_path / "state.db")
-        parent = "PARENT_ROT_ALREADY_HAS_USER"
+        parent = "PARENT_ROT_SESSION_MESSAGES_DIVERGE"
         db.create_session(parent, source="cli")
         db.append_message(parent, "user", "persisted question")
         db.append_message(parent, "assistant", "persisted answer")
@@ -393,17 +401,23 @@ class TestRotationChildFlushDedup:
 
         agent = _build_agent_with_db(db, parent)
         agent._persist_user_message_idx = len(messages) - 1
+        agent._session_messages = [
+            *loaded,
+            {"role": "user", "content": "different live question"},
+        ]
         agent.context_compressor.compress.return_value = [
-            {"role": "user", "content": "live question"},
+            {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
         ]
 
         returned, _ = agent._compress_context(messages, "sys", approx_tokens=120_000)
-        agent._flush_messages_to_session_db(returned)
+        agent._flush_messages_to_session_db(messages, conversation_history=loaded)
 
         child_rows = db.get_messages_as_conversation(
             agent.session_id, include_inactive=True
         )
         assert _count_rows(child_rows, content="live question", role="user") == 1
+        assert _DB_PERSISTED_MARKER in messages[-1]
+        assert _DB_PERSISTED_MARKER not in agent._session_messages[-1]
 
 
 class TestPlatformForwardedAtBoundary:

@@ -8208,6 +8208,54 @@ class AIAgent:
                 fence=active_fence,
                 telemetry_agent=self,
             )
+            try:
+                from agent.context_compressor import _DB_PERSISTED_MARKER
+            except Exception:
+                _DB_PERSISTED_MARKER = "_db_persisted"
+
+            def _sync_persisted_markers(target_messages, source_messages):
+                if not isinstance(target_messages, list) or not isinstance(
+                    source_messages, list
+                ):
+                    return
+                for source_message in source_messages:
+                    if not (
+                        isinstance(source_message, dict)
+                        and source_message.get(_DB_PERSISTED_MARKER)
+                    ):
+                        continue
+                    source_role = source_message.get("role")
+                    source_content = source_message.get("content")
+                    source_timestamp = source_message.get("timestamp")
+                    for target_message in target_messages:
+                        if not isinstance(target_message, dict):
+                            continue
+                        if target_message.get(_DB_PERSISTED_MARKER):
+                            continue
+                        if target_message.get("role") != source_role:
+                            continue
+                        if target_message.get("content") != source_content:
+                            continue
+                        target_timestamp = target_message.get("timestamp")
+                        if (
+                            target_timestamp is not None
+                            and source_timestamp is not None
+                            and target_timestamp != source_timestamp
+                        ):
+                            continue
+                        target_message[_DB_PERSISTED_MARKER] = True
+                        break
+
+            if isinstance(result, tuple) and result:
+                result_messages = result[0]
+                if isinstance(result_messages, list) and result_messages is not messages:
+                    _sync_persisted_markers(messages, result_messages)
+                    session_messages = getattr(self, "_session_messages", None)
+                    if (
+                        isinstance(session_messages, list)
+                        and session_messages is not messages
+                    ):
+                        _sync_persisted_markers(session_messages, result_messages)
             # compress_context ran on a daemon pool worker thread; the session
             # id rotation updated hermes_logging._session_context (a
             # threading.local) on the WORKER thread, not this one. Propagate
