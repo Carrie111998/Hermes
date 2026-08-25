@@ -27,12 +27,17 @@
 
 **Identity / isolation:**
 
-- Identity is `project_id` + canonical absolute runs-root (resolved, case-folded for uniqueness). Display name and cwd are never identity.
+- Registry location: `{HERMES_HOME}/.htr/project_registry/` (schema `htr.project_registry.record.v1`, `schema_version` 1). Independent of cwd and of any project's `runs_root`.
+- Identity is `project_id` (`prj_YYYYMMDD_hex`) + canonical absolute runs-root (symlink-resolved, `normcase` uniqueness). `display_name` and cwd are never identity.
+- Immutable identity fields: `project_id`, `runs_root`, `created_at`. `update` may change only `display_name` and `status` (`active` | `archived`). Archived is not delete: records remain readable and listable with `include_archived`.
 - Duplicate `project_id` + same canonical path is idempotent (no rewrite).
-- Duplicate `project_id` + different path → identity conflict. Same/overlapping path + different id → path conflict.
-- Unregistered single-project `{HERMES_HOME}/runs` workflow is unchanged.
+- Duplicate `project_id` + different path → identity conflict. Same/overlapping path + different id → path conflict. Overlap uses path semantics (`Path.relative_to`), not string prefix.
+- An HTR project is a runs-root namespace **inside one Hermes profile**. It is not a Hermes profile and does not cross `HERMES_HOME` / profile boundaries.
+- Unregistered single-project `{HERMES_HOME}/runs` workflow is unchanged. No auto-register, no migration, no deletion, no `runs_root` relocate.
 
 **Explicitly not implemented:** Task 31 case history / learning; Task 28 retry/repair; unattended invoke; relocating a project's runs_root; deleting projects; cross-profile orchestration.
+
+**Upstream / authority:** Local v1 on `task29-local-merge-g` is **not** official `upstream/main` completion and **not** an Architect checkpoint. `TASK29_UPSTREAM_COMPLETION=NOT_COMPLETE` is unchanged.
 
 ---
 

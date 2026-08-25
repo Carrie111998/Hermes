@@ -134,7 +134,7 @@ Runtime must not append events or write SoT directly. Writes only through allowl
 
 **Task 27 approved Successor Run creation (Path-R1 creation-only v1 — checkpoint approved and complete):** Control store at `{runs_root}/.control/recovery_runs/{recovery_request_id}/` with immutable records; `{successor}/recovery_origin.json` linkage. **Path R1 only** — creates **one approved linked Successor Run**; original finalized source Run **permanently immutable**; successor creation **does not authorize successor execution**; all six outcome non-permission booleans remain **`false`**; **`forward_fix` outside v1**; attempt-before-creation; exclusive successor reservation/bootstrap without Task 23 marker. Does **not** grant retry, repair, invoke, artifact copy, external side effect, automatic execution, completion, closure, marker disposition, or outcome rewrite. **Task 28 not started and not approved.**
 
-**Task 30 multi-project registry + isolation (local v1):** Registry SoT at `{HERMES_HOME}/.htr/project_registry/projects/{project_id}/record.json` (schema `htr.project_registry.record.v1`). Identity is `prj_` id + canonical absolute runs-root; display name and cwd are not identity. Exclusive create + flock; idempotent re-register of the same id+path; identity/path/overlap conflicts fail closed. Unregistered `{HERMES_HOME}/runs` single-project workflow is unchanged. Does **not** implement Task 31 learning, Task 28 repair, unattended invoke, runs-root relocation, or project deletion.
+**Task 30 multi-project registry + isolation (local v1):** Registry SoT at `{HERMES_HOME}/.htr/project_registry/projects/{project_id}/record.json` (schema `htr.project_registry.record.v1`, `schema_version` 1). Identity is `prj_YYYYMMDD_hex` + canonical absolute runs-root; `project_id`, `runs_root`, and `created_at` are immutable; display name and cwd are not identity. Exclusive create + flock covering check+write; list/get/lookup take the same lock; idempotent re-register of the same id+path; identity/path/overlap conflicts fail closed (path semantics, not string prefix). Archived ≠ delete. HTR project ≠ Hermes profile. Unregistered `{HERMES_HOME}/runs` single-project workflow is unchanged. Does **not** implement Task 31 learning, Task 28 repair, unattended invoke, runs-root relocation, or project deletion. Local v1 is **not** official `upstream/main` completion and **not** an Architect checkpoint. `TASK29_UPSTREAM_COMPLETION=NOT_COMPLETE`.
 
 Ambiguous outcomes include: not started; completed and verified; failed before mutation; may-have-completed (lost ack); SoT/event disagree; post-write verification failed; escalation required.
 
@@ -185,7 +185,7 @@ read-only observability          ← Task 19 ✅
 → Recovery/Successor Run protocol ← Task 27 ✅ (Path-R1 creation-only v1 checkpoint approved and complete)
 → bounded retry and repair       ← Task 28 (not started and not approved)
 → selective unattended automation
-→ multi-project orchestration    ← Task 30
+→ multi-project orchestration    ← Task 30 (local v1; not upstream / not Architect checkpoint)
 → controlled learning            ← Task 31
 ```
 
@@ -243,6 +243,8 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 - Task 26A, 26B, 26B.1, and 26C **closed**; **Task 26 complete for approved v1 scope** (Path B deferred).
 - **Task 27 Path-R1 creation-only v1 checkpoint approved and complete** — creates one approved linked Successor Run; original finalized source Run permanently immutable; successor creation does not authorize successor execution; all six outcome non-permission booleans remain false; forward_fix outside v1; Path R1 only eligibility path.
 - **Task 28 not started and not approved.**
-- **Task 30 multi-project registry + isolation local v1 implemented** — `{HERMES_HOME}/.htr/project_registry`; unregistered single-project runs root unchanged; not an upstream checkpoint.
+- **Task 30 multi-project registry + isolation local v1 implemented** — `{HERMES_HOME}/.htr/project_registry` schema v1; unregistered single-project runs root unchanged; HTR project ≠ Hermes profile; not official `upstream/main`; not an Architect checkpoint.
+- **Task 29 remains `TASK29_UPSTREAM_COMPLETION=NOT_COMPLETE`.** Local Phase I artifact inspection does not complete upstream Task 29.
+- **Task 31 not started and not approved.**
 - No general Phase 2 lifecycle invoke path is enabled outside the Task 25 pilot API.
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.

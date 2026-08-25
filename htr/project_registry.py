@@ -13,6 +13,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -127,6 +129,14 @@ def _canonical_json(data: dict[str, Any]) -> str:
 
 def _sha256_hex(data: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(data).encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def _registry_lock(hermes_home: Path | None) -> Iterator[None]:
+    """Serialize registry check+write. Callers already holding this lock must use unlocked helpers."""
+    lock_path = paths.project_registry_lock_path(hermes_home)
+    with io.file_lock(lock_path):
+        yield
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -288,7 +298,7 @@ def _write_json_exclusive(path: Path, data: dict[str, Any]) -> None:
     _fsync_dir(path.parent)
 
 
-def _record_from_payload(payload: dict[str, Any], *, source: Path) -> ProjectRecord:
+def _record_from_payload(payload: Any, *, source: Path) -> ProjectRecord:
     if not isinstance(payload, dict):
         raise ProjectRegistryCorrupt(f"project record is not a JSON object: {source.name}")
     schema = payload.get("schema")
@@ -330,6 +340,8 @@ def _record_from_payload(payload: dict[str, Any], *, source: Path) -> ProjectRec
         raise ProjectRegistryCorrupt("project record has invalid project_identity_digest")
 
     runs_root = Path(runs_root_raw)
+    if not runs_root.is_absolute():
+        raise ProjectRegistryCorrupt("project record runs_root is not absolute")
     expected_key = path_comparison_key(runs_root)
     expected_root_digest = _runs_root_digest(runs_root)
     expected_identity = _identity_digest(project_id, stored_key)
@@ -522,8 +534,7 @@ def register_project(
         return record
 
 
-def get_project(project_id: str, *, hermes_home: Path | None = None) -> ProjectRecord:
-    pid = _require_project_id(project_id)
+def _get_project_unlocked(pid: str, *, hermes_home: Path | None) -> ProjectRecord:
     record_dir = paths.project_record_dir(pid, hermes_home)
     record_path = paths.project_record_path(pid, hermes_home)
     if not record_dir.exists() and not record_path.exists():
@@ -540,12 +551,23 @@ def get_project(project_id: str, *, hermes_home: Path | None = None) -> ProjectR
     return record
 
 
+def get_project(project_id: str, *, hermes_home: Path | None = None) -> ProjectRecord:
+    pid = _require_project_id(project_id)
+    if not paths.project_registry_root(hermes_home).exists():
+        raise ProjectNotRegistered(f"project is not registered: {pid}")
+    with _registry_lock(hermes_home):
+        return _get_project_unlocked(pid, hermes_home=hermes_home)
+
+
 def list_projects(
     *,
     hermes_home: Path | None = None,
     include_archived: bool = False,
 ) -> list[ProjectRecord]:
-    records = _load_all_records(hermes_home)
+    if not paths.project_registry_root(hermes_home).exists():
+        return []
+    with _registry_lock(hermes_home):
+        records = _load_all_records(hermes_home)
     if not include_archived:
         records = [item for item in records if item.status == PROJECT_STATUS_ACTIVE]
     return sorted(records, key=lambda item: item.project_id)
@@ -560,7 +582,11 @@ def lookup_project_by_runs_root(
     """Return the registered project for *runs_root*, or None if unregistered."""
     resolved = canonicalize_runs_root(runs_root, must_exist=must_exist)
     key = path_comparison_key(resolved)
-    for record in _load_all_records(hermes_home):
+    if not paths.project_registry_root(hermes_home).exists():
+        return None
+    with _registry_lock(hermes_home):
+        records = _load_all_records(hermes_home)
+    for record in records:
         if record.path_comparison_key == key:
             return record
     return None
@@ -584,7 +610,7 @@ def update_project_metadata(
 
     lock_path = paths.project_registry_lock_path(hermes_home)
     with io.file_lock(lock_path):
-        current = get_project(pid, hermes_home=hermes_home)
+        current = _get_project_unlocked(pid, hermes_home=hermes_home)
         next_name = (
             current.display_name
             if display_name is _UNSET

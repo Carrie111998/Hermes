@@ -352,6 +352,10 @@ def test_update_metadata_and_archive(tmp_path):
         created.project_id, status="archived", hermes_home=home
     )
     assert archived.status == "archived"
+    assert archived.created_at == created.created_at
+    assert archived.runs_root == created.runs_root
+    assert archived.project_id == created.project_id
+    assert get_project(created.project_id, hermes_home=home).status == "archived"
     assert list_projects(hermes_home=home) == []
     assert list_projects(hermes_home=home, include_archived=True)[0].status == "archived"
     with pytest.raises(ProjectInvalidInput):
@@ -430,3 +434,196 @@ def test_cli_unknown_project_error_class(capsys):
     assert rc != 0
     assert payload["ok"] is False
     assert payload["error_class"] == "not_registered"
+
+
+def test_string_prefix_paths_are_not_overlap(tmp_path):
+    home = _home(tmp_path)
+    shorter = _runs_dir(tmp_path, "proj")
+    longer = _runs_dir(tmp_path, "project")
+    first = register_project(shorter, hermes_home=home)
+    second = register_project(longer, hermes_home=home)
+    assert first.project_id != second.project_id
+    listed = list_projects(hermes_home=home)
+    assert {item.project_id for item in listed} == {first.project_id, second.project_id}
+
+
+def test_parent_after_child_is_path_conflict(tmp_path):
+    home = _home(tmp_path)
+    parent = _runs_dir(tmp_path, "outer")
+    child = parent / "inner"
+    child.mkdir()
+    register_project(child, hermes_home=home)
+    with pytest.raises(ProjectPathConflict):
+        register_project(parent, hermes_home=home)
+
+
+def test_corrupt_top_level_array_and_field_types(tmp_path):
+    home = _home(tmp_path)
+    runs = _runs_dir(tmp_path)
+    created = register_project(runs, hermes_home=home)
+    record_path = paths.project_record_path(created.project_id, home)
+    original = json.loads(record_path.read_text(encoding="utf-8"))
+
+    record_path.write_text("[1, 2]\n", encoding="utf-8")
+    with pytest.raises(ProjectRegistryCorrupt, match="not a JSON object"):
+        get_project(created.project_id, hermes_home=home)
+
+    missing = dict(original)
+    del missing["created_at"]
+    record_path.write_text(json.dumps(missing, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ProjectRegistryCorrupt, match="created_at"):
+        get_project(created.project_id, hermes_home=home)
+
+    wrong_name = dict(original)
+    wrong_name["display_name"] = 12
+    record_path.write_text(json.dumps(wrong_name, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ProjectRegistryCorrupt, match="display_name"):
+        list_projects(hermes_home=home)
+
+    relative = dict(original)
+    relative["runs_root"] = "relative/runs"
+    record_path.write_text(json.dumps(relative, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ProjectRegistryCorrupt, match="not absolute"):
+        get_project(created.project_id, hermes_home=home)
+
+
+def test_update_rejects_invalid_status(tmp_path):
+    home = _home(tmp_path)
+    runs = _runs_dir(tmp_path)
+    created = register_project(runs, hermes_home=home)
+    with pytest.raises(ProjectInvalidInput, match="status"):
+        update_project_metadata(created.project_id, status="deleted", hermes_home=home)
+    assert get_project(created.project_id, hermes_home=home).status == "active"
+
+
+def test_list_projects_sorts_by_project_id(tmp_path):
+    home = _home(tmp_path)
+    stamp = "20260824"
+    ids = [f"prj_{stamp}_ffffff", f"prj_{stamp}_000000", f"prj_{stamp}_aaaaaa"]
+    for index, project_id in enumerate(ids):
+        register_project(
+            _runs_dir(tmp_path, f"sort-{index}"),
+            project_id=project_id,
+            hermes_home=home,
+        )
+    listed = list_projects(hermes_home=home)
+    assert [item.project_id for item in listed] == sorted(ids)
+
+
+def test_concurrent_metadata_updates_leave_valid_record(tmp_path):
+    home = _home(tmp_path)
+    runs = _runs_dir(tmp_path)
+    created = register_project(runs, display_name="Start", hermes_home=home)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _worker(label: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            update_project_metadata(created.project_id, display_name=label, hermes_home=home)
+        except BaseException as exc:  # noqa: BLE001 — capture for assertion
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_worker, args=("Alpha",)),
+        threading.Thread(target=_worker, args=("Beta",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert errors == []
+    loaded = get_project(created.project_id, hermes_home=home)
+    assert loaded.display_name in {"Alpha", "Beta"}
+    assert loaded.project_id == created.project_id
+    assert loaded.runs_root == created.runs_root
+    assert loaded.created_at == created.created_at
+
+
+def test_cli_update_unregistered_and_observe_project_id(tmp_path, capsys, monkeypatch):
+    from hermes_cli import htr as cli_htr
+
+    missing = SimpleNamespace(
+        htr_command="project",
+        htr_project_command="update",
+        project_id=generate_project_id(),
+        display_name="Nope",
+        clear_display_name=False,
+        status=None,
+    )
+    rc = cli_htr.htr_command(missing)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc != 0
+    assert payload["error_class"] == "not_registered"
+
+    captured: dict[str, object] = {}
+
+    def fake_snapshot(run_id, base_dir=None):
+        captured["run_id"] = run_id
+        captured["base_dir"] = base_dir
+        return {"run_id": run_id, "integrity": {"status": "ok", "error_count": 0}}
+
+    monkeypatch.setattr(cli_htr, "build_run_snapshot", fake_snapshot)
+    monkeypatch.setattr(cli_htr, "compute_exit_code", lambda *_args, **_kwargs: 0)
+
+    runs = _runs_dir(tmp_path)
+    record = register_project(runs)
+    observe_args = SimpleNamespace(
+        htr_command="observe",
+        run_id="run_20260824_aaaaaa",
+        project_id=record.project_id,
+        runs_root=None,
+        summary=False,
+        strict=False,
+    )
+    assert cli_htr.htr_command(observe_args) == 0
+    capsys.readouterr()
+    assert captured["base_dir"] == record.runs_root
+
+    other = _runs_dir(tmp_path, "other-root")
+    mismatch = SimpleNamespace(
+        htr_command="observe",
+        run_id="run_20260824_aaaaaa",
+        project_id=record.project_id,
+        runs_root=str(other),
+        summary=False,
+        strict=False,
+    )
+    mismatch_rc = cli_htr.htr_command(mismatch)
+    mismatch_payload = json.loads(capsys.readouterr().out)
+    assert mismatch_rc != 0
+    assert mismatch_payload["error_class"] == "identity_conflict"
+
+    legacy = SimpleNamespace(
+        htr_command="observe",
+        run_id="run_20260824_aaaaaa",
+        project_id=None,
+        runs_root=str(runs),
+        summary=False,
+        strict=False,
+    )
+    assert cli_htr.htr_command(legacy) == 0
+    assert captured["base_dir"] == Path(str(runs))
+
+    plan_captured: dict[str, object] = {}
+
+    def fake_plan(snapshot, intent):
+        plan_captured["base_dir"] = intent.htr_runs_root
+        return {"ok": True}
+
+    monkeypatch.setattr(cli_htr, "build_action_plan", fake_plan)
+    monkeypatch.setattr(cli_htr, "compute_plan_exit_code", lambda *_args, **_kwargs: 0)
+    plan_args = SimpleNamespace(
+        htr_command="plan",
+        run_id="run_20260824_aaaaaa",
+        project_id=record.project_id,
+        runs_root=None,
+        inputs_file=None,
+        action=None,
+        project_checkpoint=None,
+        remediation_intent=False,
+        summary=False,
+    )
+    assert cli_htr.htr_command(plan_args) == 0
+    assert plan_captured["base_dir"] == str(record.runs_root)
