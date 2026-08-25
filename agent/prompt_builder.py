@@ -1628,7 +1628,7 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     try:
         st = os.stat(marker_path)
         manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = [
-            int(st.st_mtime), int(st.st_size),
+            st.st_mtime_ns, int(st.st_size),
         ]
     except OSError:
         pass
@@ -1654,6 +1654,35 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
                 continue
             manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
     return manifest
+
+
+def _index_dirs_fingerprint(dirs: "list[Path]") -> tuple[str, ...]:
+    """Fingerprint the skill index files under *dirs* by relative path, mtime_ns,
+    and size.
+
+    Used as part of the in-process prompt-cache key so that a skill
+    install/uninstall/edit made by a *different* process (e.g. ``hermes skills
+    install`` while the gateway keeps running) invalidates the cached index for
+    the external and project skill tiers as well as the local one. Mirrors the
+    ``mtime_ns + size`` scheme of ``_build_skills_manifest`` (nanosecond
+    resolution, so a same-second edit preserving size still invalidates).
+    ``iter_skill_index_files`` applies the same exclusion rules (metadata,
+    support dirs, org mirrors) as the index scan itself, so touching an ignored
+    file does not spuriously invalidate the cache.
+    """
+    entries: list[str] = []
+    for root in dirs:
+        if not root.exists():
+            continue
+        prefix = len(os.path.join(str(root), ""))
+        for filename in ("SKILL.md", "DESCRIPTION.md"):
+            for path in iter_skill_index_files(root, filename):
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                entries.append(f"{str(path)[prefix:]}:{st.st_mtime_ns}:{st.st_size}")
+    return tuple(sorted(entries))
 
 
 def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
@@ -1902,8 +1931,30 @@ def _build_skills_system_prompt_inner(
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     project_dirs = project_dirs or []
+    # Fingerprint the skill directories so a skill install/uninstall/edit made
+    # by a *different* process (e.g. `hermes skills install` while the gateway
+    # keeps running) invalidates this process's cached index. Without this,
+    # the LRU serves a stale skill list for the lifetime of the gateway and
+    # newly installed skills never reach the model's system prompt. The
+    # manifest is the same mtime_ns+size fingerprint the disk snapshot uses for
+    # validation — cheap to compute and catches any content change, including
+    # a same-second edit that preserves byte size.
+    _skills_fingerprint = tuple(
+        sorted(
+            f"{rel}:{mtime_ns}:{size}"
+            for rel, (mtime_ns, size) in _build_skills_manifest(skills_dir).items()
+        )
+    )
+    # External and project skill tiers feed the same index but are keyed by
+    # path alone; fingerprint their contents too so a skill added to an
+    # external/project dir by another process invalidates the cache as well.
+    _external_fingerprint = _index_dirs_fingerprint(list(external_dirs))
+    _project_fingerprint = _index_dirs_fingerprint(project_dirs)
     cache_key = (
         str(skills_dir),
+        _skills_fingerprint,
+        _external_fingerprint,
+        _project_fingerprint,
         tuple(str(d) for d in external_dirs),
         tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
