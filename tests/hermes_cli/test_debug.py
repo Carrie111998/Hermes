@@ -1003,6 +1003,29 @@ class TestDebugSlashCommand:
         run.assert_not_called()
         assert "/debug upload" in capsys.readouterr().out
 
+    def test_upload_failure_keeps_persistent_slash_worker_alive(self):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        from tui_gateway.slash_worker import _run
+
+        class _WorkerCLI(CLICommandsMixin):
+            def process_command(self, command):
+                if command.startswith("/debug"):
+                    self._handle_debug_command(command)
+                else:
+                    print("worker still alive")
+
+        cli = _WorkerCLI()
+        with patch(
+            "hermes_cli.debug.build_debug_share",
+            side_effect=RuntimeError("paste.rs unavailable"),
+        ):
+            failure = _run(cli, "/debug upload")
+            follow_up = _run(cli, "/worker-health")
+
+        assert "Upload failed: paste.rs unavailable" in failure
+        assert "hermes debug share --local" in failure
+        assert follow_up == "worker still alive"
+
 
     def test_word_parsing_is_case_insensitive(self):
         c = self._captured("/debug NOUS")

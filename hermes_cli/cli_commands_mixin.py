@@ -3800,7 +3800,14 @@ class CLICommandsMixin:
         args = SimpleNamespace(
             lines=200, expire=7, local=local, nous=nous, yes=True
         )
-        run_debug_share(args)
+        try:
+            run_debug_share(args)
+        except SystemExit:
+            # ``run_debug_share`` is also a CLI entry point, so upload failures
+            # intentionally use a non-zero process exit there. Slash commands
+            # run inside a persistent worker and must keep that process alive;
+            # the actionable error has already been printed into its response.
+            return
 
     def _handle_update_command(self) -> bool:
         """Handle /update — update Hermes Agent to the latest version.
