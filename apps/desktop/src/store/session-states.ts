@@ -773,6 +773,21 @@ export const $sessionTiles = atom<SessionTile[]>(
   isSecondaryWindow() ? [] : [...(tilesByProfile[profileKey()] ?? []), ...(tilesByProfile[BOTS_TILE_BUCKET] ?? [])]
 )
 
+// A resume-resolved owner is useful only while that tile is mounted. Prune at
+// the atom boundary so close, profile switch, restore, and direct test/store
+// replacement all release the record; otherwise repeatedly opened one-off
+// tiles grow resolvedTileOwners forever and can revive stale ownership if a
+// stored id is reused later.
+$sessionTiles.subscribe(tiles => {
+  const mounted = new Set(tiles.map(tile => tile.storedSessionId))
+
+  for (const storedSessionId of resolvedTileOwners.keys()) {
+    if (!mounted.has(storedSessionId)) {
+      resolvedTileOwners.delete(storedSessionId)
+    }
+  }
+})
+
 function persistTiles() {
   // Shares the origin's storage; a secondary window holds no tiles, so a write
   // back would only wipe the primary's set.

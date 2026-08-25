@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
 import { DropdownMenuItem, dropdownMenuRow } from '@/components/ui/dropdown-menu'
-import type { HermesGateway } from '@/hermes'
+import type { HermesGateway, ProfileScope } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { currentPickerSelection } from '@/lib/model-status-label'
@@ -38,9 +38,8 @@ export interface ModelSelection {
 interface ModelMenuPanelProps {
   gateway?: HermesGateway
   onSelectModel: (selection: ModelSelection) => Promise<boolean> | void
-  /** Profile whose catalog this is. Omitted → the active API profile scope
-   *  (never pinned to a literal 'default'). */
-  profile?: string
+  /** Owner scope whose catalog this is. Omitted → the active API scope. */
+  profile?: ProfileScope
   /** THIS surface's dispatcher — owner-routed for a tile. Catalog reads go
    *  through it too, not only writes: `model.options` resolves the session in
    *  the answering backend's own process, so the ambient socket returns the

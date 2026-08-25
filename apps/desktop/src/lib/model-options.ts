@@ -1,4 +1,5 @@
-import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse } from '@/hermes'
+import { profileScopeKey } from '@/api/client'
+import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse, type ProfileScope } from '@/hermes'
 import type { ModelOptionProvider } from '@/types/hermes'
 
 /**
@@ -47,7 +48,7 @@ interface ModelOptionsRequest {
   /** Profile whose REST catalog the recovery path reads. Defaults to the
    *  active API profile — wrong for a tile bound to another profile's
    *  session, so session-bound surfaces pass their owner's profile. */
-  profile?: null | string
+  profile?: ProfileScope
   refresh?: boolean
   /**
    * Owner-routed dispatcher for the `model.options` read. Takes precedence
@@ -60,10 +61,8 @@ interface ModelOptionsRequest {
   sessionId?: null | string
 }
 
-export function modelOptionsQueryKey(profile: null | string | undefined, sessionId?: null | string) {
-  const profileKey = (profile ?? '').trim() || 'default'
-
-  return ['model-options', profileKey, sessionId || 'global'] as const
+export function modelOptionsQueryKey(profile: ProfileScope, sessionId?: null | string) {
+  return ['model-options', profileScopeKey(profile), sessionId || 'global'] as const
 }
 
 function hasSelectableModels(options: ModelOptionsResponse | null | undefined): boolean {
@@ -72,13 +71,13 @@ function hasSelectableModels(options: ModelOptionsResponse | null | undefined): 
 
 function restModelOptions(
   opts: { explicitOnly: boolean; refresh?: true },
-  profile: null | string | undefined
+  profile: ProfileScope
 ): Promise<ModelOptionsResponse> {
-  const key = (profile ?? '').trim()
-
-  // Only pin the profile when the caller named one — the default keeps the
-  // active API profile scope (and the call shape) every other caller relies on.
-  return key ? getGlobalModelOptions(opts, key) : getGlobalModelOptions(opts)
+  // Only pass a scope when the caller named one — undefined keeps the active
+  // API (connection, profile) scope and the call shape global callers rely on.
+  return profile == null || (typeof profile === 'string' && !profile.trim())
+    ? getGlobalModelOptions(opts)
+    : getGlobalModelOptions(opts, profile)
 }
 
 export async function requestModelOptions({

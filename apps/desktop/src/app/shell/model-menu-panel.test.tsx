@@ -402,16 +402,23 @@ describe('ModelMenuPanel provider collapse', () => {
 })
 
 // #93892: a tile's menu is handed an owner-routed `requestGateway`; catalog
-// READS must ride it too (not only writes), or a secondary-profile bot chat
-// lists the ambient profile's models.
+// READS and fallback must remain on that owner (not only writes), or a remote
+// bot tile can list the active connection's models.
 describe('ModelMenuPanel catalog routing', () => {
-  it('reads the catalog through the surface dispatcher, scoped to its session', async () => {
+  it("keeps a remote-owner tile's empty WS catalog pinned while another connection is active", async () => {
+    const ownerScope = { connectionId: 'remote-owner', profile: 'backend-bot' }
+
     const requestGateway = vi.fn(async (method: string) =>
-      method === 'model.options' ? { model: 'gemini-3.1-pro', provider: 'google', providers: [GOOGLE_PROVIDER] } : {}
+      method === 'model.options' ? { model: 'gemini-3.1-pro', provider: 'google', providers: [] } : {}
     )
 
-    // The ambient REST catalog is a different profile's — it must not show.
-    getGlobalModelOptions.mockResolvedValue({ providers: [DEEPSEEK_PROVIDER] })
+    // Deterministic active-connection trap: only the explicit owner scope gets
+    // the owner's REST catalog; an ambient fallback gets the other connection.
+    getGlobalModelOptions.mockImplementation(async (_opts, scope) =>
+      JSON.stringify(scope) === JSON.stringify(ownerScope)
+        ? { providers: [GOOGLE_PROVIDER] }
+        : { providers: [DEEPSEEK_PROVIDER] }
+    )
 
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
@@ -419,7 +426,11 @@ describe('ModelMenuPanel catalog routing', () => {
       <QueryClientProvider client={client}>
         <DropdownMenu open>
           <DropdownMenuContent>
-            <ModelMenuPanel onSelectModel={vi.fn()} profile="bot" requestGateway={requestGateway as never} />
+            <ModelMenuPanel
+              onSelectModel={vi.fn()}
+              profile={ownerScope}
+              requestGateway={requestGateway as never}
+            />
           </DropdownMenuContent>
         </DropdownMenu>
       </QueryClientProvider>
@@ -428,7 +439,7 @@ describe('ModelMenuPanel catalog routing', () => {
     await content.findByText(/Gemini 3\.1 Pro/i)
 
     expect(requestGateway).toHaveBeenCalledWith('model.options', { explicit_only: true, session_id: 'runtime-1' })
-    expect(getGlobalModelOptions).not.toHaveBeenCalled()
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, ownerScope)
     expect(content.queryByText('Deepseek Chat')).toBeNull()
   })
 })

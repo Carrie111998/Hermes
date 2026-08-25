@@ -214,6 +214,36 @@ describe('requestModelOptions owner routing', () => {
     expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, 'bot')
   })
 
+  it("keeps a remote-owner tile's empty WS catalog pinned during REST recovery while another connection is active", async () => {
+    const ambientPayload = {
+      model: 'ambient-model',
+      provider: 'ambient',
+      providers: [{ models: ['ambient-model'], name: 'Ambient', slug: 'ambient' }]
+    }
+
+    const ownerPayload = {
+      model: 'owner-model',
+      provider: 'owner',
+      providers: [{ models: ['owner-model'], name: 'Owner', slug: 'owner' }]
+    }
+
+    const ownerScope = { connectionId: 'remote-owner', profile: 'backend-bot' }
+    const request = vi.fn(() => Promise.resolve({ model: 'owner-model', provider: 'owner', providers: [] }))
+
+    // Deterministically model the active-connection trap: an unpinned REST
+    // read returns the foreground connection's catalog; only the exact tile
+    // owner scope reaches the backend that owns the session.
+    vi.mocked(getGlobalModelOptions).mockImplementationOnce(async (_opts, scope) =>
+      JSON.stringify(scope as unknown) === JSON.stringify(ownerScope) ? ownerPayload : ambientPayload
+    )
+
+    await expect(
+      requestModelOptions({ profile: ownerScope as never, request: request as never, sessionId: 'tile-runtime' })
+    ).resolves.toEqual(ownerPayload)
+
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, ownerScope)
+  })
+
   it('keeps the unpinned REST call shape when no profile is named', async () => {
     const request = vi.fn(() => Promise.reject(new Error('socket closed')))
 

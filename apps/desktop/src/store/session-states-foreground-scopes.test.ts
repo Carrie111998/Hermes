@@ -112,4 +112,15 @@ describe('foregroundSessionScopes', () => {
     $sessionTiles.set([])
     expect(foregroundSessionScopes().has('conn:local::bot')).toBe(false)
   })
+
+  it('forgets a resolved owner when its tile closes instead of reviving stale ownership', () => {
+    $sessionTiles.set([{ storedSessionId: 'stored-resolved' }])
+    recordTileOwner('stored-resolved', 'bot')
+    expect(foregroundSessionScopes()).toEqual(new Set(['bot']))
+
+    $sessionTiles.set([])
+    $sessionTiles.set([{ storedSessionId: 'stored-resolved' }])
+
+    expect(foregroundSessionScopes()).toEqual(new Set())
+  })
 })
