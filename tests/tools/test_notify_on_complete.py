@@ -295,6 +295,12 @@ class TestCompletionConsumed:
         assert result["status"] == "running"
         assert not registry.is_completion_consumed("proc_ack_run")
 
+    def test_ack_on_unknown_session_is_not_found(self, registry):
+        """ack() on a session_id the registry has never seen must report
+        not_found rather than silently acknowledging."""
+        result = registry.ack("nope")
+        assert result["status"] == "not_found"
+
 
 # ---------------------------------------------------------------------------
 # Silent-background-process hint
