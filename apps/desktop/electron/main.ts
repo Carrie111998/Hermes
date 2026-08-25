@@ -13492,7 +13492,7 @@ async function probeSshProfileInventory(connection) {
       SSH_INVENTORY_RETRY_MS
     )
   ) {
-    return
+    return connectionInstallIds.get(connection.id)?.id
   }
 
   sshInventoryAttemptedAt.set(connection.id, Date.now())
@@ -13507,7 +13507,7 @@ async function probeSshProfileInventory(connection) {
   })
 
   if (!sshConfig) {
-    return
+    return connectionInstallIds.get(connection.id)?.id
   }
 
   const ssh = createSshProbeConnection(
@@ -13518,9 +13518,14 @@ async function probeSshProfileInventory(connection) {
   try {
     await ssh.open()
     const profiles = await remoteLifecycle.listRemoteHermesProfiles(ssh)
+    const installId = await remoteLifecycle.probeRemoteHermesInstallId(ssh)
 
     if (profiles.length > 0) {
       sshRosterCache.set(connection.id, profiles)
+    }
+
+    if (installId) {
+      rememberConnectionInstallId(connection.id, { install_id: installId })
     }
   } catch (error: any) {
     sshRememberLog(`[ssh] profile inventory failed for ${connection.id}: ${error?.message || error}`)
@@ -13531,6 +13536,8 @@ async function probeSshProfileInventory(connection) {
       void 0
     }
   }
+
+  return connectionInstallIds.get(connection.id)?.id
 }
 
 async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRegistry()) {
@@ -13569,8 +13576,8 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
         // respawn Spark/Mini every Bot Mode poll (~5s), then the mux died
         // (ECONNRESET / liveness probe drop).
         if (connection.kind === 'ssh') {
-          await probeSshProfileInventory(connection)
-          raw = { connection, profiles: null, error: 'connect-on-demand' }
+          const installId = await probeSshProfileInventory(connection)
+          raw = { connection, profiles: null, error: 'connect-on-demand', ...(installId ? { installId } : {}) }
         } else {
           // Same connect-on-demand courtesy for the forced-local path: when
           // the primary route is remote, enumerating "This device" would

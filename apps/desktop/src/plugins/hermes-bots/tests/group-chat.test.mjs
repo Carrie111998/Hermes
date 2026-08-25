@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, rebindKnownGroupChatMembers, canonicalizeResolvableGroupChatMembers, reconcileKnownGroupChatMembers, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, $lastSources, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -631,6 +631,202 @@ test('group gateway mirror is size bounded and favors recent messages', () => {
   assert.ok(snapshot.rooms['name:Large'].log.length <= 16)
   assert.match(snapshot.rooms['name:Large'].log.at(-1).text, /^99:/)
   assert.ok(snapshot.rooms['name:Large'].log.at(-1).text.length <= 1200)
+})
+
+test('group gateway mirror gives members stable machine identities', () => {
+  const gc = load(() => '(pass)')
+  gc.$lastSources.set([
+    { connectionId: 'local', kind: 'local', label: 'This device', installId: 'macbook-install' },
+    { connectionId: 'mac-mini', kind: 'ssh', label: 'Mac Mini', installId: 'mini-install' }
+  ])
+
+  const snapshot = gc.groupChatSyncSnapshot({
+    Shared: {
+      log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }],
+      members: [
+        { name: 'default', connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', sourceScoped: true },
+        { name: 'default', connectionId: 'mac-mini', connectionKind: 'ssh', connectionLabel: 'Mac Mini', sourceScoped: true }
+      ]
+    }
+  })
+
+  assert.equal(
+    JSON.stringify(snapshot.rooms['name:Shared'].members.map(member => member.sourceInstallId)),
+    JSON.stringify(['macbook-install', 'mini-install'])
+  )
+  assert.ok(snapshot.rooms['name:Shared'].members.every(member => !('connectionId' in member)))
+})
+
+test('synced group members rebind to this Desktop connection ids', () => {
+  const gc = load(() => '(pass)')
+  gc.$lastSources.set([
+    { connectionId: 'local', kind: 'local', label: 'This device', installId: 'mini-install' },
+    { connectionId: 'macbook', kind: 'ssh', label: 'MacBook', installId: 'macbook-install' }
+  ])
+  gc.$lastRoster.set([
+    { name: 'default', connectionId: 'local', handle: 'default-this-device' },
+    { name: 'default', connectionId: 'macbook', handle: 'default-macbook' }
+  ])
+
+  const merged = gc.mergeRemoteGroupChatSnapshotIntoRooms({
+    version: 3,
+    rooms: {
+      'name:Shared': {
+        name: 'Shared',
+        revision: 2,
+        log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }],
+        members: [
+          {
+            name: 'default',
+            connectionId: 'local',
+            connectionKind: 'local',
+            connectionLabel: 'This device',
+            sourceInstallId: 'macbook-install',
+            sourceScoped: true
+          },
+          {
+            name: 'default',
+            connectionId: 'mac-mini',
+            connectionKind: 'ssh',
+            connectionLabel: 'Mac Mini',
+            sourceInstallId: 'mini-install',
+            sourceScoped: true
+          }
+        ]
+      }
+    }
+  }, {})
+
+  assert.equal(
+    JSON.stringify(merged.Shared.members.map(member => ({
+      connectionId: member.connectionId,
+      connectionLabel: member.connectionLabel,
+      handle: member.handle,
+      remoteSource: member.remoteSource
+    }))),
+    JSON.stringify([
+      { connectionId: 'macbook', connectionLabel: 'MacBook', handle: 'default-macbook', remoteSource: true },
+      { connectionId: 'local', connectionLabel: 'This device', handle: 'default-this-device', remoteSource: false }
+    ])
+  )
+})
+
+test('synced group members rebind after the source inventory arrives late', () => {
+  const gc = load(() => '(pass)')
+  const imported = gc.mergeRemoteGroupChatSnapshotIntoRooms({
+    version: 3,
+    rooms: {
+      'name:Shared': {
+        name: 'Shared',
+        revision: 1,
+        log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }],
+        members: [{ name: 'default', sourceInstallId: 'macbook-install', sourceScoped: true }]
+      }
+    }
+  }, {})
+
+  assert.equal(imported.Shared.members[0].connectionId, undefined)
+  assert.equal(imported.Shared.members[0].remoteSource, true)
+
+  gc.$lastSources.set([
+    { connectionId: 'macbook', kind: 'ssh', label: 'MacBook', installId: 'macbook-install' }
+  ])
+  gc.$lastRoster.set([
+    { name: 'default', connectionId: 'macbook', handle: 'default-macbook' }
+  ])
+  const rebound = gc.rebindKnownGroupChatMembers(imported)
+
+  assert.equal(rebound.changed, true)
+  assert.equal(rebound.rooms.Shared.members[0].connectionId, 'macbook')
+  assert.equal(rebound.rooms.Shared.members[0].handle, 'default-macbook')
+})
+
+test('legacy room membership canonicalizes only on the origin connection registry', () => {
+  const origin = load(() => '(pass)')
+  origin.$lastSources.set([
+    { connectionId: 'local', kind: 'local', label: 'This device', installId: 'macbook-install' },
+    { connectionId: 'mac-mini', kind: 'ssh', label: 'Mac Mini', installId: 'mini-install' }
+  ])
+  const rooms = {
+    Shared: {
+      log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }],
+      members: [
+        { name: 'default', connectionId: 'local', sourceScoped: true },
+        { name: 'default', connectionId: 'mac-mini', sourceScoped: true }
+      ]
+    }
+  }
+  const canonical = origin.canonicalizeResolvableGroupChatMembers(rooms)
+
+  assert.equal(JSON.stringify(canonical.changedRooms), JSON.stringify(['Shared']))
+  assert.equal(
+    JSON.stringify(canonical.rooms.Shared.members.map(member => member.sourceInstallId)),
+    JSON.stringify(['macbook-install', 'mini-install'])
+  )
+
+  const peer = load(() => '(pass)')
+  peer.$lastSources.set([
+    { connectionId: 'local', kind: 'local', label: 'This device', installId: 'mini-install' },
+    { connectionId: 'macbook', kind: 'ssh', label: 'MacBook', installId: 'macbook-install' }
+  ])
+  const untouched = peer.canonicalizeResolvableGroupChatMembers(rooms)
+
+  assert.equal(untouched.changedRooms.length, 0)
+  assert.equal(untouched.rooms.Shared, rooms.Shared)
+})
+
+test('canonical membership collapses legacy and stable copies of the same machines', () => {
+  const gc = load(() => '(pass)')
+  gc.$lastSources.set([
+    { connectionId: 'local', kind: 'local', label: 'This device', installId: 'macbook-install' },
+    { connectionId: 'mac-mini', kind: 'ssh', label: 'Mac Mini', installId: 'mini-install' }
+  ])
+  const rooms = {
+    Shared: {
+      log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }],
+      members: [
+        { name: 'default', connectionId: 'local' },
+        { name: 'default', connectionId: 'mac-mini' },
+        { name: 'default', sourceInstallId: 'mini-install' }
+      ]
+    }
+  }
+  const canonical = gc.canonicalizeResolvableGroupChatMembers(rooms)
+  const snapshot = gc.groupChatSyncSnapshot(canonical.rooms)
+
+  assert.equal(canonical.rooms.Shared.members.length, 2)
+  assert.equal(snapshot.rooms['name:Shared'].members.length, 2)
+  assert.equal(
+    JSON.stringify(snapshot.rooms['name:Shared'].members.map(member => member.sourceInstallId).sort()),
+    JSON.stringify(['macbook-install', 'mini-install'])
+  )
+})
+
+test('late room hydration replaces legacy aliases with one stable member per machine', () => {
+  const gc = load(() => '(pass)')
+
+  // The roster can finish before storage/server room hydration on a cold boot.
+  gc.$lastSources.set([
+    { connectionId: 'local', kind: 'local', label: 'This device', installId: 'macbook-install' },
+    { connectionId: 'mac-mini', kind: 'ssh', label: 'Mac Mini', installId: 'mini-install' }
+  ])
+  const reconciled = gc.reconcileKnownGroupChatMembers({
+    Shared: {
+      log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }],
+      members: [
+        { name: 'default', connectionId: 'local' },
+        { name: 'default', connectionId: 'mac-mini' },
+        { name: 'default', sourceInstallId: 'mini-install', sourceScoped: true }
+      ]
+    }
+  })
+
+  assert.equal(reconciled.changed, true)
+  assert.equal(reconciled.rooms.Shared.members.length, 2)
+  assert.equal(
+    JSON.stringify(reconciled.rooms.Shared.members.map(member => member.sourceInstallId).sort()),
+    JSON.stringify(['macbook-install', 'mini-install'])
+  )
 })
 
 test('group gateway mirror preserves threads and budgets escaped Unicode', () => {

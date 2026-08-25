@@ -278,6 +278,25 @@ async function listRemoteHermesProfiles(ssh) {
   return parseRemoteProfileListing(listing)
 }
 
+async function probeRemoteHermesInstallId(ssh) {
+  const home = assertSafeRemoteHome(await probeRemoteHermesHome(ssh))
+  const file = expandRemotePath(`${home}/install_id`)
+  let output = ''
+
+  try {
+    output = await ssh.exec(`if [ -f ${file} ]; then IFS= read -r value < ${file}; printf '%s\\n' "$value"; fi`)
+  } catch (cause) {
+    const error: any = new Error('Could not read the remote Hermes install id.')
+    error.kind = 'transient-transport-error'
+    error.cause = cause
+    throw error
+  }
+
+  const value = String(output || '').trim().split('\n').pop() || ''
+
+  return /^[A-Za-z0-9._:-]{8,160}$/.test(value) ? value : ''
+}
+
 function assertSafeRemoteHome(home) {
   const value = String(home || '').trim()
 
@@ -973,6 +992,7 @@ export {
   pidIsOurDashboard,
   probeHermesVersion,
   probeRemoteHermesHome,
+  probeRemoteHermesInstallId,
   probeRemotePlatform,
   PROTOCOL_VERSION,
   readLockfile,

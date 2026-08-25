@@ -553,6 +553,7 @@ const groupChatSyncInFlightConnections = new Set()
 const groupChatSyncRetryTimers = new Map()
 const groupChatSyncRetryCounts = new Map()
 let groupChatSyncDisposed = false
+let groupChatSyncSourceFingerprint = ''
 
 /** Conservative byte count for the gateway's ensure_ascii JSON encoding.
  *  Python also inserts separator spaces, so reserve one extra byte per JS
@@ -620,6 +621,160 @@ function normalizeGroupChatSyncSnapshot(snapshot) {
   return { version: 3, updatedAt: Number(snapshot.updatedAt || 0), rooms, deleted }
 }
 
+function groupChatSyncSource(connectionId, installId = '', sources = $lastSources.get()) {
+  const stableId = String(installId || '').trim()
+  const localId = String(connectionId || '').trim()
+  const rows = Array.isArray(sources) ? sources : []
+
+  if (stableId) {
+    const byInstall = rows.find(source => String(source?.installId || '').trim() === stableId)
+
+    return byInstall || null
+  }
+
+  return rows.find(source => String(source?.connectionId || '').trim() === localId) || null
+}
+
+function groupChatMemberForSync(member) {
+  const source = groupChatSyncSource(member?.connectionId, member?.sourceInstallId)
+  const sourceInstallId = String(member?.sourceInstallId || source?.installId || '').trim()
+
+  if (sourceInstallId) {
+    // Device-local connection ids/labels (especially `local` / `This device`)
+    // must never enter the shared projection: another Desktop would interpret
+    // them as its own machine and two writers would flap the room forever.
+    return {
+      name: String(member?.name || '').slice(0, 128),
+      sourceInstallId: sourceInstallId.slice(0, 160),
+      sourceScoped: true
+    }
+  }
+
+  return {
+    name: String(member?.name || '').slice(0, 128),
+    ...(member?.handle ? { handle: String(member.handle).slice(0, 128) } : {}),
+    ...(member?.connectionId ? { connectionId: String(member.connectionId).slice(0, 128) } : {}),
+    ...(member?.connectionKind ? { connectionKind: String(member.connectionKind).slice(0, 64) } : {}),
+    ...(member?.connectionLabel ? { connectionLabel: String(member.connectionLabel).slice(0, 128) } : {}),
+    ...(member?.sourceScoped ? { sourceScoped: true } : {})
+  }
+}
+
+/** Translate a synced machine identity back into this Desktop's connection
+ * registry. Connection ids such as `local` are device-relative; install_id is
+ * the stable backend identity shared by both computers. */
+function rebindSyncedGroupMember(member) {
+  const source = groupChatSyncSource(member?.connectionId, member?.sourceInstallId)
+
+  if (!source) {
+    return { ...member, remoteSource: true }
+  }
+
+  const connectionId = String(source.connectionId || member?.connectionId || '')
+  const name = String(member?.name || '')
+  const roster = (Array.isArray($lastRoster.get()) ? $lastRoster.get() : []).find(row =>
+    String(row?.connectionId || '') === connectionId &&
+    String(row?.name || row?.profile || '') === name
+  )
+
+  return {
+    ...member,
+    connectionId,
+    connectionKind: source.kind || member?.connectionKind,
+    connectionLabel: source.label || member?.connectionLabel,
+    ...(source.installId ? { sourceInstallId: String(source.installId) } : {}),
+    ...(roster?.handle ? { handle: String(roster.handle) } : {}),
+    sourceScoped: true,
+    remoteSource: source.kind !== 'local'
+  }
+}
+
+function rebindKnownGroupChatMembers(all = $groupChats.get()) {
+  let changed = false
+  const rooms = {}
+
+  for (const [name, room] of Object.entries(all || {})) {
+    let roomChanged = false
+    const members = (Array.isArray(room?.members) ? room.members : []).map(member => {
+      if (!member?.sourceInstallId) {
+        return member
+      }
+
+      const rebound = rebindSyncedGroupMember(member)
+      const differs =
+        rebound.connectionId !== member.connectionId ||
+        rebound.connectionKind !== member.connectionKind ||
+        rebound.connectionLabel !== member.connectionLabel ||
+        rebound.handle !== member.handle ||
+        rebound.remoteSource !== member.remoteSource
+
+      if (differs) {
+        changed = true
+        roomChanged = true
+      }
+
+      return rebound
+    })
+
+    rooms[name] = roomChanged ? { ...room, members } : room
+  }
+
+  return { rooms, changed }
+}
+
+/** Upgrade one locally-authored legacy room only when every member's old
+ * connection id resolves on this Desktop. That is true on the room's origin
+ * machine and false on a synced peer where `local` / custom ids mean something
+ * else. The origin can then publish one higher-revision canonical membership. */
+function canonicalizeResolvableGroupChatMembers(all = $groupChats.get()) {
+  const rooms = { ...(all || {}) }
+  const changedRooms = []
+
+  for (const [name, room] of Object.entries(rooms)) {
+    const members = Array.isArray(room?.members) ? room.members : []
+
+    if (!members.length || !members.some(member => !member?.sourceInstallId)) {
+      continue
+    }
+
+    const sources = members.map(member =>
+      groupChatSyncSource(member?.connectionId, member?.sourceInstallId)
+    )
+
+    if (sources.some(source => !source?.installId)) {
+      continue
+    }
+
+    const canonicalMembers = new Map()
+    members.forEach((member, index) => {
+      const canonical = rebindSyncedGroupMember({ ...member, sourceInstallId: String(sources[index].installId) })
+      canonicalMembers.set(groupChatSyncMemberKey(canonical), canonical)
+    })
+
+    rooms[name] = {
+      ...room,
+      members: [...canonicalMembers.values()]
+    }
+    changedRooms.push(name)
+  }
+
+  return { rooms, changedRooms }
+}
+
+/** Reconcile both halves of stable group membership in one pass. Source
+ * inventory and persisted/shared rooms hydrate independently at startup, so
+ * either one may arrive first. */
+function reconcileKnownGroupChatMembers(all = $groupChats.get()) {
+  const rebound = rebindKnownGroupChatMembers(all)
+  const canonicalized = canonicalizeResolvableGroupChatMembers(rebound.rooms)
+
+  return {
+    rooms: canonicalized.changedRooms.length ? canonicalized.rooms : rebound.rooms,
+    changed: rebound.changed || canonicalized.changedRooms.length > 0,
+    changedRooms: canonicalized.changedRooms
+  }
+}
+
 /** Compact, display-oriented copy of Desktop's room log for gateway clients.
  *  The live orchestration state stays in plugin storage; this bounded mirror
  *  rides the default profile's ui_meta so mobile can show the same messages.
@@ -659,19 +814,17 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
       at: Number(entry?.at || 0),
       ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {})
     }))
+    const projectedMembers = new Map()
+    for (const member of (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS)) {
+      const projected = groupChatMemberForSync(member)
+      projectedMembers.set(groupChatSyncMemberKey(projected), projected)
+    }
     const compact = {
       name: String(name).slice(0, 64),
       ...(typeof room?.roomId === 'string' && room.roomId ? { roomId: String(room.roomId).slice(0, 128) } : {}),
       log,
       revision: Math.max(0, Number(room?.syncRevision ?? room?.revision ?? 0)),
-      members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS).map(member => ({
-        name: String(member?.name || '').slice(0, 128),
-        ...(member?.handle ? { handle: String(member.handle).slice(0, 128) } : {}),
-        ...(member?.connectionId ? { connectionId: String(member.connectionId).slice(0, 128) } : {}),
-        ...(member?.connectionKind ? { connectionKind: String(member.connectionKind).slice(0, 64) } : {}),
-        ...(member?.connectionLabel ? { connectionLabel: String(member.connectionLabel).slice(0, 128) } : {}),
-        ...(member?.sourceScoped ? { sourceScoped: true } : {})
-      })),
+      members: [...projectedMembers.values()],
       ...(typeof room?.image === 'string' && room.image.length <= GROUP_CHAT_SYNC_IMAGE_CHARS
         ? { image: room.image }
         : {})
@@ -715,6 +868,12 @@ function groupChatSyncEntryKey(entry) {
 }
 
 function groupChatSyncMemberKey(member) {
+  const sourceInstallId = String(member?.sourceInstallId || '').trim()
+
+  if (sourceInstallId) {
+    return JSON.stringify(['install', sourceInstallId, String(member?.name || '')])
+  }
+
   return JSON.stringify([
     String(member?.source || ''),
     String(member?.connectionId || ''),
@@ -958,7 +1117,8 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
         members.clear()
       }
       for (const member of Array.isArray(projected.members) ? projected.members : []) {
-        members.set(groupChatSyncMemberKey(member), { ...member, remoteSource: true })
+        const rebound = rebindSyncedGroupMember(member)
+        members.set(groupChatSyncMemberKey(rebound), rebound)
       }
     }
 
@@ -6316,16 +6476,25 @@ function groupLastActivity(room) {
 /** Seat a group's member roster: local bots whose meta names the group, plus
  *  the room record's stored descriptors (remote members can't ride bot-meta).
  *  Prefers the LIVE roster row for a stored descriptor when present. */
+function groupChatMemberIdentityKey(bot) {
+  const source = groupChatSyncSource(bot?.connectionId, bot?.sourceInstallId)
+  const sourceInstallId = String(bot?.sourceInstallId || source?.installId || '').trim()
+
+  return sourceInstallId
+    ? `install:${sourceInstallId}::${bot?.name || 'default'}`
+    : botRosterKey(bot)
+}
+
 function groupChatMemberBots(group, roster, metaByName) {
   const local = (roster || []).filter(
     bot => botGroups(botRosterMeta(bot, metaByName)).includes(group)
   )
   const stored = ($groupChats.get()[group] || {}).members || []
-  const seated = new Set(local.map(botRosterKey))
+  const seated = new Set(local.map(groupChatMemberIdentityKey))
   const remote = []
 
   for (const descriptor of stored) {
-    const key = botRosterKey(descriptor)
+    const key = groupChatMemberIdentityKey(descriptor)
 
     if (seated.has(key)) {
       continue
@@ -6335,7 +6504,7 @@ function groupChatMemberBots(group, roster, metaByName) {
     // A selected-but-offline ghost intentionally carries only enough identity
     // to paint the roster. Never let it replace the room's durable descriptor,
     // which owns the full handle/title used by mentions and remote sync.
-    remote.push((roster || []).find(bot => !bot?.ghost && botRosterKey(bot) === key) || descriptor)
+    remote.push((roster || []).find(bot => !bot?.ghost && groupChatMemberIdentityKey(bot) === key) || descriptor)
   }
 
   return [...local, ...remote]
@@ -6351,6 +6520,8 @@ function durableGroupChatMembers(bots) {
     // route — the same degraded shape the hydrate annotate produces. The
     // strict throw here would lose the entire room update over one row.
     const route = resolveBotConnectionRoute(bot).route
+    const source = groupChatSyncSource(bot?.connectionId, bot?.sourceInstallId)
+    const sourceInstallId = String(bot?.sourceInstallId || source?.installId || '').trim()
     // Keep the friendly identity on the stored descriptor: after a
     // connection switch the live roster row may be gone, and renamed-tag
     // mentions must still resolve against the persisted member.
@@ -6364,6 +6535,7 @@ function durableGroupChatMembers(bots) {
       connectionId: bot.connectionId,
       connectionKind: bot.connectionKind,
       connectionLabel: bot.connectionLabel,
+      ...(sourceInstallId ? { sourceInstallId } : {}),
       ...(route ? { route, targetProfile: route.targetProfile } : {}),
       // A swept/annotated member keeps its degraded mark across the rebuild —
       // otherwise the next room send would silently un-mark an orphaned row.
@@ -14288,6 +14460,28 @@ function BotsPane() {
     $lastRoster.set(roster.filter(row => !row?.ghost))
     if (Array.isArray(data?.sources)) {
       $lastSources.set(data.sources)
+      const reconciled = reconcileKnownGroupChatMembers()
+
+      if (reconciled.changed) {
+        $groupChats.set(reconciled.rooms)
+        void persistGroupChatRooms(reconciled.rooms)
+      }
+
+      // install_id is the first machine-stable identity available after a
+      // cold roster load. Publish once when that inventory changes so legacy
+      // room members gain stable ids; payload equality makes later polls free.
+      const sourceFingerprint = data.sources
+        .map(source => `${String(source?.connectionId || '')}:${String(source?.installId || '')}`)
+        .sort()
+        .join('|')
+
+      if (sourceFingerprint && sourceFingerprint !== groupChatSyncSourceFingerprint) {
+        groupChatSyncSourceFingerprint = sourceFingerprint
+        scheduleGroupChatServerSync(
+          reconciled.changed ? reconciled.rooms : $groupChats.get(),
+          { changedRooms: reconciled.changedRooms }
+        )
+      }
     }
     mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
     pullServerAvatars(activeSourceRoster)
@@ -15058,7 +15252,15 @@ export default {
           // must hydrate the gateway projection instead of merely avoiding an
           // empty overwrite and then rendering an empty conversation.
           await pullGroupChatServerState().catch(() => false)
-          scheduleGroupChatServerSync($groupChats.get())
+          const reconciled = reconcileKnownGroupChatMembers()
+
+          if (reconciled.changed) {
+            $groupChats.set(reconciled.rooms)
+            await persistGroupChatRooms(reconciled.rooms)
+          }
+          scheduleGroupChatServerSync(reconciled.changed ? reconciled.rooms : $groupChats.get(), {
+            changedRooms: reconciled.changedRooms
+          })
         })
         .catch(() => undefined)
     } catch {

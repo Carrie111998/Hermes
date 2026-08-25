@@ -30,7 +30,7 @@ function load() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__groups = { botGroups, groupMembershipPatch, groupChatNames, groupLastActivity, groupChatMemberBots, durableGroupChatMembers, knownGroups, stripPreviewMarkdown, $groupChats };\n'
+      '\nglobalThis.__groups = { botGroups, groupMembershipPatch, groupChatNames, groupLastActivity, groupChatMemberBots, durableGroupChatMembers, knownGroups, stripPreviewMarkdown, $groupChats, $lastSources };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   return context.__groups
@@ -151,6 +151,32 @@ test('groupChatMemberBots: stored descriptors beat presentation-only ghosts', ()
   assert.equal(members.length, 1)
   assert.equal(members[0], stored)
   assert.equal(members[0].handle, 'spark-work')
+})
+
+test('groupChatMemberBots: stable install identity dedupes device-relative connection ids', () => {
+  const { groupChatMemberBots, $groupChats, $lastSources } = load()
+  const local = { name: 'default', connectionId: 'local' }
+  const macbook = { name: 'default', connectionId: 'macbook' }
+  $lastSources.set([
+    { connectionId: 'local', kind: 'local', installId: 'mini-install' },
+    { connectionId: 'macbook', kind: 'ssh', installId: 'macbook-install' }
+  ])
+  $groupChats.set({
+    Research: {
+      log: [],
+      members: [
+        { name: 'default', connectionId: 'local', sourceInstallId: 'macbook-install' },
+        { name: 'default', connectionId: 'mac-mini', sourceInstallId: 'mini-install' }
+      ]
+    }
+  })
+
+  const members = groupChatMemberBots('Research', [local, macbook], {
+    'macbook::default': { group: 'Research' }
+  })
+
+  assert.equal(members.length, 2)
+  assert.equal(JSON.stringify(members.map(member => member.connectionId).sort()), JSON.stringify(['local', 'macbook']))
 })
 
 test('durableGroupChatMembers: retains active and remote source identities', () => {
