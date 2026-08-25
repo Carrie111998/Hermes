@@ -1465,15 +1465,15 @@ class WeComAdapter(BasePlatformAdapter):
         official openclaw plugin): while a bubble is open for this chat,
         every send writes into that SAME stream with ``finish=false`` — the
         bubble shows the live draft and stays "thinking". The FINAL send
-        (metadata ``_wecom_final=True``) NEVER writes the answer into the
-        bubble; it just closes the bubble (neutral finish) and the answer
-        is delivered as a STANDALONE markdown message. This keeps the
-        bubble a pure "thinking" indicator and avoids orphaned placeholders.
+        (metadata ``_wecom_final=True``) writes the answer INTO the bubble
+        (finish=true) — the bubble BECOMES the answer (normal path). Past
+        the stream lifetime that write fails and the answer falls back to a
+        standalone markdown message.
 
         Busy-acks / receipts for a NEW message carry ``_wecom_no_stream``
         (deliver standalone, never touch the open bubble). A redirect ack
         carries ``_wecom_redirect`` — it closes the open bubble with the
-        "adjusted" notice.
+        "adjusted" notice; the following turn opens a fresh bubble normally.
         """
         no_stream = bool(metadata and metadata.get("_wecom_no_stream"))
         is_redirect_ack = bool(metadata and metadata.get("_wecom_redirect"))
@@ -1482,12 +1482,15 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
-        # Redirect ack: close the old bubble (if any) with the notice. The
-        # next send_typing (new turn) opens a fresh bubble naturally.
+        # Redirect ack: close the OLD bubble with the notice. We do NOT flip
+        # _turn_active — the redirected turn continues in the SAME chat and
+        # its next send_typing must open a FRESH bubble for the new answer
+        # (matching normal/timeout logic). Using _finish_thinking here would
+        # set _turn_active=False and the fence would suppress that new bubble.
         if is_redirect_ack:
             from agent.i18n import t
-            await self._finish_thinking(
-                chat_id, t("gateway.busy_ack.redirect_short"))
+            await self._write_stream(
+                chat_id, t("gateway.busy_ack.redirect_short"), finish=True)
             return SendResult(success=True)
 
         # Live bubble open → write into it. Mid-turn: finish=false (draft /
