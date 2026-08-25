@@ -116,7 +116,7 @@ description: "54 个真实设计系统（Stripe、Linear、Vercel）的 HTML/CSS
 
 | 模板 | 网站 | 风格 |
 |---|---|---|
-| `claude.md` | Anthropic Claude | 暖赤陶色强调色，简洁编辑排版 |
+| `anthropic-claude.md` | Anthropic Claude | 暖赤陶色强调色，简洁编辑排版 |
 | `cohere.md` | Cohere | 鲜艳渐变，数据丰富的仪表盘美学 |
 | `elevenlabs.md` | ElevenLabs | 暗色电影感 UI，音频波形美学 |
 | `minimax.md` | Minimax | 带霓虹强调色的粗犷暗色界面 |

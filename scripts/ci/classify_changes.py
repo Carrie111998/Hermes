@@ -65,6 +65,18 @@ _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _NIX_PATHS = ("nix/",) # nix files
 _NIX_FILES = {"flake.nix", "flake.lock"} # base nix files
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
+# Context guides are prose, but the docs-site lane owns the repository-wide
+# context-budget lint. Keep this in sync with prompt_builder/subdirectory_hints.
+_CONTEXT_BASENAMES = {
+    ".hermes.md",
+    "HERMES.md",
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "agents.md",
+    "CLAUDE.md",
+    "claude.md",
+    ".cursorrules",
+}
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
 # Published artifacts that live under website/ but that Python asserts about.
@@ -124,6 +136,12 @@ def _is_docs(p: str) -> bool:
 
 def _is_nix(p: str) -> bool:
     return p.startswith(_NIX_PATHS) or p in _NIX_FILES
+
+
+def _is_cursor_rule(p: str) -> bool:
+    return p.endswith(".mdc") and (
+        p.startswith(".cursor/rules/") or "/.cursor/rules/" in p
+    )
 
 
 def _py_irrelevant(p: str) -> bool:
@@ -199,7 +217,12 @@ def classify(files: list[str]) -> dict[str, bool]:
         "docker": docker_meta or python_prod or frontend,
         "docker_meta": docker_meta,
         "frontend": frontend,
-        "site": any(f.startswith(_SITE) for f in files),
+        "site": any(
+            f.startswith(_SITE)
+            or os.path.basename(f) in _CONTEXT_BASENAMES
+            or _is_cursor_rule(f)
+            for f in files
+        ),
         "scan": any(_is_scan(f) for f in files),
         "deps": deps,
         "uv_lock": any(f in ("pyproject.toml", "uv.lock") for f in files),

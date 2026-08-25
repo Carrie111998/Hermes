@@ -71,6 +71,12 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
 
 CASES = {
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
+    "root agent context → site": (["AGENTS.md"], _lanes(site=True)),
+    "nested agent context → site": (["examples/AGENTS.md"], _lanes(site=True)),
+    "cursor rule → site": (
+        ["project/.cursor/rules/typescript.mdc"],
+        _lanes(python=True, site=True),
+    ),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True)),
     "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True)),

@@ -38,6 +38,9 @@ jobs:
         with:
           command: python -m pip install ascii-guard==2.3.0 pyyaml==6.0.3
 
+      - name: Check agent context budgets
+        run: python3 scripts/check_context_file_limits.py .
+
       - name: Extract skill metadata for dashboard
         run: python3 website/scripts/extract-skills.py
 

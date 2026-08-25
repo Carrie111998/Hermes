@@ -128,7 +128,7 @@ those carry more visual identity than the specific font face.
 
 | Template | Site | Style |
 |---|---|---|
-| `claude.md` | Anthropic Claude | Warm terracotta accent, clean editorial layout |
+| `anthropic-claude.md` | Anthropic Claude | Warm terracotta accent, clean editorial layout |
 | `cohere.md` | Cohere | Vibrant gradients, data-rich dashboard aesthetic |
 | `elevenlabs.md` | ElevenLabs | Dark cinematic UI, audio-waveform aesthetics |
 | `minimax.md` | Minimax | Bold dark interface with neon accents |
