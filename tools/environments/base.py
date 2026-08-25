@@ -1191,34 +1191,42 @@ class BaseEnvironment(ABC):
                 # logged instead of swallowed.
                 _selector = selectors.DefaultSelector()
                 try:
-                    _selector.register(fd, selectors.EVENT_READ)
-                    while True:
-                        try:
-                            ready = _selector.select(timeout=0.1)
-                        except (ValueError, OSError) as _exc:
-                            logger.warning(
-                                "drain: readiness poll failed for fd %s (%r); "
-                                "stopping drain — output may be truncated",
-                                fd, _exc,
-                            )
-                            break
-                        if ready:
+                    try:
+                        _selector.register(fd, selectors.EVENT_READ)
+                    except (ValueError, OSError) as _exc:
+                        logger.warning(
+                            "drain: failed to register fd %s (%r); "
+                            "stopping drain",
+                            fd, _exc,
+                        )
+                    else:
+                        while True:
                             try:
-                                chunk = os.read(fd, 4096)
-                            except (ValueError, OSError):
+                                ready = _selector.select(timeout=0.1)
+                            except (ValueError, OSError) as _exc:
+                                logger.warning(
+                                    "drain: readiness poll failed for fd %s (%r); "
+                                    "stopping drain — output may be truncated",
+                                    fd, _exc,
+                                )
                                 break
-                            if not chunk:
-                                break  # true EOF — all writers closed
-                            output.append(decoder.decode(chunk))
-                            idle_after_exit = 0
-                        elif proc.poll() is not None:
-                            # bash is gone and the pipe was idle for ~100ms.
-                            # Give it two more cycles to catch any buffered
-                            # tail, then stop — otherwise we wait forever on a
-                            # grandchild pipe.
-                            idle_after_exit += 1
-                            if idle_after_exit >= 3:
-                                break
+                            if ready:
+                                try:
+                                    chunk = os.read(fd, 4096)
+                                except (ValueError, OSError):
+                                    break
+                                if not chunk:
+                                    break  # true EOF — all writers closed
+                                output.append(decoder.decode(chunk))
+                                idle_after_exit = 0
+                            elif proc.poll() is not None:
+                                # bash is gone and the pipe was idle for ~100ms.
+                                # Give it two more cycles to catch any buffered
+                                # tail, then stop — otherwise we wait forever on a
+                                # grandchild pipe.
+                                idle_after_exit += 1
+                                if idle_after_exit >= 3:
+                                    break
                 finally:
                     _selector.close()
             finally:
