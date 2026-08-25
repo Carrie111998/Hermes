@@ -46,6 +46,9 @@ _gateway_lock_handle = None
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
+# Runtime metadata is intentionally readable by local supervision/status tools,
+# but only on first creation. Existing permissions remain authoritative.
+_RUNTIME_METADATA_CREATE_MODE = 0o644
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
@@ -696,7 +699,13 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
+    atomic_json_write(
+        path,
+        payload,
+        indent=None,
+        separators=(",", ":"),
+        create_mode=_RUNTIME_METADATA_CREATE_MODE,
+    )
 
 
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
