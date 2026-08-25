@@ -1000,6 +1000,26 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         # double-flag the same condition.
         return []
 
+    # A ready task is not stranded when the configured concurrency budget is
+    # fully occupied. It is queued behind healthy running work, so suggesting
+    # reassignment or a missing worker would be actively misleading.
+    graph = cfg.get("_graph") or {}
+    kanban_cfg = cfg.get("kanban") or {}
+    running_total = int(graph.get("running_total") or 0)
+    running_by_assignee = graph.get("running_by_assignee") or {}
+    max_in_progress = _positive_int(kanban_cfg.get("max_in_progress"), 0)
+    max_per_profile = _positive_int(
+        kanban_cfg.get("max_in_progress_per_profile"), 0
+    )
+    if (
+        (max_in_progress and running_total >= max_in_progress)
+        or (
+            max_per_profile
+            and int(running_by_assignee.get(assignee, 0)) >= max_per_profile
+        )
+    ):
+        return []
+
     # Find the most recent event that put this task into ready.
     # ``created`` covers tasks born ready; ``promoted`` covers parent-
     # done auto-promotion; ``reclaimed`` covers TTL/crash recovery;

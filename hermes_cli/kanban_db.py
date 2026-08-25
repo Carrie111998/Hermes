@@ -3929,6 +3929,19 @@ def task_graph_contexts(
     if not ordered_ids:
         return contexts
 
+    running_rows = conn.execute(
+        "SELECT assignee, COUNT(*) AS count FROM tasks "
+        "WHERE status = 'running' GROUP BY assignee"
+    ).fetchall()
+    running_by_assignee = {
+        (row["assignee"] or ""): int(row["count"])
+        for row in running_rows
+    }
+    running_total = sum(running_by_assignee.values())
+    for context in contexts.values():
+        context["running_total"] = running_total
+        context["running_by_assignee"] = running_by_assignee
+
     placeholders = ",".join("?" for _ in ordered_ids)
     for row in conn.execute(
         "SELECT l.child_id AS owner_id, t.id, t.title, t.status "
