@@ -1636,9 +1636,47 @@ def cmd_capabilities(name: Optional[str] = None) -> None:
             cap for cap in CAPABILITY_REGISTRY
             if plugin_capability_granted(key, cap)
         }
-        if not declared and not effective and name is None:
+        portable = None
+        directory = Path(entry[4]).resolve() if entry[4] else None
+        if directory is not None and (directory / "plugin.json").is_file():
+            try:
+                from hermes_cli.agent_plugins import (
+                    canonical_package_digest,
+                    read_agent_plugin_manifest,
+                )
+                from hermes_cli.plugins import (
+                    _trusted_portable_session_capability_bindings,
+                )
+
+                manifest, _diagnostics = read_agent_plugin_manifest(directory)
+                extension = (manifest.get("extensions") or {}).get("com.hermes")
+                requested = (
+                    extension.get("sessionCapability")
+                    if isinstance(extension, dict)
+                    else []
+                )
+                requested = [
+                    item for item in requested
+                    if isinstance(item, str) and item
+                ] if isinstance(requested, list) else []
+                digest = canonical_package_digest(directory)
+                grants = _trusted_portable_session_capability_bindings()
+                portable = {
+                    "digest": digest,
+                    "servers": [
+                        {
+                            "name": server,
+                            "binding": f"{key}:{server}",
+                            "granted": grants.get(f"{key}:{server}") == digest,
+                        }
+                        for server in requested
+                    ],
+                }
+            except Exception:
+                portable = {"digest": "unavailable", "servers": []}
+        if not declared and not effective and portable is None and name is None:
             continue
-        rows.append((key, entry[3], declared, granted, effective))
+        rows.append((key, entry[3], declared, granted, effective, portable))
 
     if name is not None and not rows:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
@@ -1648,7 +1686,7 @@ def cmd_capabilities(name: Optional[str] = None) -> None:
         console.print("[dim]No plugins declare or hold capabilities.[/dim]")
         return
 
-    for key, source, declared, granted, effective in sorted(rows):
+    for key, source, declared, granted, effective, portable in sorted(rows):
         console.print(f"[bold]{key}[/bold] [dim]({source})[/dim]")
         if not declared:
             console.print("  declared: [dim](none)[/dim]")
@@ -1665,6 +1703,20 @@ def cmd_capabilities(name: Optional[str] = None) -> None:
                 f"  {cap}: [green]granted[/green] "
                 "[dim](not declared in manifest)[/dim]"
             )
+        if portable is not None:
+            console.print(
+                "  portable package digest: "
+                f"[dim]{portable['digest']}[/dim]"
+            )
+            for server in portable["servers"]:
+                state = (
+                    "[green]granted for this digest[/green]"
+                    if server["granted"]
+                    else "[yellow]not granted for this digest[/yellow]"
+                )
+                console.print(
+                    f"  session capability {server['binding']}: {state}"
+                )
 
 
 def _resolve_tool_override_grant(
@@ -3055,7 +3107,19 @@ def cmd_plugin_doctor(target: str = ".", *, ci: bool = False) -> None:
     from hermes_cli.plugin_dev import doctor_plugin
 
     report = doctor_plugin(target)
-    Console().print(report.format_text())
+    console = Console()
+    console.print(report.format_text())
+    portable_root = Path(target).expanduser().resolve()
+    if (portable_root / "plugin.json").is_file():
+        try:
+            from hermes_cli.agent_plugins import canonical_package_digest
+
+            console.print(
+                "Portable package digest: "
+                f"[dim]{canonical_package_digest(portable_root)}[/dim]"
+            )
+        except Exception as exc:
+            console.print(f"Portable package digest: [red]unavailable ({exc})[/red]")
     if ci and not report.ok:
         raise SystemExit(1)
 

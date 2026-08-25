@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import hmac
 import importlib.metadata
 import importlib.util
 import inspect
@@ -635,6 +636,42 @@ def _portable_skill_namespace(key: str) -> str:
     slug = slug.strip("-_") or "plugin"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
     return f"agent-plugin-{slug}-{digest}"
+
+
+def _trusted_portable_session_capability_bindings() -> Dict[str, str]:
+    """Return exact profile-approved ``binding -> package digest`` grants.
+
+    Legacy string entries intentionally do not grant authority: a name-only
+    grant survives arbitrary package replacement.  Object grants are accepted
+    only with the exact two-field shape ``{binding, digest}``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        plugins = (load_config() or {}).get("plugins") or {}
+    except Exception:
+        return {}
+    if not isinstance(plugins, Mapping):
+        return {}
+    raw = plugins.get("trusted_session_context") or []
+    if not isinstance(raw, list):
+        return {}
+    digest_re = re.compile(r"^sha256:[0-9a-f]{64}$")
+    result: Dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {"binding", "digest"}:
+            continue
+        binding = item.get("binding")
+        digest = item.get("digest")
+        if (
+            isinstance(binding, str)
+            and binding == binding.strip()
+            and 0 < len(binding.encode("utf-8")) <= 256
+            and isinstance(digest, str)
+            and digest_re.fullmatch(digest) is not None
+        ):
+            result[binding] = digest
+    return result
 
 
 def _display_author(value: object) -> str:
@@ -5121,6 +5158,7 @@ class PluginManager:
                         skill.name,
                         exc,
                     )
+            trusted_capabilities = _trusted_portable_session_capability_bindings()
             for server_name, config in package.mcp_servers.items():
                 internal_name = f"{manifest.skill_namespace}__{server_name}"
                 if internal_name in self._portable_mcp_servers:
@@ -5130,7 +5168,32 @@ class PluginManager:
                         internal_name,
                     )
                     continue
-                self._portable_mcp_servers[internal_name] = dict(config)
+                translated = dict(config)
+                requested = bool(translated.pop("request_session_capability", False))
+                binding = f"{lookup_key}:{server_name}"
+                granted_digest = trusted_capabilities.get(binding)
+                if requested and hmac.compare_digest(
+                    granted_digest or "", package.content_digest
+                ):
+                    translated["session_capability"] = {
+                        "audience": (
+                            f"com.hermes.mcp/portable/{package.name}/{server_name}"
+                        ),
+                        "binding": binding,
+                        "package_digest": package.content_digest,
+                        "package_root": str(package.root),
+                    }
+                elif requested:
+                    logger.warning(
+                        "Agent Plugin '%s' MCP server '%s' requested trusted "
+                        "session capability but exact digest approval '%s' is absent "
+                        "(loaded digest %s)",
+                        lookup_key,
+                        server_name,
+                        binding,
+                        package.content_digest,
+                    )
+                self._portable_mcp_servers[internal_name] = translated
             loaded.enabled = True
         except Exception as exc:
             loaded.error = str(exc)

@@ -212,6 +212,93 @@ class TestPluginDiscovery:
         assert manager._plugins["native"].enabled is True
         assert manager._plugins["native"].module is not None
 
+    @pytest.mark.parametrize("approval", ["none", "legacy-string", "digest-object"])
+    def test_portable_session_capability_requires_digest_bound_profile_approval(
+        self, tmp_path, monkeypatch, approval
+    ):
+        from hermes_cli.agent_plugins import (
+            MCP_SCHEMA_V1,
+            PLUGIN_SCHEMA_V1,
+            canonical_package_digest,
+        )
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        plugin = home / "plugins" / "portable"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "$schema": PLUGIN_SCHEMA_V1,
+                    "name": "portable.test",
+                    "extensions": {
+                        "com.hermes": {
+                            "sessionCapability": ["workflow"]
+                        }
+                    },
+                }
+            )
+        )
+        (plugin / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "$schema": MCP_SCHEMA_V1,
+                    "mcpServers": {
+                        "workflow": {
+                            "type": "stdio",
+                            "command": "python",
+                            "args": ["-I", "-S", "-B", "${PLUGIN_ROOT}/server.py"],
+                            "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+                        }
+                    },
+                }
+            )
+        )
+        (plugin / "server.py").write_text("# reviewed\n")
+        plugins_config = {"enabled": ["portable.test"]}
+        digest = canonical_package_digest(plugin)
+        if approval == "legacy-string":
+            plugins_config["trusted_session_context"] = [
+                "portable.test:workflow"
+            ]
+        elif approval == "digest-object":
+            plugins_config["trusted_session_context"] = [{
+                "binding": "portable.test:workflow",
+                "digest": digest,
+            }]
+        home.mkdir(exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": plugins_config})
+        )
+        empty_bundled = tmp_path / "bundled"
+        empty_bundled.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(
+            plugins_mod, "get_bundled_plugins_dir", lambda: empty_bundled
+        )
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        [config] = manager.get_portable_mcp_servers().values()
+        authority = config.get("session_capability")
+        assert (isinstance(authority, dict)) is (approval == "digest-object")
+        assert "request_session_capability" not in config
+        if isinstance(authority, dict):
+            assert authority["package_digest"] == digest
+            assert authority["binding"] == "portable.test:workflow"
+            assert authority["audience"] == (
+                "com.hermes.mcp/portable/portable.test/workflow"
+            )
+
+            # The same sticky name-only grant cannot authorize replaced bytes.
+            (plugin / "server.py").write_text("# replacement\n")
+            replaced = PluginManager()
+            replaced.discover_and_load()
+            [replaced_config] = replaced.get_portable_mcp_servers().values()
+            assert "session_capability" not in replaced_config
+
     def test_disabled_portable_plugin_registers_nothing(self, tmp_path, monkeypatch):
         from hermes_cli.agent_plugins import PLUGIN_SCHEMA_V1
         from hermes_cli import plugins as plugins_mod

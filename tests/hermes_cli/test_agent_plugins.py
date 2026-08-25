@@ -75,6 +75,296 @@ def test_loads_manifest_skill_and_stdio_server(tmp_path: Path) -> None:
     assert (tmp_path / "data").is_dir()
 
 
+def test_hermes_extension_opts_named_server_into_host_minted_capability(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    (tmp_path / "server.py").write_text("# reviewed\n", encoding="utf-8")
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(
+            extensions={
+                "com.hermes": {"sessionCapability": ["workflow"]}
+            }
+        ),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "workflow": {
+                    "type": "stdio",
+                    "command": "python",
+                    "args": ["-I", "-S", "-B", "${PLUGIN_ROOT}/server.py"],
+                    "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+                },
+                "ordinary": {"type": "stdio", "command": "python"},
+            },
+        },
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    assert package.mcp_servers["workflow"]["request_session_capability"] is True
+    assert package.mcp_servers["workflow"]["command"] == str(
+        Path(sys.executable).resolve(strict=True)
+    )
+    assert "session_capability" not in package.mcp_servers["workflow"]
+    assert "session_capability" not in package.mcp_servers["ordinary"]
+    assert package.content_digest.startswith("sha256:")
+    assert package.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"type": "stdio", "command": "python", "args": ["server.py"]},
+        {
+            "type": "stdio",
+            "command": "python3",
+            "args": ["-I", "-S", "-B", "server.py"],
+        },
+        {
+            "type": "stdio",
+            "command": "python",
+            "args": ["-I", "-B", "-S", "server.py"],
+            "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+        },
+    ],
+)
+def test_session_capability_rejects_nonisolated_python_launch(
+    tmp_path: Path, entry: dict
+) -> None:
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(extensions={"com.hermes": {"sessionCapability": ["workflow"]}}),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {"$schema": MCP_SCHEMA_V1, "mcpServers": {"workflow": entry}},
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    assert "request_session_capability" not in package.mcp_servers["workflow"]
+    assert any("require -I -S -B" in item.message for item in package.diagnostics)
+
+
+def test_session_capability_python_command_ignores_mutable_path_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sys
+
+    hostile = tmp_path / "hostile-bin"
+    hostile.mkdir()
+    fake_python = hostile / "python"
+    fake_python.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    fake_python.chmod(0o700)
+    package_root = tmp_path / "plugin"
+    package_root.mkdir()
+    (package_root / "server.py").write_text("# reviewed\n", encoding="utf-8")
+    _write_json(
+        package_root / "plugin.json",
+        _manifest(extensions={"com.hermes": {"sessionCapability": ["workflow"]}}),
+    )
+    _write_json(
+        package_root / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "workflow": {
+                    "type": "stdio",
+                    "command": "python",
+                    "args": ["-I", "-S", "-B", "${PLUGIN_ROOT}/server.py"],
+                    "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+                }
+            },
+        },
+    )
+    monkeypatch.setenv("PATH", str(hostile))
+
+    package = load_agent_plugin(package_root, tmp_path / "data")
+
+    server = package.mcp_servers["workflow"]
+    assert server["request_session_capability"] is True
+    assert server["command"] == str(Path(sys.executable).resolve(strict=True))
+    assert server["command"] != str(fake_python)
+
+
+def test_session_capability_rejects_python_script_from_plugin_data(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "plugin"
+    package_root.mkdir()
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    (data_root / "server.py").write_text("# mutable data\n", encoding="utf-8")
+    _write_json(
+        package_root / "plugin.json",
+        _manifest(extensions={"com.hermes": {"sessionCapability": ["workflow"]}}),
+    )
+    _write_json(
+        package_root / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "workflow": {
+                    "type": "stdio",
+                    "command": "python",
+                    "args": ["-I", "-S", "-B", "${PLUGIN_DATA}/server.py"],
+                    "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+                }
+            },
+        },
+    )
+
+    package = load_agent_plugin(package_root, data_root)
+
+    assert "request_session_capability" not in package.mcp_servers["workflow"]
+    assert any("in-package file" in item.message for item in package.diagnostics)
+
+
+@pytest.mark.parametrize("command", ["node", "bash"])
+def test_session_capability_rejects_bare_ambient_nonpython_command(
+    tmp_path: Path, command: str
+) -> None:
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(extensions={"com.hermes": {"sessionCapability": ["workflow"]}}),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "workflow": {"type": "stdio", "command": command}
+            },
+        },
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    assert "request_session_capability" not in package.mcp_servers["workflow"]
+    assert any("bare ambient" in item.message for item in package.diagnostics)
+
+
+def test_session_capability_allows_digest_included_package_executable(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "server"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(extensions={"com.hermes": {"sessionCapability": ["workflow"]}}),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "workflow": {"type": "stdio", "command": "./server"}
+            },
+        },
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    server = package.mcp_servers["workflow"]
+    assert server["request_session_capability"] is True
+    assert server["command"] == str(executable.resolve())
+
+
+@pytest.mark.parametrize(
+    "forward",
+    ["workflow", [""], [1], {"workflow": True}],
+)
+def test_invalid_hermes_session_forwarding_extension_is_nonfatal(
+    tmp_path: Path, forward: object
+) -> None:
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(
+            extensions={
+                "com.hermes": {"sessionCapability": forward}
+            }
+        ),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "workflow": {"type": "stdio", "command": "python"}
+            },
+        },
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    assert "request_session_capability" not in package.mcp_servers["workflow"]
+    assert "session_capability" not in package.mcp_servers["workflow"]
+    assert any("sessionCapability" in item.message for item in package.diagnostics)
+
+
+def test_unknown_forwarded_server_does_not_widen_another_server(
+    tmp_path: Path,
+) -> None:
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(
+            extensions={
+                "com.hermes": {"sessionCapability": ["missing"]}
+            }
+        ),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "ordinary": {"type": "stdio", "command": "python"}
+            },
+        },
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    assert "request_session_capability" not in package.mcp_servers["ordinary"]
+    assert "session_capability" not in package.mcp_servers["ordinary"]
+    assert any(item.scope == "mcp:missing" for item in package.diagnostics)
+
+
+def test_session_capability_rejects_executable_python_cache(tmp_path: Path) -> None:
+    import py_compile
+
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(extensions={"com.hermes": {"sessionCapability": ["workflow"]}}),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {
+            "$schema": MCP_SCHEMA_V1,
+            "mcpServers": {
+                "workflow": {"type": "stdio", "command": "python"}
+            },
+        },
+    )
+    source = tmp_path / "server.py"
+    source.write_text("VALUE = 'reviewed'\n", encoding="utf-8")
+    cache = tmp_path / "__pycache__" / "server.cpython-313.pyc"
+    cache.parent.mkdir()
+    py_compile.compile(str(source), cfile=str(cache), doraise=True)
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    assert "request_session_capability" not in package.mcp_servers["workflow"]
+    assert any("bytecode caches" in item.message for item in package.diagnostics)
+
+
 @pytest.mark.parametrize(
     "manifest",
     [

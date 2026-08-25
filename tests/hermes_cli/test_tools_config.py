@@ -74,6 +74,23 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+def test_explicit_mcp_server_names_do_not_emit_zero_toolset_warning(caplog):
+    """Raw MCP server names are valid platform allowlist entries even though
+    they are not static toolsets and only gain registry aliases at discovery."""
+    import hermes_cli.tools_config as _tc
+
+    _tc._warned_invalid_platform_toolsets.discard("test-surface")
+    config = {
+        "mcp_servers": {"portable-workflows": {"command": "reviewed-runtime"}},
+        "platform_toolsets": {"test-surface": ["portable-workflows"]},
+    }
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.tools_config"):
+        assert _get_platform_tools(config, "test-surface") == {"portable-workflows"}
+
+    assert not any("#38798" in r.getMessage() for r in caplog.records)
+
+
 
 
 

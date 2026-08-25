@@ -224,6 +224,21 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_observability_context() -> dict[str, str]:
+    """Return correlation IDs bound around the current model tool dispatch.
+
+    These values originate in the host executor, not in model-authored tool
+    arguments. Integrations may use the opaque ``tool_call_id`` as part of an
+    idempotency key, but it is correlation metadata rather than user identity
+    or authorization on its own.
+    """
+    return {
+        "turn_id": _approval_turn_id.get() or "",
+        "tool_call_id": _approval_tool_call_id.get() or "",
+        "session_id": _approval_session_id.get() or "",
+    }
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 

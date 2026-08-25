@@ -576,6 +576,197 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_opted_in_server_receives_host_minted_capability_not_arguments(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        authority = {
+            "audience": "com.hermes.mcp/portable/example/workflow",
+            "binding": "example:workflow",
+            "package_digest": "sha256:" + "a" * 64,
+            "package_root": "/approved/package",
+        }
+        expected_meta = {
+            "com.hermes/capability": {
+                "claims": {"workflow": "greet", "tool_call_id": "call-opaque-31"},
+                "signature": "opaque",
+            }
+        }
+
+        try:
+            handler = _make_tool_handler(
+                "test_srv", "greet", 120, session_capability=authority
+            )
+            from tools.approval import (
+                reset_current_observability_context,
+                set_current_observability_context,
+            )
+            correlation = set_current_observability_context(
+                turn_id="turn-7",
+                tool_call_id="call-opaque-31",
+                session_id="session-7",
+            )
+            with (
+                patch(
+                    "tools.mcp_tool._prepare_session_capability",
+                    return_value=expected_meta,
+                ),
+                self._patch_mcp_loop(),
+            ):
+                try:
+                    result = json.loads(handler({"name": "world"}))
+                finally:
+                    reset_current_observability_context(correlation)
+            assert result["result"] == "ok"
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+                meta=expected_meta,
+            )
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_capability_snapshot_survives_background_loop_without_cross_talk(self):
+        """Concurrent callers retain their host-bound event and tool-call IDs."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import tools.mcp_tool as mcp_mod
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import (
+            reset_current_observability_context,
+            set_current_observability_context,
+        )
+
+        seen: list[dict] = []
+
+        class Session:
+            async def call_tool(self, name, arguments=None, **kwargs):
+                await asyncio.sleep(0.01)
+                seen.append(dict(kwargs["meta"]["com.hermes/capability"]["claims"]))
+                return _make_call_result(name, is_error=False)
+
+        server = _make_mock_server("test_srv", session=Session())
+        mcp_mod._servers["test_srv"] = server
+        started_here = mcp_mod._mcp_loop is None or not mcp_mod._mcp_loop.is_running()
+        if started_here:
+            mcp_mod._ensure_mcp_loop()
+        authority = {
+            "audience": "com.hermes.mcp/portable/example/workflow",
+            "binding": "example:workflow",
+            "package_digest": "sha256:" + "a" * 64,
+            "package_root": "/approved/package",
+        }
+        handler = mcp_mod._make_tool_handler(
+            "test_srv", "greet", 10, session_capability=authority
+        )
+
+        def fake_prepare(_server, workflow, _arguments, _authority):
+            claims = mcp_mod._hermes_session_call_meta()
+            claims["workflow"] = workflow
+            return {
+                "com.hermes/capability": {
+                    "claims": claims,
+                    "signature": "opaque",
+                }
+            }
+
+        def invoke(index: int) -> str:
+            session_tokens = set_session_vars(
+                platform="wearable",
+                source="wearable",
+                chat_id="device-context",
+                message_id=f"event-{index}",
+                session_id=f"session-{index}",
+                profile="test-profile",
+            )
+            correlation = set_current_observability_context(
+                turn_id=f"turn-{index}",
+                tool_call_id=f"call-{index}",
+                session_id=f"session-{index}",
+            )
+            try:
+                return handler({"index": index})
+            finally:
+                reset_current_observability_context(correlation)
+                clear_session_vars(session_tokens)
+
+        try:
+            with patch.object(
+                mcp_mod, "_prepare_session_capability", side_effect=fake_prepare
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(invoke, (1, 2)))
+            assert all("error" not in json.loads(item) for item in results)
+            assert {
+                (item["message_id"], item["tool_call_id"], item["session_id"])
+                for item in seen
+            } == {
+                ("event-1", "call-1", "session-1"),
+                ("event-2", "call-2", "session-2"),
+            }
+        finally:
+            mcp_mod._servers.pop("test_srv", None)
+            if started_here:
+                mcp_mod._stop_mcp_loop()
+
+    def test_capability_is_minted_once_and_reused_on_transport_recovery(self):
+        import tools.mcp_tool as mcp_mod
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            side_effect=[
+                RuntimeError("expired transport session"),
+                _make_call_result("recovered", is_error=False),
+            ]
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        mcp_mod._servers["test_srv"] = server
+        authority = {
+            "audience": "com.hermes.mcp/portable/example/workflow",
+            "binding": "example:workflow",
+            "package_digest": "sha256:" + "a" * 64,
+            "package_root": "/approved/package",
+        }
+        capability_meta = {
+            "com.hermes/capability": {
+                "claims": {"nonce": "one-logical-call"},
+                "signature": "opaque",
+            }
+        }
+
+        def retry(_server_name, _exc, call_once, _operation):
+            return call_once()
+
+        try:
+            handler = mcp_mod._make_tool_handler(
+                "test_srv", "greet", 10, session_capability=authority
+            )
+            with (
+                patch.object(
+                    mcp_mod,
+                    "_prepare_session_capability",
+                    return_value=capability_meta,
+                ) as mint,
+                patch.object(
+                    mcp_mod, "_handle_auth_error_and_retry", side_effect=retry
+                ),
+                self._patch_mcp_loop(),
+            ):
+                result = json.loads(handler({"name": "world"}))
+            assert result["result"] == "recovered"
+            mint.assert_called_once()
+            assert mock_session.call_tool.await_count == 2
+            first_meta = mock_session.call_tool.await_args_list[0].kwargs["meta"]
+            second_meta = mock_session.call_tool.await_args_list[1].kwargs["meta"]
+            assert first_meta is capability_meta
+            assert second_meta is capability_meta
+        finally:
+            mcp_mod._servers.pop("test_srv", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
