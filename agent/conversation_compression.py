@@ -3824,6 +3824,13 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    # For the `already_present` outcome the live-dict stamping is
+                    # handled by the run_agent _compress_context wrapper's
+                    # _sync_persisted_markers (it mirrors the handoff stamps back
+                    # to the live lists by scoped identity). This branch only
+                    # covers inserted/merged; compress_context is intentionally
+                    # NOT self-contained for already_present — a future direct
+                    # caller of compress_context must go through that wrapper.
                     current_idx = getattr(agent, "_persist_user_message_idx", None)
                     if (
                         compressed_user_turn_outcome in {"inserted", "merged"}
@@ -3959,6 +3966,14 @@ def compress_context(
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
                     old_session_id = None
+                    # NOTE: _db_flush_scan_prefix is intentionally NOT cleared
+                    # here. The flush's bounded scan is identity-based
+                    # (messages[i] is prefix[i]); the deepcopy rollback below
+                    # replaces every row, so a stale prefix can never
+                    # identity-match again. A failed parent flush clears its own
+                    # prefix, and on the snapshot path the live list is
+                    # untouched — do not "restore" a clear here without
+                    # re-checking those invariants.
                     messages[:] = copy.deepcopy(messages_before_compression)
                     compressed = messages
                     _compression_made_progress = False

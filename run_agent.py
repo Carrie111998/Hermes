@@ -8212,8 +8212,11 @@ class AIAgent:
                     telemetry_agent=self,
                 )
             try:
+                # _DB_PERSISTED_MARKER lives at module level in
+                # agent.context_compressor; conversation_compression only
+                # imports it locally (cannot be imported from there).
+                from agent.context_compressor import _DB_PERSISTED_MARKER
                 from agent.conversation_compression import (
-                    _DB_PERSISTED_MARKER,
                     _messages_match_scoped_identity,
                 )
             except Exception:
