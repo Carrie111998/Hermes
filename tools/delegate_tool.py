@@ -2653,6 +2653,7 @@ def _run_single_child(
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
     _worktree_info: Optional[Dict[str, str]] = None
+    _defer_child_close_to_worker = False
 
     def _attach_worktree(entry_dict: Dict[str, Any]) -> None:
         """Inspect + prune the child worktree, reporting into the entry."""
@@ -2845,6 +2846,25 @@ def _run_single_child(
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if is_timeout and not _child_future.done():
+                # The timeout owner abandons this daemon worker by design, but
+                # closing the child here also closes its dedicated SessionDB
+                # while run_conversation may still be flushing on that worker.
+                # Keep ownership with the worker until it actually exits; a
+                # future callback is race-safe even if completion happens
+                # between done() and add_done_callback().
+                _defer_child_close_to_worker = True
+
+                def _close_detached_child(_future) -> None:
+                    try:
+                        child.close()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close detached child agent after worker exit",
+                            exc_info=True,
+                        )
+
+                _child_future.add_done_callback(_close_detached_child)
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -3367,11 +3387,12 @@ def _run_single_child(
         # Close tool resources (terminal sandboxes, browser daemons,
         # background processes, httpx clients) so subagent subprocesses
         # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+        if not _defer_child_close_to_worker:
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop

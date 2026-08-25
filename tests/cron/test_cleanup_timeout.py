@@ -48,6 +48,39 @@ class HangingAgent:
         self.release.wait()
 
 
+class BlockingCronAgent:
+    def __init__(self, release: threading.Event, db):
+        self.release = release
+        self.db = db
+        self.worker_started = threading.Event()
+        self.worker_finished = threading.Event()
+        self.closed = threading.Event()
+        self.session_id = "cron-timeout-session"
+
+    def run_conversation(self, _prompt):
+        self.worker_started.set()
+        self.release.wait()
+        assert not self.db.close.called
+        self.db.append_message("cron-timeout-session", "assistant", "late")
+        self.worker_finished.set()
+        return {"final_response": "late", "messages": []}
+
+    def get_activity_summary(self):
+        return {
+            "seconds_since_activity": 60.0,
+            "last_activity_desc": "blocked provider call",
+            "api_call_count": 3,
+            "max_iterations": 250,
+            "current_tool": None,
+        }
+
+    def interrupt(self, *_args, **_kwargs):
+        return None
+
+    def close(self):
+        self.closed.set()
+
+
 def test_run_job_bounds_sessiondb_finalization(tmp_path):
     release = threading.Event()
     fake_db = HangingSessionDB(release)
@@ -90,6 +123,45 @@ def test_agent_teardown_is_bounded():
 
         assert agent.entered.wait(timeout=0.5)
         assert elapsed < 0.5
+    finally:
+        release.set()
+
+
+def test_inactivity_timeout_defers_session_cleanup_until_worker_exits(tmp_path):
+    release = threading.Event()
+    fake_db = MagicMock()
+    db_closed = threading.Event()
+    fake_db.close.side_effect = db_closed.set
+    agent = BlockingCronAgent(release, fake_db)
+    job = {
+        "id": "cron-timeout-worker",
+        "name": "cron timeout worker",
+        "prompt": "hello",
+        "model": "test-model",
+    }
+
+    try:
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler._cron_inactivity_seconds", return_value=0.01), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
+             patch("run_agent.AIAgent", return_value=agent):
+            success, _output, final_response, error = run_job(job)
+
+        assert agent.worker_started.is_set()
+        assert success is False
+        assert final_response == ""
+        assert "idle for" in error
+        assert not db_closed.is_set()
+        assert not agent.closed.is_set()
+
+        release.set()
+        assert agent.worker_finished.wait(timeout=2.0)
+        assert db_closed.wait(timeout=2.0)
+        assert agent.closed.wait(timeout=2.0)
     finally:
         release.set()
 
