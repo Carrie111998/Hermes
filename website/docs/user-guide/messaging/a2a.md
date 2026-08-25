@@ -93,6 +93,8 @@ Secure by default; every widening step is explicit:
   Entries must match `A2A_PEER_TOKENS` names. Shared-token/IP identities and
   authorization claims in request bodies cannot enable this tier. Injection
   filtering, slash-command wrapping, and outbound redaction stay enabled.
+  Task operations and conversation contexts remain isolated to the
+  authenticated peer.
 - **Outbound redaction** — credential-shaped strings (API keys, JWTs, tokens) are scrubbed from replies.
 - **Audit log** — every exchange appends to `~/.hermes/a2a_audit.jsonl`.
 - **Anti-loop** — per-context turn caps stop two agents ping-ponging forever.

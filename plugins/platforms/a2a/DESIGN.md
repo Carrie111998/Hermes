@@ -48,15 +48,19 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   `tasks/list`, `tasks/cancel`, `tasks/subscribe`,
   `tasks/pushNotificationConfig/create` (legacy `set` names accepted).
 - **Live-session injection (the #11025 insight):** inbound tasks route through
-  the normal `MessageEvent` → `handle_message` path keyed by the A2A
-  `contextId`, so the agent that answers is the same one serving the user —
+  the normal `MessageEvent` → `handle_message` path keyed by an internal hash
+  of the authenticated peer and wire `contextId`, so the agent that answers is
+  the same one serving the user without allowing another peer to resume that
+  conversation —
   full memory/context, not a clone. The reply returns through `adapter.send()`,
   which fulfils the pending per-**task** `Future` the HTTP request is blocked
   on (per-context FIFO, so concurrent same-context requests can't cross-talk);
   `on_processing_complete` resolves failures/cancellations promptly.
 - **Task store:** every task (including terminal ones, bounded to the last
-  500) stays queryable via `tasks/get` / `tasks/list`, and `tasks/subscribe`
-  reattaches to a running task's stream via store watchers. A watchdog fails
+  500) stays queryable only to its authenticated peer via `tasks/get` /
+  `tasks/list`; cancel, subscribe, and push-config operations enforce the same
+  peer scope. `tasks/subscribe` reattaches to a running task's stream via store
+  watchers. A watchdog fails
   orphaned tasks after 5 minutes (idempotent transitions — no double
   counting in metrics).
 - **input-required:** the platform hint tells the agent to start a reply with

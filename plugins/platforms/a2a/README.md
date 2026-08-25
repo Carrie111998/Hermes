@@ -72,6 +72,8 @@ via `tasks/get`.
   Entries must match names in `A2A_PEER_TOKENS`; shared-token/IP identities
   and authorization claims in message bodies never qualify. Filtering,
   slash-command wrapping, and outbound credential redaction remain active.
+  Task queries, cancellation, subscriptions, push configuration, and
+  conversation contexts remain isolated to the authenticated peer.
 - Outbound text is scrubbed of credential-shaped strings.
 - Push callbacks are SSRF-guarded and HMAC-SHA256 signed (`X-A2A-Signature`).
 - Every exchange is logged to `~/.hermes/a2a_audit.jsonl`.

@@ -766,6 +766,50 @@ class TestReplyCapture:
 # --------------------------------------------------------------------------
 
 class TestTaskRpcHandlers:
+    def test_task_state_is_scoped_to_authenticated_peer(self):
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-alice", "ctx", "alice")
+        adapter.tasks.complete("task-alice", protocol.STATE_COMPLETED, "private")
+
+        assert "error" in adapter._rpc_tasks_get(
+            1, {"taskId": "task-alice"}, peer="bob"
+        )
+        assert adapter._rpc_tasks_list(2, {}, peer="bob")["result"]["tasks"] == []
+        assert "error" in adapter._rpc_tasks_cancel(
+            3, {"taskId": "task-alice"}, peer="bob"
+        )
+        assert adapter.tasks.watch("task-alice", peer="bob") is None
+
+        created = adapter._rpc_push_config_create(
+            4,
+            {
+                "taskId": "task-alice",
+                "pushNotificationConfig": {"url": "https://bob.example/hook"},
+            },
+            peer="bob",
+        )
+        assert created["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        assert adapter._rpc_push_config_get(
+            5, {"taskId": "task-alice"}, peer="bob"
+        )["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        assert adapter._rpc_push_config_list(
+            6, {"taskId": "task-alice"}, peer="bob"
+        )["result"]["configs"] == []
+        assert adapter._rpc_push_config_delete(
+            7, {"taskId": "task-alice"}, peer="bob"
+        )["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+        assert adapter._rpc_tasks_get(
+            8, {"taskId": "task-alice"}, peer="alice"
+        )["result"]["id"] == "task-alice"
+
+    def test_context_ids_are_namespaced_by_authenticated_peer(self):
+        adapter = _bare_adapter()
+        alice = adapter._scoped_context_id("alice", "shared")
+        bob = adapter._scoped_context_id("bob", "shared")
+        assert alice != bob
+        assert alice == adapter._scoped_context_id("alice", "shared")
+
     def test_tasks_get_unknown_uses_spec_error_code(self):
         adapter = _bare_adapter()
         resp = adapter._rpc_tasks_get(1, {"taskId": "ghost"})
@@ -781,16 +825,15 @@ class TestTaskRpcHandlers:
         assert protocol.extract_text(task["artifacts"][0]) == "answer"
 
     def test_tasks_cancel_resets_turns_for_context(self):
-        """Cancel must reset anti-loop turns for the task's CONTEXT (the old
-        code passed the task_id into a context-keyed map — silent no-op)."""
+        """Cancel resets the authenticated peer's internal anti-loop context."""
         adapter = _bare_adapter()
+        internal_context = adapter._scoped_context_id("peer", "ctx-loopy")
         for _ in range(4):
-            adapter._turns.track("ctx-loopy")
+            adapter._turns.track(internal_context)
         adapter.tasks.create("task-c", "ctx-loopy", "peer")
-        resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-c"})
+        resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-c"}, peer="peer")
         assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
-        # Turn counter went back to zero: next track() is turn 1.
-        assert adapter._turns.track("ctx-loopy") == 1
+        assert adapter._turns.track(internal_context) == 1
 
     def test_cancel_terminal_task_not_cancelable(self):
         adapter = _bare_adapter()
@@ -1293,6 +1336,116 @@ class TestInboundRoundTrip:
             assert "'alice'" in seen["text"]
             assert "the-operator" not in seen["text"]
             assert "untrusted external input" in seen["text"]
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_operator_task_and_context_are_isolated_from_other_peer(self, monkeypatch):
+        monkeypatch.setenv("A2A_PEER_TOKENS", "alice:tok-alice,bob:tok-bob")
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("A2A_HOST", "127.0.0.1")
+        monkeypatch.setattr(
+            security, "get_trusted_operator_peers", lambda: {"alice"}
+        )
+
+        seen_chats = {}
+
+        def reply_fn(event):
+            seen_chats[event.source.user_id] = event.source.chat_id
+            if event.source.user_id == "alice":
+                return "PRIVATE-SENTINEL-ALICE"
+            return "ordinary reply"
+
+        adapter, base = _make_live_adapter(monkeypatch, reply_fn=reply_fn)
+        alice_auth = {"Authorization": "Bearer tok-alice"}
+        bob_auth = {"Authorization": "Bearer tok-bob"}
+
+        async def rpc(method, params, auth, req_id):
+            return await asyncio.to_thread(
+                _post_json,
+                base + "/",
+                {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params},
+                auth,
+            )
+
+        async def run():
+            assert await adapter.connect() is True
+            alice = await asyncio.to_thread(
+                _post_json,
+                base + "/",
+                _send_body("read private notes", ctx="shared-wire-context"),
+                alice_auth,
+            )
+            alice_task = alice["result"]
+            assert alice_task["contextId"] == "shared-wire-context"
+            assert protocol.extract_text(alice_task["artifacts"][0]) == "PRIVATE-SENTINEL-ALICE"
+
+            bob = await asyncio.to_thread(
+                _post_json,
+                base + "/",
+                _send_body("continue", ctx="shared-wire-context"),
+                bob_auth,
+            )
+            assert bob["result"]["contextId"] == "shared-wire-context"
+            assert seen_chats["alice"] != seen_chats["bob"]
+
+            get_resp = await rpc(
+                "tasks/get", {"taskId": alice_task["id"]}, bob_auth, "get"
+            )
+            assert get_resp["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+            list_resp = await rpc("tasks/list", {}, bob_auth, "list")
+            listed_text = json.dumps(list_resp["result"])
+            assert alice_task["id"] not in listed_text
+            assert "PRIVATE-SENTINEL-ALICE" not in listed_text
+
+            subscribe = await rpc(
+                "tasks/subscribe", {"taskId": alice_task["id"]}, bob_auth, "sub"
+            )
+            assert subscribe["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+            push_create = await rpc(
+                "tasks/pushNotificationConfig/create",
+                {
+                    "taskId": alice_task["id"],
+                    "pushNotificationConfig": {"url": "https://bob.example/hook"},
+                },
+                bob_auth,
+                "push-create",
+            )
+            assert push_create["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+            push_get = await rpc(
+                "tasks/pushNotificationConfig/get",
+                {"taskId": alice_task["id"]},
+                bob_auth,
+                "push-get",
+            )
+            assert push_get["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+            push_list = await rpc(
+                "tasks/pushNotificationConfig/list",
+                {"taskId": alice_task["id"]},
+                bob_auth,
+                "push-list",
+            )
+            assert push_list["result"]["configs"] == []
+            push_delete = await rpc(
+                "tasks/pushNotificationConfig/delete",
+                {"taskId": alice_task["id"]},
+                bob_auth,
+                "push-delete",
+            )
+            assert push_delete["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+            adapter.tasks.create(
+                "alice-pending", "shared-wire-context", "alice"
+            )
+            cancel = await rpc(
+                "tasks/cancel", {"taskId": "alice-pending"}, bob_auth, "cancel"
+            )
+            assert cancel["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+            assert adapter.tasks.get("alice-pending", peer="alice")["state"] == (
+                protocol.STATE_SUBMITTED
+            )
             await adapter.disconnect()
 
         asyncio.run(run())
