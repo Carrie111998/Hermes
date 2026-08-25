@@ -469,6 +469,19 @@ def test_clean_demo_balanced_primary_list(
         "sector_ids": ["household-appliances"],
         "buyer_types": ["importer", "distributor", "retailer", "wholesaler"],
         "enabled_source_ids": ["customer-list-corpus", "legacy-lifecycle"],
+        # The policy the deployed Demo campaign actually carries. It matters
+        # here because curated-corpus evidence has no domain: a gate that
+        # counted domains rejected every one of these candidates for lacking a
+        # source it does have, and the run reported 42 researched with 0
+        # eligible.
+        "eligibility": {
+            "require_resolved_identity": True,
+            "require_official_domain": False,
+            "require_target_presence": True,
+            "require_buyer_role": True,
+            "exclude_inactive": True,
+            "minimum_independent_sources": 1,
+        },
     })
     assert created.status_code == 201, created.text
     campaign = created.json()

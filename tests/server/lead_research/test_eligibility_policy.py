@@ -179,3 +179,38 @@ def test_sector_buyer_does_not_claim_production_or_ownership():
 
     assert not satisfies_buyer_role({"sector_buyer"}, {"manufacturer"})
     assert not satisfies_buyer_role({"sector_buyer"}, {"brand"})
+
+
+# An internal dataset reference is a source. The gate counted domains, and
+# curated-corpus evidence has no domain to count — so a campaign asking for one
+# independent source rejected every curated candidate for lacking something it
+# was never going to have. The real Demo run failed exactly this way: 42
+# candidates researched, 42 eligible companies reported as 0.
+def test_a_dataset_reference_counts_as_an_independent_source():
+    from server.lead_research.models import VerificationBundle, VerificationSource
+    from server.lead_research.service import _independent_source_count
+
+    def source(**kwargs):
+        return VerificationSource(
+            raw_hash="0" * 64, classification="independent", **kwargs,
+        )
+
+    internal = VerificationBundle(
+        candidate_source_record_id="rec-1",
+        sources=[source(
+            source_reference="dataset:kitchen-appliances:3:rec-1",
+            retrieved_via="dataset:kitchen-appliances:3:rec-1",
+        )],
+    )
+    external = VerificationBundle(
+        candidate_source_record_id="rec-1",
+        sources=[source(
+            provenance_url="https://registry.example/rec-1",
+            retrieved_via="https://search.example",
+        )],
+    )
+
+    assert _independent_source_count([("corpus", internal)]) == 1
+    assert _independent_source_count([("corpus", internal), ("web", external)]) == 2
+    # Two pages on one host are still one publisher.
+    assert _independent_source_count([("web", external), ("web", external)]) == 1
