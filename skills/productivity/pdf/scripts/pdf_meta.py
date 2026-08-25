@@ -83,6 +83,15 @@ def main() -> int:
 
     writer = PdfWriter()
     writer.append(reader)
+    # append() copies pages/outlines but neither the Info dictionary nor
+    # embedded attachments — re-apply both so composeable operations stop
+    # losing document state (#94870). Mode branches below still override
+    # (--set-meta merges over preserved values; --clear-meta wipes them).
+    if reader.metadata:
+        writer.add_metadata(dict(reader.metadata))
+    for name, contents in (reader.attachments or {}).items():
+        data = contents[0] if isinstance(contents, list) else contents
+        writer.add_attachment(name, bytes(data))
 
     if args.set_meta:
         meta = {}

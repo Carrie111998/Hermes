@@ -34,6 +34,22 @@ def main() -> int:
         print("Missing dependency: install with 'python3 -m pip install pypdf'", file=sys.stderr)
         return 2
 
+    def _reapply_document_state(writer: PdfWriter, source: PdfReader) -> None:
+        # append() copies pages/outlines but neither the Info dictionary nor
+        # embedded attachments — re-apply both so encrypt/decrypt round trips
+        # stop losing document state (#94870).
+        try:
+            if source.metadata:
+                writer.add_metadata(dict(source.metadata))
+        except Exception:
+            pass
+        try:
+            for name, contents in (source.attachments or {}).items():
+                data = contents[0] if isinstance(contents, list) else contents
+                writer.add_attachment(name, bytes(data))
+        except Exception:
+            pass
+
     reader = PdfReader(args.pdf)
     if args.encrypt:
         if not args.user_password:
@@ -44,6 +60,7 @@ def main() -> int:
             return 3
         writer = PdfWriter()
         writer.append(reader)
+        _reapply_document_state(writer, reader)
         writer.encrypt(
             user_password=args.user_password,
             owner_password=args.owner_password or args.user_password,
@@ -59,6 +76,7 @@ def main() -> int:
             return 4
         writer = PdfWriter()
         writer.append(reader)
+        _reapply_document_state(writer, reader)
         action = "decrypted"
 
     with open(args.output, "wb") as fh:

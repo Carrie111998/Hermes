@@ -412,3 +412,54 @@ def test_attachments_roundtrip(report_pdf: Path, workdir: Path):
     assert len(result["extracted"]) == 1
     extracted = Path(result["extracted"][0])
     assert "UNIQUEATTACH99" in extracted.read_text(encoding="utf-8")
+
+
+def test_attach_preserves_existing_metadata(report_pdf: Path, workdir: Path):
+    """#94870: attaching a file must not drop the document's existing
+    metadata — writer.append(reader) copies pages only, so the Info dict has
+    to be re-applied."""
+    titled = workdir / "meta_titled.pdf"
+    run("pdf_meta.py", str(report_pdf), "--set-meta",
+        "--title", "Preserve Me", "--author", "author-x", "-o", str(titled))
+    meta = json.loads(run("pdf_read.py", str(titled), "--meta").stdout)["metadata"]
+    assert meta["Title"] == "Preserve Me"
+
+    payload = workdir / "keep_meta_payload.txt"
+    payload.write_text("keep-meta payload\n", encoding="utf-8")
+    with_att = workdir / "meta_kept.pdf"
+    run("pdf_meta.py", str(titled), "--attach", str(payload), "-o", str(with_att))
+
+    meta = json.loads(run("pdf_read.py", str(with_att), "--meta").stdout)["metadata"]
+    assert meta.get("Title") == "Preserve Me", "attach dropped existing metadata"
+    assert meta.get("Author") == "author-x"
+    listing = json.loads(run("pdf_meta.py", str(with_att), "--list-attachments").stdout)
+    assert listing["attachments"] == ["keep_meta_payload.txt"]
+
+
+def test_attachments_survive_encrypt_decrypt(workdir: Path):
+    """#94870: embedded attachments must survive an encrypt→decrypt round
+    trip — both pdf_secure paths rebuild via writer.append(reader), which
+    drops embedded files."""
+    pytest.importorskip("cryptography")
+    payload = workdir / "secure_payload.txt"
+    payload.write_text("secure payload UNIQUESPEC42\n", encoding="utf-8")
+    with_att = workdir / "secure_in.pdf"
+    spec = {"title": "Secure Doc", "elements": [{"type": "paragraph", "text": "body"}]}
+    spec_path = workdir / "secure_spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    run("pdf_create.py", str(spec_path), "-o", str(with_att))
+    run("pdf_meta.py", str(with_att), "--attach", str(payload), "-o", str(with_att))
+
+    encrypted = workdir / "secure_enc.pdf"
+    run("pdf_secure.py", str(with_att), "--encrypt",
+        "--user-password", "pw", "-o", str(encrypted))
+    decrypted = workdir / "secure_dec.pdf"
+    run("pdf_secure.py", str(encrypted), "--decrypt", "--password", "pw",
+        "-o", str(decrypted))
+
+    listing = json.loads(run("pdf_meta.py", str(decrypted), "--list-attachments").stdout)
+    assert listing["attachments"] == ["secure_payload.txt"], (
+        "attachment lost across encrypt/decrypt"
+    )
+    meta = json.loads(run("pdf_read.py", str(decrypted), "--meta").stdout)["metadata"]
+    assert meta.get("Title") == "Secure Doc"
