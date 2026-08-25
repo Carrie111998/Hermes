@@ -623,6 +623,46 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def resolve_stream_ttfb_timeout(
+    base_url: str | None,
+    est_tokens: int,
+    stale_timeout: float,
+    env_value: str | None = None,
+) -> float:
+    """Resolve the generic stream no-first-byte cutoff in one place."""
+    if env_value is None or not str(env_value).strip():
+        configured = 120.0
+    else:
+        try:
+            configured = float(env_value)
+        except (TypeError, ValueError):
+            configured = 120.0
+    if configured <= 0:
+        return float("inf")
+    if base_url and is_local_endpoint(base_url):
+        return float("inf")
+    if est_tokens > 100_000:
+        timeout = max(configured, 300.0)
+    elif est_tokens > 50_000:
+        timeout = max(configured, 240.0)
+    else:
+        timeout = configured
+    if stale_timeout is not None and stale_timeout != float("inf"):
+        timeout = min(timeout, stale_timeout)
+    return timeout
+
+
+def ttfb_kill_should_fire(
+    first_event_seen: bool, elapsed: float, ttfb_timeout: float
+) -> bool:
+    """Return whether a no-first-byte stream should be killed now."""
+    return (
+        not first_event_seen
+        and ttfb_timeout != float("inf")
+        and elapsed > ttfb_timeout
+    )
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters.
 
@@ -5142,32 +5182,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     # ── No-first-byte TTFB watchdog (generic streaming path) ──────────
     # A provider can accept a connection without emitting a stream event.
-    # The stale detector is deliberately scaled for reasoning models, so a
-    # separate cutoff is needed to retry a dead connection promptly.
-    # Apply a much shorter no-byte cutoff so the inner retry loop
-    # reconnects promptly; a fresh connection typically succeeds in
-    # seconds. Large subscription-backed requests can legitimately spend
-    # tens of seconds in backend admission / prompt prefill before the
-    # first SSE event, so the cutoff scales with context size and is
-    # disabled entirely for local endpoints (their prefill can take
-    # minutes). Operators can tune via HERMES_STREAM_TTFB_TIMEOUT_SECONDS
-    # (0 disables this watchdog).
-    _ttfb_timeout = env_float("HERMES_STREAM_TTFB_TIMEOUT_SECONDS", 120.0)
-    if _ttfb_timeout <= 0:
-        _ttfb_timeout = float("inf")
-    elif agent.base_url and is_local_endpoint(agent.base_url):
-        _ttfb_timeout = float("inf")
-    else:
-        _est_ttfb_tokens = estimate_request_context_tokens(api_kwargs)
-        if _est_ttfb_tokens > 100_000:
-            _ttfb_timeout = max(_ttfb_timeout, 300.0)
-        elif _est_ttfb_tokens > 50_000:
-            _ttfb_timeout = max(_ttfb_timeout, 240.0)
-        # Never let the TTFB cutoff exceed the stale patience: the stale
-        # detector owns the terminal kill + diagnostics for a connection
-        # that delivered bytes then wedged.
-        if _stream_stale_timeout is not None and _stream_stale_timeout != float("inf"):
-            _ttfb_timeout = min(_ttfb_timeout, _stream_stale_timeout)
+    _ttfb_timeout = resolve_stream_ttfb_timeout(
+        agent.base_url,
+        estimate_request_context_tokens(api_kwargs),
+        _stream_stale_timeout,
+        os.environ.get("HERMES_STREAM_TTFB_TIMEOUT_SECONDS"),
+    )
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
@@ -5218,7 +5238,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # out the (possibly 600s) stale patience on a dead connection.
         if not first_stream_event_seen["yes"] and _ttfb_timeout != float("inf"):
             _ttfb_elapsed = time.time() - last_chunk_time["t"]
-            if _ttfb_elapsed > _ttfb_timeout:
+            if ttfb_kill_should_fire(
+                first_stream_event_seen["yes"], _ttfb_elapsed, _ttfb_timeout
+            ):
                 logger.warning(
                     "Stream produced no first byte for %.0fs (TTFB threshold "
                     "%.0fs) — no stream events received. model=%s. Killing "
@@ -5236,9 +5258,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _close_request_client_once("stream_ttfb_kill")
                 except Exception:
                     pass
-                # Reset the timer so we don't kill repeatedly while the
-                # inner thread processes the closure.
+                # Reset both guards so we don't kill repeatedly while the
+                # inner thread processes the closure. The next attempt resets
+                # this flag when it actually starts.
                 last_chunk_time["t"] = time.time()
+                first_stream_event_seen["yes"] = True
                 agent._emit_wait_notice(
                     f"⚠ no first byte from provider in {int(_ttfb_elapsed)}s — "
                     f"reconnecting..."
