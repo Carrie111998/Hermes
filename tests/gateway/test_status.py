@@ -13,6 +13,28 @@ from gateway import status
 
 
 class TestGatewayPidState:
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX-only mode assertion")
+    def test_runtime_metadata_create_mode_is_applied_before_replace(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        target = tmp_path / "gateway_state.json"
+
+        status._write_json_file(target, {"gateway_state": "running"})
+
+        assert (target.stat().st_mode & 0o777) == 0o644
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX-only mode assertion")
+    def test_runtime_metadata_preserves_existing_mode(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        target = tmp_path / "gateway_state.json"
+        target.write_text("{}", encoding="utf-8")
+        target.chmod(0o600)
+
+        status._write_json_file(target, {"gateway_state": "running"})
+
+        assert (target.stat().st_mode & 0o777) == 0o600
+
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
