@@ -1,8 +1,8 @@
 import { type ReactNode, useEffect, useState } from 'react'
 
 import { Loader2 } from '@/lib/icons'
-import { cn } from '@/lib/utils'
 import { Tip } from '@/components/ui/tooltip'
+import { cn } from '@/lib/utils'
 
 /**
  * A site's icon, resolved the thorough way.
