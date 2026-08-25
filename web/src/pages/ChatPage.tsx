@@ -47,6 +47,7 @@ import {
   PTY_RESUME_SANITIZE_WINDOW_MS,
   PTY_TICKET_TIMEOUT_MS,
   type PtyConnectionState,
+  isPtyFocusReport,
   shouldBlockPtyInput,
   shouldReconnectPtyOnPageResume,
 } from "@/lib/pty-reconnect";
@@ -1442,7 +1443,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // Mouse reports (scroll wheel etc.) are not typed input — swallow
         // them before the blocked-input check so scrolling a disconnected
         // terminal doesn't trip the "reconnecting" notice.
-        if (SGR_MOUSE_RE.test(data)) {
+        if (SGR_MOUSE_RE.test(data) || isPtyFocusReport(data)) {
           return;
         }
 
@@ -1475,7 +1476,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // normal onData path.
       sendComposedText = (data) => forwardPtyData(data, false);
       onDataDisposable = term.onData((data) => {
-        if (!SGR_MOUSE_RE.test(data)) {
+        if (!SGR_MOUSE_RE.test(data) && !isPtyFocusReport(data)) {
           compositionForwarder.noteTerminalData(data);
         }
         forwardPtyData(data);
@@ -1669,16 +1670,42 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     document.addEventListener("visibilitychange", onResume);
     window.addEventListener("pageshow", onResume);
-    window.addEventListener("focus", onResume);
     window.addEventListener("online", onResume);
 
     return () => {
       document.removeEventListener("visibilitychange", onResume);
       window.removeEventListener("pageshow", onResume);
-      window.removeEventListener("focus", onResume);
       window.removeEventListener("online", onResume);
     };
   }, [isActive, maybeReconnectOnPageResume]);
+
+  // OS app-switch focuses the window but must not reconnect the PTY (that
+  // disposes xterm and force-redraws Ink). Restore terminal focus so Ctrl+V
+  // paste lands in the composer instead of the browser chrome.
+  useEffect(() => {
+    if (!isActive || typeof window === "undefined") {
+      return;
+    }
+
+    const restoreTerminalFocus = () => {
+      const host = hostRef.current;
+      const active =
+        typeof document !== "undefined" ? document.activeElement : null;
+      const focusIsElsewhereInChatPage =
+        active !== null &&
+        active !== document.body &&
+        host !== null &&
+        !host.contains(active);
+      if (!focusIsElsewhereInChatPage) {
+        termRef.current?.focus();
+      }
+    };
+
+    window.addEventListener("focus", restoreTerminalFocus);
+    return () => {
+      window.removeEventListener("focus", restoreTerminalFocus);
+    };
+  }, [isActive]);
 
   // Keep the live xterm theme in sync when the active theme's terminal
   // colors change (e.g. user switches to a custom YAML theme mid-session).

@@ -66,6 +66,13 @@ export function shouldReconnectPtyOnPageResume({
   if (socketReadyState === WS_OPEN) {
     return false;
   }
+  // An "open" PTY with no socket handle is a transient ref gap (app-switch
+  // `focus`/`visibilitychange` can read wsRef before it is rebound), not a
+  // dead connection. Reconnecting here disposes xterm and force-redraws the
+  // TUI — the dashboard "session reload" that eats paste.
+  if (ptyState === "open") {
+    return socketReadyState === WS_CLOSING || socketReadyState === WS_CLOSED;
+  }
   // A connect is mid-flight (the async socket-open IIFE is awaiting its
   // ticket URL and hasn't assigned wsRef yet, or the socket is still
   // CONNECTING on a non-stuck attempt). Don't fire a redundant reconnect
@@ -90,4 +97,14 @@ export function shouldReconnectPtyOnPageResume({
 
 export function shouldBlockPtyInput(ptyState: PtyConnectionState): boolean {
   return ptyState !== "open";
+}
+
+// xterm.js emits these when DECSET 1004 is on (Ink enables it). Forwarding
+// them into the dashboard PTY makes Ink erase + full-repaint on every OS
+// app-switch — the TUI looks like it reloaded and Ctrl+V races the redraw.
+const PTY_FOCUS_IN = "\x1b[I";
+const PTY_FOCUS_OUT = "\x1b[O";
+
+export function isPtyFocusReport(data: string): boolean {
+  return data === PTY_FOCUS_IN || data === PTY_FOCUS_OUT;
 }
