@@ -16,6 +16,7 @@ not done here.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 from agent.conversation_loop import (
@@ -336,3 +337,111 @@ class TestContextFingerprintSemantics:
             include_project_context=True,
         )
         assert first != second
+
+
+class TestKeepPromptCompressionFingerprintPairing:
+    def test_keep_prompt_after_soul_drift_does_not_pair_stale_bytes_with_current_digest(
+        self, tmp_path
+    ):
+        """Keep-prompt compaction after a mid-session SOUL edit must not persist
+        (stale prompt, current digest). That false-valid pair defeats restore.
+
+        Either rebuild from current inputs and persist the matching digest, or
+        keep the old bytes with a NULL fingerprint so the next restore
+        self-heals. Never stamp a new digest onto stale cached prompt bytes.
+        """
+        from agent.conversation_compression import compress_context
+        from run_agent import AIAgent
+
+        _home, token, db = _open_home(tmp_path, CURRENT_SOUL)
+        try:
+            session_id = "keep-prompt-soul-drift"
+            stale_prompt = (
+                "You are Hermes Agent.\n"
+                f"{STALE_SOUL}\n"
+                "Model: test/model\n"
+                "Provider: openrouter"
+            )
+            db.create_session(
+                session_id,
+                source="api",
+                model="test/model",
+                system_prompt=stale_prompt,
+            )
+            conn = db._conn
+            assert conn is not None
+            conn.execute(
+                "UPDATE sessions SET system_prompt_fingerprint = ? WHERE id = ?",
+                ("stale-managed-context-fingerprint", session_id),
+            )
+            conn.commit()
+
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                agent = AIAgent(
+                    api_key="test-key",
+                    base_url="https://openrouter.ai/api/v1",
+                    model="test/model",
+                    quiet_mode=True,
+                    session_db=db,
+                    session_id=session_id,
+                    skip_context_files=True,
+                    skip_memory=True,
+                    load_soul_identity=True,
+                )
+            agent.compression_in_place = True
+            agent._compression_feasibility_checked = True
+            agent._use_prompt_caching = False
+            agent._cached_system_prompt = stale_prompt
+            agent._memory_manager = None
+
+            def _fake_compress(
+                messages, current_tokens=None, focus_topic=None, force=False
+            ):
+                return [
+                    {
+                        "role": "user",
+                        "content": "[CONTEXT COMPACTION] summary of prior turns",
+                    },
+                    {"role": "assistant", "content": "recent reply"},
+                ]
+
+            agent.context_compressor.compress = _fake_compress
+            agent.context_compressor._last_compress_aborted = False
+            agent.context_compressor._last_summary_error = None
+            agent.context_compressor.compression_count = 1
+
+            messages = [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"message {i} " + ("word " * 20),
+                }
+                for i in range(8)
+            ]
+            compress_context(
+                agent, messages, "sys", approx_tokens=100_000, force=True
+            )
+
+            row = db.get_session(session_id) or {}
+            persisted = row.get("system_prompt") or ""
+            persisted_fp = row.get("system_prompt_fingerprint")
+            current_fp = compute_current_context_fingerprint(agent)
+            assert current_fp
+            stale_kept = STALE_SOUL in persisted
+            rebuilt = CURRENT_SOUL in persisted and STALE_SOUL not in persisted
+            assert stale_kept or rebuilt, (
+                "keep-prompt after SOUL drift must keep old bytes or rebuild "
+                f"from current inputs; got {persisted!r}"
+            )
+            if stale_kept:
+                assert persisted_fp is None, (
+                    "kept stale prompt bytes must not be paired with a current "
+                    f"digest (got {persisted_fp!r})"
+                )
+            else:
+                assert persisted_fp == current_fp
+            assert not (
+                STALE_SOUL in persisted and persisted_fp == current_fp
+            ), "never persist (old prompt, new digest)"
+        finally:
+            db.close()
+            reset_hermes_home_override(token)

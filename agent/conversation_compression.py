@@ -3387,7 +3387,21 @@ def compress_context(
             )
             from agent.conversation_loop import compute_current_context_fingerprint
 
+            # Kept bytes describe whatever managed inputs they were built
+            # from. Stamp the current digest only when it already matches
+            # the stored pair; otherwise persist NULL so restore self-heals
+            # instead of treating (stale SOUL/context, new digest) as valid.
             prompt_fingerprint = compute_current_context_fingerprint(agent)
+            stored_fp = None
+            session_db = getattr(agent, "_session_db", None)
+            if session_db is not None and getattr(agent, "session_id", None):
+                try:
+                    stored_row = session_db.get_session(agent.session_id) or {}
+                    stored_fp = stored_row.get("system_prompt_fingerprint")
+                except Exception:
+                    stored_fp = None
+            if stored_fp != prompt_fingerprint:
+                prompt_fingerprint = None
         else:
             from agent.conversation_loop import build_prompt_with_fingerprint
 
