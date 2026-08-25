@@ -2,7 +2,30 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { ensureMainWindow, focusMainWindow } from './main-window-lifecycle'
+import { ensureMainWindow, focusMainWindow, hideMainWindow } from './main-window-lifecycle'
+
+test('hides only a live visible primary window', () => {
+  const calls: string[] = []
+
+  const visibleWindow = {
+    hide: () => calls.push('hide'),
+    isDestroyed: () => false,
+    isVisible: () => true
+  }
+
+  assert.equal(hideMainWindow(visibleWindow), true)
+  assert.deepEqual(calls, ['hide'])
+
+  assert.equal(
+    hideMainWindow({
+      hide: () => assert.fail('an already hidden window must not be hidden again'),
+      isDestroyed: () => false,
+      isVisible: () => false
+    }),
+    false
+  )
+  assert.equal(hideMainWindow(null), false)
+})
 
 test('reveals a tray-hidden primary window before focusing it', () => {
   const calls: string[] = []

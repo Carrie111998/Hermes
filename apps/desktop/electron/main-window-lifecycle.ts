@@ -10,6 +10,21 @@ type FocusableMainWindowLike = MainWindowLike & {
   show: () => unknown
 }
 
+type HideableMainWindowLike = MainWindowLike & {
+  hide: () => unknown
+  isVisible: () => boolean
+}
+
+export function hideMainWindow(window: HideableMainWindowLike | null | undefined): boolean {
+  if (!window || window.isDestroyed() || !window.isVisible()) {
+    return false
+  }
+
+  window.hide()
+
+  return true
+}
+
 export function focusMainWindow(window: FocusableMainWindowLike): void {
   if (!window || window.isDestroyed()) {
     return

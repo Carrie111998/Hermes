@@ -213,7 +213,7 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
-import { ensureMainWindow, focusMainWindow as focusWindow } from './main-window-lifecycle'
+import { ensureMainWindow, focusMainWindow as focusWindow, hideMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
@@ -10688,6 +10688,7 @@ const backendShutdown = createBackendShutdownCoordinator(async () => {
 
 async function exitAfterBackendShutdown(code) {
   await backendShutdown.run()
+  disposeWindowsTray()
   app.exit(code)
 }
 
@@ -12441,7 +12442,7 @@ function createWindow({ startHidden = false }: { startHidden?: boolean } = {}) {
       })
     ) {
       event.preventDefault()
-      mainWindow?.hide()
+      hideMainWindow(mainWindow)
     }
   })
 
@@ -12569,11 +12570,13 @@ function createWindowsTray(): boolean {
     tray.setToolTip('Hermes')
     tray.setContextMenu(
       Menu.buildFromTemplate([
-        { label: 'Open Hermes', click: restoreMainWindow },
+        { label: 'Show Hermes', click: restoreMainWindow },
+        { label: 'Hide Hermes', click: () => hideMainWindow(mainWindow) },
         { type: 'separator' },
         { label: 'Quit Hermes', click: () => app.quit() }
       ])
     )
+    tray.on('click', restoreMainWindow)
     tray.on('double-click', restoreMainWindow)
     windowsTray = tray
 
@@ -12584,6 +12587,11 @@ function createWindowsTray(): boolean {
 
     return false
   }
+}
+
+function disposeWindowsTray() {
+  windowsTray?.destroy()
+  windowsTray = null
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => {
@@ -15748,8 +15756,7 @@ app.on('before-quit', event => {
 })
 
 app.on('will-quit', () => {
-  windowsTray?.destroy()
-  windowsTray = null
+  disposeWindowsTray()
 })
 
 app.on('window-all-closed', () => {
