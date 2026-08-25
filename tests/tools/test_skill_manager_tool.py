@@ -947,3 +947,54 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+    def test_read_mark_survives_across_tool_call_threads(self, tmp_path, monkeypatch):
+        """The reporter's loop: skill_view runs in one tool-call worker thread,
+        skill_manage(patch) in another. A ContextVar mark set in the first
+        worker's contextvars snapshot was discarded when that worker returned,
+        so the guard in the second worker never passed and every patch of an
+        existing skill was refused (#94324)."""
+        import threading
+
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("widgets", _skill_content("widgets"))
+
+            def _run_skill_view():
+                from tools.skills_tool import skill_view
+                from tools.skill_provenance import (
+                    BACKGROUND_REVIEW,
+                    reset_current_write_origin,
+                    set_current_write_origin,
+                )
+                token = set_current_write_origin(BACKGROUND_REVIEW)
+                try:
+                    assert json.loads(skill_view("widgets"))["success"] is True
+                finally:
+                    reset_current_write_origin(token)
+
+            worker = threading.Thread(target=_run_skill_view)
+            worker.start()
+            worker.join()
+
+            from tools.skill_provenance import (
+                BACKGROUND_REVIEW,
+                reset_current_write_origin,
+                set_current_write_origin,
+            )
+            token = set_current_write_origin(BACKGROUND_REVIEW)
+            try:
+                result = json.loads(skill_manage(
+                    action="patch",
+                    name="widgets",
+                    old_string=_skill_content("widgets").splitlines()[-1],
+                    new_string="patched line (#94324)",
+                ))
+            finally:
+                reset_current_write_origin(token)
+
+            assert result["success"] is True, result
+
+        _reset_background_review_read_marks()

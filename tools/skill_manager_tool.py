@@ -36,7 +36,7 @@ import json
 import logging
 import re
 import shutil
-import contextvars as _ctxvars
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,9 +52,14 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
-)
+# Read-before-write marks live in a plain Lock-guarded module set, NOT a
+# ContextVar: Hermes runs each tool call in a worker thread under its own
+# contextvars snapshot, so a ContextVar set inside skill_view's worker was
+# discarded when that worker returned — the guard in skill_manage's worker
+# only ever saw the empty default and refused every patch/edit of an
+# existing skill, deadlocking the background curator's improve path (#94324).
+_background_review_read_lock = threading.Lock()
+_background_review_read_paths: "set[str]" = set()
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -77,9 +82,8 @@ def mark_background_review_skill_read(path: Path) -> None:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    with _background_review_read_lock:
+        _background_review_read_paths.add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -87,12 +91,14 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    with _background_review_read_lock:
+        return resolved in _background_review_read_paths
 
 
 def _reset_background_review_read_marks() -> None:
     """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    with _background_review_read_lock:
+        _background_review_read_paths.clear()
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
