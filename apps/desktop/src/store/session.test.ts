@@ -30,6 +30,7 @@ import {
   getRememberedRoute,
   getRememberedSessionId,
   getSessionOwnerHint,
+  knownSessionOwner,
   knownSessionProfile,
   mergeSessionPage,
   rememberedSessionProfile,
@@ -956,6 +957,22 @@ describe('knownSessionProfile', () => {
     const sessions = [session({ id: 'stored-1', profile: 'ai-engineer' })]
 
     expect(knownSessionProfile(sessions, 'stored-1')).toBe('ai-engineer')
+  })
+
+  it('preserves a connection-scoped row as a route instead of reducing it to a profile', () => {
+    const sessions = [session({ id: 'local-session', connection_id: 'local', profile: 'default' })]
+
+    expect(knownSessionOwner(sessions, 'local-session')).toEqual({
+      connectionId: 'local',
+      profile: 'default'
+    })
+  })
+
+  it('prefers the unique owner hint when a normal session row lacks connection identity', () => {
+    const owner = { connectionId: 'local', mode: 'local' as const, profile: 'default' }
+    setSessionOwnerHint('local-session', owner)
+
+    expect(knownSessionOwner([session({ id: 'local-session', profile: 'default' })], 'local-session')).toEqual(owner)
   })
 
   it('returns the owner hint for a hidden session absent from the list', () => {

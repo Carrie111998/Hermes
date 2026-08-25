@@ -42,7 +42,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   clearReadBaseline,
-  knownSessionProfile,
+  knownSessionOwner,
   lineageAliases,
   markSessionRead,
   sessionMatchesStoredId,
@@ -752,7 +752,7 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
 
   const storedSessionId = storedSessionIdForRuntimeId(sessionId) ?? sessionId
 
-  return sessionTileOwnerRoute(storedSessionId) ?? knownSessionProfile($sessions.get(), storedSessionId)
+  return sessionTileOwnerRoute(storedSessionId) ?? knownSessionOwner($sessions.get(), storedSessionId)
 }
 
 /**
@@ -809,7 +809,7 @@ export function storedSessionIdForRuntimeId(sessionId: string): null | string {
 export function setSessionTileWorkspaceScope(storedSessionId: string, scope: SessionTileWorkspaceScope): boolean {
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.workspaceMode === 'bots' ? scope.ownerRoute : undefined
+  const ownerRoute = scope.ownerRoute
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (

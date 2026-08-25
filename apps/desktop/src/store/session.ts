@@ -142,6 +142,40 @@ export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId:
 }
 
 /**
+ * Resolve the strongest owner identity available for a session. A connection-
+ * scoped row or open-time hint must stay a route object; reducing it to a bare
+ * profile name sends same-named sessions to the primary connection.
+ */
+export function knownSessionOwner(
+  sessions: readonly SessionInfo[],
+  sessionId: null | string
+): SessionProfileRoute | string | undefined {
+  if (!sessionId) {
+    return undefined
+  }
+
+  const row = sessions.find(session => sessionMatchesStoredId(session, sessionId))
+  const rowProfile = row?.profile?.trim()
+  const rowConnection = row?.connection_id?.trim()
+
+  if (rowConnection) {
+    return {
+      connectionId: rowConnection,
+      ...(row?.source === 'local' ? { mode: 'local' as const } : {}),
+      profile: rowProfile || 'default'
+    }
+  }
+
+  const hint = getSessionOwnerHint(sessionId)
+
+  if (hint) {
+    return hint
+  }
+
+  return rowProfile || undefined
+}
+
+/**
  * The profile a routed session belongs to, for keying the remembered id and
  * other PRESENTATION uses (which profile's sidebar/navigation this session sits
  * under). Falls back to the active gateway profile when the owner is unknown.

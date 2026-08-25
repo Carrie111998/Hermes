@@ -22,7 +22,12 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
-import { openGatewayForAgent, openGatewayForProfile, requestGatewayForAgent } from '@/store/gateway'
+import {
+  activeGatewayConnectionId,
+  openGatewayForAgent,
+  openGatewayForProfile,
+  requestGatewayForAgent
+} from '@/store/gateway'
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -77,6 +82,7 @@ import {
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
+  setSessionOwnerHint,
   setSessions,
   setSessionStartedAt,
   setTurnStartedAt,
@@ -167,6 +173,23 @@ interface SessionActionsOptions {
 // bounded retry rebinds it when the backend returns. Boot-into-a-stale-last-id
 // (NOT in this set) still legitimately drops to a draft.
 const createdThisRun = new Set<string>()
+
+function currentSessionOwnerRoute(capturedRoute?: SessionProfileRoute | null): SessionProfileRoute | undefined {
+  if (capturedRoute) {
+    return { ...capturedRoute }
+  }
+
+  const connectionId = activeGatewayConnectionId()
+
+  if (!connectionId) {
+    return undefined
+  }
+
+  return {
+    connectionId,
+    profile: normalizeProfileKey($activeGatewayProfile.get())
+  }
+}
 
 // Reflect a stored row's persisted token counts into the live usage atom
 // (total is derived, so callers can't drift it out of sync with input/output).
@@ -506,6 +529,16 @@ export function useSessionActions({
           return null
         }
 
+        const ownerRoute = currentSessionOwnerRoute(capturedRoute)
+
+        if (ownerRoute) {
+          setSessionOwnerHint(created.session_id, ownerRoute)
+
+          if (stored) {
+            setSessionOwnerHint(stored, ownerRoute)
+          }
+        }
+
         resetViewSync()
         activeSessionIdRef.current = created.session_id
         selectedStoredSessionIdRef.current = stored
@@ -644,6 +677,13 @@ export function useSessionActions({
 
         createdThisRun.add(stored)
 
+        const ownerRoute = currentSessionOwnerRoute(capturedRoute)
+
+        if (ownerRoute) {
+          setSessionOwnerHint(created.session_id, ownerRoute)
+          setSessionOwnerHint(stored, ownerRoute)
+        }
+
         // Seed the per-runtime cache so the tile renders immediately without a
         // redundant resume. Only add the row to the SIDEBAR when `listed` — an
         // unlisted (draft) tab stays out of the session list until its first
@@ -661,7 +701,13 @@ export function useSessionActions({
         const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
-        openSessionTile(stored, dir, undefined, undefined, workspaceScope)
+        openSessionTile(
+          stored,
+          dir,
+          undefined,
+          undefined,
+          ownerRoute ? { ...workspaceScope, ownerRoute } : workspaceScope
+        )
         patchSessionTile(stored, { runtimeId: created.session_id })
 
         if (dir === 'center' && runtimeInfo?.cwd) {
