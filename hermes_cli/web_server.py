@@ -19799,7 +19799,6 @@ def start_server(
     # normally instead of being swallowed and double-run.
     try:
         from uvicorn._compat import asyncio_run as _runner
-
         _loop_factory = config.get_loop_factory()
     except Exception:
         _runner = None
@@ -19811,8 +19810,16 @@ def start_server(
         except Exception:
             pass
 
-    if _runner is not None:
-        _runner(_serve(), loop_factory=_loop_factory)
-    else:
-        asyncio.run(_serve())
+    try:
+        if _runner is not None:
+            _runner(_serve(), loop_factory=_loop_factory)
+        else:
+            asyncio.run(_serve())
+    except KeyboardInterrupt:
+        return
+    except SystemExit as exc:
+        if exc.code == 1 and _port_bind_conflict(host, port):
+            _report_port_in_use(host, port)
+            raise SystemExit(PORT_IN_USE_EXIT_CODE) from None
+        raise
 
