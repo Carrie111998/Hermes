@@ -820,7 +820,14 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
+        pooled_read_conn = db._get_read_conn()
+        if pooled_read_conn is not None:
+            # _get_read_conn() opens a permitted pooled connection; return it
+            # before exercising search so _read_ctx() uses the exact connection
+            # carrying this trace callback. Leaving it checked out makes the
+            # production query open a different, untraced connection under WAL.
+            db._read_pool.put_nowait(pooled_read_conn)
+        read_conn = pooled_read_conn or db._conn
         traced_connections = [db._conn]
         if read_conn is not db._conn:
             traced_connections.append(read_conn)
