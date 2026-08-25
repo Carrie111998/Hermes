@@ -24,6 +24,7 @@ _SELF_RESOLUTION_PREFIXES = (
     "addressed ",
     "implemented in ",
     "resolved ",
+    "fixed at ",
     "fixed in ",
     "fixed both ",
     "fixed the ",
@@ -37,6 +38,9 @@ _ACTION_REMAINS_MARKERS = (
     "follow-up required",
     "todo",
     "unresolved",
+)
+_CODEX_REVIEW_ENVELOPE_PREFIX = (
+    "### 💡 codex review here are some automated review suggestions for this pull request."
 )
 _DEGRADED_REASONS = frozenset(
     {"github_error", "admission_cap", "dispatch_failed", "exact_head_unavailable"}
@@ -426,6 +430,8 @@ class ScanController:
                 return "before_not_before"
         except (AttributeError, ValueError):
             return "invalid_feedback_timestamp"
+        if _is_non_actionable_review_container(feedback):
+            return "non_actionable_review_container"
         if _is_self_resolution_receipt(feedback, owner_login=owner_login):
             return "self_resolution_receipt"
         return None
@@ -465,7 +471,7 @@ class ScanController:
 def _is_self_resolution_receipt(feedback: Feedback, *, owner_login: str) -> bool:
     """Suppress only high-confidence author receipts that describe completed work."""
 
-    if feedback.kind != "issue_comment":
+    if feedback.kind not in {"issue_comment", "review_comment"}:
         return False
     if feedback.reviewer.login.casefold() != owner_login.casefold():
         return False
@@ -475,6 +481,23 @@ def _is_self_resolution_receipt(feedback: Feedback, *, owner_login: str) -> bool
     if body.startswith(_SELF_RESOLUTION_PREFIXES):
         return True
     return body.startswith("confirmed ") and "superseded" in body
+
+
+def _is_non_actionable_review_container(feedback: Feedback) -> bool:
+    """Suppress review-level envelopes whose actionable findings arrive separately."""
+
+    if feedback.kind != "review":
+        return False
+    body = " ".join(feedback.body.casefold().split())
+    if not body:
+        return True
+    return (
+        feedback.is_bot
+        and body.startswith(_CODEX_REVIEW_ENVELOPE_PREFIX)
+        and "p1 badge" not in body
+        and "p2 badge" not in body
+        and not any(marker in body for marker in _ACTION_REMAINS_MARKERS)
+    )
 
 
 def _receipt_branch(receipt: FeedbackReceipt) -> str:

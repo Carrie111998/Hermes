@@ -202,6 +202,83 @@ def test_scan_suppresses_high_confidence_self_resolution_receipts(tmp_path: Path
     ledger.close()
 
 
+def test_scan_suppresses_non_actionable_review_containers_but_keeps_inline_findings(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(local_path, not_before="2026-08-24T00:00:00Z")
+    created_at = datetime.fromisoformat("2026-08-24T00:00:00+00:00")
+    reviewer = Reviewer("codex-review-bot", "MEMBER")
+    boilerplate = (
+        "### 💡 Codex Review\n"
+        "Here are some automated review suggestions for this pull request.\n"
+        "**Reviewed commit:** `abc123`"
+    )
+    github = FakeGitHub(
+        admitted_pull_request(sha),
+        (
+            Feedback("review", "empty-review", reviewer, "", created_at, True),
+            Feedback("review", "review-envelope", reviewer, boilerplate, created_at, True),
+            Feedback(
+                "review_comment",
+                "inline-finding",
+                reviewer,
+                "[P1] Preserve the fallback when the provider omits strikes.",
+                created_at,
+                True,
+            ),
+        ),
+    )
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 1
+    assert result.skipped["non_actionable_review_container"] == 2
+    assert [task.evidence["feedback_id"] for task in kanban.tasks] == ["inline-finding"]
+    ledger.close()
+
+
+def test_scan_suppresses_self_review_comment_receipt_only_when_no_action_remains(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(local_path, not_before="2026-08-24T00:00:00Z")
+    created_at = datetime.fromisoformat("2026-08-24T00:00:00+00:00")
+    owner = Reviewer("owner", "MEMBER")
+    github = FakeGitHub(
+        admitted_pull_request(sha),
+        (
+            Feedback(
+                "review_comment",
+                "fixed-reply",
+                owner,
+                "Fixed at 026649c79. Focused verification passed.",
+                created_at,
+                False,
+            ),
+            Feedback(
+                "review_comment",
+                "remaining-reply",
+                owner,
+                "Fixed the first case, but one blocker remains and still needs work.",
+                created_at,
+                False,
+            ),
+        ),
+    )
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 1
+    assert result.skipped["self_resolution_receipt"] == 1
+    assert [task.evidence["feedback_id"] for task in kanban.tasks] == ["remaining-reply"]
+    ledger.close()
+
+
 def test_scan_refetches_the_head_and_does_not_claim_or_dispatch_a_race(tmp_path: Path) -> None:
     local_path, sha = initialized_repository(tmp_path)
     policy = configured_policy(local_path, not_before="2026-08-24T00:00:00Z")
