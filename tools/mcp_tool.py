@@ -2396,7 +2396,7 @@ class MCPServerTask:
         "_reconnect_retries", "_session_proven", "_was_parked",
         "_inflight_tasks", "_reconnecting", "_suspect_reason",
         "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected",
+        "_ever_connected", "_rpc_generation", "_admitting_generation",
     )
 
     def __init__(self, name: str):
@@ -2441,9 +2441,29 @@ class MCPServerTask:
         # registered while running so a reconnect/shutdown teardown can fail
         # them fast instead of orphaning them on a dying transport.
         self._inflight_tasks: set = set()
-        # True while a deliberate teardown is failing in-flight calls — lets
+        # True while a deliberate teardown is failing in-flight calls, lets
         # _track_inflight_rpc convert the cancel into a retryable error.
         self._reconnecting: bool = False
+        # Generation-scoped RPC admission gate (#48069 residual, the piece
+        # #94184 did not carry). Closes the ZERO-ACTIVE-RPC late-admission
+        # window: _fail_inflight_calls early-returns when there are no
+        # victims to cancel, so a teardown that fires with no in-flight RPCs
+        # never flags _reconnecting/mark_suspect, and a LATE call arriving in
+        # that window could be admitted against a retiring ClientSession and
+        # hang on the dying transport. The gate makes admission an explicit,
+        # synchronously-checked property of the live session generation.
+        #
+        # _rpc_generation: monotonic id of the live session, bumped on each
+        #   new session publish.
+        # _admitting_generation: the generation currently ACCEPTING rpcs.
+        #   None means draining/closed, no session is admitting calls, so a
+        #   late call is refused (retryable) rather than admitted-and-orphaned.
+        # The check-and-register in _track_inflight_rpc is synchronous
+        # relative to the synchronous _close_rpc_admission() on the same event
+        # loop: a late call is deterministically EITHER registered-then-swept
+        # OR refused, never both admitted-and-outside-the-sweep.
+        self._rpc_generation: int = 0
+        self._admitting_generation: Optional[int] = None
         # SuspectableBackend state (#81051/#77765/#84132): latched by races
         # (teardown-vs-keepalive, auth-lock corruption); verified lazily by
         # ensure_healthy() before the next call reuses the connection.
@@ -2652,6 +2672,10 @@ class MCPServerTask:
     def _mark_stdio_recycled(self, reason: str) -> None:
         """Mark a stdio session dormant before its transport finishes closing."""
         self._recycled_reason = reason
+        # Close RPC admission before the transport unwinds so a late call in
+        # the recycle window is refused, not admitted against the dormant
+        # session (#48069 residual).
+        self._close_rpc_admission()
         self.session = None
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
@@ -2965,6 +2989,42 @@ class MCPServerTask:
         self._mark_session_proven()
         return True
 
+    def _publish_session(self, session: Any) -> None:
+        """Open RPC admission for a fresh session, then store it (#48069).
+
+        ALL session-assignment sites on the connect/reconnect paths route
+        through here (stdio / SSE / new-HTTP / legacy-HTTP). It bumps
+        ``_rpc_generation`` and OPENS admission (``_admitting_generation =
+        _rpc_generation``) BEFORE storing ``self.session``, so any handler
+        that observes a non-None session also observes an admitting
+        generation, there is no ordering in which a call sees a live session
+        but a closed gate for that same generation.
+
+        Re-entry into a healthy session REOPENS admission here (and clears the
+        ``_reconnecting`` teardown flag), so any path re-establishing a
+        session, including test doubles, is covered without a separate reset.
+        """
+        self._rpc_generation += 1
+        self._admitting_generation = self._rpc_generation
+        self._reconnecting = False
+        self.session = session
+
+    def _close_rpc_admission(self) -> None:
+        """Stop admitting new RPCs against the current session (#48069).
+
+        Called at EVERY lifecycle exit BEFORE the cancellation sweep and
+        BEFORE the transport unwinds (reconnect exit, shutdown exit, stdio
+        recycle, transport-TaskGroup drop). Setting ``_admitting_generation``
+        to None means a late call arriving in the teardown window is refused
+        (retryable) instead of admitted against a retiring ClientSession.
+
+        CRITICAL: this fires INDEPENDENTLY of whether there were in-flight
+        victims to cancel. ``_fail_inflight_calls`` early-returns in the
+        zero-victims case, which is exactly the sharp ZERO-ACTIVE-RPC window;
+        closing admission here regardless is what seals it.
+        """
+        self._admitting_generation = None
+
     def _fail_inflight_calls(self, reason: str) -> None:
         """Cancel every in-flight RPC attached to this connection.
 
@@ -2975,6 +3035,10 @@ class MCPServerTask:
         at least one task flags the cycle as a teardown race
         (``_teardown_race``) so run() treats the following reconnect as
         recovery rather than charging the rapid-drop budget.
+
+        The admission gate (``_close_rpc_admission``) is closed by the
+        caller BEFORE this runs, so even the zero-victims early-return below
+        cannot leave the connection admitting late calls (#48069 residual).
         """
         victims = [t for t in self._inflight_tasks if not t.done()]
         if not victims:
@@ -3125,10 +3189,16 @@ class MCPServerTask:
                         pass
 
         if self._shutdown_event.is_set():
+            # Close RPC admission BEFORE the sweep so a late call arriving in
+            # the teardown window is refused, not admitted against the dying
+            # session, this fires even in the zero-victims case that
+            # _fail_inflight_calls early-returns from (#48069 residual).
+            self._close_rpc_admission()
             self._fail_inflight_calls("shutdown")
             return "shutdown"
         # Deliberate teardown: fail any in-flight RPC NOW so it doesn't ride
         # the dying transport to the full tool timeout (#48069/#81995).
+        self._close_rpc_admission()
         self._fail_inflight_calls("reconnect")
         self._reconnect_event.clear()
         return "reconnect"
@@ -3338,7 +3408,11 @@ class MCPServerTask:
                     self.initialize_result = await self._negotiate_session(
                         session, connect_timeout
                     )
-                    self.session = session
+                    # Publish through the admission gate: opens RPC admission
+                    # for this new session generation BEFORE storing it, so a
+                    # handler that sees a live session also sees an open gate
+                    # (#48069 residual).
+                    self._publish_session(session)
                     self._mark_lifecycle_started()
                     await self._discover_tools()
                     self._ready.set()
@@ -3559,9 +3633,13 @@ class MCPServerTask:
             raise eg
         logger.debug(
             "MCP server '%s': transport TaskGroup exited after a live session "
-            "(%r) — reconnecting immediately instead of backing off",
+            "(%r), reconnecting immediately instead of backing off",
             self.name, eg,
         )
+        # The transport group dropped: the ClientSession is dying. Close RPC
+        # admission before run() rebuilds so a late call in this window is
+        # refused, not admitted against the retiring session (#48069 residual).
+        self._close_rpc_admission()
         return "reconnect"
 
     async def _run_http(self, config: dict):
@@ -3711,7 +3789,8 @@ class MCPServerTask:
                         self.initialize_result = await self._negotiate_session(
                             session, float(connect_timeout)
                         )
-                        self.session = session
+                        # Publish through the admission gate (#48069 residual).
+                        self._publish_session(session)
                         await self._discover_tools()
                         self._ready.set()
                         self._ever_connected = True
@@ -3777,7 +3856,8 @@ class MCPServerTask:
                             self.initialize_result = await self._negotiate_session(
                                 session, float(connect_timeout)
                             )
-                            self.session = session
+                            # Publish through the admission gate (#48069 residual).
+                            self._publish_session(session)
                             await self._discover_tools()
                             self._ready.set()
                             self._ever_connected = True
@@ -3821,11 +3901,12 @@ class MCPServerTask:
                     read_stream, write_stream, _get_session_id,
                 ):
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                        # Bound the handshake (#59349) — see stdio path.
+                        # Bound the handshake (#59349), see stdio path.
                         self.initialize_result = await self._negotiate_session(
                             session, float(connect_timeout)
                         )
-                        self.session = session
+                        # Publish through the admission gate (#48069 residual).
+                        self._publish_session(session)
                         await self._discover_tools()
                         self._ready.set()
                         self._ever_connected = True
@@ -5998,9 +6079,50 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str):
     cancel is converted into a clean retryable RuntimeError instead of a raw
     CancelledError; external cancels (caller timeout, user interrupt)
     propagate unchanged.
+
+    Generation-scoped admission gate (#48069 residual, the piece #94184 did
+    not carry). BEFORE registering the task, the gate is read SYNCHRONOUSLY,
+    with NO ``await`` between the admission check and the
+    ``_inflight_tasks.add(task)`` registration. If the live session is not
+    admitting (``_admitting_generation is None`` or != ``_rpc_generation``),
+    the call is REFUSED with the same retryable RuntimeError the
+    teardown-cancel path raises, so the caller retries on the rebuilt
+    session, instead of being registered against a retiring ClientSession.
+
+    Because this check-and-register is synchronous relative to the
+    synchronous ``_close_rpc_admission()`` on the same event loop, a late
+    call arriving in the teardown window is deterministically EITHER
+    registered-then-swept OR refused, never both admitted-and-outside-the-
+    sweep. This closes the ZERO-ACTIVE-RPC window that ``_fail_inflight_calls``
+    early-returns from (no victims to cancel means it never flagged the
+    connection, but admission is already closed here).
     """
     inflight = getattr(server, "_inflight_tasks", None)
     task = asyncio.current_task()
+    # Read the admission gate synchronously (no await before the add below).
+    # The gate only engages on a REAL published connection: ``_rpc_generation``
+    # is a positive int and ``_admitting_generation`` is an int or None. A bare
+    # test double (SimpleNamespace without the attrs, or a MagicMock whose
+    # attributes auto-create as Mock objects) is treated as always-admitting,
+    # the gate is a production-connection feature, not something a fake needs.
+    # ``_rpc_generation == 0`` (a connection that assigned ``.session`` directly
+    # and never published) is likewise not gated.
+    live_gen = getattr(server, "_rpc_generation", 0)
+    admitting = getattr(server, "_admitting_generation", 0)
+    if (
+        isinstance(live_gen, int)
+        and live_gen > 0
+        and (admitting is None or isinstance(admitting, int))
+    ):
+        if admitting is None or admitting != live_gen:
+            # Draining/closed or a stale generation: refuse rather than admit
+            # against a retiring session. Same retryable error the cancel path
+            # raises, so the caller re-dispatches on the rebuilt session.
+            raise RuntimeError(
+                f"MCP {op} on '{server_name}' arrived during a reconnect "
+                f"teardown window (no admitting session); retry the request "
+                f"on the rebuilt session"
+            )
     if task is not None and inflight is not None:
         # Test doubles may pass a bare SimpleNamespace; tracking is then
         # simply skipped (fast-fail teardown is a production-connection
