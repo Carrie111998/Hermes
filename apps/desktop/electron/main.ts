@@ -76,6 +76,10 @@ import {
 } from './connection-config'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { provisionDesktopBrand } from './desktop-brand-provision'
+import {
+  assertFoundrlyIsolatedHome,
+  resolveFoundrlyEffectiveHermesHome
+} from './foundrly-home'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
   buildPosixCleanupScript,
@@ -600,22 +604,29 @@ if (INSTALL_STAMP) {
 function resolveHermesHome() {
   if (process.env.HERMES_HOME) {
     const explicit = normalizeHermesHomeRoot(process.env.HERMES_HOME)
+    const brand = process.env.HERMES_DESKTOP_BRAND
 
-    if (process.env.HERMES_DESKTOP_BRAND === 'quizverse') {
+    if (brand === 'quizverse' || brand === 'foundrly') {
       const ixDefault = IS_WINDOWS && process.env.LOCALAPPDATA
         ? path.join(process.env.LOCALAPPDATA, 'hermes')
         : path.join(app.getPath('home'), '.hermes')
 
-      return assertQuizverseIsolatedHome(explicit, ixDefault)
+      return brand === 'foundrly'
+        ? assertFoundrlyIsolatedHome(explicit, ixDefault)
+        : assertQuizverseIsolatedHome(explicit, ixDefault)
     }
 
     return explicit
   }
 
-  // QuizVerse owns an isolated agent profile by default. Users who
+  // QuizVerse / Foundrly own an isolated agent profile by default. Users who
   // intentionally shared a profile can preserve that behavior by explicitly
-  // setting HERMES_HOME; we never silently copy IX/admin configuration.
-  if (process.env.HERMES_DESKTOP_BRAND === 'quizverse') {
+  // setting HERMES_HOME (must not be the shared IX default); we never silently
+  // copy IX/admin configuration into these brands.
+  if (
+    process.env.HERMES_DESKTOP_BRAND === 'quizverse' ||
+    process.env.HERMES_DESKTOP_BRAND === 'foundrly'
+  ) {
     return path.join(app.getPath('userData'), 'hermes-home')
   }
 
@@ -662,13 +673,17 @@ const QV_MCP_SERVER_PIPE_NONCE =
   process.env.HERMES_DESKTOP_BRAND === 'quizverse' ? crypto.randomBytes(16).toString('hex') : ''
 
 function effectiveDesktopHermesHome(): string {
-  if (process.env.HERMES_DESKTOP_BRAND !== 'quizverse') {
+  const brand = process.env.HERMES_DESKTOP_BRAND
+
+  if (brand !== 'quizverse' && brand !== 'foundrly') {
     return HERMES_HOME
   }
 
   const activeProfile = readActiveDesktopProfile()
 
-  return resolveQuizverseEffectiveHermesHome(HERMES_HOME, activeProfile)
+  return brand === 'foundrly'
+    ? resolveFoundrlyEffectiveHermesHome(HERMES_HOME, activeProfile)
+    : resolveQuizverseEffectiveHermesHome(HERMES_HOME, activeProfile)
 }
 
 function quizverseMcpServerSocketPath(): string {
@@ -687,11 +702,22 @@ function ensureDesktopBrandProvision(targetHermesHome = effectiveDesktopHermesHo
       productName: BRAND.productName,
       sharedSkillsRoot: IS_PACKAGED
         ? path.join(process.resourcesPath, 'hermes-skills')
-        : path.join(SOURCE_REPO_ROOT, 'skills')
+        : path.join(SOURCE_REPO_ROOT, 'skills'),
+      ...(BRAND.id === 'foundrly'
+        ? {
+            foundrly: {
+              webUrl: BRAND.foundrly?.webUrl,
+              adminPortalUrl: BRAND.foundrly?.adminPortalUrl,
+              adminChatUrl: BRAND.foundrly?.adminChatUrl
+            }
+          }
+        : {})
     })
 
     rememberLog(
-      `[brand] provisioned skin at ${result.skinPath}${result.configTouched ? ' (config updated)' : ''}; ` +
+      `[brand] provisioned skin at ${result.skinPath}` +
+      `${result.configTouched ? ' (config updated)' : ''}` +
+      `${result.soulWritten ? ' (soul written)' : ''}; ` +
       `${result.sharedSkillCount} shared skills`
     )
   } catch (error) {
@@ -7714,12 +7740,20 @@ async function spawnPoolBackend(profile, entry) {
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-  const backendArgs = process.env.HERMES_DESKTOP_BRAND === 'quizverse'
+  const isolatedBrandHome =
+    process.env.HERMES_DESKTOP_BRAND === 'quizverse' ||
+    process.env.HERMES_DESKTOP_BRAND === 'foundrly'
+  const backendArgs = isolatedBrandHome
     ? ['serve', '--host', '127.0.0.1', '--port', '0']
     : ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
 
-  if (process.env.HERMES_DESKTOP_BRAND === 'quizverse') {
-    ensureDesktopBrandProvision(resolveQuizverseEffectiveHermesHome(HERMES_HOME, profile))
+  if (isolatedBrandHome) {
+    const profileHome =
+      process.env.HERMES_DESKTOP_BRAND === 'foundrly'
+        ? resolveFoundrlyEffectiveHermesHome(HERMES_HOME, profile)
+        : resolveQuizverseEffectiveHermesHome(HERMES_HOME, profile)
+
+    ensureDesktopBrandProvision(profileHome)
   }
 
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
@@ -7738,8 +7772,10 @@ async function spawnPoolBackend(profile, entry) {
       cwd: hermesCwd,
       env: {
         ...process.env,
-        HERMES_HOME: process.env.HERMES_DESKTOP_BRAND === 'quizverse'
-          ? resolveQuizverseEffectiveHermesHome(HERMES_HOME, profile)
+        HERMES_HOME: isolatedBrandHome
+          ? process.env.HERMES_DESKTOP_BRAND === 'foundrly'
+            ? resolveFoundrlyEffectiveHermesHome(HERMES_HOME, profile)
+            : resolveQuizverseEffectiveHermesHome(HERMES_HOME, profile)
           : HERMES_HOME,
         ...backend.env,
         // Pin the gateway's tool/terminal cwd to the same directory we chose for
@@ -7976,7 +8012,11 @@ async function startHermes() {
     // unaffected.
     const activeProfile = readActiveDesktopProfile()
 
-    if (activeProfile && process.env.HERMES_DESKTOP_BRAND !== 'quizverse') {
+    if (
+      activeProfile &&
+      process.env.HERMES_DESKTOP_BRAND !== 'quizverse' &&
+      process.env.HERMES_DESKTOP_BRAND !== 'foundrly'
+    ) {
       backendArgs.unshift('--profile', activeProfile)
     }
 

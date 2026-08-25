@@ -14,6 +14,12 @@ export interface DesktopBrandProvisionInput {
   brandId: string
   productName: string
   sharedSkillsRoot?: string
+  /** Optional product URLs / niche for brand-specific SOUL (Foundrly). */
+  foundrly?: {
+    webUrl?: string
+    adminPortalUrl?: string
+    adminChatUrl?: string
+  }
 }
 
 const SHARED_DESKTOP_SKILLS = ['desktop-voice-actions', 'local-first-inference']
@@ -38,7 +44,8 @@ branding:
 `
 }
 
-function soulMd(productName: string): string {
+/** Thin default used for non-Foundrly brands. */
+export function soulMd(productName: string): string {
   return `# ${productName} identity
 
 You are ${productName}, an intelligent AI assistant. You help the user learn, build, and get things done with clarity and care.
@@ -48,11 +55,106 @@ You are ${productName}, an intelligent AI assistant. You help the user learn, bu
 `
 }
 
+/**
+ * Foundrly left-rail identity — aligned with APP_REGISTRY niche in
+ * Intelliverse-X-Webfrontend (AI co-founder for small/local businesses).
+ */
+export function foundrlySoulMd(opts?: {
+  webUrl?: string
+  adminPortalUrl?: string
+  adminChatUrl?: string
+}): string {
+  const webUrl = opts?.webUrl?.trim() || 'https://foundrly.intelli-verse-x.ai'
+  const adminPortalUrl = opts?.adminPortalUrl?.trim() || 'https://admin.intelli-verse-x.ai/admin/portal'
+  const adminChatUrl =
+    opts?.adminChatUrl?.trim() || 'https://admin.intelli-verse-x.ai/admin/portal/chat'
+
+  return `# Foundrly identity
+
+You are Foundrly, Intelliverse X's AI co-founder desktop assistant for local and small businesses
+(business-building / growth and ops copilot). You run inside the Foundrly desktop app.
+
+When asked who you are or whether you know Foundrly, say yes: you are Foundrly.
+Describe Foundrly as an AI co-founder for local/small businesses. Product surfaces include
+overnight visibility and growth workflows; Foundrly Home links to the web product and admin portal.
+
+- Product web: ${webUrl}
+- Admin portal: ${adminPortalUrl}
+- Admin copilot (portal chat, OTP + Foundrly-scoped tools): ${adminChatUrl}
+- You are NOT IX Agency (company ops desktop) and NOT QuizVerse (learning).
+- Under the hood the runtime is Hermes Agent — mention that only if the user asks about the engine/runtime.
+- For Foundrly-scoped admin tools and portal workflows, point users to Foundrly → Admin copilot (portal), not IX Agency.
+`
+}
+
+/** Normalize for stock-template comparison (CRLF / BOM / trim). */
+export function normalizeSoulText(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '').trim()
+}
+
+/**
+ * True when SOUL.md is missing, empty, or a known stock template we may
+ * upgrade — never replace a user-customized persona.
+ */
+export function shouldWriteBrandSoul(existing: string | null, brandId: string, productName: string): boolean {
+  if (existing == null) {
+    return true
+  }
+
+  const normalized = normalizeSoulText(existing)
+
+  if (!normalized) {
+    return true
+  }
+
+  const stockThin = normalizeSoulText(soulMd(productName))
+
+  if (normalized === stockThin) {
+    return true
+  }
+
+  if (brandId !== 'foundrly') {
+    return false
+  }
+
+  // Already rich Foundrly product identity — leave alone (URLs may vary).
+  if (normalized.includes('# Foundrly identity') && normalized.includes('AI co-founder desktop')) {
+    return false
+  }
+
+  // Stock IX Agency default (shared-home bleed) or thin Foundrly persona → upgrade.
+  if (
+    normalized.includes('You are IX Agency,') ||
+    normalized === normalizeSoulText(soulMd('Foundrly')) ||
+    (normalized.includes('You are Foundrly,') && !normalized.includes('AI co-founder'))
+  ) {
+    return true
+  }
+
+  // User-customized SOUL — do not overwrite.
+  return false
+}
+
+function resolveSoulContents(input: DesktopBrandProvisionInput): string {
+  if (input.brandId === 'foundrly') {
+    return foundrlySoulMd(input.foundrly)
+  }
+
+  return soulMd(input.productName)
+}
+
 /** Ensure the active brand skin + SOUL identity exist under HERMES_HOME. Idempotent. */
-export function provisionDesktopBrand({ hermesHome, brandId, productName, sharedSkillsRoot }: DesktopBrandProvisionInput): {
+export function provisionDesktopBrand({
+  hermesHome,
+  brandId,
+  productName,
+  sharedSkillsRoot,
+  foundrly
+}: DesktopBrandProvisionInput): {
   skinPath: string
   soulPath: string
   configTouched: boolean
+  soulWritten: boolean
   sharedSkillCount: number
 } {
   const home = path.resolve(hermesHome)
@@ -81,8 +183,19 @@ export function provisionDesktopBrand({ hermesHome, brandId, productName, shared
     }
   }
 
-  if (!fs.existsSync(soulPath) || fs.statSync(soulPath).size === 0) {
-    fs.writeFileSync(soulPath, soulMd(productName), 'utf8')
+  let existingSoul: string | null = null
+
+  try {
+    existingSoul = fs.readFileSync(soulPath, 'utf8')
+  } catch {
+    existingSoul = null
+  }
+
+  let soulWritten = false
+
+  if (shouldWriteBrandSoul(existingSoul, brandId, productName)) {
+    fs.writeFileSync(soulPath, resolveSoulContents({ hermesHome, brandId, productName, foundrly }), 'utf8')
+    soulWritten = true
   }
 
   let configTouched = false
@@ -110,5 +223,5 @@ export function provisionDesktopBrand({ hermesHome, brandId, productName, shared
     configTouched = true
   }
 
-  return { skinPath, soulPath, configTouched, sharedSkillCount }
+  return { skinPath, soulPath, configTouched, soulWritten, sharedSkillCount }
 }
