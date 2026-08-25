@@ -245,9 +245,9 @@ export class JsonRpcGatewayClient {
             }
 
             this.socket = null
+            this.setState('error')
           }
 
-          this.setState('error')
           reject(new Error(this.options.connectErrorMessage))
         }, this.options.connectTimeoutMs)
       }
