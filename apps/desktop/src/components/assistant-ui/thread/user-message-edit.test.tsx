@@ -15,6 +15,8 @@ import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-s
 
 import { assistantMessage, stubThreadEnvironment, stubThreadViewportSize, userMessage } from '../test-utils'
 
+import { BLUR_SETTLE_MS, LATCH_COOLDOWN_MS } from './user-edit-composer'
+
 import { Thread } from '.'
 stubThreadEnvironment()
 
@@ -253,5 +255,103 @@ describe('Enter submission and latch behavior', () => {
     // The editor should allow the newline to be inserted (by not preventing default)
     // We don't simulate actual newline insertion here (requires complex DOM manipulation)
     // but we verify the guard did not block it
+  })
+})
+
+// The edit composer is the one composer that routinely unmounts (confirming or
+// cancelling tears it down), so a deferred callback can outlive the component.
+// In the app that is a stray state update on a dead tree; in jsdom the window is
+// already gone when the timer fires, surfacing as an uncaught
+// `ReferenceError: window is not defined` that fails the whole suite from an
+// unrelated test file.
+//
+// These assert on the timers this composer itself schedules — `getTimerCount()`
+// is global and legitimately non-zero from the runtime and React internals.
+describe('deferred work does not outlive the edit composer', () => {
+  // Records timers scheduled while tracking is active, keyed by their delay, so
+  // a test can assert on the composer's own timers. The global timer count is
+  // legitimately non-zero from the runtime and React internals, so filtering by
+  // this component's distinctive delays is what isolates its cleanup.
+  function trackTimers() {
+    const scheduled = new Map<number, { delayMs: number; run: () => void }>()
+    const cleared = new Set<number>()
+    const realSetTimeout = window.setTimeout.bind(window)
+    const realClearTimeout = window.clearTimeout.bind(window)
+
+    vi.spyOn(window, 'setTimeout').mockImplementation(((run: () => void, delayMs?: number) => {
+      const id = realSetTimeout(run, delayMs) as unknown as number
+      scheduled.set(id, { delayMs: delayMs ?? 0, run })
+
+      return id
+    }) as typeof window.setTimeout)
+
+    vi.spyOn(window, 'clearTimeout').mockImplementation(((id?: number) => {
+      if (id !== undefined) {
+        cleared.add(id)
+      }
+
+      realClearTimeout(id)
+    }) as typeof window.clearTimeout)
+
+    return {
+      pendingAt: (delayMs: number) =>
+        [...scheduled.entries()].filter(([id, timer]) => timer.delayMs === delayMs && !cleared.has(id)).map(([id]) => id),
+      run: (id: number) => scheduled.get(id)?.run()
+    }
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('clears the pending submit latch timer when the composer unmounts', async () => {
+    const onEdit = vi.fn(async () => {})
+    const { unmount } = render(<IncrementalHarness onEdit={onEdit} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }))
+
+    const editor = await screen.findByRole('textbox', { name: 'Edit message' })
+    editor.textContent = 'edit that schedules the latch timer'
+    fireEvent.input(editor)
+
+    // Track only from here: the latch is scheduled synchronously by this
+    // keyDown. Assert before awaiting anything — a resolved onEdit closes the
+    // edit and unmounts the composer, which clears the latch on its own.
+    const timers = trackTimers()
+    fireEvent.keyDown(editor, { key: 'Enter' })
+
+    const stranded = timers.pendingAt(LATCH_COOLDOWN_MS)
+    expect(stranded.length).toBeGreaterThan(0)
+
+    unmount()
+
+    // The latch timer must not survive the composer that scheduled it.
+    expect(timers.pendingAt(LATCH_COOLDOWN_MS)).toEqual([])
+  })
+
+  it('clears the deferred blur handler when the composer unmounts', async () => {
+    const onEdit = vi.fn(async () => {})
+    const { unmount } = render(<IncrementalHarness onEdit={onEdit} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }))
+
+    const editor = await screen.findByRole('textbox', { name: 'Edit message' })
+
+    const timers = trackTimers()
+    // Blur defers the trigger-close and the cancel by BLUR_SETTLE_MS.
+    fireEvent.blur(editor)
+
+    const stranded = timers.pendingAt(BLUR_SETTLE_MS)
+    expect(stranded.length).toBeGreaterThan(0)
+
+    unmount()
+
+    expect(timers.pendingAt(BLUR_SETTLE_MS)).toEqual([])
+
+    // Firing a stranded callback by hand is what a real timer flush would do:
+    // post-fix these are cleared, so nothing is left to touch the dead tree.
+    expect(() => {
+      stranded.forEach(id => timers.run(id))
+    }).not.toThrow()
   })
 })
