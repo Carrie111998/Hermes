@@ -819,7 +819,19 @@ def _e2ee_unsupported_reason() -> str:
         from tools.lazy_deps import unsupported_reason
 
         return unsupported_reason("platform.matrix.e2ee") or ""
-    except Exception:  # pragma: no cover — defensive
+    except Exception:
+        # Fail CLOSED on the hosts we know cannot build olm. Returning "" here
+        # would mean "E2EE is installable", so a broken/partial install (where
+        # importing tools.lazy_deps fails) would make the wizard offer E2EE and
+        # walk the user straight into the doomed build this split exists to
+        # prevent. The platform test needs no imports, so it still holds.
+        if sys.platform in ("win32", "darwin"):
+            where = "Windows" if sys.platform == "win32" else "macOS"
+            return (
+                f"unsupported on {where}: Matrix E2EE depends on python-olm "
+                f"(libolm), which has no {where} wheel and cannot be built "
+                "from sdist here."
+            )
         return ""
 
 
@@ -836,6 +848,14 @@ def _ensure_matrix_e2ee_deps() -> bool:
     if blocked:
         logger.warning("Matrix: cannot install E2EE dependencies — %s", blocked)
         return False
+    # This can run mid-connect, and on a host with a toolchain python-olm
+    # builds libolm from sdist — tens of seconds with no output of its own.
+    # Announce it so an otherwise unexplained pause in adapter startup is
+    # attributable.
+    logger.info(
+        "Matrix: installing E2EE dependencies (python-olm + crypto stack) — "
+        "this may take a while if python-olm builds from source..."
+    )
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
 
