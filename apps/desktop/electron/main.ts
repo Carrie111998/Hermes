@@ -15469,11 +15469,7 @@ app.whenReady().then(() => {
     safeStorageApi: safeStorage
   })
 
-  if (IS_MAC) {
-    Menu.setApplicationMenu(buildApplicationMenu())
-  } else {
-    Menu.setApplicationMenu(null)
-  }
+  Menu.setApplicationMenu(buildApplicationMenu())
 
   installMediaPermissions()
   installDownloadHandling()
