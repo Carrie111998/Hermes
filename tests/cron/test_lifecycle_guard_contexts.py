@@ -42,6 +42,9 @@ BLOCKED = [
     'pid=$(systemctl --user show hermes-gateway.service -p MainPID --value); kill -USR1 "$pid"',
     # and the historical order, which the old pattern already caught
     "pkill -f hermes-gateway",
+    "/usr/bin/pkill -f hermes-gateway",
+    "command /usr/bin/pkill -f hermes-gateway",
+    "env -i PATH=/usr/bin /usr/bin/pkill -f hermes-gateway",
     "kill -9 $(pgrep -f hermes-gateway)",
     # newline separator, not just ';'
     'pid=$(systemctl --user show hermes-gateway.service -p MainPID --value)\nkill -TERM "$pid"',
@@ -84,10 +87,19 @@ def test_benign_shapes_are_allowed(command):
     assert lg.contains_gateway_lifecycle_command(command) is False
 
 
-def test_kill_by_pid_is_blocked_when_pid_resolves(monkeypatch):
+@pytest.mark.parametrize(
+    "command",
+    [
+        "kill -USR1 133375",
+        "/bin/kill -TERM 133375",
+        "command /bin/kill -TERM 133375",
+        "env -i PATH=/usr/bin /usr/bin/kill -TERM 133375",
+        "sudo /bin/kill -TERM 133375",
+    ],
+)
+def test_kill_by_pid_is_blocked_when_pid_resolves(monkeypatch, command):
     monkeypatch.setattr(lg, "_resolve_gateway_main_pid", lambda: 133375)
-    assert lg.kill_targets_gateway_main_pid("kill -USR1 133375") is True
-    assert lg.kill_targets_gateway_main_pid("kill -TERM 133375") is True
+    assert lg.kill_targets_gateway_main_pid(command) is True
 
 
 def test_kill_by_pid_fails_open_when_pid_unknown(monkeypatch):
@@ -103,6 +115,9 @@ def test_kill_by_pid_does_not_overmatch(monkeypatch):
     # no kill at a command position -> no PID lookup, no block
     assert lg.kill_targets_gateway_main_pid("echo 133375") is False
     assert lg.kill_targets_gateway_main_pid("grep 133375 /tmp/pids") is False
+    assert lg.kill_targets_gateway_main_pid("echo /bin/kill -TERM 133375") is False
+    # A different command mentioning the PID must not be attributed to kill.
+    assert lg.kill_targets_gateway_main_pid("kill -TERM 99; echo 133375") is False
 
 
 def test_pid_lookup_is_skipped_without_a_kill(monkeypatch):

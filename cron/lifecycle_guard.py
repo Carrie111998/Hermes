@@ -62,8 +62,10 @@ class GatewayLifecycleBlocked(ValueError):
 # is anchored on a concrete command identifier so a match can only fire on
 # actual shell-command-shaped strings, not on prose.
 _KILL_AT_COMMAND_POSITION = (
-    r"(?:\A|[;&|(){}\n])[ \t]*(?:sudo[ \t]+(?:-\S+[ \t]+)*)?p?kill\b"
+    r"(?:\A|[;&|(){}\n])[ \t]*(?:sudo[ \t]+(?:-\S+[ \t]+)*)?"
+    r"(?:[^\s;&|(){}]*/)?p?kill\b"
 )
+_GATEWAY_KILL_TARGET_RE = re.compile(r"(?i)\bhermes[.\-]?gateway\b")
 
 
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
@@ -157,12 +159,24 @@ def _resolve_gateway_main_pid():
 
 def kill_targets_gateway_main_pid(text: str) -> bool:
     """Fail-open numeric-PID companion to the command-shaped text guard."""
-    if not text or not _KILL_COMMAND_RE.search(text):
+    if not text:
+        return False
+    kill_segments = list(_iter_kill_command_segments(text))
+    raw_kill_match = _KILL_COMMAND_RE.search(text)
+    if not kill_segments and not raw_kill_match:
         return False
     pid = _resolve_gateway_main_pid()
     if not pid:
         return False
-    return re.search(r"(?<![0-9])" + str(pid) + r"(?![0-9])", text) is not None
+    pid_re = re.compile(r"(?<![0-9])" + str(pid) + r"(?![0-9])")
+    if kill_segments:
+        return any(
+            pid_re.search(" ".join(segment[index:]))
+            for segment, index in kill_segments
+        )
+    # If shlex cannot recover a malformed command, preserve the bounded raw
+    # fallback instead of letting a syntax error disable the guard entirely.
+    return raw_kill_match is not None and pid_re.search(text) is not None
 
 
 # A backslash immediately followed by a newline is a POSIX shell line
@@ -335,6 +349,8 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # from execute_code, where commas and brackets — not spaces — separate
     # the argv words the OS will actually see.
     for segment in _iter_command_segments(normalized):
+        if _segment_kill_targets_gateway(segment):
+            return True
         joined = " ".join(segment)
         if joined and _GATEWAY_LIFECYCLE_PATTERN.search(joined):
             return True
@@ -645,6 +661,43 @@ def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
     return index
+
+
+def _kill_executable_index(segment: list[str]) -> Optional[int]:
+    """Return the executable index when a segment runs ``kill``/``pkill``.
+
+    Absolute paths and transparent wrapper chains are normalized through the
+    same helpers used by the referenced-script walker. This keeps
+    ``/bin/kill``, ``command kill`` and ``env /usr/bin/pkill`` equivalent to
+    their bare executable forms without matching the word ``kill`` in data.
+    """
+    index = _command_token_index(segment)
+    if index is None:
+        return None
+    index = _peel_transparent_prefixes(segment, index)
+    if index >= len(segment):
+        return None
+    if _executable_name(segment[index]).lower() not in {"kill", "pkill"}:
+        return None
+    return index
+
+
+def _iter_kill_command_segments(text: str) -> Iterator[tuple[list[str], int]]:
+    """Yield tokenized command segments whose effective executable is kill."""
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    for segment in _iter_command_segments(normalized):
+        index = _kill_executable_index(segment)
+        if index is not None:
+            yield segment, index
+
+
+def _segment_kill_targets_gateway(segment: list[str]) -> bool:
+    """Return True when one executable kill segment names the gateway."""
+    index = _kill_executable_index(segment)
+    return index is not None and any(
+        _GATEWAY_KILL_TARGET_RE.search(token)
+        for token in segment[index + 1 :]
+    )
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
