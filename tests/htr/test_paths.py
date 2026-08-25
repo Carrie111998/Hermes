@@ -35,3 +35,19 @@ def test_path_traversal_in_task_id_rejected(tmp_path):
     run_id = new_run_id()
     with pytest.raises(ValueError):
         paths.task_dir(run_id, "../escape", base_dir=tmp_path)
+
+
+def test_project_registry_paths_use_hermes_home(tmp_path):
+    from htr.ids import generate_project_id
+
+    project_id = generate_project_id()
+    root = paths.project_registry_root(tmp_path)
+    assert root == tmp_path / ".htr" / "project_registry"
+    assert paths.project_record_path(project_id, tmp_path) == (
+        root / "projects" / project_id / "record.json"
+    )
+
+
+def test_project_id_traversal_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        paths.project_record_dir("../escape", tmp_path)

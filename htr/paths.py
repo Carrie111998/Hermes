@@ -377,3 +377,45 @@ def heal_dir(
     base_dir: Path | None = None,
 ) -> Path:
     return attempt_dir(run_id, task_id, attempt_id, base_dir) / "heal"
+
+
+HTR_META_DIR_NAME = ".htr"
+PROJECT_REGISTRY_DIR_NAME = "project_registry"
+PROJECT_REGISTRY_PROJECTS_DIR_NAME = "projects"
+PROJECT_REGISTRY_RECORD_NAME = "record.json"
+PROJECT_REGISTRY_LOCK_NAME = "registry.lock"
+
+
+def _hermes_home_path(hermes_home: Path | None = None) -> Path:
+    if hermes_home is not None:
+        return Path(hermes_home)
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home()
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def project_registry_root(hermes_home: Path | None = None) -> Path:
+    """Return ``{HERMES_HOME}/.htr/project_registry`` — above per-project runs trees."""
+    return _hermes_home_path(hermes_home) / HTR_META_DIR_NAME / PROJECT_REGISTRY_DIR_NAME
+
+
+def project_registry_lock_path(hermes_home: Path | None = None) -> Path:
+    return project_registry_root(hermes_home) / PROJECT_REGISTRY_LOCK_NAME
+
+
+def project_registry_projects_root(hermes_home: Path | None = None) -> Path:
+    return project_registry_root(hermes_home) / PROJECT_REGISTRY_PROJECTS_DIR_NAME
+
+
+def project_record_dir(project_id: str, hermes_home: Path | None = None) -> Path:
+    _validate_path_component(project_id, "project_id")
+    if not validate_id(project_id, "project"):
+        raise ValueError(f"invalid project_id format: {project_id!r}")
+    return project_registry_projects_root(hermes_home) / project_id
+
+
+def project_record_path(project_id: str, hermes_home: Path | None = None) -> Path:
+    return project_record_dir(project_id, hermes_home) / PROJECT_REGISTRY_RECORD_NAME

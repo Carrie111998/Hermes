@@ -30,6 +30,7 @@ IdKind = Literal[
     "bounded_action_proposal",
     "bounded_action_review_decision",
     "bounded_action_escalation",
+    "project",
 ]
 
 ID_PREFIXES: dict[IdKind, str] = {
@@ -55,10 +56,11 @@ ID_PREFIXES: dict[IdKind, str] = {
     "bounded_action_proposal": "bar_",
     "bounded_action_review_decision": "brd_",
     "bounded_action_escalation": "bes_",
+    "project": "prj_",
 }
 
 _ID_BODY_RE = re.compile(
-    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn|mdp|mda|mdc|mat|rcr|rap|rcl|rat|bar|brd|bes)_(\d{8})_([a-f0-9]{6})$"
+    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn|mdp|mda|mdc|mat|rcr|rap|rcl|rat|bar|brd|bes|prj)_(\d{8})_([a-f0-9]{6})$"
 )
 
 
@@ -194,3 +196,7 @@ def generate_bounded_action_review_decision_id() -> str:
 
 def generate_bounded_action_escalation_id() -> str:
     return generate_id("bounded_action_escalation")
+
+
+def generate_project_id() -> str:
+    return generate_id("project")

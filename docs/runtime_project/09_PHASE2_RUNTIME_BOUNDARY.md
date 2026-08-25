@@ -134,6 +134,8 @@ Runtime must not append events or write SoT directly. Writes only through allowl
 
 **Task 27 approved Successor Run creation (Path-R1 creation-only v1 — checkpoint approved and complete):** Control store at `{runs_root}/.control/recovery_runs/{recovery_request_id}/` with immutable records; `{successor}/recovery_origin.json` linkage. **Path R1 only** — creates **one approved linked Successor Run**; original finalized source Run **permanently immutable**; successor creation **does not authorize successor execution**; all six outcome non-permission booleans remain **`false`**; **`forward_fix` outside v1**; attempt-before-creation; exclusive successor reservation/bootstrap without Task 23 marker. Does **not** grant retry, repair, invoke, artifact copy, external side effect, automatic execution, completion, closure, marker disposition, or outcome rewrite. **Task 28 not started and not approved.**
 
+**Task 30 multi-project registry + isolation (local v1):** Registry SoT at `{HERMES_HOME}/.htr/project_registry/projects/{project_id}/record.json` (schema `htr.project_registry.record.v1`). Identity is `prj_` id + canonical absolute runs-root; display name and cwd are not identity. Exclusive create + flock; idempotent re-register of the same id+path; identity/path/overlap conflicts fail closed. Unregistered `{HERMES_HOME}/runs` single-project workflow is unchanged. Does **not** implement Task 31 learning, Task 28 repair, unattended invoke, runs-root relocation, or project deletion.
+
 Ambiguous outcomes include: not started; completed and verified; failed before mutation; may-have-completed (lost ack); SoT/event disagree; post-write verification failed; escalation required.
 
 **No general true rollback** in baseline. Successor-based recovery is forward recovery, not rollback.
@@ -222,8 +224,8 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 | 26 | Execution reconciliation (umbrella) | ✅ Complete for approved v1 scope (26A/26B/26C Path A done; Path B deferred) |
 | 27 | Recovery/Successor Run creation (Path R1 v1) | ✅ Path-R1 creation-only v1 checkpoint approved and complete |
 | 28 | Bounded retry/repair framework | Not started |
-| 29 | Advisory artifact/link inspection | |
-| 30 | Multi-project registry + isolation | |
+| 29 | Advisory artifact/link inspection | ✅ local Phase I (MERGE_G `3b43f6dfc`; upstream not complete) |
+| 30 | Multi-project registry + isolation | ✅ local v1 (`task29-local-merge-g`; upstream not complete) |
 | 31 | Case history + controlled learning | |
 
 ---
@@ -241,5 +243,6 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 - Task 26A, 26B, 26B.1, and 26C **closed**; **Task 26 complete for approved v1 scope** (Path B deferred).
 - **Task 27 Path-R1 creation-only v1 checkpoint approved and complete** — creates one approved linked Successor Run; original finalized source Run permanently immutable; successor creation does not authorize successor execution; all six outcome non-permission booleans remain false; forward_fix outside v1; Path R1 only eligibility path.
 - **Task 28 not started and not approved.**
+- **Task 30 multi-project registry + isolation local v1 implemented** — `{HERMES_HOME}/.htr/project_registry`; unregistered single-project runs root unchanged; not an upstream checkpoint.
 - No general Phase 2 lifecycle invoke path is enabled outside the Task 25 pilot API.
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.

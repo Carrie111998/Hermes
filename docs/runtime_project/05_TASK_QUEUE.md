@@ -1,12 +1,38 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-30 (Task 27 Path-R1 creation-only v1 checkpoint approved and complete; Task 28 not started and not approved)
+**Last updated:** 2026-08-24 (Task 30 multi-project registry + isolation — local v1 implemented; Task 28 still not started and not approved)
 
 ---
 
 ## Active Task
 
-**None** — Task 27 Path-R1 creation-only v1 is checkpoint approved and complete. **Task 28 not started and not approved.**
+**None** — Task 30 multi-project registry + isolation local v1 is implemented. **Task 28 not started and not approved.** Task 31 is not started and not approved.
+
+---
+
+## Completed (local)
+
+### Task 30 — Multi-project registry + isolation (v1)
+
+**Status:** ✅ Local v1 implemented on `task29-local-merge-g` (parent `3b43f6dfc`). Not an upstream checkpoint.
+**Depends on:** existing `runs_root` / `{HERMES_HOME}/runs` path contract (Task 1+); does **not** depend on Task 28 or Task 31.
+
+**Delivered:**
+
+- `htr/project_registry.py` — register / get / list / metadata update; fail-closed identity and path conflicts; atomic exclusive create + flock; isolated `{HERMES_HOME}/.htr/project_registry/`
+- `htr/paths.py` — registry path helpers above per-project runs trees
+- `htr/ids.py` — `prj_` project identity
+- `hermes htr project {register,show,list,update}` plus optional `--project-id` on `observe` / `plan`
+- `tests/htr/test_project_registry.py`
+
+**Identity / isolation:**
+
+- Identity is `project_id` + canonical absolute runs-root (resolved, case-folded for uniqueness). Display name and cwd are never identity.
+- Duplicate `project_id` + same canonical path is idempotent (no rewrite).
+- Duplicate `project_id` + different path → identity conflict. Same/overlapping path + different id → path conflict.
+- Unregistered single-project `{HERMES_HOME}/runs` workflow is unchanged.
+
+**Explicitly not implemented:** Task 31 case history / learning; Task 28 retry/repair; unattended invoke; relocating a project's runs_root; deleting projects; cross-profile orchestration.
 
 ---
 

@@ -2,7 +2,7 @@
 
 **Baseline:** Architecture Baseline v1.0
 **Date:** 2026-07-18
-**Updated:** 2026-07-30 (Task 27 Path-R1 creation-only v1 checkpoint approved and complete; Task 28 not started and not approved)
+**Updated:** 2026-08-24 (Task 30 multi-project registry + isolation local v1 implemented; Task 28 not started and not approved)
 
 ---
 

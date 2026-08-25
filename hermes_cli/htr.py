@@ -20,6 +20,15 @@ from htr.observe import (
     build_run_snapshot,
     compute_exit_code,
 )
+from htr.project_registry import (
+    ProjectRegistryError,
+    project_registry_error_payload,
+    register_project,
+    get_project,
+    list_projects,
+    resolve_invocation_runs_root,
+    update_project_metadata,
+)
 
 
 def _print_observe_summary(snapshot: dict[str, Any], *, stream: Any = None) -> None:
@@ -61,8 +70,78 @@ def _load_inputs_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def _print_registry_error(exc: BaseException) -> int:
+    payload = project_registry_error_payload(exc)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return EXIT_INVOCATION
+
+
+def _cli_runs_root(args) -> Path | None:
+    return resolve_invocation_runs_root(
+        project_id=getattr(args, "project_id", None),
+        runs_root=getattr(args, "runs_root", None),
+    )
+
+
+def _handle_project(args) -> int:
+    command = getattr(args, "htr_project_command", None)
+    try:
+        if command == "register":
+            record = register_project(
+                args.runs_root,
+                project_id=getattr(args, "project_id", None),
+                display_name=getattr(args, "display_name", None),
+            )
+            print(json.dumps({"ok": True, "project": record.to_dict()}, indent=2, ensure_ascii=False))
+            return 0
+        if command == "show":
+            record = get_project(args.project_id)
+            print(json.dumps({"ok": True, "project": record.to_dict()}, indent=2, ensure_ascii=False))
+            return 0
+        if command == "list":
+            records = list_projects(include_archived=bool(getattr(args, "include_archived", False)))
+            print(
+                json.dumps(
+                    {"ok": True, "projects": [item.to_dict() for item in records]},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if command == "update":
+            display_name = getattr(args, "display_name", None)
+            clear_name = bool(getattr(args, "clear_display_name", False))
+            status = getattr(args, "status", None)
+            if clear_name and display_name is not None:
+                payload = {
+                    "ok": False,
+                    "error_class": "invalid_input",
+                    "message": "--clear-display-name cannot be combined with --display-name",
+                }
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+                return EXIT_INVOCATION
+            kwargs: dict[str, Any] = {}
+            if clear_name:
+                kwargs["display_name"] = None
+            elif display_name is not None:
+                kwargs["display_name"] = display_name
+            if status is not None:
+                kwargs["status"] = status
+            record = update_project_metadata(args.project_id, **kwargs)
+            print(json.dumps({"ok": True, "project": record.to_dict()}, indent=2, ensure_ascii=False))
+            return 0
+    except ProjectRegistryError as exc:
+        return _print_registry_error(exc)
+
+    print(f"unknown htr project subcommand: {command!r}", file=sys.stderr)
+    return EXIT_INVOCATION
+
+
 def _handle_plan(args) -> int:
-    base_dir = Path(args.runs_root) if args.runs_root else None
+    try:
+        base_dir = _cli_runs_root(args)
+    except ProjectRegistryError as exc:
+        return _print_registry_error(exc)
 
     if getattr(args, "inputs_file", None) and not getattr(args, "action", None):
         error = make_invocation_error(
@@ -109,7 +188,10 @@ def _handle_plan(args) -> int:
 def htr_command(args) -> int:
     """Dispatch ``hermes htr`` subcommands."""
     if args.htr_command == "observe":
-        base_dir = Path(args.runs_root) if args.runs_root else None
+        try:
+            base_dir = _cli_runs_root(args)
+        except ProjectRegistryError as exc:
+            return _print_registry_error(exc)
         try:
             snapshot = build_run_snapshot(args.run_id, base_dir=base_dir)
         except ObserveInvocationError as exc:
@@ -124,6 +206,9 @@ def htr_command(args) -> int:
 
     if args.htr_command == "plan":
         return _handle_plan(args)
+
+    if args.htr_command == "project":
+        return _handle_project(args)
 
     print(f"unknown htr subcommand: {args.htr_command!r}", file=sys.stderr)
     return EXIT_INVOCATION

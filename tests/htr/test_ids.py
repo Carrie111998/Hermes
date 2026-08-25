@@ -17,6 +17,15 @@ def test_generate_id_has_expected_prefix_and_shape():
     assert len(parsed[2]) == 6
 
 
+def test_project_id_kind_is_valid():
+    from htr.ids import generate_project_id
+
+    project_id = generate_project_id()
+    assert project_id.startswith("prj_")
+    assert validate_id(project_id, "project")
+    assert not validate_id(project_id, "run")
+
+
 def test_all_prefixes_are_unique():
     prefixes = set(ID_PREFIXES.values())
     assert len(prefixes) == len(ID_PREFIXES)

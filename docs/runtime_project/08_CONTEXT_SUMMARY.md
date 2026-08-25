@@ -44,7 +44,7 @@ Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Tasks 19–25 
 19 observe ✅ → 21 action plan ✅ → 22 immutable seal ✅ → 23 write barrier ✅ → 24 approval ✅
 → 25 human-gated invoke ✅ → 26A read-only inspection ✅ → 26B durable cases ✅ → 26B.1 observation stabilization ✅
 → 26C marker disposition ✅ (Path-A v1) → 27 Recovery/Successor creation ✅ (Path-R1 v1)
-→ 28 bounded repair (not started) → 29 artifact inspect → 30 multi-project → 31 learning
+→ 28 bounded repair (not started) → 29 artifact inspect ✅ (local Phase I) → 30 multi-project ✅ (local v1) → 31 learning
 ```
 
 ---
