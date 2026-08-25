@@ -2397,7 +2397,14 @@ class PluginContext:
             )
             return
         registry_name = provider.name
-        scope = self._manager.scope_key
+        # The dashboard auth gate is process-global: one HTTP listener serves
+        # every profile, and its middleware runs under whatever home the
+        # current request is scoped to (``--open-profile``, ``?profile=``).
+        # Registering per-home means the gate looks the provider up under a
+        # home it was never registered against and fails closed -- 503 on
+        # /api/auth/providers, "Sign-in unavailable", and valid sessions
+        # rejected as expired. Register globally so every scope sees it.
+        scope = None
         previous = snapshot_registration(registry_name, scope=scope)
         try:
             register_provider(provider, scope=scope)
