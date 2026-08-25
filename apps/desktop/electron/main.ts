@@ -1043,7 +1043,10 @@ function chatWindowSurfaceOptions() {
     // opts into the documented transparent-window limits — including that a
     // RESIZABLE transparent window is unsupported and breaks (electron#48421).
     // Every chat window is resizable.
-    backgroundMaterial: IS_WINDOWS && GLASS_SUPPORTED ? backgroundMaterialFor(translucencyState) : undefined,
+    backgroundMaterial:
+      IS_WINDOWS && GLASS_SUPPORTED && glassActive(translucencyState)
+        ? backgroundMaterialFor(translucencyState)
+        : undefined,
     ...windowOpacityOptions(translucencyState),
     ...windowBackingOptions(translucencyState, getWindowBackgroundColor())
   }
