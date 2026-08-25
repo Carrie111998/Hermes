@@ -7137,16 +7137,9 @@ async def update_memory_provider_config(
 
 @app.get("/api/config")
 async def get_config(profile: Optional[str] = None):
-    # _profile_scope blocks on the process-wide _SKILLS_PROFILE_LOCK and
-    # load_config() reads from disk; on the event loop a slow lock-holder
-    # froze the whole gateway for >1s (observed via the loop watchdog).
-    # asyncio.to_thread copies the contextvar context, so the profile
-    # override stays scoped to the worker thread.
-    def _run():
-        with _profile_scope(profile):
-            return _normalize_config_for_web(load_config())
+    with _profile_scope(profile):
+        config = _normalize_config_for_web(read_raw_config())
 
-    config = await asyncio.to_thread(_run)
     # Strip internal keys that the frontend shouldn't see or send back
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
@@ -7194,7 +7187,7 @@ def get_model_info(profile: Optional[str] = None):
     """
     try:
         with _profile_scope(profile):
-            cfg = load_config()
+            cfg = read_raw_config()
         model_cfg = cfg.get("model", "")
 
         # Extract model name and provider from the config
@@ -7468,7 +7461,7 @@ def get_auxiliary_models(profile: Optional[str] = None):
     """
     try:
         with _profile_scope(profile):
-            cfg = load_config()
+            cfg = read_raw_config()
         aux_cfg = cfg.get("auxiliary", {})
         if not isinstance(aux_cfg, dict):
             aux_cfg = {}
@@ -7985,26 +7978,10 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # is not sent in the PUT body. A full-replace save would silently
             # drop those keys. Deep-merge incoming over what's on disk so the
             # frontend can only overwrite what it explicitly sends.
-            with _CONFIG_MUTATION_LOCK:
-                existing = read_raw_config()
-                incoming = _denormalize_config_from_web(body.config)
-                merged = _deep_merge(existing, incoming)
-                # Compare normalized approvals.mode across the in-memory
-                # documents, not config blocks and not cache re-reads: the
-                # settings page PUTs the defaulted GET record while disk
-                # holds sparse YAML, so a block compare is always-unequal
-                # (every autosave would broadcast), and reloading after the
-                # save can serve the pre-save cache on an (mtime_ns, size)
-                # key collision. Only approvals.mode feeds session.info, so
-                # it is the honest trigger.
-                approvals_mode_changed = _approval_mode_of(merged) != _approval_mode_of(existing)
-                save_config(merged)
-        # REST saves bypass the config.set RPC (which re-emits itself), so
-        # refresh live sessions' cached approval/YOLO indicators after a mode
-        # change. Own-profile saves only: a profile-scoped save targets a
-        # different HERMES_HOME than this process's gateway sessions.
-        if approvals_mode_changed and not _is_other_profile(body.profile or profile):
-            _broadcast_gateway_session_info()
+            existing = read_raw_config()
+            incoming = _denormalize_config_from_web(body.config)
+            save_config(_deep_merge(existing, incoming))
+
         return {"ok": True}
 
     try:
@@ -17729,7 +17706,7 @@ def _render_active_theme_bootstrap_css() -> str:
     before paint, so no shim is needed for them.
     """
     try:
-        config = load_config()
+        config = read_raw_config()
         active = cfg_get(config, "dashboard", "theme", default="default")
         if not active or not isinstance(active, str):
             return ""
@@ -18237,7 +18214,7 @@ async def get_dashboard_themes():
     them without a stub.
     """
     def _run():
-        config = load_config()
+        config = read_raw_config()
         active = cfg_get(config, "dashboard", "theme", default="default")
         user_themes = _discover_user_themes()
         seen = set()
@@ -18265,7 +18242,7 @@ async def set_dashboard_theme(body: ThemeSetBody):
     """Set the active dashboard theme (persists to config.yaml)."""
     def _run():
         with _CONFIG_MUTATION_LOCK:
-            config = load_config()
+            config = read_raw_config()
             if "dashboard" not in config:
                 config["dashboard"] = {}
             config["dashboard"]["theme"] = body.name
@@ -18293,7 +18270,7 @@ _FONT_CHOICES = frozenset({
 async def get_dashboard_font():
     """Return the active font override (``"theme"`` = use the theme's font)."""
     def _run():
-        config = load_config()
+        config = read_raw_config()
         font = cfg_get(config, "dashboard", "font", default=_FONT_DEFAULT_ID)
         if font not in _FONT_CHOICES:
             font = _FONT_DEFAULT_ID
@@ -18315,7 +18292,7 @@ async def set_dashboard_font(body: FontSetBody):
 
     def _run():
         with _CONFIG_MUTATION_LOCK:
-            config = load_config()
+            config = read_raw_config()
             if "dashboard" not in config:
                 config["dashboard"] = {}
             config["dashboard"]["font"] = font
@@ -19834,22 +19811,8 @@ def start_server(
         except Exception:
             pass
 
-    # Same clean Ctrl+C contract as the POSIX branch above: ``capture_signals()``
-    # re-raises the captured signal after the graceful shutdown has already
-    # completed. For console Ctrl+C the re-raised SIGINT lands as
-    # ``KeyboardInterrupt`` — a clean user-requested exit here too. (Re-raised
-    # SIGTERM/SIGBREAK keep their default terminate disposition and never reach
-    # this except.)
-    try:
-        if _runner is not None:
-            _runner(_serve(), loop_factory=_loop_factory)
-        else:
-            asyncio.run(_serve())
-    except KeyboardInterrupt:
-        return
-    except SystemExit as exc:
-        # Same probe-to-bind race translation as the POSIX branch (#93608).
-        if exc.code == 1 and _port_bind_conflict(host, port):
-            _report_port_in_use(host, port)
-            raise SystemExit(PORT_IN_USE_EXIT_CODE) from None
-        raise
+    if _runner is not None:
+        _runner(_serve(), loop_factory=_loop_factory)
+    else:
+        asyncio.run(_serve())
+
