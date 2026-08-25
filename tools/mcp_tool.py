@@ -119,6 +119,7 @@ from urllib.parse import urlparse
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
+from utils import normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -3947,6 +3948,12 @@ class MCPServerTask:
         # critically, no reconnect-backoff burn.  (Ported from
         # anomalyco/opencode#25019.)
         if self._is_http():
+            # GNOME manual SOCKS proxy settings commonly export the bare
+            # ``socks://`` alias. httpx/httpx2 validate environment proxies
+            # before applying NO_PROXY and accept only the explicit
+            # ``socks5://`` scheme, so normalize before either the preflight
+            # client or the MCP transport constructs an HTTP client.
+            normalize_proxy_env_vars()
             try:
                 _validate_remote_mcp_url(self.name, config.get("url"))
             except InvalidMcpUrlError as exc:
