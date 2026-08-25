@@ -21,9 +21,13 @@ def test_census_returns_every_full_nonterminal_row_without_mutation(monkeypatch,
     # host load; it is the only test in this file that left the probes live,
     # and the only one building 505 rows.
     #
-    # ONE of the two probes is the entire cost, measured on this box:
-    #     _pid_exists           56.40 ms/call   -> 505 census rows = 28.5s
-    #     _process_start_time    0.09 ms/call   -> 506 inserts     =  0.04s
+    # ONE of the two probes is the entire cost. Measured on this box, and the
+    # figure that matters is the ORDER OF MAGNITUDE, not the absolutes — those
+    # drift with host load (_pid_exists read 56ms in one session and 31-34ms in
+    # another; neither probe is memoized, so that is pure load):
+    #     _pid_exists         tens of ms/call  -> 505 census rows = ~30s
+    #     _process_start_time  ~0.1 ms/call    -> 506 inserts     = ~0.05s
+    # Two-plus orders of magnitude apart under every load condition measured.
     # _pid_exists goes to psutil and is what blows the cap. The census calls
     # BOTH per row; create_execution() calls only _process_start_time (see
     # cron/executions.py, in the INSERT parameter tuple), which is free. So
