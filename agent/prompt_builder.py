@@ -11,6 +11,7 @@ import sys
 import threading
 import contextvars
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_constants import (
@@ -1689,6 +1690,21 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
 _truncation_warnings: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
     "context_file_truncation_warnings", default=None
 )
+
+
+@contextmanager
+def isolated_context_file_notices():
+    """Discard notices produced by a read-only prompt projection.
+
+    A fresh accumulator preserves any authoritative notices already pending in
+    the caller's context while ensuring inspection-only builds cannot leak
+    delayed status messages into a later tool call.
+    """
+    token = _truncation_warnings.set([])
+    try:
+        yield
+    finally:
+        _truncation_warnings.reset(token)
 
 
 def _record_truncation_warning(msg: str) -> None:

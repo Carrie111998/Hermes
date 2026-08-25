@@ -51,6 +51,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_context_file_notices,
+    isolated_context_file_notices,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -422,11 +423,19 @@ def build_system_prompt_parts(
         # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
         # ambient resolution on a thread that lost the HERMES_HOME ContextVar
         # reads the launch profile's SOUL.md instead (#50233).
-        _soul_content = _r.load_soul_md(
-            _ctx_len,
-            home_override=agent_home,
-            scan_policy=_context_scan_policy,
-        )
+        if install_runtime_state:
+            _soul_content = _r.load_soul_md(
+                _ctx_len,
+                home_override=agent_home,
+                scan_policy=_context_scan_policy,
+            )
+        else:
+            with isolated_context_file_notices():
+                _soul_content = _r.load_soul_md(
+                    _ctx_len,
+                    home_override=agent_home,
+                    scan_policy=_context_scan_policy,
+                )
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -842,12 +851,21 @@ def build_system_prompt_parts(
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
-        context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
-            context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=agent_home,
-            scan_policy=_context_scan_policy)
+        if install_runtime_state:
+            context_files_prompt = _r.build_context_files_prompt(
+                cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+                context_length=_ctx_len,
+                allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+                home_override=agent_home,
+                scan_policy=_context_scan_policy)
+        else:
+            with isolated_context_file_notices():
+                context_files_prompt = _r.build_context_files_prompt(
+                    cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+                    context_length=_ctx_len,
+                    allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+                    home_override=agent_home,
+                    scan_policy=_context_scan_policy)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
