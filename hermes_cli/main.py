@@ -8310,7 +8310,13 @@ def _find_stale_dashboard_pids(
 
 def _parse_dashboard_runtime(command: str) -> tuple[str, str, int] | None:
     """Best-effort parse of a dashboard/server cmdline into mode, host, and port."""
+    from hermes_cli.dashboard_procs import _cmdline_runs_subcommand
+
     mode = None
+    # The literal patterns only match when the subcommand follows the
+    # entrypoint directly; a profile launch (`hermes_cli.main -p carmelo
+    # dashboard`) puts a global flag in between. _cmdline_runs_subcommand
+    # covers that shape without matching prose in a chat cmdline.
     if any(
         pattern in command
         for pattern in (
@@ -8318,7 +8324,7 @@ def _parse_dashboard_runtime(command: str) -> tuple[str, str, int] | None:
             "hermes_cli.main dashboard",
             "hermes_cli/main.py dashboard",
         )
-    ):
+    ) or _cmdline_runs_subcommand(command, ("dashboard",)):
         mode = "dashboard"
     elif any(
         pattern in command
@@ -8327,7 +8333,7 @@ def _parse_dashboard_runtime(command: str) -> tuple[str, str, int] | None:
             "hermes_cli.main serve",
             "hermes_cli/main.py serve",
         )
-    ):
+    ) or _cmdline_runs_subcommand(command, ("serve",)):
         mode = "serve"
     if mode is None:
         return None

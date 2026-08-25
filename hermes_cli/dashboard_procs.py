@@ -25,6 +25,60 @@ def _m():
     return main
 
 
+_SUBCOMMANDS = ("dashboard", "serve")
+
+
+def _is_hermes_entrypoint(token: str) -> bool:
+    """True when *token* is the hermes entrypoint of a command line.
+
+    Covers every shape the launcher takes: the console script
+    (``/usr/local/bin/hermes``, quoted ``"C:\\...\\hermes.exe"``), the module
+    form (``-m hermes_cli.main``) and a direct script path
+    (``.../hermes_cli/main.py``).  Comparing the final path segment rather than
+    a suffix keeps an unrelated ``/opt/nothermes`` from matching.
+    """
+    cleaned = token.strip("\"'").replace("\\", "/")
+    if cleaned.lower().endswith(".exe"):
+        cleaned = cleaned[: -len(".exe")]
+    return (
+        cleaned.rsplit("/", 1)[-1] == "hermes"
+        or cleaned == "hermes_cli.main"
+        or cleaned.endswith("hermes_cli/main.py")
+    )
+
+
+def _cmdline_runs_subcommand(command: str, subcommands: tuple[str, ...]) -> bool:
+    """True when *command* invokes hermes with one of *subcommands*.
+
+    The literal ``patterns`` list below only matches when the subcommand sits
+    directly after the entrypoint (``hermes_cli.main dashboard``).  A profile
+    launch puts a global flag in between — ``hermes_cli.main -p carmelo
+    dashboard`` — so the scan silently misses every profile-started server,
+    which is the normal way these run.  ``--status`` then reports nothing while
+    a backend is bound to the port, and ``--stop`` leaves it running.
+
+    Matching on the bare word instead would re-introduce the false positive the
+    ps-over-pgrep comment warns about: ``hermes chat --query "fix the
+    dashboard"`` also contains the token.  A real subcommand always appears
+    before the first long option, while prose only ever reaches the cmdline as
+    the value of one (``--query ...``), so cutting the token list at the first
+    ``--`` separates the two without a regex.
+    """
+    tokens = command.split()
+    entry = next(
+        (i for i, tok in enumerate(tokens) if _is_hermes_entrypoint(tok)),
+        None,
+    )
+    if entry is None:
+        return False
+    for tok in tokens[entry + 1 :]:
+        if tok.startswith("--"):
+            break
+        if tok in subcommands:
+            return True
+    return False
+
+
 def _scan_dashboard_processes(
     *,
     exclude_pids: set[int] | None = None,
@@ -101,7 +155,10 @@ def _scan_dashboard_processes(
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
                     if (
-                        any(p in current_cmd for p in patterns)
+                        (
+                            any(p in current_cmd for p in patterns)
+                            or _cmdline_runs_subcommand(current_cmd, _SUBCOMMANDS)
+                        )
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -134,7 +191,10 @@ def _scan_dashboard_processes(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    if (
+                        any(p in command for p in patterns)
+                        or _cmdline_runs_subcommand(command, _SUBCOMMANDS)
+                    ) and pid != self_pid:
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
