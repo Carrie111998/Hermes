@@ -1,23 +1,13 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-// Regression coverage for #93479: a failed dynamic import of the lazily-loaded
-// Shiki diff module (packaged asar/asar.unpacked path mismatch, or any other
-// fetch failure) rejects the `React.lazy()` promise. React.Suspense only
-// covers the *pending* state, so the rejection throws past it to the nearest
-// error boundary — which in production is the whole workspace `ContribBoundary`
-// — and blanks the transcript instead of degrading to the plain colored diff.
-vi.mock('./syntax-diff', () => {
-  throw new Error(
-    'Failed to fetch dynamically imported module: file:///Hermes.app/Contents/Resources/app.asar/dist/assets/syntax-diff-Bo0962zh.js'
-  )
-})
-
 import { ErrorBoundary } from '@/components/error-boundary'
 
-import { FileDiffPanel } from './diff-lines'
-
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.doUnmock('./syntax-diff')
+  vi.resetModules()
+})
 
 const DIFF = [
   'diff --git a/file.ts b/file.ts',
@@ -44,6 +34,16 @@ function renderQuietly(node: Parameters<typeof render>[0]) {
 
 describe('FileDiffPanel survives a failed lazy syntax-diff chunk', () => {
   it('degrades to the plain colored diff instead of taking down the surrounding boundary', async () => {
+    // Keep the rejected lazy import local to this test instead of using a
+    // hoisted file-wide mock. The latter can outlive this file's execution
+    // and surface its rejection as an unhandled error in a sibling UI test.
+    vi.doMock('./syntax-diff', () => {
+      throw new Error(
+        'Failed to fetch dynamically imported module: file:///Hermes.app/Contents/Resources/app.asar/dist/assets/syntax-diff-Bo0962zh.js'
+      )
+    })
+
+    const { FileDiffPanel } = await import('./diff-lines')
     const { container } = renderQuietly(
       <ErrorBoundary fallback={() => <div>{WORKSPACE_FALLBACK_TEXT}</div>} label="workspace">
         <FileDiffPanel diff={DIFF} path="file.ts" />
