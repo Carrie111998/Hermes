@@ -2,6 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { enterSelectionMode } from '@/store/session-selection'
+
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
 
 afterEach(cleanup)
@@ -61,6 +63,7 @@ vi.mock('@/i18n', () => ({
           renameFailed: 'Rename failed',
           renameTitle: 'Rename session',
           renamed: 'Renamed',
+          selectChats: 'Select chats',
           sessionActions: 'Session actions',
           unpin: 'Unpin',
           untitledPlaceholder: 'Untitled'
@@ -98,6 +101,7 @@ vi.mock('@/store/session-color', () => ({
   $sessionColorOverrides: atom<Record<string, string>>({}),
   setSessionColorOverride: vi.fn()
 }))
+vi.mock('@/store/session-selection', () => ({ enterSelectionMode: vi.fn() }))
 vi.mock('@/store/session-states', () => ({
   $sessionTiles: atom<unknown[]>([]),
   openSessionTile: vi.fn()
@@ -285,5 +289,43 @@ describe('SessionActionsMenu', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
     expect(await screen.findByText('Session deleted')).toBeTruthy()
     expect(onDelete).toHaveBeenCalledTimes(1)
+  })
+})
+
+// The entry point into the sidebar's explicit multi-select mode: both the
+// kebab dropdown and the row's right-click context menu route through the
+// same useSessionActions items, so one test per surface is enough to prove
+// the wiring rather than the shared logic twice.
+describe('SessionActionsMenu "Select chats"', () => {
+  afterEach(() => {
+    vi.mocked(enterSelectionMode).mockClear()
+  })
+
+  it('enters selection mode with this row selected from the kebab menu', async () => {
+    renderMenu()
+
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Select chats' }))
+
+    expect(enterSelectionMode).toHaveBeenCalledWith('s1')
+  })
+
+  it('enters selection mode with this row selected from the right-click menu', async () => {
+    render(
+      <SessionContextMenu sessionId="s2" title="Another session">
+        <button aria-label="Session row" type="button">
+          Row
+        </button>
+      </SessionContextMenu>
+    )
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Session row' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Select chats' }))
+
+    expect(enterSelectionMode).toHaveBeenCalledWith('s2')
   })
 })

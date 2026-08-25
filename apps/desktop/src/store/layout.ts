@@ -731,6 +731,87 @@ export function unpinSession(sessionId: string) {
   )
 }
 
+// A rollback token for one dropped pin. `rankById` is a snapshot of the pin
+// order at drop time, shared by every pin dropped in the same write — it lets
+// `restoreSessionPins` re-derive relative order without an absolute index,
+// which breaks the moment a sibling pin's successful removal shifts everyone
+// after it (#mixed-completion-order).
+export interface SessionPinRollback {
+  id: string
+  rankById: ReadonlyMap<string, number>
+}
+
+// Drop several pins in ONE read-modify-write, returning what `restoreSessionPins`
+// needs to undo it. Deliberately reads the CURRENT list rather than taking a
+// snapshot the caller holds across an await: two bulk rows unpinning in parallel
+// would each write back their own pre-await snapshot, so the later write
+// resurrects the pin the earlier one dropped. That clobber is why a bulk
+// archive/delete cannot run its rows sequentially and still finish in bounded
+// time.
+export function dropSessionPins(sessionIds: Array<null | string | undefined>): SessionPinRollback[] {
+  const doomed = new Set(sessionIds.map(id => id?.trim()).filter((id): id is string => Boolean(id)))
+
+  if (!doomed.size) {
+    return []
+  }
+
+  const current = $pinnedSessionIds.get()
+  const rankById: ReadonlyMap<string, number> = new Map(current.map((id, index) => [id, index]))
+  const removed: string[] = []
+
+  const next = current.filter(id => {
+    if (!doomed.has(id)) {
+      return true
+    }
+
+    removed.push(id)
+
+    return false
+  })
+
+  if (removed.length) {
+    setOrderIds($pinnedSessionIds, next)
+  }
+
+  return removed.map(id => ({ id, rankById }))
+}
+
+// Undo `dropSessionPins` on a failed mutation. Each token merges back before
+// the first live pin whose rank (in that token's frozen snapshot) is greater
+// than the token's own — a live pin the snapshot never saw (newly pinned
+// mid-flight) has no rank to compare and is skipped over, leaving it exactly
+// where it already sits. Idempotent: a token whose id is already live is
+// left alone, so restoring the same rollback twice is a no-op the second time.
+export function restoreSessionPins(tokens: readonly SessionPinRollback[]): void {
+  if (!tokens.length) {
+    return
+  }
+
+  let next = $pinnedSessionIds.get()
+
+  for (const token of tokens) {
+    if (next.includes(token.id)) {
+      continue
+    }
+
+    const rank = token.rankById.get(token.id) ?? Infinity
+
+    let insertAt = next.findIndex(id => {
+      const liveRank = token.rankById.get(id)
+
+      return liveRank !== undefined && liveRank > rank
+    })
+
+    if (insertAt === -1) {
+      insertAt = next.length
+    }
+
+    next = [...next.slice(0, insertAt), token.id, ...next.slice(insertAt)]
+  }
+
+  setOrderIds($pinnedSessionIds, next)
+}
+
 // Apply a new pinned order from a drag. The dragged list only holds the pins
 // that currently RESOLVE to a loaded row, so this is a permutation of a subset:
 // re-slot the ids it names into the positions they already occupied, leaving

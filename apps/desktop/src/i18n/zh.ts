@@ -2424,6 +2424,7 @@ export const zh: Translations = {
       branchFrom: '分支',
       rename: '重命名',
       archive: '归档',
+      selectChats: '选择聊天',
       newWindow: '新窗口',
       openInTerminal: '在终端中打开',
       hideTabBar: '隐藏标签栏',
@@ -2463,6 +2464,14 @@ export const zh: Translations = {
       thisWeek: '本周',
       lastWeek: '上周',
       thisMonth: '本月'
+    },
+    selection: {
+      count: n => `已选择 ${n} 个`,
+      archive: '归档',
+      delete: '删除',
+      cancel: '取消',
+      deleteTitle: n => `删除 ${n} 个会话？`,
+      deleteDesc: n => `这将永久删除 ${n} 个会话，且无法撤销。`
     },
     statusDivider: {
       working: '进行中',
@@ -3536,6 +3545,10 @@ export const zh: Translations = {
     deleteFailed: '删除失败',
     archived: '已归档',
     archiveFailed: '归档失败',
+    archivedMany: count => `已归档 ${count} 个会话`,
+    archiveFailedMany: count => `${count} 个会话归档失败`,
+    deletedMany: count => `已删除 ${count} 个会话`,
+    deleteFailedMany: count => `${count} 个会话删除失败`,
     cwdChangeFailed: '工作目录更改失败',
     cwdStagedTitle: '工作目录已暂存',
     cwdStagedMessage: '重启桌面后端后，工作目录更改才会应用到当前活跃会话。',

@@ -1883,6 +1883,7 @@ export const zhHant = defineLocale({
       branchFrom: '分支',
       rename: '重新命名',
       archive: '封存',
+      selectChats: '選取聊天',
       newWindow: '新視窗',
       openInTerminal: '在終端機中開啟',
       copyIdFailed: '無法複製工作階段 ID',
@@ -1917,6 +1918,14 @@ export const zhHant = defineLocale({
       thisWeek: '本週',
       lastWeek: '上週',
       thisMonth: '本月'
+    },
+    selection: {
+      count: n => `已選取 ${n} 個`,
+      archive: '封存',
+      delete: '刪除',
+      cancel: '取消',
+      deleteTitle: n => `刪除 ${n} 個會話？`,
+      deleteDesc: n => `這將永久刪除 ${n} 個會話，且無法復原。`
     },
     statusDivider: {
       working: '進行中',
@@ -2914,6 +2923,10 @@ export const zhHant = defineLocale({
     deleteFailed: '刪除失敗',
     archived: '已封存',
     archiveFailed: '封存失敗',
+    archivedMany: count => `已封存 ${count} 個會話`,
+    archiveFailedMany: count => `${count} 個會話封存失敗`,
+    deletedMany: count => `已刪除 ${count} 個會話`,
+    deleteFailedMany: count => `${count} 個會話刪除失敗`,
     cwdChangeFailed: '工作目錄變更失敗',
     cwdStagedTitle: '工作目錄已暫存',
     cwdStagedMessage: '重新啟動桌面後端後，工作目錄變更才會套用至此作用中工作階段。',

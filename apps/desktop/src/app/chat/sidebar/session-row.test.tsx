@@ -9,6 +9,12 @@ import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
 import type * as SessionStore from '@/store/session'
+import {
+  $selectedSessionIds,
+  clearSessionSelection,
+  enterSelectionMode,
+  registerSessionRowOrder
+} from '@/store/session-selection'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
 import type * as WindowsStore from '@/store/windows'
@@ -422,5 +428,100 @@ describe('Inbox-style session card', () => {
 
     expect(workspace.className).toMatch(/\btruncate\b/)
     expect(screen.getByText('133 messages')).toBeTruthy()
+  })
+})
+
+// Explicit selection mode: outside it, every existing click gesture (plain
+// resume, ⇧ pin, ⌘/⌃ new tab, ⌘/⌃+⇧ new window, ⌥+⇧ archive) is untouched —
+// that's what session-row-gesture.test.ts and its unmodified callers already
+// prove. This block only covers the NEW behavior that only exists once
+// selection mode is active, and the one seam where entering it changes a
+// plain click's meaning outside the row's own onClick.
+describe('SidebarSessionRow selection mode', () => {
+  afterEach(() => {
+    clearSessionSelection()
+  })
+
+  const rowFor = (title: string) => screen.getByText(title)
+
+  it('leaves a plain click alone (resume) when selection mode is off', () => {
+    const onResume = vi.fn()
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={onResume}
+        onToggleUnread={noop}
+        session={makeSession({ id: 'b', title: 'Off' })}
+        unread={false}
+      />
+    )
+
+    fireEvent.click(rowFor('Off'))
+
+    expect(onResume).toHaveBeenCalledOnce()
+    expect($selectedSessionIds.get()).toEqual([])
+  })
+
+  it('toggles this row on a plain click while selection mode is active', () => {
+    enterSelectionMode('anchor')
+    renderRow(makeSession({ id: 'b', title: 'Toggle me' }))
+
+    fireEvent.click(rowFor('Toggle me'))
+    expect($selectedSessionIds.get()).toEqual(['anchor', 'b'])
+
+    fireEvent.click(rowFor('Toggle me'))
+    expect($selectedSessionIds.get()).toEqual(['anchor'])
+  })
+
+  it('selects a contiguous range on ⇧-click while selection mode is active', () => {
+    registerSessionRowOrder('sessions', ['a', 'b', 'c', 'd'])
+    enterSelectionMode('a')
+    renderRow(makeSession({ id: 'c', title: 'Range end' }))
+
+    fireEvent.click(rowFor('Range end'), { shiftKey: true })
+
+    expect($selectedSessionIds.get()).toEqual(['a', 'b', 'c'])
+  })
+
+  it('does not fire the existing modifier gestures while selection mode is active', () => {
+    const onArchive = vi.fn()
+    const onPin = vi.fn()
+    enterSelectionMode('anchor')
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={onArchive}
+        onDelete={noop}
+        onPin={onPin}
+        onResume={noop}
+        onToggleUnread={noop}
+        session={makeSession({ id: 'b', title: 'No archive here' })}
+        unread={false}
+      />
+    )
+
+    // ⌥+⇧ archives outside selection mode (session-row-gesture.test.ts); inside
+    // it, every click is a selection gesture instead.
+    fireEvent.click(rowFor('No archive here'), { altKey: true, shiftKey: true })
+
+    expect(onArchive).not.toHaveBeenCalled()
+    expect(onPin).not.toHaveBeenCalled()
+    expect($selectedSessionIds.get()).toEqual(['anchor', 'b'])
+  })
+
+  it('toggles this specific row regardless of ctrl/cmd, since the modifier gestures are suppressed', () => {
+    enterSelectionMode('anchor')
+    renderRow(makeSession({ id: 'b', title: 'Ctrl click' }))
+
+    fireEvent.click(rowFor('Ctrl click'), { ctrlKey: true })
+
+    expect($selectedSessionIds.get()).toEqual(['anchor', 'b'])
   })
 })

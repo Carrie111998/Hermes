@@ -1,7 +1,7 @@
 import type { useSensors } from '@dnd-kit/core'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -20,6 +20,7 @@ import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
+import { forgetSessionRowOrder, registerSessionRowOrder } from '@/store/session-selection'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
@@ -169,6 +170,10 @@ interface SidebarSessionsSectionProps {
   // grouping is active — the flat recents list opts in; dense tree surfaces
   // (pinned, projects, messaging) keep the one-line row.
   card?: boolean
+  // Range-selection scope for this section's rows (⇧-click). Defaults to the
+  // section label, which is already unique per sidebar section; ranges never
+  // span two scopes, so each list selects on its own.
+  selectionScope?: string
 }
 
 export function SidebarSessionsSection({
@@ -212,7 +217,8 @@ export function SidebarSessionsSection({
   dndSensors,
   showProfileTags = false,
   grouping = 'none',
-  card = false
+  card = false,
+  selectionScope
 }: SidebarSessionsSectionProps) {
   const { t } = useI18n()
   const dividerLabels = t.sidebar.dateDivider
@@ -238,6 +244,7 @@ export function SidebarSessionsSection({
   // The flat recents/pinned list is the only place sessions reorder by hand;
   // grouped/tree views always sort by creation date and never drag.
   const sessionsDraggable = sortable && !!onReorderSessions
+  const scope = selectionScope ?? label
 
   // Only Pinned arrives pre-ordered as a flat sequence. Recents keeps its
   // recency sort — the drag order is layered on per date group below, so the
@@ -261,6 +268,7 @@ export function SidebarSessionsSection({
         onToggleUnread: () => onToggleUnread(session.id),
         onResume: () => onResumeSession(session.id),
         reorderable: draggable && !branchStem,
+        selectionScope: scope,
         session,
         showProfile: showProfileTags,
         unread: session.unread === true
@@ -282,6 +290,7 @@ export function SidebarSessionsSection({
       onTogglePin,
       onToggleUnread,
       pinned,
+      scope,
       showProfileTags
     ]
   )
@@ -357,6 +366,28 @@ export function SidebarSessionsSection({
   // session order made a drop compute its target index against a list the user
   // wasn't looking at — the drag that landed a row in the wrong slot.
   const sortableRowIds = useMemo(() => reorderableRowIds(flatRows), [flatRows])
+
+  // Publish the row order ⇧-click ranges over. The DATA order, not the mounted
+  // order: virtualization renders a window, and a range from a row scrolled out
+  // of view must still cover everything between the two ends. Grouped sections
+  // (profile/project lanes) and project lanes both publish nothing: a shared
+  // order across lanes would let a range spill from one lane into the next, so
+  // ⇧-click there degrades to selecting just the clicked row (the row-menu
+  // entry point still works everywhere).
+  const selectionOrderIds = useMemo(
+    () => (groups?.length ? null : flatRows.flatMap(row => (row.kind === 'session' ? [row.entry.session.id] : []))),
+    [flatRows, groups]
+  )
+
+  useEffect(() => {
+    if (selectionOrderIds === null) {
+      return
+    }
+
+    registerSessionRowOrder(scope, selectionOrderIds)
+
+    return () => forgetSessionRowOrder(scope)
+  }, [scope, selectionOrderIds])
 
   // Pinned never virtualizes. Virtualization needs a bounded viewport to
   // measure against, and Pinned deliberately has none — however many chats you
@@ -468,6 +499,7 @@ export function SidebarSessionsSection({
         onToggleUnread={onToggleUnread}
         pinned={pinned}
         rows={flatRows}
+        selectionScope={scope}
         showProfileTags={showProfileTags}
         sortable={sessionsDraggable}
       />
@@ -520,6 +552,7 @@ export function SidebarSessionsSection({
 
 interface SortableSessionRowProps {
   session: SessionInfo
+  selectionScope?: string
   isPinned: boolean
   isSelected: boolean
   unread: boolean

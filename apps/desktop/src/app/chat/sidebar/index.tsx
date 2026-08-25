@@ -127,6 +127,7 @@ import {
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
+import { clearSessionSelection } from '@/store/session-selection'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
@@ -171,6 +172,7 @@ import {
 } from './projects'
 import { WorktreeDialog } from './projects/worktree-dialog'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
+import { SidebarSelectionActionBar } from './selection-action-bar'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
@@ -449,6 +451,38 @@ export function ChatSidebar({
     window.addEventListener(SESSION_SEARCH_FOCUS_EVENT, onFocus)
 
     return () => window.removeEventListener(SESSION_SEARCH_FOCUS_EVENT, onFocus)
+  }, [])
+
+  // Escape cancels the sidebar's multi-select. Capture phase and
+  // unconditional: selection is a sidebar-wide mode, so it must not depend on
+  // where focus happens to sit, and clearing an inactive selection is a no-op.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        clearSessionSelection()
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown, true)
+
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [])
+
+  // A click on sidebar space that ISN'T a session row or the selection action
+  // bar cancels the selection — the empty area below the list, a section
+  // header, the nav. Row clicks are excluded because they carry their own
+  // selection gestures; the action bar and any open menu/dialog are excluded
+  // so clicking "Archive 7 chats" doesn't also cancel the very thing clicked.
+  const onSidebarPointerDown = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if (
+      (event.target as HTMLElement).closest(
+        '[data-session-row], [data-row-actions], [data-session-selection-bar], [role="menu"], [role="dialog"], [data-slot="dropdown-menu-trigger"]'
+      )
+    ) {
+      return
+    }
+
+    clearSessionSelection()
   }, [])
 
   // Flash the ⌘N hint full-opacity (no transition) for the press, so hitting
@@ -1465,7 +1499,9 @@ export function ChatSidebar({
         'border-(--sidebar-edge-border) bg-(--ui-sidebar-surface-background) opacity-100'
       )}
       collapsible="none"
+      onPointerDown={onSidebarPointerDown}
     >
+      <SidebarSelectionActionBar />
       <SidebarContent className="gap-0 overflow-hidden bg-transparent px-2.5">
         <SidebarGroup className="shrink-0 p-0 pb-2 pt-[calc(var(--titlebar-height)+0.375rem)]">
           <SidebarGroupContent>
@@ -1607,6 +1643,7 @@ export function ChatSidebar({
                 open
                 pinned={false}
                 rootClassName="min-h-32 flex-1 overflow-hidden p-0"
+                selectionScope="search-results"
                 sessions={searchResults}
                 showProfileTags={showAllProfiles}
               />
@@ -1630,6 +1667,7 @@ export function ChatSidebar({
                 open={pinsOpen}
                 pinned
                 rootClassName="shrink-0 p-0 pb-1"
+                selectionScope="pinned"
                 sessions={pinnedSessions}
                 showProfileTags={showAllProfiles}
                 sortable={pinnedSessions.length > 1}
@@ -1819,6 +1857,11 @@ export function ChatSidebar({
                   'min-h-32 flex-1 overflow-hidden p-0',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
+                // Stable regardless of the (possibly translated, project-name-
+                // swapping) `sessionsLabel` — the default `label` fallback
+                // would otherwise re-key this section's range-selection scope
+                // on every locale switch or project entry/exit.
+                selectionScope="sessions"
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
               />
@@ -1865,6 +1908,10 @@ export function ChatSidebar({
                     open={messagingOpenIds.includes(group.sourceId)}
                     pinned={false}
                     rootClassName="shrink-0 p-0"
+                    // The stable source id, not the (possibly shared or
+                    // translated) display `label` — two platforms rendering
+                    // the same label text must not share one ⇧-click range.
+                    selectionScope={group.sourceId}
                     sessions={shownSessions}
                   />
                 )

@@ -30,6 +30,12 @@ import { $projects } from '@/store/projects'
 import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
 import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
 import { $sessionListDensity } from '@/store/session-list-density'
+import {
+  $selectedSessionIds,
+  $selectionModeActive,
+  selectSessionRange,
+  toggleSessionSelection
+} from '@/store/session-selection'
 import { $openStoredSessionIds } from '@/store/session-states'
 import { sessionCostUsd } from '@/store/sidebar-archive'
 import { $todoProgressBySession } from '@/store/todos'
@@ -77,6 +83,10 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
    *  model · size footer. The flat recents list opts in via the filter menu;
    *  dense tree surfaces (projects, messaging, pins) keep the one-line row. */
   card?: boolean
+  /** Which list this row belongs to, for ⇧-click range selection. Ranges never
+   *  cross a scope boundary — see `selectSessionRange`. Surfaces that don't
+   *  register a row order (project lanes) still get a plain-click toggle. */
+  selectionScope?: string
 }
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
@@ -137,6 +147,7 @@ function SidebarSessionRowImpl({
   dragHandleProps,
   showProfile = false,
   card = false,
+  selectionScope = 'sessions',
   className,
   style,
   ref,
@@ -163,6 +174,10 @@ function SidebarSessionRowImpl({
   // rather than threaded as props: the subscription re-renders past the memo
   // below, and a toggle should repaint every row at once anyway.
   const rowMeta = useStore($sidebarRowMeta)
+  // Explicit sidebar multi-select. A selector, not a plain useStore: the row
+  // repaints when ITS OWN membership flips, not on every other row's toggle.
+  const selectionModeActive = useStore($selectionModeActive)
+  const isMultiSelected = useStoreSelector($selectedSessionIds, ids => ids.includes(session.id))
   // Pinned metadata occupies the actions slot and swaps out for the kebab on
   // hover, so the row reserves the same width either way and never reflows.
   const pinnedAge = rowMeta.includes('updated')
@@ -358,6 +373,9 @@ function SidebarSessionRowImpl({
           !card && density !== 'compact' && 'min-h-[2.75rem]',
           !card && density === 'detailed' && 'min-h-[3.875rem]',
           isSelected && 'bg-(--ui-row-active-background)',
+          // Multi-selected: the active band plus an inset ring, so a
+          // selection of many rows never reads as many open sessions.
+          isMultiSelected && 'bg-(--ui-row-active-background) inset-ring-1 inset-ring-(--ui-accent)',
           // Open in another pane: the SAME band, just weaker. Its own mixed
           // token rather than row opacity — dimming the whole row would take
           // the title and the status dot down with it.
@@ -370,6 +388,7 @@ function SidebarSessionRowImpl({
           className
         )}
         data-glass-opaque={dragging ? '' : undefined}
+        data-session-row=""
         data-working={liveTurn ? 'true' : undefined}
         // The row runs BOTH drags off one press, and each declines outside its
         // own region — so no timing/arbitration rule is needed and neither can
@@ -425,6 +444,27 @@ function SidebarSessionRowImpl({
             openSession(session.id, () => undefined, 'tab')
           })}
           onClick={event => {
+            // Explicit multi-select mode (entered via a row's "Select chats"
+            // menu item) takes over the click entirely: a plain click toggles
+            // just this row, ⇧-click extends the range from the last touched
+            // row. None of the modifier gestures below fire while it's
+            // active — they're one right-click away in the row's menu, and
+            // reusing their modifiers for selection would be the same
+            // ambiguity this mode exists to avoid.
+            if (selectionModeActive) {
+              event.preventDefault()
+              event.stopPropagation()
+              triggerHaptic('selection')
+
+              if (event.shiftKey) {
+                selectSessionRange(selectionScope, session.id)
+              } else {
+                toggleSessionSelection(selectionScope, session.id)
+              }
+
+              return
+            }
+
             // Modifier-click gestures on a row (see `resolveSessionRowClick`):
             //   ⇧          → pin / unpin
             //   ⌘/⌃        → open in a new tab (stack into main)
@@ -624,6 +664,7 @@ function rowPropsEqual(a: SidebarSessionRowProps, b: SidebarSessionRowProps): bo
     a.dragging === b.dragging &&
     a.showProfile === b.showProfile &&
     a.card === b.card &&
+    a.selectionScope === b.selectionScope &&
     a.dragHandleProps === b.dragHandleProps &&
     a.className === b.className &&
     a.style === b.style
