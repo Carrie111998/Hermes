@@ -2267,6 +2267,26 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
 
+            # Re-check the gateway-lifecycle guard on the MERGED record when
+            # prompt or script changes. create_job() enforces this at
+            # creation time (see its own comment: prevents agent-driven
+            # SIGTERM-respawn loops under launchd/systemd KeepAlive, #30719),
+            # but update_job() — the only other write path for these two
+            # fields, used by both `hermes cron edit` and the agent's own
+            # `cronjob(action="update", ...)` tool — never re-validated
+            # them: a job could be CREATED with a harmless script and then
+            # UPDATED to point at (or embed) a gateway-restart command with
+            # no guard in between. Scanning the merged prompt+script instead
+            # of just the changed field also closes the split-across-fields
+            # evasion the guard's own docstring calls out (a command spread
+            # across the two so neither field alone looks dangerous).
+            if {"prompt", "script"}.intersection(updates):
+                from cron.lifecycle_guard import check_gateway_lifecycle
+                check_gateway_lifecycle(
+                    _coerce_job_text(updated.get("prompt")).strip(),
+                    updated.get("script"),
+                )
+
             if is_terminal_job(job) and (
                 updated.get("state") not in {"completed", "error"}
                 or updated.get("enabled") is True
