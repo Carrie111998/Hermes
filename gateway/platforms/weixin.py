@@ -183,6 +183,7 @@ _FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
 _LIST_PREFIX_RE = re.compile(
     r"^\s*(?:[-+*•]|\d+[.)]|[（(]\d+[）)])\s+(?:\[[ xX]\]\s+)?"
 )
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
@@ -754,6 +755,12 @@ def _wrap_copy_friendly_lines_for_weixin(content: str) -> str:
             # treat server-inserted newlines as new paragraphs and discard
             # their leading spaces. Keep each list item on one physical line.
             or _LIST_PREFIX_RE.match(line)
+            # CJK prose is primarily read on narrow mobile screens. A hard
+            # server newline combines with the client's own wrapping and
+            # creates short, ragged fragments around embedded Latin terms.
+            # Keep the original English copy-field wrapping behaviour below,
+            # but let WeChat wrap CJK prose at the actual viewport width.
+            or _CJK_RE.search(line)
         ):
             wrapped.append(line)
             continue
