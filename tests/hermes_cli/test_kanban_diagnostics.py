@@ -202,7 +202,14 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     ("kanban_config", "graph"),
     [
         (
-            {"max_spawn": 1, "max_in_progress": 1},
+            {"max_spawn": 1},
+            {
+                "running_by_assignee": {"demo": 1},
+                "assignee_profile_exists": True,
+            },
+        ),
+        (
+            {"max_in_progress": 1},
             {"running_total": 1, "assignee_profile_exists": True},
         ),
         (
@@ -243,6 +250,27 @@ def test_stranded_in_ready_warns_for_invalid_profile_at_host_capacity():
         now=now,
         config={"kanban": {"max_in_progress": 1}},
         graph={"running_total": 1, "assignee_profile_exists": False},
+    )
+
+    assert [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+def test_stranded_in_ready_warns_when_only_another_board_reaches_max_spawn():
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [_event("created", ts=now - 45 * 60)]
+
+    diags = kd.compute_task_diagnostics(
+        task,
+        events,
+        [],
+        now=now,
+        config={"kanban": {"max_spawn": 1}},
+        graph={
+            "running_total": 1,
+            "running_by_assignee": {},
+            "assignee_profile_exists": True,
+        },
     )
 
     assert [d for d in diags if d.kind == "stranded_in_ready"]
