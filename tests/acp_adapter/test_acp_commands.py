@@ -4,6 +4,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 from acp.schema import TextContentBlock
 
+import acp_adapter.server as server_mod
 from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager
 
@@ -161,6 +162,46 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert observed["lock_held"] is True
     assert state.cancel_event.is_set()
     assert state.interrupted_prompt_text == "original request"
+
+
+@pytest.mark.asyncio
+async def test_acp_cancel_idle_session_does_not_hard_interrupt(monkeypatch):
+    """A cancel on an IDLE session must not poison the reused agent.
+
+    Xcode implemented \"stop and send\": it fires a ``session/cancel``
+    notification right before submitting the next message. That cancel lands
+    on a session whose previous turn already finished (``is_running`` is
+    False). It must still publish ``cancel_event`` (the next prompt clears it
+    itself at turn start), but must NOT call ``request_hard_interrupt`` — if it
+    did, ``_interrupt_requested`` would stay set on the reused agent and the
+    very next turn would abort at the session-turn-lease acquire with the
+    \"Stopped waiting for another Hermes process on this session\" message.
+    """
+    acp_agent, state, _fake, _conn = make_agent_and_state()
+    state.is_running = False
+    state.current_prompt_text = ""
+    calls = []
+    monkeypatch.setattr(server_mod, "request_hard_interrupt", lambda agent: calls.append(agent))
+
+    await acp_agent.cancel(state.session_id)
+
+    assert state.cancel_event.is_set()
+    assert calls == [], "idle cancel must not hard-interrupt the reused agent"
+
+
+@pytest.mark.asyncio
+async def test_acp_cancel_running_session_still_hard_interrupts(monkeypatch):
+    """A cancel on a genuinely running session must still request a hard stop."""
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.is_running = True
+    state.current_prompt_text = "in flight"
+    calls = []
+    monkeypatch.setattr(server_mod, "request_hard_interrupt", lambda agent: calls.append(agent))
+
+    await acp_agent.cancel(state.session_id)
+
+    assert state.cancel_event.is_set()
+    assert calls == [fake], "running cancel must hard-interrupt the agent"
 
 
 
