@@ -10,7 +10,7 @@ import threading
 import time
 import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 
 def _ensure_discord_mock():
@@ -630,6 +630,7 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+        assert event.metadata["discord_voice_channel_input"] is True
 
     @pytest.mark.asyncio
     async def test_input_resolves_channel_prompt(self, runner):
@@ -724,6 +725,8 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
         adapter._allowed_user_ids = set()
+        adapter._voice_stt_provider = None
+        adapter._voice_stt_model = None
         adapter._running = True
         return adapter
 
@@ -910,13 +913,21 @@ class TestDiscordVoiceChannelMethods:
         adapter._allowed_user_ids = set()
 
         pcm_data = b"\x00" * 96000
+        adapter._voice_stt_provider = "groq"
+        adapter._voice_stt_model = "whisper-large-v3-turbo"
 
         with patch("plugins.platforms.discord.adapter.VoiceReceiver.pcm_to_wav"), \
              patch("tools.transcription_tools.transcribe_audio",
-                   return_value={"success": True, "transcript": "Hello"}), \
+                   return_value={"success": True, "transcript": "Hello", "provider": "local"}) as transcribe, \
              patch("tools.voice_mode.is_whisper_hallucination", return_value=False):
             await adapter._process_voice_input(111, 42, pcm_data)
 
+        transcribe.assert_called_once_with(
+            ANY,
+            "whisper-large-v3-turbo",
+            "discord_voice_channel",
+            "groq",
+        )
         callback.assert_called_once_with(guild_id=111, user_id=42, transcript="Hello")
 
 

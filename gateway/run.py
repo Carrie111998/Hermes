@@ -10187,6 +10187,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True  # handled (silently dropped); do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
+        # Discord voice-channel input is already endpointed and transcribed by
+        # the adapter before it reaches this guard.  Treat it like live barge-in
+        # rather than an ordinary voice-note attachment: otherwise a profile
+        # configured with busy_input_mode=queue leaves the speaker waiting for
+        # the entire previous voice turn even though voice.barge_in is enabled.
+        # The marker is stamped only by _handle_voice_channel_input below and is
+        # platform/type checked here so arbitrary message metadata cannot change
+        # busy-session policy.
+        _event_metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        _is_discord_voice_channel_input = (
+            event.source.platform == Platform.DISCORD
+            and event.message_type == MessageType.VOICE
+            and _event_metadata.get("discord_voice_channel_input") is True
+            and bool((event.text or "").strip())
+            and not (getattr(event, "media_urls", None) or [])
+        )
+        _voice_barge_in = False
+        if _is_discord_voice_channel_input:
+            _voice_cfg = (_load_gateway_config().get("voice") or {})
+            _barge_in_raw = _voice_cfg.get("barge_in", True)
+            if isinstance(_barge_in_raw, str):
+                _voice_barge_in = _barge_in_raw.strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+            else:
+                _voice_barge_in = bool(_barge_in_raw)
+            if _voice_barge_in:
+                effective_mode = "interrupt"
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -10395,7 +10423,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt"
-            and event.message_type == MessageType.TEXT
+            and (
+                event.message_type == MessageType.TEXT
+                or _is_discord_voice_channel_input
+            )
             and not event.media_urls
             and not event.media_types
             and running_agent is not None
@@ -22210,6 +22241,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt,
+            metadata={
+                "discord_voice_channel_input": True,
+            },
         )
 
         await adapter.handle_message(event)

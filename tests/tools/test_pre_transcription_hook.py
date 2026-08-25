@@ -287,6 +287,31 @@ class TestHookMergeMechanics:
 
 
 class TestNoHookPath:
+    def test_call_scoped_provider_override_routes_without_mutating_config(
+        self, monkeypatch, tmp_path,
+    ):
+        audio = _make_audio(tmp_path)
+        _no_hooks(monkeypatch)
+
+        backend = MagicMock(return_value={"success": True, "transcript": "hi"})
+        cfg_patch, prov_patch = _dispatch_ctx({"provider": "openai"}, "openai")
+        with cfg_patch, prov_patch, \
+             patch("tools.transcription_tools._transcribe_groq", backend):
+            result = transcription_tools.transcribe_audio(
+                audio,
+                model="whisper-large-v3-turbo",
+                source="discord_voice_channel",
+                provider="groq",
+            )
+
+        assert result["success"] is True
+        backend.assert_called_once_with(
+            audio,
+            "whisper-large-v3-turbo",
+            language=None,
+            prompt=None,
+        )
+
     def test_no_hook_dispatch_kwargs_identical_to_control(
         self, monkeypatch, tmp_path,
     ):

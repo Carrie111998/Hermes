@@ -2926,6 +2926,7 @@ def _transcribe_prepared_audio(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    provider_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
@@ -2940,6 +2941,8 @@ def _transcribe_prepared_audio(
         source:    Optional caller-surface label (e.g. ``"gateway"``,
                    ``"voice_mode"``) forwarded to the ``pre_transcription``
                    plugin hook for observability. Not used for dispatch.
+        provider_override: Optional provider for this transcription only. This
+                   leaves the global ``stt.provider`` selection unchanged.
 
     Returns:
         dict with keys:
@@ -2973,7 +2976,11 @@ def _transcribe_prepared_audio(
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
         }
 
-    provider = _get_provider(stt_config)
+    provider = (
+        str(provider_override).strip().lower()
+        if provider_override is not None and str(provider_override).strip()
+        else _get_provider(stt_config)
+    )
     if not _is_local_stt_provider(provider, stt_config):
         error = _validate_audio_file_size(Path(file_path))
         if error:
@@ -3176,12 +3183,14 @@ def transcribe_audio(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Safely validate, preprocess supported inputs, and dispatch transcription.
 
     ``source`` is an optional caller-surface label (e.g. ``"gateway"``,
     ``"voice_mode"``) forwarded to the ``pre_transcription`` plugin hook for
-    observability. Not used for dispatch.
+    observability. ``provider`` optionally overrides ``stt.provider`` for this
+    call without mutating global configuration.
     """
     # Refuse to feed a credential / secret store (auth.json, .env, OAuth
     # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
@@ -3214,7 +3223,9 @@ def transcribe_audio(
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
             return prepared_error
-        return _transcribe_prepared_audio(prepared_path, model, source)
+        return _transcribe_prepared_audio(
+            prepared_path, model, source, provider_override=provider,
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)

@@ -36,6 +36,21 @@ A paid [Nous Portal](/user-guide/features/tool-gateway) subscription supplies th
 | **Auto Voice Reply** | Telegram, Discord | Agent sends spoken audio alongside text responses |
 | **Voice Channel** | Discord | Bot joins VC, listens to users speaking, speaks replies back |
 
+For live Discord conversations, you can select a faster or more accurate STT
+route without changing transcription on other surfaces:
+
+```yaml
+discord:
+  voice_stt:
+    provider: groq
+    model: whisper-large-v3-turbo
+```
+
+Leave either value empty to inherit the global `stt.provider` or that
+provider's configured model. Discord voice-channel turns also honor
+`voice.barge_in`: when enabled, new speech redirects a compatible active turn
+or interrupts it instead of silently waiting behind the previous reply.
+
 ## Requirements
 
 ### Python Packages

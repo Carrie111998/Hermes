@@ -1031,6 +1031,25 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+def _read_voice_stt_overrides() -> tuple[Optional[str], Optional[str]]:
+    """Return Discord voice-channel (provider, model) STT overrides."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config() or {}
+        discord_cfg = cfg.get("discord", {}) or {}
+        voice_stt = discord_cfg.get("voice_stt", {}) or {}
+    except Exception:
+        return None, None
+    if not isinstance(voice_stt, dict):
+        return None, None
+    provider = voice_stt.get("provider")
+    model = voice_stt.get("model")
+    provider = provider.strip() if isinstance(provider, str) and provider.strip() else None
+    model = model.strip() if isinstance(model, str) and model.strip() else None
+    return provider, model
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -1097,6 +1116,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
         self._voice_timeout_seconds = self._load_voice_timeout()
         self._playback_timeout_seconds = self._load_playback_timeout()
+        # Snapshot non-secret voice STT routing while this adapter is created
+        # inside its owning profile scope. The async listener must not reread a
+        # process-global config path later in a multiplexed gateway.
+        self._voice_stt_provider, self._voice_stt_model = _read_voice_stt_overrides()
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
@@ -4937,14 +4960,25 @@ class DiscordAdapter(BasePlatformAdapter):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode import is_whisper_hallucination
 
+        pipeline_started = time.monotonic()
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()
         try:
             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
+            conversion_done = time.monotonic()
 
             from tools.transcription_tools import transcribe_audio
-            result = await asyncio.to_thread(transcribe_audio, wav_path)
+            stt_provider = getattr(self, "_voice_stt_provider", None)
+            stt_model = getattr(self, "_voice_stt_model", None)
+            result = await asyncio.to_thread(
+                transcribe_audio,
+                wav_path,
+                stt_model,
+                "discord_voice_channel",
+                stt_provider,
+            )
+            transcription_done = time.monotonic()
 
             if not result.get("success"):
                 return
@@ -4960,6 +4994,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     user_id=user_id,
                     transcript=transcript,
                 )
+            dispatch_done = time.monotonic()
+            logger.info(
+                "Discord voice stages for guild=%d user=%d: convert=%.0fms "
+                "stt=%.0fms dispatch=%.0fms total=%.0fms provider=%s",
+                guild_id,
+                user_id,
+                (conversion_done - pipeline_started) * 1000,
+                (transcription_done - conversion_done) * 1000,
+                (dispatch_done - transcription_done) * 1000,
+                (dispatch_done - pipeline_started) * 1000,
+                result.get("provider", "unknown"),
+            )
         except Exception as e:
             # CalledProcessError from pcm_to_wav carries ffmpeg's captured
             # stderr — surface it, or the log only says "exit status N".

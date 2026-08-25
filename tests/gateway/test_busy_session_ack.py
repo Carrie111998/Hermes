@@ -188,6 +188,111 @@ class TestBusySessionAck:
         # Verify agent interrupt was called
         agent.interrupt.assert_called_once_with("Are you working?")
 
+    @pytest.mark.asyncio
+    async def test_discord_voice_barge_in_redirects_even_when_busy_mode_queues(
+        self, monkeypatch
+    ):
+        """Live Discord speech uses redirect instead of waiting behind a turn."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(
+            _gr, "_load_gateway_config", lambda: {"voice": {"barge_in": True}}
+        )
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("discord")
+        event = MessageEvent(
+            text="Actually, make it shorter",
+            message_type=MessageType.VOICE,
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                chat_type="channel",
+                user_id="user1",
+            ),
+            message_id="voice-1",
+            metadata={"discord_voice_channel_input": True},
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[Platform.DISCORD] = adapter
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect.return_value = True
+        runner._running_agents[sk] = agent
+
+        assert await runner._handle_active_session_busy_message(event, sk) is True
+
+        agent.redirect.assert_called_once_with("Actually, make it shorter")
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_discord_voice_barge_in_falls_back_to_interrupt(self, monkeypatch):
+        """Agents without redirect support still receive live speech promptly."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(
+            _gr, "_load_gateway_config", lambda: {"voice": {"barge_in": True}}
+        )
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("discord")
+        event = MessageEvent(
+            text="Stop and answer this",
+            message_type=MessageType.VOICE,
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                chat_type="channel",
+                user_id="user1",
+            ),
+            message_id="voice-2",
+            metadata={"discord_voice_channel_input": True},
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[Platform.DISCORD] = adapter
+        agent = MagicMock(spec=["interrupt", "get_activity_summary"])
+        runner._running_agents[sk] = agent
+
+        assert await runner._handle_active_session_busy_message(event, sk) is True
+
+        agent.interrupt.assert_called_once_with("Stop and answer this")
+        assert adapter._pending_messages[sk] is event
+
+    @pytest.mark.asyncio
+    async def test_discord_voice_respects_disabled_barge_in(self, monkeypatch):
+        """Explicitly disabled barge-in preserves the configured queue policy."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(
+            _gr, "_load_gateway_config", lambda: {"voice": {"barge_in": False}}
+        )
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("discord")
+        event = MessageEvent(
+            text="Wait for the current answer",
+            message_type=MessageType.VOICE,
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                chat_type="channel",
+                user_id="user1",
+            ),
+            message_id="voice-3",
+            metadata={"discord_voice_channel_input": True},
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[Platform.DISCORD] = adapter
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        assert await runner._handle_active_session_busy_message(event, sk) is True
+
+        agent.redirect.assert_not_called()
+        agent.interrupt.assert_not_called()
+        assert adapter._pending_messages[sk] is event
+
 
     @pytest.mark.asyncio
     async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch):

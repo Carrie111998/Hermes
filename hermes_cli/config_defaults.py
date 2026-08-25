@@ -2274,6 +2274,14 @@ DEFAULT_CONFIG = {
         # The adapter also probes clip duration and extends this floor by a
         # padding window, so long TTS readbacks are not cut at exactly 120s.
         "voice_playback_timeout_seconds": 120,
+        # Optional Discord voice-channel-only STT route. Empty values inherit
+        # the global stt.provider and that provider's configured model. This
+        # allows a low-latency, high-accuracy cloud model for live conversation
+        # while retaining local/offline STT on other surfaces.
+        "voice_stt": {
+            "provider": "",
+            "model": "",
+        },
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and
