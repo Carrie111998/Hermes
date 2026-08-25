@@ -22,6 +22,7 @@
   "files": [
     "src/app/ix-agency/data/mcp-tiles.json",
     "src/app/ix-agency/data/skills.json",
+    "brands/foundrly.json",
     "brands/ix-agency.json",
     "brands/quizverse.json"
   ],
