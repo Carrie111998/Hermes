@@ -96,11 +96,25 @@ class Settings:
     # *something* in the room fast. If the real answer lands before this
     # deadline we skip the placeholder entirely (no double-message spam).
     ack_deadline_ms: int = field(default_factory=lambda: _env_int("ACK_DEADLINE_MS", 3500))
-    answer_timeout_s: float = field(default_factory=lambda: _env_float("ANSWER_TIMEOUT_S", 90.0))
     ack_text: str = field(
         default_factory=lambda: _env(
             "ACK_TEXT",
             "네, 질문 확인했습니다 🔎 관련 법령·판례를 찾아보는 중이라 잠시만 기다려 주세요.",
+        )
+    )
+    # A real legal answer can outrun the first budget — several law-API
+    # round trips plus generation. Rather than throwing that work away at
+    # 90s, the bot says how much longer it needs and keeps going; people
+    # asking a legal question wait minutes without minding.
+    answer_timeout_s: float = field(default_factory=lambda: _env_float("ANSWER_TIMEOUT_S", 90.0))
+    answer_extension_s: float = field(
+        default_factory=lambda: _env_float("ANSWER_EXTENSION_S", 180.0)
+    )
+    patience_text: str = field(
+        default_factory=lambda: _env(
+            "PATIENCE_TEXT",
+            "답변을 생성하느라 시간이 걸리고 있습니다. "
+            "{minutes}분내로 답변드리도록 하겠습니다. 잠시만 기다려주세요.",
         )
     )
 
@@ -178,6 +192,21 @@ class Settings:
     @property
     def draft_model(self) -> str:
         return self.llm_draft_model or self.llm_model
+
+    @property
+    def total_answer_budget_s(self) -> float:
+        """Hard ceiling: the first budget plus the extension we promised."""
+        return max(self.answer_timeout_s, 0.0) + max(self.answer_extension_s, 0.0)
+
+    def patience_message(self) -> str:
+        """"…{minutes}분내로 답변드리겠습니다" with the real number filled in."""
+        minutes = max(1, round(max(self.answer_extension_s, 0.0) / 60))
+        try:
+            return self.patience_text.format(minutes=minutes)
+        except (KeyError, IndexError, ValueError):
+            # A custom PATIENCE_TEXT with stray braces must not break the
+            # one message whose whole job is to keep the client waiting.
+            return self.patience_text
 
     def missing_required(self) -> list[str]:
         """Config that must be present for the bot to do anything useful."""

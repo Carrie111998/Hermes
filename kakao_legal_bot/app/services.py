@@ -104,7 +104,9 @@ def build_services(settings: Settings | None = None) -> Services:
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,
         max_tool_rounds=settings.llm_max_tool_rounds,
-        timeout_s=max(settings.answer_timeout_s, 30.0),
+        # Must cover the *whole* budget including the extension — an HTTP
+        # timeout at 90s would make the promised 3 extra minutes a lie.
+        timeout_s=max(settings.total_answer_budget_s, 30.0),
     )
 
     iris = IrisClient(settings)

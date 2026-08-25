@@ -35,8 +35,8 @@ INTRO_TEXT = """안녕하세요, {bot_name}입니다 🙂
 문서가 필요하시면 초안을 만들어 {lawyer_name}님 검토 후 이메일로 보내드립니다.
 (제 답변은 일반적인 법률 정보이고, 최종 판단은 {lawyer_name}님이 확인해 드립니다.)"""
 
-TIMEOUT_TEXT = """죄송합니다, 자료를 찾는 데 시간이 예상보다 오래 걸리고 있습니다.
-{lawyer_name}님께 전달해 두었으니 확인 후 답변드리겠습니다. 급하신 내용이면 한 번 더 말씀해 주세요."""
+TIMEOUT_TEXT = """자료를 찾는 데 예상보다 오래 걸리고 있습니다.
+{lawyer_name}님께 질문을 그대로 전달해 두었으니 확인 후 직접 답변드리겠습니다."""
 
 ERROR_TEXT = """죄송합니다, 지금 답변을 만들지 못했습니다.
 {lawyer_name}님께 전달해 두었습니다. 조금 뒤 다시 여쭤봐 주시면 답변드리겠습니다."""
@@ -144,6 +144,7 @@ class Pipeline:
 
         task = asyncio.create_task(self._guarded_answer(question, history))
 
+        # ① Kakao's window: put *something* in the room fast.
         ack_deadline = max(settings.ack_deadline_ms, 0) / 1000.0
         done, _pending = await asyncio.wait({task}, timeout=ack_deadline)
         if not done:
@@ -154,7 +155,25 @@ class Pipeline:
                     timeout=max(1.0, ack_deadline),
                 )
 
-        remaining = max(settings.answer_timeout_s - (time.monotonic() - started), 1.0)
+        # ② Still going after the first budget? Say how much longer and
+        # keep the work — a legal answer often needs several law-API round
+        # trips, and throwing away a nearly-finished one to apologise
+        # serves nobody. Clients asking a legal question wait minutes.
+        if settings.answer_extension_s > 0 and not done:
+            first_wait = settings.answer_timeout_s - (time.monotonic() - started)
+            if first_wait > 0:
+                done, _pending = await asyncio.wait({task}, timeout=first_wait)
+            if not done:
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        services.sender.send(
+                            room_id, settings.patience_message(), record_role=""
+                        ),
+                        timeout=10.0,
+                    )
+
+        # ③ Hard ceiling. Only now do we hand the question to the lawyer.
+        remaining = max(settings.total_answer_budget_s - (time.monotonic() - started), 1.0)
         try:
             result = await asyncio.wait_for(task, timeout=remaining)
         except (TimeoutError, asyncio.TimeoutError):
@@ -162,7 +181,8 @@ class Pipeline:
                 room_id, TIMEOUT_TEXT.format(lawyer_name=settings.lawyer_name), record_role=""
             )
             await services.sender.notify_lawyer(
-                f"⏱️ 답변 시간 초과\n방: {event.room_name or room_id}\n질문: {question[:300]}"
+                f"⏱️ 답변 시간 초과 ({settings.total_answer_budget_s:.0f}초)\n"
+                f"방: {event.room_name or room_id}\n질문: {question[:300]}"
             )
             return
 

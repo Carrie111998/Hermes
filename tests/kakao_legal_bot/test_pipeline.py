@@ -78,15 +78,70 @@ async def test_intro_is_sent_only_once(settings, db):
 
 
 @pytest.mark.asyncio
-async def test_answer_timeout_tells_the_client_and_the_lawyer(settings, db):
+async def test_slow_answer_buys_more_time_instead_of_giving_up(settings, db):
+    """The first budget expiring is a status update, not a failure.
+
+    A legal answer that needs several law-API round trips routinely runs
+    past 90s; throwing that work away to apologise would be the worst of
+    both worlds.
+    """
     db.upsert_room("room-1", "상담방", "direct")
     db.set_room_flag("room-1", "intro_sent", 1)
-    services, sender, pipeline = build(settings, db, FakeAgent("영원히", delay=30))
-    object.__setattr__(services.settings, "answer_timeout_s", 0.3)
+    _services, sender, pipeline = build(settings, db, FakeAgent("오래 걸린 답변", delay=0.5))
+    object.__setattr__(settings, "answer_timeout_s", 0.25)
+    object.__setattr__(settings, "answer_extension_s", 180.0)
 
-    await pipeline.handle(make_event("오래 걸리는 질문"))
+    await pipeline.handle(make_event("아주 복잡한 질문"))
 
-    assert any("시간이 예상보다 오래" in text for text in sender.texts)
+    assert sender.texts[0] == settings.ack_text
+    assert sender.texts[1] == "답변을 생성하느라 시간이 걸리고 있습니다. 3분내로 답변드리도록 하겠습니다. 잠시만 기다려주세요."
+    assert sender.texts[2] == "오래 걸린 답변"
+    # Nobody woke the lawyer — the answer arrived on its own.
+    assert sender.lawyer_notes == []
+
+
+@pytest.mark.asyncio
+async def test_the_patience_notice_says_the_configured_number_of_minutes(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    _services, sender, pipeline = build(settings, db, FakeAgent("답변", delay=0.5))
+    object.__setattr__(settings, "answer_timeout_s", 0.25)
+    object.__setattr__(settings, "answer_extension_s", 300.0)
+
+    await pipeline.handle(make_event("질문"))
+
+    assert "5분내로" in sender.texts[1]
+
+
+@pytest.mark.asyncio
+async def test_only_the_hard_ceiling_hands_the_question_to_the_lawyer(settings, db):
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    _services, sender, pipeline = build(settings, db, FakeAgent("영원히", delay=30))
+    object.__setattr__(settings, "answer_timeout_s", 0.2)
+    object.__setattr__(settings, "answer_extension_s", 0.3)
+
+    await pipeline.handle(make_event("끝나지 않는 질문"))
+
+    # The promise is made first… (the minute count itself is asserted above)
+    assert "시간이 걸리고 있습니다" in sender.texts[1]
+    assert any("예상보다 오래" in text for text in sender.texts)  # …then kept honest
+    assert any("시간 초과" in note for note in sender.lawyer_notes)
+
+
+@pytest.mark.asyncio
+async def test_extension_can_be_turned_off(settings, db):
+    """ANSWER_EXTENSION_S=0 restores the plain single-deadline behaviour."""
+    db.upsert_room("room-1", "상담방", "direct")
+    db.set_room_flag("room-1", "intro_sent", 1)
+    _services, sender, pipeline = build(settings, db, FakeAgent("영원히", delay=30))
+    object.__setattr__(settings, "answer_timeout_s", 0.3)
+    object.__setattr__(settings, "answer_extension_s", 0.0)
+
+    await pipeline.handle(make_event("질문"))
+
+    assert not any("시간이 걸리고 있습니다" in text for text in sender.texts)
+    assert any("예상보다 오래" in text for text in sender.texts)
     assert sender.lawyer_notes
 
 
