@@ -500,6 +500,9 @@ DEFAULT_CONFIG = {
         # When on, SETUID/SETGID caps are omitted from the container since
         # no privilege drop is needed.
         "docker_run_as_host_user": False,
+        # Explicit opt-in for trusted profiles to reuse the same Docker
+        # container identity. Empty preserves the active-profile boundary.
+        "docker_shared_container_key": "",
         # Persistent shell — keep a long-lived bash shell across execute() calls
         # so cwd/env vars/shell variables survive between commands.
         # Enabled by default for non-local backends (SSH); local is always opt-in
@@ -548,6 +551,7 @@ DEFAULT_CONFIG = {
         "backend": "",
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
+        "snapshot_threshold": 15000,  # Max chars before snapshot truncate-and-store (min 1000)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
         "headed": False,  # Local mode: launch Chromium with a visible window (also skips per-turn cleanup so the window persists between turns; idle reaper still applies)
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)
@@ -747,6 +751,9 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        "checkpoint_required": False, # Fail closed before lossy compaction unless an
+                                      # active memory provider confirms checkpoint API
+                                      # compatibility and completes the checkpoint.
         "progress_notices": False,    # opt-in (#52995): when True, routine compression
                                       # progress statuses (compacting/preflight/pre-API/
                                       # idle/retry) are delivered to chat gateway
@@ -1075,15 +1082,11 @@ DEFAULT_CONFIG = {
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
-        "web_extract": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
-            "extra_body": {},
-            "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
-        },
+        # Note: web_extract no longer uses an auxiliary LLM — pages are
+        # truncate-and-stored with a read_file pointer (no summarization),
+        # and browser snapshots follow the same pattern. The old
+        # ``auxiliary.web_extract.*`` block was removed here. Existing
+        # values in user config.yaml files are harmless leftovers and ignored.
         "compression": {
             "provider": "auto",
             "model": "",
@@ -3700,6 +3703,15 @@ DEFAULT_CONFIG = {
         # explicit ozone backend, or GPU workaround flags. A list of strings;
         # a single string is also accepted and shell-split.
         "electron_flags": [],
+        # Linux Ozone backend hint, bridged to ELECTRON_OZONE_PLATFORM_HINT
+        # at launch (an explicit env var still wins). "auto" is Chromium's
+        # default — Wayland on a Wayland session, X11 otherwise.
+        # Set "x11" to run under XWayland when a compositor ignores
+        # always-on-top for native Wayland clients (COSMIC, issue #84011).
+        # That also lands the HUD on the solid-window input path, because
+        # setIgnoreMouseEvents is a one-way door on X11.
+        # "wayland" forces a native Wayland surface.
+        "ozone_platform_hint": "auto",
         # GPU hardware acceleration policy for the desktop app:
         #   "auto"  - let the app detect remote displays (SSH/VNC/RDP) and
         #             disable GPU only then (default; current behavior).
@@ -3761,7 +3773,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 39,
+    "_config_version": 40,
 }
 
 # Optional environment variables that enhance functionality
