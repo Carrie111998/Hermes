@@ -12189,10 +12189,15 @@ function spawnQuickEntryWindow() {
   // resurrect itself over the app, but its loss belongs in desktop.log.
   installWindowRendererLifecycle(win, { kind: 'quick', callbacks: { log: rememberLog } })
 
-  // Hide on blur. The window must never hold the user's focus captive — losing
-  // focus is the cheapest, least surprising dismiss (matches Spotlight).
+  // Hide on blur on X11/macOS. On Wayland, Electron can emit blur immediately
+  // after `show()` because niri does not grant focus to this always-on-top
+  // helper window; hiding there makes Quick Entry appear for a moment and then
+  // vanish before the user can type.
+  const waylandSession =
+    process.platform === 'linux' &&
+    (process.env.XDG_SESSION_TYPE === 'wayland' || Boolean(process.env.WAYLAND_DISPLAY))
   win.on('blur', () => {
-    if (!win.isDestroyed()) {
+    if (!waylandSession && !win.isDestroyed()) {
       win.hide()
     }
   })
