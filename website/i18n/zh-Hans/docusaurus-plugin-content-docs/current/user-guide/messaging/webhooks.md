@@ -407,10 +407,11 @@ hermes webhook subscribe github-issues \
   --prompt "New issue #{issue.number}: {issue.title}\nBy: {issue.user.login}\n\n{issue.body}" \
   --deliver telegram \
   --deliver-chat-id "-100123456789" \
-  --description "Triage new GitHub issues"
+  --description "Triage new GitHub issues" \
+  --secret-fd 3 3< /path/to/webhook-secret
 ```
 
-此命令返回 webhook URL 和自动生成的 HMAC secret。将你的服务配置为 POST 到该 URL。
+`--secret-fd` 最多读取 4096 字节的 UTF-8 内容，去除末尾空白，并避免在命令行和进程列表中暴露 HMAC secret。它与旧版 `--secret` 选项互斥。如果两个选项都未提供，Hermes 仍会自动生成 secret。secret 值存储在仅所有者可读写的 `~/.hermes/webhook_subscriptions.json` 文件中，不会由此命令或 `hermes webhook list` 输出。使用同一 secret 将你的服务配置为 POST 到返回的 URL。
 
 ### 列出订阅
 
