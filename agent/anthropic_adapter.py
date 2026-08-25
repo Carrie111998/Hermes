@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -283,8 +284,16 @@ def _supports_adaptive_thinking(model: str) -> bool:
     Kimi / Moonshot models are the exception: their Anthropic-compatible
     endpoints implement the adaptive contract (``thinking.type="adaptive"``
     + ``output_config.effort``, including ``xhigh`` and ``display``).
+
+    The Qwen3.8 family is the same shape of exception on third-party
+    Anthropic-compatible endpoints: the adaptive contract works with a
+    clean effort dose-response, while the manual ``budget_tokens`` field
+    is rejected outright (HTTP 502 upstream_error at any budget value) —
+    see :func:`_model_name_is_qwen3_8_family`.
     """
     if _model_name_is_kimi_family(model):
+        return True
+    if _model_name_is_qwen3_8_family(model):
         return True
     if not _is_claude_model(model):
         return False
@@ -550,6 +559,34 @@ def _model_name_is_kimi_family(model: str | None) -> bool:
     if m in _KIMI_FAMILY_EXACT_SLUGS:
         return True
     return m.startswith(_KIMI_FAMILY_MODEL_PREFIXES)
+
+
+def _model_name_is_qwen3_8_family(model: str | None) -> bool:
+    """True for Qwen3.8 models (``qwen3.8-max``, ``qwen3.8-plus``, …).
+
+    Third-party Anthropic-compatible endpoints serving the Qwen3.8 family
+    implement the adaptive-thinking contract — ``thinking.type="adaptive"``
+    + ``output_config.effort``, the same shape as Kimi/Moonshot and GLM-5
+    (#91006). Verified live against ``qwen3.8-max`` via a third-party relay
+    (2026-08-25): effort low ≈0.5K thinking chars vs high ≈5.5K (~10x
+    dose-response), while the manual ``budget_tokens`` field fails hard
+    with HTTP 502 upstream_error at any budget value — so the manual path
+    breaks every request when reasoning effort is configured.
+
+    Older Qwen generations (``qwen3-max``, ``qwen2.5``, ``qwq``, …) keep
+    the manual path: no evidence they accept the adaptive contract.
+    """
+    if not isinstance(model, str):
+        return False
+    m = model.strip().lower()
+    if not m:
+        return False
+    # Strip vendor prefix (e.g. ``qwen/qwen3.8-max`` → ``qwen3.8-max``)
+    if "/" in m:
+        m = m.rsplit("/", 1)[-1]
+    # qwen3.8, qwen3.8-max, qwen3.8p2 / qwen-3.8-max (relay spellings) —
+    # but NOT qwen3-max / qwen3.85 / qwen2.5 / qwq.
+    return bool(re.match(r"^qwen-?3\.8(?:[.\-_p]|$)", m))
 
 
 def _is_kimi_family_endpoint(base_url: str | None, model: str | None = None) -> bool:
