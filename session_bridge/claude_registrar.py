@@ -920,16 +920,24 @@ class _WinPtyProcess:
 
     def terminate(self, timeout: float = 1.0) -> bool:
         try:
-            terminated = self._process.terminate(force=True)  # type: ignore[attr-defined]
+            self._process.terminate(force=True)  # type: ignore[attr-defined]
         except Exception:
-            terminated = False
+            # A kill that races the child's own exit raises PermissionError
+            # (WinError 5) here: Windows refuses to terminate a process that is
+            # already on its way out. That is evidence about the KILL CALL, not
+            # about whether the process is gone, so it must not decide the
+            # answer -- confirm death below instead. Measured on 2026-08-25
+            # against a real ConPTY: this raised, the next poll reported the
+            # child dead with exitstatus 2, and the old code still returned
+            # False because the except handler had latched terminated=False.
+            pass
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            try:
-                if not self._process.isalive():  # type: ignore[attr-defined]
-                    return terminated is not False
-            except Exception:
-                return False
+            # Whether the kill call succeeded is moot once the process is
+            # confirmed gone; the caller only needs to know it can trust the
+            # cleanup that follows.
+            if self._is_dead():
+                return True
             time.sleep(0.01)
         pid = getattr(self._process, "pid", None)
         if sys.platform.startswith("win") and type(pid) is int:
@@ -1029,7 +1037,11 @@ class _WinPtyProcess:
         try:
             return not bool(self._process.isalive())  # type: ignore[attr-defined]
         except Exception:
-            return False
+            # The liveness probe can raise once the child has been reaped and
+            # its handle is no longer valid. A recorded exit status is then the
+            # authoritative answer. Absent one, liveness is genuinely unknown --
+            # and unknown must not be reported as dead.
+            return self._exit_code() is not None
 
     def _exit_code(self) -> int | None:
         value = getattr(self._process, "exitstatus", None)
