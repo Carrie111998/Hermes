@@ -3952,7 +3952,13 @@ class CuaDriverBackend(ComputerUseBackend):
 
         Gated on the per-tool capability claim so we don't send the
         field to drivers that predate the surface (which would reject
-        the schema with `additionalProperties: false`).
+        the schema with `additionalProperties: false`). As a defensive
+        second path, a tool whose live ``inputSchema`` declares an
+        ``element_token`` property also qualifies: ``inputSchema`` is a
+        core MCP ``tools/list`` field that no strict client model can
+        drop, so token-attach survives a driver that stops advertising
+        the capability vocabulary (field-verified workaround for the
+        Windows reproduction on #89527).
         """
         idx = args.get("element_index")
         if not isinstance(idx, int):
@@ -3960,8 +3966,11 @@ class CuaDriverBackend(ComputerUseBackend):
         token = self._snapshot_tokens.get(idx)
         if not token:
             return
-        if not self._session.supports_capability(
-            "accessibility.element_tokens", tool=tool
+        if not (
+            self._session.supports_capability(
+                "accessibility.element_tokens", tool=tool
+            )
+            or self._session.supports_input_property(tool, "element_token")
         ):
             return
         args["element_token"] = token

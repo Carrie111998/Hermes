@@ -2238,6 +2238,9 @@ class TestElementTokenAttachment:
                 return cap in capabilities.get(tool, set())
             return any(cap in caps for caps in capabilities.values())
         backend._session.supports_capability = _supports
+        # MagicMock auto-attributes are truthy — pin the schema gate
+        # closed unless a test overrides it.
+        backend._session.supports_input_property = lambda tool, prop: False
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
@@ -2253,6 +2256,36 @@ class TestElementTokenAttachment:
         assert args["element_index"] == 5
         # The matching token rode along — cua-driver will prefer it.
         assert args["element_token"] == "s0001:5"
+
+    def test_token_attached_via_input_schema_when_capability_missing(self):
+        """Defensive second path (Windows repro on #89527): a driver whose
+        live click inputSchema declares ``element_token`` but whose
+        capability vocabulary no longer advertises the token still gets
+        the attach — inputSchema is a core MCP field no strict client
+        model can drop."""
+        backend = self._backend_with_session({
+            "click": {"input.pointer.click"},  # capability token absent
+        })
+        backend._session.supports_input_property = (
+            lambda tool, prop: tool == "click" and prop == "element_token"
+        )
+        backend._snapshot_tokens = {5: "s0001:5"}
+        backend.click(element=5, button="left")
+        _, args = backend._session.call_tool.call_args.args
+        assert args["element_token"] == "s0001:5"
+
+    def test_token_not_attached_when_neither_gate_qualifies(self):
+        """Fail-closed pin: no capability claim AND no inputSchema property
+        means the field must not ride along (older drivers reject unknown
+        args via additionalProperties=false)."""
+        backend = self._backend_with_session({
+            "click": {"input.pointer.click"},
+        })
+        backend._session.supports_input_property = lambda tool, prop: False
+        backend._snapshot_tokens = {5: "s0001:5"}
+        backend.click(element=5, button="left")
+        _, args = backend._session.call_tool.call_args.args
+        assert "element_token" not in args
 
 
     def test_capture_refreshes_snapshot_tokens(self):
