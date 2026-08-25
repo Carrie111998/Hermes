@@ -214,6 +214,12 @@ _LONG_HANDLERS = frozenset(
         # this RPC, so running it inline would periodically freeze every other
         # socket request (including prompt/cancel/layout actions).
         "account.usage",
+        "auth.accounts",
+        "auth.cli.accounts",
+        "auth.cli.start",
+        "auth.cli.poll",
+        "auth.cli.submit",
+        "auth.cli.cancel",
         # CPU sampling intentionally waits 100ms for a meaningful interval;
         # never spend that delay on the socket reader thread.
         "system.resources",
@@ -270,6 +276,7 @@ _LONG_HANDLERS = frozenset(
         # exchanges. Keep them off the socket reader so cancel/poll remain live.
         "auth.oauth.start",
         "auth.oauth.submit",
+        "auth.oauth.cancel",
         "process.list",
         # profiles.list runs list_profiles() (recursive skill-tree walk per
         # profile) and opens each profile's state.db for the last-session
@@ -1535,13 +1542,21 @@ def _profile_home(profile: str | None) -> Path | None:
     try:
         from hermes_cli import profiles as profiles_mod
 
-        home = Path(profiles_mod.get_profile_dir(name))
+        canon = profiles_mod.normalize_profile_name(name)
+        profiles_mod.validate_profile_name(canon)
+        home = Path(profiles_mod.get_profile_dir(canon)).resolve(strict=False)
+        if canon != "default":
+            profiles_root = Path(profiles_mod._get_profiles_root()).resolve(
+                strict=False
+            )
+            if home.parent != profiles_root:
+                return None
     except Exception:
         return None
     # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
+    if home == Path(_hermes_home).resolve(strict=False):
         return None
-    return home if (home / "state.db").exists() or home.exists() else None
+    return home if home.is_dir() else None
 
 
 def _profile_scoped(handler):
@@ -1554,7 +1569,28 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        requested = params.get("profile") if isinstance(params, dict) else None
+        raw_name = str(requested or "").strip()
+        if raw_name:
+            try:
+                from hermes_cli import profiles as profiles_mod
+
+                canon = profiles_mod.normalize_profile_name(raw_name)
+                profiles_mod.validate_profile_name(canon)
+                requested_home = Path(
+                    profiles_mod.get_profile_dir(canon)
+                ).resolve(strict=False)
+            except Exception:
+                return _err(rid, 4064, "profile not found or invalid")
+        else:
+            requested_home = None
+        home = _profile_home(raw_name)
+        if (
+            raw_name
+            and home is None
+            and requested_home != Path(_hermes_home).resolve(strict=False)
+        ):
+            return _err(rid, 4064, "profile not found or invalid")
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -10665,6 +10701,93 @@ def _start_usage_ticker(
     return stop, thread
 
 
+def _apply_pending_credential_selection(session: dict) -> bool:
+    """Apply an explicit account choice at the next safe turn boundary."""
+    with session["history_lock"]:
+        pending = session.get("_pending_credential_selection")
+        if not isinstance(pending, dict):
+            return False
+        provider = str(pending.get("provider") or "").strip().lower()
+        credential_id = str(pending.get("credential_id") or "").strip()
+        if not provider or not credential_id:
+            session.pop("_pending_credential_selection", None)
+            return False
+        agent = session.get("agent")
+
+    # Never pair a provider's token with a client temporarily using a fallback
+    # provider. Leave the choice queued until the primary provider is restored.
+    if str(getattr(agent, "provider", "") or "").strip().lower() != provider:
+        return False
+    swap_credential = getattr(agent, "_swap_credential", None)
+    if not callable(swap_credential):
+        return False
+
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool(provider)
+        entry = pool.select_by_id(credential_id)
+    except Exception:
+        logger.warning(
+            "pending credential selection could not load provider pool: %s",
+            provider,
+            exc_info=True,
+        )
+        return False
+    if entry is None or str(getattr(entry, "id", "") or "") != credential_id:
+        return False
+    runtime_key = str(getattr(entry, "runtime_api_key", "") or "").strip()
+    if not runtime_key:
+        return False
+
+    # Claim the exact queued snapshot. A newer click remains queued instead of
+    # being erased by this turn's older pool load.
+    with session["history_lock"]:
+        if session.get("_pending_credential_selection") != pending:
+            return False
+        session.pop("_pending_credential_selection", None)
+
+    previous_pool = getattr(agent, "_credential_pool", None)
+    agent._credential_pool = pool
+    try:
+        swap_credential(entry)
+    except Exception:
+        agent._credential_pool = previous_pool
+        with session["history_lock"]:
+            session.setdefault("_pending_credential_selection", pending)
+        logger.warning(
+            "pending credential selection could not rebuild the %s client",
+            provider,
+            exc_info=True,
+        )
+        return False
+
+    # Fallback restoration reads this snapshot, so align it with the selected
+    # primary credential instead of reviving the token used before the click.
+    primary = getattr(agent, "_primary_runtime", None)
+    if (
+        isinstance(primary, dict)
+        and str(primary.get("provider") or "").strip().lower() == provider
+    ):
+        primary["api_key"] = getattr(agent, "api_key", runtime_key)
+        primary["base_url"] = getattr(agent, "base_url", primary.get("base_url"))
+        primary["client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+        if provider == "anthropic":
+            primary["anthropic_api_key"] = getattr(
+                agent, "_anthropic_api_key", runtime_key
+            )
+            primary["anthropic_base_url"] = getattr(
+                agent,
+                "_anthropic_base_url",
+                primary.get("anthropic_base_url"),
+            )
+            primary["is_anthropic_oauth"] = bool(
+                getattr(agent, "_is_anthropic_oauth", False)
+            )
+    logger.info("explicit credential selection applied for provider %s", provider)
+    return True
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -10799,6 +10922,7 @@ def _run_prompt_submit(
             # the turn runs. No-op for every other session shape.
             _sync_bot_capabilities(sid, session)
             agent = session["agent"]
+            _apply_pending_credential_selection(session)
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
             with session["history_lock"]:
@@ -15619,6 +15743,7 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
+    methods_cli_auth as _methods_cli_auth,
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_images as _methods_images,
@@ -15634,6 +15759,7 @@ for _m in (
     _methods_config,
     _methods_complete,
     _methods_tools,
+    _methods_cli_auth,
     _methods_profiles,
     _methods_images,
 ):

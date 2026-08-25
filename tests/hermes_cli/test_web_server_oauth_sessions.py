@@ -144,3 +144,44 @@ def test_anthropic_cancel_before_final_save_prevents_persistence(monkeypatch):
     assert not worker.is_alive()
     assert result["status"] == "cancelled"
     assert saved == []
+
+
+def test_anthropic_cancel_during_failed_exchange_stays_cancelled(monkeypatch):
+    session_id = "cancel-failed-exchange"
+    exchange_started = threading.Event()
+    release_exchange = threading.Event()
+
+    def urlopen(_request, timeout=0):
+        assert timeout == 20
+        exchange_started.set()
+        assert release_exchange.wait(2)
+        raise RuntimeError("exchange failed")
+
+    monkeypatch.setattr(
+        web_server,
+        "_ANTHROPIC_OAUTH_TOKEN_URLS",
+        ("https://auth.example/token",),
+    )
+    monkeypatch.setattr(web_server.urllib.request, "urlopen", urlopen)
+    session = _session(session_id, "work")
+    with web_server._oauth_sessions_lock:
+        web_server._oauth_sessions[session_id] = session
+
+    result = {}
+    worker = threading.Thread(
+        target=lambda: result.update(
+            web_server._submit_anthropic_pkce(session_id, "code#state", "work")
+        )
+    )
+    worker.start()
+    assert exchange_started.wait(2)
+    with web_server._oauth_sessions_lock:
+        session["cancelled"] = True
+        session["status"] = "cancelled"
+        web_server._oauth_sessions.pop(session_id, None)
+    release_exchange.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert result["status"] == "cancelled"
+    assert session["status"] == "cancelled"

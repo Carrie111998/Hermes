@@ -280,7 +280,10 @@ def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch
     def fake_sleep(_interval):
         # Simulate a real concurrent DELETE /api/providers/oauth/sessions/{sid}
         # firing while the worker is asleep between polls.
-        resp = client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
+        resp = client.delete(
+            f"/api/providers/oauth/sessions/{sid}?profile=coder",
+            headers=HEADERS,
+        )
         assert resp.status_code == 200, resp.text
 
     monkeypatch.setattr(ws.time, "sleep", fake_sleep)
@@ -369,7 +372,10 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
 
     def _fire_delete():
         delete_started.set()
-        client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
+        client.delete(
+            f"/api/providers/oauth/sessions/{sid}?profile=coder",
+            headers=HEADERS,
+        )
         delete_finished.set()
 
     monkeypatch.setattr(auth_mod, "_save_codex_tokens", fake_save)
@@ -391,9 +397,9 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
         "finishes, not slip in between the check and the save"
     )
     # DELETE arrived after the point of no return (save already committed),
-    # so this is the legitimate too-late-to-cancel outcome: token saved,
-    # session subsequently removed by the now-unblocked DELETE.
-    assert sid not in ws._oauth_sessions
+    # so it must not claim cancellation or erase the approved session.
+    assert ws._oauth_sessions[sid]["status"] == "approved"
+    ws._oauth_sessions.pop(sid, None)
 
 
 def test_cancel_oauth_session_marks_dict_cancelled_before_popping():
@@ -418,12 +424,16 @@ def test_cancel_oauth_session_marks_dict_cancelled_before_popping():
     worker_ref = ws._oauth_sessions[session_id]
 
     resp = client.delete(
-        f"/api/providers/oauth/sessions/{session_id}",
+        f"/api/providers/oauth/sessions/{session_id}?profile=coder",
         headers=HEADERS,
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"ok": True, "session_id": session_id}
+    assert resp.json() == {
+        "ok": True,
+        "session_id": session_id,
+        "status": "cancelled",
+    }
     assert session_id not in ws._oauth_sessions
     assert worker_ref["cancelled"] is True
 
@@ -693,7 +703,4 @@ def test_status_falls_through_to_generic_dispatcher_for_catalog_only_provider():
     assert out["token_preview"] and "sk-future-secret-token-xyz" not in out["token_preview"]
     assert out["expires_at"] == "2026-12-01T00:00:00Z"
     assert out["has_refresh_token"] is True
-
-
-
 

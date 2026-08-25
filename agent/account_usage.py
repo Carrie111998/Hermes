@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
-from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
+from hermes_cli.auth import AuthError, _decode_jwt_claims, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 if TYPE_CHECKING:
@@ -489,7 +489,19 @@ def _resolve_codex_usage_credentials(
     """
     explicit_key = str(api_key or "").strip()
     if explicit_key:
-        return explicit_key, str(base_url or "").strip(), None
+        claims = _decode_jwt_claims(explicit_key)
+        auth_claims = claims.get("https://api.openai.com/auth")
+        account_id = (
+            auth_claims.get("chatgpt_account_id")
+            if isinstance(auth_claims, dict)
+            else None
+        )
+        normalized_account_id = (
+            account_id.strip()
+            if isinstance(account_id, str) and account_id.strip()
+            else None
+        )
+        return explicit_key, str(base_url or "").strip(), normalized_account_id
 
     # Tier 2: the native runtime resolver. It ALREADY falls back to the
     # credential pool when the singleton is empty (see
@@ -775,8 +787,10 @@ def redeem_codex_reset_credit(
     )
 
 
-def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
-    token = (resolve_anthropic_token() or "").strip()
+def _fetch_anthropic_account_usage(
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    token = (api_key or resolve_anthropic_token() or "").strip()
     if not token:
         return None
     if not _is_oauth_token(token):
@@ -831,6 +845,9 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         provider="anthropic",
         source="oauth_usage_api",
         fetched_at=_utc_now(),
+        plan=_title_case_slug(
+            payload.get("subscription_type") or payload.get("plan_type")
+        ),
         windows=tuple(windows),
         details=tuple(details),
     )
@@ -921,7 +938,7 @@ def fetch_account_usage(
         if normalized == "openai-codex":
             return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
         if normalized == "anthropic":
-            return _fetch_anthropic_account_usage()
+            return _fetch_anthropic_account_usage(api_key=api_key)
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
     except Exception:

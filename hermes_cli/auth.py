@@ -88,7 +88,10 @@ from hermes_cli.config import (
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
-from agent.credential_persistence import sanitize_borrowed_credential_payload
+from agent.credential_persistence import (
+    is_borrowed_credential_source,
+    sanitize_borrowed_credential_payload,
+)
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -1655,10 +1658,32 @@ _POOL_STATUS_FIELDS = (
 )
 
 
+def _pool_status_snapshot(entry: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Return the canonical status compare-and-set value for one pool entry."""
+    values = []
+    for field in _POOL_STATUS_FIELDS:
+        value = entry.get(field)
+        if field == "last_status_at" and isinstance(value, str):
+            # PooledCredential.from_dict() normalizes persisted timestamps to
+            # epoch seconds. Apply the same parser to the disk side so a
+            # legacy ISO representation compares equal to its in-memory
+            # value. Unparseable strings remain distinct, keeping the CAS
+            # fail-closed when equivalence cannot be proven.
+            from agent.credential_pool import _parse_absolute_timestamp
+
+            parsed = _parse_absolute_timestamp(value)
+            if parsed is not None:
+                value = parsed
+        values.append(value)
+    return tuple(values)
+
+
 def _merge_disk_cooldown_state(
     entry: Dict[str, Any],
     disk_entry: Optional[Dict[str, Any]],
     provider_id: str,
+    *,
+    status_reset_snapshot: Optional[Tuple[Any, ...]] = None,
 ) -> Dict[str, Any]:
     """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
 
@@ -1685,6 +1710,14 @@ def _merge_disk_cooldown_state(
 
         disk_status = disk_entry.get("last_status")
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
+            return entry
+        # An explicit reset is compare-and-set: bypass the stale-write guard
+        # only while disk still contains the exact status tuple the operator
+        # chose to clear. A concurrently newer cooldown remains authoritative.
+        if (
+            status_reset_snapshot is not None
+            and _pool_status_snapshot(disk_entry) == status_reset_snapshot
+        ):
             return entry
         # A token change means the caller re-authed/refreshed this entry and
         # intentionally cleared its status (e.g. _sync_codex_entry_from_
@@ -1715,17 +1748,39 @@ def _merge_disk_cooldown_state(
 def prefer_eligible_credential(provider_id: str, credential_id: str) -> str:
     """Atomically persist one eligible credential as the pool preference.
 
-    Returns ``saved``, ``missing``, or ``unavailable``. The eligibility check
-    and ordering write share the auth-store lock, so concurrent status updates
-    cannot race between validation and persistence.
+    Returns "saved", "missing", or "unavailable". The eligibility check and
+    ordering write share the auth-store lock, so concurrent status updates
+    cannot race between validation and persistence. In a profile that inherits
+    its pool from the global root, the preference is written back to that source
+    store instead of creating a stale local shadow copy.
     """
     provider = str(provider_id or "").strip()
     wanted = str(credential_id or "").strip()
     if not provider or not wanted:
         return "missing"
 
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    # Borrowed credentials are persisted as metadata-only references, so the
+    # raw auth row may legitimately omit its token. Resolve that narrow case
+    # through the runtime pool before taking the auth-store write lock. Owned
+    # rows must carry their own provider-specific runtime material.
+    borrowed_runtime_available = False
+    try:
+        from agent.credential_pool import load_pool
+
+        runtime_entry = load_pool(provider).eligible_by_id(wanted)
+        borrowed_runtime_available = bool(
+            runtime_entry is not None
+            and runtime_entry.runtime_api_key
+            and is_borrowed_credential_source(runtime_entry.source, provider)
+        )
+    except Exception:
+        borrowed_runtime_available = False
+
+    def persist_preference(
+        auth_store: Dict[str, Any],
+        *,
+        target_path: Optional[Path] = None,
+    ) -> str:
         pools = auth_store.get("credential_pool")
         if not isinstance(pools, dict):
             return "missing"
@@ -1736,16 +1791,71 @@ def prefer_eligible_credential(provider_id: str, credential_id: str) -> str:
         selected = next((entry for entry in entries if entry.get("id") == wanted), None)
         if selected is None:
             return "missing"
-        if str(selected.get("last_status") or "").lower() in {"dead", "exhausted"}:
+        from agent.credential_pool import PooledCredential, _exhausted_until
+
+        selected_model = PooledCredential.from_dict(provider, selected)
+        if not selected_model.runtime_api_key and not borrowed_runtime_available:
             return "unavailable"
+        selected_status = str(selected.get("last_status") or "").lower()
+        if selected_status == "dead":
+            return "unavailable"
+        if selected_status == "exhausted":
+            sole_credential = (
+                sum(
+                    1
+                    for entry in entries
+                    if str(entry.get("last_status") or "").lower() != "dead"
+                )
+                <= 1
+            )
+            exhausted_until = _exhausted_until(
+                selected_model,
+                sole_credential=sole_credential,
+            )
+            if exhausted_until is not None and time.time() < exhausted_until:
+                return "unavailable"
+            selected["last_status"] = "ok"
+            for field in _POOL_STATUS_FIELDS:
+                if field != "last_status":
+                    selected[field] = None
 
         ordered = [selected, *(entry for entry in entries if entry is not selected)]
         for priority, entry in enumerate(ordered):
             entry["priority"] = priority
             entry["preferred"] = entry is selected
-        pools[provider] = [sanitize_borrowed_credential_payload(entry, provider) for entry in ordered]
-        _save_auth_store(auth_store)
+        pools[provider] = [
+            sanitize_borrowed_credential_payload(entry, provider)
+            for entry in ordered
+        ]
+        _save_auth_store(auth_store, target_path=target_path)
         return "saved"
+
+    # Lock ordering matches _provider_state_transaction: active/profile first,
+    # then the distinct global source. Holding the active lock prevents a local
+    # pool from appearing between the fallback decision and the global write.
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        pools = auth_store.get("credential_pool")
+        local_entries = pools.get(provider) if isinstance(pools, dict) else None
+        if isinstance(local_entries, list) and local_entries:
+            return persist_preference(auth_store)
+
+        global_store = _load_global_auth_store()
+        global_pools = global_store.get("credential_pool")
+        global_entries = (
+            global_pools.get(provider) if isinstance(global_pools, dict) else None
+        )
+        global_path = _global_auth_file_path()
+        if (
+            global_path is None
+            or not isinstance(global_entries, list)
+            or not global_entries
+        ):
+            return persist_preference(auth_store)
+
+        with _auth_store_lock(target_path=global_path):
+            source_store = _load_auth_store(global_path)
+            return persist_preference(source_store, target_path=global_path)
 
 
 def write_credential_pool(
@@ -1753,6 +1863,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    status_reset_snapshots: Optional[Dict[str, Tuple[Any, ...]]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1770,9 +1881,14 @@ def write_credential_pool(
     snapshot cannot erase a cooldown/quarantine another process just wrote.
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
-    merge does not resurrect them from the on-disk copy.
+    merge does not resurrect them from the on-disk copy. Pass
+    ``status_reset_snapshots`` only for an explicit operator reset. An entry
+    bypasses the cooldown recency merge only when its current disk status
+    still equals the exact pre-reset tuple, preserving a concurrently newer
+    cooldown for the same ID.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
+    reset_snapshots = status_reset_snapshots or {}
     with _auth_store_lock():
         auth_store = _load_auth_store()
         pool = auth_store.get("credential_pool")
@@ -1798,7 +1914,10 @@ def write_credential_pool(
         }
         merged: List[Dict[str, Any]] = [
             _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
+                entry,
+                existing_by_id.get(entry.get("id")),
+                provider_id,
+                status_reset_snapshot=reset_snapshots.get(entry.get("id")),
             )
             if isinstance(entry, dict)
             else entry

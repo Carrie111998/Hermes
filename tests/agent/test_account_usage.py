@@ -78,6 +78,62 @@ def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_
     assert calls[0]["headers"]["Authorization"] == "Bearer live-agent-token"
 
 
+def test_codex_usage_derives_account_id_from_explicit_pool_token(monkeypatch, codex_usage_payload):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "_decode_jwt_claims",
+        lambda _token: {
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-pool"}
+        },
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="pool-jwt",
+    )
+
+    assert snapshot is not None
+    assert calls[0]["headers"]["ChatGPT-Account-Id"] == "acct-pool"
+
+
+def test_anthropic_usage_prefers_explicit_pool_token(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(
+            calls,
+            {
+                "subscription_type": "max",
+                "five_hour": {"utilization": 0.25, "resets_at": "2026-08-23T20:00:00Z"},
+                "seven_day": {"utilization": 40, "resets_at": "2026-08-29T20:00:00Z"},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_anthropic_token",
+        lambda: (_ for _ in ()).throw(AssertionError("global auth should not be used")),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "anthropic",
+        api_key="sk-ant-oat01-explicit-pool-token",
+    )
+
+    assert snapshot is not None
+    assert snapshot.plan == "Max"
+    assert [window.used_percent for window in snapshot.windows] == [25.0, 40.0]
+    assert calls[0]["headers"]["Authorization"] == "Bearer sk-ant-oat01-explicit-pool-token"
+
+
 def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usage_payload):
     calls = []
     monkeypatch.setattr(

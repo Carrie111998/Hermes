@@ -91,6 +91,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("account.usage")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Return provider quota windows for the backend's credential-pool account.
 
@@ -136,28 +137,204 @@ def _(rid, params: dict) -> dict:
 
 
 @method("auth.accounts")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
-    """List or prioritize redacted credential-pool entries for one provider."""
+    """List or prioritize redacted credential-pool entries for one provider.
+
+    List responses include a redacted usage snapshot for every credential.
+    Quota probes run concurrently and fail open per account; raw credentials
+    never leave this backend process.
+    """
     action = str(params.get("action") or "list").strip().lower()
     provider = str(params.get("provider") or "").strip()
     if action not in {"list", "use"}:
         return _err(rid, 4003, "action must be list or use")
     if not provider:
         return _err(rid, 4003, "provider required")
+    credential_id = str(params.get("credential_id") or "").strip()
+    if action == "use" and not credential_id:
+        return _err(rid, 4003, "credential_id required")
     try:
         from agent.credential_pool import load_pool
 
-        pool = load_pool(provider)
-        if action == "use":
-            credential_id = str(params.get("credential_id") or "").strip()
-            if not credential_id:
-                return _err(rid, 4003, "credential_id required")
-            if not pool.prioritize(credential_id):
-                return _err(rid, 4044, "credential not found")
+        target_session = None
+        display_session = None
+        selection_generation = None
+        selection_lock = None
+        session_id = str(params.get("session_id") or "").strip()
+        if session_id:
+            candidate_session, session_error = _sess(params, rid)
+            if session_error is None:
+                agent = (candidate_session or {}).get("agent")
+                agent_provider = str(
+                    getattr(agent, "provider", "") or ""
+                ).strip().lower()
+                if agent_provider == provider.lower():
+                    display_session = candidate_session
+                    if action == "use":
+                        target_session = candidate_session
+        if target_session is not None:
+            with target_session["history_lock"]:
+                if target_session.get("_closing"):
+                    target_session = None
+                else:
+                    selection_generation = (
+                        int(target_session.get("_credential_selection_generation", 0))
+                        + 1
+                    )
+                    target_session["_credential_selection_generation"] = (
+                        selection_generation
+                    )
+                    selection_lock = target_session.get(
+                        "_credential_selection_lock"
+                    )
+                    if selection_lock is None:
+                        selection_lock = threading.RLock()
+                        target_session["_credential_selection_lock"] = selection_lock
+
+        selection_home_token = None
+        if display_session is not None:
+            from hermes_constants import set_hermes_home_override
+
+            # The live session is the authority for where its credential pool
+            # lives. This inner override supersedes a stale or forged UI
+            # profile parameter for both list and use, and falls back to the
+            # launch home for None.
+            selection_home_token = set_hermes_home_override(
+                display_session.get("profile_home")
+            )
+        selection_superseded = False
+        try:
+            from contextlib import nullcontext
+
+            with selection_lock if selection_lock is not None else nullcontext():
+                pool = load_pool(provider)
+                if action != "use":
+                    pass
+                elif (
+                    target_session is not None
+                    and target_session.get("_credential_selection_generation")
+                    != selection_generation
+                ):
+                    selection_superseded = True
+                elif pool.eligible_by_id(credential_id) is None:
+                    return _err(rid, 4094, "credential is currently unavailable")
+                else:
+                    from hermes_cli.auth import prefer_eligible_credential
+
+                    selection = prefer_eligible_credential(provider, credential_id)
+                    if selection == "missing":
+                        return _err(rid, 4044, "credential not found")
+                    if selection != "saved":
+                        return _err(rid, 4094, "credential is currently unavailable")
+                    pool = load_pool(provider)
+                    if target_session is not None:
+                        with target_session["history_lock"]:
+                            if (
+                                target_session.get("_closing")
+                                or target_session.get(
+                                    "_credential_selection_generation"
+                                )
+                                != selection_generation
+                            ):
+                                selection_superseded = True
+                            else:
+                                target_session["_pending_credential_selection"] = {
+                                    "provider": provider,
+                                    "credential_id": credential_id,
+                                }
+        finally:
+            if selection_home_token is not None:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(selection_home_token)
 
         entries = sorted(pool.entries(), key=lambda entry: entry.priority)
-        accounts = [
-            {
+        active_credential_id = None
+        if display_session is not None:
+            live_agent = display_session.get("agent")
+            live_pool = getattr(live_agent, "_credential_pool", None)
+            runtime_api_key = getattr(live_agent, "api_key", None)
+            for candidate_pool in (live_pool, pool):
+                if candidate_pool is None:
+                    continue
+                resolve_entry_id = getattr(
+                    candidate_pool, "entry_id_for_api_key", None
+                )
+                if callable(resolve_entry_id):
+                    try:
+                        active_credential_id = resolve_entry_id(runtime_api_key)
+                    except Exception:
+                        active_credential_id = None
+                if active_credential_id:
+                    break
+                current = getattr(candidate_pool, "current", None)
+                if runtime_api_key is None and callable(current):
+                    try:
+                        current_entry = current()
+                    except Exception:
+                        current_entry = None
+                    if current_entry is not None:
+                        active_credential_id = getattr(current_entry, "id", None)
+                if active_credential_id:
+                    break
+        usage_by_id = {}
+        if action == "list" and entries:
+            from concurrent.futures import ThreadPoolExecutor
+            from contextvars import copy_context
+
+            from agent.account_usage import account_usage_to_dict, fetch_account_usage
+
+            def fetch_entry_usage(entry):
+                api_key = str(
+                    getattr(entry, "runtime_api_key", None) or ""
+                ).strip()
+                if not api_key:
+                    return {
+                        "available": False,
+                        "provider": provider,
+                        "windows": [],
+                        "details": [],
+                        "unavailable_reason": "credential_unavailable",
+                    }
+                try:
+                    snapshot = fetch_account_usage(
+                        provider,
+                        base_url=getattr(entry, "runtime_base_url", None),
+                        api_key=api_key,
+                    )
+                    if snapshot is not None:
+                        return account_usage_to_dict(snapshot)
+                except Exception:
+                    pass
+                return {
+                    "available": False,
+                    "provider": provider,
+                    "windows": [],
+                    "details": [],
+                    "unavailable_reason": "usage_unavailable",
+                }
+
+            def fetch_entry_usage_in_context(task):
+                context, entry = task
+                return context.run(fetch_entry_usage, entry)
+
+            # ContextVars are not inherited by ThreadPoolExecutor workers.
+            # Capture a distinct Context per task because one Context cannot be
+            # entered concurrently by multiple quota probes.
+            tasks = [(copy_context(), entry) for entry in entries]
+            with ThreadPoolExecutor(max_workers=min(4, len(entries))) as executor:
+                usage_by_id = {
+                    entry.id: usage
+                    for entry, usage in zip(
+                        entries,
+                        executor.map(fetch_entry_usage_in_context, tasks),
+                    )
+                }
+
+        accounts = []
+        for index, entry in enumerate(entries):
+            account = {
                 "id": entry.id,
                 "label": entry.label,
                 "auth_type": entry.auth_type,
@@ -166,11 +343,20 @@ def _(rid, params: dict) -> dict:
                 "status": entry.last_status or "ok",
                 "error_reason": entry.last_error_reason,
                 "preferred": index == 0,
+                "active": entry.id == active_credential_id,
             }
-            for index, entry in enumerate(entries)
-        ]
-        return _ok(rid, {"provider": provider, "accounts": accounts})
+            if action == "list":
+                account["usage"] = usage_by_id.get(entry.id)
+            accounts.append(account)
+        payload = {"provider": provider, "accounts": accounts}
+        if selection_superseded:
+            payload["superseded"] = True
+        elif action == "use" and target_session is not None:
+            payload["pending_session_id"] = session_id
+        return _ok(rid, payload)
     except Exception:
+        if action == "use":
+            return _err(rid, 5023, "credential selection unavailable")
         return _ok(rid, {"provider": provider, "accounts": [], "unavailable": True})
 
 

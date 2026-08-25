@@ -11153,6 +11153,8 @@ def _submit_anthropic_pkce(
         session_profile = sess.get("profile")
         if sess["status"] != "pending" or sess.get("cancelled"):
             return {"ok": False, "status": sess["status"], "message": sess.get("error_message")}
+        session_state = sess["state"]
+        session_verifier = sess["verifier"]
 
     # Anthropic's redirect callback page formats the code as `<code>#<state>`.
     # Strip the state suffix if present (we already have the verifier server-side).
@@ -11166,9 +11168,9 @@ def _submit_anthropic_pkce(
         "grant_type": "authorization_code",
         "client_id": _ANTHROPIC_OAUTH_CLIENT_ID,
         "code": code,
-        "state": state_from_callback or sess["state"],
+        "state": state_from_callback or session_state,
         "redirect_uri": _ANTHROPIC_OAUTH_REDIRECT_URI,
-        "code_verifier": sess["verifier"],
+        "code_verifier": session_verifier,
     }).encode()
     # Anthropic migrated the OAuth token endpoint to platform.claude.com;
     # console.anthropic.com now 404s. Try the new host first, then fall back.
@@ -11193,6 +11195,8 @@ def _submit_anthropic_pkce(
             continue
     if result is None:
         with _oauth_sessions_lock:
+            if sess.get("cancelled") or _oauth_sessions.get(session_id) is not sess:
+                return {"ok": False, "status": "cancelled", "message": None}
             sess["status"] = "error"
             sess["error_message"] = f"Token exchange failed: {last_exc}"
         return {"ok": False, "status": "error", "message": sess["error_message"]}
@@ -11202,6 +11206,8 @@ def _submit_anthropic_pkce(
     expires_in = int(result.get("expires_in") or 3600)
     if not access_token:
         with _oauth_sessions_lock:
+            if sess.get("cancelled") or _oauth_sessions.get(session_id) is not sess:
+                return {"ok": False, "status": "cancelled", "message": None}
             sess["status"] = "error"
             sess["error_message"] = "No access token returned"
         return {"ok": False, "status": "error", "message": sess["error_message"]}
@@ -14753,12 +14759,23 @@ def _resolve_profile_dir(name: str) -> Path:
     """Validate ``name`` and resolve to its directory or raise an HTTPException."""
     from hermes_cli import profiles as profiles_mod
     try:
-        profiles_mod.validate_profile_name(name)
+        canon = profiles_mod.normalize_profile_name(name)
+        profiles_mod.validate_profile_name(canon)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if not profiles_mod.profile_exists(name):
-        raise HTTPException(status_code=404, detail=f"Profile '{name}' does not exist.")
-    return profiles_mod.get_profile_dir(name)
+    profile_dir = profiles_mod.get_profile_dir(canon)
+    if canon == "default":
+        return profile_dir
+    if profile_dir.is_symlink():
+        raise HTTPException(status_code=400, detail="Profile directory must not be a symlink.")
+    try:
+        profiles_root = profiles_mod._get_profiles_root().resolve(strict=True)
+        resolved = profile_dir.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
+    if resolved.parent != profiles_root or not resolved.is_dir():
+        raise HTTPException(status_code=400, detail="Profile directory is outside the profiles root.")
+    return resolved
 
 
 def _profile_setup_command(name: str) -> str:
