@@ -379,6 +379,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _context_scan_policy = _r._context_file_scanning_policy(
         home_override=agent_home
     )
+    subdirectory_hints = getattr(agent, "_subdirectory_hints", None)
+    if subdirectory_hints is not None:
+        subdirectory_hints.set_scan_policy(_context_scan_policy)
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
