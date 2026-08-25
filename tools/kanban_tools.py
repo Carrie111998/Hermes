@@ -772,6 +772,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
+            except kb.NonPassingVerdictError as verdict_err:
+                return tool_error(
+                    f"kanban_complete blocked: {verdict_err}. Your task is "
+                    "still in-flight and no dependent work was promoted. "
+                    "Approve only with metadata={\"verdict\": \"PASS\"}; "
+                    "otherwise call kanban_request_changes with actionable "
+                    "rework or kanban_block for a genuine external escalation."
+                )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
                     f"kanban_complete could not preserve the declared artifacts: "
@@ -1778,7 +1786,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. Reviewers must "
+        "include metadata={\"verdict\": \"PASS\"}; any missing or non-PASS "
+        "review verdict leaves the task in-flight and does not promote "
+        "dependent work. The ``metadata.verdict`` key is reserved for this "
+        "review contract; ordinary task metadata must use a different key."
     ),
     "parameters": {
         "type": "object",
@@ -1801,7 +1813,8 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                     "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "workers alongside ``summary``. ``verdict`` is reserved: "
+                    "when present it must normalize to exact ``PASS``."
                 ),
             },
             "result": {
