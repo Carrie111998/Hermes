@@ -134,6 +134,42 @@ class TestCheckFnTransientFailureSuppression:
         t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
         assert reg._check_fn_cached(probe) is False
 
+    def test_cache_is_scoped_to_profile_secret_context(self, tmp_path):
+        """A success under profile A cannot make profile B's unavailable
+        backend appear ready through the shared check_fn TTL cache."""
+        import tools.registry as reg
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home_a = tmp_path / "a"
+        home_b = tmp_path / "b"
+        home_a.mkdir()
+        home_b.mkdir()
+
+        def profile_probe():
+            from hermes_constants import get_hermes_home
+
+            return get_hermes_home() == home_a
+
+        home_token = set_hermes_home_override(home_a)
+        secret_token = set_secret_scope({"SAMPLE_AUTH_TOKEN": "token-a"})
+        try:
+            assert reg._check_fn_cached(profile_probe) is True
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+
+        home_token = set_hermes_home_override(home_b)
+        secret_token = set_secret_scope({})
+        try:
+            assert reg._check_fn_cached(profile_probe) is False
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+
     def test_profile_scoped_availability_does_not_cross_multiplex_profiles(
         self, tmp_path
     ):

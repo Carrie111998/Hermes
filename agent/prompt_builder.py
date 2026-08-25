@@ -1270,11 +1270,12 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 
 
 # Cache the backend probe result per process so we only pay the probe cost
-# on the first prompt build of a session. Keyed by (env_type, cwd_hint) so
-# a mid-process backend switch rebuilds the string. Kept in-module (not on
-# disk) because the probe captures live backend state that may change
-# across Hermes restarts.
-_BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+# on the first prompt build of a session. Keyed by (env_type, cwd_hint,
+# profile_home) so a mid-process backend switch rebuilds the string and a
+# multiplexed profile never sees another profile's probe output. Kept
+# in-module (not on disk) because the probe captures live backend state that
+# may change across Hermes restarts.
+_BACKEND_PROBE_CACHE: dict[tuple[str, str, str], str] = {}
 
 
 def _windows_marketing_version() -> str:
@@ -1330,7 +1331,11 @@ def _probe_remote_backend(env_type: str) -> str | None:
     operate on a different machine than the host Hermes runs on.
     """
     cwd_hint = os.getenv("TERMINAL_CWD", "")
-    cache_key = (env_type, cwd_hint)
+    try:
+        profile_key = str(get_hermes_home())
+    except Exception:
+        profile_key = ""
+    cache_key = (env_type, cwd_hint, profile_key)
     cached = _BACKEND_PROBE_CACHE.get(cache_key)
     if cached is not None:
         return cached or None
@@ -1479,6 +1484,15 @@ def build_environment_hints() -> str:
     hints: list[str] = []
 
     backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        if is_multiplex_active() and current_secret_scope() is not None:
+            from tools.terminal_tool import _get_env_config
+
+            backend = str(_get_env_config().get("env_type") or backend).strip().lower()
+    except Exception:
+        logger.debug("Could not resolve profile-scoped terminal backend", exc_info=True)
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
 
     if not is_remote_backend:

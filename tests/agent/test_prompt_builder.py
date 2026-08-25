@@ -811,6 +811,85 @@ class TestEnvironmentHints:
         assert "Terminal backend: docker" in result
         assert "inside" in result.lower()
 
+    def test_multiplexed_profile_hint_resolves_scoped_backend(self, monkeypatch, tmp_path):
+        """Under multiplexing, the hint must describe the ACTIVE profile's
+        configured backend, not the process-global TERMINAL_ENV — two profiles
+        served by one process get two different (correct) hints."""
+        import agent.prompt_builder as _pb
+        from agent.secret_scope import is_multiplex_active, set_multiplex_active
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli import config as hermes_config
+
+        profile_ssh = tmp_path / "profile-ssh"
+        profile_local = tmp_path / "profile-local"
+        profile_ssh.mkdir()
+        profile_local.mkdir()
+        (profile_ssh / "config.yaml").write_text(
+            "terminal:\n  backend: ssh\n", encoding="utf-8"
+        )
+        (profile_local / "config.yaml").write_text(
+            "terminal:\n  backend: local\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        # Process-global selection that neither profile configured.
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        # Deterministic: never probe a live backend from a prompt build.
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        previous = is_multiplex_active()
+        set_multiplex_active(True)
+        hermes_config._LOAD_CONFIG_CACHE.clear()
+        hermes_config._RAW_CONFIG_CACHE.clear()
+        _pb._clear_backend_probe_cache()
+        try:
+            with _profile_runtime_scope(profile_ssh):
+                ssh_hint = _pb.build_environment_hints()
+            with _profile_runtime_scope(profile_local):
+                local_hint = _pb.build_environment_hints()
+        finally:
+            set_multiplex_active(previous)
+
+        assert "Terminal backend: ssh" in ssh_hint
+        assert "Host:" not in ssh_hint
+        assert "Host:" in local_hint
+        assert "Terminal backend:" not in local_hint
+
+    def test_backend_probe_cache_is_scoped_to_profile_home(self, monkeypatch, tmp_path):
+        """One profile's cached probe output must never be served as another
+        profile's environment hint."""
+        import agent.prompt_builder as _pb
+        import tools.terminal_tool as _tt
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        _pb._clear_backend_probe_cache()
+
+        outputs = iter(["user=alpha\n", "user=bravo\n"])
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                return {"returncode": 0, "output": next(outputs)}
+
+        monkeypatch.setattr(_tt, "_create_environment", lambda **kwargs: _FakeEnv())
+
+        token = set_hermes_home_override(str(tmp_path / "a"))
+        try:
+            first = _pb._probe_remote_backend("docker")
+        finally:
+            reset_hermes_home_override(token)
+
+        token = set_hermes_home_override(str(tmp_path / "b"))
+        try:
+            second = _pb._probe_remote_backend("docker")
+        finally:
+            reset_hermes_home_override(token)
+
+        assert first is not None and "alpha" in first
+        assert second is not None and "bravo" in second
+
     def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()
         (the daemon launch dir). Regression for #24882/#24969/#27383/#29265."""
