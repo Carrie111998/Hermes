@@ -1,6 +1,7 @@
 """Preview actions fail fast when the Desktop renderer bridge is unavailable."""
 
 import json
+import threading
 
 import pytest
 
@@ -68,6 +69,27 @@ def test_repeated_preview_actions_short_circuit_after_unanswered_probe(session, 
     assert len(bridge.calls) == 1
 
 
+def test_interrupted_preview_probe_does_not_poison_session(session, monkeypatch):
+    calls = 0
+
+    def interrupt_then_answer(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "", False
+        return json.dumps({"success": True}), False
+
+    monkeypatch.setattr(server, "_block", interrupt_then_answer)
+
+    first = server._preview_action_request("s1", {"action": "elements"})
+    second = server._preview_action_request("s1", {"action": "elements"})
+
+    assert json.loads(first)["success"] is False
+    assert json.loads(second)["success"] is True
+    assert calls == 2
+    assert session["preview_action_bridge"] == "answered"
+
+
 def test_slow_action_does_not_condemn_proven_preview_bridge(session, bridge):
     bridge.answers = [json.dumps({"success": True})]
     server._preview_action_request("s1", {"action": "elements"})
@@ -78,3 +100,42 @@ def test_slow_action_does_not_condemn_proven_preview_bridge(session, bridge):
 
     assert json.loads(result)["success"] is True
     assert len(bridge.calls) == 3
+
+
+def test_concurrent_probe_timeout_cannot_overwrite_answered_bridge(session, monkeypatch):
+    entered = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+    call_lock = threading.Lock()
+    call_count = 0
+
+    def ordered_block(*_args, **_kwargs):
+        nonlocal call_count
+        with call_lock:
+            index = call_count
+            call_count += 1
+        entered[index].set()
+        assert release[index].wait(2)
+        return json.dumps({"success": True}) if index == 0 else ""
+
+    monkeypatch.setattr(server, "_block", ordered_block)
+    results: list[str | None] = [None, None]
+    threads = [
+        threading.Thread(
+            target=lambda i=i: results.__setitem__(
+                i, server._preview_action_request("s1", {"action": "elements"})
+            )
+        )
+        for i in range(2)
+    ]
+    threads[0].start()
+    assert entered[0].wait(2)
+    threads[1].start()
+    assert entered[1].wait(2)
+
+    release[0].set()
+    threads[0].join(2)
+    release[1].set()
+    threads[1].join(2)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert server._sessions["s1"]["preview_action_bridge"] == "answered"

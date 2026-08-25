@@ -4034,7 +4034,8 @@ def _block(
     payload: dict,
     timeout: float | None = 300,
     batch_qids: list[str] | None = None,
-) -> str:
+    with_outcome: bool = False,
+) -> str | tuple[str, bool]:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
@@ -4107,6 +4108,8 @@ def _block(
             sid,
             {"request_id": rid},
         )
+    if with_outcome:
+        return answer, not answered and not answer_present
     return answer
 
 
@@ -4256,12 +4259,13 @@ def _preview_action_request(sid: str, payload: dict) -> str:
     session = _sessions.get(sid)
     if session is None:
         session = {}
-    state = session.get("preview_action_bridge")
+    with _prompt_lock:
+        state = session.get("preview_action_bridge")
 
     if state == "unanswered":
         return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
 
-    answer = _block(
+    block_result = _block(
         "preview.act.request",
         sid,
         dict(payload),
@@ -4270,12 +4274,20 @@ def _preview_action_request(sid: str, payload: dict) -> str:
             if state == "answered"
             else _PREVIEW_ACTION_PROBE_TIMEOUT_S
         ),
+        with_outcome=True,
     )
 
-    if answer:
-        session["preview_action_bridge"] = "answered"
-    elif state != "answered":
-        session["preview_action_bridge"] = "unanswered"
+    if isinstance(block_result, tuple):
+        answer, timed_out = block_result
+    else:
+        # Compatibility for tests and embedders that replace the bridge callback.
+        answer, timed_out = block_result, not bool(block_result)
+
+    with _prompt_lock:
+        if answer:
+            session["preview_action_bridge"] = "answered"
+        elif timed_out and session.get("preview_action_bridge") != "answered":
+            session["preview_action_bridge"] = "unanswered"
 
     return answer or _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
 
