@@ -357,8 +357,12 @@ def _payload_has_error_shape(payload: Any) -> bool:
     return False
 
 
-def _provider_stream_text_may_be_sse(text: str) -> bool:
+def _provider_stream_text_may_be_sse(text: Any) -> bool:
     """Return True while pending text still looks like an SSE control block."""
+    if not isinstance(text, str):
+        # Some OpenAI-compatible relays (e.g. Mistral hosting GLM-5.2) emit
+        # delta.content as a list of content blocks; treat as non-SSE text.
+        return False
     stripped = (text or "").lstrip()
     if not stripped:
         return False
@@ -390,6 +394,31 @@ def _provider_stream_text_may_be_sse(text: str) -> bool:
         return False
 
     return saw_sse_field
+
+
+def _normalize_stream_content_to_text(content: Any) -> str:
+    """Collapse an OpenAI-compatible delta ``content`` into plain text.
+
+    Standard deltas carry ``content`` as a ``str``. Some relays (e.g. Mistral
+    serving GLM-5.2) emit it as a list of multi-part blocks such as
+    ``[{"type": "text", "text": "..."}]``. Downstream code assumes a string
+    (``.lstrip()``, ``"".join()``), so normalize once at the accumulation
+    point instead of guarding every consumer. Non-text blocks are dropped;
+    non-str/non-list shapes degrade to "" (empty delta, safely ignored).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
 
 
 def _provider_stream_error_from_text(
@@ -4199,11 +4228,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             # Accumulate text content — fire callback only when no tool calls
             delta_content = getattr(delta, "content", None)
+            delta_content = _normalize_stream_content_to_text(delta_content)
             if delta_content:
                 content_parts.append(delta_content)
                 if not tool_calls_acc:
-                    if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
-                        pending_text_parts.append(delta.content)
+                    if pending_text_parts or _provider_stream_text_may_be_sse(delta_content):
+                        pending_text_parts.append(delta_content)
                         pending_text = "".join(pending_text_parts)
                         if _provider_stream_text_may_be_sse(pending_text):
                             continue
