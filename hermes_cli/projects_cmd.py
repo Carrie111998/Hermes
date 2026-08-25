@@ -313,7 +313,11 @@ def _cmd_restore(args, conn, proj) -> int:
 @_with_project
 def _cmd_delete(args, conn, proj) -> int:
     if not args.yes:
-        answer = input(f"Permanently delete project '{proj.slug}'? [y/N]: ").strip().lower()
+        try:
+            answer = input(f"Permanently delete project '{proj.slug}'? [y/N]: ").strip().lower()
+        except EOFError:
+            print("Aborted: no input available; pass --yes to delete non-interactively.")
+            return 1
         if answer not in ("y", "yes"):
             print("Aborted.")
             return 1
