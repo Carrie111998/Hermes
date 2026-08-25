@@ -2287,6 +2287,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Prefetch: synchronous first-turn recall returned %d results",
                 recalled.count,
             )
+            self._record_recall_indicator(returned=bool(recalled.text), count=recalled.count)
             return self._format_recall(recalled.text)
 
         self._record_recall_indicator(returned=bool(result), count=count)
