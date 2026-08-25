@@ -29,6 +29,7 @@ import type {
 } from '../gatewayTypes.js'
 import { useGitBranch } from '../hooks/useGitBranch.js'
 import { pruneVirtualHeightCache, useVirtualHistory } from '../hooks/useVirtualHistory.js'
+import { shouldCopyStableSelection } from '../lib/copyOnSelect.js'
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage, capTranscriptHistory } from '../lib/messages.js'
 import { DEFAULT_VOICE_RECORD_KEY, type ParsedVoiceRecordKey } from '../lib/platform.js'
@@ -273,19 +274,17 @@ export function useMainApp(gw: GatewayClient) {
   // ref de-dupes against re-entrant notifications.
   useEffect(() => {
     return selection.subscribe(() => {
-      if (!selection.hasSelection()) {
-        return
-      }
-
       const state = selection.getState() as { isDragging?: boolean } | null
-
-      if (state?.isDragging) {
-        return
-      }
-
       const version = selection.version()
 
-      if (version === lastCopiedVersionRef.current) {
+      if (
+        !shouldCopyStableSelection({
+          hasSelection: selection.hasSelection(),
+          isDragging: state?.isDragging,
+          version,
+          lastCopiedVersion: lastCopiedVersionRef.current
+        })
+      ) {
         return
       }
 
