@@ -21,6 +21,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.prompt_builder import compute_context_fingerprint
+
+# Agents in this file skip cwd context files; the resulting fingerprint is
+# constant and lets reuse tests supply a matching stored digest without
+# hashing the live HERMES_HOME SOUL.md.
+_SKIPPED_CONTEXT_FP = compute_context_fingerprint(
+    include_soul=False, include_project_context=False
+)
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
@@ -36,8 +44,18 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    agent.skip_context_files = True
+    agent.load_soul_identity = False
+    agent._bot_mode_protocol = False
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
+
+
+def _row(system_prompt, fingerprint=_SKIPPED_CONTEXT_FP):
+    return {
+        "system_prompt": system_prompt,
+        "system_prompt_fingerprint": fingerprint,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +68,7 @@ class TestStoredPromptReuse:
         """Continuing session with a stored prompt → reuse byte-for-byte."""
         stored = "Stored prompt from turn 1 — byte-identical reuse"
         db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session.return_value = _row(stored)
         agent = _make_agent(session_db=db)
 
         with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
@@ -66,7 +84,7 @@ class TestStoredPromptReuse:
         """Non-ASCII bytes in the stored prompt are not mangled."""
         stored = "Stored prompt with unicode: ☤ ⚗ ◆ — and emoji 🦊"
         db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session.return_value = _row(stored)
         agent = _make_agent(session_db=db)
 
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
@@ -88,7 +106,7 @@ class TestStoredPromptReuse:
             "Provider: openrouter"
         )
         db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session.return_value = _row(stored)
         agent = _make_agent(
             session_db=db,
             prebuilt_prompt=(
@@ -109,7 +127,9 @@ class TestStoredPromptReuse:
         )
         agent._build_system_prompt.assert_called_once_with(None)
         db.update_system_prompt.assert_called_once_with(
-            agent.session_id, agent._cached_system_prompt
+            agent.session_id,
+            agent._cached_system_prompt,
+            fingerprint=_SKIPPED_CONTEXT_FP,
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
 
@@ -133,7 +153,9 @@ class TestLegitimateFreshBuild:
         agent._build_system_prompt.assert_called_once_with(None)
         assert agent._cached_system_prompt == "BUILT_PROMPT"
         # Persisted to DB
-        db.update_system_prompt.assert_called_once_with(agent.session_id, "BUILT_PROMPT")
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "BUILT_PROMPT", fingerprint=_SKIPPED_CONTEXT_FP
+        )
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_no_db_skips_persistence(self):
@@ -210,7 +232,7 @@ class TestPromptStabilityInvariant:
             "Session ID: 20260517_153500_abc123\n"
         )
         db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session.return_value = _row(stored)
         agent = _make_agent(session_db=db)
 
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
@@ -241,7 +263,7 @@ class TestStaticPrefixReconstructionOnRestore:
         stable = "STATIC IDENTITY AND GUIDANCE"
         stored = stable + "\n\nper-session context\n\nvolatile tail"
         db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session.return_value = _row(stored)
         agent = _make_agent(session_db=db)
         agent._use_prompt_caching = True
         agent._cached_system_prompt_static = None
@@ -265,7 +287,7 @@ class TestStaticPrefixReconstructionOnRestore:
         legacy layout, restored bytes still authoritative."""
         stored = "OLD STATIC HEAD\n\nper-session context"
         db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session.return_value = _row(stored)
         agent = _make_agent(session_db=db)
         agent._use_prompt_caching = True
         agent._cached_system_prompt_static = None
@@ -288,7 +310,7 @@ class TestStaticPrefixReconstructionOnRestore:
         break the byte-identical restore."""
         stored = "Stored prompt — must survive"
         db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session.return_value = _row(stored)
         agent = _make_agent(session_db=db)
         agent._use_prompt_caching = True
         agent._cached_system_prompt_static = None

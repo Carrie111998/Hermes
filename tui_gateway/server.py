@@ -37,7 +37,10 @@ from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.conversation_loop import (
+    INTERRUPT_WAITING_FOR_MODEL_PREFIX,
+    build_prompt_with_fingerprint,
+)
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -4927,9 +4930,13 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
         set_hermes_home_override(profile_home) if profile_home else None
     )
     try:
-        prompt = agent._build_system_prompt(None)
+        prompt, fingerprint = build_prompt_with_fingerprint(agent, None)
         agent._cached_system_prompt = prompt
-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
+        db.update_system_prompt(
+            getattr(agent, "session_id", None) or session_key,
+            prompt,
+            fingerprint=fingerprint,
+        )
     except Exception:
         logger.warning(
             "failed to persist live session system prompt for session %s",

@@ -3385,8 +3385,15 @@ def compress_context(
                 system_message=system_message,
                 log_label="compression keep-prompt",
             )
+            from agent.conversation_loop import compute_current_context_fingerprint
+
+            prompt_fingerprint = compute_current_context_fingerprint(agent)
         else:
-            new_system_prompt = agent._build_system_prompt(system_message)
+            from agent.conversation_loop import build_prompt_with_fingerprint
+
+            new_system_prompt, prompt_fingerprint = build_prompt_with_fingerprint(
+                agent, system_message
+            )
             agent._cached_system_prompt = new_system_prompt
 
         _session_commit_succeeded = False
@@ -3773,10 +3780,17 @@ def compress_context(
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
                     agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
+                        agent.session_id,
+                        new_system_prompt,
+                        fingerprint=prompt_fingerprint,
                     )
                     agent._last_flushed_db_idx = 0
                 else:
+                    agent._session_db.update_system_prompt(
+                        agent.session_id,
+                        new_system_prompt,
+                        fingerprint=prompt_fingerprint,
+                    )
                     agent._last_flushed_db_idx = len(compressed)
                     agent._flushed_db_message_session_id = agent.session_id
                     agent._flushed_db_message_ids = {

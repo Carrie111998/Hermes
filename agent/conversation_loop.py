@@ -880,7 +880,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
       * ``empty``  — row exists, ``system_prompt`` column is the empty
         string.  Indicates a previous-turn write that ran but stored
         nothing (silent persistence bug).  Always warns.
-      * ``present`` — row exists with a usable prompt → reused verbatim.
+      * ``present`` — row exists with a usable prompt → reused verbatim
+        only when runtime identity AND the managed-context fingerprint
+        both match.
 
     Read or write failures against the session DB log at WARNING (not
     DEBUG) so persistent issues (disk full, schema drift, lock contention)
@@ -891,6 +893,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     """
     stored_prompt = None
     stored_state = "missing"
+    session_row = None
     if conversation_history and agent._session_db:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
@@ -912,109 +915,109 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
-        # Bot Chat capability epoch: an eternal bot session must adopt
-        # user-initiated capability changes (skills/toolsets/MCP/SOUL/roster)
-        # on the next message, not at /new or compression. The stored prompt
-        # embeds a fingerprint of the capability surface; a mismatch against
-        # disk is a deliberate, once-per-change rebuild — the /model
-        # exception applied to capabilities. Prompts without the stamp
-        # (every non-Bot-Chat session) never take this branch, and the check
-        # fails closed to "reuse" so a probe failure can't burn cache.
-        _bot_stale = False
-        try:
-            from tools.bot_mode_probe import (
-                BOT_CHAT_TITLE,
-                stored_bot_chat_prompt_needs_upgrade,
-                stored_prompt_capability_stale,
-            )
-
-            _home_for_epoch = None
-            try:
-                from agent.system_prompt import _agent_home
-
-                _home_for_epoch = _agent_home(agent)
-            except Exception:
-                pass
-            _bot_stale = stored_prompt_capability_stale(stored_prompt, _home_for_epoch)
-            if not _bot_stale and getattr(agent, "_bot_mode_protocol", True):
-                # Legacy upgrade: a Bot Chat whose prompt predates the epoch
-                # mechanism (no stamp, no protocol) gets ONE migration
-                # rebuild — otherwise pre-existing bots would never learn
-                # the messaging protocol. Title-gated so ordinary unstamped
-                # sessions (i.e. all of them) never take this path; the
-                # rebuilt prompt carries the stamp, so it cannot re-fire.
-                _t = str(getattr(agent, "_session_title_hint", "") or "").strip()
-                if not _t and agent._session_db and agent.session_id:
-                    try:
-                        _t = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
-                    except Exception:
-                        _t = ""
-                if _t == BOT_CHAT_TITLE:
-                    _bot_stale = stored_bot_chat_prompt_needs_upgrade(stored_prompt, _home_for_epoch)
-        except Exception:
-            _bot_stale = False
-        if _bot_stale:
+        if not _stored_prompt_matches_managed_context(agent, session_row):
+            stored_state = "stale_inputs"
             logger.info(
-                "Bot Chat capability epoch changed for session %s; rebuilding "
-                "system prompt to adopt the new capability surface (one-time "
-                "prefix-cache break).",
+                "Stored system prompt for session %s has stale managed context; "
+                "rebuilding from current SOUL/project inputs.",
                 agent.session_id,
             )
-            agent._session_title_hint = "Bot Chat"
-            # The skills index inside the prompt comes from a two-layer cache
-            # (in-process LRU + disk snapshot) that doesn't watch the skills
-            # dir; a capability refresh must rebuild THROUGH it or a freshly
-            # installed skill stays invisible in the new prompt.
+        else:
+            # Bot Chat capability epoch: an eternal bot session must adopt
+            # user-initiated capability changes (skills/toolsets/MCP/SOUL/roster)
+            # on the next message, not at /new or compression. The stored prompt
+            # embeds a fingerprint of the capability surface; a mismatch against
+            # disk is a deliberate, once-per-change rebuild — the /model
+            # exception applied to capabilities. Prompts without the stamp
+            # (every non-Bot-Chat session) never take this branch, and the check
+            # fails closed to "reuse" so a probe failure can't burn cache.
+            _bot_stale = False
             try:
-                from agent.prompt_builder import clear_skills_system_prompt_cache
+                from tools.bot_mode_probe import (
+                    BOT_CHAT_TITLE,
+                    stored_bot_chat_prompt_needs_upgrade,
+                    stored_prompt_capability_stale,
+                )
 
-                clear_skills_system_prompt_cache(clear_snapshot=True)
-            except Exception:
-                pass
-            agent._cached_system_prompt = agent._build_system_prompt(system_message)
-            agent._bot_capability_refreshed = True
-            # Persist the refreshed prompt so the NEXT turn restores the new
-            # bytes verbatim — the cache break is once per capability change,
-            # never per turn. (on_session_start deliberately not re-fired:
-            # this is a continuation, not a new session.)
-            if agent._session_db:
+                _home_for_epoch = None
                 try:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, agent._cached_system_prompt
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Session DB update_system_prompt failed after Bot Chat "
-                        "capability refresh (session=%s): %s. The refresh will "
-                        "re-fire next turn.",
-                        agent.session_id, exc,
-                    )
+                    from agent.system_prompt import _agent_home
+
+                    _home_for_epoch = _agent_home(agent)
+                except Exception:
+                    pass
+                _bot_stale = stored_prompt_capability_stale(stored_prompt, _home_for_epoch)
+                if not _bot_stale and getattr(agent, "_bot_mode_protocol", True):
+                    # Legacy upgrade: a Bot Chat whose prompt predates the epoch
+                    # mechanism (no stamp, no protocol) gets ONE migration
+                    # rebuild — otherwise pre-existing bots would never learn
+                    # the messaging protocol. Title-gated so ordinary unstamped
+                    # sessions (i.e. all of them) never take this path; the
+                    # rebuilt prompt carries the stamp, so it cannot re-fire.
+                    _t = str(getattr(agent, "_session_title_hint", "") or "").strip()
+                    if not _t and agent._session_db and agent.session_id:
+                        try:
+                            _t = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
+                        except Exception:
+                            _t = ""
+                    if _t == BOT_CHAT_TITLE:
+                        _bot_stale = stored_bot_chat_prompt_needs_upgrade(stored_prompt, _home_for_epoch)
+            except Exception:
+                _bot_stale = False
+            if _bot_stale:
+                logger.info(
+                    "Bot Chat capability epoch changed for session %s; rebuilding "
+                    "system prompt to adopt the new capability surface (one-time "
+                    "prefix-cache break).",
+                    agent.session_id,
+                )
+                agent._session_title_hint = "Bot Chat"
+                # The skills index inside the prompt comes from a two-layer cache
+                # (in-process LRU + disk snapshot) that doesn't watch the skills
+                # dir; a capability refresh must rebuild THROUGH it or a freshly
+                # installed skill stays invisible in the new prompt.
+                try:
+                    from agent.prompt_builder import clear_skills_system_prompt_cache
+
+                    clear_skills_system_prompt_cache(clear_snapshot=True)
+                except Exception:
+                    pass
+                prompt, fingerprint = build_prompt_with_fingerprint(agent, system_message)
+                agent._cached_system_prompt = prompt
+                agent._bot_capability_refreshed = True
+                # Persist the refreshed prompt so the NEXT turn restores the new
+                # bytes verbatim — the cache break is once per capability change,
+                # never per turn. (on_session_start deliberately not re-fired:
+                # this is a continuation, not a new session.)
+                _persist_system_prompt_pair(
+                    agent, prompt, fingerprint, context="after Bot Chat capability refresh"
+                )
+                return
+            # Continuing session — reuse the exact system prompt from the
+            # previous turn so the Anthropic cache prefix matches.
+            agent._cached_system_prompt = stored_prompt
+            # Prompt-section callbacks are new-session-only. Recover their frozen
+            # bytes from the persisted full prompt so a later compression rebuild
+            # keeps them without evaluating plugin state in this resumed process.
+            from agent.system_prompt import restore_plugin_prompt_sections
+
+            restore_plugin_prompt_sections(agent, stored_prompt)
+            # Reconstruct the cross-session-stable prefix for the early cache
+            # breakpoint. The static prefix is not persisted (only the full
+            # prompt is), so gateway surfaces that build a fresh AIAgent per
+            # turn would otherwise lose the two-block system layout after the
+            # first turn — flip-flopping the wire shape mid-conversation and
+            # silently degrading to the legacy single-breakpoint layout.
+            #
+            # ``reconstruct_static_prefix`` gates on ``_use_prompt_caching`` (so
+            # non-Anthropic routes skip the rebuild), applies the startswith
+            # safety gate (stored prompt bytes are never rewritten), and
+            # fails open to the legacy cache layout.
+            from agent.system_prompt import reconstruct_static_prefix
+
+            reconstruct_static_prefix(agent, system_message=system_message)
             return
-        # Continuing session — reuse the exact system prompt from the
-        # previous turn so the Anthropic cache prefix matches.
-        agent._cached_system_prompt = stored_prompt
-        # Prompt-section callbacks are new-session-only. Recover their frozen
-        # bytes from the persisted full prompt so a later compression rebuild
-        # keeps them without evaluating plugin state in this resumed process.
-        from agent.system_prompt import restore_plugin_prompt_sections
-
-        restore_plugin_prompt_sections(agent, stored_prompt)
-        # Reconstruct the cross-session-stable prefix for the early cache
-        # breakpoint. The static prefix is not persisted (only the full
-        # prompt is), so gateway surfaces that build a fresh AIAgent per
-        # turn would otherwise lose the two-block system layout after the
-        # first turn — flip-flopping the wire shape mid-conversation and
-        # silently degrading to the legacy single-breakpoint layout.
-        #
-        # ``reconstruct_static_prefix`` gates on ``_use_prompt_caching`` (so
-        # non-Anthropic routes skip the rebuild), applies the startswith
-        # safety gate (stored prompt bytes are never rewritten), and
-        # fails open to the legacy cache layout.
-        from agent.system_prompt import reconstruct_static_prefix
-
-        reconstruct_static_prefix(agent, system_message=system_message)
-        return
-    if stored_prompt:
+    if stored_prompt and stored_state != "stale_inputs":
         stored_state = "stale_runtime"
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "
@@ -1039,7 +1042,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    prompt, fingerprint = build_prompt_with_fingerprint(agent, system_message)
+    agent._cached_system_prompt = prompt
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
@@ -1071,17 +1075,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
     # gateway path (fresh AIAgent per turn → reads from this row every
-    # subsequent turn).
-    if agent._session_db:
-        try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
-        except Exception as exc:
-            logger.warning(
-                "Session DB update_system_prompt failed for session %s: "
-                "%s. Subsequent turns will rebuild the system prompt and "
-                "miss the prefix cache.",
-                agent.session_id, exc,
-            )
+    # subsequent turn). Prompt and fingerprint are paired in one UPDATE.
+    _persist_system_prompt_pair(agent, prompt, fingerprint)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
@@ -1158,6 +1153,100 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         return False
 
     return True
+
+
+def compute_current_context_fingerprint(agent) -> str | None:
+    """Fingerprint of the agent's current managed prompt inputs, or None.
+
+    None means compute failed — callers must fail open to the pre-existing
+    runtime-identity-only restore check so a fingerprint bug cannot break
+    sessions.
+    """
+    try:
+        from agent.prompt_builder import compute_context_fingerprint
+        from agent.runtime_cwd import resolve_context_cwd
+        from agent.system_prompt import _agent_home
+
+        skip_project = bool(getattr(agent, "skip_context_files", False))
+        include_soul = bool(
+            getattr(agent, "load_soul_identity", False) or not skip_project
+        )
+        ctx_len = None
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is not None:
+            raw_len = getattr(compressor, "context_length", None)
+            if isinstance(raw_len, int) and raw_len > 0:
+                ctx_len = raw_len
+        cwd = None if skip_project else resolve_context_cwd()
+        return compute_context_fingerprint(
+            cwd=str(cwd) if cwd is not None else None,
+            include_soul=include_soul,
+            include_project_context=not skip_project,
+            home_override=_agent_home(agent),
+            context_length=ctx_len,
+            allow_install_tree_fallback=getattr(agent, "platform", None) in ("cli", "tui"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to compute managed-context fingerprint for session %s: %s. "
+            "Failing open to runtime-identity restore.",
+            getattr(agent, "session_id", None),
+            exc,
+        )
+        return None
+
+
+def build_prompt_with_fingerprint(agent, system_message):
+    """Build the system prompt and pair it with a TOCTOU-safe fingerprint.
+
+    The fingerprint is computed before and after the build. If the two
+    disagree (a context file changed mid-build) or either compute fails,
+    the fingerprint is None so the next restore rebuilds instead of
+    tagging a stale prompt with a fresh-looking digest.
+    """
+    pre = compute_current_context_fingerprint(agent)
+    prompt = agent._build_system_prompt(system_message)
+    post = compute_current_context_fingerprint(agent)
+    fingerprint = pre if pre is not None and pre == post else None
+    return prompt, fingerprint
+
+
+def _stored_prompt_matches_managed_context(agent, session_row) -> bool:
+    """Return False when stored managed-context inputs are stale or missing.
+
+    Compute failure fail-opens (True) so a fingerprint bug cannot invalidate
+    prefix cache. A legacy NULL stored fingerprint is a mismatch and
+    self-heals via a one-time rebuild.
+    """
+    current_fp = compute_current_context_fingerprint(agent)
+    if current_fp is None:
+        return True
+    stored_fp = None
+    if session_row:
+        stored_fp = session_row.get("system_prompt_fingerprint")
+    if not stored_fp:
+        return False
+    return stored_fp == current_fp
+
+
+def _persist_system_prompt_pair(agent, prompt, fingerprint, *, context: str = "") -> None:
+    """Atomically persist prompt snapshot + fingerprint; warn on write failure."""
+    if not getattr(agent, "_session_db", None):
+        return
+    suffix = f" {context}" if context else ""
+    try:
+        agent._session_db.update_system_prompt(
+            agent.session_id, prompt, fingerprint=fingerprint
+        )
+    except Exception as exc:
+        logger.warning(
+            "Session DB update_system_prompt failed for session %s%s: "
+            "%s. Subsequent turns will rebuild the system prompt and "
+            "miss the prefix cache.",
+            agent.session_id,
+            suffix,
+            exc,
+        )
 
 
 # The three _get_continuation_prompt variants below, in named-constant form

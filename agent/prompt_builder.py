@@ -4,6 +4,7 @@ All functions are stateless. AIAgent._build_system_prompt() calls these to
 assemble pieces, then combines them with memory and ephemeral prompts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -2668,3 +2669,120 @@ def build_context_files_prompt(
     if not sections:
         return ""
     return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+
+
+# =========================================================================
+# Managed-context fingerprint (durable session restore, #68563)
+# =========================================================================
+
+_CONTEXT_FINGERPRINT_VERSION = "v1"
+
+
+def _fingerprint_add(hasher: "hashlib._Hash", key: str, value: str) -> None:
+    """Length-prefix a key/value pair so contents cannot collide across slots."""
+    data = value.encode("utf-8")
+    hasher.update(f"{key}:{len(data)}\n".encode("utf-8"))
+    hasher.update(data)
+    hasher.update(b"\n")
+
+
+def _project_family_presence(cwd_path: Path) -> dict:
+    """Which project-context families exist under *cwd_path*.
+
+    Existence is independent of which family wins first-match-wins loading, so
+    add/remove of a shadowed candidate still changes the digest while editing
+    a shadowed file's content does not.
+    """
+    agents = False
+    for directory in _agents_md_directory_chain(cwd_path):
+        for name in ("AGENTS.override.md", "AGENTS.md", "agents.md"):
+            if (directory / name).exists():
+                agents = True
+                break
+        if agents:
+            break
+    rules_dir = cwd_path / ".cursor" / "rules"
+    cursor = (cwd_path / ".cursorrules").exists() or (
+        rules_dir.is_dir() and any(rules_dir.glob("*.mdc"))
+    )
+    return {
+        "hermes_md": _find_hermes_md(cwd_path) is not None,
+        "agents_md": agents,
+        "claude_md": (cwd_path / "CLAUDE.md").exists() or (cwd_path / "claude.md").exists(),
+        "cursorrules": cursor,
+    }
+
+
+def compute_context_fingerprint(
+    *,
+    cwd: Optional[str] = None,
+    include_soul: bool = True,
+    include_project_context: bool = True,
+    home_override: "Path | None" = None,
+    context_length: Optional[int] = None,
+    allow_install_tree_fallback: bool = False,
+) -> str:
+    """SHA-256 of the managed inputs used to assemble the system prompt.
+
+    The digest is not model-visible. It is stored beside the prompt snapshot
+    so a durable session can reuse byte-stable prefix-cache bytes only while
+    SOUL.md / project context files are unchanged.
+    """
+    hasher = hashlib.sha256()
+    _fingerprint_add(hasher, "version", _CONTEXT_FINGERPRINT_VERSION)
+
+    if include_soul:
+        soul = load_soul_md(context_length, home_override=home_override) or ""
+        _fingerprint_add(hasher, "soul", soul)
+    else:
+        _fingerprint_add(hasher, "soul", "<skipped>")
+
+    if not include_project_context:
+        _fingerprint_add(hasher, "project", "<skipped>")
+        return hasher.hexdigest()
+
+    if cwd is None:
+        cwd_value = os.getcwd()
+        cwd_is_fallback = True
+    else:
+        cwd_value = cwd
+        cwd_is_fallback = False
+    cwd_path = Path(cwd_value).resolve()
+
+    from agent.runtime_cwd import _is_install_tree
+
+    if (
+        cwd_is_fallback
+        and not allow_install_tree_fallback
+        and _is_install_tree(cwd_path)
+    ):
+        _fingerprint_add(hasher, "project", "<install-tree-skipped>")
+        return hasher.hexdigest()
+
+    presence = _project_family_presence(cwd_path)
+    winner = "none"
+    content = ""
+    if presence["hermes_md"]:
+        content = _load_hermes_md(cwd_path, context_length)
+        if content:
+            winner = "hermes_md"
+    if winner == "none" and presence["agents_md"]:
+        content = _load_agents_md(cwd_path, context_length)
+        if content:
+            winner = "agents_md"
+    if winner == "none" and presence["claude_md"]:
+        content = _load_claude_md(cwd_path, context_length)
+        if content:
+            winner = "claude_md"
+    if winner == "none" and presence["cursorrules"]:
+        content = _load_cursorrules(cwd_path, context_length)
+        if content:
+            winner = "cursorrules"
+        else:
+            content = ""
+
+    _fingerprint_add(hasher, "project_winner", winner)
+    _fingerprint_add(hasher, "project_content", content)
+    for family, exists in presence.items():
+        _fingerprint_add(hasher, f"exists:{family}", "1" if exists else "0")
+    return hasher.hexdigest()
