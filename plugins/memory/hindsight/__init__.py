@@ -45,8 +45,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.secret_scope import get_secret
-
+from agent.secret_scope import (
+    UnscopedSecretError,
+    current_secret_scope,
+    get_secret,
+    reset_secret_scope,
+    set_secret_scope,
+)
 from agent.memory_provider import MemoryProvider, RecallStatus
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -445,7 +450,7 @@ def _load_config() -> dict:
 
     return {
         "mode": os.environ.get("HINDSIGHT_MODE", "cloud"),
-        "apiKey": get_secret("HINDSIGHT_API_KEY", ""),
+        "apiKey": _get_scoped_secret("HINDSIGHT_API_KEY", ""),
         "timeout": _parse_int_setting(os.environ.get("HINDSIGHT_TIMEOUT"), _DEFAULT_TIMEOUT),
         "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
         "retain_tags": os.environ.get("HINDSIGHT_RETAIN_TAGS", ""),
@@ -587,6 +592,79 @@ def _load_simple_env(path) -> dict[str, str]:
     return values
 
 
+def _get_scoped_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Scope-aware read for HINDSIGHT_* credentials under a multiplexer.
+
+    Mirrors ``gateway/platforms/whatsapp_common.py::_get_wsecret`` (Slack
+    pattern #59739 / WhatsApp ``_get_wsecret``). The Hindsight plugin's
+    daemon-start thread does NOT inherit the caller's per-turn secret
+    scope (issue #94933), so reads must be safe under both:
+
+    - **scope installed** (secondary profile turn): the scope is
+      authoritative; a scoped miss returns ``default`` and we do NOT
+      borrow from ``os.environ`` (that would leak the default profile's
+      key into this profile).
+    - **unscoped under multiplex** (default profile's own startup loop):
+      a bare ``get_secret`` would raise ``UnscopedSecretError`` and crash
+      the daemon. Here ``os.environ`` IS the active profile's value (no
+      other profile to leak from), so fall back to it.
+
+    For the daemon-start thread specifically, ``initialize()`` /
+    ``_start_daemon()`` additionally wraps the whole flow in
+    ``set_secret_scope(...)`` so the helper always sees a scope on this
+    code path under multiplexing.
+    """
+    try:
+        value = get_secret(name, default)
+    except UnscopedSecretError:
+        value = os.getenv(name)
+    return value if value is not None else default
+
+
+def _build_hindsight_scope(config: dict[str, Any]) -> dict[str, str]:
+    """Build the secret scope the Hindsight daemon-start thread runs under.
+
+    Threads do not inherit contextvars, so the per-turn scope that wrapped
+    ``initialize()`` does not propagate into ``hindsight-daemon-start``.
+    That thread calls ``_get_client()`` and
+    ``_build_embedded_profile_env()``, both of which read
+    ``HINDSIGHT_LLM_API_KEY`` (and ``HINDSIGHT_API_KEY``). Under
+    ``gateway.multiplex_profiles`` a bare read raises
+    ``UnscopedSecretError`` and the daemon never binds its port — memory
+    silently stops working for ALL profiles (issue #94933).
+
+    We build the scope from the **merged** env: main ``<hermes_home>/.env``
+    first, then overlay the profile daemon env at
+    ``~/.hindsight/profiles/<name>.env``. That file only carries ~5
+    daemon runtime keys (LLM provider/model/idle-timeout), so reading it
+    alone is insufficient — the LLM key lives in the main ``.env`` and
+    must come first.
+    """
+    from pathlib import Path
+
+    scope: dict[str, str] = {}
+    main_env = _load_simple_env(get_hermes_home() / ".env")
+    scope.update(main_env)
+
+    try:
+        profile_env_path = _embedded_profile_env_path(config)
+        profile_env = _load_simple_env(profile_env_path)
+    except Exception:
+        profile_env = {}
+    # Overlay only non-empty profile values so a stale or missing
+    # profile env does not blank out the main .env's LLM key.
+    scope.update({k: v for k, v in profile_env.items() if v})
+
+    # Strip genuinely-global vars; ``get_secret`` reads those from
+    # ``os.environ`` directly, so copying them in is wasted and noisy.
+    try:
+        from agent.secret_scope import _is_global_env
+        scope = {k: v for k, v in scope.items() if not _is_global_env(k)}
+    except Exception:
+        pass
+    return scope
+
+
 def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None) -> dict[str, str]:
     """Build the profile-scoped env file that standalone hindsight-embed consumes."""
     current_key = llm_api_key
@@ -594,7 +672,7 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         current_key = (
             config.get("llmApiKey")
             or config.get("llm_api_key")
-            or get_secret("HINDSIGHT_LLM_API_KEY", "")
+            or _get_scoped_secret("HINDSIGHT_LLM_API_KEY", "")
         )
 
     current_provider = config.get("llm_provider", "")
@@ -900,7 +978,7 @@ class HindsightMemoryProvider(MemoryProvider):
             has_key = bool(
                 cfg.get("apiKey")
                 or cfg.get("api_key")
-                or get_secret("HINDSIGHT_API_KEY", "")
+                or _get_scoped_secret("HINDSIGHT_API_KEY", "")
             )
             has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
             return has_key or has_url
@@ -1029,7 +1107,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Step 3: Mode-specific config
         if mode == "cloud":
             print("\n  Get your API key at https://ui.hindsight.vectorize.io\n")
-            existing_key = get_secret("HINDSIGHT_API_KEY", "") or ""
+            existing_key = _get_scoped_secret("HINDSIGHT_API_KEY", "") or ""
             if existing_key:
                 masked = f"...{existing_key[-4:]}" if len(existing_key) > 4 else "set"
                 sys.stdout.write(f"  API key (current: {masked}, blank to keep): ")
@@ -1257,7 +1335,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 kwargs = dict(
                     profile=self._config.get("profile", "hermes"),
                     llm_provider=llm_provider,
-                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or get_secret("HINDSIGHT_LLM_API_KEY", ""),
+                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or _get_scoped_secret("HINDSIGHT_LLM_API_KEY", ""),
                     llm_model=self._config.get("llm_model", ""),
                 )
                 if self._llm_base_url:
@@ -1662,7 +1740,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
                 self._mode = "disabled"
                 return
-        self._api_key = self._config.get("apiKey") or self._config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
+        self._api_key = self._config.get("apiKey") or self._config.get("api_key") or _get_scoped_secret("HINDSIGHT_API_KEY", "")
         default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
         self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
         self._llm_base_url = self._config.get("llm_base_url", "")
@@ -1801,39 +1879,60 @@ class HindsightMemoryProvider(MemoryProvider):
                 log_dir = get_hermes_home() / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log_path = log_dir / "hindsight-embed.log"
+                # Threads do NOT inherit contextvars, so the per-turn secret
+                # scope that wrapped initialize() does not propagate here.
+                # Build a fresh scope from the merged env (main .env + the
+                # profile daemon env at ~/.hindsight/profiles/<name>.env) so
+                # subsequent reads of HINDSIGHT_LLM_API_KEY /
+                # HINDSIGHT_API_KEY inside _get_client() and
+                # _build_embedded_profile_env() resolve to this profile's
+                # values instead of failing closed with
+                # ``UnscopedSecretError`` under gateway.multiplex_profiles.
+                # Issue #94933: daemon never started under multiplexing.
+                scope_token = None
                 try:
-                    # Redirect the daemon manager's Rich console to our log file
-                    # instead of stderr. This avoids global fd redirects that
-                    # would capture output from other threads.
-                    import hindsight_embed.daemon_embed_manager as dem
-                    from rich.console import Console
-                    dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
+                    scope_env = _build_hindsight_scope(self._config or {})
+                    if scope_env:
+                        scope_token = set_secret_scope(scope_env)
+                    try:
+                        # Redirect the daemon manager's Rich console to our log file
+                        # instead of stderr. This avoids global fd redirects that
+                        # would capture output from other threads.
+                        import hindsight_embed.daemon_embed_manager as dem
+                        from rich.console import Console
+                        dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
 
-                    client = self._get_client()
-                    profile = self._config.get("profile", "hermes")
+                        client = self._get_client()
+                        profile = self._config.get("profile", "hermes")
 
-                    # Update the profile .env to match our current config so
-                    # the daemon always starts with the right settings.
-                    # If the config changed and the daemon is running, stop it.
-                    profile_env = _embedded_profile_env_path(self._config)
-                    expected_env = _build_embedded_profile_env(self._config)
-                    saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                        # Update the profile .env to match our current config so
+                        # the daemon always starts with the right settings.
+                        # If the config changed and the daemon is running, stop it.
+                        profile_env = _embedded_profile_env_path(self._config)
+                        expected_env = _build_embedded_profile_env(self._config)
+                        saved = _load_simple_env(profile_env)
+                        config_changed = saved != expected_env
 
-                    if config_changed:
-                        profile_env = _materialize_embedded_profile_env(self._config)
-                        if client._manager.is_running(profile):
-                            with open(log_path, "a", encoding="utf-8") as f:
-                                f.write("\n=== Config changed, restarting daemon ===\n")
-                            client._manager.stop(profile)
+                        if config_changed:
+                            profile_env = _materialize_embedded_profile_env(self._config)
+                            if client._manager.is_running(profile):
+                                with open(log_path, "a", encoding="utf-8") as f:
+                                    f.write("\n=== Config changed, restarting daemon ===\n")
+                                client._manager.stop(profile)
 
-                    client._ensure_started()
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write("\n=== Daemon started successfully ===\n")
-                except Exception as e:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"\n=== Daemon startup failed: {e} ===\n")
-                        traceback.print_exc(file=f)
+                        client._ensure_started()
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write("\n=== Daemon started successfully ===\n")
+                    except Exception as e:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n=== Daemon startup failed: {e} ===\n")
+                            traceback.print_exc(file=f)
+                finally:
+                    if scope_token is not None:
+                        try:
+                            reset_secret_scope(scope_token)
+                        except Exception:
+                            pass
 
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
