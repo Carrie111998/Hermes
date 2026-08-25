@@ -328,6 +328,9 @@ class CDPSupervisor:
         self._frames: Dict[str, FrameInfo] = {}
         self._console_events: List[ConsoleEvent] = []
         self._active = False
+        # Strong refs to fire-and-forget tasks: the event loop keeps only
+        # weak references, so unreferenced tasks can be GC-reaped mid-wait.
+        self._spawned_tasks: set = set()
 
         # Supervisor loop machinery — populated in start().
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -923,17 +926,23 @@ class CDPSupervisor:
             # re-archive it as "remote".
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy")
-            asyncio.create_task(
+            dismiss_task = asyncio.create_task(
                 self._auto_handle_dialog(dialog, accept=False, prompt_text="")
             )
+            self._spawned_tasks.add(dismiss_task)
+            if hasattr(dismiss_task, "add_done_callback"):
+                dismiss_task.add_done_callback(self._spawned_tasks.discard)
         elif self.dialog_policy == DIALOG_POLICY_AUTO_ACCEPT:
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy")
-            asyncio.create_task(
+            accept_task = asyncio.create_task(
                 self._auto_handle_dialog(
                     dialog, accept=True, prompt_text=dialog.default_prompt
                 )
             )
+            self._spawned_tasks.add(accept_task)
+            if hasattr(accept_task, "add_done_callback"):
+                accept_task.add_done_callback(self._spawned_tasks.discard)
         else:
             # must_respond → add to pending and arm watchdog.
             with self._state_lock:
@@ -1143,17 +1152,23 @@ class CDPSupervisor:
         if self.dialog_policy == DIALOG_POLICY_AUTO_DISMISS:
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy")
-            asyncio.create_task(
+            dismiss_task = asyncio.create_task(
                 self._fulfill_bridge_request(dialog, accept=False, prompt_text="")
             )
+            self._spawned_tasks.add(dismiss_task)
+            if hasattr(dismiss_task, "add_done_callback"):
+                dismiss_task.add_done_callback(self._spawned_tasks.discard)
         elif self.dialog_policy == DIALOG_POLICY_AUTO_ACCEPT:
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy")
-            asyncio.create_task(
+            accept_task = asyncio.create_task(
                 self._fulfill_bridge_request(
                     dialog, accept=True, prompt_text=default_prompt
                 )
             )
+            self._spawned_tasks.add(accept_task)
+            if hasattr(accept_task, "add_done_callback"):
+                accept_task.add_done_callback(self._spawned_tasks.discard)
         else:
             # must_respond — add to pending + arm watchdog.
             with self._state_lock:
@@ -1297,7 +1312,10 @@ class CDPSupervisor:
         # Enable domains on the child off-loop so the reader keeps pumping.
         # Awaiting the CDP replies here would deadlock because only the
         # reader can resolve those replies' Futures.
-        asyncio.create_task(self._enable_child_domains(sid))
+        enable_task = asyncio.create_task(self._enable_child_domains(sid))
+        self._spawned_tasks.add(enable_task)
+        if hasattr(enable_task, "add_done_callback"):
+            enable_task.add_done_callback(self._spawned_tasks.discard)
 
     async def _enable_child_domains(self, sid: str) -> None:
         """Enable Page+Runtime (+nested setAutoAttach) on a child CDP session.

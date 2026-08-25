@@ -212,6 +212,10 @@ class LSPClient:
         # Request/response correlation
         self._next_id: int = 0
         self._pending: Dict[int, asyncio.Future] = {}
+        # Strong refs to fire-and-forget dispatch tasks: the loop keeps only
+        # weak references to tasks, so an unreferenced dispatcher can be
+        # GC-reaped and the server's request never answered.
+        self._spawned_tasks: set = set()
 
         # Server-side request handlers (server → client requests).
         # Kept small and explicit; everything else returns method-not-found.
@@ -376,7 +380,10 @@ class LSPClient:
                 if kind == "response":
                     self._dispatch_response(key, msg)
                 elif kind == "request":
-                    asyncio.create_task(self._dispatch_request(key, msg))
+                    dispatch_task = asyncio.create_task(self._dispatch_request(key, msg))
+                    self._spawned_tasks.add(dispatch_task)
+                    if hasattr(dispatch_task, "add_done_callback"):
+                        dispatch_task.add_done_callback(self._spawned_tasks.discard)
                 elif kind == "notification":
                     self._dispatch_notification(key, msg)
                 else:
