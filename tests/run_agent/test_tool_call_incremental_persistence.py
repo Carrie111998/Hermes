@@ -34,7 +34,11 @@ import pytest
 
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.agent_runtime_helpers import sanitize_api_messages
-from agent.tool_executor import execute_tool_calls_segmented
+from agent.tool_executor import (
+    execute_tool_calls_concurrent,
+    execute_tool_calls_segmented,
+    execute_tool_calls_sequential,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -626,6 +630,42 @@ def test_segmented_batch_activity_counters_cover_full_turn():
         and item.get("tool_total") == 2
         for item in snapshots
     )
+
+
+@pytest.mark.parametrize(
+    ("executor", "tool_call_id"),
+    [
+        (execute_tool_calls_sequential, "zero-sequential"),
+        (execute_tool_calls_concurrent, "zero-concurrent"),
+    ],
+)
+def test_explicit_zero_activity_total_is_not_replaced_by_batch_size(
+    executor,
+    tool_call_id,
+):
+    agent = _make_agent("tool_one")
+    call = _mock_tool_call(name="tool_one", call_id=tool_call_id)
+    assistant_message = SimpleNamespace(content="", tool_calls=[call])
+    messages: list[dict] = []
+    snapshots = _record_activity_snapshots(agent)
+
+    with (
+        patch.object(agent, "_invoke_tool", return_value="result"),
+        patch("run_agent.handle_function_call", return_value="result"),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        executor(
+            agent,
+            assistant_message,
+            messages,
+            "task-1",
+            activity_tool_total=0,
+        )
+
+    assert any(snapshot["tool_total"] == 0 for snapshot in snapshots)
 
 
 # ---------------------------------------------------------------------------

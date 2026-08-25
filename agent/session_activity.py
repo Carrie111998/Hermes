@@ -70,16 +70,70 @@ def touch_activity(agent: Any, description: str, **state: Any) -> None:
     the activity hook itself.
     """
     callback = getattr(agent, "_touch_activity")
+    callback_self = getattr(callback, "__self__", None)
+    callback_func = getattr(callback, "__func__", None)
+    cached = getattr(agent, "_touch_activity_adapter_cache", None)
+    if cached is not None:
+        cached_callback, cached_self, cached_func, accepted = cached
+        same_bound_method = (
+            callback_self is not None
+            and callback_func is not None
+            and callback_self is cached_self
+            and callback_func is cached_func
+        )
+        same_callable = (
+            callback_self is None
+            and callback_func is None
+            and callback is cached_callback
+        )
+        if same_bound_method or same_callable:
+            if accepted is None:
+                callback(description, **state)
+            else:
+                callback(
+                    description,
+                    **{name: value for name, value in state.items() if name in accepted},
+                )
+            return
+
     try:
         parameters = inspect.signature(callback).parameters
     except (TypeError, ValueError):
+        accepted = None
+    else:
+        if any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            accepted = None
+        else:
+            accepted = frozenset(
+                name
+                for name, parameter in parameters.items()
+                if parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            )
+    cache_entry = (
+        callback,
+        callback_self,
+        callback_func,
+        accepted,
+    )
+    try:
+        agent._touch_activity_adapter_cache = cache_entry
+    except Exception:
+        # Slotted test doubles and third-party readers may not allow cache state.
+        pass
+    if accepted is None:
         callback(description, **state)
-        return
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        callback(description, **state)
-        return
-    accepted = {name: value for name, value in state.items() if name in parameters}
-    callback(description, **accepted)
+    else:
+        callback(
+            description,
+            **{name: value for name, value in state.items() if name in accepted},
+        )
 
 
 def reset_session_activity_persist_window(agent: Any) -> None:

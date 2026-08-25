@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import run_agent
+import agent.session_activity as session_activity
 from agent.session_activity import ActivityProvenance
 
 
@@ -225,7 +226,8 @@ def test_touch_activity_exposes_safe_monotonic_turn_state(monkeypatch):
     assert first["tool_total"] == 3
     assert first["tool_pending"] == 2
     assert first["phase_started_at"] == 500.0
-    assert first["last_heartbeat_at"] == 500.0
+    assert first["last_heartbeat_mono"] == 500.0
+    assert "last_heartbeat_at" not in first
     assert first["seconds_since_activity"] == 0.0
     assert first["last_activity_desc"] == "waiting for tool batch"
     assert not {
@@ -243,8 +245,110 @@ def test_touch_activity_exposes_safe_monotonic_turn_state(monkeypatch):
     second = agent.get_activity_summary()
     assert second["phase"] == "tool_batch_wait"
     assert second["phase_started_at"] == 500.0
-    assert second["last_heartbeat_at"] == 502.0
+    assert second["last_heartbeat_mono"] == 502.0
+    assert "last_heartbeat_at" not in second
     assert second["seconds_since_activity"] == 0.0
+
+
+def test_touch_activity_memoizes_callback_signature_and_refreshes_when_replaced(
+    monkeypatch,
+):
+    calls = []
+    signature_calls = 0
+
+    def structured(description, **state):
+        calls.append((description, state))
+
+    def legacy(description):
+        calls.append((description, {}))
+
+    original_signature = session_activity.inspect.signature
+
+    def counting_signature(callback):
+        nonlocal signature_calls
+        signature_calls += 1
+        return original_signature(callback)
+
+    monkeypatch.setattr(session_activity.inspect, "signature", counting_signature)
+    agent = SimpleNamespace(_touch_activity=structured)
+
+    session_activity.touch_activity(agent, "first", phase="model_call")
+    session_activity.touch_activity(agent, "second", phase="response_delivery")
+    assert signature_calls == 1
+    assert calls[-1][1]["phase"] == "response_delivery"
+
+    agent._touch_activity = legacy
+    session_activity.touch_activity(agent, "legacy", phase="model_call")
+    assert signature_calls == 2
+    assert calls[-1] == ("legacy", {})
+
+
+def test_get_activity_summary_reads_turn_counters_under_activity_lock():
+    class GuardedLock:
+        def __init__(self):
+            self.held = False
+
+        def acquire(self):
+            self.held = True
+
+        def release(self):
+            self.held = False
+
+    class GuardedBudget:
+        def __init__(self, owner):
+            self.owner = owner
+
+        @property
+        def used(self):
+            assert self.owner._activity_lock.held
+            return 3
+
+        @property
+        def max_total(self):
+            assert self.owner._activity_lock.held
+            return 10
+
+    class GuardedAgent:
+        _LOCKED_FIELDS = {
+            "_api_call_count",
+            "max_iterations",
+            "iteration_budget",
+        }
+
+        def __init__(self):
+            self._activity_lock = GuardedLock()
+            self._last_activity_ts = 1_700_000_000.0
+            self._last_activity_mono = 500.0
+            self._last_activity_desc = "model call"
+            self._last_activity_provenance = ActivityProvenance.UNKNOWN
+            self._current_tool = None
+            self._turn_phase = "model_call"
+            self._turn_phase_started_at = 500.0
+            self._turn_tool_total = 0
+            self._turn_tool_completed = 0
+            self._last_heartbeat_mono = 500.0
+            self._api_call_count = 2
+            self.max_iterations = 10
+            self.iteration_budget = GuardedBudget(self)
+
+        def __getattribute__(self, name):
+            if name in type(self)._LOCKED_FIELDS:
+                lock = object.__getattribute__(self, "_activity_lock")
+                assert lock.held, f"{name} read outside activity lock"
+            return object.__getattribute__(self, name)
+
+    agent = GuardedAgent()
+    get_summary = run_agent.AIAgent.get_activity_summary.__get__(
+        agent,
+        GuardedAgent,
+    )
+
+    summary = get_summary()
+
+    assert summary["api_call_count"] == 2
+    assert summary["max_iterations"] == 10
+    assert summary["budget_used"] == 3
+    assert summary["budget_max"] == 10
 
 
 def test_reset_activity_labels_after_turn_keeps_ts_and_clears_labels():

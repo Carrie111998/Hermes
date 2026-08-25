@@ -1304,7 +1304,9 @@ def execute_tool_calls_concurrent(
     # its own bound against the batch deadline it must stay under.
     timeout_s = _resolve_concurrent_tool_timeout()
     gate_timeout_s = _start_order_gate_timeout(timeout_s)
-    activity_total = activity_tool_total or num_tools
+    activity_total = (
+        num_tools if activity_tool_total is None else activity_tool_total
+    )
     activity_offset = max(0, activity_tool_offset)
 
     # Touch activity before launching workers so the gateway knows
@@ -2026,7 +2028,9 @@ def execute_tool_calls_sequential(
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
     num_tools_seq = len(assistant_message.tool_calls)
-    activity_total = activity_tool_total or num_tools_seq
+    activity_total = (
+        num_tools_seq if activity_tool_total is None else activity_tool_total
+    )
     activity_offset = max(0, activity_tool_offset)
 
     # Keep every runtime-tool branch on one bounded execution funnel without

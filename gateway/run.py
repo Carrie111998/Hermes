@@ -3444,6 +3444,11 @@ def _format_gateway_inactivity_warning(
 def _format_gateway_timeout_diagnostic(activity: Optional[dict]) -> str:
     """Build the bounded user-facing diagnostic for an inactive turn."""
     safe = _safe_gateway_activity_fields(activity)
+    remediation = (
+        " To increase the limit, set agent.gateway_timeout in config.yaml "
+        "(value in seconds, 0 = no limit) and restart the gateway.\n"
+        "Try again, or use /reset to start fresh."
+    )
     diagnostic = (
         "⏱️ I stopped this turn after the configured inactivity limit. "
         f"It was in `{safe['phase']}` with `{safe['current_tool']}` as the "
@@ -3454,10 +3459,10 @@ def _format_gateway_timeout_diagnostic(activity: Optional[dict]) -> str:
         return (
             f"{diagnostic} I did not replay the unfinished tool; its final side "
             "effect is unknown. Review external state before continuing."
+            f"{remediation}"
         )
     return (
-        f"{diagnostic} No tool was replayed automatically. You can continue or "
-        "use /reset to start fresh."
+        f"{diagnostic} No tool was replayed automatically.{remediation}"
     )
 
 

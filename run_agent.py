@@ -4483,7 +4483,12 @@ class AIAgent:
                 tool_total,
                 max(0, int(getattr(self, "_turn_tool_completed", 0) or 0)),
             )
-            last_heartbeat_at = getattr(self, "_last_heartbeat_mono", None)
+            last_heartbeat_mono = getattr(self, "_last_heartbeat_mono", None)
+            api_call_count = getattr(self, "_api_call_count", 0)
+            max_iterations = getattr(self, "max_iterations", 0)
+            iteration_budget = getattr(self, "iteration_budget", None)
+            budget_used = getattr(iteration_budget, "used", 0)
+            budget_max = getattr(iteration_budget, "max_total", 0)
         finally:
             if activity_lock is not None:
                 activity_lock.release()
@@ -4503,16 +4508,16 @@ class AIAgent:
             now=now_wall,
             extra={
                 "current_tool": current_tool,
-                "api_call_count": self._api_call_count,
-                "max_iterations": self.max_iterations,
-                "budget_used": self.iteration_budget.used,
-                "budget_max": self.iteration_budget.max_total,
+                "api_call_count": api_call_count,
+                "max_iterations": max_iterations,
+                "budget_used": budget_used,
+                "budget_max": budget_max,
                 "phase": phase,
                 "tool_total": tool_total,
                 "tool_completed": tool_completed,
                 "tool_pending": max(0, tool_total - tool_completed),
                 "phase_started_at": phase_started_at,
-                "last_heartbeat_at": last_heartbeat_at or None,
+                "last_heartbeat_mono": last_heartbeat_mono or None,
                 **(
                     {"seconds_since_activity": seconds_since_activity}
                     if seconds_since_activity is not None

@@ -215,6 +215,10 @@ def test_timeout_diagnostic_reports_unknown_side_effect_without_private_data():
     assert "1/2 tools completed" in diagnostic
     assert "did not replay" in diagnostic
     assert "side effect is unknown" in diagnostic
+    assert (
+        "To increase the limit, set agent.gateway_timeout in config.yaml "
+        "(value in seconds, 0 = no limit) and restart the gateway."
+    ) in diagnostic
     for private_text in (
         "command text",
         "credential-value",
