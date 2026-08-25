@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import sqlite3
 import stat
+import threading
 
 import pytest
 
@@ -316,6 +317,53 @@ def test_failed_accounting_lock_survives_later_success_until_owner_close(
     finally:
         if not accounting_closed:
             accounting_db.close()
+        archive_db.close()
+
+
+def test_timed_out_stopped_writer_releases_retained_accounting_lock_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "state.db"
+    archive_db = SessionDB(db_path)
+    accounting_db = SessionDB(db_path)
+    entered_apply = threading.Event()
+    release_apply = threading.Event()
+    try:
+        archive_db.create_session("terminal", source="cli")
+        archive_db.end_session("terminal", "completed")
+        assert archive_db.set_session_archived("terminal", True)
+
+        def blocked_failed_apply(_batch):
+            entered_apply.set()
+            if not release_apply.wait(10):
+                raise AssertionError("test did not release blocked writer")
+            return {"terminal"}
+
+        monkeypatch.setattr(accounting_db, "_apply_token_batch", blocked_failed_apply)
+        accounting_db.queue_token_counts(
+            "terminal", input_tokens=1, model="failed-model"
+        )
+        assert entered_apply.wait(5)
+        writer = accounting_db._token_writer_thread
+        assert writer is not None
+
+        accounting_db._stop_token_writer(join_timeout=0.01)
+        with pytest.raises(PendingSessionAccountingError, match="pending token"):
+            with cold_store._exclusive_lineage_accounting_locks(
+                archive_db, "terminal"
+            ):
+                pass
+
+        release_apply.set()
+        writer.join(timeout=10)
+        assert not writer.is_alive()
+        with cold_store._exclusive_lineage_accounting_locks(
+            archive_db, "terminal"
+        ):
+            pass
+    finally:
+        release_apply.set()
+        accounting_db.close()
         archive_db.close()
 
 
@@ -724,6 +772,30 @@ def test_store_rejects_rename_unsafe_archive_parent_before_creating_root(
         assert not archive_root.exists()
     finally:
         db.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership is required")
+def test_root_lock_rejects_foreign_owned_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive_root = tmp_path / "archive"
+    lock_path = cold_store._cold_archive_lock_path(archive_root)
+    lock_path.write_text("", encoding="utf-8")
+    lock_path.chmod(0o600)
+    real_fstat = os.fstat
+
+    def foreign_regular_owner(fd: int) -> os.stat_result:
+        opened = real_fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            return opened
+        values = list(opened)
+        values[4] = os.geteuid() + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(os, "fstat", foreign_regular_owner)
+    with pytest.raises(ValueError, match="unsafe cold archive lock sidecar"):
+        with cold_store._exclusive_cold_archive_root_lock(archive_root):
+            pass
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership is required")

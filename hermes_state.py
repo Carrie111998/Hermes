@@ -8444,6 +8444,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._token_queue_cond.wait(remaining)
                 if not self._token_queue:
                     self._token_writer_thread = None
+                    descriptors = [
+                        descriptor
+                        for descriptor in self._token_accounting_lock_fds.values()
+                        if descriptor is not None
+                    ]
+                    self._token_accounting_lock_fds.clear()
+                    for descriptor in descriptors:
+                        os.close(descriptor)
                     return  # stop requested and fully drained
                 # busy is set BEFORE the queue is cleared: the lock-free
                 # fast path in flush_token_counts() reads queue-then-busy,

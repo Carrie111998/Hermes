@@ -396,7 +396,7 @@ def _exclusive_cold_archive_root_lock(archive_root: Path) -> Iterator[None]:
             raise ValueError(f"unsafe cold archive lock sidecar: {lock_path}") from exc
 
         opened = os.fstat(lock_fd)
-        if not stat.S_ISREG(opened.st_mode):
+        if not _is_private_owned_entry(opened, directory=False):
             raise ValueError(f"unsafe cold archive lock sidecar: {lock_path}")
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
