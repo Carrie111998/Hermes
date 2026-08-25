@@ -1463,6 +1463,9 @@ class WeComAdapter(BasePlatformAdapter):
         falls through to normal markdown as before.
         """
         is_final = bool(metadata and metadata.get("_wecom_final"))
+        # Busy-ack and similar receipts for a NEW message must not touch the
+        # still-running turn's stream — deliver as standalone markdown.
+        no_stream = bool(metadata and metadata.get("_wecom_no_stream"))
 
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
@@ -1470,7 +1473,7 @@ class WeComAdapter(BasePlatformAdapter):
         # Live bubble open → write into it. Mid-turn: finish=false (bubble
         # content updates, stays "thinking"); final: finish=true (replaced by
         # the answer). Either way SKIP markdown — one message per turn.
-        st = self._thinking_streams.get(chat_id)
+        st = None if no_stream else self._thinking_streams.get(chat_id)
         if st is not None:
             ok = await self._write_stream(
                 chat_id, content, finish=is_final)

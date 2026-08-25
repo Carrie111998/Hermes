@@ -10612,6 +10612,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        # WeCom single-stream: the busy-ack is a receipt for the NEW message,
+        # not part of the still-running turn's stream — mark it so adapter
+        # send() delivers it as a standalone markdown message instead of
+        # overwriting the open thinking bubble.
+        if isinstance(thread_meta, dict):
+            thread_meta["_wecom_no_stream"] = True
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
