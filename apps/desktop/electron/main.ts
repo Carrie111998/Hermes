@@ -289,6 +289,7 @@ import {
 } from './remote-liveness'
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { buildDesktopServeChildEnv, scrubDesktopChildEnv } from './scrub-child-env'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
@@ -2251,7 +2252,7 @@ function backendSupportsServe(backend) {
       // and its timeout-only retry instead of a thinner local bound.
       execProbeSync(backend.command, [...prefix, 'serve', '--help'], {
         cwd: backend.root || undefined,
-        env: { ...process.env, HERMES_HOME, ...(backend.env || {}) },
+        env: scrubDesktopChildEnv(process.env, { HERMES_HOME }, backend.env),
         timeout: PROBE_TIMEOUT_MS,
         stdio: 'ignore',
         // `.cmd`/`.bat` shim backends carry shell: true in their descriptor
@@ -3738,12 +3739,11 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
 
       child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
         cwd: HERMES_HOME,
-        env: {
-          ...process.env,
+        env: scrubDesktopChildEnv(process.env, {
           HERMES_HOME,
           HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
           PATH: pathWithHermesManagedNode(venvBin)
-        },
+        }),
         detached: true,
         stdio: 'ignore'
       })
@@ -3765,11 +3765,10 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     } else {
       child = spawnUpdaterProcess(updater, updaterArgs, {
         cwd: HERMES_HOME,
-        env: {
-          ...process.env,
+        env: scrubDesktopChildEnv(process.env, {
           HERMES_HOME,
           PATH: pathWithHermesManagedNode(venvBin)
-        },
+        }),
         detached: true,
         stdio: 'ignore'
       })
@@ -3900,11 +3899,10 @@ async function handOffWindowsBootstrapRecovery(reason) {
 
   const child = spawnUpdaterProcess(updater, updaterArgs, {
     cwd: HERMES_HOME,
-    env: {
-      ...process.env,
+    env: scrubDesktopChildEnv(process.env, {
       HERMES_HOME,
       PATH: pathWithHermesManagedNode(venvBin)
-    },
+    }),
     detached: true,
     stdio: 'ignore'
   })
@@ -4129,12 +4127,11 @@ async function applyUpdatesPosixHandoff(opts: any) {
 
   const child = spawnUpdaterProcess(handoff.command, args, {
     cwd: HERMES_HOME,
-    env: {
-      ...process.env,
+    env: scrubDesktopChildEnv(process.env, {
       HERMES_HOME,
       HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
       PATH: pathWithHermesManagedNode(path.join(updateRoot, 'venv', 'bin'))
-    },
+    }),
     detached: true,
     stdio: 'ignore'
   })
@@ -10781,25 +10778,16 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     backend.args,
     hiddenWindowsChildOptions({
       cwd: hermesCwd,
-      env: {
-        ...process.env,
-        HERMES_HOME,
-        ...backend.env,
-        // Pin the gateway's tool/terminal cwd to the same directory we chose for
-        // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
-        // can still point at the install dir even when spawn cwd is home.
-        TERMINAL_CWD: hermesCwd,
-        HERMES_DASHBOARD_SESSION_TOKEN: token,
-        // Marks this dashboard backend as desktop-spawned so it runs the cron
-        // scheduler tick loop (the gateway isn't running under the app).
-        HERMES_DESKTOP: '1',
-        // Exact parent identity lets the backend self-exit after an unclean
-        // Desktop death without mistaking a reused PID for its owner. If the
-        // optional marker probe fails, retain legacy PID-only tracking.
-        ...parentIdentityEnv,
-        HERMES_WEB_DIST: webDist,
-        ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
-      },
+      env: buildDesktopServeChildEnv({
+        source: process.env,
+        backendEnv: backend.env,
+        hermesHome: HERMES_HOME,
+        terminalCwd: hermesCwd,
+        dashboardSessionToken: token,
+        parentIdentityEnv,
+        webDist,
+        readyFile
+      }),
       shell: backend.shell,
       stdio: ['ignore', 'pipe', 'pipe']
     })
@@ -11165,30 +11153,18 @@ async function startHermes() {
       backend.args,
       hiddenWindowsChildOptions({
         cwd: hermesCwd,
-        env: {
-          ...process.env,
-          // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
-          // resolves to the SAME location our resolveHermesHome() picked. Without
-          // this pin, Python falls back to ~/.hermes on every platform — fine on
-          // mac/linux (where our default matches), but on Windows our default is
-          // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
-          // Mismatch would split config / sessions / .env / logs across two
-          // directories. install.ps1 sets HERMES_HOME via setx; the desktop
-          // can't reliably do that, so we set it inline for every spawn.
-          HERMES_HOME,
-          ...backend.env,
-          TERMINAL_CWD: hermesCwd,
-          HERMES_DASHBOARD_SESSION_TOKEN: token,
-          // Marks this dashboard backend as desktop-spawned so it runs the cron
-          // scheduler tick loop (the gateway isn't running under the app).
-          HERMES_DESKTOP: '1',
-          // Exact parent identity lets the backend self-exit after an unclean
-          // Desktop death without mistaking a reused PID for its owner. If the
-          // optional marker probe fails, retain legacy PID-only tracking.
-          ...parentIdentityEnv,
-          HERMES_WEB_DIST: webDist,
-          ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
-        },
+        // Pin HERMES_HOME so the child uses the Desktop's config/session root,
+        // and admit only the freshly minted dashboard session token.
+        env: buildDesktopServeChildEnv({
+          source: process.env,
+          backendEnv: backend.env,
+          hermesHome: HERMES_HOME,
+          terminalCwd: hermesCwd,
+          dashboardSessionToken: token,
+          parentIdentityEnv,
+          webDist,
+          readyFile
+        }),
         shell: backend.shell,
         stdio: ['ignore', 'pipe', 'pipe']
       })
@@ -15480,7 +15456,7 @@ async function getUninstallSummary() {
         ['-m', 'hermes_cli.main', 'uninstall', '--gui-summary'],
         hiddenWindowsChildOptions({
           cwd: agentRoot,
-          env: { ...process.env, HERMES_HOME, NO_COLOR: '1' },
+          env: scrubDesktopChildEnv(process.env, { HERMES_HOME, NO_COLOR: '1' }),
           stdio: ['ignore', 'pipe', 'ignore']
         })
       )
