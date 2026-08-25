@@ -13585,9 +13585,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
 
-            # Capture old server names before shutdown
+            # Capture old server names before shutdown (configured servers, not just connected ones)
             with _lock:
-                old_servers = set(_servers.keys())
+                from tools.mcp_tool import _load_mcp_config
+                old_servers = set(_load_mcp_config().keys())
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections

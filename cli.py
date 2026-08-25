@@ -10660,9 +10660,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
 
-            # Capture old server names
+            # Capture old server names (configured servers, not just connected ones)
             with _lock:
-                old_servers = set(_servers.keys())
+                from tools.mcp_tool import _load_mcp_config
+                old_servers = set(_load_mcp_config().keys())
 
             if not self._command_running:
                 print("🔄 Reloading MCP servers...")
