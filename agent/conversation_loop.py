@@ -2538,6 +2538,10 @@ def run_conversation(
         # Guardrail-halt wrap-up: this one call offers no tools so the model
         # writes a real summary of what it observed instead of resuming the
         # halted loop. Consumed here so the following call re-arms tools.
+        # It is an ordinary iteration for accounting purposes -- a guardrailed
+        # turn costs one API call more than it used to, paid from the same
+        # iteration budget (or, if the halt landed on the last budgeted call,
+        # from the one-more-chance grace flag).
         #
         # This is the only place the toolset may narrow mid-conversation, and
         # it is deliberately the LAST call of the turn: an empty list makes
@@ -7491,6 +7495,23 @@ def run_conversation(
                         agent._toolguard_last_halt_decision = decision
                         agent._tool_guardrail_halt_decision = None
                         agent._toolguard_suppress_tools_next_call = True
+                        # The wrap-up call is paid from the same iteration
+                        # budget as any other call, so a guardrailed turn
+                        # costs one call more than it used to. When the halt
+                        # lands on the LAST budgeted call the loop condition
+                        # is already false, and a bare ``continue`` would drop
+                        # out of the loop entirely -- skipping the wrap-up and
+                        # the canned fallback below it, leaving the turn with
+                        # no ``guardrail_halt`` exit reason. Borrow upstream's
+                        # one-more-chance grace flag for exactly that case: it
+                        # both re-opens the loop condition and skips the
+                        # budget consume, and it is cleared on entry to the
+                        # iteration, so the turn still ends right after.
+                        if not (
+                            api_call_count < agent.max_iterations
+                            and agent.iteration_budget.remaining > 0
+                        ):
+                            agent._budget_grace_call = True
                         agent._emit_status(
                             f"⚠️ Tool guardrail halted {decision.tool_name}: "
                             f"{decision.code} — requesting a final summary"

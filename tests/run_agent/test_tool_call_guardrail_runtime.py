@@ -531,19 +531,105 @@ def test_wrapup_preserves_guardrail_metadata_on_the_turn_result():
     assert result.get("guardrail"), "guardrail metadata lost through the wrap-up"
 
 
+def _always_calls_tools():
+    """A model that never stops calling tools, tool-free wrap-up included.
+
+    Unbounded on purpose: a fixed response list would let the turn end by
+    running out of seeded responses, which looks identical to the branch the
+    test means to pin.
+    """
+    counter = {"n": 0}
+
+    def _respond(*_args, **_kwargs):
+        counter["n"] += 1
+        return _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", json.dumps({"query": "same"}), f"c{counter['n']}")
+            ],
+        )
+
+    return _respond
+
+
 def test_second_halt_after_wrapup_falls_back_to_canned_response():
     """Only one wrap-up per turn — a model that keeps calling tools through
     the wrap-up gets the bounded canned halt, so the loop still terminates."""
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
-    # Every response is another tool call: the wrap-up never produces prose.
-    agent.client.chat.completions.create.side_effect = [
-        _mock_response(
-            content="",
-            finish_reason="tool_calls",
-            tool_calls=[_mock_tool_call("web_search", json.dumps({"query": "same"}), f"c{i}")],
-        )
-        for i in range(12)
-    ]
+    agent.client.chat.completions.create.side_effect = _always_calls_tools()
+    agent._disable_streaming = True
+    statuses: list[str] = []
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_emit_status", side_effect=lambda m, *a, **k: statuses.append(str(m))),
+    ):
+        result = agent.run_conversation("search repeatedly")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert "stopped retrying" in result["final_response"]
+    # Termination came from the second-halt branch, not from exhausting the
+    # iteration budget: the halt fired well inside it...
+    calls = len(agent.client.chat.completions.create.call_args_list)
+    assert calls < agent.max_iterations, calls
+    # ...and exactly two halts were recorded — the wrap-up, then the fallback.
+    halts = [s for s in statuses if "Tool guardrail halted" in s]
+    assert len(halts) == 2, halts
+    assert "requesting a final summary" in halts[0]
+    assert "requesting a final summary" not in halts[1]
+
+
+# ── the halt landing on the last budgeted call ────────────────────────────
+#
+# The wrap-up ``continue``s to the top of the loop, so if the halt lands on
+# the last call the loop condition is already false. Without the grace flag
+# the turn would fall out of the loop having made neither the wrap-up call
+# nor the canned fallback under it, ending with no ``guardrail_halt`` at all.
+# (Only the iteration edge is exercised here: build_turn_context rebuilds
+# ``iteration_budget`` from ``max_iterations`` every turn, so the budget can
+# only run out at or after that same point.)
+
+
+def _assert_wrapped_up_at_the_edge(agent, result, budget_summary):
+    """The summary came from the wrap-up, not from the post-loop
+    max-iterations fallback.
+
+    Both end in a tool-free call, so the discriminator has to be which code
+    path produced it: ``_handle_max_iterations`` must never run, and its
+    signature -- a synthetic user message asking for a summary -- must be
+    absent from the request actually sent.
+    """
+    calls = agent.client.chat.completions.create.call_args_list
+    sent_tools = [kw.get("tools") for _, kw in calls]
+    assert not sent_tools[-1], "the wrap-up call never happened"
+    budget_summary.assert_not_called()
+    roles = [m["role"] for m in calls[-1][1]["messages"]]
+    assert roles.count("user") == 1, roles
+    assert roles[-1] == "tool", roles[-3:]
+    assert result["final_response"] == "Partial results before the stop."
+    assert result.get("guardrail"), "guardrail metadata lost at the budget edge"
+
+
+def test_wrapup_still_runs_when_halt_lands_on_the_last_iteration():
+    """max_iterations is reached by the halting call itself."""
+    # 3 tool-calling iterations is exactly what this config needs to halt.
+    # 3 tool-calling iterations is exactly what this config needs to halt.
+    agent = _make_agent("web_search", max_iterations=3, config=_hard_stop_config())
+
+    with patch.object(agent, "_handle_max_iterations") as budget_summary:
+        result = _run_halting_turn(agent, summary="Partial results before the stop.")
+
+    _assert_wrapped_up_at_the_edge(agent, result, budget_summary)
+
+
+def test_canned_fallback_still_reached_when_halt_lands_on_the_last_iteration():
+    """And when the wrap-up call itself halts again at the budget edge, the
+    turn still ends on the canned halt rather than an empty response."""
+    agent = _make_agent("web_search", max_iterations=3, config=_hard_stop_config())
+    agent.client.chat.completions.create.side_effect = _always_calls_tools()
     agent._disable_streaming = True
     with (
         patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
