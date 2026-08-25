@@ -17,6 +17,7 @@ import type { AddressInfo } from 'node:net'
 import { afterAll, describe, expect, it } from 'vitest'
 
 import {
+  createDeadlineSignal,
   destroyKeepaliveAgents,
   downloadAgentFor,
   isIdempotentMethod,
@@ -214,6 +215,79 @@ describe('withRetry', () => {
     ).rejects.toThrow('500')
     expect(attempts).toBe(1)
   })
+})
+
+describe('createDeadlineSignal', () => {
+  it('provides a signal and a dispose function that clears the timer', () => {
+    const { signal, dispose } = createDeadlineSignal(50)
+
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal.aborted).toBe(false)
+
+    dispose()
+  })
+
+  it('aborts the signal after the budget expires', async () => {
+    const { signal, dispose } = createDeadlineSignal(5)
+
+    expect(signal.aborted).toBe(false)
+
+    await new Promise(r => setTimeout(r, 20))
+
+    expect(signal.aborted).toBe(true)
+
+    dispose()
+  })
+
+  it('dispose before deadline keeps the signal live', async () => {
+    const { signal, dispose } = createDeadlineSignal(10_000)
+
+    expect(signal.aborted).toBe(false)
+
+    dispose()
+
+    await new Promise(r => setTimeout(r, 20))
+
+    expect(signal.aborted).toBe(false)
+  })
+
+  it('dispose after deadline fired is safe (no-op on already-fired timer)', async () => {
+    const { signal, dispose } = createDeadlineSignal(5)
+
+    await new Promise(r => setTimeout(r, 20))
+
+    expect(signal.aborted).toBe(true)
+
+    expect(() => dispose()).not.toThrow()
+  })
+
+  it('signal forwarded into http.request aborts the socket', async () => {
+    const server = http.createServer(() => {})
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+
+    const address = server.address() as AddressInfo
+    const { signal, dispose } = createDeadlineSignal(200)
+
+    try {
+      const promise = new Promise((resolve, reject) => {
+        const req = http.get(`http://127.0.0.1:${address.port}`, { signal }, resolve)
+
+        req.on('error', reject)
+      })
+
+      await expect(promise).rejects.toMatchObject({ code: 'ABORT_ERR' })
+      expect(signal.aborted).toBe(true)
+    } finally {
+      dispose()
+      await new Promise<void>((resolve, reject) => {
+        server.close(error => (error ? reject(error) : resolve()))
+      })
+    }
+  }, 5_000)
 })
 
 describe('keep-alive agent pools', () => {

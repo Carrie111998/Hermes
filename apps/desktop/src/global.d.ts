@@ -175,7 +175,10 @@ declare global {
       sshConfigHosts: () => Promise<DesktopSshHostsResult>
       sshResolveHost: (host: string) => Promise<DesktopSshResolveResult>
       probeConnectionConfig: (remoteUrl: string) => Promise<DesktopConnectionProbeResult>
-      oauthLoginConnectionConfig: (remoteUrl: string) => Promise<DesktopOauthLoginResult>
+      oauthLoginConnectionConfig: (
+        remoteUrl: string,
+        options?: DesktopOauthLoginOptions
+      ) => Promise<DesktopOauthLoginResult>
       oauthLogoutConnectionConfig: (remoteUrl: string) => Promise<DesktopOauthLogoutResult>
       // Hermes Cloud: one portal login powers discovery + silent per-agent
       // sign-in (cloud-auto-discovery Phase 3).
@@ -957,10 +960,31 @@ export interface DesktopConnectionProbeResult {
   error: string | null
 }
 
+export interface DesktopOauthLoginOptions {
+  /** When true, force the embedded-webview cookie flow, skipping provider
+   *  discovery and the native RFC 8252 PKCE flow entirely. Useful for
+   *  corporate proxies that block loopback, or as a user-driven retry after
+   *  a native login failure. */
+  forceEmbedded?: boolean
+}
+
+export interface NativeOauthError {
+  /** Stable machine-readable code for the failure class. */
+  code: string
+  /** Human-readable description (safe for display). */
+  message: string
+  /** Native failures can be retried through the embedded-webview flow. */
+  canRetryEmbedded: true
+}
+
 export interface DesktopOauthLoginResult {
   ok: boolean
   baseUrl: string
   connected: boolean
+  /** Structured failure detail when ok is false and the native PKCE flow
+   *  was the selected strategy. Absent for embedded-webview attempts and
+   *  for successful logins. */
+  error?: NativeOauthError
 }
 
 export interface DesktopOauthLogoutResult {

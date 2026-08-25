@@ -29,6 +29,7 @@ export function FirstRunRemoteForm({ onBack }: FirstRunRemoteFormProps) {
   const [probe, setProbe] = useState<DesktopConnectionProbeResult | null>(null)
   const [oauthConnected, setOauthConnected] = useState(false)
   const [signingIn, setSigningIn] = useState(false)
+  const [retryEmbeddedSignIn, setRetryEmbeddedSignIn] = useState(false)
   const [testing, setTesting] = useState(false)
   const [applying, setApplying] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -39,9 +40,14 @@ export function FirstRunRemoteForm({ onBack }: FirstRunRemoteFormProps) {
 
   const trimmedUrl = coerceRemoteUrlScheme(remoteUrl)
 
+  useEffect(() => {
+    setRetryEmbeddedSignIn(false)
+  }, [trimmedUrl])
+
   const invalidateTest = useCallback(() => {
     testSeq.current += 1
     setTesting(false)
+    setRetryEmbeddedSignIn(false)
     setError(null)
     setSuccess(null)
     setLastTestedPayloadKey(null)
@@ -118,7 +124,7 @@ export function FirstRunRemoteForm({ onBack }: FirstRunRemoteFormProps) {
   payloadKeyRef.current = currentPayloadKey
   const canApply = lastTestedPayloadKey === currentPayloadKey
 
-  const signIn = async () => {
+  const signIn = async (forceEmbedded = false) => {
     if (!trimmedUrl) {
       setError(copy.enterUrlFirst)
 
@@ -133,14 +139,21 @@ export function FirstRunRemoteForm({ onBack }: FirstRunRemoteFormProps) {
       // backing out must still allow local install without leaving a remote
       // connection selected. The login IPC accepts the raw URL and stores only
       // its OAuth cookies; config is persisted once the user applies.
-      const result = await window.hermesDesktop.oauthLoginConnectionConfig(trimmedUrl)
+      const result = forceEmbedded
+        ? await window.hermesDesktop.oauthLoginConnectionConfig(trimmedUrl, { forceEmbedded: true })
+        : await window.hermesDesktop.oauthLoginConnectionConfig(trimmedUrl)
+
       invalidateTest()
       setOauthConnected(Boolean(result.connected))
 
-      if (!result.connected) {
-        setError(copy.signInIncomplete)
+      if (result.connected) {
+        setRetryEmbeddedSignIn(false)
+      } else {
+        setRetryEmbeddedSignIn(!forceEmbedded && Boolean(result.error?.canRetryEmbedded))
+        setError(result.error?.message || copy.signInIncomplete)
       }
     } catch (err) {
+      setRetryEmbeddedSignIn(false)
       setError(errorMessage(err))
     } finally {
       setSigningIn(false)
@@ -278,9 +291,13 @@ export function FirstRunRemoteForm({ onBack }: FirstRunRemoteFormProps) {
                     {copy.connected}
                   </div>
                 ) : (
-                  <Button disabled={signingIn || applying} onClick={() => void signIn()} size="sm">
+                  <Button disabled={signingIn || applying} onClick={() => void signIn(retryEmbeddedSignIn)} size="sm">
                     {signingIn ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
-                    {isPasswordProvider ? copy.signIn : copy.signInWith(providerLabel)}
+                    {retryEmbeddedSignIn
+                      ? copy.tryEmbeddedSignIn
+                      : isPasswordProvider
+                        ? copy.signIn
+                        : copy.signInWith(providerLabel)}
                   </Button>
                 )}
               </div>

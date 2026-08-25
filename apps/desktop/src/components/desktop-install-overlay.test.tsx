@@ -516,6 +516,60 @@ describe('DesktopInstallOverlay first-run setup', () => {
     })
   })
 
+  it('shows a native error and retries through embedded sign-in only after a second click', async () => {
+    const gatewayUrl = 'https://gateway.example.com/hermes'
+
+    const desktop = installDesktopMock(
+      bootstrapState({
+        setupChoice: { platform: 'linux', activeRoot: '/home/me/.hermes/hermes-agent' }
+      })
+    )
+
+    desktop.probeConnectionConfig.mockResolvedValue({
+      authMode: 'oauth',
+      baseUrl: gatewayUrl,
+      error: null,
+      providers: [{ displayName: 'GitHub', name: 'github', supportsPassword: false }],
+      reachable: true,
+      version: '0.17.0'
+    })
+    desktop.oauthLoginConnectionConfig
+      .mockResolvedValueOnce({
+        ok: false,
+        baseUrl: gatewayUrl,
+        connected: false,
+        error: {
+          code: 'native_login_timeout',
+          message: 'Loopback callback timed out',
+          canRetryEmbedded: true
+        }
+      })
+      .mockResolvedValueOnce({ ok: true, baseUrl: gatewayUrl, connected: false })
+
+    render(<DesktopInstallOverlay />)
+
+    fireEvent.click(await screen.findByText('Connect to existing Hermes'))
+    fireEvent.change(await screen.findByPlaceholderText('https://gateway.example.com/hermes'), {
+      target: { value: gatewayUrl }
+    })
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 550))
+    })
+
+    fireEvent.click(await screen.findByText('Sign in with GitHub'))
+
+    expect(await screen.findByText('Loopback callback timed out')).toBeTruthy()
+    expect(desktop.oauthLoginConnectionConfig).toHaveBeenCalledTimes(1)
+    expect(desktop.oauthLoginConnectionConfig).toHaveBeenNthCalledWith(1, gatewayUrl)
+
+    fireEvent.click(screen.getByText('Try embedded sign-in'))
+
+    await waitFor(() => expect(desktop.oauthLoginConnectionConfig).toHaveBeenCalledTimes(2))
+    expect(desktop.oauthLoginConnectionConfig).toHaveBeenNthCalledWith(2, gatewayUrl, { forceEmbedded: true })
+    expect(await screen.findByText('Sign in with GitHub')).toBeTruthy()
+  })
+
   it('offers remote connection from the unsupported packaged install screen', async () => {
     const desktop = installDesktopMock(
       bootstrapState({

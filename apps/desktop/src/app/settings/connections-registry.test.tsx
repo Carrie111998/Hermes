@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopConnectionsRegistry } from '@/global'
+import { $notifications } from '@/store/notifications'
 import { $connection } from '@/store/session'
 
 import {
@@ -18,6 +19,8 @@ const remove = vi.fn()
 const setLaunchMode = vi.fn()
 const setPrimary = vi.fn()
 const test = vi.fn()
+const oauthLoginConnectionConfig = vi.fn()
+const probeConnectionConfig = vi.fn()
 
 const registry: DesktopConnectionsRegistry = {
   connections: [
@@ -38,6 +41,7 @@ const registry: DesktopConnectionsRegistry = {
 }
 
 beforeEach(() => {
+  $notifications.set([])
   $connection.set({
     baseUrl: 'http://homelab.lan:9119',
     connectionId: 'homelab',
@@ -55,9 +59,14 @@ beforeEach(() => {
   setLaunchMode.mockResolvedValue({ ok: true, registry: { ...registry, launchMode: 'last-used' } })
   setPrimary.mockResolvedValue({ ok: true, registry: { ...registry, primary: 'homelab' } })
   test.mockResolvedValue({ ok: true, reachable: true })
+  probeConnectionConfig.mockResolvedValue({ providers: [] })
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
-    value: { connections: { list, remove, save, setLaunchMode, setPrimary, test } }
+    value: {
+      connections: { list, remove, save, setLaunchMode, setPrimary, test },
+      oauthLoginConnectionConfig,
+      probeConnectionConfig
+    }
   })
 })
 
@@ -102,6 +111,46 @@ describe('ConnectionsRegistrySection', () => {
       label: 'Spark box',
       url: 'http://spark.lan:9119'
     })
+  })
+
+  it('offers an explicit embedded retry after native sign-in fails', async () => {
+    const gatewayUrl = 'https://retry.example.test'
+
+    oauthLoginConnectionConfig
+      .mockResolvedValueOnce({
+        ok: false,
+        baseUrl: gatewayUrl,
+        connected: false,
+        error: {
+          code: 'native_login_timeout',
+          message: 'Loopback callback timed out',
+          canRetryEmbedded: true
+        }
+      })
+      .mockResolvedValueOnce({ ok: true, baseUrl: gatewayUrl, connected: false })
+
+    render(<ConnectionsRegistrySection />)
+
+    await waitFor(() => expect(screen.getByText('Homelab')).toBeTruthy())
+    fireEvent.click(screen.getByText('Add connection'))
+    fireEvent.change(screen.getByPlaceholderText('Homelab'), { target: { value: 'Retry gateway' } })
+    fireEvent.change(screen.getByPlaceholderText('http://homelab.lan:9119'), {
+      target: { value: gatewayUrl }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'OAuth' }))
+    fireEvent.click(await screen.findByRole('button', { name: /sign in/i }))
+
+    await waitFor(() => expect(oauthLoginConnectionConfig).toHaveBeenCalledTimes(1))
+    expect(oauthLoginConnectionConfig).toHaveBeenNthCalledWith(1, gatewayUrl)
+
+    const notification = $notifications.get().find(item => item.action?.label === 'Try embedded sign-in')
+
+    expect(notification?.message).toBe('Loopback callback timed out')
+    act(() => notification?.action?.onClick())
+
+    await waitFor(() => expect(oauthLoginConnectionConfig).toHaveBeenCalledTimes(2))
+    expect(oauthLoginConnectionConfig).toHaveBeenNthCalledWith(2, gatewayUrl, { forceEmbedded: true })
+    expect(save).not.toHaveBeenCalled()
   })
 
   it('offers every kind on create and disables Local while the managed entry exists', async () => {

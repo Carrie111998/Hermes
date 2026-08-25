@@ -31,7 +31,13 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
+import {
+  createDeadlineSignal,
+  destroyKeepaliveAgents,
+  downloadAgentFor,
+  jsonAgentFor,
+  withRetry
+} from './api-transport'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
   type BackendOutputTail,
@@ -5076,7 +5082,8 @@ function fetchPublicJson(url, options: any = {}) {
               ...(options.headers || {}),
               'Content-Type': 'application/json',
               ...(body ? { 'Content-Length': String(body.length) } : {})
-            }
+            },
+            signal: options.signal
           },
           res => {
             const chunks = []
@@ -5987,19 +5994,25 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
   let providers = []
 
   try {
-    const body = (await fetchPublicJson(
-      `${baseUrl}/api/auth/providers`,
-      requestOptionsWithHeaders({ timeoutMs: 8_000 }, headers)
-    )) as any
+    const { signal, dispose } = createDeadlineSignal(8_000)
 
-    if (Array.isArray(body?.providers)) {
-      providers = body.providers
-        .filter(p => p && typeof p === 'object')
-        .map(p => ({ name: String(p.name || ''), supportsPassword: Boolean(p.supports_password) }))
-        .filter(p => p.name)
+    try {
+      const body = (await fetchPublicJson(
+        `${baseUrl}/api/auth/providers`,
+        requestOptionsWithHeaders({ timeoutMs: 8_000, signal }, headers)
+      )) as any
+
+      if (Array.isArray(body?.providers)) {
+        providers = body.providers
+          .filter(p => p && typeof p === 'object')
+          .map(p => ({ name: String(p.name || ''), supportsPassword: Boolean(p.supports_password) }))
+          .filter(p => p.name)
+      }
+
+      gatewayAuthProvidersCache.set(baseUrl, providers)
+    } finally {
+      dispose()
     }
-
-    gatewayAuthProvidersCache.set(baseUrl, providers)
   } catch {
     // Optional metadata — an unreadable list keeps the strict guard.
   }
@@ -13447,19 +13460,56 @@ async function fetchJsonForBackend(
 }
 
 ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
-ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {
-  // Capability-gated login (RFC 8252). Probe the gateway's public /api/status
-  // for supported auth_flows and /api/auth/providers for provider capabilities:
-  //   - all providers support password → always use the embedded login window
-  //     (password providers require the dashboard login form; native PKCE
-  //     can never complete for that provider shape)
-  //   - advertises "native_pkce" AND at least one non-password provider →
-  //     run the system-browser + loopback + PKCE flow
-  //   - older gateway with no provider metadata → fall back to the auth_flows
-  //     check (existing compatibility)
-  //   - a failed native login reports the error rather than auto-falling back
-  //     to the embedded flow — one sign-in action opens at most one window.
+
+function codeForNativeOauthError(error: Error): { code: string; message: string; canRetryEmbedded: true } {
+  const msg = error.message || String(error)
+
+  if (/timed out/i.test(msg)) {
+    return { code: 'native_login_timeout', message: msg, canRetryEmbedded: true }
+  }
+
+  if (/could not open.*browser/i.test(msg)) {
+    return { code: 'native_login_browser_failed', message: msg, canRetryEmbedded: true }
+  }
+
+  if (/state mismatch/i.test(msg)) {
+    return { code: 'native_login_state_mismatch', message: msg, canRetryEmbedded: true }
+  }
+
+  if (/gateway rejected/i.test(msg)) {
+    return { code: 'native_login_gateway_rejected', message: msg, canRetryEmbedded: true }
+  }
+
+  if (/missing authorization code/i.test(msg)) {
+    return { code: 'native_login_missing_code', message: msg, canRetryEmbedded: true }
+  }
+
+  if (/missing access_token/i.test(msg)) {
+    return { code: 'native_login_token_exchange_failed', message: msg, canRetryEmbedded: true }
+  }
+
+  return { code: 'native_login_failed', message: msg, canRetryEmbedded: true }
+}
+
+ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, options) => {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+  const forceEmbedded = options && typeof options === 'object' && options.forceEmbedded === true
+
+  if (forceEmbedded) {
+    try {
+      await openOauthLoginWindow(baseUrl)
+
+      const connected = await hasOauthSessionCookie(baseUrl)
+
+      if (connected) {
+        remoteReauthFailure = null
+      }
+
+      return { ok: true, baseUrl, connected }
+    } catch {
+      return { ok: false, baseUrl, connected: false }
+    }
+  }
 
   let statusBody: any = null
 
@@ -13490,18 +13540,22 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
 
       return { ok: true, baseUrl, connected: true }
     } catch (error) {
-      rememberLog(
-        `[native-oauth] native login failed (${
-          error instanceof Error ? error.message : String(error)
-        })`
-      )
+      const err = error instanceof Error ? error : new Error(String(error))
 
-      return { ok: false, error: error instanceof Error ? error.message : String(error), connected: false }
+      rememberLog(`[native-oauth] native login failed (${err.message})`)
+
+      const structured = codeForNativeOauthError(err)
+
+      return { ok: false, baseUrl, connected: false, error: structured }
     }
   }
 
   // Legacy embedded-webview cookie flow.
-  await openOauthLoginWindow(baseUrl)
+  try {
+    await openOauthLoginWindow(baseUrl)
+  } catch {
+    return { ok: false, baseUrl, connected: false }
+  }
 
   const connected = await hasOauthSessionCookie(baseUrl)
 

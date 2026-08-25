@@ -126,6 +126,7 @@ export const ar = defineLocale({
       signedInMessage: 'جار إعادة الاتصال بالبوابة البعيدة...',
       signInIncompleteTitle: 'تسجيل الدخول غير مكتمل',
       signInIncompleteMessage: 'أغلقت نافذة تسجيل الدخول قبل اكتمال المصادقة.',
+      tryEmbeddedSignIn: 'جرّب تسجيل الدخول المضمّن',
       signInFailed: 'فشل تسجيل الدخول',
       signInToRemoteGateway: 'تسجيل الدخول للبوابة البعيدة',
       signInWithProvider: provider => `تسجيل الدخول عبر ${provider}`,
@@ -2091,7 +2092,8 @@ export const ar = defineLocale({
     transcriptSaved: 'تم حفظ النص الكامل في',
     copiedOutput: 'تم النسخ!',
     copyOutput: 'نسخ المخرجات',
-    reloadRetry: 'إعادة التحميل وإعادة المحاولة'
+    reloadRetry: 'إعادة التحميل وإعادة المحاولة',
+    tryEmbeddedSignIn: 'جرّب تسجيل الدخول المضمّن'
   },
   onboarding: {
     headerTitle: 'لنُعِدّ لك Hermes Agent',

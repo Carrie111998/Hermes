@@ -167,7 +167,30 @@ async function withRetry(makeAttempt, options: any = {}) {
   throw lastError
 }
 
+/**
+ * One-shot wall-clock deadline: an AbortController whose signal the caller
+ * forwards into a Node http(s) request so the socket is truly aborted when the
+ * total budget expires, and the timer is cleared in finally so success does
+ * not leak a pending timeout.
+ *
+ * Typical use:
+ *
+ *   const { signal, dispose } = createDeadlineSignal(8_000)
+ *   try {
+ *     const body = await fetchJson(url, token, { signal, ...other })
+ *   } finally {
+ *     dispose()
+ *   }
+ */
+function createDeadlineSignal(totalMs: number): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), totalMs)
+
+  return { signal: controller.signal, dispose: () => clearTimeout(timer) }
+}
+
 export {
+  createDeadlineSignal,
   destroyKeepaliveAgents,
   downloadAgentFor,
   isIdempotentMethod,

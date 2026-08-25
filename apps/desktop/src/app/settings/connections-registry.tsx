@@ -325,38 +325,50 @@ export function ConnectionsRegistrySection() {
   // it mints (native PKCE bearer tokens, or the legacy session cookies). This
   // is the same IPC the first-run form and the gateway panel use — the
   // registry editor simply had no affordance to reach it.
-  const signInOauth = useCallback(async () => {
-    if (!editorUrl) {
-      notify({ kind: 'warning', title: t.settings.gateway.authTitle, message: t.settings.gateway.enterUrlFirst })
+  const signInOauth = useCallback(
+    async (forceEmbedded = false, targetUrl = editorUrl) => {
+      if (!targetUrl) {
+        notify({ kind: 'warning', title: t.settings.gateway.authTitle, message: t.settings.gateway.enterUrlFirst })
 
-      return
-    }
-
-    setSigningIn(true)
-
-    try {
-      const result = await window.hermesDesktop.oauthLoginConnectionConfig(editorUrl)
-
-      setOauthConnected(Boolean(result.connected))
-
-      if (result.connected) {
-        notify({
-          title: t.settings.gateway.signedIn,
-          message: t.settings.gateway.connectedTo(authProviderShape.providerLabel)
-        })
-      } else {
-        notify({
-          kind: 'warning',
-          title: t.boot.failure.signInIncompleteTitle,
-          message: t.boot.failure.signInIncompleteMessage
-        })
+        return
       }
-    } catch (err) {
-      notifyError(err, t.settings.gateway.signInFailed)
-    } finally {
-      setSigningIn(false)
-    }
-  }, [authProviderShape.providerLabel, editorUrl, t])
+
+      setSigningIn(true)
+
+      try {
+        const result = forceEmbedded
+          ? await window.hermesDesktop.oauthLoginConnectionConfig(targetUrl, { forceEmbedded: true })
+          : await window.hermesDesktop.oauthLoginConnectionConfig(targetUrl)
+
+        setOauthConnected(Boolean(result.connected))
+
+        if (result.connected) {
+          notify({
+            title: t.settings.gateway.signedIn,
+            message: t.settings.gateway.connectedTo(authProviderShape.providerLabel)
+          })
+        } else {
+          notify({
+            kind: 'warning',
+            title: t.boot.failure.signInIncompleteTitle,
+            message: result.error?.message || t.boot.failure.signInIncompleteMessage,
+            action:
+              !forceEmbedded && result.error?.canRetryEmbedded
+                ? {
+                    label: t.boot.failure.tryEmbeddedSignIn,
+                    onClick: () => void signInOauth(true, targetUrl)
+                  }
+                : undefined
+          })
+        }
+      } catch (err) {
+        notifyError(err, t.settings.gateway.signInFailed)
+      } finally {
+        setSigningIn(false)
+      }
+    },
+    [authProviderShape.providerLabel, editorUrl, t]
+  )
 
   const load = useCallback(async () => {
     if (!bridge) {

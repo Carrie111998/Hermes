@@ -541,10 +541,10 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   // OAuth sign-in: persist the URL + oauth mode first (so the saved config has
   // the URL the login window needs), then open the gateway login window and
   // refresh the connection status from the saved config once it completes.
-  const signIn = async () => {
+  const signIn = async (forceEmbedded = false, targetUrl = trimmedUrl) => {
     const seq = ++signingSeq.current
 
-    if (!trimmedUrl) {
+    if (!targetUrl) {
       notify({ kind: 'warning', title: g.incompleteTitle, message: g.enterUrlFirst })
 
       return
@@ -553,21 +553,25 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     setSigningIn(true)
 
     try {
-      // Save (don't apply/restart) so the login window has a URL to use and the
-      // oauth mode is persisted, without yet flipping the live connection.
-      const saved = await window.hermesDesktop.saveConnectionConfig({
-        mode: state.mode,
-        remoteAuthMode: 'oauth',
-        remoteUrl: trimmedUrl
-      })
+      if (!forceEmbedded) {
+        // Save (don't apply/restart) so the login window has a URL to use and the
+        // oauth mode is persisted, without yet flipping the live connection.
+        const saved = await window.hermesDesktop.saveConnectionConfig({
+          mode: state.mode,
+          remoteAuthMode: 'oauth',
+          remoteUrl: targetUrl
+        })
 
-      if (seq !== signingSeq.current) {
-        return
+        if (seq !== signingSeq.current) {
+          return
+        }
+
+        acceptSavedConfig(saved)
       }
 
-      acceptSavedConfig(saved)
-
-      const result = await window.hermesDesktop.oauthLoginConnectionConfig(trimmedUrl)
+      const result = forceEmbedded
+        ? await window.hermesDesktop.oauthLoginConnectionConfig(targetUrl, { forceEmbedded: true })
+        : await window.hermesDesktop.oauthLoginConnectionConfig(targetUrl)
 
       if (seq !== signingSeq.current) {
         return
@@ -581,7 +585,14 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
         notify({
           kind: 'warning',
           title: t.boot.failure.signInIncompleteTitle,
-          message: t.boot.failure.signInIncompleteMessage
+          message: result.error?.message || t.boot.failure.signInIncompleteMessage,
+          action:
+            !forceEmbedded && result.error?.canRetryEmbedded
+              ? {
+                  label: t.boot.failure.tryEmbeddedSignIn,
+                  onClick: () => void signIn(true, targetUrl)
+                }
+              : undefined
         })
       }
     } catch (err) {

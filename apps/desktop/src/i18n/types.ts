@@ -157,6 +157,7 @@ export interface Translations {
       signedInMessage: string
       signInIncompleteTitle: string
       signInIncompleteMessage: string
+      tryEmbeddedSignIn: string
       signInFailed: string
       signInToRemoteGateway: string
       signInWithProvider: (provider: string) => string
@@ -2235,6 +2236,7 @@ export interface Translations {
     signInWith: (provider: string) => string
     enterUrlFirst: string
     signInIncomplete: string
+    tryEmbeddedSignIn: string
     tokenTitle: string
     tokenDesc: string
     pasteSessionToken: string

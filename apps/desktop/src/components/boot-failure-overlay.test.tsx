@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
+import { $notifications } from '@/store/notifications'
 import { $desktopOnboarding } from '@/store/onboarding'
 
 import { BootFailureOverlay } from './boot-failure-overlay'
@@ -48,6 +49,7 @@ const remoteToken = {
 }
 
 beforeEach(() => {
+  $notifications.set([])
   $desktopOnboarding.set({
     configured: true,
     flow: { status: 'idle' },
@@ -113,10 +115,23 @@ describe('BootFailureOverlay', () => {
     }
   })
 
-  it('clears and signs in only the failed gateway once', async () => {
+  it('offers an embedded retry without clearing the failed gateway twice', async () => {
     const gatewayUrl = 'http://100.116.104.53:9191'
     const logout = vi.fn().mockResolvedValue({ ok: true, connected: false })
-    const login = vi.fn().mockResolvedValue({ ok: true, connected: false })
+
+    const login = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        baseUrl: gatewayUrl,
+        connected: false,
+        error: {
+          code: 'native_login_timeout',
+          message: 'Loopback callback timed out',
+          canRetryEmbedded: true
+        }
+      })
+      .mockResolvedValueOnce({ ok: true, baseUrl: gatewayUrl, connected: false })
 
     const restore = stubDesktop(
       {
@@ -141,6 +156,15 @@ describe('BootFailureOverlay', () => {
       expect(logout).toHaveBeenCalledTimes(1)
       expect(logout).toHaveBeenCalledWith(gatewayUrl)
       expect(login).toHaveBeenCalledTimes(1)
+
+      const notification = $notifications.get().find(item => item.action?.label === 'Try embedded sign-in')
+
+      expect(notification?.message).toBe('Loopback callback timed out')
+      act(() => notification?.action?.onClick())
+
+      await waitFor(() => expect(login).toHaveBeenCalledTimes(2))
+      expect(login).toHaveBeenNthCalledWith(2, gatewayUrl, { forceEmbedded: true })
+      expect(logout).toHaveBeenCalledTimes(1)
     } finally {
       restore()
     }

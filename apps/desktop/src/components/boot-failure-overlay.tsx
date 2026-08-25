@@ -167,16 +167,21 @@ export function BootFailureOverlay() {
   // (username/password form or OAuth redirect — the desktop drives both). On a
   // successful sign-in the cookie is re-established; reload so boot mints a fresh
   // ticket against a live session without disturbing other saved gateways.
-  const signInRemote = async () => {
-    if (!remoteReauth) {
+  const signInRemote = async (forceEmbedded = false, targetUrl = remoteReauth?.url) => {
+    if (!targetUrl) {
       return
     }
 
     setBusy('signin')
 
     try {
-      await window.hermesDesktop?.oauthLogoutConnectionConfig?.(remoteReauth.url)
-      const result = await window.hermesDesktop?.oauthLoginConnectionConfig(remoteReauth.url)
+      if (!forceEmbedded) {
+        await window.hermesDesktop?.oauthLogoutConnectionConfig?.(targetUrl)
+      }
+
+      const result = forceEmbedded
+        ? await window.hermesDesktop?.oauthLoginConnectionConfig(targetUrl, { forceEmbedded: true })
+        : await window.hermesDesktop?.oauthLoginConnectionConfig(targetUrl)
 
       if (result?.connected) {
         notify({ kind: 'success', title: t.boot.failure.signedInTitle, message: t.boot.failure.signedInMessage })
@@ -188,7 +193,14 @@ export function BootFailureOverlay() {
       notify({
         kind: 'warning',
         title: t.boot.failure.signInIncompleteTitle,
-        message: t.boot.failure.signInIncompleteMessage
+        message: result?.error?.message || t.boot.failure.signInIncompleteMessage,
+        action:
+          !forceEmbedded && result?.error?.canRetryEmbedded
+            ? {
+                label: t.boot.failure.tryEmbeddedSignIn,
+                onClick: () => void signInRemote(true, targetUrl)
+              }
+            : undefined
       })
     } catch (err) {
       notifyError(err, t.boot.failure.signInFailed)
