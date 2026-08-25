@@ -502,10 +502,16 @@ def cron_command(args):
             args.job_id,
             "Paused",
             reason=_clean_reason(getattr(args, "reason", None)),
+            caller="hermes_cli:cron_pause",
         )
 
     if subcmd == "resume":
-        return _job_action("resume", args.job_id, "Resumed")
+        return _job_action(
+            "resume",
+            args.job_id,
+            "Resumed",
+            caller="hermes_cli:cron_resume",
+        )
 
     if subcmd == "run":
         return _job_action(

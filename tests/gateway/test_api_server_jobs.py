@@ -444,7 +444,12 @@ class TestPauseJob:
                 data = await resp.json()
                 assert data["job"] == paused_job
                 assert data["job"]["enabled"] is False
-                mock_pause.assert_called_once_with(VALID_JOB_ID)
+                # The caller string is the whole point of the route
+                # threading it: without it the CRON_PAUSED event records an
+                # anonymous pause and the HTTP surface is unattributable.
+                mock_pause.assert_called_once_with(
+                    VALID_JOB_ID, caller="http_api:api_server"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +474,9 @@ class TestResumeJob:
                 data = await resp.json()
                 assert data["job"] == resumed_job
                 assert data["job"]["enabled"] is True
-                mock_resume.assert_called_once_with(VALID_JOB_ID)
+                mock_resume.assert_called_once_with(
+                    VALID_JOB_ID, caller="http_api:api_server"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -651,8 +658,9 @@ class TestCronUnavailable:
         app = _create_app(adapter)
         captured = {}
 
-        def _plain_pause(job_id):
+        def _plain_pause(job_id, caller=None):
             captured["job_id"] = job_id
+            captured["caller"] = caller
             return SAMPLE_JOB
 
         async with TestClient(TestServer(app)) as cli:
@@ -664,6 +672,7 @@ class TestCronUnavailable:
                 data = await resp.json()
                 assert data["job"] == SAMPLE_JOB
                 assert captured["job_id"] == VALID_JOB_ID
+                assert captured["caller"] == "http_api:api_server"
 
     @pytest.mark.asyncio
     async def test_list_handler_no_self_binding(self, adapter):

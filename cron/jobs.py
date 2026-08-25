@@ -1151,9 +1151,26 @@ def pause_jobs_cas(
     *,
     reason: str,
     dispatch_barrier: Any,
+    caller: str,
 ) -> Dict[str, Any]:
-    """Atomically pause eligible exact rows under a retained dispatch barrier."""
+    """Atomically pause eligible exact rows under a retained dispatch barrier.
+
+    ``caller`` is required rather than optional, unlike ``pause_job``'s: this
+    is the bulk containment path, it has no production caller yet, and the
+    cheapest moment to make attribution mandatory is before it gains one. A
+    containment sweep that pauses eight rows at once is precisely the shape
+    that was unattributable in the 2026-08-24/25 churn.
+
+    Emits one CRON_PAUSED per row that actually transitioned, AFTER the jobs
+    lock is released. Not inside it: the event bus is its own SQLite database
+    with its own lock, and taking it while holding both the cron jobs lock and
+    a retained dispatch barrier would invent a lock-ordering hazard purely for
+    audit. The returned proof dict is the durable record either way — the
+    events are the operator-visible half.
+    """
     barrier_proof = _require_dispatch_barrier(dispatch_barrier)
+    if not isinstance(caller, str) or not caller.strip():
+        raise ValueError("pause caller must be a non-empty string")
     requested = _validate_unique_job_names(names)
     if not isinstance(names, list):
         raise ValueError("pause job names must be a list")
@@ -1189,7 +1206,7 @@ def pause_jobs_cas(
         if durable != after:
             raise RuntimeError("scheduler pause durable exact readback mismatch")
 
-        return {
+        result = {
             "schema_version": 1,
             "complete": True,
             "source": "cron.jobs",
@@ -1208,6 +1225,25 @@ def pause_jobs_cas(
             },
         }
 
+    changed = set(result["changed_job_ids"])
+    before_by_id = {str(row.get("id")): row for row in before}
+    for row in after:
+        row_id = str(row.get("id"))
+        if row_id not in changed:
+            continue
+        emit_cron_lifecycle_safe(
+            action="paused",
+            job_id=row_id,
+            job_name=row.get("name") or row_id,
+            caller=caller,
+            reason=reason,
+            paused_at=row.get("paused_at"),
+            previous_state=(before_by_id.get(row_id) or {}).get("state"),
+            new_state=row.get("state"),
+        )
+
+    return result
+
 
 def restore_jobs_cas(
     *,
@@ -1215,9 +1251,24 @@ def restore_jobs_cas(
     target_rows: List[Dict[str, Any]],
     dependency_order: List[str],
     dispatch_barrier: Any,
+    caller: str,
 ) -> Dict[str, Any]:
-    """Atomically restore exact rows under the retained dispatch barrier."""
+    """Atomically restore exact rows under the retained dispatch barrier.
+
+    Emits one CRON_RESUMED per row that this restore actually un-pauses, after
+    the jobs lock is released — see ``pause_jobs_cas`` on both the required
+    ``caller`` and why the emit sits outside the lock.
+
+    "Actually un-pauses" is narrower than "restored": a restore may legally
+    replace a paused row with another paused row (the containment fields are
+    the only ones allowed to differ, and rolling back to a still-paused
+    snapshot is a valid target). Only a row that was held out of the schedule
+    before and is runnable after gets an event, so the CRON_PAUSED/CRON_RESUMED
+    pairing stays truthful rather than merely symmetric.
+    """
     barrier_proof = _require_dispatch_barrier(dispatch_barrier)
+    if not isinstance(caller, str) or not caller.strip():
+        raise ValueError("restore caller must be a non-empty string")
     if not isinstance(expected_paused_rows, list) or not expected_paused_rows:
         raise ValueError("expected paused rows must be a non-empty list")
     if not isinstance(target_rows, list) or not target_rows:
@@ -1279,7 +1330,7 @@ def restore_jobs_cas(
             copy.deepcopy(row) for row in durable_scope if row["name"] in set(target_names)
         ]
 
-        return {
+        result = {
             "schema_version": 1,
             "complete": True,
             "source": "cron.jobs",
@@ -1297,6 +1348,26 @@ def restore_jobs_cas(
                 "durable_readback": _canonical_job_rows_digest(durable_scope),
             },
         }
+
+    observed_by_id = {str(row.get("id")): row for row in observed}
+    for row in durable_targets:
+        row_id = str(row.get("id"))
+        was = observed_by_id.get(row_id)
+        if was is None or not _is_paused(was) or _is_paused(row):
+            continue
+        emit_cron_lifecycle_safe(
+            action="resumed",
+            job_id=row_id,
+            job_name=row.get("name") or row_id,
+            caller=caller,
+            reason=was.get("paused_reason"),
+            paused_at=was.get("paused_at"),
+            previous_state=was.get("state"),
+            new_state=row.get("state"),
+            next_run_at=row.get("next_run_at"),
+        )
+
+    return result
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -1855,7 +1926,9 @@ def _unpause_updates(job: Dict[str, Any]) -> Dict[str, Any]:
 
     Shared by ``resume_job`` and ``trigger_job``, the two paths that revive a
     paused job, so the field can never be coherent on one and lossy on the
-    other.
+    other. Both also emit CRON_RESUMED carrying the archived values, for the
+    same reason and with the same symmetry requirement — see
+    ``emit_cron_lifecycle_safe``.
     """
     updates: Dict[str, Any] = {"paused_at": None, "paused_reason": None}
 
@@ -1879,16 +1952,34 @@ def _unpause_updates(job: Dict[str, Any]) -> Dict[str, Any]:
     return updates
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def pause_job(
+    job_id: str,
+    reason: Optional[str] = None,
+    caller: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name.
 
     ``reason`` is the WHY, and it is worth passing: a paused job with no
     ``paused_reason`` is indistinguishable from one paused because it is
     broken, so the next reader has to guess whether resuming is safe.
+
+    ``caller`` is the WHO, and it goes on the CRON_PAUSED event rather than on
+    the job record — the record holds current state, the event holds the
+    transition. Like ``trigger_job``'s, it is optional for back-compat and
+    warns when omitted; every surface (CLI, console, LLM tool, both HTTP APIs)
+    passes its own fixed string.
     """
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    if caller is None:
+        logger.warning(
+            "pause_job called anonymously (caller=None) for job_id=%s name=%s "
+            "— postmortem attribution will be impossible. Pass an explicit "
+            "caller string.",
+            job_id, job.get("name"),
+        )
+    previous_state = job.get("state")
     normalized_reason = (reason or "").strip() or None
     updates: Dict[str, Any] = {
         "enabled": False,
@@ -1907,14 +1998,45 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     if "paused" in job:
         updates["paused"] = True
 
-    return update_job(job["id"], updates)
+    updated = update_job(job["id"], updates)
+
+    if updated is not None:
+        emit_cron_lifecycle_safe(
+            action="paused",
+            job_id=job["id"],
+            job_name=updated.get("name") or job.get("name") or job["id"],
+            caller=caller,
+            reason=normalized_reason,
+            paused_at=updated.get("paused_at") or updates["paused_at"],
+            previous_state=previous_state,
+            new_state=updated.get("state"),
+        )
+
+    return updated
 
 
-def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
+def resume_job(
+    job_id: str,
+    caller: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resume a paused job and compute the next future run from now.
+
+    Accepts a job ID or name. Emits CRON_RESUMED carrying the pause it is
+    ending — ``reason``/``paused_at`` on the event are the values being
+    retired, not new ones, so the pause and its resume can be joined from
+    either end of the pair. See ``pause_job`` on ``caller``.
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return None
+
+    if caller is None:
+        logger.warning(
+            "resume_job called anonymously (caller=None) for job_id=%s "
+            "name=%s — postmortem attribution will be impossible. Pass an "
+            "explicit caller string.",
+            job_id, job.get("name"),
+        )
 
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
@@ -1924,13 +2046,32 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
 
+    previous_state = job.get("state")
+    previous_paused_at = job.get("paused_at")
+    previous_paused_reason = job.get("paused_reason")
+
     updates: Dict[str, Any] = {
         "enabled": True,
         "state": "scheduled",
         "next_run_at": next_run_at,
     }
     updates.update(_unpause_updates(job))
-    return update_job(job["id"], updates)
+    updated = update_job(job["id"], updates)
+
+    if updated is not None:
+        emit_cron_lifecycle_safe(
+            action="resumed",
+            job_id=job["id"],
+            job_name=updated.get("name") or job.get("name") or job["id"],
+            caller=caller,
+            reason=previous_paused_reason,
+            paused_at=previous_paused_at,
+            previous_state=previous_state,
+            new_state=updated.get("state"),
+            next_run_at=updated.get("next_run_at"),
+        )
+
+    return updated
 
 
 def _get_event_bus():
@@ -2009,6 +2150,98 @@ def emit_cron_triggered_safe(
         )
 
 
+def _is_paused(job: Dict[str, Any]) -> bool:
+    """Is this job currently held out of the schedule?
+
+    Both spellings count. ``pause_job`` writes ``state: "paused"`` AND
+    ``enabled: False`` together, but a job disabled by some other path carries
+    only the second, and reviving it is the same operator-visible transition.
+
+    ``job.get("enabled", True)`` matches the due scan's default: a legacy
+    record with no ``enabled`` key is runnable, so treating its absence as
+    "disabled" would report a resume on every trigger of such a record.
+    """
+    return job.get("state") == "paused" or job.get("enabled", True) is not True
+
+
+def emit_cron_lifecycle_safe(
+    *,
+    action: str,
+    job_id: str,
+    job_name: str,
+    caller: Optional[str],
+    reason: Optional[str],
+    paused_at: Optional[str],
+    previous_state: Optional[str],
+    new_state: Optional[str],
+    next_run_at: Optional[str] = None,
+) -> None:
+    """Best-effort CRON_PAUSED/CRON_RESUMED emit for a lifecycle transition.
+
+    The pause/resume counterpart to ``emit_cron_triggered_safe``, and "every
+    path" is load-bearing here for the same reason. A job leaves or re-enters
+    the schedule on exactly five paths, and all five emit here:
+
+    ==================  ==========================  ======================
+    transition          call site                   action=
+    ==================  ==========================  ======================
+    operator pause      ``pause_job``               ``"paused"``
+    operator resume     ``resume_job``              ``"resumed"``
+    implicit un-pause   ``trigger_job``             ``"resumed"``
+    bulk containment    ``pause_jobs_cas``          ``"paused"``
+    bulk restore        ``restore_jobs_cas``        ``"resumed"``
+    ==================  ==========================  ======================
+
+    ``update_job`` itself deliberately stays out of the table. It is the
+    shared writer under all five, and every caller that moves a lifecycle
+    field already knows which transition it is making; emitting from there
+    instead would mean inferring the transition from a field diff and would
+    fire on writes that change no state at all.
+
+    The bottom two are the scheduler's bulk containment CAS, which has no
+    production caller yet — they emit AFTER their jobs lock is released; see
+    ``pause_jobs_cas``. The third is the one that is easy to forget and
+    expensive to miss:
+    ``trigger_job`` sets ``enabled: True`` and clears the pause fields, so
+    "run this now" silently ends a pause. Without an event there, a reader
+    joining CRON_PAUSED to CRON_RESUMED would see an unterminated pause on a
+    job that has been running all along — worse than no trail, because it
+    reads as a job still contained. It is emitted only when the job actually
+    WAS paused (see ``_is_paused``), and it is emitted BEFORE the
+    CRON_TRIGGERED for the same call so the two read in cause order.
+
+    Until 2026-08-25 none of the five emitted anything at all. That is what
+    made the 2026-08-24/25 pause churn on eight jobflow/jaum/tracker rows
+    unattributable: two sessions searched ``audit.jsonl`` and the agent
+    transcripts for a record that was never written. If a path is added, add
+    it to the table or delete the claim.
+
+    Defensive on purpose, exactly like the trigger emitter: any import or bus
+    failure is logged and swallowed. The state mutation has already been
+    persisted by the caller, so a bus outage costs an audit record — never a
+    pause that half-happened.
+    """
+    try:
+        from events.producers.cron_lifecycle_emitter import emit_cron_lifecycle
+        bus = _get_event_bus()
+        emit_cron_lifecycle(
+            bus,
+            action=action,
+            job_id=job_id,
+            job_name=job_name,
+            caller=caller,
+            reason=reason,
+            paused_at=paused_at,
+            previous_state=previous_state,
+            new_state=new_state,
+            next_run_at=next_run_at,
+        )
+    except Exception:
+        logger.exception(
+            "cron_%s emit failed for job_id=%s", action, job_id
+        )
+
+
 def trigger_job(
     job_id: str,
     caller: Optional[str] = None,
@@ -2049,6 +2282,10 @@ def _trigger_job_admitted(
         )
 
     previous_next_run_at = job.get("next_run_at")
+    previous_state = job.get("state")
+    was_paused = _is_paused(job)
+    previous_paused_at = job.get("paused_at")
+    previous_paused_reason = job.get("paused_reason")
 
     updated = update_job(
         job["id"],
@@ -2059,6 +2296,21 @@ def _trigger_job_admitted(
             **_unpause_updates(job),
         },
     )
+
+    if updated is not None and was_paused:
+        # Emitted before the CRON_TRIGGERED below so the pair reads in cause
+        # order: the job came out of its pause, and then it was scheduled.
+        emit_cron_lifecycle_safe(
+            action="resumed",
+            job_id=job["id"],
+            job_name=updated.get("name") or job.get("name") or job["id"],
+            caller=caller,
+            reason=previous_paused_reason,
+            paused_at=previous_paused_at,
+            previous_state=previous_state,
+            new_state=updated.get("state"),
+            next_run_at=updated.get("next_run_at"),
+        )
 
     if updated is not None:
         emit_cron_triggered_safe(

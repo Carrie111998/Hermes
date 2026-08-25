@@ -1450,7 +1450,15 @@ class CLICommandsMixin:
                 return
             job_id = positionals[0]
             action = "remove" if subcommand in {"remove", "rm", "delete"} else subcommand
-            result = _cron_api(action=action, job_id=job_id, reason="paused from /cron" if action == "pause" else None)
+            # An explicit caller per action: without one the cronjob tool
+            # defaults to "llm:cronjob_tool", which would attribute an
+            # interactive /cron pause to the model that did not issue it.
+            result = _cron_api(
+                action=action,
+                job_id=job_id,
+                reason="paused from /cron" if action == "pause" else None,
+                caller=f"hermes_chat:slash_cron_{action}",
+            )
             if not result.get("success"):
                 print(f"(x_x) Failed to {action} job: {result.get('error')}")
                 return

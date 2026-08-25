@@ -122,6 +122,8 @@ _POLICY: Dict[EventType, _Spec] = {
     # ----- cron lifecycle → TRACE ops firehose ------------------------
     _E.CRON_STARTED: _Spec(Attention.TRACE, OPS_TRACE),
     _E.CRON_TRIGGERED: _Spec(Attention.TRACE, OPS_TRACE),
+    _E.CRON_PAUSED: _Spec(Attention.TRACE, OPS_TRACE),
+    _E.CRON_RESUMED: _Spec(Attention.TRACE, OPS_TRACE),
     _E.CRON_COMPLETED: _Spec(Attention.TRACE, OPS_TRACE),   # content sniffer may upgrade
     _E.CRON_SKIPPED: _Spec(Attention.TRACE, OPS_TRACE),
     _E.CRON_SKIPPED_DUPLICATE: _Spec(Attention.TRACE, OPS_TRACE),
