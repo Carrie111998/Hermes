@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync, appendFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -113,6 +113,31 @@ const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+// Durable inbound-message log (JSONL). Appended for every message queued to
+// the gateway so message *content* survives bridge restarts and is
+// retrievable later. Path: <whatsapp dir>/inbound.jsonl — a sibling of the
+// session dir. Disable with WHATSAPP_INBOUND_LOG=off (or ''/0/false/no).
+const INBOUND_LOG = path.join(path.dirname(SESSION_DIR), 'inbound.jsonl');
+const INBOUND_LOG_ENABLED = !['off', '0', 'false', 'no', ''].includes(
+  String(process.env.WHATSAPP_INBOUND_LOG || 'on').toLowerCase()
+);
+
+function appendInboundLog(event) {
+  if (!INBOUND_LOG_ENABLED) return;
+  try {
+    appendFileSync(INBOUND_LOG, JSON.stringify({
+      ts: Date.now(),
+      chatId: event.chatId || null,
+      senderId: event.senderId || null,
+      senderName: event.senderName || null,
+      fromOwner: !!event.fromOwner,
+      body: event.body || null,
+      hasMedia: !!event.hasMedia,
+      mediaType: event.mediaType || null,
+      messageId: event.messageId || null,
+    }) + '\n', 'utf8');
+  } catch {}
+}
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -761,6 +786,7 @@ async function startSocket() {
 
       messageStore.remember(msg);
       messageQueue.push(event);
+      appendInboundLog(event);
       emitDebugEvent({
         stage: 'queued',
         chatId: redactWhatsAppId(chatId),
