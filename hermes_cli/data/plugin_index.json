@@ -66,13 +66,13 @@
     },
     {
       "name": "hermes-a2a-peers",
-      "description": "Dashboard tab for direct A2A chat with configured a2a_agents via server-side dispatch.",
+      "description": "Dashboard tab and /node slash command for configured a2a_agents via server-side dispatch.",
       "author": "kadiratesdev",
       "tags": ["a2a", "dashboard", "peers", "messaging"],
       "repo": "kadiratesdev/hermes-a2a-peers",
-      "ref": "79f65da610fa7326b433c1616c006cf7067aee32",
+      "ref": "533db8bc1423a786bed083269a875f56321364e1",
       "homepage": "https://github.com/kadiratesdev/hermes-a2a-peers",
-      "capabilities": ["dashboard"],
+      "capabilities": ["dashboard", "commands"],
       "api_version": 1,
       "added_at": "2026-08-25"
     }
