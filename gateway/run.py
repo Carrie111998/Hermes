@@ -425,7 +425,7 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
 )
 
 _GATEWAY_RATE_LIMIT_RE = re.compile(
-    r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)",
+    r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit|session\s+limit)",
     re.IGNORECASE,
 )
 
@@ -447,6 +447,11 @@ _GATEWAY_CONNECTION_ERROR_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+# Captures the reset hint from a provider usage/session-limit envelope, e.g.
+# "… session limit · resets 5:20pm (America/New_York)" → "resets 5:20pm
+# (America/New_York)". Stops at sentence/line breaks so we never leak a long
+# raw body into chat. Input is already secret-redacted at the call site.
+_GATEWAY_RESET_HINT_RE = re.compile(r"reset[s]?\b[^\n.]{0,48}", re.IGNORECASE)
 
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
@@ -743,6 +748,13 @@ def _gateway_provider_error_reply(text: str) -> str:
             "error out of chat; check gateway logs for details or try rephrasing."
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
+        hint_match = _GATEWAY_RESET_HINT_RE.search(text)
+        if hint_match:
+            hint = hint_match.group(0).strip().rstrip(" .·-")
+            return (
+                f"⏱️ The model provider hit its usage/session limit — {hint}. "
+                "Please try again after that."
+            )
         return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
     if _GATEWAY_CONNECTION_ERROR_RE.search(text):
         return (

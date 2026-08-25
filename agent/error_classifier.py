@@ -237,6 +237,11 @@ _USAGE_LIMIT_PATTERNS = [
     "quota",
     "limit exceeded",
     "key limit exceeded",
+    # GitHub Copilot / Claude ACP periodic session cap, e.g.
+    # "You've hit your session limit · resets 5:20pm (America/New_York)".
+    # It resets on a rolling window, so the transient signals below steer
+    # it to rate_limit (retryable + fallback) rather than billing.
+    "session limit",
 ]
 
 # Patterns confirming usage limit is transient (not billing)
@@ -248,6 +253,7 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "resets in",
     "reset after",
     "available in",
+    "resets",  # bare "resets 5:20pm" form (Copilot ACP session limit)
     "wait",
     "requests remaining",
     "periodic",

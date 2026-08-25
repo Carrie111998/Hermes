@@ -343,3 +343,33 @@ def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_
     # Prose around the secret is preserved — redaction is surgical.
     assert "here is the token you asked me to echo" in sanitized
     assert sanitized.endswith("done.")
+def test_telegram_final_response_surfaces_session_limit_reset_time():
+    """A Copilot/Claude ACP session-limit error must read as a usage/session
+    limit with its reset time — not the opaque 'failed after retries' message."""
+    raw = (
+        "API call failed after 2 retries. Copilot ACP session/prompt failed: "
+        "Internal error: You've hit your session limit · resets 5:20pm "
+        "(America/New_York)"
+    )
+
+    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
+
+    lowered = sanitized.lower()
+    assert "usage/session limit" in lowered or "session limit" in lowered
+    assert "resets 5:20pm" in sanitized  # the actionable reset hint survives
+    assert "failed after retries" not in lowered  # not the generic fallback
+    assert "internal error" not in lowered  # raw provider envelope withheld
+
+
+def test_telegram_status_surfaces_session_limit_reset_time():
+    """Same mapping on the status path that feeds 'gateway logs' notices."""
+    raw = (
+        "⚠️ Copilot ACP session/prompt failed: Internal error: You've hit your "
+        "session limit · resets 5:20pm (America/New_York)"
+    )
+
+    sanitized = _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", raw)
+
+    assert sanitized is not None
+    assert "resets 5:20pm" in sanitized
+    assert "failed after retries" not in sanitized.lower()
