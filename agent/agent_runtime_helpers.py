@@ -3500,7 +3500,10 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
        Claude-style models sometimes tack on (TodoTool_tool ->
        TodoTool -> Todo -> todo). Applied twice so double-tacked
        suffixes like ``TodoTool_tool`` reduce all the way.
-    5. Fuzzy match (difflib, cutoff=0.7).
+    5. Fuzzy match (difflib, cutoff=0.7) — but only when the input
+       name is NOT a real tool in the full registry. A tool that the
+       registry knows but ``check_fn`` gated for this turn must not be
+       remapped to a sibling (cross-operation remap, #94506).
 
     See #14784 for the original reports (TodoTool_tool, Patch_tool,
     BrowserClick_tool were all returning "Unknown tool" before).
@@ -3572,7 +3575,23 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
         if c and c in agent.valid_tool_names:
             return c
 
-    # Fuzzy match as last resort.
+    # Fuzzy match as last resort — but only when the input name is NOT a
+    # real tool in the full registry.  A tool that the registry knows but
+    # check_fn gated for this turn was *intentionally* withheld; remapping
+    # it to a sibling (e.g. kanban_list → kanban_link) silently changes
+    # the operation — a cross-operation remap that can turn a read into a
+    # write or stall a board with no error (#94506).  Returning None lets
+    # the caller fall through to the normal "unknown tool" path so the
+    # model learns the name is unavailable here and can pick another
+    # approach.
+    try:
+        from tools.registry import registry as _tool_registry
+        _all_names = _tool_registry.get_all_tool_names()
+    except Exception:  # noqa: BLE001 — registry import best-effort
+        _all_names = []
+    if lowered in _all_names:
+        return None
+
     matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
     if matches:
         return matches[0]
