@@ -456,7 +456,7 @@ Also independent of this opt-in, every human reaction fires the `reaction:added`
 
 - **Slack** (`slack.reaction_triggers`): unset disables; `true` (synonyms `all`, `*`, `1`) routes every emoji, but only on the bot's own messages; a non-empty allowlist matches ASCII shortcode names (colons stripped, whitespace/comma-separated) and may target **any** message — operator-curated handoff emojis deliberately bypass the own-message rule.
 - **Photon/iMessage**: no opt-in and no allowlist — every tapback on a bot-sent message routes to the agent, passing the raw emoji through.
-- **Discord**: `false`/unset disables; `true` routes all emoji but only on bot-authored messages; a list is an allowlist whose matching folds variation selectors and skin-tone modifiers on both sides, so an allowlist entry 👍 also matches 👍️ and 👏🏻 variants; an empty value or `,,,` disables — the deliberate inverse of Slack, where an empty allowlist means all emoji; and numeric-looking entries such as `[1]` parse as the truthy literal `1` and enable **all** emoji — always quote emoji names.
+- **Discord**: `false`/unset disables; `true` routes all emoji but only on bot-authored messages; a list is an allowlist whose matching folds variation selectors and skin-tone modifiers on both sides, so an allowlist entry 👍 also matches 👍️ and 👍🏻 variants; an empty value or `,,,` disables — the deliberate inverse of Slack, where an empty allowlist means all emoji; and numeric-looking entries such as `[1]` parse as the truthy literal `1` and enable **all** emoji — always quote emoji names.
 
 #### `discord.ignored_channels`
 
