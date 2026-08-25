@@ -91,6 +91,7 @@ class TestSearchFilesOnlyWithSpaces:
             completed = subprocess.run(
                 command,
                 shell=True,
+                executable="/bin/bash",
                 text=True,
                 capture_output=True,
                 cwd=cwd,
