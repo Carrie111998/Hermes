@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = get_hermes_home() / "singularity_snapshots.json"
 
+# Container-visible launch cwd. The backend process can be started from a
+# host-only path (e.g. /usr/local/lib/hermes-agent) that does not exist
+# inside the sandbox; apptainer then warns "Error changing the container
+# working directory" on every exec and the terminal wrapper's `cd` fails
+# with exit 126. Launching from /root — the container home, and the same
+# default_cwd terminal_tool uses for container backends — avoids that.
+_SANDBOX_LAUNCH_CWD = "/root"
+
 
 def _find_singularity_executable() -> str:
     """Locate the apptainer or singularity CLI binary."""
@@ -159,6 +167,52 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
             return image
 
 
+def _container_ca_bundle() -> str:
+    """Return a CA bundle path that exists INSIDE the sandbox.
+
+    The host process env can carry a host-only CA path (``SSL_CERT_FILE``
+    pointing at the venv's certifi bundle) that is not mounted into the
+    container, which kills HTTPS for curl/Python inside. Python
+    (``SSL_CERT_FILE``/``REQUESTS_CA_BUNDLE``) and curl (``CURL_CA_BUNDLE``)
+    REPLACE the CA store rather than adding to it, so the sandbox launch env
+    must point at a bundle the container can actually read. Debian-based
+    images ship the system bundle at the canonical path — prefer it, then
+    fall back to the inherited value (best effort).
+    """
+    for candidate in (
+        "/etc/ssl/certs/ca-certificates.crt",    # Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",      # RHEL/CentOS
+        "/etc/ssl/cert.pem",                     # Alpine/macOS
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    inherited = os.environ.get("SSL_CERT_FILE") or os.environ.get("CURL_CA_BUNDLE")
+    if inherited and os.path.exists(inherited):
+        return inherited
+    try:
+        import certifi
+        return certifi.where()
+    except ImportError:
+        return "/etc/ssl/certs/ca-certificates.crt"
+
+
+def _sandbox_launch_env() -> dict:
+    """Env for apptainer spawns: container-visible CA paths.
+
+    Mirrors the Docker backend's egress CA rewrite
+    (``tools/environments/docker.py``): the sandbox inherits the backend
+    process env, which may reference host-only paths. Rewriting the CA vars
+    here is what makes HTTPS work inside the container regardless of how the
+    host process was launched.
+    """
+    env = os.environ.copy()
+    ca = _container_ca_bundle()
+    env["SSL_CERT_FILE"] = ca
+    env["REQUESTS_CA_BUNDLE"] = ca
+    env["CURL_CA_BUNDLE"] = ca
+    return env
+
+
 class SingularityEnvironment(BaseEnvironment):
     """Hardened Singularity/Apptainer container with resource limits and persistence.
 
@@ -228,7 +282,11 @@ class SingularityEnvironment(BaseEnvironment):
         cmd.extend([str(self.image), self.instance_id])
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, stdin=subprocess.DEVNULL)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=120, stdin=subprocess.DEVNULL,
+                env=_sandbox_launch_env(), cwd=_SANDBOX_LAUNCH_CWD,
+            )
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to start instance: {result.stderr}")
             self._instance_started = True
@@ -245,13 +303,17 @@ class SingularityEnvironment(BaseEnvironment):
             raise RuntimeError("Singularity instance not started")
 
         cmd = [self.executable, "exec",
+               "--pwd", _SANDBOX_LAUNCH_CWD,
                f"instance://{self.instance_id}"]
         if login:
             cmd.extend(["bash", "-l", "-c", cmd_string])
         else:
             cmd.extend(["bash", "-c", cmd_string])
 
-        return _popen_bash(cmd, stdin_data)
+        return _popen_bash(
+            cmd, stdin_data,
+            env=_sandbox_launch_env(), cwd=_SANDBOX_LAUNCH_CWD,
+        )
 
     def cleanup(self):
         """Stop the instance. If persistent, the overlay dir survives."""
