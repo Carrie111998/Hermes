@@ -42,3 +42,8 @@ different document that must stay intact.
   through as light chips on a dark rail.
 - **No shadows, `border-radius: 0`, Signal Blue under ~10% of a screen.**
   Inherited house rules, not per-feature preferences. See DESIGN.md.
+
+
+<claude-mem-context>
+
+</claude-mem-context>

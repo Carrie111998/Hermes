@@ -12,6 +12,9 @@ export const DEFAULT_RESEARCH_CONFIG = {
   buyer_types: ['importer', 'distributor'],
   enabled_source_ids: [],
   precision_profile: 'high_precision',
+  // An internal research safety bound, not a customer promise. The primary
+  // list is a global 5-15 strong fits; this only caps how many candidates a
+  // single market is allowed to research, and the editor no longer offers it.
   max_qualified_leads_per_country: 50,
   freshness_days: 180,
   exclusions: { company_ids: [], domains: [], seller_only: true, sanctioned_entities: true },

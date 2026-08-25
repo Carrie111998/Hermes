@@ -207,6 +207,7 @@ class CorpusProvider(CatalogProvider):
             # the company speaking about itself.
             classification="independent",
             retrieved_via=reference,
+            publisher_label=manifest.publisher_label,
             facts=facts,
             snapshot_content=snapshot_content,
             fact_spans=spans_for_facts(snapshot_content, facts),

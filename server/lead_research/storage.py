@@ -164,6 +164,7 @@ class EvidenceRepository:
                 source = VerificationSource(
                     provenance_url=row["provenance_url"] or None,
                     source_reference=reference,
+                    publisher_label=payload.get("publisher_label"),
                     raw_hash=row["raw_hash"],
                     classification=payload.get("classification", "independent"),
                     retrieved_via=(
@@ -267,6 +268,7 @@ class EvidenceRepository:
                     # column is the public link a customer may follow, and an
                     # internal reference is not one.
                     "source_reference": source.source_reference,
+                    "publisher_label": source.publisher_label,
                     # What question this answered. Reuse requires a match; see
                     # `query_fingerprint`.
                     "query_fingerprint": query_fingerprint,

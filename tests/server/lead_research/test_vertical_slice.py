@@ -775,3 +775,105 @@ def test_a_tenant_connected_source_still_enables_normally():
     response = client.post(f"/api/v1/data-sources/{source_id}/enable", headers=headers)
     assert response.status_code == 200, response.text
     assert response.json()["enabled"] is True
+
+
+def test_result_views_and_lead_list_match_display_decisions():
+    """Four views, one decision. A customer's primary list is not "not rejected".
+
+    `active` used to mean "strong_fit or review", so a candidate that never
+    cleared the floor sat in the same list as one that did, and `/leads`
+    returned both. The display decision is now the only thing that puts a row
+    in the primary list, and the other two states are separately reachable
+    rather than hidden.
+    """
+    app, client, headers, _ = make_research_client()
+    campaign = client.post(
+        "/api/v1/research-campaigns", headers=headers, json=campaign_body(),
+    ).json()
+    start_and_settle(app, client, headers, campaign["id"])
+
+    rows = app.state.db.all(
+        "SELECT id,data FROM research_results WHERE company_id=? AND campaign_id=? ORDER BY id",
+        (campaign["company_id"], campaign["id"]),
+    )
+    assert len(rows) >= 3
+    reviewed, overflowed = rows[0], rows[1]
+    app.state.db.execute(
+        "UPDATE research_results SET verdict='review',lead_id=NULL WHERE id=?",
+        (reviewed["id"],),
+    )
+    overflow_data = {
+        **json.loads(overflowed["data"]),
+        "selection": {
+            "displayed": False, "display_rank": None,
+            "country_round": None, "reason": "outside_result_limit",
+        },
+    }
+    app.state.db.execute(
+        "UPDATE research_results SET lead_id=NULL,data=? WHERE id=?",
+        (json.dumps(overflow_data), overflowed["id"]),
+    )
+
+    def view(name):
+        response = client.get(
+            f"/api/v1/research-campaigns/{campaign['id']}/results?view={name}",
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    active, review, overflow = view("active"), view("review"), view("outside_limit")
+    leads = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/leads", headers=headers,
+    ).json()
+
+    assert active
+    assert all(
+        item["verdict"] == "strong_fit" and item["selection"]["displayed"]
+        for item in active
+    )
+    ranks = [item["selection"]["display_rank"] for item in active]
+    assert ranks == sorted(ranks), "the primary list arrives in saved rank order"
+    assert [item["id"] for item in review] == [reviewed["id"]]
+    assert all(item["verdict"] == "review" and item["lead_id"] is None for item in review)
+    assert [item["id"] for item in overflow] == [overflowed["id"]]
+    assert all(
+        item["verdict"] == "strong_fit" and not item["selection"]["displayed"]
+        for item in overflow
+    )
+    assert [item["id"] for item in leads] == [item["lead_id"] for item in active]
+    assert reviewed["id"] not in {item["id"] for item in active}
+    assert overflowed["id"] not in {item["id"] for item in active}
+
+
+def test_a_dataset_receipt_is_shown_without_pretending_to_be_a_link():
+    """Internal evidence has a reference, not a URL, and must still be a receipt."""
+    app, client, headers, company_id = make_research_client()
+    campaign = client.post(
+        "/api/v1/research-campaigns", headers=headers, json=campaign_body(),
+    ).json()
+    start_and_settle(app, client, headers, campaign["id"])
+    evidence = app.state.db.one(
+        "SELECT id,payload FROM evidence_records WHERE company_id=? LIMIT 1", (company_id,),
+    )
+    payload = {
+        **json.loads(evidence["payload"]),
+        "source_reference": "dataset:kitchen-appliances:3:atlas-1",
+    }
+    app.state.db.execute(
+        "UPDATE evidence_records SET provenance_url=NULL,payload=? WHERE id=?",
+        (json.dumps(payload), evidence["id"]),
+    )
+
+    results = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/results", headers=headers,
+    ).json()
+    citations = [item for row in results for item in row["evidence"]]
+
+    referenced = [item for item in citations if item.get("source_reference")]
+    assert referenced, "an internal dataset receipt must reach the customer view"
+    assert all(item["provenance_url"] is None for item in referenced)
+    assert all(
+        item["source_reference"] == "dataset:kitchen-appliances:3:atlas-1"
+        for item in referenced
+    )

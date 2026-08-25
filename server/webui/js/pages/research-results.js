@@ -26,6 +26,7 @@ const COPY = Object.freeze({
     observed: 'Observed', retrieved: 'Retrieved', archived: 'Archived', snapshot: 'Snapshot', hash: 'SHA-256',
     verified: 'Exact source span verified', unverified: 'Source span not mechanically verified',
     openSource: 'Open source', noUnknowns: 'No weighted criteria remain unknown.',
+    reference: 'Dataset record', publisher: 'Published by',
   },
   tr: {
     fit: 'Uyum', confidence: 'Kanıt güveni', band: 'Grup', known: 'Bilinen', unknown: 'Bilinmeyen',
@@ -34,6 +35,7 @@ const COPY = Object.freeze({
     observed: 'Gözlemlendi', retrieved: 'Alındı', archived: 'Arşivlendi', snapshot: 'Anlık görüntü', hash: 'SHA-256',
     verified: 'Kaynak alıntısı birebir doğrulandı', unverified: 'Kaynak alıntısı mekanik olarak doğrulanmadı',
     openSource: 'Kaynağı aç', noUnknowns: 'Ağırlıklı bilinmeyen kriter kalmadı.',
+    reference: 'Veri kümesi kaydı', publisher: 'Yayınlayan',
   },
 });
 const DIMENSION_LABELS = Object.freeze({
@@ -81,6 +83,20 @@ function confidencePercent(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 'Not known';
   return `${Math.round(number <= 1 ? number * 100 : number)}%`;
+}
+
+// What a curated buyer list actually proved. It states that this company buys
+// in the sector; it does not state that it is specifically an importer or a
+// distributor, and rendering it as "Sector buyer" invited the reader to assume
+// the narrower claim.
+const ROLE_LABELS = Object.freeze({
+  en: { sector_buyer: 'Curated sector buyer · exact channel not confirmed' },
+  tr: { sector_buyer: 'Derlenmiş sektör alıcısı · kesin kanal doğrulanmadı' },
+});
+
+function buyerRoleLabel(value, locale = 'en') {
+  const key = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return ROLE_LABELS[supportedLocale(locale)][key] || sentence(value);
 }
 
 function verdictLabel(verdict) {
@@ -181,6 +197,11 @@ export function renderEvidence(evidence, locale = 'en') {
     criteria.length ? [labels.criterion, criteria.map(item =>
       `${dimensionLabel(item.dimension, locale)} · ${item.weight}%`).join(', ')] : null,
     supportedLocale(locale) !== 'en' && displayed !== canonical ? [labels.displayed, claimValue(displayed)] : null,
+    // Internal evidence has no page to open, so its identity is shown as a
+    // value the reader can quote back. Never an anchor: a link a customer
+    // cannot follow is worse than an identifier.
+    !link && evidence.source_reference ? [labels.reference, evidence.source_reference] : null,
+    evidence.publisher_label ? [labels.publisher, evidence.publisher_label] : null,
     [labels.canonical, claimValue(canonical)],
     [labels.original, original || 'Not recorded'],
     [labels.sourceLanguage, LANGUAGE_NAMES[supportedLocale(locale)][language] || sentence(language)],
@@ -195,7 +216,10 @@ export function renderEvidence(evidence, locale = 'en') {
       el('strong', {}, sentence(evidence.source_id, 'Saved source')),
       link),
     el('dl', { class: 'ifz-result-citation-meta' }, definitionRows.map(([label, value]) =>
-      el('div', {}, el('dt', {}, label), el('dd', {}, label === labels.hash ? el('code', {}, value) : value)))),
+      el('div', {}, el('dt', {}, label), el('dd', {},
+        label === labels.hash || label === labels.reference
+          ? el('code', {}, value)
+          : value)))),
     el('p', {
       class: `ifz-result-validation ${evidence.mechanically_validated ? 'verified' : 'unverified'}`,
     }, evidence.mechanically_validated ? labels.verified : labels.unverified));
@@ -317,9 +341,63 @@ function resultTable(results, selectedId, onSelect, locale = 'en') {
         el('td', { class: 'cell-num' }, confidencePercent(result.evidence_confidence)),
         el('td', { class: 'cell-num' }, `${result.unknown_weight ?? 0}%`),
         el('td', {}, result.country || 'Not known'),
-        el('td', {}, sentence(result.buyer_role)),
+        el('td', {}, buyerRoleLabel(result.buyer_role, locale)),
         el('td', { class: 'cell-num' }, String(result.source_count ?? 0)));
       }))));
+}
+
+// The four questions a customer asks about one run, in the order they matter:
+// which companies am I working, which nearly made it, which cleared the bar but
+// did not fit in the list, and which were ruled out. `active` keeps its wire
+// name for compatibility.
+const VIEWS = Object.freeze(['active', 'review', 'outside_limit', 'rejected']);
+const VIEW_LABELS = Object.freeze({
+  active: 'Strong fits', review: 'Review',
+  outside_limit: 'Not selected', rejected: 'Rejected',
+});
+const VIEW_COUNT_METRIC = Object.freeze({
+  active: 'qualified_leads', review: 'review_candidates',
+  outside_limit: 'outside_result_limit',
+});
+
+function emptyResultStates() {
+  return Object.fromEntries(VIEWS.map(view => [view, { status: 'idle', items: [] }]));
+}
+
+function emptySelection() {
+  return Object.fromEntries(VIEWS.map(view => [view, '']));
+}
+
+function overallMetrics(rows) {
+  const items = Array.isArray(rows) ? rows : rows?.items || [];
+  return items.find(row => row.dimension === 'overall') || items[0] || null;
+}
+
+function countryDistribution(metrics) {
+  const entries = Object.entries(metrics?.leads_by_country || {});
+  entries.sort(([left], [right]) => left.localeCompare(right));
+  return entries;
+}
+
+// The one sentence that has to be true. A short list is reported as short: the
+// engine never promotes a review candidate to reach the target, so copy that
+// implied it could was the lie this row exists to remove.
+function selectionSummary(metrics) {
+  const qualified = Number(metrics?.qualified_leads ?? 0);
+  const target = Number(metrics?.result_target_min ?? 5);
+  const shortfall = Number(metrics?.result_shortfall ?? 0);
+  if (shortfall > 0) {
+    return {
+      headline: `${qualified} strong ${qualified === 1 ? 'fit' : 'fits'} qualified `
+        + `\u00b7 ${shortfall} below the target of ${target}`,
+      detail: 'Review candidates do not fill the target. Widen the markets or the '
+        + 'product terms, or connect another source.',
+    };
+  }
+  return {
+    headline: `${qualified} of ${target} target leads qualified`,
+    detail: null,
+  };
 }
 
 export async function mount(root, ctx) {
@@ -331,8 +409,9 @@ export async function mount(root, ctx) {
     campaigns: [],
     campaignId: ctx.query.campaign || '',
     view: 'active',
-    resultStates: { active: { status: 'idle', items: [] }, rejected: { status: 'idle', items: [] } },
-    selected: { active: '', rejected: '' },
+    resultStates: emptyResultStates(),
+    selected: emptySelection(),
+    metrics: null,
     claims: new Map(),
     campaignError: null,
     contextVersion: 0,
@@ -435,6 +514,20 @@ export async function mount(root, ctx) {
     }
   }
 
+  async function loadMetrics() {
+    if (!state.campaignId) return;
+    const campaignId = state.campaignId;
+    try {
+      const response = await call('researchCampaigns.metrics', { params: { campaignId } });
+      if (disposed || state.campaignId !== campaignId) return;
+      state.metrics = overallMetrics(response);
+      render();
+    } catch {
+      // The counts are a summary of the list already on screen. Losing them is
+      // not worth replacing the results with an error.
+    }
+  }
+
   async function switchView(view) {
     if (state.view === view) return;
     state.contextVersion += 1;
@@ -447,14 +540,12 @@ export async function mount(root, ctx) {
     state.contextVersion += 1;
     state.campaignId = campaignId;
     state.view = 'active';
-    state.resultStates = {
-      active: { status: 'idle', items: [] },
-      rejected: { status: 'idle', items: [] },
-    };
-    state.selected = { active: '', rejected: '' };
+    state.resultStates = emptyResultStates();
+    state.selected = emptySelection();
+    state.metrics = null;
     state.claims.clear();
     render();
-    await loadResults('active');
+    await Promise.all([loadResults('active'), loadMetrics()]);
   }
 
   async function exportView(action) {
@@ -492,8 +583,37 @@ export async function mount(root, ctx) {
         el('div', {}, el('dt', {}, 'Run'), el('dd', {}, sentence(current.status))),
         el('div', {}, el('dt', {}, 'Markets'), el('dd', {}, String((config.target_countries || []).length))),
         el('div', {}, el('dt', {}, 'Configured sources'), el('dd', {}, String((config.enabled_source_ids || []).length))),
-        el('div', {}, el('dt', {}, state.view === 'active' ? 'Active results' : 'Rejected results'),
+        el('div', {}, el('dt', {}, `${VIEW_LABELS[state.view]} shown`),
           el('dd', {}, String(state.resultStates[state.view].items.length)))));
+  }
+
+  function selectionNode() {
+    const metrics = state.metrics;
+    const summary = selectionSummary(metrics);
+    const distribution = countryDistribution(metrics);
+    return el('section', {
+      class: 'ifz-results-selection',
+      'aria-label': 'Primary list coverage',
+    },
+    el('div', { class: 'ifz-results-selection-headline' },
+      el('strong', {}, summary.headline),
+      el('span', {}, `Limit ${Number(metrics?.result_limit ?? 15)}`)),
+    el('dl', { class: 'ifz-results-selection-spread' },
+      el('div', {},
+        el('dt', {}, 'Markets represented'),
+        el('dd', {}, String(Number(metrics?.countries_represented ?? distribution.length)))),
+      ...distribution.map(([code, count]) => el('div', { class: 'ifz-results-market' },
+        el('dt', {}, code),
+        el('dd', {}, String(count))))),
+    summary.detail
+      ? el('p', { class: 'ifz-results-selection-note ifz-prose' }, summary.detail)
+      : null);
+  }
+
+  function tabLabel(view) {
+    const metric = VIEW_COUNT_METRIC[view];
+    if (!metric || !state.metrics) return VIEW_LABELS[view];
+    return `${VIEW_LABELS[view]} ${Number(state.metrics[metric] ?? 0)}`;
   }
 
   function render() {
@@ -537,10 +657,11 @@ export async function mount(root, ctx) {
       disabled: viewState.status !== 'loaded' || !viewState.items.length,
     });
     exportAction.addEventListener('click', () => void exportView(exportAction));
-    const tabHost = tabs([
-      { key: 'active', label: 'Active' },
-      { key: 'rejected', label: 'Rejected' },
-    ], state.view, view => void switchView(view));
+    const tabHost = tabs(
+      VIEWS.map(view => ({ key: view, label: tabLabel(view) })),
+      state.view,
+      view => void switchView(view),
+    );
 
     let listBody;
     if (viewState.status === 'loading' || viewState.status === 'idle') {
@@ -552,12 +673,16 @@ export async function mount(root, ctx) {
     } else if (!viewState.items.length) {
       listBody = emptyState({
         icon: 'search',
-        title: state.view === 'active' ? 'No active results' : 'No rejected results',
+        title: `No ${VIEW_LABELS[state.view].toLowerCase()}`,
         // A brief that researched nothing at all also lands here, so the copy
         // must not claim an evidence judgement that never ran.
-        hint: state.view === 'active'
-          ? 'No company reached the Active threshold. A brief that researched none lands here too — check the run funnel counts.'
-          : 'This brief did not reject any researched companies.',
+        hint: {
+          active: 'No company cleared the strong-fit floor. A brief that researched '
+            + 'none lands here too — check the run funnel counts.',
+          review: 'Every researched company either qualified or was ruled out.',
+          outside_limit: 'Every qualifying company fits inside the list.',
+          rejected: 'This brief did not reject any researched company.',
+        }[state.view],
       });
     } else {
       listBody = resultTable(viewState.items, state.selected[state.view], chooseResult, locale);
@@ -576,6 +701,7 @@ export async function mount(root, ctx) {
       }),
       noticeNode(current),
       briefNode(current),
+      selectionNode(),
       tabHost,
       el('div', { class: 'ifz-results-workspace' },
         el('section', { class: 'ifz-results-list', 'aria-label': `${sentence(state.view)} company results` }, listBody),
@@ -593,10 +719,15 @@ export async function mount(root, ctx) {
         call('researchCampaigns.list'),
         call('researchCampaigns.results', { params: { campaignId }, query: { view } }),
       ]);
+      // Separate, and separately allowed to fail: the counts summarize the
+      // list, so losing them must never cost the customer the list itself.
+      const metrics = await call('researchCampaigns.metrics', { params: { campaignId } })
+        .catch(() => null);
       // The customer may have switched brief or tab while this was in flight;
       // landing a stale list on the new selection is worse than not refreshing.
       if (disposed || state.campaignId !== campaignId || state.view !== view) return;
       state.campaigns = itemsOf(campaigns);
+      state.metrics = overallMetrics(metrics) || state.metrics;
       const viewState = state.resultStates[view];
       if (viewState.status === 'loaded') {
         const items = itemsOf(results);
@@ -629,7 +760,7 @@ export async function mount(root, ctx) {
           || '';
       }
       render();
-      await loadResults('active');
+      await Promise.all([loadResults('active'), loadMetrics()]);
     }
   } catch (error) {
     if (!disposed) {

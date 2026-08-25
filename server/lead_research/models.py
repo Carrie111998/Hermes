@@ -329,6 +329,11 @@ class VerificationSource(ApiModel):
     fact_spans: dict[str, list[EvidenceSpan]] = Field(default_factory=dict)
     source_language: str = "en"
     archive_snapshot_at: datetime | None = None
+    # Who published what this source says, in the customer's words. Provenance
+    # metadata, not a claim: an internal `dataset:` reference identifies the row
+    # but says nothing about whose list it came from, and a receipt naming
+    # neither is not a receipt.
+    publisher_label: str | None = None
     # When this page was actually fetched. None for a bundle a provider just
     # returned, which is by definition now; a bundle rebuilt from the cache
     # carries the age of the evidence, which is the whole reason freshness can

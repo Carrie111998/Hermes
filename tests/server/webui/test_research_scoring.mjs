@@ -108,3 +108,40 @@ test('weight controls announce and highlight both dimensions after a transfer', 
   });
   resetDom(dom);
 });
+
+
+// The editor stopped offering a per-country qualified-lead ceiling, because the
+// engine stopped honouring it as one: the primary list is a global 5-15. The
+// stored value survives as an internal research bound, so a campaign edited
+// after this change must not silently lose it.
+test('editing weights preserves the hidden per-country research bound', async () => {
+  const { DEFAULT_RESEARCH_CONFIG } = await import('../../../server/webui/js/research-state.js');
+  const config = {
+    ...DEFAULT_RESEARCH_CONFIG,
+    max_qualified_leads_per_country: 12,
+    scoring: {
+      ...DEFAULT_RESEARCH_CONFIG.scoring,
+      weights: { ...DEFAULT_RESEARCH_CONFIG.scoring.weights },
+    },
+  };
+
+  const next = {
+    ...config,
+    scoring: {
+      ...config.scoring,
+      weights: transferWeight(config.scoring.weights, 'contactability', 5),
+    },
+  };
+
+  assert.equal(next.max_qualified_leads_per_country, 12);
+  assert.equal(next.scoring.weights.contactability, 10);
+  assert.equal(
+    Object.values(next.scoring.weights).reduce((a, b) => a + b, 0), 100,
+  );
+});
+
+test('the shipped default still carries a bound for legacy campaigns', async () => {
+  const { DEFAULT_RESEARCH_CONFIG } = await import('../../../server/webui/js/research-state.js');
+
+  assert.equal(DEFAULT_RESEARCH_CONFIG.max_qualified_leads_per_country, 50);
+});

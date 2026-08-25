@@ -99,8 +99,6 @@ export async function mount(root, ctx) {
       { value: 'balanced', title: 'Balanced', desc: 'Broader discovery with review queues.' },
       { value: 'exploratory', title: 'Exploratory', desc: 'Maximum coverage; material uncertainty is explicit.' },
     ], cfg.precision_profile, { onChange: value => update({ precision_profile: value }) });
-    const max = input({ type: 'number', min: 1, max: 200, value: cfg.max_qualified_leads_per_country });
-    max.addEventListener('input', () => update({ max_qualified_leads_per_country: Number(max.value) }));
     const hs = input({ value: cfg.hs_codes.join(', '), placeholder: '8418, 8516' });
     hs.addEventListener('change', () => update({ hs_codes: hs.value.split(',').map(value => value.trim()).filter(Boolean) }));
     const productPicker = chipSelect(
@@ -133,8 +131,7 @@ export async function mount(root, ctx) {
         field('Company products', productPicker, { hint: 'Resolved from the confirmed company research profile.' }),
         field('Plain product names', productTerms, { hint: 'Useful when a formal sector or HS code is not known.' }),
         field('Buyer types', buyers, { required: true }),
-        field('Precision profile', precision),
-        field('Maximum qualified leads per target country', max, { hint: 'A hard ceiling, not a forecast.' })) }),
+        field('Precision profile', precision)) }),
     );
   }
 
@@ -243,7 +240,8 @@ export async function mount(root, ctx) {
           el('dt', {}, 'Sectors'), el('dd', {}, sentenceList(cfg.sector_ids)),
           el('dt', {}, 'Products'), el('dd', {}, sentenceList(cfg.product_terms)),
           el('dt', {}, 'Buyer types'), el('dd', {}, sentenceList(cfg.buyer_types)),
-          el('dt', {}, 'Ceiling'), el('dd', {}, `Up to ${cfg.max_qualified_leads_per_country} qualified leads per country`)) }),
+          el('dt', {}, 'Primary list'),
+          el('dd', {}, 'Primary list: 5\u201315 strong fits across all markets.')) }),
         card({ title: 'Evidence & scoring', body: el('dl', { class: 'ifz-review-list' },
           el('dt', {}, 'Sources'), el('dd', {}, chosenSources.map(source => source.display_name).join(', ') || 'None'),
           el('dt', {}, 'Source levels'), el('dd', {}, [...new Set(chosenSources.flatMap(source => source.entity_levels))].join(', ')),

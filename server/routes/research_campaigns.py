@@ -174,31 +174,55 @@ def _row(request: Request, company_id: str, campaign_id: str):
     return row
 
 
-ResultView = Literal["active", "rejected"]
+# `active` keeps its name for compatibility, but it now means exactly the
+# customer's primary list: strong fits the ranker chose to display. What used to
+# share that list — candidates that never cleared the floor — is `review`, and
+# strong fits beyond the global limit are `outside_limit`. Three separate
+# answers to three separate questions, instead of one list called "not
+# rejected".
+ResultView = Literal["active", "review", "outside_limit", "rejected"]
+
+_VIEW_VERDICTS = {
+    "active": ("strong_fit",),
+    "outside_limit": ("strong_fit",),
+    "review": ("review",),
+    "rejected": ("reject",),
+}
+
+
+def _displayed(row) -> bool:
+    return bool((json_load(row["data"], {}).get("selection") or {}).get("displayed"))
+
+
+def _display_rank(row) -> int:
+    rank = (json_load(row["data"], {}).get("selection") or {}).get("display_rank")
+    return int(rank) if isinstance(rank, (int, float)) else 1_000_000
 
 
 def _result_rows(request: Request, company_id: str, campaign_id: str, view: ResultView):
     _row(request, company_id, campaign_id)
-    if view == "rejected":
-        sql = (
-            "SELECT * FROM research_results "
-            "WHERE company_id=? AND campaign_id=? AND verdict='reject' "
-            "ORDER BY fit_score DESC,evidence_confidence DESC,created_at DESC"
-        )
-    else:
-        sql = (
-            "SELECT * FROM research_results "
-            "WHERE company_id=? AND campaign_id=? AND verdict IN ('strong_fit','review') "
-            "ORDER BY fit_score DESC,evidence_confidence DESC,created_at DESC"
-        )
-    return request.app.state.db.all(sql, (company_id, campaign_id))
+    verdicts = _VIEW_VERDICTS[view]
+    rows = request.app.state.db.all(
+        "SELECT * FROM research_results "
+        f"WHERE company_id=? AND campaign_id=? AND verdict IN ({','.join('?' for _ in verdicts)}) "
+        "ORDER BY fit_score DESC,evidence_confidence DESC,created_at DESC",
+        (company_id, campaign_id, *verdicts),
+    )
+    # The display flag lives inside a JSON column, and SQLite and Postgres do
+    # not agree on how to read one. Filtering here keeps both backends
+    # answering identically, which schema parity requires.
+    if view == "active":
+        return sorted((row for row in rows if _displayed(row)), key=_display_rank)
+    if view == "outside_limit":
+        return [row for row in rows if not _displayed(row)]
+    return rows
 
 
 _CUSTOMER_RESULT_FIELDS = (
     "reasons", "missing_evidence", "conflicting_claims", "source_ids",
     "official_domains", "independent_domains", "score_dimensions",
     "confidence_factors", "profile_version_id", "scope", "playbook_versions",
-    "source_policy",
+    "source_policy", "selection",
 )
 _CUSTOMER_SCORE_FIELDS = (
     "priority_band", "known_weight", "unknown_weight", "unknown_dimensions",
@@ -378,9 +402,16 @@ def _customer_evidence(
         "source_class": payload.get("classification") or "public",
     }
     url = stored["provenance_url"] if stored else shared["provenance_url"]
+    reference = payload.get("source_reference")
     return {
         "source_id": stored["source_id"] if stored else shared["source_id"],
         "provenance_url": url if str(url or "").startswith("https://") else None,
+        # Evidence from a curated dataset has no public page to link. The
+        # reference is the receipt: dataset, version and row, immutably. Shown
+        # as a value, never as an href — a link the customer cannot follow is
+        # worse than an identifier they can quote.
+        "source_reference": reference if str(reference or "").startswith("dataset:") else None,
+        "publisher_label": payload.get("publisher_label"),
         "retrieved_at": first["retrieved_at"],
         "observed_at": first["observed_at"],
         "archive_snapshot_at": payload.get("archive_snapshot_at"),
@@ -808,20 +839,27 @@ def campaign_leads(campaign_id: str, request: Request,
     company_id = _scope(principal, x_company_id)
     _row(request, company_id, campaign_id)
     result = []
+    # The primary list, in the order the ranker saved. Not "every result with a
+    # lead row": a rerun can leave an older lead attached to a result the new
+    # ranking no longer displays, and the customer's list has to be exactly what
+    # the run decided.
     rows = request.app.state.db.all(
-        "SELECT leads.* FROM research_results "
+        "SELECT leads.*,research_results.data AS result_data FROM research_results "
         "JOIN leads ON leads.id=research_results.lead_id AND leads.company_id=research_results.company_id "
         "WHERE research_results.company_id=? AND research_results.campaign_id=? "
-        "AND research_results.verdict IN ('strong_fit','review') "
-        # By fit, not by insertion order. This is the list the customer works
-        # down, and the brief page promises it is ranked by their weights —
-        # ordering it by created_at handed them the corpus's arbitrary order.
-        # created_at only breaks ties, so the order stays stable across reruns.
-        "ORDER BY research_results.fit_score DESC,"
-        "research_results.evidence_confidence DESC,leads.created_at DESC",
+        "AND research_results.verdict='strong_fit'",
         (company_id, campaign_id),
     )
-    for row in rows:
+    selected = [
+        row for row in rows
+        if (json_load(row["result_data"], {}).get("selection") or {}).get("displayed")
+    ]
+    selected.sort(key=lambda row: (
+        (json_load(row["result_data"], {}).get("selection") or {}).get("display_rank")
+        or 1_000_000,
+        row["created_at"],
+    ))
+    for row in selected:
         data = json_load(row["data"], {})
         result.append({"id": row["id"], "company_name": row["company_name"], "website": row["website"],
                        "country": row["country"], "status": row["status"], **data})

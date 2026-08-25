@@ -14,6 +14,14 @@ beforeEach(() => {
 
 afterEach(() => {
   delete globalThis.fetch;
+  metricsFixture = {
+    dimension: 'overall', dimension_value: 'all',
+    qualified_leads: 5, strong_fit_pool: 8, review_candidates: 8, review_leads: 8,
+    outside_result_limit: 3, countries_represented: 4,
+    leads_by_country: { DE: 2, ES: 1, FR: 1, PL: 1 },
+    result_target_min: 5, result_limit: 15, result_shortfall: 0,
+    shortfall_reasons: {},
+  };
   resetDom(dom);
 });
 
@@ -27,6 +35,15 @@ function deferred() {
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
   return { promise, resolve, reject };
 }
+
+let metricsFixture = {
+  dimension: 'overall', dimension_value: 'all',
+  qualified_leads: 5, strong_fit_pool: 8, review_candidates: 8, review_leads: 8,
+  outside_result_limit: 3, countries_represented: 4,
+  leads_by_country: { DE: 2, ES: 1, FR: 1, PL: 1 },
+  result_target_min: 5, result_limit: 15, result_shortfall: 0,
+  shortfall_reasons: {},
+};
 
 function responseFor(url) {
   if (url === '/api/v1/research-campaigns') return [{
@@ -52,6 +69,27 @@ function responseFor(url) {
     country: 'DE', buyer_role: 'Retailer', source_count: 1,
     reasons: ['buyer_role'], conflicting_claims: [], missing_evidence: ['second_source'],
   }];
+  if (url === '/api/v1/research-campaigns/rc_1/results?view=review') return [{
+    id: 'result_review', organization_id: 'org_3', company_name: 'Maybe ES',
+    verdict: 'review', lead_id: null, fit_score: 68, evidence_confidence: 0.7,
+    priority_band: 'B', known_weight: 45, unknown_weight: 55,
+    country: 'ES', buyer_role: 'sector_buyer', source_count: 1,
+    reasons: ['priority_band_b', 'insufficient_answered_weight'],
+    conflicting_claims: [], missing_evidence: ['second_source'],
+  }];
+  if (url === '/api/v1/research-campaigns/rc_1/results?view=outside_limit') return [{
+    id: 'result_overflow', organization_id: 'org_4', company_name: 'Surplus PL',
+    verdict: 'strong_fit', lead_id: null, fit_score: 84, evidence_confidence: 0.8,
+    priority_band: 'A', known_weight: 60, unknown_weight: 40,
+    country: 'PL', buyer_role: 'Distributor', source_count: 2,
+    selection: {
+      displayed: false, display_rank: null, country_round: null,
+      reason: 'outside_result_limit',
+    },
+    reasons: ['a_band_above_absolute_quality_floor'],
+    conflicting_claims: [], missing_evidence: [],
+  }];
+  if (url === '/api/v1/research-campaigns/rc_1/metrics') return [metricsFixture];
   if (url === '/api/v1/research/results/result_active/claims') return [{
     id: 'claim_1', field: 'buyer_role', value: 'Distributor', status: 'observed',
     confidence: 0.92, evidence: [{
@@ -64,6 +102,8 @@ function responseFor(url) {
     }],
   }];
   if (url === '/api/v1/research/results/result_rejected/claims') return [];
+  if (url === '/api/v1/research/results/result_review/claims') return [];
+  if (url === '/api/v1/research/results/result_overflow/claims') return [];
   throw new Error(`unstubbed request: ${url}`);
 }
 
@@ -658,4 +698,100 @@ test('a finished campaign is not polled, and disposing stops the polling', async
   t.mock.timers.tick(20000);
   await nextTurn();
   assert.equal(requests.length, afterMount);
+});
+
+
+// ── the primary list is the product ────────────────────────────────────────
+
+test('the primary list names its target, its limit and its market spread', async () => {
+  globalThis.fetch = async url => ({
+    ok: true, status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => responseFor(url),
+  });
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('div');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, navigate: () => {} });
+  try {
+    await nextTurn();
+    await nextTurn();
+    assert.match(root.textContent, /Strong fits 5/);
+    assert.match(root.textContent, /Review 8/);
+    assert.match(root.textContent, /Not selected 3/);
+    assert.match(root.textContent, /5 of 5 target leads qualified/);
+    assert.match(root.textContent, /Limit 15/);
+    assert.match(root.textContent, /DE\s*2/);
+    assert.match(root.textContent, /ES\s*1/);
+  } finally {
+    dispose();
+  }
+});
+
+test('a short list says how short it is and refuses to blame the reviews', async () => {
+  metricsFixture = {
+    ...metricsFixture,
+    qualified_leads: 3, strong_fit_pool: 3, outside_result_limit: 0,
+    countries_represented: 2, leads_by_country: { DE: 2, ES: 1 },
+    result_shortfall: 2, shortfall_reasons: { review_candidates: 8 },
+  };
+  globalThis.fetch = async url => ({
+    ok: true, status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => responseFor(url),
+  });
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('div');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, navigate: () => {} });
+  try {
+    await nextTurn();
+    await nextTurn();
+    assert.match(root.textContent, /3 strong fits qualified · 2 below the target/);
+    assert.match(root.textContent, /Review candidates do not fill the target/);
+  } finally {
+    dispose();
+  }
+});
+
+test('a curated buyer role says what it does and does not prove', async () => {
+  globalThis.fetch = async url => ({
+    ok: true, status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => responseFor(url),
+  });
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('div');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, navigate: () => {} });
+  try {
+    await nextTurn();
+    await nextTurn();
+    byText(root, 'button', 'Review 8').click();
+    await nextTurn();
+    await nextTurn();
+    assert.match(root.textContent, /Curated sector buyer · exact channel not confirmed/);
+  } finally {
+    dispose();
+  }
+});
+
+test('a dataset receipt is shown as a reference, never as a dead link', async () => {
+  const { renderEvidence } = await import('../../../server/webui/js/pages/research-results.js');
+  const citation = renderEvidence({
+    source_id: 'customer-list-corpus',
+    provenance_url: null,
+    source_reference: 'dataset:kitchen-appliances:3:atlas-1',
+    publisher_label: 'Kitchen appliance customer list',
+    value_en: 'sector_buyer', original_text: '"buyer_role": ["sector_buyer"]',
+    source_language: 'en', retrieved_at: '2026-08-24T00:00:00Z',
+    snapshot_id: 'snap_1', raw_hash: 'b'.repeat(64), mechanically_validated: true,
+  });
+
+  assert.match(citation.textContent, /dataset:kitchen-appliances:3:/);
+  assert.match(citation.textContent, /Kitchen appliance customer list/);
+  assert.equal(citation.querySelectorAll('a').length, 0);
 });

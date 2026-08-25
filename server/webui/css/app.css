@@ -5774,6 +5774,78 @@ h1, h2, h3, h4, p { margin: 0; }
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
+/* The primary list's own contract: how many qualified against the target, the
+   hard limit, and how they fell across markets. One hairline-divided row, read
+   before the table, because a list of nine means nothing until you know whether
+   nine was the ceiling or the shortfall. */
+.ifz-results-selection {
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+  margin-bottom: var(--space-4);
+}
+.ifz-results-selection-headline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+.ifz-results-selection-headline > strong {
+  color: var(--text-strong);
+  font-size: var(--fs-lg);
+  font-variant-numeric: tabular-nums;
+}
+.ifz-results-selection-headline > span {
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ifz-results-selection-spread {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 0;
+}
+.ifz-results-selection-spread > div {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: var(--space-3) var(--space-4);
+  border-right: 1px solid var(--border);
+}
+.ifz-results-selection-spread > div:last-child { border-right: 0; }
+.ifz-results-selection-spread > div:first-child { padding-left: 0; }
+.ifz-results-selection-spread dt {
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+}
+.ifz-results-selection-spread dd {
+  margin: 0;
+  color: var(--text-strong);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+/* A market code is an identifier, not prose. */
+.ifz-results-market dt { letter-spacing: var(--track-label); }
+.ifz-results-selection-note {
+  margin: 0;
+  padding: 0 0 var(--space-3);
+  color: var(--muted);
+}
+@media (max-width: 900px) {
+  .ifz-results-selection-headline {
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ifz-results-selection-spread > div:first-child { padding-left: var(--space-4); }
+}
 .ifz-research-results > .ifz-tabs {
   margin-bottom: var(--space-3);
 }

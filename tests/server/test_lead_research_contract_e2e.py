@@ -315,7 +315,10 @@ def test_two_tenants_reuse_public_fact_but_keep_decisions_private(contract_app):
         client,
         b,
         product_terms=["industrial valve"],
-        weights=_weights(30, 60),
+        # Both tenants weight the reachable dimensions heavily enough to
+        # qualify — a review has no primary result to compare — while still
+        # splitting product against buyer differently, which is the point.
+        weights=_weights(70, 20),
     )
     second_results = wait_for_results(app, client, b, second["id"])
     second_public = _public_result(second_results)
