@@ -1,24 +1,10 @@
-"""Regression: completion injection must resolve a SECONDARY profile's adapter.
+"""Regression: completion injection must resolve a secondary profile's adapter.
 
-Under ``gateway.multiplex_profiles`` one gateway process serves the default
-profile plus every named profile under ``~/.hermes/profiles/``. Only the
-default profile's adapters live in ``GatewayRunner.adapters``; each secondary
-profile's adapters live in ``_profile_adapters[profile]``.
-
-``_inject_watch_notification`` — the single funnel every background-process and
-async-delegation completion passes through — resolved its adapter from
-``self.adapters`` only (the alias-aware ``resolve_delivery_transport`` call and
-the legacy literal scan both read that one map). For a secondary profile that
-map has no entry for the profile's platform, so resolution fell through to a
-bare ``return None``: registration proven, drain proven, and then no delivery,
-no synthetic turn, and no log line naming the drop.
-
-The kanban notifier already resolves the same problem correctly via
-``_adapter_for_source``/``_authorization_adapter``
-(``gateway/authz_mixin.py``), which reads ``source.profile`` and fails closed
-rather than replying out of the default profile's bot. Contract under test:
-the injection path resolves through that same profile-aware resolver, and a
-genuine miss is logged rather than swallowed.
+Under ``gateway.multiplex_profiles`` only the default profile's adapters live in
+``GatewayRunner.adapters``; a secondary profile's live in
+``_profile_adapters[profile]``. Contract under test: ``_inject_watch_notification``
+resolves through the profile-aware resolver rather than ``self.adapters`` alone,
+and logs a genuine miss rather than swallowing it.
 """
 
 import logging
@@ -50,8 +36,7 @@ def _runner(default_adapters, profile_adapters):
 
 
 def _alpha_event():
-    """A completion for the alpha profile's Matrix room (served by its own
-    ``@alpha-bot:example.org`` connection), as the watcher queues it."""
+    """A completion for the alpha profile's Matrix room, as the watcher queues it."""
     return {
         "type": "process_completed",
         "session_id": "proc_alpha_1",
@@ -65,8 +50,7 @@ def _alpha_event():
 
 @pytest.mark.asyncio
 async def test_injection_resolves_secondary_profile_adapter():
-    """The alpha profile's Matrix adapter must receive the completion, even
-    though ``self.adapters`` (the default profile's map) has no Matrix entry."""
+    """Alpha's Matrix adapter is used although the default map has no Matrix entry."""
     alpha_adapter = _Adapter("matrix-alpha")
     telegram = _Adapter("telegram-default")
     runner = _runner(
@@ -86,9 +70,7 @@ async def test_injection_resolves_secondary_profile_adapter():
 
 @pytest.mark.asyncio
 async def test_injection_does_not_leak_to_default_profile_adapter():
-    """Fail closed: when the alpha profile has no Matrix adapter, the default
-    profile's Matrix adapter must NOT be used — that answers out of the wrong
-    bot."""
+    """Fail closed rather than answering out of the default profile's bot."""
     default_matrix = _Adapter("matrix-default")
     runner = _runner({Platform.MATRIX: default_matrix}, {"alpha": {}})
 
@@ -100,8 +82,7 @@ async def test_injection_does_not_leak_to_default_profile_adapter():
 
 @pytest.mark.asyncio
 async def test_default_profile_injection_unchanged():
-    """Control: a default-profile (``agent:main``) completion still resolves
-    through ``self.adapters`` exactly as before."""
+    """Control: an ``agent:main`` completion still resolves through ``self.adapters``."""
     matrix = _Adapter("matrix-default")
     runner = _runner({Platform.MATRIX: matrix}, {})
     evt = _alpha_event()
@@ -115,8 +96,7 @@ async def test_default_profile_injection_unchanged():
 
 @pytest.mark.asyncio
 async def test_unresolvable_adapter_is_logged_not_silent(caplog):
-    """The drop that used to be a bare ``return None`` must name the platform
-    and profile it could not resolve."""
+    """An unresolvable drop names the platform and profile it could not resolve."""
     runner = _runner({}, {"alpha": {}})
 
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
@@ -129,30 +109,14 @@ async def test_unresolvable_adapter_is_logged_not_silent(caplog):
     ), f"expected a WARNING naming platform+profile, got: {[r.getMessage() for r in caplog.records]}"
 
 
-# ---------------------------------------------------------------------------
-# Transport provenance vs runtime namespace
-#
-# ``source.profile`` is the RUNTIME namespace, not the transport owner. When one
-# shared credential serves several routed runtimes, resolving a completion from
-# the runtime namespace is wrong in both directions:
-#
-#   (a) the runtime registers no adapter for the platform -> the completion is
-#       dropped although the originating transport is live;
-#   (b) the runtime owns its OWN adapter for that platform -> the completion is
-#       delivered from a different bot than the one the user spoke to.
-#
-# So the commissioning turn records WHICH TRANSPORT it arrived on, as a name,
-# and the completion re-resolves whatever adapter is live for that name now.
-# ---------------------------------------------------------------------------
+# Transport provenance vs runtime namespace: when one shared credential serves
+# several routed runtimes, resolving from ``source.profile`` either drops a
+# completion whose transport is live, or answers from a different bot than the
+# user spoke to.
 
 
 def _shared_primary_event(**overrides):
-    """A completion commissioned on the SHARED PRIMARY Matrix transport by a
-    turn routed into the secondary runtime ``alpha``.
-
-    ``profile`` (runtime) and ``transport_profile`` (transport owner) disagree —
-    which is the whole point.
-    """
+    """A shared-primary Matrix completion whose runtime and transport disagree."""
     evt = _alpha_event()
     evt["profile"] = "alpha"
     evt["transport_profile"] = "default"
@@ -162,8 +126,7 @@ def _shared_primary_event(**overrides):
 
 @pytest.mark.asyncio
 async def test_shared_primary_transport_into_runtime_with_no_adapter():
-    """(a) Routed runtime ``alpha`` owns NO Matrix adapter, but the turn arrived
-    on the shared primary transport, which is live. Deliver on it."""
+    """Runtime ``alpha`` owns no Matrix adapter; deliver on the live transport."""
     primary_matrix = _Adapter("matrix-primary")
     runner = _runner({Platform.MATRIX: primary_matrix}, {"alpha": {}})
 
@@ -181,10 +144,7 @@ async def test_shared_primary_transport_into_runtime_with_no_adapter():
 
 @pytest.mark.asyncio
 async def test_shared_primary_transport_is_not_switched_for_a_secondary_bot():
-    """(b) Same route, but ``alpha`` ALSO owns its own Matrix adapter. The
-    completion must go back out the ORIGINATING (primary) transport — answering
-    from ``alpha``'s bot is a wrong-credential delivery to a user who never
-    spoke to it."""
+    """With ``alpha`` also owning a Matrix adapter, the originating one still wins."""
     primary_matrix = _Adapter("matrix-primary")
     alpha_matrix = _Adapter("matrix-alpha")
     runner = _runner(
@@ -206,8 +166,7 @@ async def test_shared_primary_transport_is_not_switched_for_a_secondary_bot():
 
 @pytest.mark.asyncio
 async def test_dedicated_per_profile_transport_still_uses_the_secondary_bot():
-    """(c) Control — the original topology. ``alpha`` owns the transport it was
-    commissioned on, so provenance names ``alpha`` and delivery is unchanged."""
+    """Control: ``alpha`` owns the transport it was commissioned on."""
     primary_matrix = _Adapter("matrix-primary")
     alpha_matrix = _Adapter("matrix-alpha")
     runner = _runner(
@@ -226,14 +185,12 @@ async def test_dedicated_per_profile_transport_still_uses_the_secondary_bot():
 
 @pytest.mark.asyncio
 async def test_provenance_is_re_resolved_to_the_current_live_adapter():
-    """Provenance is a NAME, never the adapter object captured at commissioning
-    time. An adapter that reconnected (or a whole restarted process) must be
-    picked up as-is."""
+    """Provenance is a name, so a reconnected adapter is picked up as-is."""
     stale_alpha = _Adapter("matrix-alpha-stale")
     live_alpha = _Adapter("matrix-alpha-live")
     profile_adapters = {"alpha": {Platform.MATRIX: stale_alpha}}
     runner = _runner({}, profile_adapters)
-    # Reconnect swaps the registry entry underneath us.
+    # Reconnect swaps the registry entry after commissioning.
     profile_adapters["alpha"][Platform.MATRIX] = live_alpha
 
     result = await runner._inject_watch_notification(
@@ -247,8 +204,7 @@ async def test_provenance_is_re_resolved_to_the_current_live_adapter():
 
 @pytest.mark.asyncio
 async def test_unresolvable_provenance_fails_closed_with_the_return_address(caplog):
-    """A named provenance with no live adapter must drop — never silently, and
-    never by falling through to some other profile's bot."""
+    """A named provenance with no live adapter drops loudly, without falling through."""
     primary_matrix = _Adapter("matrix-primary")
     runner = _runner({Platform.MATRIX: primary_matrix}, {"alpha": {}})
 
@@ -266,16 +222,12 @@ async def test_unresolvable_provenance_fails_closed_with_the_return_address(capl
     ), f"expected a WARNING naming the provenance and the return address, got: {messages}"
 
 
-# ---------------------------------------------------------------------------
-# Restart / recovery leg
-# ---------------------------------------------------------------------------
+# Restart / recovery leg.
 
 
 @pytest.mark.asyncio
 async def test_completion_routes_correctly_after_a_gateway_restart(tmp_path, monkeypatch):
-    """(f) Serialize the watcher record, drop ALL in-memory state, reload from
-    the checkpoint, and complete: the provenance must survive and still select
-    the originating transport."""
+    """Provenance survives a checkpoint round-trip and still selects the transport."""
     import json
 
     from tools import process_registry as pr_mod
@@ -306,7 +258,7 @@ async def test_completion_routes_correctly_after_a_gateway_restart(tmp_path, mon
     registry._write_checkpoint()
     assert json.loads(checkpoint.read_text())[0]["watcher_transport_profile"] == "default"
 
-    # --- restart: nothing in memory survives ---
+    # Restart: nothing in memory survives.
     restarted = pr_mod.ProcessRegistry()
     assert restarted.recover_from_checkpoint() == 1
     watcher = next(
@@ -316,7 +268,7 @@ async def test_completion_routes_correctly_after_a_gateway_restart(tmp_path, mon
     assert watcher["chat_type"] == "group"
     assert watcher["chat_id"] == "!room:example.org"
 
-    # --- the completion, built the way _run_process_watcher builds it ---
+    # The completion, built the way _run_process_watcher builds it.
     primary_matrix = _Adapter("matrix-primary")
     alpha_matrix = _Adapter("matrix-alpha")
     runner = _runner(
@@ -349,8 +301,7 @@ async def test_completion_routes_correctly_after_a_gateway_restart(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_legacy_record_without_provenance_keeps_runtime_resolution():
-    """Records queued before provenance was captured (or restored from a
-    pre-upgrade checkpoint) must keep the runtime-profile behaviour."""
+    """Records without provenance keep the runtime-profile behaviour."""
     alpha_matrix = _Adapter("matrix-alpha")
     runner = _runner({}, {"alpha": {Platform.MATRIX: alpha_matrix}})
 
@@ -361,15 +312,12 @@ async def test_legacy_record_without_provenance_keeps_runtime_resolution():
     assert alpha_matrix.handle_message.await_count == 1
 
 
-# ---------------------------------------------------------------------------
-# Async-delegation completions, end to end on the injection path
-# ---------------------------------------------------------------------------
+# Async-delegation completions, end to end on the injection path.
 
 
 @pytest.mark.asyncio
 async def test_async_delegation_matrix_colon_room_id_routes_to_the_full_id():
-    """(d) The captured address is used verbatim: the completion goes to
-    ``!room:example.org``, not to the ``!room`` a positional key split yields."""
+    """The captured address is used verbatim, keeping the whole Matrix room id."""
     alpha_matrix = _Adapter("matrix-alpha")
     runner = _runner({}, {"alpha": {Platform.MATRIX: alpha_matrix}})
 
@@ -393,7 +341,7 @@ async def test_async_delegation_matrix_colon_room_id_routes_to_the_full_id():
 
 @pytest.mark.asyncio
 async def test_async_delegation_slack_scoped_session_routes_to_the_channel():
-    """(e) The workspace scope stays the scope and the channel stays the chat."""
+    """The workspace scope stays the scope and the channel stays the chat."""
     slack = _Adapter("slack-default")
     runner = _runner({Platform.SLACK: slack}, {})
 
@@ -418,8 +366,7 @@ async def test_async_delegation_slack_scoped_session_routes_to_the_channel():
 
 @pytest.mark.asyncio
 async def test_legacy_async_delegation_enrichment_uses_the_canonical_parser():
-    """A legacy event with only a session_key is enriched through the canonical
-    parser, so even the fallback keeps the whole Matrix room id."""
+    """Session-key-only enrichment goes through the canonical parser."""
     alpha_matrix = _Adapter("matrix-alpha")
     runner = _runner({}, {"alpha": {Platform.MATRIX: alpha_matrix}})
 
@@ -437,19 +384,14 @@ async def test_legacy_async_delegation_enrichment_uses_the_canonical_parser():
     assert delivered.source.chat_id == "!room:example.org"
 
 
-# ---------------------------------------------------------------------------
-# Relay ingress — the receiving adapter is registered under Platform.RELAY
-# while the source keeps the logical platform, so the registry check in
-# ``_registered_transport_adapter`` cannot see it. Provenance must still be
-# recorded, or a relayed turn's completion falls back to runtime-profile
-# resolution and answers out of a secondary profile's own bot.
-# ---------------------------------------------------------------------------
+# Relay ingress registers the adapter under ``Platform.RELAY`` while the source
+# keeps the logical platform, so ``_registered_transport_adapter`` cannot see it
+# and provenance has to be recorded another way.
 
 
 @pytest.mark.asyncio
 async def test_relay_ingress_records_default_provenance():
-    """A relayed turn routed into runtime ``alpha`` records ``default``
-    provenance, not nothing."""
+    """A relayed turn routed into runtime ``alpha`` records ``default`` provenance."""
     import weakref
 
     relay = _Adapter("relay")
@@ -472,8 +414,7 @@ async def test_relay_ingress_records_default_provenance():
 
 @pytest.mark.asyncio
 async def test_relay_completion_is_not_answered_by_a_secondary_bot():
-    """With that provenance the completion goes back out the relay chain, not
-    out ``alpha``'s native Slack bot."""
+    """That provenance sends the completion back out the relay chain."""
     relay = _Adapter("relay")
     alpha_slack = _Adapter("slack-alpha")
     runner = _runner(

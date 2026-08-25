@@ -102,12 +102,10 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
-# TRANSPORT PROVENANCE — which profile owns the ADAPTER this turn arrived on,
-# as opposed to ``_SESSION_PROFILE``, which is the runtime namespace the turn is
-# routed to. The two differ whenever one shared credential serves several
-# routed runtimes, and only this one identifies the bot that must answer.
-# Values: ``"default"`` (the process-default adapter map), a profile name, or
-# ``""``/unset when the transport could not be identified (legacy).
+# Which profile owns the adapter this turn arrived on, as opposed to
+# ``_SESSION_PROFILE``, the runtime namespace it is routed to: the two differ
+# when one shared credential serves several routed runtimes, and only this one
+# identifies the bot that must answer. ``""`` means unidentified transport.
 _SESSION_TRANSPORT_PROFILE: ContextVar = ContextVar(
     "HERMES_SESSION_TRANSPORT_PROFILE", default=_UNSET
 )

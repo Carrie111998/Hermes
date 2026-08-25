@@ -1,18 +1,9 @@
-"""Regression: async delegation must carry a STRUCTURED return address.
+"""Regression: async delegation must carry a structured return address.
 
-``tools/async_delegation.py`` persisted ``session_key`` plus a few origin fields
-(scope_id / user_id / user_name) and nothing else, so a completion had to be
-reconstructed by splitting the session key on ``":"``. That grammar is
-platform-specific and lossy — a Matrix room id is ``!room:server``, and a Slack
-key carries the workspace id between the chat-type slot and the chat id — so the
-completion could target the wrong chat even with the adapter lookup fixed.
-
-And ``profile`` (the runtime namespace) is not the transport owner: one shared
-credential can serve several routed runtimes. ``transport_profile`` is carried
-separately, and is what the gateway re-resolves the delivering adapter from.
-
-These tests pin the capture at dispatch, its replay onto the completion event,
-and its survival across a restart (durable record -> recovery -> event).
+Session-key grammar is platform-specific and lossy to split, and the runtime
+namespace ``profile`` is not the transport owner. These tests pin the capture at
+dispatch, its replay onto the completion event, and its survival across a
+restart (durable record -> recovery -> event).
 """
 
 import json
@@ -26,7 +17,7 @@ from tools import async_delegation as ad
 
 @pytest.fixture
 def hermes_home(tmp_path, monkeypatch):
-    """Point the durable state.db at a temp dir — no network, no shared state."""
+    """Point the durable state.db at a temp dir."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
     return tmp_path
@@ -34,9 +25,7 @@ def hermes_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def matrix_turn():
-    """A turn that arrived on the SHARED PRIMARY Matrix transport but is routed
-    into the secondary runtime ``alpha`` — the topology where the runtime
-    namespace and the transport owner disagree."""
+    """A shared-primary Matrix turn routed into the secondary runtime ``alpha``."""
     tokens = set_session_vars(
         platform="matrix",
         chat_id="!room:example.org",
@@ -74,8 +63,7 @@ def slack_turn():
 
 
 def test_capture_records_the_full_return_address_matrix(matrix_turn):
-    """(d) The colon-bearing Matrix room id is captured whole — not recovered
-    later by splitting the key, which would yield ``!room``."""
+    """The colon-bearing Matrix room id is captured whole."""
     origin = ad._capture_routing_origin()
 
     assert origin["platform"] == "matrix"
@@ -86,8 +74,7 @@ def test_capture_records_the_full_return_address_matrix(matrix_turn):
 
 
 def test_capture_records_the_slack_workspace_scope(slack_turn):
-    """(e) The workspace scope and the channel are separate captured fields, so
-    neither can end up in the other's slot."""
+    """The workspace scope and the channel are captured as separate fields."""
     origin = ad._capture_routing_origin()
 
     assert origin["platform"] == "slack"
@@ -126,8 +113,7 @@ def _pushed_event(monkeypatch, record):
 
 
 def test_completion_event_carries_the_captured_address(monkeypatch, matrix_turn):
-    """The completion the gateway consumes is fully addressed — no session-key
-    parsing needed on the delivery path."""
+    """The completion the gateway consumes is fully addressed."""
     record = {
         "delegation_id": "del_1",
         "session_key": "agent:alpha:matrix:group:!room:example.org",
@@ -147,8 +133,7 @@ def test_completion_event_carries_the_captured_address(monkeypatch, matrix_turn)
 
 
 def test_slack_completion_event_routes_to_the_right_chat(monkeypatch, slack_turn):
-    """(e) end to end: the channel is the chat id and the workspace is the
-    scope, on the event the gateway delivers from."""
+    """On the delivered event the channel is the chat id and the workspace the scope."""
     record = {
         "delegation_id": "del_slack",
         "session_key": "agent:main:slack:group:T0WORKSPACE:C0CHANNEL:U0USER",
@@ -165,9 +150,7 @@ def test_slack_completion_event_routes_to_the_right_chat(monkeypatch, slack_turn
 
 
 def test_routing_address_survives_a_restart(hermes_home, matrix_turn, monkeypatch):
-    """(f) Durable leg: persist the dispatch, then recover it as an owner-died
-    record in a fresh process. The replayed event must carry the same address
-    and the same transport provenance."""
+    """A dispatch recovered as an owner-died record replays the same address."""
     record = {
         "delegation_id": "del_restart",
         "session_key": "agent:alpha:matrix:group:!room:example.org",
@@ -188,7 +171,7 @@ def test_routing_address_survives_a_restart(hermes_home, matrix_turn, monkeypatc
     assert persisted["chat_id"] == "!room:example.org"
     assert persisted["transport_profile"] == "default"
 
-    # --- restart: the owning process is gone ---
+    # Restart: the owning process is gone.
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
     assert ad.recover_abandoned_delegations() >= 1
 

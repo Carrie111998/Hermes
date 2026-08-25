@@ -202,18 +202,8 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-# The STRUCTURED return address an async delegation must carry from the
-# commissioning turn to its completion, mapped to the session contextvar that
-# holds each field.
-#
-# ``session_key`` alone is not a return address: it is colon-delimited and its
-# grammar is platform-specific (a Matrix room id is ``!room:server``; a Slack
-# key carries the workspace id between the chat-type slot and the chat id), so
-# a completion reconstructed by splitting it can target the wrong chat. And
-# ``profile`` — the runtime namespace — is not the transport owner: one shared
-# credential can serve several routed runtimes, so ``transport_profile`` is
-# carried separately and is what the gateway re-resolves the delivering adapter
-# from (see GatewayAuthorizationMixin._transport_owner_profile).
+# The return address carried from the commissioning turn to the completion:
+# session_key is lossy to split, and the runtime profile is not the transport.
 _ROUTING_ORIGIN_FIELDS = (
     ("platform", "HERMES_SESSION_PLATFORM"),
     ("chat_type", "HERMES_SESSION_CHAT_TYPE"),
@@ -226,8 +216,6 @@ _ROUTING_ORIGIN_FIELDS = (
     ("transport_profile", "HERMES_SESSION_TRANSPORT_PROFILE"),
 )
 
-#: The keys :func:`_capture_routing_origin` can produce — persisted with the
-#: durable record and replayed onto the completion event.
 _ROUTING_ORIGIN_KEYS = tuple(key for key, _ in _ROUTING_ORIGIN_FIELDS)
 
 
@@ -269,11 +257,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
-            # Structured return address + transport provenance: persisted so
-            # a restart-recovered completion reconstructs the SAME
-            # SessionSource and delivers through the SAME transport, without
-            # re-deriving either from the session key — see
-            # _capture_routing_origin.
+            # Routing origin persisted at dispatch (see _capture_routing_origin).
             *_ROUTING_ORIGIN_KEYS,
         )
         if key in record
@@ -399,10 +383,6 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
-            # Routing origin persisted at dispatch (see _capture_routing_origin):
-            # restores the full structured return address AND the transport
-            # provenance, so a completion replayed after a restart routes to
-            # the same chat through the same bot.
             for _k in _ROUTING_ORIGIN_KEYS:
                 if task.get(_k):
                     event[_k] = task[_k]
@@ -1013,9 +993,7 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
-    # Routing origin captured at dispatch (see _capture_routing_origin):
-    # the full structured return address plus transport provenance, so the
-    # gateway never has to re-derive either from the session key.
+    # Routing origin captured at dispatch (see _capture_routing_origin).
     for _k in _ROUTING_ORIGIN_KEYS:
         if record.get(_k):
             evt[_k] = record[_k]

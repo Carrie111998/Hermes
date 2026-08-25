@@ -512,24 +512,13 @@ def test_parse_session_key_with_extra_parts():
         "platform": "discord",
         "chat_type": "group",
         "chat_id": "chan123",
-        # ``main`` is the default profile's namespace literal, not a profile.
+        # ``main`` is a namespace literal, not a profile name.
         "profile": None,
     }
 
 
 def test_parse_session_key_accepts_profile_namespace():
-    """A named profile's key (``agent:alpha:...``) must parse, report the
-    profile, and keep the WHOLE Matrix room id.
-
-    ``_session_key_namespace`` reuses ``parts[1]`` to carry the profile under
-    ``gateway.multiplex_profiles``. Requiring the literal ``main`` here made
-    every secondary profile's session unparseable, which stripped the routing
-    metadata off its completions.
-
-    And a Matrix room id is ``!localpart:homeserver``, so the positional
-    ``split(":")`` this parser used to be returned ``chat_id == "!room"`` —
-    a room that does not exist. See gateway.session.parse_session_key.
-    """
+    """A named profile's key parses, reports the profile, and keeps the whole room id."""
     result = _parse_session_key("agent:alpha:matrix:group:!room:example.org")
     assert result == {
         "platform": "matrix",
@@ -540,8 +529,7 @@ def test_parse_session_key_accepts_profile_namespace():
 
 
 def test_parse_session_key_rejects_non_agent_and_short_keys():
-    """Control: raw api_server session ids still return None, so the
-    self-post recovery path in _inject_watch_notification is unaffected."""
+    """Control: raw api_server session ids still return None."""
     assert _parse_session_key("sess_abc123") is None
     assert _parse_session_key("agent:main:matrix:dm") is None
     assert _parse_session_key("agent::matrix:dm:!room") is None

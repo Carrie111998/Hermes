@@ -3858,23 +3858,10 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
 def _parse_session_key(session_key: str) -> "dict | None":
     """Thin alias for :func:`gateway.session.parse_session_key`.
 
-    A session key is an OPAQUE identifier, not a return address. Routing must
-    come from the structured fields captured when the background work was
-    commissioned (platform / chat_type / chat_id / thread_id / runtime profile
-    / transport provenance) and carried on the durable record. This parser is
-    the legacy fallback for records that predate that capture, and the
-    "is this a structured agent key at all?" test that
-    ``_inject_watch_notification`` uses to tell a gateway session key from a
-    raw ``api_server`` session id.
-
-    It used to be a positional ``split(":")`` here, which was lossy for real
-    session-key grammar: a Matrix room id is ``!room:server``, so
-    ``agent:main:matrix:group:!room:example.org`` parsed ``chat_id ==
-    "!room"`` and discarded the homeserver, and a Slack key carries the
-    workspace id between the chat-type slot and the chat id, so the chat-id
-    slot held the workspace. The canonical parser mirrors
-    ``build_session_key``'s per-platform grammar instead; see its docstring for
-    what remains ambiguous by construction.
+    A session key is not a return address: routing comes from the structured
+    fields carried on the durable record. This stays as the fallback for
+    records that predate that capture, and as the "is this a structured agent
+    key at all?" test ``_inject_watch_notification`` uses.
     """
     return parse_session_key(session_key)
 
@@ -24699,14 +24686,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        # TRANSPORT PROVENANCE (see _transport_owner_profile). Captured here,
-        # on the commissioning turn, because this is the only point where the
-        # receiving adapter is still reachable from the source: anything the
-        # turn commissions (a background process, an async delegation) records
-        # this token and re-resolves the CURRENT LIVE adapter from it when the
-        # work completes. Resolving the completion from the runtime profile
-        # instead is what drops it, or answers from the wrong bot, whenever one
-        # shared transport serves several routed runtimes.
+        # The only point where the receiving adapter is still reachable from
+        # the source (see _transport_owner_profile).
         try:
             _transport_profile = self._transport_owner_profile(context.source) or ""
         except Exception:
@@ -25282,11 +25263,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "the connector's tenant guard (user_id fallback only).",
                 platform_name, chat_id, chat_type,
             )
-        # Carry the profile through. A reconstructed source that drops it
-        # resolves against the DEFAULT profile's adapter map, which under
-        # multiplexing is the wrong bot (or, commonly, no adapter at all for
-        # that platform) — see _inject_watch_notification's profile-aware
-        # resolution.
+        # A reconstructed source that drops the profile resolves against the
+        # default profile's map: under multiplexing, the wrong bot or none.
         profile = str(evt.get("profile") or "").strip() or derived_profile
         return SessionSource(
             platform=platform,
@@ -25377,7 +25355,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = None
-        # The full return address, for every log line on this path.
         _return_address = (
             "platform=%s chat_type=%s chat_id=%s thread=%s scope=%s "
             "runtime profile=%r transport provenance=%r "
@@ -25392,25 +25369,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 sorted(getattr(self, "_profile_adapters", None) or {}) or "none",
             )
         )
-        # ---- TRANSPORT PROVENANCE FIRST ----------------------------------
-        # ``source.profile`` is the RUNTIME namespace, not the transport owner.
-        # One shared credential (a single Matrix bot, say) can serve several
-        # routed runtimes, and then resolving a completion from the runtime
-        # namespace is wrong in both directions: the runtime may register no
-        # adapter for the platform (completion dropped although the originating
-        # transport is live), or it may own its OWN adapter for that platform
-        # (completion delivered from a different bot than the user spoke to).
-        # So the commissioning turn records WHICH TRANSPORT it arrived on — as
-        # a name, never an adapter object — and we re-resolve whatever adapter
-        # is live for that name NOW. See
-        # GatewayAuthorizationMixin._transport_owner_profile and, upstream of
-        # it, BasePlatformAdapter.set_owner_profile.
+        # Provenance wins over ``source.profile``, the runtime namespace: one
+        # credential can serve several runtimes, so resolving from the runtime
+        # drops the completion or answers from another bot.
         _transport_profile = str(evt.get("transport_profile") or "").strip() or None
         _provenance_is_default = _transport_profile == TRANSPORT_PROFILE_DEFAULT
         if _transport_profile and not _provenance_is_default:
-            # A named profile owns the transport: its map is the only correct
-            # answer. Fail closed on a miss rather than delivering out of some
-            # other profile's bot.
+            # A named profile owns the transport, so fail closed on a miss
+            # rather than delivering out of another profile's bot.
             try:
                 adapter = self._adapter_for_transport_profile(
                     source.platform, _transport_profile,
@@ -25431,24 +25397,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
         elif not _provenance_is_default:
-            # Legacy record with NO provenance (queued before it was captured,
-            # or restored from a pre-upgrade checkpoint): fall back to the
-            # runtime profile's own adapter, which is correct for the
-            # dedicated-adapter-per-profile topology and is what this path did
-            # before provenance existed.
-            #
-            # Profile-aware resolution (multiplex plane): under
-            # ``gateway.multiplex_profiles`` one gateway process serves the
-            # default profile plus every named profile, and only the default
-            # profile's adapters live in ``self.adapters`` — each secondary
-            # profile's adapters live in ``_profile_adapters[profile]``. Both
-            # scans below read ``self.adapters`` only, so a completion for a
-            # secondary profile found no adapter and hit a bare ``return None``:
-            # no delivery, no synthetic turn, and no log line to say so. Reuse
-            # ``_adapter_for_source``, the resolver the kanban notifier already
-            # trusts for exactly this (gateway/authz_mixin.py), which consults
-            # the stamped ``source.profile`` and fails closed rather than
-            # replying out of the default profile's bot.
+            # No provenance recorded: resolve from the runtime profile, which
+            # is correct for the dedicated-adapter-per-profile topology and
+            # fails closed on an unknown profile.
             try:
                 adapter = self._adapter_for_source(source)
             except Exception as exc:
@@ -25457,17 +25408,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_name, getattr(source, "profile", None), exc,
                 )
                 adapter = None
-        # Whether the ``self.adapters`` fallbacks below are allowed to answer.
-        # They read the DEFAULT profile's map. Provenance of ``default`` says
-        # exactly that map is the right one — including for relay-fronted
-        # platforms, whose adapter only ``resolve_delivery_transport`` can find.
-        # Without provenance, a source stamped with a secondary profile that
-        # owns a registry entry must NOT reach them: that delivers out of the
-        # wrong bot. ``_authorization_adapter`` fails closed in exactly that
-        # case; mirror its rule instead of undoing it. A profile with no
-        # registry entry at all (relay-fronted deployments, where secondary
-        # profiles deliberately register no adapters) keeps the historical
-        # fallback behaviour.
+        # The fallbacks below read the default profile's map, so without
+        # provenance a source stamped with a secondary profile that owns a
+        # registry entry must not reach them (as ``_authorization_adapter``).
         _profile_name = (getattr(source, "profile", None) or "").strip() or None
         _fallback_ok = _provenance_is_default or not (
             _profile_name
@@ -25475,13 +25418,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and _profile_name in (getattr(self, "_profile_adapters", None) or {})
         )
         if adapter is None and _fallback_ok:
-            # Alias-aware resolution (relay plane): a relay-fronted gateway
-            # registers ONE adapter under Platform.RELAY fronting N logical
-            # platforms, so a literal ``p.value == platform_name`` scan misses
-            # "slack" and silently drops the completion as "no gateway route"
-            # (staging incident 2026-08-09, second occurrence). Resolve through
-            # the shared transport resolver — native adapter wins; relay is
-            # eligible only when it advertises fronting the logical platform.
+            # Alias-aware: a relay-fronted gateway registers one adapter under
+            # Platform.RELAY fronting several logical platforms, which the
+            # literal scan below misses. Native adapter wins over relay.
             try:
                 _platform_enum = Platform(platform_name)
             except (ValueError, KeyError):
@@ -25504,9 +25443,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter = a
                     break
         if not adapter:
-            # Previously a bare ``return None``. This is the last silent drop
-            # on the completion path (the two above it already log), and it
-            # is the one a multiplexed deployment actually hits, so name the
+            # The drop a multiplexed deployment actually hits, so name the
             # whole return address that could not be resolved.
             logger.warning(
                 "Dropping watch notification for process %s: no adapter for %s",
@@ -26320,11 +26257,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": user_id,
                         "user_name": user_name,
                         "message_id": message_id,
-                        # Runtime namespace and, separately, the transport this
-                        # process's commissioning turn actually arrived on. The
-                        # completion is delivered through the LIVE adapter
-                        # re-resolved from the latter — see
-                        # _inject_watch_notification.
+                        # Runtime namespace and, separately, the transport the
+                        # turn arrived on; delivery re-resolves the latter.
                         "profile": watcher.get("profile", ""),
                         "transport_profile": watcher.get("transport_profile", ""),
                         "started_at": getattr(session, "started_at", None),

@@ -28,9 +28,9 @@ from gateway.whatsapp_identity import (
 )
 
 
-# Provenance token for "the process-default adapter map" (``self.adapters``).
-# Deliberately the same string ``_authorization_adapter`` already treats as the
-# default map, so a recorded provenance token can be handed straight back to it.
+# Provenance token for the process-default adapter map (``self.adapters``).
+# Same string ``_authorization_adapter`` already treats as the default map, so a
+# recorded token can be handed straight back to it.
 TRANSPORT_PROFILE_DEFAULT = "default"
 
 
@@ -195,50 +195,33 @@ class GatewayAuthorizationMixin:
         return getattr(source, "profile", None)
 
     def _transport_owner_profile(self, source) -> Optional[str]:
-        """Return DURABLE transport provenance for the turn *source* arrived on.
+        """Return durable transport provenance for the turn *source* arrived on.
 
-        ``source.profile`` is the runtime namespace — which agent config,
-        credentials and session lane the turn is routed to. It is NOT the
-        transport owner: one shared credential (a single Matrix bot, say) can
-        serve several routed runtimes, so a completion resolved from the
-        runtime namespace is either dropped (that runtime registers no adapter
-        for the platform) or answered from a different bot than the one the
-        user spoke to.
-
-        This returns the profile that OWNS the receiving adapter, as a token
+        Unlike ``source.profile`` — the runtime namespace the turn is routed to
+        — this names the profile that owns the receiving adapter, as a token
         that survives serialization onto a durable record:
 
         * ``"default"`` — the process-default adapter map (``self.adapters``),
-          which is also the answer for relay ingress: one process-level
-          RelayAdapter fronts every multiplexed profile.
+          also the answer for relay ingress.
         * ``"<name>"``  — ``_profile_adapters["<name>"]``.
-        * ``None``      — no live transport provenance on this source (a
-          restored or hand-built source), i.e. legacy: the caller must fall
-          back to the runtime profile.
+        * ``None``      — no live transport provenance on this source, so the
+          caller must fall back to the runtime profile.
 
-        The token is deliberately the same vocabulary
-        :meth:`_authorization_adapter` already accepts, so re-resolving the
-        CURRENT LIVE adapter at completion time is a single call with no new
-        lookup rules — and no new fail-open path.
+        The token is the vocabulary :meth:`_authorization_adapter` already
+        accepts, so re-resolving the live adapter later is a single call.
         """
         adapter = self._registered_transport_adapter(source)
         if adapter is None:
-            # Relay ingress: the receiving adapter is registered under
-            # ``Platform.RELAY`` while the source keeps the logical platform,
-            # so the registry check above cannot see it. ONE process-level
-            # RelayAdapter owns the connector socket for every multiplexed
-            # profile (secondary profiles deliberately register no relay
-            # adapter), so the process-default map IS the owner — the same rule
-            # :meth:`_adapter_for_source` applies. Without this a relayed turn
-            # records no provenance at all and its completion falls back to
-            # runtime-profile resolution, which is the wrong-bot delivery this
-            # method exists to prevent.
+            # Relay ingress registers the adapter under ``Platform.RELAY`` while
+            # the source keeps the logical platform, so the check above misses
+            # it. One process-level RelayAdapter serves every profile, so the
+            # default map owns it (the rule :meth:`_adapter_for_source` applies).
             if getattr(source, "delivered_via_upstream_relay", False) is True:
                 return TRANSPORT_PROFILE_DEFAULT
             return None
-        # #89860's ownership API is the adapter's own declaration of which
-        # profile's credentials it holds. Prefer it; it is set by
-        # ``_configure_profile_adapter`` before any inbound event is handled.
+        # The adapter's own declaration of which profile's credentials it holds
+        # (see #89860), set by ``_configure_profile_adapter`` before any inbound
+        # event is handled, so prefer it over the registry scans below.
         owner = getattr(adapter, "_owner_profile", None)
         if isinstance(owner, str) and owner.strip():
             return owner.strip()
@@ -253,13 +236,12 @@ class GatewayAuthorizationMixin:
         return None
 
     def _adapter_for_transport_profile(self, platform, transport_profile):
-        """Re-resolve the CURRENT LIVE adapter for a recorded provenance token.
+        """Re-resolve the currently live adapter for a recorded provenance token.
 
-        The adapter object captured at commissioning time must never be held
-        across a completion: it may have been disconnected and replaced by the
-        reconnect path (``_run_secondary_profile_reconnect``), or the whole
-        process may have restarted. Provenance is recorded as a *name*; this
-        turns the name back into whatever adapter is live NOW.
+        An adapter object captured at commissioning time cannot be held across a
+        completion: the reconnect path may have replaced it, or the process may
+        have restarted. Provenance is a name, and this turns it back into
+        whatever adapter is live now.
         """
         if not transport_profile:
             return None

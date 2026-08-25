@@ -1,19 +1,8 @@
 """Regression: ``parse_session_key`` must be the inverse of ``build_session_key``.
 
-A session key is colon-delimited and its grammar is platform-specific, so a
-positional ``split(":")`` is lossy on real keys:
-
-* a Matrix room id is ``!localpart:homeserver``, so
-  ``agent:main:matrix:group:!room:example.org`` split positionally yields
-  ``chat_id == "!room"`` — a room that does not exist — and silently discards
-  the homeserver;
-* ``build_session_key`` inserts the Slack workspace id BETWEEN the chat-type
-  slot and the chat id, so on a scoped Slack key the chat-id slot holds the
-  workspace.
-
-The contract these tests pin: for every shape ``build_session_key`` emits,
-parsing the key it built recovers the platform, chat type, chat id, workspace
-scope and profile it was built from.
+Session-key grammar is platform-specific, so a positional ``split(":")`` is lossy
+on real keys. For every shape ``build_session_key`` emits, parsing the key it
+built must recover the platform, chat type, chat id, workspace scope and profile.
 """
 
 import pytest
@@ -118,8 +107,7 @@ def test_parse_is_the_inverse_of_build(source, profile):
         f"{key!r} -> chat_id {parsed['chat_id']!r}; delivering there is "
         "delivering to the wrong chat"
     )
-    # ``main`` is a namespace literal, not a profile — it is reported as None so
-    # it can be handed straight to the profile-aware resolvers.
+    # ``main`` is a namespace literal, not a profile, so it is reported as None.
     assert parsed["profile"] == profile
     if source.scope_id:
         assert parsed.get("scope_id") == source.scope_id
@@ -127,15 +115,13 @@ def test_parse_is_the_inverse_of_build(source, profile):
 
 @pytest.mark.parametrize("source,profile", ROUND_TRIPS)
 def test_chat_type_slot_round_trips(source, profile):
-    """The chat-type slot survives, including Discord's prospective-thread
-    rewrite of ``group`` to ``thread``."""
+    """The chat-type slot survives, including Discord's ``group``/``thread`` rewrite."""
     key = build_session_key(source, profile=profile)
     assert parse_session_key(key)["chat_type"] == key.split(":")[2 + 1]
 
 
 def test_thread_id_only_where_the_grammar_is_unambiguous():
-    """A 6th token in a GROUP key may be a participant id, not a thread — so
-    ``thread_id`` is reported only for ``dm``/``thread``."""
+    """A group key's 6th token may be a participant, so no ``thread_id`` is reported."""
     group = build_session_key(
         _source(platform=Platform.DISCORD, chat_id="chan", chat_type="group", user_id="u1")
     )
@@ -163,6 +149,5 @@ def test_thread_id_only_where_the_grammar_is_unambiguous():
     ],
 )
 def test_non_keys_return_none(not_a_key):
-    """``_inject_watch_notification`` uses ``None`` here to tell a gateway
-    session key from a raw api_server session id it must self-post to."""
+    """``None`` is how ``_inject_watch_notification`` spots a non-gateway session id."""
     assert parse_session_key(not_a_key) is None

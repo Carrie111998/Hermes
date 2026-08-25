@@ -374,11 +374,10 @@ def format_uptime_short(seconds: int) -> str:
 
 
 def _watcher_return_address(session: "ProcessSession") -> Dict[str, Any]:
-    """The structured return address recorded when *session* was commissioned.
+    """The return address recorded when *session* was commissioned.
 
-    One place, so every event this registry queues carries the same complete
-    address — including the transport provenance the gateway re-resolves the
-    delivering adapter from.
+    One place, so every event this registry queues carries the same fields,
+    including the transport provenance delivery re-resolves an adapter from.
     """
     return {
         "platform": session.watcher_platform,
@@ -419,22 +418,18 @@ class ProcessSession:
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
-    # The rest of the STRUCTURED return address, captured when the process was
-    # commissioned (tools/terminal_tool.py). Before these existed the gateway
-    # had to recover chat_type/scope_id/profile by splitting the session_key on
-    # ":", which is lossy for real key grammar (Matrix ids are ``!room:server``;
-    # Slack keys carry the workspace id before the chat id) — see
-    # gateway.session.parse_session_key.
+    # The rest of the return address, captured when the process was
+    # commissioned (tools/terminal_tool.py). Without these the gateway can only
+    # recover chat_type/scope_id/profile by splitting the session_key, which is
+    # lossy for real key grammar (see gateway.session.parse_session_key).
     watcher_chat_type: str = ""
     watcher_scope_id: str = ""
     # Runtime namespace this process's turn was routed to.
     watcher_profile: str = ""
-    # TRANSPORT PROVENANCE: the profile that owns the ADAPTER the commissioning
-    # turn arrived on ("default" for the process-default adapter map). Distinct
-    # from watcher_profile: one shared credential can serve several routed
-    # runtimes, and only this identifies the bot that must answer. Recorded as a
-    # NAME, never an adapter object, so it survives reconnects and restarts and
-    # is re-resolved to whatever adapter is live at completion time.
+    # The profile owning the adapter the commissioning turn arrived on, which is
+    # distinct from watcher_profile when one credential serves several routed
+    # runtimes. A name, never an adapter object, so it survives reconnects and
+    # restarts and is re-resolved to whatever adapter is live at completion.
     watcher_transport_profile: str = ""
     watcher_user_id: str = ""
     watcher_user_name: str = ""
@@ -2779,11 +2774,10 @@ class ProcessRegistry:
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
-                            # Structured return address + transport provenance:
-                            # persisted so a completion that lands AFTER a
-                            # gateway restart still re-resolves the originating
-                            # transport instead of falling back to the runtime
-                            # profile's adapter map (or to a session_key split).
+                            # Persisted so a completion landing after a gateway
+                            # restart still re-resolves the originating
+                            # transport, rather than falling back to the runtime
+                            # profile's adapter map or to a session_key split.
                             "watcher_chat_type": s.watcher_chat_type,
                             "watcher_scope_id": s.watcher_scope_id,
                             "watcher_profile": s.watcher_profile,
@@ -2885,9 +2879,8 @@ class ProcessRegistry:
                 detached=True,  # Can't read output, but can report status + kill
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),
-                # Absent on pre-existing checkpoints — an empty transport
-                # provenance is the documented "legacy record" signal and the
-                # gateway falls back to runtime-profile resolution for it.
+                # Absent on pre-existing checkpoints: empty provenance is the
+                # legacy-record signal the gateway falls back on.
                 watcher_chat_type=entry.get("watcher_chat_type", ""),
                 watcher_scope_id=entry.get("watcher_scope_id", ""),
                 watcher_profile=entry.get("watcher_profile", ""),

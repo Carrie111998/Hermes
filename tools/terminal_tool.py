@@ -3478,30 +3478,19 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
-                            # The rest of the structured return address. Until
-                            # these were captured here, a completion had to be
-                            # reconstructed by splitting the session_key on
-                            # ":" — which is lossy for real key grammar (a
-                            # Matrix room id is ``!room:server``; a Slack key
-                            # carries the workspace id before the chat id) —
-                            # and the chat_type slot was simply left empty.
+                            # The rest of the return address; a session_key split recovers it lossily.
                             proc_session.watcher_chat_type = _gse(
                                 "HERMES_SESSION_CHAT_TYPE", ""
                             )
                             proc_session.watcher_scope_id = _gse(
                                 "HERMES_SESSION_SCOPE_ID", ""
                             )
-                            # Runtime namespace...
+                            # Runtime namespace the turn was routed to...
                             proc_session.watcher_profile = _gse(
                                 "HERMES_SESSION_PROFILE", ""
                             )
-                            # ...and, separately, TRANSPORT PROVENANCE: which
-                            # profile owns the adapter this turn arrived on.
-                            # The two differ whenever one shared credential
-                            # serves several routed runtimes, and only this one
-                            # identifies the bot that must deliver the
-                            # completion (see
-                            # GatewayAuthorizationMixin._transport_owner_profile).
+                            # ...and the profile owning the adapter it arrived
+                            # on, which is the bot that must answer.
                             proc_session.watcher_transport_profile = _gse(
                                 "HERMES_SESSION_TRANSPORT_PROFILE", ""
                             )
