@@ -314,13 +314,11 @@ def _detect_python_recipe(root: Path) -> Recipe | None:
             evidence=["Detected Python project", "Detected FastAPI/Uvicorn dependency"],
         )
 
-    if is_flask:
+    if is_flask and ((root / "app.py").exists() or (root / "main.py").exists()):
         if (root / "app.py").exists():
             app_module = "app.py"
-        elif (root / "main.py").exists():
-            app_module = "main.py"
         else:
-            app_module = "app.py"
+            app_module = "main.py"
         return Recipe(
             name="Flask app",
             kind="flask",

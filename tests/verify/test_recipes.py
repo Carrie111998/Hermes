@@ -132,6 +132,16 @@ class TestPythonDetection:
         assert recipe.kind == "flask"
         assert recipe.port == 5000
 
+    def test_flask_dependency_without_root_entrypoint_falls_back_to_python(self, tmp_path):
+        """Regression: Flask listed as dependency but no app.py or main.py at root
+        must not be reported as a runnable Flask app. A dependency is not an
+        entrypoint — the detector must not invent one."""
+        (tmp_path / "requirements.txt").write_text("flask>=3\n", encoding="utf-8")
+        recipe = detect_recipe(tmp_path)
+        assert recipe.kind == "python"
+        assert not recipe.start
+        assert recipe.port is None
+
     def test_generic_python_uv(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
         (tmp_path / "uv.lock").touch()
