@@ -127,6 +127,12 @@ class TestShouldExclude:
         assert _should_exclude(Path("hermes-agent/run_agent.py"))
         assert _should_exclude(Path("hermes-agent/.git/HEAD"))
 
+    def test_excludes_only_root_browser_automation_runtime(self):
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("browser-automation/chrome-profile/first_party_sets.db"))
+        assert _should_exclude(Path("browser-automation/chrome-mac-arm64/Chrome"))
+        assert not _should_exclude(Path("skills/example/browser-automation/README.md"))
+
 
     def test_excludes_backups_dir(self):
         """backups/ is excluded so pre-update backups don't nest exponentially."""
@@ -164,6 +170,28 @@ class TestShouldExclude:
 # ---------------------------------------------------------------------------
 
 class TestBackup:
+
+    def test_backup_prunes_root_browser_automation_but_keeps_nested_user_content(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        runtime = hermes_home / "browser-automation/chrome-profile"
+        runtime.mkdir(parents=True)
+        (runtime / "first_party_sets.db").write_bytes(b"locked runtime")
+        nested = hermes_home / "skills/example/browser-automation"
+        nested.mkdir(parents=True)
+        (nested / "README.md").write_text("user content\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        out_zip = tmp_path / "backup.zip"
+
+        from hermes_cli.backup import run_backup
+        run_backup(Namespace(output=str(out_zip)))
+
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            names = zf.namelist()
+        assert not any(name.startswith("browser-automation/") for name in names)
+        assert "skills/example/browser-automation/README.md" in names
 
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):

@@ -49,10 +49,9 @@ logger = logging.getLogger(__name__)
 # here because the exclusion set needs it.
 _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 
-# Directory names to skip entirely (matched against each path component)
-# ``hermes-agent`` is special-cased to root level only in ``_should_exclude``
-# so that skill directories like ``skills/autonomous-ai-agents/hermes-agent/``
-# are not accidentally excluded.
+# Directory names to skip entirely (matched against each path component).
+# ``hermes-agent`` and ``browser-automation`` are special-cased to root level
+# only so nested user content with those names is preserved.
 #
 # The dependency/cache entries below matter for more than tidiness: without
 # them a single plugin venv, MCP-server install, or pip/uv cache living under
@@ -67,6 +66,7 @@ _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 # restorable user skills that must survive a backup.
 _EXCLUDED_DIRS = {
     "hermes-agent",     # the codebase repo — re-clone instead
+    "browser-automation",  # downloaded Chrome + live profile runtime — regenerate instead
     "__pycache__",      # bytecode caches — regenerated on import
     ".git",             # nested git dirs (profiles shouldn't have these, but safety)
     "node_modules",     # js deps — reinstalled on demand
@@ -95,6 +95,7 @@ _EXCLUDED_DIRS = {
     ".mypy_cache",
     ".ruff_cache",
 }
+_ROOT_ONLY_EXCLUDED_DIRS = {"hermes-agent", "browser-automation"}
 
 # File-name suffixes to skip
 _EXCLUDED_SUFFIXES = (
@@ -327,10 +328,8 @@ def _should_exclude(rel_path: Path) -> bool:
     for part in parts:
         if part not in _EXCLUDED_DIRS:
             continue
-        # ``hermes-agent`` only matches at the root level (first component).
-        # Nested directories with the same name — e.g.
-        # ``skills/autonomous-ai-agents/hermes-agent/`` — must be preserved.
-        if part == "hermes-agent" and part != parts[0]:
+        # Root runtime/code directories only match the first component.
+        if part in _ROOT_ONLY_EXCLUDED_DIRS and part != parts[0]:
             continue
         return True
 
@@ -829,13 +828,13 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         rel_dir = dp.relative_to(hermes_root)
 
         # Prune excluded directories in-place so os.walk doesn't descend
-        # ``hermes-agent`` is only pruned at the root level; nested dirs
-        # with the same name (e.g. in skills/) must be preserved.
+        # Root runtime/code directories are pruned only at root; nested user
+        # content with the same names must be preserved.
         is_root = rel_dir == Path(".")
         orig_dirnames = dirnames[:]
         dirnames[:] = [
             d for d in dirnames
-            if d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root)
+            if d not in _EXCLUDED_DIRS or (d in _ROOT_ONLY_EXCLUDED_DIRS and not is_root)
         ]
         for removed in set(orig_dirnames) - set(dirnames):
             skipped_dirs.add(str(rel_dir / removed))
