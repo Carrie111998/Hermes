@@ -6504,6 +6504,13 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                # WeCom single-stream-per-turn: mark this as the turn's FINAL
+                # send so the adapter closes the thinking bubble (finish=true)
+                # instead of appending another mid-turn update. Mid-turn sends
+                # (progress/interim) don't carry this flag and keep writing
+                # finish=false into the same stream.
+                if isinstance(_final_thread_metadata, dict):
+                    _final_thread_metadata["_wecom_final"] = True
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

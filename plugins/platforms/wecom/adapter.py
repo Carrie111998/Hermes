@@ -1451,23 +1451,36 @@ class WeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send markdown to a WeCom chat via proactive ``aibot_send_msg``."""
-        del metadata
+        """Send markdown to a WeCom chat via proactive ``aibot_send_msg``.
+
+        Thinking-bubble semantics (single-stream-per-turn, mirrors the
+        official openclaw plugin): while a bubble is open for this chat,
+        every send writes into that SAME stream with ``finish=false`` —
+        mid-turn texts update the bubble in place instead of spawning new
+        messages. The FINAL send (metadata ``_wecom_final=True``) closes the
+        stream with ``finish=true``, replacing the bubble with the answer.
+        If no bubble is open (disabled/expired/never opened), everything
+        falls through to normal markdown as before.
+        """
+        is_final = bool(metadata and metadata.get("_wecom_final"))
 
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
-        # If a thinking bubble is open for this chat, replace it in place with
-        # the final content and SKIP the normal markdown (else WeCom shows the
-        # answer twice: once via the stream finish frame, once as markdown).
-        # message_id is the bare streamId — the only correlation key WeCom
-        # has for this reply; no synthetic uuid is fabricated.
-        if await self._finish_thinking(chat_id, content):
-            st = self._finished_streams.get(chat_id)
-            return SendResult(
-                success=True,
-                message_id=st["id"] if st else None,
-            )
+        # Live bubble open → write into it. Mid-turn: finish=false (bubble
+        # content updates, stays "thinking"); final: finish=true (replaced by
+        # the answer). Either way SKIP markdown — one message per turn.
+        st = self._thinking_streams.get(chat_id)
+        if st is not None:
+            ok = await self._write_stream(
+                chat_id, content, finish=is_final)
+            if ok:
+                return SendResult(
+                    success=True,
+                    message_id=st["id"],
+                )
+            # Write failed (expired/ws closed) → state already cleaned;
+            # fall through to markdown below.
 
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
@@ -1698,44 +1711,49 @@ class WeComAdapter(BasePlatformAdapter):
                          "stream": {"id": st["id"], "finish": True,
                                     "content": t(f"gateway.busy_ack.{notice_key}")}},
             })
+            self._finished_streams[chat_id] = {"id": st["id"], "req": st["req"]}
         except Exception:
             pass
 
-    async def _finish_thinking(self, chat_id: str, content: str) -> bool:
-        """Close the open thinking bubble with finish=true (in-place replace).
+    async def _write_stream(self, chat_id: str, content: str, *, finish: bool) -> bool:
+        """Write text into the chat's open thinking stream.
 
-        Mirrors wecom-bridge exactly: the finish=true frame is fire-and-forget
-        (raw wsManager send, no ack wait — WeCom does NOT ack finish frames,
-        and awaiting one times out after the frame was already delivered,
-        which used to double-render: stream content + follow-up markdown).
+        Single-stream-per-turn (official openclaw semantics): mid-turn sends
+        use finish=false — the bubble content updates in place and stays in
+        "thinking" state; the final send uses finish=true — the bubble is
+        replaced by the answer. Fire-and-forget raw send either way (WeCom
+        does not ack finish frames; awaiting one times out after delivery).
 
-        Stream lifetime guard: a WeCom stream can only be updated for ~6
-        minutes after it opens (server-side; keepalives do NOT extend it —
-        errcode 846608). For turns longer than that the finish frame would be
-        silently dropped by the server, so we DON'T take the stream path at
-        all: return False and let send() deliver via normal markdown /
-        proactive send. The stale bubble is cancelled client-side (it will
-        show the native timeout state, same as official openclaw's expired-
-        stream fallback).
+        Lifetime guard: a stream can only be updated for ~6 minutes after
+        opening (server-side, errcode 846608; keepalives do NOT extend it).
+        Past that deadline this returns False WITHOUT sending — caller falls
+        back to normal markdown/proactive send. The stale entry is cleaned
+        and its keepalive cancelled either way.
 
-        Returns True when a LIVE bubble existed and the finish frame was sent
-        (caller should then SKIP the normal markdown reply).
+        Returns True when the frame was written into a live stream (caller
+        should SKIP markdown).
         """
-        st = self._thinking_streams.pop(chat_id, None)
-        ka = self._thinking_keepalives.pop(chat_id, None)
-        if ka:
-            ka.cancel()
+        st = self._thinking_streams.get(chat_id)
         if st is None:
             return False
-        # 6-minute stream lifetime guard (WeCom server-side limit).
         if time.monotonic() - st["opened_at"] > self.THINKING_STREAM_MAX_S:
             logger.warning(
                 "[%s] thinking stream %s exceeded %.0fs lifetime — skipping "
-                "finish frame (would be dropped); falling back to markdown",
+                "stream write; falling back to markdown",
                 self.name, st["id"], time.monotonic() - st["opened_at"])
+            self._thinking_streams.pop(chat_id, None)
+            ka = self._thinking_keepalives.pop(chat_id, None)
+            if ka:
+                ka.cancel()
             return False
-        self._finished_streams[chat_id] = {"id": st["id"], "req": st["req"]}
-        body = {"msgtype": "stream", "stream": {"id": st["id"], "finish": True,
+        if finish:
+            # Closing: pop state and stop the heartbeat.
+            self._thinking_streams.pop(chat_id, None)
+            ka = self._thinking_keepalives.pop(chat_id, None)
+            if ka:
+                ka.cancel()
+            self._finished_streams[chat_id] = {"id": st["id"], "req": st["req"]}
+        body = {"msgtype": "stream", "stream": {"id": st["id"], "finish": finish,
                                                 "content": content[:self.MAX_MESSAGE_LENGTH]}}
         if not self._ws or self._ws.closed:
             return False
@@ -1743,13 +1761,18 @@ class WeComAdapter(BasePlatformAdapter):
             await self._ws.send_json({"cmd": APP_CMD_RESPONSE,
                                       "headers": {"req_id": st["req"]},
                                       "body": body})
-            logger.info("[%s] thinking bubble finished in-place -> %s (%s)",
-                        self.name, chat_id, st["id"])
+            logger.info("[%s] stream write (finish=%s) -> %s (%s)",
+                        self.name, finish, chat_id, st["id"])
             return True
         except Exception as e:
-            logger.warning("[%s] finish frame failed (%s); falling back to markdown",
+            logger.warning("[%s] stream write failed (%s); falling back to markdown",
                            self.name, e)
             return False
+
+    async def _finish_thinking(self, chat_id: str, content: str) -> bool:
+        """Close the open bubble with finish=true. Thin wrapper over
+        _write_stream(finish=True); kept for abort-path callers."""
+        return await self._write_stream(chat_id, content, finish=True)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
