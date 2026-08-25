@@ -487,3 +487,141 @@ async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
 
     assert result is False
     assert provider.context.current_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-process refresh-token rotation (single-use refresh tokens)
+#
+# Two Hermes backends routinely share one HERMES_HOME (desktop `serve` +
+# `gateway run`). With a provider that rotates refresh tokens, the loser of the
+# race POSTs a token the winner already consumed and gets 400 — while a valid
+# replacement sits on disk. Clearing state there forces an interactive browser
+# reauth that a cron/background context cannot satisfy.
+# ---------------------------------------------------------------------------
+
+
+def _token(access, refresh, expires_in=3600):
+    from mcp.shared.auth import OAuthToken
+
+    return OAuthToken(
+        access_token=access,
+        token_type="Bearer",
+        expires_in=expires_in,
+        refresh_token=refresh,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_400_recovers_token_rotated_by_peer(tmp_path, monkeypatch):
+    """A peer rotated the refresh token: recover from disk instead of clearing."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    # We hold R1 in memory and are about to fail with it.
+    provider.context.current_tokens = _token("A1", "R1")
+    # The peer process already persisted its replacement.
+    await provider.context.storage.set_tokens(_token("A2", "R2"))
+
+    resp = _fake_response(
+        400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
+    )
+    result = await provider._handle_refresh_response(resp)
+
+    assert result is True, "a rotated-token race must be recoverable"
+    assert provider.context.current_tokens.access_token == "A2"
+    assert provider.context.current_tokens.refresh_token == "R2"
+
+
+@pytest.mark.asyncio
+async def test_refresh_400_still_clears_when_disk_is_same_token(tmp_path, monkeypatch):
+    """No peer wrote anything: the credential really is dead — clear it."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    provider.context.current_tokens = _token("A1", "R1")
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+
+    resp = _fake_response(
+        400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
+    )
+    result = await provider._handle_refresh_response(resp)
+
+    assert result is False
+    assert provider.context.current_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_400_does_not_recover_expired_disk_token(tmp_path, monkeypatch):
+    """A *different* but already-expired disk token is not a recovery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    provider.context.current_tokens = _token("A1", "R1")
+    await provider.context.storage.set_tokens(_token("A2", "R2", expires_in=-60))
+
+    resp = _fake_response(
+        400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
+    )
+    result = await provider._handle_refresh_response(resp)
+
+    assert result is False
+    assert provider.context.current_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_400_does_not_recover_tokenless_disk_entry(
+    tmp_path, monkeypatch
+):
+    """A disk entry without an access token is not a recovery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    provider.context.current_tokens = _token("A1", "R1")
+    # Rotated refresh token, but the access token is empty — recovering here
+    # would ship an Authorization header with no credential.
+    await provider.context.storage.set_tokens(_token("", "R2"))
+
+    resp = _fake_response(
+        400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
+    )
+    result = await provider._handle_refresh_response(resp)
+
+    assert result is False
+    assert provider.context.current_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_400_recovery_never_logs_token_material(
+    tmp_path, monkeypatch, caplog
+):
+    """The recovery path must not leak secrets into logs."""
+    import logging
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    provider.context.current_tokens = _token("access-secret", "refresh-secret")
+    await provider.context.storage.set_tokens(
+        _token("rotated-access-secret", "rotated-refresh-secret")
+    )
+
+    resp = _fake_response(
+        400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
+    )
+    with caplog.at_level(logging.DEBUG):
+        result = await provider._handle_refresh_response(resp)
+
+    assert result is True
+    assert "refresh-secret" not in caplog.text
+    assert "rotated-refresh-secret" not in caplog.text
+    assert "rotated-access-secret" not in caplog.text
