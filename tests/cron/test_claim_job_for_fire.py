@@ -215,3 +215,63 @@ def test_fire_claim_fence_rejects_stale_owner(temp_home):
 
     with fire_claim_fence(job["id"], expected_owner="stale") as owns_claim:
         assert owns_claim is False
+
+
+def test_manual_run_recovers_stale_claim_and_executes_script(temp_home):
+    """The Windows incident loop recovers after the fire-claim TTL.
+
+    A fresh foreign claim must block a manual retry, but the same claim stamped
+    beyond the lease TTL must be replaced and the real no-agent execution path
+    must run through output persistence and terminal claim clearing.
+    """
+    from datetime import timedelta
+    from pathlib import Path
+
+    import cron.jobs as jobs
+    from tools.cronjob_tools import _execute_job_now
+
+    scripts_dir = Path(temp_home) / "scripts"
+    scripts_dir.mkdir()
+    marker = Path(temp_home) / "stale-claim-retry.marker"
+    (scripts_dir / "write_marker.py").write_text(
+        "from pathlib import Path\n"
+        "print('ran-after-stale-claim')\n"
+        f"Path({str(marker)!r}).write_text('ran-after-stale-claim', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    job = jobs.create_job(
+        name="stale fire claim retry",
+        schedule="every 5m",
+        prompt="",
+        script="write_marker.py",
+        no_agent=True,
+        deliver="local",
+    )
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+
+    fresh_result = _execute_job_now(jobs.get_job(job["id"]))
+    assert fresh_result["claimed"] is False
+    assert "already being fired" in fresh_result["error"]
+    assert marker.exists() is False
+
+    records = jobs.load_jobs()
+    for record in records:
+        if record["id"] == job["id"]:
+            record["fire_claim"]["at"] = (
+                jobs._hermes_now() - timedelta(minutes=6)
+            ).isoformat()
+    jobs.save_jobs(records)
+
+    result = _execute_job_now(jobs.get_job(job["id"]))
+    persisted = jobs.get_job(job["id"])
+    output_files = list(
+        (Path(temp_home) / "cron" / "output" / job["id"]).glob("*.md")
+    )
+    assert result == {"claimed": True, "success": True, "error": None}
+    assert marker.read_text(encoding="utf-8") == "ran-after-stale-claim"
+    assert len(output_files) == 1
+    assert "ran-after-stale-claim" in output_files[0].read_text(encoding="utf-8")
+    assert persisted["fire_claim"] is None
+    assert persisted["last_status"] == "ok"
