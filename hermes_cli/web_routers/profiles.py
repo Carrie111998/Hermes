@@ -24,6 +24,7 @@ import sys  # noqa: F401
 import threading
 import time  # noqa: F401
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
@@ -1179,7 +1180,8 @@ async def export_profile_endpoint(name: str, body: ProfileExport):
             staging.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not create export directory: {exc}")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # Microseconds so two rapid exports can't overwrite the archive.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S_%f")
         output = str(staging / f"{profiles_mod.normalize_profile_name(name)}-{stamp}.tar.gz")
 
     loop = asyncio.get_running_loop()
