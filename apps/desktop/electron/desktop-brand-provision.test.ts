@@ -2,14 +2,15 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
 
-const {
+import { test } from 'vitest'
+
+import {
   foundrlySoulMd,
   provisionDesktopBrand,
   shouldWriteBrandSoul,
   soulMd
-} = await import(new URL('./desktop-brand-provision.ts', import.meta.url).href)
+} from './desktop-brand-provision'
 
 test('Foundrly rich soul names co-founder product and not IX Agency', () => {
   const soul = foundrlySoulMd({
