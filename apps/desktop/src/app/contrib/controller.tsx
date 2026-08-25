@@ -817,6 +817,7 @@ export function ContribController() {
   if (isHudWindow()) {
     return (
       <ContribWiring>
+        <RouteHeading />
         <HudShell />
       </ContribWiring>
     )
