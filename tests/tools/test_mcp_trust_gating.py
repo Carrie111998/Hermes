@@ -245,3 +245,16 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+    def test_sdk_tool_annotations_supported(self):
+        """The MCP SDK exposes camelCase wire hints as snake_case attrs."""
+        from mcp.types import Tool
+
+        tool = Tool.model_validate({
+            "name": "list_repos",
+            "description": "List repositories",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": True},
+        })
+
+        assert mcp_tool._annotation_read_only_hint(tool) is True
