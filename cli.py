@@ -13865,12 +13865,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"  Invalid --since/--until date (expected YYYY-MM-DD): {e}")
                 return
 
+            kwargs = {"days": days, "source": source}
+            if since_ts is not None:
+                kwargs["since"] = since_ts
+            if until_ts is not None:
+                kwargs["until"] = until_ts
+
             db = SessionDB()
             try:
                 engine = InsightsEngine(db)
-                report = engine.generate(
-                    days=days, source=source, since=since_ts, until=until_ts
-                )
+                report = engine.generate(**kwargs)
                 print(engine.format_terminal(report))
             finally:
                 db.close()

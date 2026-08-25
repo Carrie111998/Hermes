@@ -12483,11 +12483,15 @@ def cmd_insights(args):
             print(f"Invalid --since/--until date (expected YYYY-MM-DD): {e}")
             return
 
+        kwargs = {"days": args.days, "source": args.source}
+        if since_ts is not None:
+            kwargs["since"] = since_ts
+        if until_ts is not None:
+            kwargs["until"] = until_ts
+
         db = SessionDB()
         engine = InsightsEngine(db)
-        report = engine.generate(
-            days=args.days, source=args.source, since=since_ts, until=until_ts
-        )
+        report = engine.generate(**kwargs)
         print(engine.format_terminal(report))
     except Exception as e:
         print(f"Error generating insights: {e}")
