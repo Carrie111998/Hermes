@@ -349,6 +349,7 @@ def atomic_json_write(
     *,
     indent: int = 2,
     mode: int | None = None,
+    create_mode: int | None = None,
     **dump_kwargs: Any,
 ) -> None:
     """Write JSON data to a file atomically.
@@ -364,6 +365,10 @@ def atomic_json_write(
         mode: Optional final permission mode. When set, the temp file is
             created and replaced with this mode, avoiding chmod-after-write
             TOCTOU exposure for secret-bearing files.
+        create_mode: Optional permission mode for a brand-new target. Existing
+            targets retain their original mode; the selected mode is applied to
+            the temp file before replacement so readers never observe mkstemp's
+            restrictive default on the new file.
         **dump_kwargs: Additional keyword args forwarded to json.dump(), such
             as default=str for non-native types.
     """
@@ -372,6 +377,9 @@ def atomic_json_write(
 
     original_mode = None if mode is not None else _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
+    effective_mode = mode if mode is not None else original_mode
+    if effective_mode is None and create_mode is not None and not path.exists():
+        effective_mode = create_mode
 
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
@@ -379,11 +387,11 @@ def atomic_json_write(
         suffix=".tmp",
     )
     try:
-        if mode is not None and hasattr(os, "fchmod"):
-            # fchmod is Unix-only; Windows' os module has no fchmod. Skipping it
-            # here is safe — mkstemp already created the temp file as 0o600, and
-            # the post-replace os.chmod below applies the final mode durably.
-            os.fchmod(fd, mode)
+        if effective_mode is not None and hasattr(os, "fchmod"):
+            # Set the mode on the temp fd BEFORE replacement. This keeps the
+            # first-created file at its requested mode for the entire time it
+            # is visible, rather than exposing mkstemp's 0600 briefly.
+            os.fchmod(fd, effective_mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
                 data,
@@ -398,13 +406,7 @@ def atomic_json_write(
         real_path = atomic_replace(tmp_path, path)
         real_path_obj = Path(real_path)
         _restore_file_owner(real_path_obj, original_owner)
-        if mode is not None:
-            try:
-                os.chmod(real_path_obj, mode)
-            except OSError:
-                pass
-        else:
-            _restore_file_mode(real_path_obj, original_mode)
+        _restore_file_mode(real_path_obj, effective_mode)
     except BaseException:
         # Intentionally catch BaseException so temp-file cleanup still runs for
         # KeyboardInterrupt/SystemExit before re-raising the original signal.
