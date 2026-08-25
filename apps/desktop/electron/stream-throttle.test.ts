@@ -150,3 +150,102 @@ test('closed and destroyed windows drop out without throwing', () => {
   // Only the registration-time call landed; nothing after close.
   assert.deepEqual(closedWin.calls, [true])
 })
+
+// ---------------------------------------------------------------------------
+// Fullscreen keep-painting (#94865 — Hyprland/Wayland white screen)
+// ---------------------------------------------------------------------------
+
+function makeFullscreenableWindow() {
+  const win = makeWindow()
+  const listeners = new Map<string, () => void>()
+  let fullscreen = false
+  const ext = win as ReturnType<typeof makeWindow> & {
+    isFullScreen: () => boolean
+    listeners: Map<string, () => void>
+    goFullscreen(on: boolean): void
+  }
+  ext.isFullScreen = () => fullscreen
+  ext.listeners = listeners
+  win.on = (event: string, fn: () => void) => {
+    listeners.set(event, fn)
+  }
+  ext.goFullscreen = (on: boolean) => {
+    fullscreen = on
+    listeners.get(on ? 'enter-full-screen' : 'leave-full-screen')?.()
+  }
+
+  return ext
+}
+
+test('entering fullscreen unthrottles even when idle; leaving re-arms throttling', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const win = makeFullscreenableWindow()
+  throttle.register(win)
+
+  assert.deepEqual(win.calls, [true]) // idle default
+
+  // Fullscreen with zero turns in flight: must keep painting.
+  win.goFullscreen(true)
+  assert.deepEqual(win.calls, [true, false])
+  assert.equal(throttle.isUnthrottled(), true)
+
+  // A settle report during fullscreen must NOT re-throttle it.
+  throttle.update(true)
+  throttle.update(false)
+  assert.equal(timers.pendingCount, 0)
+  assert.deepEqual(win.calls, [true, false])
+
+  // Leaving fullscreen re-arms the normal settle path.
+  win.goFullscreen(false)
+  throttle.update(false)
+  assert.equal(timers.pendingCount, 1)
+  timers.fire()
+  assert.deepEqual(win.calls, [true, false, true])
+  assert.equal(throttle.isUnthrottled(), false)
+})
+
+test('fullscreen keeps the fleet live on settle; everything re-throttles after leave', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const fsWin = makeFullscreenableWindow()
+  const normalWin = makeWindow()
+
+  throttle.register(fsWin)
+  throttle.register(normalWin)
+
+  // Fullscreen lifts the whole fleet (global dial, same as streaming).
+  fsWin.goFullscreen(true)
+  assert.deepEqual(fsWin.calls.slice(-1), [false])
+  assert.deepEqual(normalWin.calls.slice(-1), [false])
+
+  // A settle report during fullscreen must NOT arm re-throttling.
+  throttle.update(false)
+  assert.equal(timers.pendingCount, 0)
+  assert.deepEqual(normalWin.calls, [true, false])
+
+  // Leaving fullscreen while idle arms the trailing re-throttle for everyone.
+  fsWin.goFullscreen(false)
+  assert.equal(timers.pendingCount, 1)
+  timers.fire()
+  assert.deepEqual(fsWin.calls, [true, false, true])
+  assert.deepEqual(normalWin.calls, [true, false, true])
+  assert.equal(throttle.isUnthrottled(), false)
+})
+
+test('leaving fullscreen while a turn is still in flight keeps both windows live', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const win = makeFullscreenableWindow()
+  throttle.register(win)
+
+  throttle.update(true) // streaming: everything unthrottled
+  assert.deepEqual(win.calls, [true, false])
+
+  win.goFullscreen(false) // user exits fullscreen mid-stream — nothing changes
+  assert.deepEqual(win.calls, [true, false])
+  assert.equal(throttle.isUnthrottled(), true)
+
+  throttle.update(false)
+  assert.equal(timers.pendingCount, 1, 'normal trailing re-throttle resumes')
+})
