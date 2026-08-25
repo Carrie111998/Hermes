@@ -202,13 +202,23 @@ def _extract_health_report_from_result(result: Dict[str, Any]) -> Dict[str, Any]
 
 def _open_mcp(binary: str) -> subprocess.Popen:
     """Spawn ``<binary> mcp`` with UTF-8 + sanitized env."""
+    from tools.computer_use.cua_backend import (
+        _standard_mcp_transport_args,
+        _windows_process_session_id,
+    )
+
+    args = _standard_mcp_transport_args(
+        ["mcp"],
+        platform=sys.platform,
+        windows_session_id=_windows_process_session_id(),
+    )
     # cua-driver emits UTF-8 (containing emoji in check messages on macOS
     # and arbitrary file paths on Windows). The Python default
     # text-mode encoding follows the system locale — `cp1252` on a
     # default Windows install — which raises UnicodeDecodeError on the
     # first non-ASCII byte. Pin the codec.
     return subprocess.Popen(
-        [binary, "mcp"],
+        [binary, *args],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

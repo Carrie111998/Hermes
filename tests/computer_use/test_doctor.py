@@ -97,6 +97,30 @@ def _default_cli_version_matches_report(monkeypatch):
     )
 
 
+# ── transport selection ────────────────────────────────────────────────────
+
+
+def test_doctor_routes_session_zero_through_interactive_daemon():
+    from tools.computer_use import doctor
+
+    proc = MagicMock()
+    with patch(
+        "tools.computer_use.cua_backend._windows_process_session_id",
+        return_value=0,
+    ), patch(
+        "tools.computer_use.cua_backend._resolve_mcp_invocation",
+        return_value=("C:/cua-driver.exe", ["mcp"]),
+    ), patch("subprocess.Popen", return_value=proc) as popen:
+        assert doctor._open_mcp("C:/cua-driver.exe") is proc
+
+    assert popen.call_args.args[0] == [
+        "C:/cua-driver.exe",
+        "mcp",
+        "--socket",
+        r"\\.\pipe\cua-driver",
+    ]
+
+
 # ── exit codes ─────────────────────────────────────────────────────────────
 
 

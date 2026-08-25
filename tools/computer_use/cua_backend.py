@@ -172,6 +172,7 @@ _CUA_DRIVER_DEFAULT_CMD = "cua-driver"
 _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport (fallback when the
                             # driver doesn't expose `manifest` — see
                             # `_resolve_mcp_invocation` below)
+_WINDOWS_CUA_DAEMON_PIPE = r"\\.\pipe\cua-driver"
 
 # Whole-screen / desktop capture. cua-driver is a window-oriented driver —
 # its `get_window_state` / `screenshot` tools capture a single window (by
@@ -376,6 +377,42 @@ def _standard_runtime_launch_args(
     )
     result.extend(["--socket", private_socket])
     return result, private_socket
+
+
+def _windows_process_session_id() -> Optional[int]:
+    """Return this process's Windows session id, or None when unavailable."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        session_id = ctypes.c_ulong()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session_id)):
+            return None
+        return int(session_id.value)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _standard_mcp_transport_args(
+    args: List[str],
+    *,
+    platform: str,
+    windows_session_id: Optional[int],
+) -> List[str]:
+    """Select the authenticated interactive daemon from Windows Session 0.
+
+    A bare Windows MCP process owns a desktop runtime and is therefore invalid
+    in Session 0. The explicit named-pipe form remains a protocol-only proxy;
+    cua-driver authenticates the pipe as same-user and the interactive daemon
+    remains the sole desktop/authorization owner. Unknown session identity is
+    left on the direct path so cua-driver's own Session-0 guard fails closed.
+    """
+    result = list(args)
+    if platform == "win32" and windows_session_id == 0 and "--socket" not in result:
+        result.extend(["--socket", _WINDOWS_CUA_DAEMON_PIPE])
+    return result
 
 
 def _computer_use_max_image_dimension() -> Optional[int]:
@@ -1613,13 +1650,25 @@ class _CuaDriverSession:
                 child_env = self._embedded_daemon.child_env()
             else:
                 command, args = _resolve_mcp_invocation(driver_cmd)
-                args, owned_socket = _standard_runtime_launch_args(
+                windows_session_id = _windows_process_session_id()
+                args = _standard_mcp_transport_args(
                     args,
-                    grant_existing_profile=_cua_grant_existing_profile(),
                     platform=sys.platform,
-                    socket_path=self._owned_standard_runtime_socket,
+                    windows_session_id=windows_session_id,
                 )
-                self._owned_standard_runtime_socket = owned_socket
+                if "--socket" not in args:
+                    args, owned_socket = _standard_runtime_launch_args(
+                        args,
+                        grant_existing_profile=_cua_grant_existing_profile(),
+                        platform=sys.platform,
+                        socket_path=self._owned_standard_runtime_socket,
+                    )
+                    self._owned_standard_runtime_socket = owned_socket
+                if sys.platform == "win32" and windows_session_id == 0:
+                    logger.info(
+                        "Windows Session 0 detected; proxying standard-mode "
+                        "cua-driver MCP through the interactive daemon"
+                    )
                 child_env = cua_driver_child_env()
             _t_manifest = _time.monotonic()
             params = StdioServerParameters(
