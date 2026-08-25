@@ -24,10 +24,13 @@ vi.mock('@/i18n', () => ({
   })
 }))
 
+const openState = vi.hoisted(() => ({ value: false }))
+
 vi.mock('./model', () => ({
+  PROJECT_EXPANDED_SESSION_LIMIT: 2000,
   PROJECT_PREVIEW_COUNT: 3,
   latestProjectSessions: () => [],
-  useWorkspaceNodeOpen: () => [false, vi.fn()]
+  useWorkspaceNodeOpen: () => [openState.value, vi.fn()]
 }))
 
 // ProjectMenu (the kebab) has its own dedicated test file — stub it here so
@@ -91,5 +94,23 @@ describe('ProjectOverviewRow', () => {
     const { container } = render(<ProjectOverviewRow project={project} />)
 
     expect(container.querySelector('[data-sessions-project="p1"]')).toBeTruthy()
+  })
+
+  it('expanding renders ALL loaded preview sessions, not a 3-row stub (regression for the four stacked preview caps)', () => {
+    const rows = vi.fn<(sessions: SessionInfo[]) => null>(() => null)
+    const five = Array.from({ length: 5 }, (_, i) => ({ id: `s${i + 1}` }) as unknown as SessionInfo)
+
+    const { rerender } = render(<ProjectOverviewRow previewSessions={five} project={project} renderRows={rows} />)
+
+    // Collapsed by default — nothing rendered yet.
+    expect(rows).not.toHaveBeenCalled()
+
+    // Expand the row.
+    openState.value = true
+    rerender(<ProjectOverviewRow previewSessions={five} project={project} renderRows={rows} />)
+
+    expect(rows).toHaveBeenCalledTimes(1)
+    const received = rows.mock.calls[0]![0] as unknown as SessionInfo[]
+    expect(received.map(session => session.id)).toEqual(['s1', 's2', 's3', 's4', 's5'])
   })
 })
