@@ -17,12 +17,20 @@ def test_census_returns_every_full_nonterminal_row_without_mutation(monkeypatch,
     executions = _point_ledger(monkeypatch, tmp_path)
 
     # Serve the PID-liveness probes from one real answer instead of ~1000 live
-    # ones. Both halves of this test pay for them: create_execution() calls
-    # _process_start_time() on every insert, and the census calls both probes
-    # per row. On Windows each probe falls through the /proc branch to psutil
-    # and costs tens of ms, which put this test ~28% over the 30s per-test cap
-    # and made it flap with host load — it is the only test in this file that
-    # left the probes live, and the only one building 505 rows.
+    # ones. This test was failing on the 30s per-test cap and flapping with
+    # host load; it is the only test in this file that left the probes live,
+    # and the only one building 505 rows.
+    #
+    # ONE of the two probes is the entire cost, measured on this box:
+    #     _pid_exists           56.40 ms/call   -> 505 census rows = 28.5s
+    #     _process_start_time    0.09 ms/call   -> 506 inserts     =  0.04s
+    # _pid_exists goes to psutil and is what blows the cap. The census calls
+    # BOTH per row; create_execution() calls only _process_start_time (see
+    # cron/executions.py, in the INSERT parameter tuple), which is free. So
+    # setup's ~13s is essentially all SQLite commit-per-insert, NOT probing,
+    # and stubbing anywhere before the census would have worked. Stubbing
+    # before setup as well is tidier, not load-bearing. Both are stubbed to
+    # keep the recorded and observed values coherent.
     #
     # The answer served is the REAL start time of this process, read once
     # before stubbing, and every row here is genuinely owned by this process.
