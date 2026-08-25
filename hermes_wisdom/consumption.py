@@ -14,10 +14,16 @@ from typing import Any, Callable
 
 from hermes_constants import get_skills_dir
 
-from .client import WisdomClient, WisdomConflict, WisdomValidationError
+from .client import (
+    WisdomClient,
+    WisdomConflict,
+    WisdomNotFound,
+    WisdomValidationError,
+)
 from .compatibility import detect_local_capabilities, evaluate
 from .contract import PackageManifest, SystemSpecification, sha256_address
 from .package import PackagePolicyError, verify_content_files
+from .qualification import process_due_stability_jobs
 from .store import WisdomStore
 
 
@@ -128,6 +134,7 @@ class WisdomConsumption:
         }
 
     def check(self, *, apply_automatic: bool = True) -> dict[str, Any]:
+        qualification_events = process_due_stability_jobs(store=self.store)
         feed = self.poll_feed()
         decisions = self.poll_owner_decisions()
         remote = self._remote_installations()
@@ -170,6 +177,7 @@ class WisdomConsumption:
         telegram = self.dispatch_telegram()
         return {
             "installations": results,
+            "qualification_events": qualification_events,
             "feed": feed,
             "owner_decisions": decisions,
             "telegram": telegram,
@@ -276,6 +284,7 @@ class WisdomConsumption:
             "content_hash": content_hash,
             "baseline": baseline,
             "previous_baseline": installation["baseline"],
+            "previous_installation": installation,
             "target_path": str(target),
             "staging_path": str(staging),
             "takedown_generation": int(authoritative.get("takedown_generation") or 0),
@@ -432,12 +441,92 @@ class WisdomConsumption:
         target = _safe_target(self.store, installation)
         if int(installation["version"]) != int(plan["from_version"]):
             raise PackagePolicyError("update plan is stale; create a new plan")
+        authoritative = self._remote_installations().get(str(plan["skill_id"]))
+        if not authoritative or authoritative.get("skill_state") != "active":
+            raise PackagePolicyError(
+                "Gateway no longer authorizes this managed update; create a new plan"
+            )
+        try:
+            remote_generation = int(authoritative["takedown_generation"])
+            remote_installed = int(authoritative["installed_version"])
+            remote_latest = int(authoritative["latest_version"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PackagePolicyError(
+                "Gateway returned incomplete installation authority"
+            ) from exc
+        remote_mode = str(authoritative.get("update_mode") or "")
+        if (
+            remote_generation != int(plan["takedown_generation"])
+            or remote_installed != int(plan["from_version"])
+            or remote_latest != int(plan["version"])
+            or remote_mode != str(plan["update_mode"])
+        ):
+            raise PackagePolicyError(
+                "update authority or policy changed after planning; create a new plan"
+            )
+        response, remote_files = self.client.content(
+            str(plan["skill_id"]), int(plan["version"])
+        )
+        records, remote_hash = verify_content_files(remote_files)
+        remote_baseline = {record.path: record.hash for record in records}
+        if (
+            remote_hash != response.content_hash
+            or remote_hash != str(plan["content_hash"])
+            or remote_baseline != plan["baseline"]
+        ):
+            raise WisdomValidationError(
+                "authoritative update bytes changed after planning"
+            )
+        staging = Path(str(plan["staging_path"]))
+        if _tree_hashes(staging) != plan["baseline"]:
+            raise WisdomValidationError("staged update bytes changed after planning")
+        current_scan = self.scan(staging)
+        if current_scan["guard"]["allowed"] is False:
+            raise PackagePolicyError(
+                f"built-in guard blocked update: {current_scan['guard']['reason']}"
+            )
+        incoming = _manifest(staging)
+        compatibility = evaluate(
+            incoming.requirements,
+            detect_local_capabilities(incoming.requirements),
+        )
+        try:
+            previous = _manifest(target)
+            sensitive = _sensitive_expansion(
+                previous.requirements, incoming.requirements
+            )
+        except PackagePolicyError:
+            sensitive = [
+                "existing managed manifest is invalid; requirement expansion cannot be proven safe"
+            ]
+        if any(
+            item.get("secrets_class") and item.get("severity") in {"critical", "high"}
+            for item in current_scan.get("skill_evaluator", {}).get("findings", [])
+        ):
+            sensitive.append("high-confidence local secret finding")
+        plan["local_scan"] = current_scan
+        plan["compatibility"] = asdict(compatibility)
+        plan["sensitive_expansion"] = sensitive
         modified_now = _tree_hashes(target) != installation["baseline"]
-        if plan["sensitive_expansion"] and not accept_sensitive:
+        plan["modified"] = modified_now
+        plan["auto_allowed"] = (
+            not sensitive
+            and (not modified_now or remote_mode == "REQUIRED")
+            and compatibility.outcome == "compatible"
+            and current_scan["guard"]["allowed"] is True
+            and (
+                remote_mode == "REQUIRED"
+                or (
+                    not current_scan["guard"].get("findings")
+                    and not current_scan.get("skill_evaluator", {}).get("findings")
+                )
+            )
+        )
+        if sensitive and not accept_sensitive:
             raise PackagePolicyError(
                 "update adds sensitive requirements; explicit confirmation is required"
             )
-        outcome = plan["compatibility"]["outcome"]
+        outcome = compatibility.outcome
         if outcome == "blocked_pending_action":
             raise PackagePolicyError(
                 "blocked compatibility requirements prevent activation"
@@ -567,12 +656,44 @@ class WisdomConsumption:
                     takedown_generation=int(plan["takedown_generation"]),
                     update_mode=str(plan["update_mode"]),
                 )
-            except WisdomConflict:
+            except (WisdomConflict, WisdomNotFound, WisdomValidationError) as exc:
                 rejected = recovery / "gateway-rejected"
                 if target.exists() and not rejected.exists():
                     os.replace(target, rejected)
-                self.store.deactivate_install(str(plan["skill_id"]))
-                self.store.advance(operation_id, "gateway_rejected", done=True)
+                terminal_codes = {
+                    "skill_archived",
+                    "skill_taken_down",
+                    "takedown_generation_changed",
+                    "skill_not_found",
+                    "version_not_found",
+                }
+                if isinstance(exc, WisdomNotFound) or exc.code in terminal_codes:
+                    self.store.deactivate_install(str(plan["skill_id"]))
+                    self.store.advance(operation_id, "gateway_rejected", done=True)
+                    raise
+                previous_installation = plan.get("previous_installation")
+                previous_tree = (
+                    recovery / "managed-original"
+                    if preserve
+                    else recovery / "replaced-managed"
+                )
+                if not isinstance(previous_installation, dict):
+                    raise PackagePolicyError(
+                        "update recovery is missing the previous installation ledger"
+                    ) from exc
+                if not previous_tree.is_dir() or _tree_hashes(previous_tree) != dict(
+                    previous_installation["baseline"]
+                ):
+                    raise PackagePolicyError(
+                        "previous managed bytes are unavailable for rollback"
+                    ) from exc
+                os.replace(previous_tree, target)
+                self.store.record_install(previous_installation)
+                self.store.advance(
+                    operation_id, "gateway_rejected_rolled_back", done=True
+                )
+                plan_path = self.store.root / "update-plans" / f"{plan['receipt']}.json"
+                plan_path.unlink(missing_ok=True)
                 raise
             current = self.store.installation(str(plan["skill_id"]))
             if current:
@@ -739,8 +860,16 @@ class WisdomConsumption:
                 continue
             previous = str(local["state"])
             self.store.set_draft_state(draft.id, draft.state)
-            if draft.state not in {"approved", "rejected", "declined", "published"}:
+            if draft.state not in {
+                "approved",
+                "rejected",
+                "declined",
+                "published",
+                "changes_requested",
+            }:
                 continue
+            if draft.state == "changes_requested":
+                self.store.consume_receipt(draft.id)
             cadence = str(
                 (self.config.get("notifications") or {}).get("decisions", "immediate")
             )
@@ -756,6 +885,9 @@ class WisdomConsumption:
                         "slug": draft.slug,
                         "previous_state": previous,
                         "state": draft.state,
+                        "moderation_note": draft.moderationNote,
+                        "moderation_decider_user_id": draft.moderationDeciderUserId,
+                        "moderation_decided_at": draft.moderationDecidedAt,
                     },
                     cadence=cadence,
                 )

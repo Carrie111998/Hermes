@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -66,6 +66,7 @@ class WisdomStore:
                   content_hash TEXT NOT NULL,
                   captured_at TEXT NOT NULL,
                   tree_json TEXT NOT NULL DEFAULT '{}',
+                  skill_text TEXT,
                   PRIMARY KEY(skill_id, content_hash),
                   FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
                 );
@@ -160,6 +161,8 @@ class WisdomStore:
                   due_at TEXT NOT NULL,
                   state TEXT NOT NULL,
                   evaluated_at TEXT,
+                  session_id TEXT,
+                  task_id TEXT,
                   PRIMARY KEY(skill_id, content_hash),
                   FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
                 );
@@ -211,6 +214,16 @@ class WisdomStore:
                 db.execute(
                     "ALTER TABLE snapshot ADD COLUMN tree_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "skill_text" not in columns:
+                db.execute("ALTER TABLE snapshot ADD COLUMN skill_text TEXT")
+            stability_columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info(stability_job)").fetchall()
+            }
+            if "session_id" not in stability_columns:
+                db.execute("ALTER TABLE stability_job ADD COLUMN session_id TEXT")
+            if "task_id" not in stability_columns:
+                db.execute("ALTER TABLE stability_job ADD COLUMN task_id TEXT")
             candidate_sql = str(
                 db.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='candidate'"
@@ -332,6 +345,7 @@ class WisdomStore:
         content_hash: str | None,
         source_kind: str,
         tree: dict[str, str] | None = None,
+        snapshot_text: str | None = None,
     ) -> str:
         resolved = path.resolve()
         fs_identity = filesystem_identity(resolved)
@@ -383,16 +397,25 @@ class WisdomStore:
                 )
             if content_hash:
                 db.execute(
-                    "INSERT OR IGNORE INTO snapshot(skill_id,content_hash,captured_at,tree_json) "
-                    "VALUES(?,?,?,?)",
+                    "INSERT INTO snapshot(skill_id,content_hash,captured_at,tree_json,skill_text) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(skill_id,content_hash) DO UPDATE SET "
+                    "tree_json=excluded.tree_json,skill_text=COALESCE(snapshot.skill_text,excluded.skill_text)",
                     (
                         skill_id,
                         content_hash,
                         now,
                         json.dumps(tree or {}, sort_keys=True),
+                        snapshot_text,
                     ),
                 )
         return skill_id
+
+    def local_skill(self, skill_id: str) -> dict[str, Any] | None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM local_skill WHERE id=?", (skill_id,)
+            ).fetchone()
+            return dict(row) if row else None
 
     def latest_snapshot(self, skill_id: str) -> dict[str, Any] | None:
         with self.transaction() as db:
@@ -461,12 +484,22 @@ class WisdomStore:
             ).fetchone()
             return int(row[0]) if row else 0
 
-    def schedule_stability(self, skill_id: str, content_hash: str, due_at: str) -> None:
+    def schedule_stability(
+        self,
+        skill_id: str,
+        content_hash: str,
+        due_at: str,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
         with self.transaction() as db:
             db.execute(
-                "INSERT INTO stability_job VALUES(?,?,?,'pending',NULL) "
-                "ON CONFLICT(skill_id,content_hash) DO UPDATE SET due_at=excluded.due_at,state='pending',evaluated_at=NULL",
-                (skill_id, content_hash, due_at),
+                "INSERT INTO stability_job(skill_id,content_hash,due_at,state,evaluated_at,session_id,task_id) "
+                "VALUES(?,?,?,'pending',NULL,?,?) ON CONFLICT(skill_id,content_hash) "
+                "DO UPDATE SET due_at=excluded.due_at,state='pending',evaluated_at=NULL,"
+                "session_id=excluded.session_id,task_id=excluded.task_id",
+                (skill_id, content_hash, due_at, session_id, task_id),
             )
 
     def due_stability_jobs(self, now: str) -> list[dict[str, Any]]:

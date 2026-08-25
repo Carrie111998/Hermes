@@ -3,11 +3,49 @@ import json
 import pytest
 
 from hermes_wisdom.client import (
+    Draft,
     WisdomClient,
     WisdomError,
     WisdomNotFound,
     WisdomValidationError,
 )
+
+
+def _draft(**overrides):
+    value = {
+        "id": "d1",
+        "orgId": "o1",
+        "ownerUserId": "u1",
+        "slug": "my-skill",
+        "draftCommit": "sha256:" + "a" * 64,
+        "contentHash": "sha256:" + "b" * 64,
+        "authorDescription": "Does a task.",
+        "authorDescriptionHash": "sha256:" + "c" * 64,
+        "state": "ready",
+        "packageManifestHash": "sha256:" + "d" * 64,
+        "packageManifestSchemaVersion": 1,
+        "systemSpec": None,
+        "scan": None,
+        "scanVerdict": "pass",
+        "explanation": None,
+        "updatedAt": "now",
+    }
+    value.update(overrides)
+    return value
+
+
+def test_changes_requested_requires_complete_moderator_metadata():
+    with pytest.raises(ValueError, match="moderator return metadata"):
+        Draft.model_validate(_draft(state="changes_requested"))
+    returned = Draft.model_validate(
+        _draft(
+            state="changes_requested",
+            moderationNote="Remove the hostname.",
+            moderationDeciderUserId="moderator-1",
+            moderationDecidedAt="2026-08-25T00:00:00Z",
+        )
+    )
+    assert returned.moderationNote == "Remove the hostname."
 
 
 class Response:

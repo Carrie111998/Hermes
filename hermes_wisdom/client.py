@@ -11,7 +11,7 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 import requests
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from tools.skills_sync_client import (
     KIND_BLOB,
@@ -72,7 +72,20 @@ class Draft(WireModel):
     contentHash: str
     authorDescription: str | None
     authorDescriptionHash: str | None
-    state: str
+    state: Literal[
+        "vetting",
+        "ready",
+        "owner_approved",
+        "publishing",
+        "pending_moderation",
+        "changes_requested",
+        "published",
+        "declined",
+        "invalidated",
+    ]
+    moderationNote: str | None = None
+    moderationDeciderUserId: str | None = None
+    moderationDecidedAt: str | None = None
     packageManifestHash: str | None
     packageManifestSchemaVersion: int | None
     systemSpec: SystemSpecification | None
@@ -80,6 +93,18 @@ class Draft(WireModel):
     scanVerdict: str | None
     explanation: str | None
     updatedAt: str
+
+    @model_validator(mode="after")
+    def require_return_metadata(self) -> Draft:
+        if self.state == "changes_requested" and (
+            not self.moderationNote
+            or not self.moderationDeciderUserId
+            or not self.moderationDecidedAt
+        ):
+            raise ValueError(
+                "changes_requested drafts require complete moderator return metadata"
+            )
+        return self
 
 
 class DraftDetail(WireModel):

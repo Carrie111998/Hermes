@@ -21,7 +21,12 @@ from tools.skill_usage import _find_skill_dir, is_bundled, is_hub_installed
 from tools.skills_guard import scan_skill, should_allow_install
 from tools.skillevaluator_scan import run_tier1_scan, tier1_advisory_enabled
 
-from .client import WisdomClient, WisdomConflict, WisdomValidationError
+from .client import (
+    WisdomClient,
+    WisdomConflict,
+    WisdomNotFound,
+    WisdomValidationError,
+)
 from .compatibility import CompatibilityResult, detect_local_capabilities, evaluate
 from .consumption import WisdomConsumption
 from .contract import (
@@ -315,7 +320,7 @@ class WisdomService:
                     takedown_generation=int(plan["takedown_generation"]),
                     update_mode=plan.get("update_mode"),
                 )
-            except WisdomConflict:
+            except (WisdomConflict, WisdomNotFound, WisdomValidationError):
                 local = self.store.installation(str(plan.get("skill_id", "")))
                 if local:
                     target = Path(str(local["target_path"]))
@@ -773,11 +778,24 @@ class WisdomService:
             int(item["version"]) for item in versions
         )
         version_detail = self.client.version(skill_id, version_number)
-        spec = PackageManifest.model_validate({
-            "schema_version": 1,
-            "name": str(detail.skill.get("slug") or skill_id),
-            "requirements": version_detail.version.get("system_spec"),
-        }).requirements
+        content, files = self.client.content(skill_id, version_number)
+        manifest_body = next(
+            (body for path, _mode, body in files if path == "skill.manifest.json"),
+            None,
+        )
+        if manifest_body is None:
+            raise WisdomValidationError("version content has no package manifest")
+        manifest = PackageManifest.model_validate_json(manifest_body)
+        declared_specification = version_detail.version.get("system_spec")
+        if (
+            not isinstance(declared_specification, dict)
+            or SystemSpecification.model_validate(declared_specification)
+            != manifest.requirements
+        ):
+            raise WisdomValidationError(
+                "version metadata does not match the exact package manifest"
+            )
+        spec = manifest.requirements
         compatibility = evaluate(spec, detect_local_capabilities(spec))
         if compatibility.outcome == "blocked_pending_action":
             allowed = False
@@ -789,6 +807,8 @@ class WisdomService:
             "skill_id": skill_id,
             "slug": str(detail.skill.get("slug") or skill_id),
             "version": version_number,
+            "content_hash": content.content_hash,
+            "manifest_hash": sha256_address(manifest_body),
             "takedown_generation": int(detail.skill.get("takedown_generation", 0)),
             "update_mode": update_mode,
             "compatibility": asdict(compatibility),
@@ -831,15 +851,6 @@ class WisdomService:
         plan_path: Path,
         accept_partial: bool,
     ) -> dict[str, Any]:
-        outcome = plan["compatibility"]["outcome"]
-        if not plan.get("allowed") or outcome == "blocked_pending_action":
-            raise PackagePolicyError(
-                "blocked compatibility requirements prevent activation"
-            )
-        if outcome in {"partial", "compatible_after_setup"} and not accept_partial:
-            raise PackagePolicyError(
-                "compatibility action is required; explicitly accept the plan"
-            )
         pending = next(
             (
                 item
@@ -854,10 +865,49 @@ class WisdomService:
                 json.loads(pending["payload_json"]),
                 plan_path=plan_path,
             )
+        current_skill = self.client.skill(str(plan["skill_id"]))
+        if current_skill.skill.get("state") != "active":
+            raise PackagePolicyError("only active Wisdom skills can be installed")
+        if int(current_skill.skill.get("takedown_generation", -1)) != int(
+            plan["takedown_generation"]
+        ):
+            raise PackagePolicyError(
+                "install authorization changed after planning; create a new plan"
+            )
         response, files = self.client.content(plan["skill_id"], int(plan["version"]))
         exact_records, exact_hash = verify_content_files(files)
-        if exact_hash != response.content_hash:
+        if exact_hash != response.content_hash or exact_hash != str(
+            plan.get("content_hash")
+        ):
             raise WisdomValidationError("download changed after install planning")
+        manifest_body = next(
+            (body for path, _mode, body in files if path == "skill.manifest.json"),
+            None,
+        )
+        if manifest_body is None or sha256_address(manifest_body) != plan.get(
+            "manifest_hash"
+        ):
+            raise WisdomValidationError(
+                "package manifest changed after install planning"
+            )
+        manifest = PackageManifest.model_validate_json(manifest_body)
+        compatibility = evaluate(
+            manifest.requirements,
+            detect_local_capabilities(manifest.requirements),
+        )
+        plan["compatibility"] = asdict(compatibility)
+        plan["allowed"] = compatibility.outcome != "blocked_pending_action"
+        if compatibility.outcome == "blocked_pending_action":
+            raise PackagePolicyError(
+                "blocked compatibility requirements prevent activation"
+            )
+        if (
+            compatibility.outcome in {"partial", "compatible_after_setup"}
+            and not accept_partial
+        ):
+            raise PackagePolicyError(
+                "compatibility changed after planning; explicit acceptance is required"
+            )
         org_id = self.store.active_org_id()
         if not org_id:
             raise PackagePolicyError("run `hermes wisdom setup` before installing")
@@ -960,7 +1010,7 @@ class WisdomService:
                     takedown_generation=int(plan["takedown_generation"]),
                     update_mode=plan.get("update_mode"),
                 )
-            except WisdomConflict:
+            except (WisdomConflict, WisdomNotFound, WisdomValidationError):
                 quarantine = (
                     self.store.root / "recovery" / operation_id / "gateway-rejected"
                 )

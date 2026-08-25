@@ -30,8 +30,10 @@ def digest(path: Path) -> str:
 
 
 def main() -> int:
+    openapi = CONTRACTS / "gateway-openapi.json"
     schema = CONTRACTS / "skill-manifest.schema.v1.json"
     vectors_path = CONTRACTS / "canonical-hash-vectors.v1.json"
+    assert digest(openapi) == CONTRACT_PIN.openapi_sha256
     assert digest(schema) == CONTRACT_PIN.manifest_schema_sha256
     assert digest(vectors_path) == CONTRACT_PIN.canonical_vectors_sha256
     vectors = json.loads(vectors_path.read_text(encoding="utf-8"))
@@ -51,7 +53,7 @@ def main() -> int:
             {
                 "ok": True,
                 "gateway_commit": CONTRACT_PIN.gateway_commit,
-                "openapi_sha256": CONTRACT_PIN.openapi_sha256,
+                "openapi_sha256": digest(openapi),
                 "manifest_schema_sha256": digest(schema),
                 "canonical_vectors_sha256": digest(vectors_path),
             },

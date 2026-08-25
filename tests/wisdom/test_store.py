@@ -103,3 +103,20 @@ def test_verified_org_change_deactivates_stale_managed_installs(tmp_path: Path):
 
     assert store.active_org_id() == "org-2"
     assert store.installation("skill-1")["state"] == "inactive"
+
+
+def test_schema_v4_migrates_snapshot_text_and_stability_provenance(tmp_path: Path):
+    store = WisdomStore(tmp_path / "wisdom")
+    with store.transaction() as db:
+        snapshot_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(snapshot)").fetchall()
+        }
+        stability_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(stability_job)").fetchall()
+        }
+        version = db.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert "skill_text" in snapshot_columns
+    assert {"session_id", "task_id"} <= stability_columns
+    assert version == "4"

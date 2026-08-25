@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_wisdom.client import Feed
+from hermes_wisdom.client import Feed, WisdomConflict
 from hermes_wisdom.compatibility import CompatibilityResult
 from hermes_wisdom.consumption import WisdomConsumption, _tree_hashes
 from hermes_wisdom.contract import (
@@ -40,23 +40,29 @@ def _files(version: int, *, credentials: list[str] | None = None):
 
 
 class Client:
-    def __init__(self, files, *, mode="REQUIRED", fail_record=False):
+    def __init__(self, files, *, mode="REQUIRED", fail_record=False, record_error=None):
         self.files = files
         self.mode = mode
         self.fail_record = fail_record
+        self.record_error = record_error
+        self.skill_state = "active"
+        self.takedown_generation = 0
+        self.latest_version = 2
+        self.installed_version = 1
         self.recorded: list[dict] = []
         self.deactivated: list[tuple[str, str]] = []
         self.feed_pages: list[Feed] = []
+        self.drafts = []
 
     def installations(self, _identity):
         return [
             {
                 "skill_id": "skill-1",
-                "installed_version": 1,
-                "latest_version": 2,
+                "installed_version": self.installed_version,
+                "latest_version": self.latest_version,
                 "update_mode": self.mode,
-                "skill_state": "active",
-                "takedown_generation": 0,
+                "skill_state": self.skill_state,
+                "takedown_generation": self.takedown_generation,
             }
         ]
 
@@ -65,11 +71,16 @@ class Client:
         return SimpleNamespace(content_hash=content_hash), self.files
 
     def record_install(self, **kwargs):
+        if self.record_error is not None:
+            raise self.record_error
         if self.fail_record:
             self.fail_record = False
             raise RuntimeError("network down")
         self.recorded.append(kwargs)
         return SimpleNamespace(effective_update_mode=self.mode)
+
+    def list_drafts(self):
+        return self.drafts
 
     def deactivate_install(self, installation_id, skill_id):
         self.deactivated.append((installation_id, skill_id))
@@ -202,6 +213,128 @@ def test_update_resumes_after_gateway_record_failure(monkeypatch, tmp_path: Path
     assert manager.recover() == ["skill-1"]
     assert manager.store.pending_operations() == []
     assert client.recorded[0]["version"] == 2
+
+
+def test_apply_rejects_policy_change_before_touching_managed_files(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(_files(2), mode="MANUAL")
+    manager, target = _manager(monkeypatch, tmp_path, client=client)
+    plan = manager.update_plan("skill-1")
+    client.mode = "REQUIRED"
+
+    with pytest.raises(PackagePolicyError, match="policy changed"):
+        manager.update_apply(plan["receipt"])
+
+    assert (target / "SKILL.md").read_text() == "# Managed v1\n"
+    assert manager.store.pending_operations() == []
+
+
+def test_apply_rechecks_current_compatibility_and_scan(monkeypatch, tmp_path: Path):
+    client = Client(_files(2), mode="MANUAL")
+    manager, target = _manager(monkeypatch, tmp_path, client=client)
+    plan = manager.update_plan("skill-1")
+    monkeypatch.setattr(
+        "hermes_wisdom.consumption.evaluate",
+        lambda _specification, _local: CompatibilityResult(
+            "blocked_pending_action", (), (), (), ("new local gap",)
+        ),
+    )
+
+    with pytest.raises(PackagePolicyError, match="blocked compatibility"):
+        manager.update_apply(plan["receipt"])
+
+    assert (target / "SKILL.md").read_text() == "# Managed v1\n"
+    assert manager.store.pending_operations() == []
+
+
+def test_permanent_nonterminal_gateway_rejection_restores_previous_install(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(
+        _files(2),
+        mode="MANUAL",
+        record_error=WisdomConflict(
+            "policy missing", status=409, code="policy_not_configured"
+        ),
+    )
+    manager, target = _manager(monkeypatch, tmp_path, client=client)
+    plan = manager.update_plan("skill-1")
+
+    with pytest.raises(WisdomConflict, match="policy missing"):
+        manager.update_apply(plan["receipt"])
+
+    assert (target / "SKILL.md").read_text() == "# Managed v1\n"
+    restored = manager.store.installation("skill-1")
+    assert restored["version"] == 1
+    assert restored["state"] == "active"
+    assert manager.store.pending_operations() == []
+
+
+def test_terminal_gateway_rejection_quarantines_and_deactivates(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(
+        _files(2),
+        mode="MANUAL",
+        record_error=WisdomConflict("taken down", status=409, code="skill_taken_down"),
+    )
+    manager, target = _manager(monkeypatch, tmp_path, client=client)
+    plan = manager.update_plan("skill-1")
+
+    with pytest.raises(WisdomConflict, match="taken down"):
+        manager.update_apply(plan["receipt"])
+
+    assert not target.exists()
+    assert manager.store.installation("skill-1")["state"] == "inactive"
+    assert manager.store.pending_operations() == []
+
+
+def test_returned_draft_invalidates_receipt_and_preserves_moderator_note(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(_files(2))
+    manager, _target = _manager(monkeypatch, tmp_path, client=client)
+    local_skill = tmp_path / "owner-skill"
+    local_skill.mkdir()
+    skill_id = manager.store.register_skill(
+        local_skill, content_hash="sha256:source", source_kind="local"
+    )
+    manager.store.record_draft({
+        "id": "draft-1",
+        "skill_id": skill_id,
+        "source_hash": "sha256:source",
+        "overlay_path": str(local_skill),
+        "state": "pending_moderation",
+        "description": "Owner copy",
+        "content_hash": "sha256:content",
+        "description_hash": "sha256:description",
+        "manifest_hash": "sha256:manifest",
+    })
+    manager.store.save_receipt(
+        draft_id="draft-1",
+        server_revision="revision-1",
+        content_hash="sha256:content",
+        description_hash="sha256:description",
+        manifest_hash="sha256:manifest",
+    )
+    client.drafts = [
+        SimpleNamespace(
+            id="draft-1",
+            slug="owner-skill",
+            state="changes_requested",
+            moderationNote="Remove the environment-specific hostname.",
+            moderationDeciderUserId="moderator-1",
+            moderationDecidedAt="2026-08-25T00:00:00Z",
+        )
+    ]
+
+    assert manager.poll_owner_decisions() == {"inserted": 1}
+    assert manager.store.receipt("draft-1") is None
+    notice = manager.store.feed_events()[0]
+    assert notice["payload"]["moderation_note"] == (
+        "Remove the environment-specific hostname."
+    )
 
 
 def test_update_recovers_when_swap_won_before_journal_advance(

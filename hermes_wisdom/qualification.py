@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+from difflib import unified_diff
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -92,8 +93,23 @@ def structural_classification(
     return "ambiguous", delta
 
 
-def _classify_ambiguous(path: Path, delta: dict[str, Any]) -> str:
+def _classify_ambiguous(
+    before_text: str, after_text: str, delta: dict[str, Any]
+) -> str:
     """Use the configured model only after structural rules cannot decide."""
+    if not before_text or not after_text:
+        return "non_meaningful"
+    semantic_diff = "".join(
+        unified_diff(
+            before_text.splitlines(keepends=True),
+            after_text.splitlines(keepends=True),
+            fromfile="before/SKILL.md",
+            tofile="after/SKILL.md",
+            n=3,
+        )
+    )[:16000]
+    if not semantic_diff:
+        return "non_meaningful"
     try:
         from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 
@@ -112,9 +128,7 @@ def _classify_ambiguous(path: Path, delta: dict[str, Any]) -> str:
                     "content": json.dumps(
                         {
                             "structural_diff": delta,
-                            "untrusted_current_skill_excerpt": _frontmatter_free_text(
-                                path
-                            )[:8000],
+                            "untrusted_semantic_diff": semantic_diff,
                         },
                         sort_keys=True,
                     ),
@@ -170,6 +184,75 @@ def _emit_candidate(
     )
 
 
+def process_due_stability_jobs(
+    *,
+    store: WisdomStore | None = None,
+    at: datetime | None = None,
+) -> list[str]:
+    """Evaluate all due jobs without requiring another use of the same skill."""
+
+    state = store or WisdomStore()
+    if state.active_org_id() is None:
+        return []
+    current = _now(at)
+    recent_day = (current.date() - timedelta(days=RECENT_USE_DAYS - 1)).isoformat()
+    recent_time = (current - timedelta(days=RECENT_USE_DAYS)).isoformat()
+    emitted: list[str] = []
+    for job in state.due_stability_jobs(current.isoformat()):
+        skill_id = str(job["skill_id"])
+        content_hash = str(job["content_hash"])
+        skill = state.local_skill(skill_id)
+        path = Path(str(skill["canonical_path"])) if skill else None
+        try:
+            eligible = (
+                skill is not None
+                and skill.get("deleted_at") is None
+                and skill.get("source_kind") == "local"
+                and path is not None
+                and path.is_dir()
+                and path.resolve().is_relative_to(get_skills_dir().resolve())
+                and path.resolve().relative_to(get_skills_dir().resolve()).parts[0]
+                not in {"_org", "_wisdom", ".archive", ".hub"}
+            )
+        except (OSError, ValueError, IndexError):
+            eligible = False
+        if not eligible or path is None:
+            state.finish_stability_job(skill_id, content_hash)
+            continue
+        current_hash, _tree = snapshot_tree(path)
+        if current_hash != content_hash:
+            state.finish_stability_job(skill_id, content_hash)
+            continue
+        refinements = state.meaningful_refinement_count(skill_id, since=recent_time)
+        if refinements < REQUIRED_REFINEMENTS:
+            state.finish_stability_job(skill_id, content_hash)
+            continue
+        # A stable refined skill can still be used later in the 30-day
+        # qualification window. Keep the one-shot job pending until that use
+        # arrives; a subsequent mutation or expired refinement evidence makes
+        # the job terminal above.
+        if not state.usage_days(skill_id, since=recent_day):
+            continue
+        event_id = _emit_candidate(
+            state,
+            skill_id=skill_id,
+            skill_name=path.name,
+            content_hash=content_hash,
+            qualification="refinement",
+            local_reasons={
+                "meaningful_refinements": refinements,
+                "stable_days": STABILITY_DAYS,
+                "used_within_days": RECENT_USE_DAYS,
+            },
+            session_id=job.get("session_id"),
+            task_id=job.get("task_id"),
+        )
+        if event_id:
+            emitted.append(event_id)
+        state.finish_stability_job(skill_id, content_hash)
+    return emitted
+
+
 def record_successful_use(
     skill_name: str,
     *,
@@ -186,16 +269,22 @@ def record_successful_use(
         return None
     current = _now(at)
     content_hash, tree = snapshot_tree(path)
+    snapshot_text = _frontmatter_free_text(path)
     skill_id = state.register_skill(
-        path, content_hash=content_hash, source_kind="local", tree=tree
+        path,
+        content_hash=content_hash,
+        source_kind="local",
+        tree=tree,
+        snapshot_text=snapshot_text,
     )
     day = current.date().isoformat()
     retain_after = (current.date() - timedelta(days=RETENTION_DAYS - 1)).isoformat()
     state.record_usage_day(skill_id, day, retain_after=retain_after)
     recent_after = (current.date() - timedelta(days=RECENT_USE_DAYS - 1)).isoformat()
     days = state.usage_days(skill_id, since=recent_after)
+    stability_events = process_due_stability_jobs(store=state, at=current)
     if _consecutive(days, required=HIGH_USAGE_CONSECUTIVE_DAYS):
-        return _emit_candidate(
+        high_usage = _emit_candidate(
             state,
             skill_id=skill_id,
             skill_name=skill_name,
@@ -205,31 +294,9 @@ def record_successful_use(
             session_id=session_id,
             task_id=task_id,
         )
-    for job in state.due_stability_jobs(current.isoformat()):
-        if job["skill_id"] != skill_id:
-            continue
-        state.finish_stability_job(skill_id, str(job["content_hash"]))
-        if job["content_hash"] != content_hash:
-            continue
-        refinements = state.meaningful_refinement_count(
-            skill_id, since=(current - timedelta(days=RECENT_USE_DAYS)).isoformat()
-        )
-        if refinements >= REQUIRED_REFINEMENTS:
-            return _emit_candidate(
-                state,
-                skill_id=skill_id,
-                skill_name=skill_name,
-                content_hash=content_hash,
-                qualification="refinement",
-                local_reasons={
-                    "meaningful_refinements": refinements,
-                    "stable_days": STABILITY_DAYS,
-                    "used_within_days": RECENT_USE_DAYS,
-                },
-                session_id=session_id,
-                task_id=task_id,
-            )
-    return None
+        if high_usage:
+            return high_usage
+    return stability_events[0] if stability_events else None
 
 
 def record_mutation(
@@ -247,18 +314,25 @@ def record_mutation(
     if state.active_org_id() is None:
         return
     content_hash, tree = snapshot_tree(path)
+    snapshot_text = _frontmatter_free_text(path)
     # Resolve the identity before inserting the new snapshot, then ask for the
     # prior snapshot under that identity.
     skill_id = state.register_skill(path, content_hash=None, source_kind="local")
     previous = state.latest_snapshot(skill_id)
     state.register_skill(
-        path, content_hash=content_hash, source_kind="local", tree=tree
+        path,
+        content_hash=content_hash,
+        source_kind="local",
+        tree=tree,
+        snapshot_text=snapshot_text,
     )
     if not previous or previous["content_hash"] == content_hash:
         return
     classification, delta = structural_classification(previous["tree"], tree)
     if classification == "ambiguous":
-        classification = _classify_ambiguous(path, delta)
+        classification = _classify_ambiguous(
+            str(previous.get("skill_text") or ""), snapshot_text, delta
+        )
     state.record_refinement(
         skill_id,
         from_hash=str(previous["content_hash"]),
@@ -268,7 +342,13 @@ def record_mutation(
     )
     if classification == "meaningful":
         due = _now(at) + timedelta(days=STABILITY_DAYS)
-        state.schedule_stability(skill_id, content_hash, due.isoformat())
+        state.schedule_stability(
+            skill_id,
+            content_hash,
+            due.isoformat(),
+            session_id=session_id,
+            task_id=task_id,
+        )
 
 
 def record_mutation_async(

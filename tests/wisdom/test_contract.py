@@ -1,8 +1,10 @@
 import base64
+import hashlib
 import json
 from pathlib import Path
 
 from hermes_wisdom.contract import (
+    CONTRACT_PIN,
     ContentFile,
     author_description_hash,
     derive_content_hash,
@@ -12,6 +14,17 @@ from hermes_wisdom.contract import (
 
 
 VECTORS = Path("hermes_wisdom/contracts/canonical-hash-vectors.v1.json")
+OPENAPI = Path("hermes_wisdom/contracts/gateway-openapi.json")
+
+
+def test_checked_in_gateway_openapi_matches_the_pinned_digest():
+    assert hashlib.sha256(OPENAPI.read_bytes()).hexdigest() == (
+        CONTRACT_PIN.openapi_sha256
+    )
+    contract = json.loads(OPENAPI.read_text(encoding="utf-8"))
+    draft = contract["components"]["schemas"]["WisdomDraftRecord"]
+    assert "changes_requested" in draft["properties"]["state"]["enum"]
+    assert "/v1/sync/org/proposals/{n}/return" in contract["paths"]
 
 
 def test_gateway_canonical_vectors_match_exactly():

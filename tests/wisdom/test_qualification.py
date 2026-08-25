@@ -1,3 +1,6 @@
+import json
+import sys
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -5,6 +8,8 @@ from hermes_wisdom.qualification import (
     HIGH_USAGE_CONSECUTIVE_DAYS,
     RETENTION_DAYS,
     _emit_candidate,
+    _classify_ambiguous,
+    process_due_stability_jobs,
     record_mutation,
     record_successful_use,
 )
@@ -122,6 +127,95 @@ def test_structural_refinements_schedule_restart_safe_stability(
     event = restarted.local_events(kind="wisdom.candidate")[0]
     assert event["qualification"] == "refinement"
     assert event["payload"]["local_reasons"]["meaningful_refinements"] == 3
+
+
+def test_due_stability_runs_without_another_use_and_keeps_session(
+    monkeypatch, tmp_path: Path
+):
+    skill = _skill(tmp_path)
+    _eligible(monkeypatch, skill)
+    store = _configured_store(tmp_path)
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    record_successful_use("learned-skill", at=start, store=store)
+    for index in range(3):
+        refs = skill / "refs"
+        refs.mkdir(exist_ok=True)
+        (refs / f"step-{index}.md").write_text(str(index), encoding="utf-8")
+        record_mutation(
+            "learned-skill",
+            at=start + timedelta(days=index + 1),
+            session_id="origin-session",
+            task_id="origin-task",
+            store=store,
+        )
+
+    emitted = process_due_stability_jobs(
+        store=WisdomStore(store.root), at=start + timedelta(days=10)
+    )
+
+    assert len(emitted) == 1
+    event = store.local_events(kind="wisdom.candidate")[0]
+    assert event["session_id"] == "origin-session"
+    assert event["task_id"] == "origin-task"
+    assert process_due_stability_jobs(store=store, at=start + timedelta(days=11)) == []
+
+
+def test_due_stability_waits_for_use_within_the_qualification_window(
+    monkeypatch, tmp_path: Path
+):
+    skill = _skill(tmp_path)
+    _eligible(monkeypatch, skill)
+    store = _configured_store(tmp_path)
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    record_mutation("learned-skill", at=start, store=store)
+    for index in range(3):
+        refs = skill / "refs"
+        refs.mkdir(exist_ok=True)
+        (refs / f"late-use-{index}.md").write_text(str(index), encoding="utf-8")
+        record_mutation(
+            "learned-skill", at=start + timedelta(days=index + 1), store=store
+        )
+
+    assert process_due_stability_jobs(store=store, at=start + timedelta(days=10)) == []
+    assert len(store.due_stability_jobs((start + timedelta(days=10)).isoformat())) == 1
+
+    event_id = record_successful_use(
+        "learned-skill", at=start + timedelta(days=11), store=store
+    )
+    assert event_id
+    assert store.local_events(kind="wisdom.candidate")[0]["qualification"] == (
+        "refinement"
+    )
+
+
+def test_ambiguous_classifier_receives_only_a_bounded_before_after_diff(
+    monkeypatch,
+):
+    captured = {}
+    auxiliary = types.ModuleType("agent.auxiliary_client")
+
+    def call_llm(**kwargs):
+        captured.update(kwargs)
+        return {"content": "meaningful"}
+
+    auxiliary.call_llm = call_llm
+    auxiliary.extract_content_or_reasoning = lambda response: response["content"]
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary)
+
+    assert (
+        _classify_ambiguous(
+            "# Procedure\nUse the old endpoint.\n",
+            "# Procedure\nUse the new endpoint and verify the receipt.\n",
+            {"added": [], "removed": [], "changed": ["SKILL.md"]},
+        )
+        == "meaningful"
+    )
+    payload = json.loads(captured["messages"][1]["content"])
+    semantic = payload["untrusted_semantic_diff"]
+    assert "Use the old endpoint" in semantic
+    assert "Use the new endpoint" in semantic
+    assert "usage" not in payload
+    assert len(semantic) <= 16000
 
 
 def test_ambiguous_classifier_failure_is_conservative(monkeypatch, tmp_path: Path):
