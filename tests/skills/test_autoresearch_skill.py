@@ -657,7 +657,9 @@ def test_real_cron_job_persists_autoresearch_skill_and_workspace(
     persisted_job = next(
         stored for stored in persisted["jobs"] if stored["id"] == result["job_id"]
     )
-    assert persisted_job["prompt"] == prompt
+    # cronjob create sanitizes the prompt (invisible-unicode strip and
+    # trailing-whitespace normalization), so compare normalized forms.
+    assert persisted_job["prompt"].strip() == prompt.strip()
     assert persisted_job["workdir"] == str(workspace.resolve())
     assembled = _build_job_prompt(persisted_job)
     assert "# Autoresearch Skill" in assembled
