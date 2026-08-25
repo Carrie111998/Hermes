@@ -120,6 +120,30 @@ class TestCLIStatusBar:
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
 
+    def test_fast_mode_badge_is_shown_in_plain_status_bar_at_every_width(self):
+        cli_obj = _make_cli("gpt-5.4")
+        cli_obj.service_tier = "priority"
+
+        for width in (40, 60, 120):
+            text = cli_obj._build_status_bar_text(width=width)
+            assert "⚡ FAST" in text, f"missing fast badge at width={width}: {text!r}"
+
+        cli_obj.service_tier = None
+        assert "FAST" not in cli_obj._build_status_bar_text(width=120)
+
+    def test_fast_mode_badge_is_shown_in_styled_status_bar_at_every_width(self):
+        cli_obj = _make_cli("gpt-5.4")
+        cli_obj.service_tier = "priority"
+        cli_obj._status_bar_visible = True
+
+        for width in (40, 60, 120):
+            mock_app = MagicMock()
+            mock_app.output.get_size.return_value = MagicMock(columns=width)
+            with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+                fragments = cli_obj._get_status_bar_fragments()
+            text = "".join(value for _, value in fragments)
+            assert "⚡ FAST" in text, f"missing fast badge at width={width}: {text!r}"
+
 
     def test_input_height_counts_prompt_only_on_first_wrapped_row(self):
         # Regression for prompt_toolkit classic CLI resize glitches: the prompt
