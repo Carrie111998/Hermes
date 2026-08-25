@@ -62,6 +62,13 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.auxiliary_context import (
+    AUXILIARY_CALL_CONTEXT,
+    exception_log_detail as _aux_exception_log_detail,
+    exception_log_traceback as _aux_exception_log_traceback,
+    sensitive_content_active as _aux_sensitive_content,
+)
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -336,7 +343,10 @@ def _aux_interrupt_cancel_requested() -> bool:
         try:
             return bool(event.is_set())
         except Exception:
-            logger.debug("aux interrupt cancel event check failed", exc_info=True)
+            logger.debug(
+                "aux interrupt cancel event check failed",
+                exc_info=_aux_exception_log_traceback(),
+            )
             return False
     check = getattr(_aux_interrupt_protection, "cancel_check", None)
     if not callable(check):
@@ -344,7 +354,10 @@ def _aux_interrupt_cancel_requested() -> bool:
     try:
         return bool(check())
     except Exception:
-        logger.debug("aux interrupt cancel check failed", exc_info=True)
+        logger.debug(
+            "aux interrupt cancel check failed",
+            exc_info=_aux_exception_log_traceback(),
+        )
         return False
 
 
@@ -397,7 +410,10 @@ def _captured_aux_cancel_requested(cancel_check: Callable[[], Any]) -> bool:
     try:
         return bool(cancel_check())
     except Exception:
-        logger.debug("captured aux cancel check failed", exc_info=True)
+        logger.debug(
+            "captured aux cancel check failed",
+            exc_info=_aux_exception_log_traceback(),
+        )
         return False
 
 
@@ -453,7 +469,10 @@ def _notify_aux_progress() -> None:
     try:
         hook()
     except Exception:
-        logger.debug("aux progress hook failed", exc_info=True)
+        logger.debug(
+            "aux progress hook failed",
+            exc_info=_aux_exception_log_traceback(),
+        )
 
 
 def _aux_progress_active() -> bool:
@@ -882,7 +901,11 @@ def _fast_model_from_catalog(provider_id: str) -> str:
         except Exception:
             # Not an API-key provider, or nothing configured yet. The anonymous
             # fetch below still works for the catalogs that allow it.
-            logger.debug("No credentials for %s catalog", provider_id, exc_info=True)
+            logger.debug(
+                "No credentials for %s catalog",
+                provider_id,
+                exc_info=_aux_exception_log_traceback(),
+            )
 
         if not base_url:
             base_url = str(getattr(get_provider_profile(provider_id), "base_url", "") or "")
@@ -896,7 +919,11 @@ def _fast_model_from_catalog(provider_id: str) -> str:
             api_key=api_key or None, base_url=base_url, timeout=3.0
         ) or {}
     except Exception:
-        logger.debug("Fast-model catalog lookup failed for %s", provider_id, exc_info=True)
+        logger.debug(
+            "Fast-model catalog lookup failed for %s",
+            provider_id,
+            exc_info=_aux_exception_log_traceback(),
+        )
         return ""
 
     ids = sorted((str(m) for m in catalog), key=_model_recency_key, reverse=True)
@@ -945,7 +972,11 @@ def _get_aux_model_for_provider(provider_id: str, *, prefer_fast: bool = False) 
                 if live:
                     return live
             except Exception:
-                logger.debug("resolve_aux_model failed for %s", provider_id, exc_info=True)
+                logger.debug(
+                    "resolve_aux_model failed for %s",
+                    provider_id,
+                    exc_info=_aux_exception_log_traceback(),
+                )
 
     if profile is not None and profile.default_aux_model:
         return profile.default_aux_model
@@ -1379,14 +1410,22 @@ def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
     try:
         pool = load_pool(provider)
     except Exception as exc:
-        logger.debug("Auxiliary client: could not load pool for %s: %s", provider, exc)
+        logger.debug(
+            "Auxiliary client: could not load pool for %s: %s",
+            provider,
+            _aux_exception_log_detail(exc),
+        )
         return False, None
     if not pool or not pool.has_credentials():
         return False, None
     try:
         return True, pool.select()
     except Exception as exc:
-        logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
+        logger.debug(
+            "Auxiliary client: could not select pool entry for %s: %s",
+            provider,
+            _aux_exception_log_detail(exc),
+        )
         return True, None
 
 
@@ -1395,7 +1434,11 @@ def _peek_pool_entry(provider: str) -> Optional[Any]:
     try:
         pool = load_pool(provider)
     except Exception as exc:
-        logger.debug("Auxiliary client: could not load pool for %s (peek): %s", provider, exc)
+        logger.debug(
+            "Auxiliary client: could not load pool for %s (peek): %s",
+            provider,
+            _aux_exception_log_detail(exc),
+        )
         return None
     if not pool or not pool.has_credentials():
         return None
@@ -1409,7 +1452,11 @@ def _peek_pool_entry(provider: str) -> Optional[Any]:
         if callable(peek_fn):
             return peek_fn()
     except Exception as exc:
-        logger.debug("Auxiliary client: could not peek pool entry for %s: %s", provider, exc)
+        logger.debug(
+            "Auxiliary client: could not peek pool entry for %s: %s",
+            provider,
+            _aux_exception_log_detail(exc),
+        )
     return None
 
 
@@ -1661,7 +1708,8 @@ class _CodexCompletionsAdapter:
             except Exception as exc:
                 logger.warning(
                     "Auxiliary client: failed to sanitize tool schemas for "
-                    "Codex/xAI Responses path: %s", exc,
+                    "Codex/xAI Responses path: %s",
+                    _aux_exception_log_detail(exc),
                 )
             converted = []
             for t in tools:
@@ -1727,7 +1775,8 @@ class _CodexCompletionsAdapter:
                     resp_kwargs["prompt_cache_retention"] = _cache_retention
         except Exception:
             logger.debug(
-                "Codex auxiliary: prompt_cache_key derivation skipped", exc_info=True
+                "Codex auxiliary: prompt_cache_key derivation skipped",
+                exc_info=_aux_exception_log_traceback(),
             )
 
         # Stream and collect the response
@@ -1738,6 +1787,7 @@ class _CodexCompletionsAdapter:
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
+        timeout_context = contextvars.copy_context()
         # A protected provider call may outlive its owning compression attempt:
         # the owner returns promptly on hard cancellation while this adapter is
         # still blocked in the SDK stream on its isolated worker. Timer threads
@@ -1782,7 +1832,7 @@ class _CodexCompletionsAdapter:
                         logger.debug(
                             "Codex auxiliary: cancelled attempt stream close "
                             "during timeout failed",
-                            exc_info=True,
+                            exc_info=_aux_exception_log_traceback(),
                         )
                 return
             close = getattr(self._client, "close", None)
@@ -1790,7 +1840,10 @@ class _CodexCompletionsAdapter:
                 try:
                     close()
                 except Exception:
-                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+                    logger.debug(
+                        "Codex auxiliary: client close during timeout failed",
+                        exc_info=_aux_exception_log_traceback(),
+                    )
             # The cached auxiliary client wraps this same ``self._client``
             # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
             # this instance).  After we close the httpx transport above, the
@@ -1800,7 +1853,10 @@ class _CodexCompletionsAdapter:
             try:
                 _evict_cached_client_instance(self._client)
             except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
+                logger.debug(
+                    "Codex auxiliary: cache eviction on timeout failed",
+                    exc_info=_aux_exception_log_traceback(),
+                )
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
@@ -1827,7 +1883,11 @@ class _CodexCompletionsAdapter:
 
         try:
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                timeout_timer = threading.Timer(
+                    float(total_timeout),
+                    timeout_context.run,
+                    args=(_close_client_on_timeout,),
+                )
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
@@ -1880,7 +1940,7 @@ class _CodexCompletionsAdapter:
                     except Exception:
                         logger.debug(
                             "Codex auxiliary: late cancelled attempt stream close failed",
-                            exc_info=True,
+                            exc_info=_aux_exception_log_traceback(),
                         )
             try:
                 # Some Codex-compatible hosts accept ``stream=True`` but return
@@ -1948,7 +2008,10 @@ class _CodexCompletionsAdapter:
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
-            logger.debug("Codex auxiliary Responses API call failed: %s", exc)
+            logger.debug(
+                "Codex auxiliary Responses API call failed: %s",
+                _aux_exception_log_detail(exc),
+            )
             raise
         finally:
             if timeout_timer is not None:
@@ -2510,7 +2573,9 @@ def _maybe_wrap_anthropic(
     except Exception as exc:
         logger.warning(
             "Failed to build Anthropic client for %s (%s) — falling back to "
-            "OpenAI-wire client.", base_url, exc,
+            "OpenAI-wire client.",
+            base_url,
+            _aux_exception_log_detail(exc),
         )
         return client_obj
 
@@ -2558,7 +2623,7 @@ def _read_nous_auth() -> Optional[dict]:
             return None
         return provider
     except Exception as exc:
-        logger.debug("Could not read Nous auth: %s", exc)
+        logger.debug("Could not read Nous auth: %s", _aux_exception_log_detail(exc))
         return None
 
 
@@ -2594,7 +2659,10 @@ def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[t
 
         pool = load_pool("nous")
     except Exception as exc:
-        logger.debug("Auxiliary Nous pool credential resolution failed: %s", exc)
+        logger.debug(
+            "Auxiliary Nous pool credential resolution failed: %s",
+            _aux_exception_log_detail(exc),
+        )
         return None
 
     if not pool or not pool.has_credentials():
@@ -2603,7 +2671,10 @@ def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[t
     try:
         entry = pool.select()
     except Exception as exc:
-        logger.debug("Auxiliary Nous pool selection failed: %s", exc)
+        logger.debug(
+            "Auxiliary Nous pool selection failed: %s",
+            _aux_exception_log_detail(exc),
+        )
         return None
 
     if entry is None:
@@ -2618,7 +2689,10 @@ def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[t
         try:
             refreshed = pool.try_refresh_current()
         except Exception as exc:
-            logger.debug("Auxiliary Nous pool refresh failed: %s", exc)
+            logger.debug(
+                "Auxiliary Nous pool refresh failed: %s",
+                _aux_exception_log_detail(exc),
+            )
             refreshed = None
         if refreshed is None:
             return None
@@ -2658,7 +2732,10 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
             force_refresh=force_refresh,
         )
     except Exception as exc:
-        logger.debug("Auxiliary Nous runtime credential resolution failed: %s", exc)
+        logger.debug(
+            "Auxiliary Nous runtime credential resolution failed: %s",
+            _aux_exception_log_detail(exc),
+        )
         return None
 
     api_key = str(creds.get("api_key") or "").strip()
@@ -2706,14 +2783,20 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
                 if api_key and base_url:
                     return api_key, base_url
     except Exception as exc:
-        logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
+        logger.debug(
+            "Auxiliary xAI OAuth pool credential resolution failed: %s",
+            _aux_exception_log_detail(exc),
+        )
 
     try:
         from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
         creds = resolve_xai_oauth_runtime_credentials()
     except Exception as exc:
-        logger.debug("Auxiliary xAI OAuth runtime credential resolution failed: %s", exc)
+        logger.debug(
+            "Auxiliary xAI OAuth runtime credential resolution failed: %s",
+            _aux_exception_log_detail(exc),
+        )
         return None
 
     api_key = str(creds.get("api_key") or "").strip()
@@ -2762,7 +2845,10 @@ def _read_codex_access_token() -> Optional[str]:
 
         return access_token.strip()
     except Exception as exc:
-        logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
+        logger.debug(
+            "Could not read Codex auth for auxiliary client: %s",
+            _aux_exception_log_detail(exc),
+        )
         return None
 
 
@@ -3046,7 +3132,9 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
             logger.debug(
                 "Auxiliary/%s: recommended-models lookup failed (%s); "
                 "falling back to %s",
-                "vision" if vision else "text", exc, model,
+                "vision" if vision else "text",
+                _aux_exception_log_detail(exc),
+                model,
             )
 
     if runtime is not None:
@@ -3100,7 +3188,8 @@ def _refresh_nous_recommended_model(
     except Exception as exc:
         logger.debug(
             "Nous recommended-model refresh failed (%s); using default %s",
-            exc, _NOUS_MODEL,
+            _aux_exception_log_detail(exc),
+            _NOUS_MODEL,
         )
     if fresh and fresh.strip().lower() != stale:
         return fresh
@@ -3249,7 +3338,9 @@ def _resolve_moa_aggregator(preset_name: Optional[str]) -> Tuple[Optional[str], 
             return agg_provider, agg_model
     except Exception:
         logger.debug(
-            "MoA aggregator resolution failed for preset %r", preset_name, exc_info=True
+            "MoA aggregator resolution failed for preset %r",
+            preset_name,
+            exc_info=_aux_exception_log_traceback(),
         )
     return None, None
 
@@ -3305,19 +3396,18 @@ _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
 
-_RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
-    contextvars.ContextVar("auxiliary_relay_call", default=None)
-)
+_RELAY_AUX_CALL_CONTEXT = AUXILIARY_CALL_CONTEXT
 
 
 def _relay_auxiliary_call(callback):
-    """Give every physical retry in one auxiliary call a shared Relay identity."""
+    """Install per-call policy and a shared Relay identity for physical retries."""
 
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
         task = args[0] if args else kwargs.get("task")
         token = _RELAY_AUX_CALL_CONTEXT.set({
             "task": str(task or "unknown"),
+            "sensitive_content": bool(kwargs.get("sensitive_content", False)),
             "request_id": f"aux-{uuid.uuid4().hex}",
             "attempt_count": 0,
             "provider": "",
@@ -3344,6 +3434,7 @@ def _relay_auxiliary_call_async(callback):
         task = args[0] if args else kwargs.get("task")
         token = _RELAY_AUX_CALL_CONTEXT.set({
             "task": str(task or "unknown"),
+            "sensitive_content": bool(kwargs.get("sensitive_content", False)),
             "request_id": f"aux-{uuid.uuid4().hex}",
             "attempt_count": 0,
             "provider": "",
@@ -3393,7 +3484,7 @@ def _relay_auxiliary_metadata(
     api_mode: str | None = None,
 ) -> tuple[str, str, dict[str, Any]] | None:
     context = _RELAY_AUX_CALL_CONTEXT.get()
-    if context is None:
+    if context is None or context.get("sensitive_content"):
         return None
     attempt_count = int(context.get("attempt_count") or 0)
     context["attempt_count"] = attempt_count + 1
@@ -3631,7 +3722,10 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
 
         runtime = resolve_runtime_provider(requested="custom")
     except Exception as exc:
-        logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
+        logger.debug(
+            "Auxiliary client: custom runtime resolution failed: %s",
+            _aux_exception_log_detail(exc),
+        )
         runtime = None
 
     if not isinstance(runtime, dict):
@@ -3898,10 +3992,13 @@ def _try_azure_foundry(
             target_model=model,
         )
     except AuthError as exc:
-        logger.debug("Auxiliary azure-foundry: %s", exc)
+        logger.debug("Auxiliary azure-foundry: %s", _aux_exception_log_detail(exc))
         return None, None
     except Exception as exc:
-        logger.debug("Auxiliary azure-foundry runtime error: %s", exc)
+        logger.debug(
+            "Auxiliary azure-foundry runtime error: %s",
+            _aux_exception_log_detail(exc),
+        )
         return None, None
 
     api_key = runtime.get("api_key")
@@ -4250,7 +4347,10 @@ def _nous_portal_account_has_fresh_paid_access() -> bool:
         account_info = get_nous_portal_account_info(force_fresh=True)
         return account_info.paid_service_access is True
     except Exception as exc:
-        logger.debug("Auxiliary Nous paid-entitlement refresh check failed: %s", exc)
+        logger.debug(
+            "Auxiliary Nous paid-entitlement refresh check failed: %s",
+            _aux_exception_log_detail(exc),
+        )
         return False
 
 
@@ -4709,7 +4809,12 @@ def _pool_cache_hint(
 
 def _pool_error_context(exc: Exception) -> Dict[str, Any]:
     status = getattr(exc, "status_code", None)
-    payload: Dict[str, Any] = {"message": str(exc)}
+    payload: Dict[str, Any] = {}
+    # Credential pools persist this context to disk. A provider exception can
+    # echo its request body, so sensitive calls retain only structural status
+    # and never persist the exception message alongside the credential.
+    if not _aux_sensitive_content():
+        payload["message"] = str(exc)
     if status is not None:
         payload["status_code"] = status
     return payload
@@ -4770,7 +4875,11 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     try:
         pool = load_pool(normalized)
     except Exception as load_exc:
-        logger.debug("Auxiliary client: could not load pool for %s recovery: %s", normalized, load_exc)
+        logger.debug(
+            "Auxiliary client: could not load pool for %s recovery: %s",
+            normalized,
+            _aux_exception_log_detail(load_exc),
+        )
         return False
     if not pool or not pool.has_credentials():
         return False
@@ -5043,7 +5152,11 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
     except Exception as exc:
-        logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
+        logger.debug(
+            "Auxiliary provider credential refresh failed for %s: %s",
+            normalized,
+            _aux_exception_log_detail(exc),
+        )
         return False
     return False
 
@@ -5344,7 +5457,9 @@ def _call_fallback_candidate_sync(
         logger.warning(
             "Auxiliary %s: fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            task or "call",
+            fb_label,
+            _aux_exception_log_detail(fb_err),
         )
         return None
 
@@ -5447,7 +5562,9 @@ async def _call_fallback_candidate_async(
         logger.warning(
             "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            task or "call",
+            fb_label,
+            _aux_exception_log_detail(fb_err),
         )
         return None
 
@@ -5659,7 +5776,9 @@ def _candidate_context_window(
     except Exception as exc:
         logger.debug(
             "Auxiliary fallback: could not resolve context window for %s/%s: %s",
-            provider, model, exc,
+            provider,
+            model,
+            _aux_exception_log_detail(exc),
         )
         return None
     # ``get_model_context_length`` returns an int (with a 256K default
@@ -5869,7 +5988,11 @@ def _try_main_fallback_chain(
 
         chain = get_fallback_chain(load_config_readonly())
     except Exception as exc:
-        logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
+        logger.debug(
+            "Auxiliary %s: could not load main fallback chain: %s",
+            task or "call",
+            _aux_exception_log_detail(exc),
+        )
         return None, None, ""
 
     if not chain:
@@ -5900,7 +6023,12 @@ def _try_main_fallback_chain(
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
-            logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
+            logger.debug(
+                "Auxiliary %s: main fallback %s failed to resolve: %s",
+                task or "call",
+                label,
+                _aux_exception_log_detail(exc),
+            )
             fb_client, resolved_model = None, None
         if fb_client is not None:
             if min_ctx is not None:
@@ -7063,7 +7191,7 @@ def resolve_provider_client(
             client = _VertexOpenAI(api_key=token, base_url=base_url)
         except Exception as exc:
             logger.warning("resolve_provider_client: cannot create Vertex "
-                           "client: %s", exc)
+                           "client: %s", _aux_exception_log_detail(exc))
             return None, None
         logger.debug("resolve_provider_client: vertex (%s)", final_model)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -7130,7 +7258,7 @@ def resolve_provider_client(
                 real_client = build_anthropic_bedrock_client(region)
             except ImportError as exc:
                 logger.warning("resolve_provider_client: cannot create Bedrock "
-                               "client: %s", exc)
+                               "client: %s", _aux_exception_log_detail(exc))
                 return None, None
             client = AnthropicAuxiliaryClient(
                 real_client, final_model, api_key="aws-sdk",
@@ -8787,7 +8915,7 @@ def _build_call_kwargs(
         logger.debug(
             "_build_call_kwargs: provider profile projection failed for %s: %s",
             provider,
-            exc,
+            _aux_exception_log_detail(exc),
         )
 
     kwargs.update(profile_top_level)
@@ -8905,7 +9033,7 @@ def _validate_llm_response(
 def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
     """Close one auxiliary logical call after acceptance or terminal failure."""
     context = _RELAY_AUX_CALL_CONTEXT.get()
-    if context is None:
+    if context is None or context.get("sensitive_content"):
         return
     from agent import relay_llm
 
@@ -8938,7 +9066,7 @@ def _fail_relay_auxiliary_call() -> None:
     except Exception:
         logger.warning(
             "Relay auxiliary failure finalization failed",
-            exc_info=True,
+            exc_info=_aux_exception_log_traceback(),
         )
 
 
@@ -9146,7 +9274,9 @@ def _create_with_progress(
         # plain call reproduces the real error for the normal except-chains.
         logger.debug(
             "Auxiliary %s: streamed request failed (%s); retrying "
-            "non-streaming", task or "call", exc,
+            "non-streaming",
+            task or "call",
+            _aux_exception_log_detail(exc),
         )
         return client.chat.completions.create(**kwargs)
 
@@ -9361,8 +9491,17 @@ def call_llm(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    sensitive_content: bool = False,
+    allow_provider_fallback: bool = True,
 ) -> Any:
-    """Run an auxiliary LLM request, applying the configured task limit."""
+    """Run an auxiliary LLM request, applying the configured task limit.
+
+    ``sensitive_content`` keeps the request outside Relay/request capture and
+    redacts exception details from auxiliary-client logs. Setting
+    ``allow_provider_fallback`` to ``False`` pins the call to its selected
+    provider while retaining bounded same-provider retries and credential
+    refreshes.
+    """
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
         semaphore.acquire()
@@ -9386,6 +9525,7 @@ def call_llm(
             stream=stream,
             stream_options=stream_options,
             route_info=route_info,
+            allow_provider_fallback=allow_provider_fallback,
         )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -9432,6 +9572,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    allow_provider_fallback: bool = True,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -9463,6 +9604,9 @@ def _call_llm_impl(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        allow_provider_fallback: When False, never invoke a provider other
+            than the one selected for this call. Same-provider retries and
+            credential refreshes remain enabled.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -9493,7 +9637,12 @@ def _call_llm_impl(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            allow_provider_fallback
+            and client is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -9530,7 +9679,11 @@ def _call_llm_impl(
             # tasks because fallback entries may use OAuth / credential-pool
             # auth (for example openai-codex).
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            if (
+                allow_provider_fallback
+                and _explicit
+                and _explicit not in {"auto", "openrouter", "custom"}
+            ):
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit,
                 )
@@ -9549,7 +9702,7 @@ def _call_llm_impl(
             # Pass model=None so each provider uses its own default —
             # resolved_model may be an OpenRouter-format slug that doesn't
             # work on other providers.
-            if client is None and not resolved_base_url:
+            if allow_provider_fallback and client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client(
@@ -9679,7 +9832,7 @@ def _call_llm_impl(
                 logger.info(
                     "Auxiliary compression: timeout on the critical path; "
                     "skipping same-provider retry and falling back: %s",
-                    transient_err,
+                    _aux_exception_log_detail(transient_err),
                 )
                 raise
             _max_transient_retries = _transient_retry_count()
@@ -9690,7 +9843,7 @@ def _call_llm_impl(
                     "Auxiliary %s: transient transport error (attempt %d/%d); "
                     "retrying same provider after %.1fs before fallback: %s",
                     task or "call", _attempt, _max_transient_retries, _backoff,
-                    _last_transient,
+                    _aux_exception_log_detail(_last_transient),
                 )
                 time.sleep(_backoff)
                 try:
@@ -10067,7 +10220,11 @@ def _call_llm_impl(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        if (
+            allow_provider_fallback
+            and should_fallback
+            and (is_auto or is_capacity_error)
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -10088,7 +10245,8 @@ def _call_llm_impl(
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, resolved_provider,
+                        _aux_exception_log_detail(first_err))
 
             # Narrow the configured-chain skip to the exact model that
             # failed ONLY for model-specific failures. Auth (401) and
@@ -10173,7 +10331,7 @@ def _call_llm_impl(
                 _evict_cached_client_instance(client)
             except Exception:
                 logger.debug("Auxiliary: cache eviction after connection error failed",
-                             exc_info=True)
+                             exc_info=_aux_exception_log_traceback())
         raise
 
 
@@ -10250,8 +10408,14 @@ async def async_call_llm(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     route_info: Optional[Dict[str, str]] = None,
+    sensitive_content: bool = False,
+    allow_provider_fallback: bool = True,
 ) -> Any:
-    """Run an asynchronous auxiliary LLM request under the configured limit."""
+    """Run an asynchronous auxiliary LLM request under the configured limit.
+
+    See :func:`call_llm` for the sensitive-content and provider-pinning
+    contracts.
+    """
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
@@ -10271,6 +10435,7 @@ async def async_call_llm(
             extra_body=extra_body,
             reasoning_config=reasoning_config,
             route_info=route_info,
+            allow_provider_fallback=allow_provider_fallback,
         )
     finally:
         if semaphore is not None:
@@ -10293,6 +10458,7 @@ async def _async_call_llm_impl(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     route_info: Optional[Dict[str, str]] = None,
+    allow_provider_fallback: bool = True,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -10316,7 +10482,12 @@ async def _async_call_llm_impl(
             async_mode=True,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            allow_provider_fallback
+            and client is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -10349,7 +10520,11 @@ async def _async_call_llm_impl(
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            if (
+                allow_provider_fallback
+                and _explicit
+                and _explicit not in {"auto", "openrouter", "custom"}
+            ):
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit,
                 )
@@ -10365,7 +10540,7 @@ async def _async_call_llm_impl(
                         f"was found. Set the {_explicit.upper()}_API_KEY environment "
                         f"variable, or switch to a different provider with `hermes model`."
                     )
-            if client is None and not resolved_base_url:
+            if allow_provider_fallback and client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client(
@@ -10449,13 +10624,14 @@ async def _async_call_llm_impl(
                 logger.info(
                     "Auxiliary compression (async): timeout on the critical "
                     "path; skipping same-provider retry and falling back: %s",
-                    transient_err,
+                    _aux_exception_log_detail(transient_err),
                 )
                 raise
             logger.info(
                 "Auxiliary %s (async): transient transport error; retrying "
                 "once on the same provider before fallback: %s",
-                task or "call", transient_err,
+                task or "call",
+                _aux_exception_log_detail(transient_err),
             )
             return _validate_llm_response(
                 await _relay_async_completion(
@@ -10769,7 +10945,11 @@ async def _async_call_llm_impl(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        if (
+            allow_provider_fallback
+            and should_fallback
+            and (is_auto or is_capacity_error)
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -10786,7 +10966,8 @@ async def _async_call_llm_impl(
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, resolved_provider,
+                        _aux_exception_log_detail(first_err))
 
             # Narrow the configured-chain skip to the exact model that
             # failed ONLY for model-specific failures. Auth (401) and
@@ -10876,5 +11057,5 @@ async def _async_call_llm_impl(
                 _evict_cached_client_instance(client)
             except Exception:
                 logger.debug("Auxiliary (async): cache eviction after connection error failed",
-                             exc_info=True)
+                             exc_info=_aux_exception_log_traceback())
         raise

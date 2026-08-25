@@ -24,6 +24,10 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
+from agent.auxiliary_context import (
+    exception_log_detail as _aux_exception_log_detail,
+    exception_log_traceback as _aux_exception_log_traceback,
+)
 from agent.secret_scope import get_secret as _get_secret
 
 try:
@@ -3254,7 +3258,8 @@ def create_anthropic_message(
                     except Exception:
                         logger.debug(
                             "%son_response callback failed",
-                            log_prefix, exc_info=True,
+                            log_prefix,
+                            exc_info=_aux_exception_log_traceback(),
                         )
                 if callable(on_stream_event):
                     # Consume the event stream manually so each event can
@@ -3266,7 +3271,8 @@ def create_anthropic_message(
                         except Exception:
                             logger.debug(
                                 "%son_stream_event callback failed",
-                                log_prefix, exc_info=True,
+                                log_prefix,
+                                exc_info=_aux_exception_log_traceback(),
                             )
                 return stream.get_final_message()
         except Exception as exc:
@@ -3276,7 +3282,7 @@ def create_anthropic_message(
                 "%sAnthropic Messages stream unavailable; falling back to "
                 "messages.create(): %s",
                 log_prefix,
-                exc,
+                _aux_exception_log_detail(exc),
             )
 
     create_kwargs = dict(api_kwargs)
