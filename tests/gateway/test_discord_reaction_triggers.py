@@ -694,3 +694,140 @@ async def test_remove_unknown_target_falls_back_to_fetch_text(monkeypatch):
         _reaction_payload(message_author_id=None), added=False)
     assert len(dispatched) == 1
     assert dispatched[0].reply_to_text == "fetched text"
+
+
+# ===========================================================================
+# Fix round Task B: emoji variant folding (VS16/VS15 + skin tones) at Gate 5.
+# Discord's wire form commonly carries variation selectors or Fitzpatrick
+# modifiers while reaction_triggers entries are typed without them; folding
+# applies to BOTH sides of the comparison ONLY — event text and hook payloads
+# stay faithful to what the human tapped.
+# ===========================================================================
+from plugins.platforms.discord.adapter import fold_emoji_variants
+
+_THUMB = "\U0001F44D"                      # 👍
+_VS15, _VS16 = "\uFE0E", "\uFE0F"
+_SKIN_TONES = [
+    "\U0001F3FB", "\U0001F3FC", "\U0001F3FD", "\U0001F3FE", "\U0001F3FF",
+]
+_FAMILY_A = "\U0001F468\u200D\U0001F469\u200D\U0001F467"   # 👨‍👩‍👧
+_FAMILY_B = "\U0001F469\u200D\U0001F469\u200D\U0001F467"   # 👩‍👩‍👧 (different)
+_WOMAN_TECH_TONE = (
+    "\U0001F469\U0001F3FB\u200D\U0001F4BB"                 # 👩🏻‍💻
+)
+
+
+def test_fold_strips_vs_selectors_and_skin_tones():
+    assert fold_emoji_variants(_THUMB + _VS16) == _THUMB
+    assert fold_emoji_variants(_THUMB + _VS15) == _THUMB
+    for tone in _SKIN_TONES:
+        assert fold_emoji_variants(_THUMB + tone) == _THUMB
+    # Nothing to fold / non-emoji strings pass through byte-for-byte.
+    assert fold_emoji_variants(_THUMB) == _THUMB
+    assert fold_emoji_variants("") == ""
+    assert fold_emoji_variants("paw") == "paw"
+
+
+def test_fold_inside_zwj_sequence_keeps_base_structure():
+    # Modifiers WITHIN a ZWJ sequence are stripped wherever they appear;
+    # the base sequence structure survives.
+    assert fold_emoji_variants(_WOMAN_TECH_TONE) == (
+        "\U0001F469\u200D\U0001F4BB")
+    # A fully-unmodified sequence is already folded: identity.
+    assert fold_emoji_variants(_FAMILY_A) == _FAMILY_A
+
+
+def test_allowlist_folding_composes_after_custom_emoji_normalization():
+    # Folding composes AFTER normalize_reaction_emoji: a custom-emoji name
+    # containing selector codepoints would be folded post-reduction too.
+    assert fold_emoji_variants("paw") == "paw"
+    assert fold_emoji_variants(_THUMB) == _THUMB
+
+
+@pytest.mark.asyncio
+async def test_allowlist_plain_thumb_matches_wire_variants(monkeypatch):
+    # REAL gate chain: an entry typed as plain 👍 must admit the VS16 form
+    # AND all five Fitzpatrick wire forms (dispatch happens each time).
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)
+    monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
+                        lambda self: (True, {_THUMB}), raising=False)
+    wire_forms = [_THUMB + _VS16, _THUMB + _VS15] + [
+        _THUMB + tone for tone in _SKIN_TONES]
+    for form in wire_forms:
+        await adapter._handle_reaction_payload(
+            _reaction_payload(emoji=_FakeEmoji(form)), added=True)
+    assert len(dispatched) == len(wire_forms)
+    assert len(hooks) == len(wire_forms)
+
+
+@pytest.mark.asyncio
+async def test_allowlist_skin_tone_entry_matches_plain_emoji(monkeypatch):
+    # Folding is SYMMETRIC: an entry typed WITH a modifier admits the plain
+    # base emoji (and other tones) as well.
+    adapter = _make_adapter()
+    dispatched, _hooks = _patch_common(monkeypatch, adapter)
+    monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
+                        lambda self: (True, {_THUMB + _SKIN_TONES[0]}),
+                        raising=False)
+    for form in [_THUMB, _THUMB + _SKIN_TONES[-1], _THUMB + _VS16]:
+        await adapter._handle_reaction_payload(
+            _reaction_payload(emoji=_FakeEmoji(form)), added=True)
+    assert len(dispatched) == 3
+
+
+@pytest.mark.asyncio
+async def test_zwj_family_matching_preserved_under_folding(monkeypatch):
+    # Folding strips modifiers but keeps base structure: the exact family
+    # matches (even when its members carry tones); a DIFFERENT family does
+    # not slip through just because both sides folded.
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)
+    monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
+                        lambda self: (True, {_FAMILY_A}), raising=False)
+
+    toned_family_a = (
+        "\U0001F468\U0001F3FB\u200D\U0001F469\U0001F3FC\u200D"
+        "\U0001F467\U0001F3FD")
+    await adapter._handle_reaction_payload(
+        _reaction_payload(emoji=_FakeEmoji(toned_family_a)), added=True)
+    assert len(dispatched) == 1     # same base family -> match
+
+    await adapter._handle_reaction_payload(
+        _reaction_payload(emoji=_FakeEmoji(_FAMILY_B)), added=True)
+    assert len(dispatched) == 1     # different family stays rejected
+    assert len(hooks) == 2          # hook fired even so
+
+
+@pytest.mark.asyncio
+async def test_event_text_and_hook_keep_unfolded_wire_form(monkeypatch):
+    # Matching-only folding: reacting with the VS16 form against an allowlist
+    # of the plain thumb DISPATCHES, but the agent-facing text and the hook
+    # payload carry the ORIGINAL tapped emoji, not the folded one.
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)
+    monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
+                        lambda self: (True, {_THUMB}), raising=False)
+    wire_form = _THUMB + _VS16
+    await adapter._handle_reaction_payload(
+        _reaction_payload(emoji=_FakeEmoji(wire_form)), added=True)
+    assert len(dispatched) == 1
+    assert dispatched[0].text == f"reaction:added:{wire_form}"
+    assert hooks[0]["reaction"] == wire_form
+
+
+@pytest.mark.asyncio
+async def test_custom_emoji_path_unaffected_by_folding(monkeypatch):
+    # Regression guard: custom-emoji reduction still runs BEFORE folding and
+    # folding is a no-op on reduced ASCII names.
+    adapter = _make_adapter()
+    dispatched, _hooks = _patch_common(monkeypatch, adapter)
+    # Entry typed as full custom form; incoming animated custom form — both
+    # reduce to "paw" and match.
+    monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
+                        lambda self: (True, {"<:paw:123>"}), raising=False)
+    await adapter._handle_reaction_payload(
+        _reaction_payload(emoji=_FakeEmoji("<a:paw:999>")), added=True)
+    assert len(dispatched) == 1
+    # Event text is POST-reduction (name "paw"), PRE-fold — matching only.
+    assert dispatched[0].text == "reaction:added:paw"

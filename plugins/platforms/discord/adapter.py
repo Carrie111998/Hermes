@@ -192,6 +192,36 @@ def normalize_reaction_emoji(emoji: Any) -> str:
     return text
 
 
+# Presentation variants folded at MATCH time: variation selectors (VS15 text
+# style U+FE0E / VS16 emoji style U+FE0F) and Fitzpatrick skin-tone modifiers
+# (U+1F3FB..U+1F3FF). Discord's wire form commonly carries them; user-typed
+# allowlists usually do not.
+_EMOJI_VS_SELECTORS = ("\ufe0e", "\ufe0f")
+_SKIN_TONE_FIRST = "\U0001f3fb"
+_SKIN_TONE_LAST = "\U0001f3ff"
+
+
+def fold_emoji_variants(text: str) -> str:
+    """Strip VS15/VS16 selectors and skin-tone modifiers, keeping the base.
+
+    Discord's reaction wire form commonly carries a trailing VS16 (``👍️`` =
+    U+1F44D U+FE0F) or a Fitzpatrick modifier (``👍🏻`` = U+1F44D U+1F3FB),
+    while ``reaction_triggers`` entries are typed without them. Folding
+    removes those codepoints wherever they appear — including inside ZWJ
+    sequences, whose base structure survives (``👩🏻‍💻`` -> ``👩‍💻``) — so
+    both sides of the Gate 5 comparison land on the same string.
+    Slack-parity note: Slack matches reactions in ASCII shortcode space, so
+    this is the Discord-native equivalent forgiveness. MATCHING-ONLY: the
+    synthesized event text and hook payloads keep the original wire form so
+    the agent sees what the human actually tapped.
+    """
+    return "".join(
+        ch for ch in text
+        if ch not in _EMOJI_VS_SELECTORS
+        and not (_SKIN_TONE_FIRST <= ch <= _SKIN_TONE_LAST)
+    )
+
+
 async def _read_url_image_with_redirect_guard(
     session: Any,
     url: str,
@@ -3469,9 +3499,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if not enabled:                                # Gate 4: hooks-only mode
                 return
             # Gate 5: allowlist — normalize BOTH sides so a YAML entry written
-            # as "<:paw:123>" matches the normalized output "paw".
-            if allowlist is not None and emoji not in {
-                normalize_reaction_emoji(name) for name in allowlist
+            # as "<:paw:123>" matches the normalized output "paw", then FOLD
+            # presentation variants (VS16/VS15 selectors, Fitzpatrick
+            # skin-tone modifiers) on BOTH sides so wire forms like "👍️" or
+            # "👍🏻" match an entry typed as plain "👍". Folding is
+            # matching-only: the event text below keeps the unfolded emoji.
+            if allowlist is not None and fold_emoji_variants(emoji) not in {
+                fold_emoji_variants(normalize_reaction_emoji(name))
+                for name in allowlist
             }:
                 return
             # Hydration map contract: "" means known-but-empty (captionless
