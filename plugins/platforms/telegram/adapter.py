@@ -562,6 +562,62 @@ _POLLING_STALL_TIMEOUT = 150.0
 # dead request is still noticed quickly. Kept modest deliberately — this is
 # also how long a user waits to be told the attachment failed.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
+# Local telegram-bot-api (--local) inverts the assumption above. Against the
+# cloud API this process does the uploading, so a slow send shows up as write
+# progress and 60s is only ever the post-upload transcode wait. In local mode
+# the request hands the server a path and then blocks for the WHOLE of the
+# server's own 2000MB-ceiling upload to Telegram — 1.3GB measured at ~131s on
+# a domestic link, so 60s fails every large send while the server keeps
+# uploading in the background, invisible and unreported. Sized for the ceiling
+# rather than the median: this bound only decides how long a genuinely dead
+# request goes unnoticed, and nothing else fails a large local-mode send.
+_LOCAL_MEDIA_SEND_READ_TIMEOUT = 1800.0
+
+
+def media_read_timeout(local_mode: bool) -> float:
+    """Read timeout for a media send, widened for local Bot API mode.
+
+    See ``_LOCAL_MEDIA_SEND_READ_TIMEOUT``: in local mode the call blocks for
+    the server's entire upload to Telegram, not just a transcode, so the
+    cloud-tuned budget times out every large send.
+    """
+    return _LOCAL_MEDIA_SEND_READ_TIMEOUT if local_mode else _MEDIA_SEND_READ_TIMEOUT
+
+
+@contextlib.contextmanager
+def media_upload_source(path: str, *, local_mode: bool):
+    """Yield the value to hand PTB for ``path``, plus its rewind callback.
+
+    Two very different upload paths, selected by local mode:
+
+    * Cloud Bot API (default) — yields an open binary handle. PTB reads it
+      into an ``InputFile`` and posts it as multipart. Bounded by Telegram's
+      50MB upload cap, so the whole-file read is acceptable.
+
+    * Local telegram-bot-api ``--local`` — yields the path STRING. PTB's
+      ``parse_file_input`` only applies the ``file://`` URI optimization to
+      ``str``/``Path`` inputs; a file handle falls through to
+      ``InputFile(handle)``, whose ``load_file()`` calls ``.read()`` and pulls
+      the ENTIRE file into memory. At the 2000MB local-mode ceiling that is a
+      multi-GB allocation, which OOMs small hosts. Passing the path lets the
+      server read the bytes off disk itself — the file never enters this
+      process at all.
+
+    The second element is the rewind callback for retrying callers: handles
+    must ``seek(0)`` before a retry re-reads them; a path is stateless, so it
+    is ``None``.
+
+    Module-level rather than a method so the standalone ``send_message`` path
+    — which builds its own ``Bot`` instead of reusing the adapter — gets the
+    identical behaviour instead of reimplementing it.
+    """
+    if local_mode:
+        yield os.path.abspath(path), None
+        return
+    with open(path, "rb") as handle:
+        yield handle, lambda: handle.seek(0)
+
+
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
 )
@@ -1832,34 +1888,25 @@ class TelegramAdapter(BasePlatformAdapter):
     def _media_upload_source(self, path: str):
         """Yield the value to hand PTB for ``path``, plus its rewind callback.
 
-        Two very different upload paths, selected by local mode:
+        Thin instance wrapper over :func:`media_upload_source`; see there for
+        why local mode must pass a path instead of a handle.
 
-        * Cloud Bot API (default) — yields an open binary handle. PTB reads it
-          into an ``InputFile`` and posts it as multipart. Bounded by Telegram's
-          50MB upload cap, so the whole-file read is acceptable.
-
-        * Local telegram-bot-api ``--local`` — yields the path STRING. PTB's
-          ``parse_file_input`` only applies the ``file://`` URI optimization to
-          ``str``/``Path`` inputs; a file handle falls through to
-          ``InputFile(handle)``, whose ``load_file()`` calls ``.read()`` and
-          pulls the ENTIRE file into memory. At the 2000MB local-mode ceiling
-          that is a multi-GB allocation, which OOMs small hosts. Passing the
-          path lets the server read the bytes off disk itself — the file never
-          enters this process at all.
-
-        The second element is the rewind callback for
-        ``_send_with_dm_topic_reply_anchor_retry``. Handles must seek(0) before
-        a retry re-reads them; a path is stateless, so it is ``None``.
+        ``getattr``, not ``self._local_mode``: adapters are also constructed
+        via ``__new__`` (tests, and some gateway rebuild paths) which never
+        runs ``__init__``, and an ``AttributeError`` here would sink the whole
+        send. Absent attribute == cloud mode == the historical behaviour.
         """
-        # getattr, not self._local_mode: adapters are also constructed via
-        # __new__ (tests, and some gateway rebuild paths) which never runs
-        # __init__, and an AttributeError here would sink the whole send.
-        # Absent attribute == cloud mode == the historical behaviour.
-        if getattr(self, "_local_mode", False):
-            yield os.path.abspath(path), None
-            return
-        with open(path, "rb") as handle:
-            yield handle, lambda: handle.seek(0)
+        with media_upload_source(
+            path, local_mode=getattr(self, "_local_mode", False)
+        ) as pair:
+            yield pair
+
+    def _media_read_timeout(self) -> float:
+        """Read timeout for a media send, widened for local Bot API mode.
+
+        ``getattr`` for the same reason as ``_media_upload_source``.
+        """
+        return media_read_timeout(getattr(self, "_local_mode", False))
 
     async def _send_with_dm_topic_reply_anchor_retry(
         self,
@@ -7890,7 +7937,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     "parse_mode": _cap_parse_mode,
                                     "reply_to_message_id": reply_to_id,
                                     "duration": _duration_secs,
-                                    "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                                    "read_timeout": self._media_read_timeout(),
                                     **voice_thread_kwargs,
                                     **self._notification_kwargs(metadata),
                                 },
@@ -7941,7 +7988,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
                             "duration": _duration_secs,
-                            "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                            "read_timeout": self._media_read_timeout(),
                             **audio_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -8140,7 +8187,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "photo": photo_src,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        "read_timeout": self._media_read_timeout(),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -8238,7 +8285,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "filename": display_name,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        "read_timeout": self._media_read_timeout(),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -8289,7 +8336,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "video": video_src,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        "read_timeout": self._media_read_timeout(),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
