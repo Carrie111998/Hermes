@@ -128,6 +128,15 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    def _typed_command_prefix_for(self, platform) -> str:
+        """Return the platform's usable typed slash-command prefix."""
+        adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
+        return (
+            getattr(adapter, "typed_command_prefix", "/")
+            if adapter is not None
+            else "/"
+        )
+
     def _global_gateway_cwd(self) -> str:
         raw = os.environ.get("TERMINAL_CWD", "").strip()
         if raw:
