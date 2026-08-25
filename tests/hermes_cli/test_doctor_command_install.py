@@ -151,6 +151,31 @@ class TestDoctorCommandInstallation:
         ]
         assert discord_hint, f"no discord install hint found in output:\n{out}"
 
+    def test_missing_required_package_uses_pip_name(self, monkeypatch, tmp_path):
+        """A missing *required* package whose import name diverges from its pip
+        name (dotenv -> python-dotenv) shows the install command spelled with
+        the pip name, not a bare `pip install dotenv` that resolves to the
+        wrong distribution."""
+        _setup_doctor_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        # Force `__import__("dotenv")` to raise regardless of the host env.
+        # doctor does not import the dotenv module in its own runtime path
+        # (it reads ~/.hermes/.env directly), so nulling it is safe here.
+        monkeypatch.setitem(sys.modules, "dotenv", None)
+
+        out = _run_doctor(fix=False)
+        # The install hint must target the real pip package (python-dotenv),
+        # never a bare `pip install dotenv`.
+        hint = [
+            ln for ln in out.splitlines()
+            if "Install python-dotenv" in ln and "dotenv" in ln
+        ]
+        assert hint, f"no python-dotenv install hint found in output:\n{out}"
+        assert hint[0].rstrip().endswith("python-dotenv"), (
+            f"required install hint must end in the pip name 'python-dotenv', "
+            f"not a bare 'dotenv': {hint[0]!r}"
+        )
+
     @pytest.mark.skipif(sys.platform == "win32", reason="Symlink check is Unix-only")
     def test_termux_uses_prefix_bin(self, monkeypatch, tmp_path):
         """On Termux, the command link dir is $PREFIX/bin."""
