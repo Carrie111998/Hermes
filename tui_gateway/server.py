@@ -10532,6 +10532,9 @@ _KANBAN_NOTIFY_KINDS = (
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
+# A person is waiting to be told something finished, so this is the one poll on
+# the tick that a human directly perceives as latency.
+_EXTERNAL_TURN_POLL_SECONDS = 1.0
 
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
@@ -10783,6 +10786,119 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _maybe_consume_external_turn(sid: str, session: dict) -> None:
+    """Take at most one queued external activation for this session, if we may.
+
+    The producer of these rows is a different local process; it deliberately did
+    NOT choose a transport, because "does this session have an owner right now"
+    is stale the instant it is answered. It enqueued, and the question of who is
+    entitled to run the event is settled here, at the moment of consumption.
+
+    THREE GATES, IN THIS ORDER, AND THE ORDER IS THE POINT.
+
+    1. The session must be idle. The poller never steers or interrupts: it waits
+       for the current turn to end and then adds a new one. This is why the wake
+       could not simply be a prompt.submit from outside -- that path interrupts.
+
+    2. The active-session lease must be ours. Every other notification rail can
+       assume the producer ran inside this process, so ownership is implicit.
+       This rail is cross-process by definition, so ownership is proved, not
+       assumed: the legitimate owner re-enters its own lease, and a process that
+       is not the owner gets SESSION_NOT_OWNED and leaves the row alone for
+       whoever is. If the owner has died its lease is pruned, and a later
+       process may take the event rather than it being lost with the corpse.
+
+    3. The row must be claimed durably, so two Hermes processes that both pass
+       gates 1 and 2 in the same instant cannot both run it.
+
+    The turn is submitted HIDDEN. The row is real and persists for the
+    producer's own reconciliation, but a machine activation is not something the
+    person typed, and rendering it as their speech would be a lie about who said
+    what.
+    """
+    key = str(session.get("session_key") or "")
+    if not key or session.get("running") or session.get("_finalized"):
+        return
+
+    from tools.session_external_turns import (
+        claim_external_turn,
+        mark_external_turn_consumed,
+        pending_external_turns,
+        release_external_turn,
+    )
+
+    rows = pending_external_turns(key, limit=1)
+    if not rows:
+        return
+    row = rows[0]
+    event_id = str(row.get("event_id") or "")
+
+    # Gate 2 before gate 3: claiming a row we are not entitled to run would take
+    # it out of circulation from the process that IS entitled to run it.
+    refusal = _ensure_active_session_slot(sid, session)
+    if refusal is not None:
+        logger.debug(
+            "Not consuming external turn %s for %s: %s",
+            event_id,
+            key,
+            getattr(refusal, "reason", None) or "refused",
+        )
+        return
+
+    # Re-read rather than trust the check at the top: two database round-trips
+    # have happened since, and a turn the person started in that gap makes the
+    # claim-then-release below pure churn.
+    if session.get("running") or session.get("_finalized"):
+        return
+    if not claim_external_turn(event_id):
+        return
+
+    started = False
+    with session["history_lock"]:
+        if not session.get("running") and not session.get("_finalized"):
+            session["running"] = True
+            started = True
+    if not started:
+        # A real turn began between the idle check and the claim. Put it back;
+        # the next pass will find the session idle again.
+        release_external_turn(event_id, "session became busy before dispatch")
+        return
+
+    # Consumed only once a turn ACTUALLY started. _run_prompt_submit returns
+    # False from its early exits -- a closing session, a superseded queued
+    # generation -- without persisting anything, and marking the row beforehand
+    # turned that into a silently swallowed event: the row said delivered, the
+    # transcript held nothing, and the producer had been told to stop retrying.
+    #
+    # Re-delivery after a crash between dispatch and this mark is the safe
+    # direction of that trade, and it is already handled a layer up: the
+    # producer's marker plus canonical history decide whether the event landed,
+    # and a duplicate is visible there in a way a lost event never is.
+    dispatched = False
+    try:
+        _emit("message.start", sid)
+        dispatched = bool(
+            _run_prompt_submit(
+                f"__external__{event_id}",
+                sid,
+                session,
+                str(row.get("body") or ""),
+                display_kind="hidden",
+            )
+        )
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+        release_external_turn(event_id, f"dispatch raised: {type(exc).__name__}")
+        raise
+    if dispatched:
+        mark_external_turn_consumed(event_id)
+    else:
+        # Both early exits reset ``running`` themselves; the row goes back so a
+        # later pass can try again.
+        release_external_turn(event_id, "dispatch did not start a turn")
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -10806,6 +10922,7 @@ def _notification_poller_loop(
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
+    _last_external_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
         # ── /loop wakeup driver ──────────────────────────────────────
@@ -10820,6 +10937,19 @@ def _notification_poller_loop(
                 print(
                     f"[tui_gateway] loop wakeup poll failed: "
                     f"{type(_loop_exc).__name__}: {_loop_exc}",
+                    file=sys.stderr,
+                )
+        # ── external activation inbox ────────────────────────────────
+        # A local process outside this one queued an event for this stored
+        # session. Consumed only while idle and only under our own lease.
+        if _now - _last_external_poll >= _EXTERNAL_TURN_POLL_SECONDS:
+            _last_external_poll = _now
+            try:
+                _maybe_consume_external_turn(sid, session)
+            except Exception as _ext_exc:
+                print(
+                    f"[tui_gateway] external turn poll failed: "
+                    f"{type(_ext_exc).__name__}: {_ext_exc}",
                     file=sys.stderr,
                 )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:

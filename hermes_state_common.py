@@ -528,6 +528,42 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+-- One non-interrupting activation handed to whichever process owns a stored
+-- session, by a LOCAL producer outside that process.
+--
+-- The existing notification rails all assume the producer runs inside the
+-- process that owns the live session: async delegations are children of the
+-- turn that dispatched them, and kanban rows are addressed to a subscription
+-- this gateway registered. Nothing carried an event from an unrelated local
+-- process into the conversation a person already has open, so a background
+-- worker that finished had no way to say so except by starting a SECOND owner
+-- of that session -- which is exactly what the active-session lease now
+-- refuses, and rightly.
+--
+-- Deliberately boring, and deliberately NOT async_delegations: that table is
+-- the lifecycle of delegate_task(background=true), with attempt caps, replay
+-- expiry, abandoned-delegation recovery and a startup-only restore that every
+-- genuine delegation depends on. Arbitrary external activations are not
+-- background subagent completions and must not inherit rules written for them.
+--
+-- event_id is the PRODUCER's identity for the event, not ours, so re-enqueueing
+-- the same event is idempotent at ingress: the producer's own outbox stays the
+-- delivery authority and canonical Hermes history stays the record of what
+-- actually happened.
+CREATE TABLE IF NOT EXISTS session_external_turns (
+    event_id TEXT PRIMARY KEY,
+    target_session_key TEXT NOT NULL,
+    body TEXT NOT NULL,
+    source TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'PENDING',
+    owner_pid INTEGER,
+    owner_started_at REAL,
+    claimed_at REAL,
+    created_at REAL NOT NULL,
+    consumed_at REAL,
+    last_error TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -548,6 +584,9 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+-- The poller's only query: pending rows for THIS session, oldest first.
+CREATE INDEX IF NOT EXISTS idx_session_external_turns_pending
+    ON session_external_turns(target_session_key, state, created_at);
 """
 
 
