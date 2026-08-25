@@ -337,6 +337,13 @@ class SessionRename(BaseModel):
     # session explicitly unread, False marks it read up to now. Mirrored from
     # the Desktop sidebar's "Mark as unread"/"Mark as read". None = leave alone.
     unread: Optional[bool] = None
+    # Session taxonomy (disposition = project / archive / transient / junk,
+    # plus project_group category and named project). Classification is
+    # written only when disposition is non-None; project_group/project may be
+    # set alongside it. None on any field leaves it untouched.
+    disposition: Optional[str] = None
+    project_group: Optional[str] = None
+    project: Optional[str] = None
     # Mutate a session belonging to another profile (opens its state.db). Omit
     # for the current/default profile.
     profile: Optional[str] = None
