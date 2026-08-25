@@ -17,6 +17,7 @@ import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { resolveSessionProfile } from '@/app/session/hooks/use-session-actions/utils'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
+import { ProfileLockGate } from '@/components/profile-lock-gate'
 import { ConfirmHost } from '@/components/confirm-host'
 import { DesktopInstallOverlay } from '@/components/desktop-install-overlay'
 import { FindBar } from '@/components/find-bar'
@@ -1213,6 +1214,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       <UpdatesOverlay />
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
+      <ProfileLockGate />
       <CommandPalette />
       <PluginInstallModal />
       <PetGenerateOverlay />
