@@ -201,10 +201,16 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
 @pytest.mark.parametrize(
     ("kanban_config", "graph"),
     [
-        ({"max_in_progress": 1}, {"running_total": 1}),
+        (
+            {"max_spawn": 1, "max_in_progress": 1},
+            {"running_total": 1, "assignee_profile_exists": True},
+        ),
         (
             {"max_in_progress_per_profile": 1},
-            {"running_by_assignee": {"demo": 1}},
+            {
+                "running_by_assignee": {"demo": 1},
+                "assignee_profile_exists": True,
+            },
         ),
     ],
 )
@@ -225,7 +231,25 @@ def test_stranded_in_ready_skips_capacity_deferred_tasks(kanban_config, graph):
     assert not [d for d in diags if d.kind == "stranded_in_ready"]
 
 
+def test_stranded_in_ready_warns_for_invalid_profile_at_host_capacity():
+    now = 100_000
+    task = _task(status="ready", assignee="typo", claim_lock=None)
+    events = [_event("created", ts=now - 45 * 60)]
+
+    diags = kd.compute_task_diagnostics(
+        task,
+        events,
+        [],
+        now=now,
+        config={"kanban": {"max_in_progress": 1}},
+        graph={"running_total": 1, "assignee_profile_exists": False},
+    )
+
+    assert [d for d in diags if d.kind == "stranded_in_ready"]
+
+
 def test_task_graph_context_reports_running_capacity(kanban_home):
+    (kanban_home / "profiles" / "demo").mkdir(parents=True)
     conn = kb.connect()
     try:
         running = kb.create_task(conn, title="running", assignee="demo")
@@ -241,8 +265,24 @@ def test_task_graph_context_reports_running_capacity(kanban_home):
 
         assert context["running_total"] == 1
         assert context["running_by_assignee"] == {"demo": 1}
+        assert context["assignee_profile_exists"] is True
     finally:
         conn.close()
+
+
+def test_task_graph_context_counts_running_tasks_on_other_boards(kanban_home):
+    (kanban_home / "profiles" / "demo").mkdir(parents=True)
+    kb.create_board("second")
+    with kb.connect(board="second") as other:
+        running = kb.create_task(other, title="running", assignee="demo")
+        assert kb.claim_task(other, running) is not None
+
+    with kb.connect() as conn:
+        queued = kb.create_task(conn, title="queued", assignee="demo")
+        context = kb.task_graph_context(conn, queued)
+
+    assert context["running_total"] == 1
+    assert context["running_by_assignee"] == {}
 
 
 

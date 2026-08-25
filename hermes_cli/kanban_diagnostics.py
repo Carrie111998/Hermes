@@ -1011,7 +1011,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     max_per_profile = _positive_int(
         kanban_cfg.get("max_in_progress_per_profile"), 0
     )
-    if (
+    if graph.get("assignee_profile_exists") is True and (
         (max_in_progress and running_total >= max_in_progress)
         or (
             max_per_profile
