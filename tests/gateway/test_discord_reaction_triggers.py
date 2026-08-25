@@ -1,6 +1,7 @@
 """Reaction-trigger feature: emoji normalization, gating, synthesis."""
 import asyncio
 import dataclasses
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,6 +168,73 @@ def test_yaml_bridge_skips_env_write_under_profile_scope(monkeypatch):
         os.environ.pop("DISCORD_REACTION_TRIGGERS", None)
     assert seeded is not None
     assert seeded.get("reaction_triggers") == "👍"
+
+
+# ---------------------------------------------------------------------------
+# F2 shadow warning: legacy env-first precedence means a pre-existing
+# DISCORD_REACTION_TRIGGERS env var silently shadows fresh YAML forever.
+# Warn once when BOTH sources exist AND they parse differently.
+# ---------------------------------------------------------------------------
+def _set_rt_extra(adapter, value):
+    adapter.config.extra["reaction_triggers"] = value
+
+
+def test_shadow_warns_when_env_disagrees_with_yaml(monkeypatch, caplog):
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍")
+    _set_rt_extra(adapter, "✅")
+    with caplog.at_level(logging.WARNING):
+        # env still wins (documented legacy precedence — unchanged)
+        assert adapter._reaction_trigger_config() == (True, {"👍"})
+    assert any("overrides config.yaml" in r.message for r in caplog.records)
+
+
+def test_no_warning_when_only_env_set(monkeypatch, caplog):
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍")
+    assert adapter.config.extra == {}
+    with caplog.at_level(logging.WARNING):
+        adapter._reaction_trigger_config()
+    assert not [r for r in caplog.records if "overrides config.yaml" in r.message]
+
+
+def test_no_warning_when_only_yaml_set(monkeypatch, caplog):
+    adapter = _make_adapter()
+    monkeypatch.delenv("DISCORD_REACTION_TRIGGERS", raising=False)
+    _set_rt_extra(adapter, "✅")
+    with caplog.at_level(logging.WARNING):
+        assert adapter._reaction_trigger_config() == (True, {"✅"})
+    assert not [r for r in caplog.records if "overrides config.yaml" in r.message]
+
+
+def test_no_warning_when_trueish_forms_agree(monkeypatch, caplog):
+    # env 'true' vs YAML 'TRUE' both mean all-emoji: parsed agreement.
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "true")
+    _set_rt_extra(adapter, "TRUE")
+    with caplog.at_level(logging.WARNING):
+        assert adapter._reaction_trigger_config() == (True, None)
+    assert not [r for r in caplog.records if "overrides config.yaml" in r.message]
+
+
+def test_no_warning_when_allowlist_agrees_modulo_spacing(monkeypatch, caplog):
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍")
+    _set_rt_extra(adapter, " 👍 ")
+    with caplog.at_level(logging.WARNING):
+        adapter._reaction_trigger_config()
+    assert not [r for r in caplog.records if "overrides config.yaml" in r.message]
+
+
+def test_shadow_warning_fires_once_per_disagreement_pair(monkeypatch, caplog):
+    adapter = _make_adapter()
+    monkeypatch.setenv("DISCORD_REACTION_TRIGGERS", "👍")
+    _set_rt_extra(adapter, "✅")
+    with caplog.at_level(logging.WARNING):
+        adapter._reaction_trigger_config()
+        adapter._reaction_trigger_config()  # Gate 4 fires per reaction — no spam
+    warnings = [r for r in caplog.records if "overrides config.yaml" in r.message]
+    assert len(warnings) == 1
 
 
 def test_hydration_remember_and_lookup():

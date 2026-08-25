@@ -3409,22 +3409,70 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
-    def _reaction_trigger_config(self) -> tuple[bool, Optional[set]]:
-        """Parse DISCORD_REACTION_TRIGGERS into (enabled, allowlist).
+    @staticmethod
+    def _reaction_triggers_parsed(raw) -> tuple[bool, Optional[frozenset]]:
+        """Shared parser for reaction_triggers raw values.
 
-        unset/''/false-ish -> (False, None); true-ish -> (True, None) meaning ALL
-        emoji; anything else -> (True, {names}) allowlist. An allowlist string
-        that parses to zero names (e.g. ',,,') counts as disabled.
+        unset/''/false-ish -> (False, None); true-ish -> (True, None) meaning
+        ALL emoji; anything else -> (True, {names}) allowlist. An allowlist
+        string that parses to zero names (e.g. ',,,') counts as disabled.
+        Mirrors the historical inline logic of _reaction_trigger_config so the
+        env/YAML shadow comparison below compares exactly what would run.
         """
-        raw = str(self._gate_raw("reaction_triggers", "DISCORD_REACTION_TRIGGERS") or "").strip()
-        if not raw or raw.lower() in {"false", "0", "no", "off"}:
+        text = str(raw or "").strip()
+        if not text or text.lower() in {"false", "0", "no", "off"}:
             return False, None
-        if raw.lower() in {"true", "1", "yes", "on"}:
+        if text.lower() in {"true", "1", "yes", "on"}:
             return True, None
-        names = {part.strip() for part in raw.split(",") if part.strip()}
+        names = frozenset(part.strip() for part in text.split(",") if part.strip())
         if not names:
             return False, None
         return True, names
+
+    def _warn_reaction_trigger_env_shadow(self) -> None:
+        """Warn when DISCORD_REACTION_TRIGGERS env shadows fresh YAML config.
+
+        Resolution is env-first (legacy precedence via _gate_raw) and the
+        YAML->env bridge only writes os.environ when the var is UNSET, so a
+        stale .env/shell value makes edits to discord.reaction_triggers in
+        config.yaml appear dead with zero feedback. Fires only when BOTH
+        sources exist AND they PARSE differently ('true' vs 'TRUE' or equal
+        allowlists are agreement, not shadowing). Once per (env, extra) pair —
+        re-warns only if either value changes, so per-reaction Gate 4
+        resolution cannot spam the log.
+        """
+        env_raw = self._gate_env("DISCORD_REACTION_TRIGGERS")
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        extra_raw = extra.get("reaction_triggers") if isinstance(extra, dict) else None
+        if not env_raw or extra_raw is None:
+            return  # only one source present: no shadowing possible
+        warned_key = getattr(self, "_rt_shadow_warned_key", None)
+        pair_key = (str(env_raw), str(extra_raw))
+        if warned_key == pair_key:
+            return  # already warned for this exact disagreement state
+        if self._reaction_triggers_parsed(env_raw) == self._reaction_triggers_parsed(extra_raw):
+            return  # parsed agreement — silent
+        self._rt_shadow_warned_key = pair_key
+        logger.warning(
+            "[%s] DISCORD_REACTION_TRIGGERS env (%r) overrides config.yaml "
+            "discord.reaction_triggers (%r) - legacy precedence; unset the "
+            "env var or update it to match",
+            self.name,
+            env_raw,
+            extra_raw,
+        )
+
+    def _reaction_trigger_config(self) -> tuple[bool, Optional[set]]:
+        """Parse DISCORD_REACTION_TRIGGERS into (enabled, allowlist).
+
+        See _reaction_triggers_parsed for the grammar. Env wins over YAML
+        (documented legacy precedence); when both sources are set and
+        disagree we warn once so the shadowing is visible.
+        """
+        raw = str(self._gate_raw("reaction_triggers", "DISCORD_REACTION_TRIGGERS") or "").strip()
+        self._warn_reaction_trigger_env_shadow()
+        enabled, allowlist = self._reaction_triggers_parsed(raw)
+        return enabled, (set(allowlist) if allowlist is not None else None)
 
     def _normalize_reaction_emoji(self, emoji) -> str:
         return normalize_reaction_emoji(emoji)
