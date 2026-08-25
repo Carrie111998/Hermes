@@ -41,11 +41,10 @@ FALLBACK_PROVIDER = "custom"
 FALLBACK_BASE_URL = "http://localhost:4000/v1"
 NAMED_PROXY = "litellm_proxy"
 
-SAFETY_GATE_ERROR_MARKERS = (
-    "unsafe provider/base_url",
-    "refusing to run",
-    "not allowed",
-)
+# Distinctive phrase from cron.scheduler._guard_job_credential_exfil:
+#   RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
+# run_job persists that as "RuntimeError: Cron job '... blocked for safety: ..."
+SAFETY_GATE_ERROR_PREFIX = "blocked for safety:"
 
 
 def _iter_compatible_provider_entries(config: dict) -> list:
@@ -83,17 +82,65 @@ def _iter_compatible_provider_entries(config: dict) -> list:
     return entries
 
 
+def _provider_entry_url(entry: dict) -> str:
+    """Extract a configured endpoint, matching v12 then legacy field names."""
+    return str(
+        entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+    ).strip().rstrip("/")
+
+
+def _matches_named_proxy(entry: dict, key: str = "") -> bool:
+    name = str(entry.get("name") or "").strip()
+    provider_key = str(entry.get("provider_key") or key or "").strip()
+    return name == NAMED_PROXY or provider_key == NAMED_PROXY
+
+
+def _resolve_from_v12_providers(config: dict) -> tuple[str, str] | None:
+    """Prefer the v12 ``providers`` dict, matching runtime ``_get_named_custom_provider``.
+
+    Checks ``providers[NAMED_PROXY]`` by key first, then any entry whose
+    ``name`` is NAMED_PROXY. Returns None when the dict is absent or has no
+    usable URL so the caller can fall back to the compatibility list.
+    """
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        return None
+
+    keyed = providers.get(NAMED_PROXY)
+    if isinstance(keyed, dict):
+        url = _provider_entry_url(keyed)
+        if url:
+            return NAMED_PROXY, url
+
+    for key, entry in providers.items():
+        if key == NAMED_PROXY or not isinstance(entry, dict):
+            continue
+        if not _matches_named_proxy(entry, str(key)):
+            continue
+        url = _provider_entry_url(entry)
+        if url:
+            return NAMED_PROXY, url
+    return None
+
+
 def resolve_litellm_target(config: dict | None) -> tuple[str, str]:
-    """Return (provider, base_url) for this host's LiteLLM proxy."""
+    """Return (provider, base_url) for this host's LiteLLM proxy.
+
+    Runtime resolution checks the v12 ``providers`` mapping first
+    (``_get_named_custom_provider``); ``get_compatible_custom_providers``
+    returns legacy ``custom_providers`` entries first, so we must not walk
+    that list until the v12 dict has been tried.
+    """
     if isinstance(config, dict):
+        v12 = _resolve_from_v12_providers(config)
+        if v12 is not None:
+            return v12
         for entry in _iter_compatible_provider_entries(config):
             if not isinstance(entry, dict):
                 continue
-            name = str(entry.get("name") or "").strip()
-            key = str(entry.get("provider_key") or "").strip()
-            if name != NAMED_PROXY and key != NAMED_PROXY:
+            if not _matches_named_proxy(entry):
                 continue
-            url = str(entry.get("base_url") or "").strip().rstrip("/")
+            url = _provider_entry_url(entry)
             if url:
                 return NAMED_PROXY, url
     return FALLBACK_PROVIDER, FALLBACK_BASE_URL
@@ -104,7 +151,7 @@ def _needs_safety_gate_resume(job: dict) -> bool:
     if job.get("state") not in {"paused", "error"}:
         return False
     last_error = job.get("last_error") or ""
-    return any(marker in last_error for marker in SAFETY_GATE_ERROR_MARKERS)
+    return SAFETY_GATE_ERROR_PREFIX in last_error
 
 
 def process_target_job(
