@@ -2251,7 +2251,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                # Surface the real memory id (not just an enumerate index) so
+                # the model can pass it back to hindsight_update_memory, per
+                # UPDATE_MEMORY_SCHEMA's "as returned by hindsight_recall" contract.
+                lines = [f"{i}. [id: {r.id}] {r.text}" for i, r in enumerate(resp.results, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)

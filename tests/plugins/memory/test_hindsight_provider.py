@@ -80,8 +80,8 @@ def _make_mock_client():
     client.arecall = AsyncMock(
         return_value=SimpleNamespace(
             results=[
-                SimpleNamespace(text="Memory 1"),
-                SimpleNamespace(text="Memory 2"),
+                SimpleNamespace(id="mem-1", text="Memory 1"),
+                SimpleNamespace(id="mem-2", text="Memory 2"),
             ]
         )
     )
@@ -483,6 +483,23 @@ class TestToolHandlers:
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
 
+    def test_recall_output_surfaces_real_memory_id_for_update(self, provider):
+        # UPDATE_MEMORY_SCHEMA's memory_id description says "as returned by
+        # hindsight_recall" — pin that the recall tool actually surfaces the
+        # real memory id (not just a 1/2/3 enumerate index), so the id it
+        # returns is one hindsight_update_memory can accept.
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "dark mode"}
+        ))
+        assert "mem-1" in result["result"]
+        assert "mem-2" in result["result"]
+
+        provider.handle_tool_call(
+            "hindsight_update_memory", {"memory_id": "mem-1", "text": "corrected"}
+        )
+        call_kwargs = provider._client.memory.update_memory.call_args.kwargs
+        assert call_kwargs["memory_id"] == "mem-1"
+
 
     def test_reflect_success(self, provider):
         result = json.loads(provider.handle_tool_call(
@@ -559,7 +576,7 @@ class TestToolHandlers:
         first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:8888")
         second_client = _make_mock_client()
         second_client.arecall.return_value = SimpleNamespace(
-            results=[SimpleNamespace(text="Recovered memory")]
+            results=[SimpleNamespace(id="mem-r1", text="Recovered memory")]
         )
         clients = iter([first_client, second_client])
 
@@ -571,7 +588,7 @@ class TestToolHandlers:
             "hindsight_recall", {"query": "test"}
         ))
 
-        assert result["result"] == "1. Recovered memory"
+        assert result["result"] == "1. [id: mem-r1] Recovered memory"
         assert provider._client is second_client
         first_client.arecall.assert_called_once()
         second_client.arecall.assert_called_once()
