@@ -13674,9 +13674,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.platforms.base import MessageEvent
 
         cli_session_id = row["id"]
-        platform_name = (row.get("handoff_platform") or "").strip().lower()
-        if not platform_name:
+        raw_platform = (row.get("handoff_platform") or "").strip()
+        if not raw_platform:
             raise RuntimeError("handoff_platform is empty")
+
+        # Option 2: support teams:<channel_id> encoding
+        if ":" in raw_platform:
+            platform_name, target_channel = raw_platform.split(":", 1)
+            platform_name = platform_name.lower().strip()
+            target_channel = target_channel.strip()
+        else:
+            platform_name = raw_platform.lower()
+            target_channel = None
 
         # Resolve platform enum
         try:
@@ -13697,13 +13706,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         adapter = transport.adapter
 
-        # Home channel must be configured
-        home = self.config.get_home_channel(platform)
-        if not home or not home.chat_id:
-            raise RuntimeError(
-                f"no home channel configured for {platform_name}; "
-                f"run /sethome on the desired chat first"
-            )
+        # Resolve destination: use explicit target_channel (Teams option 2) if provided,
+        # otherwise fall back to configured home channel.
+        if target_channel:
+            # For Teams we can target any channel by ID; create a lightweight stand-in
+            home = type("obj", (object,), {"chat_id": target_channel, "name": target_channel, "thread_id": None})()
+        else:
+            home = self.config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                raise RuntimeError(
+                    f"no home channel configured for {platform_name}; "
+                    f"run /sethome on the desired chat first"
+                )
 
         cli_title = row.get("title") or cli_session_id[:8]
 

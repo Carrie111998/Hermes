@@ -833,12 +833,16 @@ class CLICommandsMixin:
 
         parts = cmd_original.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
-            _cprint("  Usage: /handoff <platform>")
-            _cprint("  Hands the current session off to that platform's home channel.")
+            _cprint("  Usage: /handoff <platform>   or   /handoff teams:<channel_id>")
+            _cprint("  Hands off to the platform's home channel, or to a specific Teams channel ID.")
+            _cprint("  Example: /handoff teams:19:82dac...@thread.tacv2")
             _cprint("  The CLI session ends here; resume it later with /resume.")
             return True
 
-        platform_name = parts[1].strip().lower()
+        raw_target = parts[1].strip()
+        # Option 2 encoding: teams:19:xxx@thread.tacv2 is stored verbatim in handoff_platform
+        platform_name = raw_target.lower()
+        base_for_validation = platform_name.split(":", 1)[0]
 
         # Validate platform name + home channel via the live gateway config.
         try:
@@ -848,9 +852,9 @@ class CLICommandsMixin:
             return True
 
         try:
-            platform = Platform(platform_name)
+            platform = Platform(base_for_validation)
         except (ValueError, KeyError):
-            _cprint(f"  Unknown platform '{platform_name}'.")
+            _cprint(f"  Unknown platform '{base_for_validation}'.")
             return True
 
         try:
@@ -882,11 +886,19 @@ class CLICommandsMixin:
                 _cprint(f"  Platform '{platform_name}' is not configured/enabled in the gateway.")
                 return True
 
-        home = gw_config.get_home_channel(platform)
-        if not home or not home.chat_id:
-            _cprint(f"  No home channel configured for {platform_name}.")
-            _cprint("  Set one with /sethome on the destination chat first.")
-            return True
+        # Only require home channel when no explicit target was given
+        target_channel = None
+        if ":" in raw_target:
+            target_channel = raw_target.split(":", 1)[1].strip()
+
+        if not target_channel:
+            home = gw_config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                _cprint(f"  No home channel configured for {platform_name}.")
+                _cprint("  Set one with /sethome on the destination chat first.")
+                return True
+        else:
+            home = type("obj", (object,), {"name": target_channel, "chat_id": target_channel, "thread_id": None})()
 
         # Refuse mid-turn: an in-flight agent run would race with the
         # gateway's switch_session and the synthetic turn dispatch.
@@ -939,7 +951,8 @@ class CLICommandsMixin:
             _cprint("  Session is already in flight for handoff. Wait for it to settle, then retry.")
             return True
 
-        _cprint(f"  Queued handoff of '{session_title}' → {platform_name} (home: {home.name}).")
+        dest = target_channel or getattr(home, "name", platform_name)
+        _cprint(f"  Queued handoff of '{session_title}' → {platform_name} ({dest}).")
         _cprint("  Waiting for the gateway to pick it up...")
 
         # Poll-block on terminal state. Tick every 0.5s; bail at ~60s.
