@@ -5,8 +5,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 // store/profile.test.ts.
 vi.mock('@/store/gateway', () => ({
   $gateway: atom<unknown>(null),
+  activeGatewayConnectionId: vi.fn(() => null),
   ensureGatewayForAgent: vi.fn(async () => undefined),
   ensureGatewayForProfile: vi.fn(async () => undefined),
+  openGatewayForAgent: vi.fn(async () => undefined),
   openGatewayForProfile: vi.fn(async () => undefined)
 }))
 vi.mock('@/hermes', () => ({

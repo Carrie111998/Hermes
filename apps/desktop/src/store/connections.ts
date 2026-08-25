@@ -6,8 +6,11 @@ import { wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
 import {
   $activeGatewayProfile,
   $newChatProfile,
+  $newChatRoute,
   $showAllProfiles,
+  beginGatewayRouteIntent,
   ensureGatewayAgent,
+  isCurrentGatewayRouteIntent,
   normalizeProfileKey,
   refreshActiveProfile,
   requestFreshSession
@@ -199,6 +202,7 @@ export async function selectConnection(connectionId: string): Promise<void> {
   if (pendingTarget === null && currentConnectionId === connectionId && currentProfile === targetProfile) {
     $showAllProfiles.set(false)
     $newChatProfile.set(targetProfile)
+    $newChatRoute.set({ connectionId, profile: targetProfile })
     requestFreshSession()
     await rememberConnection(connectionId)
 
@@ -206,6 +210,7 @@ export async function selectConnection(connectionId: string): Promise<void> {
   }
 
   const revision = ++switchRevision
+  const routeIntent = beginGatewayRouteIntent()
   pendingTarget = targetKey
   $pendingConnectionId.set(connectionId)
 
@@ -214,15 +219,31 @@ export async function selectConnection(connectionId: string): Promise<void> {
     // and a registry primary can differ from a legacy per-profile override.
     await ensureGatewayAgent(connectionId, targetProfile)
 
-    if ($connection.get()?.connectionId !== connectionId) {
-      throw new Error(`Connection "${targetConnection.label}" did not become active.`)
+    if (revision !== switchRevision || !isCurrentGatewayRouteIntent(routeIntent)) {
+      return
+    }
+
+    const activeConnection = $connection.get()
+    const activeDescriptorProfile = normalizeProfileKey(activeConnection?.profile)
+
+    if (
+      activeConnection?.connectionId !== connectionId ||
+      normalizeProfileKey($activeGatewayProfile.get()) !== targetProfile ||
+      activeDescriptorProfile !== targetProfile
+    ) {
+      throw new Error(`Connection "${targetConnection.label}" did not become active for profile "${targetProfile}".`)
     }
 
     // A newer click owns the final refresh. Serialized gateway activation
     // already makes the latest source win; this guard also prevents an older
     // request from repainting its profile list after that newer activation.
-    if (revision === switchRevision) {
+    if (revision === switchRevision && isCurrentGatewayRouteIntent(routeIntent)) {
       await rememberConnection(connectionId)
+
+      if (revision !== switchRevision || !isCurrentGatewayRouteIntent(routeIntent)) {
+        return
+      }
+
       wipeSessionListsForGatewaySwitch()
 
       if (!restoreOnBoot) {
@@ -230,11 +251,12 @@ export async function selectConnection(connectionId: string): Promise<void> {
       }
 
       $newChatProfile.set(targetProfile)
+      $newChatRoute.set({ connectionId, profile: targetProfile })
       requestFreshSession()
       await refreshActiveProfile()
     }
   } catch (error) {
-    if (revision === switchRevision) {
+    if (revision === switchRevision && isCurrentGatewayRouteIntent(routeIntent)) {
       throw error
     }
   } finally {

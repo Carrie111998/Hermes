@@ -1,3 +1,4 @@
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 import { atom, batch, computed } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
@@ -18,6 +19,7 @@ import {
   activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
+  openGatewayForAgent,
   openGatewayForProfile
 } from '@/store/gateway'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
@@ -210,6 +212,22 @@ export interface AgentProfileRoute {
 // change before the first Send; the draft's owner must not change with it.
 export const $newChatRoute = atom<AgentProfileRoute | null>(null)
 
+// Shared source/profile intent generation. Gateway activation is serialized,
+// but a newer profile pick can be queued behind an older source switch before
+// the gateway's own activation epoch advances. Source-switch finalization uses
+// this generation to avoid publishing stale draft ownership after that race.
+let routeIntentGeneration = 0
+
+export function beginGatewayRouteIntent(): number {
+  routeIntentGeneration += 1
+
+  return routeIntentGeneration
+}
+
+export function isCurrentGatewayRouteIntent(generation: number): boolean {
+  return generation === routeIntentGeneration
+}
+
 // Bumped whenever the open session should be dropped for a fresh new-session
 // draft: a profile switch/create (below), or deleting the project that owns the
 // currently-open session (store/projects). The chat controller subscribes and
@@ -258,18 +276,22 @@ export const $gatewaySwapTarget = atom<string | null>(null)
 // plus the socket connect before the sidebar can repopulate. The pointer
 // entering a profile square in the rail signals the switch a few hundred ms
 // before the click lands, so we run the same spawn + connect chain then
-// (openGatewayForProfile — without activating). `ensureBackend` in the
-// Electron main is idempotent (a pooled profile returns its existing
-// connectionPromise), so the real switch joins the in-flight work instead of
-// duplicating it — and a pre-warm for an already-open profile is a no-op.
-// Throttled per profile so drive-by hovers can't spam spawn attempts; failures
-// stay silent here and surface on the real switch, which owns retry/error UX.
+// (openGatewayForProfile/openGatewayForAgent — without activating).
+// `ensureBackend` in the Electron main is idempotent (a pooled profile returns
+// its existing connectionPromise), so the real switch joins the in-flight work
+// instead of duplicating it — and a pre-warm for an already-open profile is a
+// no-op.
+// Throttled per source/profile so drive-by hovers can't spam spawn attempts;
+// failures stay silent here and surface on the real switch, which owns
+// retry/error UX.
 const PREWARM_MIN_INTERVAL_MS = 60_000
 
 const prewarmedAt = new Map<string, number>()
 
 export function prewarmProfileBackend(name: string): void {
   const key = normalizeProfileKey(name)
+  const connectionId = activeGatewayConnectionId()
+  const scope = `${connectionId === null ? 'primary' : `connection:${connectionId}`}\u0000${key}`
 
   if (key === normalizeProfileKey($activeGatewayProfile.get())) {
     return
@@ -277,12 +299,17 @@ export function prewarmProfileBackend(name: string): void {
 
   const now = Date.now()
 
-  if (now - (prewarmedAt.get(key) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
+  if (now - (prewarmedAt.get(scope) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
     return
   }
 
-  prewarmedAt.set(key, now)
-  openGatewayForProfile(key).catch(() => undefined)
+  prewarmedAt.set(scope, now)
+
+  if (connectionId) {
+    openGatewayForAgent(connectionId, key).catch(() => undefined)
+  } else {
+    openGatewayForProfile(key).catch(() => undefined)
+  }
 }
 
 let gatewaySwitch: Promise<void> | null = null
@@ -512,12 +539,14 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 // $activeGatewayProfile → name, so $profileScope follows).
 export function selectProfile(name: string): void {
   const target = normalizeProfileKey(name)
+  beginGatewayRouteIntent()
+  const route = routeOnCurrentSource(target)
   // Switching profiles (or coming back from the all-profiles browse view) starts
   // fresh; re-tapping the profile you're already in leaves your session be.
   const switching = $showAllProfiles.get() || target !== normalizeProfileKey($activeGatewayProfile.get())
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
-  $newChatRoute.set(null)
+  $newChatRoute.set(route)
 
   if (switching) {
     requestFreshSession()
@@ -526,7 +555,7 @@ export function selectProfile(name: string): void {
   // A profile with a remote override can fail to activate because the remote
   // host rejected its saved token (rotated/revoked). That must surface as a
   // "re-enter token" affordance, never a silently dead profile (#91349).
-  void activateOnCurrentSource(target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
+  void activateOnCurrentSource(target, route).catch(error => notifyRemoteOverrideAuthFailure(target, error))
 }
 
 // Route a profile pick at the source the user is LOOKING at. $profiles is the
@@ -536,11 +565,16 @@ export function selectProfile(name: string): void {
 // main process answers against the primary — so picking "researcher" on a
 // remote source opened a local backend of the same name and dropped the user
 // back home, making the pick look like it never took. A null connection id
-// means the primary is live, which is exactly the legacy path.
-function activateOnCurrentSource(target: string): Promise<void> {
+// means the primary is live, and the explicit local registry source must also
+// use the legacy path so per-profile remote overrides still resolve.
+export function routeOnCurrentSource(target: string): AgentProfileRoute | null {
   const connectionId = activeGatewayConnectionId()
 
-  return connectionId ? ensureGatewayAgent(connectionId, target) : ensureGatewayProfile(target)
+  return connectionId && connectionId !== LOCAL_CONNECTION_ID ? { connectionId, profile: target } : null
+}
+
+function activateOnCurrentSource(target: string, route = routeOnCurrentSource(target)): Promise<void> {
+  return route ? ensureGatewayAgent(route.connectionId, route.profile) : ensureGatewayProfile(target)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
@@ -551,16 +585,19 @@ function activateOnCurrentSource(target: string): Promise<void> {
 // message lands in the right place.
 export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
+  beginGatewayRouteIntent()
+  const route = routeOnCurrentSource(target)
   $newChatProfile.set(target)
-  $newChatRoute.set(null)
+  $newChatRoute.set(route)
   requestFreshSession()
-  void activateOnCurrentSource(target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
+  void activateOnCurrentSource(target, route).catch(error => notifyRemoteOverrideAuthFailure(target, error))
 }
 
 /** Start a draft owned by a specific registry agent. Foreground activation is
  * only a presentation step; the route stays attached to the draft for the
  * eventual session.create request. */
 export function newSessionInAgent(route: AgentProfileRoute): void {
+  beginGatewayRouteIntent()
   const captured = {
     ...route,
     connectionId: route.connectionId.trim(),

@@ -18,14 +18,18 @@ import { deferred } from '../test/deferred'
 
 const ensureGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => true)
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+const activeGatewayConnectionId = vi.fn<() => null | string>(() => null)
+const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
+  activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
+  openGatewayForAgent,
   openGatewayForProfile
 }))
 vi.mock('@/hermes', () => ({

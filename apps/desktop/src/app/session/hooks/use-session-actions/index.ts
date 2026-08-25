@@ -33,9 +33,12 @@ import {
   $newChatRoute,
   $showAllProfiles,
   type AgentProfileRoute,
+  beginGatewayRouteIntent,
   ensureGatewayAgent,
   ensureGatewayProfile,
-  normalizeProfileKey
+  isCurrentGatewayRouteIntent,
+  normalizeProfileKey,
+  routeOnCurrentSource
 } from '@/store/profile'
 import {
   $projectScope,
@@ -77,6 +80,7 @@ import {
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
+  setSessionOwnerHint,
   setSessions,
   setSessionStartedAt,
   setTurnStartedAt,
@@ -501,7 +505,13 @@ export function useSessionActions({
 
         if (drift) {
           console.warn('[submit-drift-abort]', drift, { phase: 'mid-create' })
-          await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          const closeCreated = capturedRoute
+            ? requestGatewayForAgent(capturedRoute.connectionId, capturedRoute.profile, 'session.close', {
+                session_id: created.session_id
+              })
+            : requestGateway('session.close', { session_id: created.session_id })
+
+          await closeCreated.catch(() => undefined)
 
           return null
         }
@@ -517,7 +527,15 @@ export function useSessionActions({
           // reads meaningfully while the turn is in flight, instead of flashing
           // "Untitled session" until the turn persists and auto-title runs. The
           // server later returns its own preview/title and supersedes this.
-          upsertOptimisticSession(created, stored, null, preview?.trim() || null)
+          upsertOptimisticSession(
+            created,
+            stored,
+            null,
+            preview?.trim() || null,
+            null,
+            undefined,
+            capturedRoute ?? undefined
+          )
           navigate(sessionRoute(stored), { replace: true })
           // Other windows (e.g. the main window when this is the pop-out) can't
           // see this session until they re-pull the shared list.
@@ -539,7 +557,12 @@ export function useSessionActions({
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
         if (yoloArmed) {
-          await setSessionYolo(requestGateway, created.session_id, true).catch(() => undefined)
+          const requestCreatedSession = capturedRoute
+            ? <T>(method: string, params?: Record<string, unknown>) =>
+                requestGatewayForAgent<T>(capturedRoute.connectionId, capturedRoute.profile, method, params)
+            : requestGateway
+
+          await setSessionYolo(requestCreatedSession, created.session_id, true).catch(() => undefined)
         }
 
         return created.session_id
@@ -642,6 +665,10 @@ export function useSessionActions({
           return
         }
 
+        if (capturedRoute) {
+          setSessionOwnerHint(stored, capturedRoute)
+        }
+
         createdThisRun.add(stored)
 
         // Seed the per-runtime cache so the tile renders immediately without a
@@ -649,7 +676,7 @@ export function useSessionActions({
         // unlisted (draft) tab stays out of the session list until its first
         // turn persists and a refresh surfaces it.
         if (listed) {
-          upsertOptimisticSession(created, stored, null, null)
+          upsertOptimisticSession(created, stored, null, null, null, undefined, capturedRoute ?? undefined)
         }
 
         // A tile lives in its OWN worktree, so it must not run the full
@@ -697,6 +724,7 @@ export function useSessionActions({
 
   const resumeSession = useCallback(
     async (storedSessionId: string, replaceRoute = false, capturedOwner?: SessionProfileRoute) => {
+      const routeIntent = beginGatewayRouteIntent()
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
       const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
@@ -718,6 +746,11 @@ export function useSessionActions({
       resetViewSync()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
+      // An existing-session re-home invalidates any draft route captured for
+      // the previous chat. It is recaptured below from the session's actual
+      // owner after the gateway activation settles, so a later Cmd-N cannot
+      // reuse an older source/profile pair.
+      $newChatRoute.set(null)
 
       // A session is EITHER the main thread OR a tile — never both. openSessionTile
       // enforces this from the tile side (it refuses to tile the selected session);
@@ -825,6 +858,20 @@ export function useSessionActions({
         )
       } else {
         await ensureGatewayProfile(sessionProfile)
+      }
+
+      // Keep the next fresh draft on the owner that is actually active. A
+      // registry route is authoritative when one was known; otherwise derive
+      // the current composite source after the re-home. Primary/local legacy
+      // sessions intentionally produce null here.
+      if (isCurrentGatewayRouteIntent(routeIntent)) {
+        $newChatRoute.set(
+          $showAllProfiles.get()
+            ? routeOnCurrentSource($activeGatewayProfile.get())
+            : sessionOwner && typeof sessionOwner === 'object'
+              ? { ...sessionOwner }
+              : routeOnCurrentSource(sessionProfile || $activeGatewayProfile.get())
+        )
       }
 
       // Request-time routing guard for every session-scoped RPC below. The

@@ -1,3 +1,4 @@
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 import { atom } from 'nanostores'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -10,6 +11,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const ensureGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => true)
+const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const activeGatewayConnectionId = vi.fn<() => null | string>(() => null)
 const $gateway = atom<unknown>({ id: 'live-socket' })
@@ -20,6 +22,7 @@ vi.mock('@/store/gateway', () => ({
   activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
+  openGatewayForAgent,
   openGatewayForProfile
 }))
 vi.mock('@/hermes', () => ({
@@ -29,11 +32,14 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, newSessionInProfile, selectProfile } = await import('./profile')
+const { $activeGatewayProfile, $newChatRoute, newSessionInProfile, prewarmProfileBackend, selectProfile } =
+  await import('./profile')
 
 beforeEach(() => {
   ensureGatewayForProfile.mockClear()
   ensureGatewayForAgent.mockClear()
+  openGatewayForAgent.mockClear()
+  openGatewayForProfile.mockClear()
   activeGatewayConnectionId.mockReset()
   activeGatewayConnectionId.mockReturnValue(null)
   $gateway.set({ id: 'live-socket' })
@@ -51,6 +57,7 @@ describe('selectProfile', () => {
 
     await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('mini', 'researcher'))
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toEqual({ connectionId: 'mini', profile: 'researcher' })
   })
 
   it('keeps the legacy profile-only path when the primary is live', async () => {
@@ -60,6 +67,17 @@ describe('selectProfile', () => {
 
     await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('ops'))
     expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toBeNull()
+  })
+
+  it('keeps the legacy profile-only path for the explicit local source', async () => {
+    activeGatewayConnectionId.mockReturnValue(LOCAL_CONNECTION_ID)
+
+    selectProfile('ops')
+
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('ops'))
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toBeNull()
   })
 })
 
@@ -71,5 +89,55 @@ describe('newSessionInProfile', () => {
 
     await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('mini', 'designer'))
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toEqual({ connectionId: 'mini', profile: 'designer' })
+  })
+
+  it('keeps the legacy profile-only path for a primary new chat', async () => {
+    newSessionInProfile('operator')
+
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('operator'))
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toBeNull()
+  })
+
+  it('keeps the legacy profile-only path for an explicit local new chat', async () => {
+    activeGatewayConnectionId.mockReturnValue(LOCAL_CONNECTION_ID)
+
+    newSessionInProfile('operator')
+
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('operator'))
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toBeNull()
+  })
+})
+
+describe('prewarmProfileBackend', () => {
+  it('prewarms a profile on the live registry source, not the primary', async () => {
+    activeGatewayConnectionId.mockReturnValue('mini')
+
+    prewarmProfileBackend('reviewer')
+
+    await vi.waitFor(() => expect(openGatewayForAgent).toHaveBeenCalledWith('mini', 'reviewer'))
+    expect(openGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('keeps the profile-only prewarm path when the primary is live', async () => {
+    activeGatewayConnectionId.mockReturnValue(null)
+
+    prewarmProfileBackend('operator')
+
+    await vi.waitFor(() => expect(openGatewayForProfile).toHaveBeenCalledWith('operator'))
+    expect(openGatewayForAgent).not.toHaveBeenCalled()
+  })
+
+  it('throttles prewarm independently for the same profile on different sources', () => {
+    activeGatewayConnectionId.mockReturnValue('mini')
+    prewarmProfileBackend('shared-profile')
+
+    activeGatewayConnectionId.mockReturnValue('studio')
+    prewarmProfileBackend('shared-profile')
+
+    expect(openGatewayForAgent).toHaveBeenNthCalledWith(1, 'mini', 'shared-profile')
+    expect(openGatewayForAgent).toHaveBeenNthCalledWith(2, 'studio', 'shared-profile')
   })
 })

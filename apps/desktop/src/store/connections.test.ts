@@ -5,6 +5,7 @@ import type { DesktopConnectionsRegistry } from '@/global'
 
 const $activeGatewayProfile = atom('default')
 const $newChatProfile = atom<null | string>(null)
+const $newChatRoute = atom<null | { connectionId: string; profile: string }>(null)
 const $showAllProfiles = atom(false)
 
 const $connection = atom<null | {
@@ -15,20 +16,32 @@ const $connection = atom<null | {
 }>(null)
 
 const ensureGatewayAgent = vi.fn(async (_connectionId: null | string, _profile: string): Promise<void> => undefined)
+const beginGatewayRouteIntent = vi.fn(() => ++routeIntentGeneration)
+const isCurrentGatewayRouteIntent = vi.fn((generation: number) => generation === routeIntentGeneration)
 const refreshActiveProfile = vi.fn(async () => undefined)
 const requestFreshSession = vi.fn()
 const wipeSessionListsForGatewaySwitch = vi.fn()
+let routeIntentGeneration = 0
+
+const selectProfile = vi.fn((profile: string) => {
+  beginGatewayRouteIntent()
+  $newChatRoute.set({ connectionId: 'profile-source', profile })
+})
 
 vi.mock('@/store/session', () => ({ $connection }))
 vi.mock('@/store/gateway-switch', () => ({ wipeSessionListsForGatewaySwitch }))
 vi.mock('@/store/profile', () => ({
   $activeGatewayProfile,
   $newChatProfile,
+  $newChatRoute,
   $showAllProfiles,
+  beginGatewayRouteIntent,
   ensureGatewayAgent,
+  isCurrentGatewayRouteIntent,
   normalizeProfileKey: (name: null | string | undefined) => (name ?? '').trim() || 'default',
   refreshActiveProfile,
-  requestFreshSession
+  requestFreshSession,
+  selectProfile
 }))
 
 const {
@@ -63,15 +76,21 @@ beforeEach(() => {
   $connection.set(null)
   $activeGatewayProfile.set('default')
   $newChatProfile.set(null)
+  $newChatRoute.set(null)
   $showAllProfiles.set(false)
+  routeIntentGeneration = 0
+  beginGatewayRouteIntent.mockClear()
+  isCurrentGatewayRouteIntent.mockClear()
+  selectProfile.mockClear()
   ensureGatewayAgent.mockReset()
-  ensureGatewayAgent.mockImplementation(async connectionId => {
+  ensureGatewayAgent.mockImplementation(async (connectionId, profile) => {
     $connection.set({
       connectionId: connectionId ?? undefined,
       mode: connectionId === 'local' ? 'local' : 'remote',
-      profile: 'default',
+      profile,
       registryScoped: true
     })
+    $activeGatewayProfile.set(profile)
   })
   refreshActiveProfile.mockClear()
   requestFreshSession.mockClear()
@@ -148,6 +167,7 @@ describe('selectConnection', () => {
     expect(requestFreshSession).toHaveBeenCalledTimes(1)
     expect(wipeSessionListsForGatewaySwitch).toHaveBeenCalledTimes(1)
     expect($newChatProfile.get()).toBe('default')
+    expect($newChatRoute.get()).toEqual({ connectionId: 'homelab', profile: 'default' })
     expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
     expect(setLastUsed).toHaveBeenCalledWith('homelab')
   })
@@ -169,6 +189,50 @@ describe('selectConnection', () => {
     await selectConnection('local')
 
     expect(ensureGatewayAgent).toHaveBeenCalledWith('local', 'default')
+    expect($newChatRoute.get()).toEqual({ connectionId: 'local', profile: 'default' })
+  })
+
+  it('replaces a remote A draft owner when switching to the local source before Send', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'default', registryScoped: true })
+    $newChatRoute.set({ connectionId: 'homelab', profile: 'publisher' })
+
+    await selectConnection('local')
+
+    expect($newChatRoute.get()).toEqual({ connectionId: 'local', profile: 'default' })
+  })
+
+  it('replaces a remote A draft owner when switching to remote B before Send', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'default', registryScoped: true })
+    $newChatRoute.set({ connectionId: 'homelab', profile: 'shared-name' })
+
+    await selectConnection('work-vps')
+
+    expect($newChatRoute.get()).toEqual({ connectionId: 'work-vps', profile: 'default' })
+  })
+
+  it('fails closed when a stale remembered profile falls back on the target source', async () => {
+    setConnectionsRegistry(registry)
+    // Seed the per-source preference from a previously valid local descriptor,
+    // then move the live gateway to another source before selecting local.
+    $connection.set({ connectionId: 'local', mode: 'local', profile: 'stale-local-only', registryScoped: true })
+    $activeGatewayProfile.set('stale-local-only')
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'default', registryScoped: true })
+    $activeGatewayProfile.set('default')
+    ensureGatewayAgent.mockImplementationOnce(async connectionId => {
+      $connection.set({
+        connectionId: connectionId ?? undefined,
+        mode: 'local',
+        profile: 'default',
+        registryScoped: true
+      })
+      $activeGatewayProfile.set('default')
+    })
+
+    await expect(selectConnection('local')).rejects.toThrow(/profile "stale-local-only"/i)
+    expect(requestFreshSession).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toBeNull()
   })
 
   it('lets a later source choice win while an earlier dial is still pending', async () => {
@@ -203,6 +267,31 @@ describe('selectConnection', () => {
     // Only the latest intent repaints the profile list.
     expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
     expect(wipeSessionListsForGatewaySwitch).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let a slow source switch overwrite a newer profile route intent', async () => {
+    let releaseHomelab!: () => void
+    const homelabGate = new Promise<void>(resolve => {
+      releaseHomelab = resolve
+    })
+
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local', profile: 'default', registryScoped: true })
+    ensureGatewayAgent.mockImplementationOnce(async () => {
+      await homelabGate
+      $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'default', registryScoped: true })
+      $activeGatewayProfile.set('default')
+    })
+
+    const slowSourceSwitch = selectConnection('homelab')
+    await Promise.resolve()
+
+    selectProfile('newer-profile')
+    releaseHomelab()
+    await slowSourceSwitch
+
+    expect($newChatRoute.get()).toEqual({ connectionId: 'profile-source', profile: 'newer-profile' })
+    expect(requestFreshSession).not.toHaveBeenCalled()
   })
 
   it('restores the last profile used on each source', async () => {

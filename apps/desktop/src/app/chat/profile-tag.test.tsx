@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 // REST client) — same seam as store/profile.test.ts.
 vi.mock('@/store/gateway', () => ({
   $gateway: atom<unknown>(null),
+  activeGatewayConnectionId: vi.fn(() => null),
+  openGatewayForAgent: vi.fn(async () => undefined),
   ensureGatewayForProfile: vi.fn(async () => undefined)
 }))
 vi.mock('@/hermes', () => ({

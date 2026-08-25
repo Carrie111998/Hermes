@@ -9,7 +9,9 @@ vi.mock('@/store/gateway', async () => {
 
   return {
     $gateway: atom<unknown>(null),
+    activeGatewayConnectionId: vi.fn(() => null),
     ensureGatewayForProfile: vi.fn(async () => undefined),
+    openGatewayForAgent: vi.fn(async () => undefined),
     openGatewayForProfile: vi.fn(async () => undefined)
   }
 })
