@@ -9,7 +9,6 @@ Tests the new --gateway mode for hermes update, including:
 
 import json
 import os
-import sys
 import time
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -130,15 +129,16 @@ class TestRestoreStashWithInputFn:
 class TestUpdateCommandGatewayFlag:
     """Verify the gateway spawns hermes update --gateway."""
 
+    @pytest.mark.linux_only
     @pytest.mark.asyncio
     async def test_spawns_with_gateway_flag(self, tmp_path):
         """The spawned update command includes --gateway and PYTHONUNBUFFERED.
 
         The assertions below (``rc=$?``, the ``PYTHONUNBUFFERED=1 …`` env prefix)
         describe the POSIX ``bash -c`` spawn branch; Windows takes a separate
-        ``sys.executable -c`` helper branch.  Pin ``sys.platform`` so the shell
-        command template is asserted on every host — ``subprocess.Popen`` is
-        mocked, so only the command string is exercised.
+        ``sys.executable -c`` helper branch.  Run this branch on native Linux
+        rather than faking the host OS; ``subprocess.Popen`` is mocked, while
+        the platform-specific control flow remains real.
         """
         runner = _make_runner()
         event = _make_event()
@@ -155,7 +155,6 @@ class TestUpdateCommandGatewayFlag:
         mock_popen = MagicMock()
         with patch("gateway.run._hermes_home", hermes_home), \
              patch("gateway.run.__file__", fake_file), \
-             patch.object(sys, "platform", "linux"), \
              patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
              patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)
@@ -406,4 +405,3 @@ class TestCmdUpdateGatewayMode:
 
         assert len(calls) == 1
         assert "Restore" in calls[0]
-
