@@ -112,6 +112,61 @@ def _ra():
     return run_agent
 
 
+# ---------------------------------------------------------------------------
+# Provider-level model-REQUEST concurrency
+# ---------------------------------------------------------------------------
+# Optional global ceiling on how many provider API requests may be in flight
+# at once. This is a REQUEST-level limit: a request slot is acquired
+# immediately before the actual blocking HTTP model request and released
+# immediately after it completes/fails — NEVER while an agent executes tools,
+# reads/writes files, runs subprocesses, or waits. It is fully independent of
+# the AGENT-level subagent concurrency governed by
+# ``delegation.max_concurrent_children``. The main agent and all subagents
+# share the request capacity.
+#
+# Config key: ``provider_max_concurrent_requests`` (int > 0, or None for
+# unlimited). None/null leaves existing behavior completely unchanged.
+#
+# The blocking model request runs on worker threads, not the asyncio loop
+# (see ``interruptible_api_call``), so the correct primitive is a
+# ``threading.BoundedSemaphore`` — matching the existing pattern in
+# ``agent/auxiliary_client.py``.
+
+_request_semaphore: "threading.BoundedSemaphore | None" = None
+_request_semaphore_limit: "int | None" = None
+_request_semaphore_limit_lock = threading.Lock()
+
+
+def _get_request_semaphore():
+    """Return the shared request-level semaphore, (re)built from config.
+
+    A ``threading.BoundedSemaphore`` with ``N`` permits means at most ``N``
+    provider model requests are in flight simultaneously. When the config
+    value is unset/None/<=0/not-an-int we return ``None`` (a no-op), preserving
+    Hermes' existing unlimited behavior exactly.
+
+    Re-reading config on each call keeps the limit live-usable across sessions
+    without a hard reload point; the value is cached for the life of the
+    process until the limit actually changes, to avoid rebinding the semaphore
+    on every request.
+    """
+    global _request_semaphore, _request_semaphore_limit
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        limit = cfg.get("provider_max_concurrent_requests")
+    except Exception:  # config load must never break a model request
+        return _request_semaphore  # keep last known value / None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return _request_semaphore  # unlimited — keep whatever (None normally)
+    if _request_semaphore_limit != limit or _request_semaphore is None:
+        with _request_semaphore_limit_lock:
+            if _request_semaphore_limit != limit or _request_semaphore is None:
+                _request_semaphore_limit = limit
+                _request_semaphore = threading.BoundedSemaphore(limit)
+    return _request_semaphore
+
+
 class ProviderStreamError(Exception):
     """Provider encoded an API error as streaming content instead of an SDK error."""
 
@@ -924,6 +979,34 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
 
 
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+    """Run one non-streaming LLM request under the provider request-semaphore.
+
+    Thin wrapper around ``_dispatch_nonstreaming_api_request_unlocked`` that
+    scopes the optional global provider request-concurrency limit to exactly
+    the blocking HTTP model request. A request slot is acquired immediately
+    before the call and released immediately after it returns or raises — it
+    is NEVER held while the agent executes tools, reads/writes files, runs
+    subprocesses, or waits. This is the REQUEST-level throttle, independent of
+    the AGENT-level ``delegation.max_concurrent_children`` cap. When
+    ``provider_max_concurrent_requests`` is unset (the default) the semaphore
+    is ``None`` and this is a transparent pass-through: behavior is
+    byte-identical to Hermes before this change.
+    """
+    sem = _get_request_semaphore()
+    if sem is None:
+        return _dispatch_nonstreaming_api_request_unlocked(
+            agent, api_kwargs, make_client=make_client
+        )
+    sem.acquire()
+    try:
+        return _dispatch_nonstreaming_api_request_unlocked(
+            agent, api_kwargs, make_client=make_client
+        )
+    finally:
+        sem.release()
+
+
+def _dispatch_nonstreaming_api_request_unlocked(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by the interrupt-worker path (``interruptible_api_call``) and the
