@@ -25,14 +25,15 @@ class _FakeSessionDB:
         cwd: str,
         git_branch: str | None = None,
         git_repo_root: str | None = None,
+        replace_git_meta: bool = False,
     ):
         if self.fail_writes:
             raise RuntimeError("database write failed")
         row = self.rows.setdefault(session_id, {"id": session_id})
         row["cwd"] = cwd
-        if git_branch:
+        if replace_git_meta or git_branch:
             row["git_branch"] = git_branch
-        if git_repo_root:
+        if replace_git_meta or git_repo_root:
             row["git_repo_root"] = git_repo_root
 
     async def clear_session_workspace(self, session_id: str):
