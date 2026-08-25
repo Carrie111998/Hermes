@@ -3163,6 +3163,55 @@ def _run_single_child(
         )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+            # #94736: surface the structured cause so the parent agent,
+            # cron deliverer, TUI overlay, and any downstream hook can
+            # distinguish "the subagent's empty turn was a session DB
+            # write failure" from "the model returned nothing". Without
+            # this, ``last_status`` reports ``ok`` while every artifact
+            # the subagent touched was orphaned. ``failure_reason`` is
+            # the same machine-readable string the run_agent turn
+            # finalizer stamps on its own result, so callers branching
+            # on it keep working unchanged.
+            _result_failure_reason = result.get("failure_reason")
+            if isinstance(_result_failure_reason, str) and _result_failure_reason.strip():
+                entry["failure_reason"] = _result_failure_reason
+            _result_exit_reason = result.get("turn_exit_reason")
+            if isinstance(_result_exit_reason, str) and _result_exit_reason.strip():
+                entry["turn_exit_reason"] = _result_exit_reason
+                # When the cause was a persistence failure, the
+                # default ``Subagent did not produce a response.`` error
+                # is misleading — the model produced output, but the
+                # session DB refused to commit it. Replace the error
+                # string with the cause-specific wording so the
+                # delivered cron summary / Slack alert / parent-model
+                # tool-result tells the operator what actually broke.
+                if (
+                    _result_exit_reason == "session_persistence_failed"
+                    and entry["error"] == "Subagent did not produce a response."
+                ):
+                    entry["error"] = (
+                        "Subagent stopped because session storage could "
+                        "not be written "
+                        f"({_result_failure_reason or 'unknown'}); "
+                        "its in-progress work was discarded to protect "
+                        "transcript integrity. Check `hermes doctor` "
+                        "and retry."
+                    )
+                elif (
+                    _result_exit_reason == "session_persistence_failed"
+                    and "session storage" not in entry["error"].lower()
+                    and "session_persistence_failed" not in entry["error"]
+                ):
+                    # Even if ``result['error']`` is set, append the
+                    # cause tag so the structured failure_reason is
+                    # discoverable from the human-readable string —
+                    # cron summaries, Slack/email alerts, and the
+                    # parent model's tool-result all read the ``error``
+                    # field, never the machine-readable keys.
+                    entry["error"] = (
+                        f"{entry['error']} "
+                        f"[cause: {_result_failure_reason or 'unknown'}]"
+                    )
 
         # T1-24: schema-validation outcome — emitted ONLY when a schema was
         # requested, so legacy (schema-less) payloads keep their exact shape.
