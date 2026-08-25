@@ -408,6 +408,7 @@ declare global {
       onClosePreviewRequested?: (callback: () => void) => () => void
       onPreviewNav?: (callback: (command: 'back' | 'forward' | 'reload') => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
+      onNewSessionTabRequested?: (callback: () => void) => () => void
       onOpenUpdatesRequested?: (callback: () => void) => () => void
       onDeepLink?: (
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void
