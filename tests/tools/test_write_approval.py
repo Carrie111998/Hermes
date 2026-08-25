@@ -175,7 +175,11 @@ def test_stage_write_creates_private_pending_record(hermes_home, subsystem):
     finally:
         os.umask(previous_umask)
 
-    pending_path = Path(hermes_home) / "pending" / subsystem / f"{record['id']}.json"
+    pending_root = Path(hermes_home) / "pending"
+    subsystem_root = pending_root / subsystem
+    pending_path = subsystem_root / f"{record['id']}.json"
+    assert stat.S_IMODE(pending_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(subsystem_root.stat().st_mode) == 0o700
     assert stat.S_IMODE(pending_path.stat().st_mode) == 0o600
 
 
