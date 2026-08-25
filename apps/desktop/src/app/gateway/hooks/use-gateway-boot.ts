@@ -28,6 +28,7 @@ import {
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
   setPrimaryGateway,
+  setPrimaryGatewayConnection,
   touchSecondaryGateways
 } from '@/store/gateway'
 import { registerGatewayReconnect } from '@/store/gateway-reconnect'
@@ -282,6 +283,8 @@ export function useGatewayBoot({
           'Timed out reconnecting to Hermes backend'
         )
 
+        setPrimaryGatewayConnection(conn)
+
         if (cancelled) {
           return
         }
@@ -501,6 +504,7 @@ export function useGatewayBoot({
         }
 
         publish(conn)
+        setPrimaryGatewayConnection(conn)
 
         // Bounded for the same reason as attemptReconnect() (#93454): a wedged
         // ticket mint would otherwise hang the gateway switch forever.
@@ -782,6 +786,7 @@ export function useGatewayBoot({
           progress: 95
         })
         publish(conn)
+        setPrimaryGatewayConnection(conn)
 
         // Seed the workspace BEFORE the gateway opens: every session-restore
         // path is gated on gatewayState === 'open', so nothing can be active yet
@@ -896,6 +901,7 @@ export function useGatewayBoot({
 
       if (survivor?.connection) {
         publish(survivor.connection)
+        setPrimaryGatewayConnection(survivor.connection)
       }
 
       const profile = survivor?.profile ?? $activeGatewayProfile.get()
