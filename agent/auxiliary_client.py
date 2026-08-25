@@ -4385,6 +4385,7 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
         "unsupported_parameter",
         "not supported",
         "does not support",
+        "doesn't support",
         "unknown parameter",
         "unrecognized request argument",
         "unrecognized parameter",
