@@ -133,3 +133,49 @@ class TestDenyOrdering:
         assert "git push --force*" in msg
         assert "retry" in msg.lower()
         assert "rephrase" in msg.lower()
+
+
+class TestDenyRulesDoNotBlockGrepPatterns:
+    """#94747: a grep pattern operand is data the tool searches for, never a
+    command that runs — broad deny globs must not block read-only searches
+    of infrastructure code just because the search TERM is the denied word."""
+
+    def test_bare_positional_pattern_does_not_trip_deny(self, deny_config):
+        deny_config(["*docker *", "*systemctl*"])
+        assert mod._match_user_deny_rule("grep -n docker file.sh") is None
+        assert mod._match_user_deny_rule("grep -n systemctl file.sh") is None
+
+    def test_quoted_pattern_any_regex_mode_does_not_trip_deny(self, deny_config):
+        deny_config(["*docker *", "*systemctl*"])
+        # -E (ERE), plain BRE and the default form alike: the operand is data.
+        assert mod._match_user_deny_rule(
+            'grep -nE "systemctl (enable|start)" file.sh'
+        ) is None
+        assert mod._match_user_deny_rule('grep -n "docker" file.sh') is None
+
+    def test_explicit_regexp_flag_pattern_does_not_trip_deny(self, deny_config):
+        deny_config(["*docker *"])
+        assert mod._match_user_deny_rule(
+            'grep --regexp "docker run" -i file.sh'
+        ) is None
+
+    def test_real_denied_command_still_blocks(self, deny_config):
+        deny_config(["*docker *", "*systemctl*"])
+        assert mod._match_user_deny_rule("docker ps") is not None
+        assert mod._match_user_deny_rule("sudo docker run x") is not None
+        assert mod._match_user_deny_rule("systemctl start nginx") is not None
+
+    def test_denied_word_in_later_segment_still_blocks(self, deny_config):
+        """Blanking is per grep segment: a denied word in a following command
+        segment remains visible to the deny rules."""
+        deny_config(["*systemctl*"])
+        assert mod._match_user_deny_rule(
+            "grep -n systemctl f; systemctl start y"
+        ) is not None
+
+    def test_end_to_end_search_still_executes(self, deny_config, clean_env):
+        deny_config(["*systemctl*"])
+        result = mod.check_dangerous_command(
+            "grep -nE 'systemctl (enable|start)' file.sh", "local"
+        )
+        assert result["approved"] is True
