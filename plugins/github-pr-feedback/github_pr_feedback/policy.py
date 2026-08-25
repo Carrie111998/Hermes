@@ -19,6 +19,7 @@ MAX_MATCH_TERMS_PER_RULE = 32
 MAX_COMMAND_ARGUMENTS = 32
 MAX_COMMAND_ARGUMENT_LENGTH = 4096
 _SHELL_COMMANDS = frozenset({"bash", "dash", "fish", "sh", "zsh"})
+_MERGE_METHODS = frozenset({"squash", "rebase", "merge"})
 
 
 def _nonempty_string(value: object, field: str) -> str:
@@ -176,6 +177,7 @@ class MergeMaintainerPolicy:
     repository: str
     author_login: str
     base_branch: str
+    merge_methods: tuple[str, ...]
     receipt_max_age_seconds: int
     report_only: bool
     post_merge: PostMergePolicy | None
@@ -410,6 +412,7 @@ def _parse_merge_maintainer(
         "repository",
         "author_login",
         "base_branch",
+        "merge_methods",
         "receipt_max_age_seconds",
         "report_only",
         "post_merge",
@@ -426,6 +429,13 @@ def _parse_merge_maintainer(
     base_branch = _nonempty_string(raw["base_branch"], "merge_maintainer base_branch")
     if base_branch.startswith("refs/") or any(character.isspace() for character in base_branch):
         raise ValueError("merge_maintainer base_branch must be a literal branch name")
+    merge_methods = _string_list(
+        raw["merge_methods"], "merge_maintainer merge_methods", normalize=str.casefold
+    )
+    if len(set(merge_methods)) != len(merge_methods) or any(
+        method not in _MERGE_METHODS for method in merge_methods
+    ):
+        raise ValueError("merge_methods must be unique squash, rebase, or merge values")
     receipt_max_age_seconds = raw["receipt_max_age_seconds"]
     if (
         not isinstance(receipt_max_age_seconds, int)
@@ -441,6 +451,7 @@ def _parse_merge_maintainer(
         repository=repository,
         author_login=author_login,
         base_branch=base_branch,
+        merge_methods=merge_methods,
         receipt_max_age_seconds=receipt_max_age_seconds,
         report_only=report_only,
         post_merge=_parse_post_merge(raw["post_merge"], target=target),

@@ -75,6 +75,7 @@ def enabled_merge_config(repository_path: Path, deployment_path: Path) -> dict[s
         "repository": "acme/widgets",
         "author_login": "owner",
         "base_branch": "stable",
+        "merge_methods": ["squash", "rebase", "merge"],
         "receipt_max_age_seconds": 21600,
         "report_only": False,
         "post_merge": {
@@ -118,6 +119,7 @@ def test_enabled_policy_parses_strict_merge_and_post_merge_settings(tmp_path: Pa
         repository="acme/widgets",
         author_login="owner",
         base_branch="stable",
+        merge_methods=("squash", "rebase", "merge"),
         receipt_max_age_seconds=21600,
         report_only=False,
         post_merge=PostMergePolicy(
@@ -145,6 +147,8 @@ def test_enabled_policy_parses_strict_merge_and_post_merge_settings(tmp_path: Pa
         lambda merge: merge.update({"author_login": "someone-else"}),
         lambda merge: merge.update({"receipt_max_age_seconds": 0}),
         lambda merge: merge.update({"merge_method": "merge"}),
+        lambda merge: merge.update({"merge_methods": ["squash", "octopus"]}),
+        lambda merge: merge.update({"merge_methods": ["squash", "squash"]}),
         lambda merge: merge.update({"post_merge": {"deployment_path": "/tmp"}}),
         lambda merge: merge["post_merge"].update({"unknown": True}),
         lambda merge: merge["post_merge"].update({"protected_runtime_entry": "/main.py"}),

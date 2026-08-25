@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,6 +18,9 @@ class GitHubClientError(RuntimeError):
 
 MAX_FEEDBACK_BODY_CHARS = 2000
 MAX_DISCOVERED_PULL_REQUESTS = 100
+_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+_MERGE_FLAGS = {"squash": "--squash", "rebase": "--rebase", "merge": "--merge"}
 
 
 class CommandRunner(Protocol):
@@ -53,8 +57,54 @@ class Feedback:
     is_bot: bool
 
 
+@dataclass(frozen=True, slots=True)
+class RepositoryMergePolicy:
+    squash: bool
+    rebase: bool
+    merge: bool
+
+    def allows(self, method: str) -> bool:
+        return bool(getattr(self, method, False))
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestMergeState:
+    repository: str
+    number: int
+    state: str
+    is_draft: bool
+    mergeable: bool
+    merge_state_status: str
+    base_branch: str
+    head_repository: str
+    author_login: str
+    head_ref_name: str
+    head_sha: str
+    merged: bool
+    merge_commit_oid: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewState:
+    review_decision: str | None
+    unresolved_thread_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CheckState:
+    actions_enabled: bool
+    all_green: bool
+    check_count: int
+
+
 class GitHubClient:
     """Reads only the canonical PR and review endpoints using literal argv."""
+
+    REVIEW_STATE_QUERY = (
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
+        "pullRequest(number:$number){reviewDecision reviewThreads(first:100){nodes{isResolved}"
+        "pageInfo{hasNextPage}}}}}"
+    )
 
     def __init__(self, runner: CommandRunner | None = None) -> None:
         self._runner = runner or SubprocessCommandRunner()
@@ -94,6 +144,174 @@ class GitHubClient:
         if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
             raise GitHubClientError("GitHub Actions permissions had an invalid shape")
         return payload["enabled"]
+
+    def repository_is_private(self, repository: str) -> bool:
+        payload = self._read_object(f"repos/{_validated_repository(repository)}")
+        private = payload.get("private")
+        if not isinstance(private, bool):
+            raise GitHubClientError("GitHub repository privacy had an invalid shape")
+        return private
+
+    def get_repository_merge_policy(self, repository: str) -> RepositoryMergePolicy:
+        payload = self._read_object(f"repos/{_validated_repository(repository)}")
+        fields = ("allow_squash_merge", "allow_rebase_merge", "allow_merge_commit")
+        if any(not isinstance(payload.get(field), bool) for field in fields):
+            raise GitHubClientError("GitHub repository merge policy had an invalid shape")
+        return RepositoryMergePolicy(
+            squash=payload["allow_squash_merge"],
+            rebase=payload["allow_rebase_merge"],
+            merge=payload["allow_merge_commit"],
+        )
+
+    def get_merge_state(self, repository: str, number: int) -> PullRequestMergeState:
+        repository = _validated_repository(repository)
+        number = _positive_number(number)
+        row = self._read_object(f"repos/{repository}/pulls/{number}")
+        try:
+            base = row["base"]
+            head = row["head"]
+            state = row["state"]
+            is_draft = row["draft"]
+            mergeable = row["mergeable"]
+            merge_state_status = row["mergeable_state"]
+            merged = row["merged"]
+            merge_commit_oid = row.get("merge_commit_sha")
+            if (
+                not isinstance(state, str)
+                or not isinstance(is_draft, bool)
+                or not isinstance(mergeable, bool)
+                or not isinstance(merge_state_status, str)
+                or merge_state_status.casefold() == "unknown"
+                or not isinstance(merged, bool)
+                or (merge_commit_oid is not None and not _SHA.fullmatch(merge_commit_oid))
+            ):
+                raise TypeError("merge state field has invalid shape")
+            pull = PullRequestMergeState(
+                repository=repository,
+                number=_positive_number(row["number"]),
+                state=state.upper(),
+                is_draft=is_draft,
+                mergeable=mergeable,
+                merge_state_status=merge_state_status.upper(),
+                base_branch=_required_string(base["ref"]),
+                head_repository=_validated_repository(head["repo"]["full_name"]),
+                author_login=_required_string(row["user"]["login"]),
+                head_ref_name=_required_string(head["ref"]),
+                head_sha=_validated_sha(head["sha"]),
+                merged=merged,
+                merge_commit_oid=merge_commit_oid,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitHubClientError("GitHub pull request merge state was unavailable") from error
+        if pull.number != number:
+            raise GitHubClientError("GitHub pull request merge state identity changed")
+        return pull
+
+    def get_review_state(self, repository: str, number: int) -> ReviewState:
+        repository = _validated_repository(repository)
+        number = _positive_number(number)
+        owner, name = repository.split("/", 1)
+        payload = self._json(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                "query=" + self.REVIEW_STATE_QUERY,
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+            ]
+        )
+        try:
+            pull = payload["data"]["repository"]["pullRequest"]
+            decision = pull["reviewDecision"]
+            threads = pull["reviewThreads"]
+            nodes = threads["nodes"]
+            has_next_page = threads["pageInfo"]["hasNextPage"]
+            if decision is not None and decision not in {
+                "APPROVED",
+                "CHANGES_REQUESTED",
+                "REVIEW_REQUIRED",
+            }:
+                raise TypeError("review decision is unknown")
+            if not isinstance(nodes, list) or not isinstance(has_next_page, bool) or has_next_page:
+                raise TypeError("review thread coverage is incomplete")
+            if any(not isinstance(node, dict) or not isinstance(node.get("isResolved"), bool) for node in nodes):
+                raise TypeError("review thread is malformed")
+        except (KeyError, TypeError) as error:
+            raise GitHubClientError("GitHub review state was unavailable") from error
+        return ReviewState(
+            review_decision=decision,
+            unresolved_thread_count=sum(not node["isResolved"] for node in nodes),
+        )
+
+    def get_check_state(self, repository: str, head_sha: str) -> CheckState:
+        repository = _validated_repository(repository)
+        head_sha = _validated_sha(head_sha)
+        if not self.actions_enabled(repository):
+            return CheckState(actions_enabled=False, all_green=True, check_count=0)
+        check_payload = self._read_object(
+            f"repos/{repository}/commits/{head_sha}/check-runs?per_page=100"
+        )
+        status_payload = self._read_object(
+            f"repos/{repository}/commits/{head_sha}/status?per_page=100"
+        )
+        try:
+            total_count = check_payload["total_count"]
+            check_runs = check_payload["check_runs"]
+            status_state = status_payload["state"]
+            statuses = status_payload["statuses"]
+            if (
+                not isinstance(total_count, int)
+                or isinstance(total_count, bool)
+                or not isinstance(check_runs, list)
+                or total_count != len(check_runs)
+                or total_count >= 100
+                or not isinstance(statuses, list)
+                or len(statuses) >= 100
+                or status_state not in {"success", "failure", "pending", "error"}
+            ):
+                raise TypeError("check coverage is incomplete")
+            check_green = all(
+                isinstance(run, dict)
+                and run.get("status") == "completed"
+                and run.get("conclusion") in {"success", "neutral", "skipped"}
+                for run in check_runs
+            )
+        except (KeyError, TypeError) as error:
+            raise GitHubClientError("GitHub check state was unavailable") from error
+        return CheckState(
+            actions_enabled=True,
+            all_green=check_green and status_state == "success",
+            check_count=total_count + len(statuses),
+        )
+
+    def merge_pull_request(
+        self, repository: str, number: int, head_sha: str, *, method: str
+    ) -> None:
+        repository = _validated_repository(repository)
+        number = _positive_number(number)
+        head_sha = _validated_sha(head_sha)
+        flag = _MERGE_FLAGS.get(method)
+        if flag is None:
+            raise ValueError("method must be squash, rebase, or merge")
+        self._runner.run(
+            [
+                "gh",
+                "pr",
+                "merge",
+                str(number),
+                "--repo",
+                repository,
+                flag,
+                "--match-head-commit",
+                head_sha,
+            ]
+        )
 
     def list_feedback(self, repository: str, number: int) -> tuple[Feedback, ...]:
         issue_comments = self._read_pages(f"repos/{repository}/issues/{number}/comments?per_page=100")
@@ -194,3 +412,27 @@ def _timestamp(value: object) -> datetime:
     if timestamp.tzinfo is None:
         raise ValueError("timestamp requires a timezone")
     return timestamp
+
+
+def _validated_repository(value: object) -> str:
+    if not isinstance(value, str) or not _REPOSITORY.fullmatch(value):
+        raise ValueError("repository must be an exact owner/repository name")
+    return value
+
+
+def _positive_number(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("number must be a positive integer")
+    return value
+
+
+def _required_string(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("required string was absent")
+    return value.strip()
+
+
+def _validated_sha(value: object) -> str:
+    if not isinstance(value, str) or not _SHA.fullmatch(value):
+        raise ValueError("head_sha must be a full hexadecimal SHA")
+    return value.lower()
