@@ -163,12 +163,11 @@ export function BootFailureOverlay() {
     setBusy(null)
   }
 
-  // Clear the OAuth partition first, then open the gateway's login window
-  // (username/password form or OAuth redirect — the desktop drives both). A
-  // partition-wide sign-out drops stale gateway AND identity-provider cookies so
-  // an expired session can't silently bounce us back into the same state. On a
-  // successful sign-in the cookie is re-established; reload so boot mints a fresh
-  // ticket against a live session.
+  // Clear this gateway's stale OAuth state first, then open its login window
+  // (username/password form or OAuth redirect — the desktop drives both).
+  // Keep the cleanup scoped to the active remote URL: all gateways share the
+  // same persistent partition, so a partition-wide clear logs every other
+  // registered gateway out as a side effect.
   const signInRemote = async () => {
     if (!remoteReauth) {
       return
@@ -177,7 +176,7 @@ export function BootFailureOverlay() {
     setBusy('signin')
 
     try {
-      await window.hermesDesktop?.oauthLogoutConnectionConfig?.()
+      await window.hermesDesktop?.oauthLogoutConnectionConfig?.(remoteReauth.url)
       const result = await window.hermesDesktop?.oauthLoginConnectionConfig(remoteReauth.url)
 
       if (result?.connected) {
