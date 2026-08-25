@@ -148,6 +148,7 @@ def build_review_task(
     snapshot: List[Dict[str, str]],
     user_prompt: str = "",
     loaded_skills: Optional[List[str]] = None,
+    autonomous: bool = False,
 ) -> tuple:
     """Compose the reviewer subagent's (goal, context) pair."""
     goal = (
@@ -163,8 +164,13 @@ def build_review_task(
         "recommended next steps."
     )
 
+    intro = (
+        "You were spawned by the Hermes review_current_work tool."
+        if autonomous
+        else "You were spawned by the /review command."
+    )
     lines = [
-        "You were spawned by the /review command. The following is an "
+        f"{intro} The following is an "
         "excerpt of the most recent conversation between the user and "
         "their primary agent. It is your starting evidence — the work to "
         "review is referenced in it.",
@@ -238,6 +244,7 @@ def start_review(
     parent_agent,
     messages: List[Dict[str, Any]],
     user_prompt: str = "",
+    autonomous: bool = False,
 ) -> Dict[str, Any]:
     """Dispatch the reviewer subagent in the background.
 
@@ -256,7 +263,12 @@ def start_review(
         raise ValueError("Nothing to review yet — the conversation is empty.")
 
     loaded_skills = collect_parent_loaded_skills(parent_agent, messages)
-    goal, context = build_review_task(snapshot, user_prompt, loaded_skills)
+    goal, context = build_review_task(
+        snapshot,
+        user_prompt,
+        loaded_skills,
+        autonomous=autonomous,
+    )
     credentials_cfg = _load_review_credentials_cfg()
 
     from tools.delegate_tool import delegate_task

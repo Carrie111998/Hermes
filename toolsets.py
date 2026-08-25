@@ -67,7 +67,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation
-    "execute_code", "delegate_task",
+    "execute_code", "delegate_task", "review_current_work",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -279,6 +279,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "review": {
+        "description": "Dispatch a parent-only review through the built-in review rail",
+        "tools": ["review_current_work"],
+        "includes": []
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
@@ -397,7 +403,7 @@ TOOLSETS = {
             "browser_exec",
             "todo", "memory",
             "session_search", "clarify",
-            "execute_code", "delegate_task",
+            "execute_code", "delegate_task", "review_current_work",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,
@@ -430,7 +436,7 @@ TOOLSETS = {
             "browser_exec",
             "todo", "memory",
             "session_search",
-            "execute_code", "delegate_task",
+            "execute_code", "delegate_task", "review_current_work",
         ],
         "includes": []
     },
@@ -459,7 +465,7 @@ TOOLSETS = {
             # Session history search
             "session_search",
             # Code execution + delegation
-            "execute_code", "delegate_task",
+            "execute_code", "delegate_task", "review_current_work",
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)

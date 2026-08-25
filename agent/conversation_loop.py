@@ -7456,6 +7456,17 @@ def run_conversation(
                     failed = True
                     break
 
+                if getattr(agent, "_review_yield_requested", False):
+                    # An asynchronous review is a phase boundary. The review
+                    # result re-enters through the normal delegation rail; do
+                    # not make another model call in this work phase.
+                    agent._review_yield_requested = False
+                    _turn_exit_reason = "review_dispatched"
+                    final_response = (
+                        "Review dispatched. Yielding until the review result returns."
+                    )
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
