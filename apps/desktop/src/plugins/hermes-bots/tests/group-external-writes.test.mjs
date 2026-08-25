@@ -168,3 +168,76 @@ test('external writes are mirrored into the room log as member entries', async t
   assert.equal(room.log[1].text, 'verified — all green')
   assert.equal(room.externalCursors['mycon-worker1'], 2)
 })
+
+test('cap overflow: entries beyond GROUP_RECONCILE_MAX_ENTRIES survive for the next sweep', async t => {
+  const gc = load()
+  gc.$groupChats.set({ mycon_all: { log: [], watermarks: {}, epoch: 0, running: false } })
+
+  const member = { name: 'mycon-worker1' }
+  // 12 external user+assistant pairs = 24 rows, well beyond the cap of 10.
+  const messages = []
+  for (let i = 1; i <= 12; i++) {
+    messages.push({ role: 'user', content: `external post ${i}` })
+    messages.push({ role: 'assistant', content: `reply ${i}` })
+  }
+
+  // Sweep 1: mirrors only the first 10 entries; cursor stops at the last
+  // mirrored row — NOT at transcript end.
+  {
+    const { entries } = gc.collectExternalGroupEntries(messages, 0)
+    assert.equal(entries.length, 10) // capped at collection
+
+    const changed = await gc.reconcileExternalGroupWrites('mycon_all', member, { messages }, 0)
+    assert.equal(changed, true)
+
+    const room = gc.$groupChats.get().mycon_all
+    assert.equal(room.log.length, 10)
+    assert.equal(room.log[0].text, 'external post 1')
+    assert.equal(room.log[9].text, 'reply 5')
+
+    // Cursor must sit at the last MIRRORED row (index 9 -> count 10), so the
+    // overflow is still visible on the next sweep. This is the #94340 review
+    // fix: previously the cursor jumped to messages.length (24), silently
+    // dropping entries 11-24 forever.
+    assert.equal(room.externalCursors['mycon-worker1'], 10)
+  }
+
+  // Sweep 2: the next 10 rows are picked up (cap applies per sweep).
+  {
+    const changed = await gc.reconcileExternalGroupWrites('mycon_all', member, { messages }, null)
+    assert.equal(changed, true)
+
+    let room = gc.$groupChats.get().mycon_all
+    assert.equal(room.log.length, 20)
+    assert.equal(room.log[19].text, 'reply 10')
+    assert.equal(room.externalCursors['mycon-worker1'], 20)
+  }
+
+  // Sweep 3: the final 4 rows are picked up.
+  {
+    const changed = await gc.reconcileExternalGroupWrites('mycon_all', member, { messages }, null)
+    assert.equal(changed, true)
+
+    const room = gc.$groupChats.get().mycon_all
+    // All 24 delivered: nothing silently dropped despite the cap.
+    assert.equal(room.log.length, 24)
+    assert.equal(room.externalCursors['mycon-worker1'], 24)
+
+    // Every pair arrived exactly once, in order.
+    for (let i = 1; i <= 12; i++) {
+      const upost = room.log[(i - 1) * 2]
+      const areply = room.log[(i - 1) * 2 + 1]
+      assert.equal(upost.text, `external post ${i}`)
+      assert.equal(areply.text, `reply ${i}`)
+    }
+  }
+
+  // Sweep 4: nothing left — cursor stable, no changes.
+  {
+    const changed = await gc.reconcileExternalGroupWrites('mycon_all', member, { messages }, null)
+    assert.equal(changed, false)
+    const room = gc.$groupChats.get().mycon_all
+    assert.equal(room.externalCursors['mycon-worker1'], 24)
+    assert.equal(room.log.length, 24)
+  }
+})

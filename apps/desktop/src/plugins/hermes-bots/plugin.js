@@ -7303,45 +7303,62 @@ function reconciledRowText(msg) {
 }
 
 /** Split a member's unseen transcript window into external-origin entries.
- *  `seenCount` is how many leading messages the room already accounted for. */
+ *  `seenCount` is how many leading messages the room already accounted for.
+ *
+ *  Returns at most GROUP_RECONCILE_MAX_ENTRIES entries plus `cursor`, the
+ *  absolute message index (in `messages`) of the last KEPT entry's row. The
+ *  caller advances its per-member cursor to `cursor` — never to
+ *  `messages.length` — so rows beyond the cap are picked up by the next
+ *  sweep instead of being silently dropped (#94340 review). */
 function collectExternalGroupEntries(messages, seenCount) {
   const rows = Array.isArray(messages) ? messages.slice(Math.max(0, seenCount)) : []
   const entries = []
   let lastUserWasExternal = false
+  // Absolute index of the last row that produced a KEPT entry (capped).
+  let cursor = Math.max(0, seenCount) - 1
 
-  for (const row of rows) {
+  rows.forEach((row, offset) => {
+    const absIndex = Math.max(0, seenCount) + offset
     const text = reconciledRowText(row)
 
     if (!text) {
-      continue
+      return
     }
 
     if (row.role === 'user') {
       lastUserWasExternal = !isRoomFedUserText(text)
 
-      if (lastUserWasExternal) {
+      if (lastUserWasExternal && entries.length < GROUP_RECONCILE_MAX_ENTRIES) {
         entries.push({ role: 'user', text })
+        cursor = absIndex
       }
-      continue
+      return
     }
 
     // Assistant rows mirror only when they belong to an external exchange —
     // room-driven replies are committed by the turn machinery itself.
-    if (row.role === 'assistant' && lastUserWasExternal) {
+    if (row.role === 'assistant' && lastUserWasExternal && entries.length < GROUP_RECONCILE_MAX_ENTRIES) {
       entries.push({ role: 'assistant', text })
+      cursor = absIndex
     }
-  }
+  })
 
-  return { entries, totalRows: Array.isArray(messages) ? messages.length : 0 }
+  return {
+    entries,
+    totalRows: Array.isArray(messages) ? messages.length : 0,
+    cursor,
+  }
 }
 
-/** Mirror collected external entries into the room log (dedupe-safe, capped).
- *  Returns the new seen-count cursor on success, null when nothing changed. */
-function commitExternalGroupEntries(group, member, entries, totalRows) {
+/** Mirror collected external entries into the room log. Entries are already
+ *  capped by the collector; the cursor advances only to the last mirrored
+ *  row so anything beyond the cap is picked up by the next sweep (#94340
+ *  review: silent overflow loss). */
+function commitExternalGroupEntries(group, member, entries, cursorIndex) {
   const memberKey = groupMemberKey(member)
   let committed = 0
 
-  for (const entry of entries.slice(0, GROUP_RECONCILE_MAX_ENTRIES)) {
+  for (const entry of entries) {
     if (isGroupPassText(entry.text)) {
       continue
     }
@@ -7355,19 +7372,18 @@ function commitExternalGroupEntries(group, member, entries, totalRows) {
     committed += 1
   }
 
-  if (totalRows > 0) {
-    updateGroupChat(group, room => {
-      room.externalCursors = { ...(room.externalCursors || {}), [memberKey]: totalRows }
-      return room
-    })
-    return totalRows
-  }
+  updateGroupChat(group, room => {
+    room.externalCursors = { ...(room.externalCursors || {}), [memberKey]: cursorIndex + 1 }
+    return room
+  })
 
-  return committed > 0 ? null : null
+  return committed
 }
 
 /** Reconcile unseen external writes for one member. Returns true when any
- *  room-log entry was added. */
+ *  room-log entry was added. The cursor advances to the last mirrored row;
+ *  with more external rows than GROUP_RECONCILE_MAX_ENTRIES, the remainder
+ *  is picked up on subsequent turns instead of being dropped. */
 async function reconcileExternalGroupWrites(group, member, resumeState, fallbackSeenCount) {
   const memberKey = groupMemberKey(member)
   const room = $groupChats.get()[group] || {}
@@ -7382,11 +7398,11 @@ async function reconcileExternalGroupWrites(group, member, resumeState, fallback
     return false
   }
 
-  const { entries, totalRows } = collectExternalGroupEntries(messages, seenCount)
+  const { entries, cursor } = collectExternalGroupEntries(messages, seenCount)
 
   if (!entries.length) {
-    // Nothing to mirror, but advance the cursor so stale rows are not
-    // rescanned forever.
+    // Nothing worth mirroring in this window — still advance the cursor so
+    // stale rows are not rescanned forever.
     updateGroupChat(group, r => {
       r.externalCursors = { ...(r.externalCursors || {}), [memberKey]: messages.length }
       return r
@@ -7394,12 +7410,7 @@ async function reconcileExternalGroupWrites(group, member, resumeState, fallback
     return false
   }
 
-  commitExternalGroupEntries(group, member, entries, totalRows)
-
-  if (entries.length > GROUP_RECONCILE_MAX_ENTRIES) {
-    recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: 'legacy' })
-  }
-
+  commitExternalGroupEntries(group, member, entries, cursor)
   return true
 }
 
