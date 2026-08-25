@@ -306,7 +306,10 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
 
     def fake_wait(label, old_pid, timeout, domain):
         rec.waits.append(f"{domain}/{label}")
-        return (wait_results or {}).get(label, True)
+        result = (wait_results or {}).get(label, True)
+        if isinstance(result, list):
+            return result.pop(0)
+        return result
 
     monkeypatch.setattr(gw, "_wait_for_launchd_service_pid", fake_wait)
     monkeypatch.setattr(
@@ -612,6 +615,36 @@ class TestRestartMacosLaunchdGateways:
 
         assert restarted == ["ai.hermes.gateway"]
         assert failed == ["ai.hermes.gateway-zombie"]
+        assert rec.kickstarts == [
+            f"gui/{UID}/ai.hermes.gateway-zombie",
+            f"gui/{UID}/ai.hermes.gateway-zombie",
+        ]
+
+    def test_pended_sibling_respawn_gets_final_kickstart(self, monkeypatch, tmp_path):
+        """#94540: a second kickstart clears launchd's pended spawn state."""
+        label = "ai.hermes.gateway-pended"
+        rec = _fleet(
+            monkeypatch,
+            tmp_path,
+            current="ai.hermes.gateway",
+            labels=["ai.hermes.gateway", label],
+            located={
+                "ai.hermes.gateway": (f"gui/{UID}", 100),
+                label: (f"gui/{UID}", 200),
+            },
+            wait_results={label: [False, True]},
+        )
+        restarted: list[str] = []
+        failed: list[str] = []
+
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=0.0)
+
+        assert restarted == ["ai.hermes.gateway", label]
+        assert failed == []
+        assert rec.kickstarts == [
+            f"gui/{UID}/{label}",
+            f"gui/{UID}/{label}",
+        ]
 
 
 class TestWaitForLaunchdServicePid:

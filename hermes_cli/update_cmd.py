@@ -5140,6 +5140,43 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
         print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
+def _kickstart_launchd_gateway_and_wait(
+    label: str,
+    *,
+    domain: str | None = None,
+    old_pid: int | None = None,
+    timeout: float = 15.0,
+) -> bool:
+    """Force a launchd job to run and verify a fresh supervised process.
+
+    ``KeepAlive`` can leave a planned exit pended with the label still loaded
+    but no process.  Resolve that label's own domain when the caller does not
+    already have it, then use the same explicit domain for kickstart and PID
+    verification.  A missing domain is left to the existing bootstrap recovery
+    guidance because ``kickstart`` cannot revive a deregistered job.
+    """
+    from hermes_cli.gateway import (
+        _launchd_kickstart,
+        _locate_launchd_gateway_service,
+        _wait_for_launchd_service_pid,
+    )
+
+    if domain is None:
+        domain, observed_pid = _locate_launchd_gateway_service(label)
+        if domain is None:
+            return False
+        if old_pid is None:
+            old_pid = observed_pid
+
+    _launchd_kickstart(label, domain)
+    return _wait_for_launchd_service_pid(
+        label,
+        old_pid=old_pid,
+        timeout=timeout,
+        domain=domain,
+    )
+
+
 def _restart_macos_launchd_gateways(
     restarted_services: list,
     failed_or_stale_units: list,
@@ -5167,7 +5204,7 @@ def _restart_macos_launchd_gateways(
         launchd_restart,
         launchd_gateway_labels_for_install,
         _graceful_restart_via_sigusr1,
-        _launchd_kickstart,
+        _launchctl_label_supervising_pid,
         _launchd_service_registered,
         _locate_launchd_gateway_service,
         _wait_for_launchd_service_pid,
@@ -5187,6 +5224,7 @@ def _restart_macos_launchd_gateways(
         if get_launchd_plist_path().exists() and _launchd_service_registered(
             current_label
         ):
+            old_launchd_pid = _launchctl_label_supervising_pid(current_label)
             try:
                 launchd_restart()
             except subprocess.CalledProcessError as e:
@@ -5212,15 +5250,29 @@ def _restart_macos_launchd_gateways(
                 # because it fails on macOS-26 hosts whose per-user domains
                 # reject service management even though launchd_restart() owns
                 # that fallback.
-                if wait_for_launchd_gateway_supervision(label=current_label):
+                if wait_for_launchd_gateway_supervision(
+                    label=current_label,
+                    old_pid=old_launchd_pid,
+                ):
                     restarted_services.append(current_label)
                 else:
-                    failed_or_stale_units.append(current_label)
                     print(
-                        f"  ✗ {current_label} restarted but launchd is not "
-                        "supervising it.\n"
-                        "    Check logs, then: hermes gateway restart"
+                        f"  ↻ {current_label} has no supervised process; "
+                        "forcing launchd kickstart"
                     )
+                    try:
+                        recovered = _kickstart_launchd_gateway_and_wait(current_label)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                        recovered = False
+                    if recovered:
+                        restarted_services.append(current_label)
+                    else:
+                        failed_or_stale_units.append(current_label)
+                        print(
+                            f"  ✗ {current_label} restarted but launchd is not "
+                            "supervising it.\n"
+                            "    Check logs, then: hermes gateway restart"
+                        )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
@@ -5252,7 +5304,21 @@ def _restart_macos_launchd_gateways(
                 restarted_services.append(label)
                 continue
             try:
-                _launchd_kickstart(label, domain)
+                restarted = _kickstart_launchd_gateway_and_wait(
+                    label,
+                    domain=domain,
+                    old_pid=old_pid,
+                )
+                if not restarted:
+                    print(
+                        f"  ↻ {label} has no supervised process; retrying "
+                        "launchd kickstart"
+                    )
+                    restarted = _kickstart_launchd_gateway_and_wait(
+                        label,
+                        domain=domain,
+                        old_pid=old_pid,
+                    )
             except subprocess.CalledProcessError as e:
                 stderr = (getattr(e, "stderr", "") or "").strip()
                 failed_or_stale_units.append(label)
@@ -5261,9 +5327,7 @@ def _restart_macos_launchd_gateways(
                     f"    Recover manually: launchctl kickstart -k {domain}/{label}"
                 )
                 continue
-            if _wait_for_launchd_service_pid(
-                label, old_pid=old_pid, timeout=15.0, domain=domain
-            ):
+            if restarted:
                 restarted_services.append(label)
             else:
                 failed_or_stale_units.append(label)

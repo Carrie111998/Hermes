@@ -4575,8 +4575,8 @@ def _append_launchd_reload_log(message: str) -> None:
         pass
 
 
-def _launchctl_label_supervising_process(label: str) -> bool:
-    """True when launchd both knows ``label`` AND is running a process for it.
+def _launchctl_label_supervising_pid(label: str) -> int | None:
+    """Return the live PID launchd supervises for ``label``, if any.
 
     A bare ``launchctl list <label>`` exit-0 only proves a *definition* is
     registered — it also returns 0 for ``state = not running`` (macOS 26+),
@@ -4601,10 +4601,15 @@ def _launchctl_label_supervising_process(label: str) -> bool:
             text=True, encoding='utf-8', errors='replace',
         )
         if result.returncode != 0:
-            return False
-        return _parse_launchd_pid_from_list_output(result.stdout) is not None
+            return None
+        return _parse_launchd_pid_from_list_output(result.stdout)
     except (subprocess.TimeoutExpired, OSError):
-        return False
+        return None
+
+
+def _launchctl_label_supervising_process(label: str) -> bool:
+    """True when launchd both knows ``label`` AND is running a process for it."""
+    return _launchctl_label_supervising_pid(label) is not None
 
 
 def _retry_launchctl_bootstrap_until_registered(
@@ -5472,9 +5477,10 @@ def wait_for_launchd_gateway_supervision(
     *,
     timeout: float = LAUNCHD_SUPERVISION_VERIFY_TIMEOUT,
     label: str | None = None,
+    old_pid: int | None = None,
     poll_interval: float = 0.5,
 ) -> bool:
-    """Poll launchd until it is supervising a live gateway process.
+    """Poll launchd until it is supervising a fresh gateway process.
 
     :func:`launchd_restart` returns as soon as the restart has been *requested*.
     The ``_request_gateway_self_restart`` branch hands the work to the running
@@ -5484,9 +5490,10 @@ def wait_for_launchd_gateway_supervision(
     first bootstrap (#88848) — nor a ``launchctl bootstrap`` that exits 0
     without registering, which the reporter measured on macOS 26.6.1.
 
-    Judge the outcome the way #80491 taught the helper to judge it: by a live
-    supervised pid, never by an exit code.  :func:`_launchctl_label_supervising_process`
-    is already that predicate, so this only adds the wait.
+    Judge the outcome by a live supervised PID, never by an exit code.  When
+    ``old_pid`` is supplied, the still-running process that accepted the
+    asynchronous restart request does not count as success; launchd must expose
+    a different PID before the handoff is complete.
 
     Returns True immediately when the detached fallback is active.  On a host
     where launchd cannot manage the domain the gateway runs unsupervised *by
@@ -5499,7 +5506,8 @@ def wait_for_launchd_gateway_supervision(
     label = label or get_launchd_label()
     deadline = time.monotonic() + max(timeout, 0.0)
     while True:
-        if _launchctl_label_supervising_process(label):
+        pid = _launchctl_label_supervising_pid(label)
+        if pid is not None and pid != old_pid:
             return True
         if time.monotonic() >= deadline:
             return False
