@@ -161,3 +161,85 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+@pytest.mark.parametrize(
+    ("parents", "child_index", "child_count"),
+    [
+        ([-1], 1, 2),
+        ([2], 1, 2),
+        ([True], 2, 3),
+        ([False], 1, 2),
+        ([0, True], 2, 3),
+    ],
+    ids=["negative", "out-of-range", "true", "false", "mixed"],
+)
+def test_decompose_rejects_malformed_parent_indices_from_llm(
+    kanban_home, parents, child_index, child_count
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    tasks = [
+        {"title": f"child {idx}", "body": "", "assignee": None, "parents": []}
+        for idx in range(child_count)
+    ]
+    tasks[child_index]["parents"] = parents
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "reject malformed graph",
+        "tasks": tasks,
+    })
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "parents" in outcome.reason
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        task_count = conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"]
+        link_count = conn.execute("SELECT COUNT(*) AS count FROM task_links").fetchone()["count"]
+    assert root is not None
+    assert root.status == "triage"
+    assert task_count == 1
+    assert link_count == 0
+
+
+@pytest.mark.parametrize("parents", [True, False, None], ids=["true", "false", "null"])
+def test_decompose_rejects_present_non_list_parents_from_llm(kanban_home, parents):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "reject non-list parents",
+        "tasks": [
+            {"title": "parallel", "body": "", "assignee": None},
+            {"title": "invalid", "body": "", "assignee": None, "parents": parents},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "parents" in outcome.reason
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+    assert root is not None
+    assert root.status == "triage"
+
+

@@ -417,11 +417,15 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
-        parents = entry.get("parents") or []
-        if not isinstance(parents, list):
-            parents = []
-        # Clean parent indices: drop non-int and out-of-range.
-        clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        raw_parents = entry["parents"] if "parents" in entry else []
+        try:
+            clean_parents = kb.validate_decomposition_parents(
+                raw_parents,
+                child_index=idx,
+                child_count=len(raw_tasks),
+            )
+        except ValueError as exc:
+            return DecomposeOutcome(task_id, False, f"invalid parents: {exc}")
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),

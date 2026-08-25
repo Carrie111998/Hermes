@@ -135,6 +135,44 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
+def validate_decomposition_parents(
+    parents: object,
+    *,
+    child_index: int,
+    child_count: int,
+) -> list[int]:
+    """Validate and normalize sibling-parent indices for a decomposition.
+
+    The decomposer contract uses exact JSON integers as zero-based indices into
+    the same children list. Python's ``bool`` is an ``int`` subclass, so an
+    ``isinstance(value, int)`` check would incorrectly turn JSON ``true`` and
+    ``false`` into sibling links. Keep this validator shared by the parser and
+    the DB ingest boundary so malformed graphs cannot reach persistence.
+    """
+    if not isinstance(parents, list):
+        raise ValueError(f"child[{child_index}].parents must be a list")
+
+    validated: list[int] = []
+    for parent_position, parent in enumerate(parents):
+        if type(parent) is not int:
+            if isinstance(parent, bool):
+                detail = "bool is not a valid integer index"
+            else:
+                detail = "must be an integer index"
+            raise ValueError(
+                f"child[{child_index}].parents[{parent_position}] {detail}"
+            )
+        if parent < 0 or parent >= child_count:
+            raise ValueError(
+                f"child[{child_index}].parents[{parent_position}]={parent!r} "
+                "is not a valid index into children"
+            )
+        if parent == child_index:
+            raise ValueError(f"child[{child_index}] cannot list itself as a parent")
+        validated.append(parent)
+    return validated
+
+
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
@@ -7319,22 +7357,21 @@ def decompose_triage_task(
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
+    validated_parent_indices: list[list[int]] = []
     for idx, child in enumerate(children):
         if not isinstance(child, dict):
             raise ValueError(f"child[{idx}] is not a dict")
         title = child.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"child[{idx}].title is required")
-        parents_idx = child.get("parents") or []
-        if not isinstance(parents_idx, list):
-            raise ValueError(f"child[{idx}].parents must be a list")
-        for p in parents_idx:
-            if not isinstance(p, int) or p < 0 or p >= len(children):
-                raise ValueError(
-                    f"child[{idx}].parents[{p}] is not a valid index into children"
-                )
-            if p == idx:
-                raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        raw_parents = child["parents"] if "parents" in child else []
+        validated_parent_indices.append(
+            validate_decomposition_parents(
+                raw_parents,
+                child_index=idx,
+                child_count=len(children),
+            )
+        )
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -7343,8 +7380,8 @@ def decompose_triage_task(
     # can never promote them.
     _in_deg = [0] * len(children)
     _adj: list[list[int]] = [[] for _ in range(len(children))]
-    for _i, _c in enumerate(children):
-        for _p in (_c.get("parents") or []):
+    for _i, _parents in enumerate(validated_parent_indices):
+        for _p in _parents:
             _adj[_p].append(_i)
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
@@ -7441,8 +7478,8 @@ def decompose_triage_task(
             child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
-        for idx, child in enumerate(children):
-            for p_idx in child.get("parents") or []:
+        for idx, p_indices in enumerate(validated_parent_indices):
+            for p_idx in p_indices:
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
                 conn.execute(

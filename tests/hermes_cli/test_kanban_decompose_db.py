@@ -88,5 +88,85 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_decompose_missing_parents_is_parallel(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orch",
+            children=[{"title": "parallel task"}],
+            author="alice",
+        )
+
+    assert child_ids is not None
+    with kb.connect() as conn:
+        child = kb.get_task(conn, child_ids[0])
+    assert child is not None
+    assert child.status == "ready"
+
+
+@pytest.mark.parametrize(
+    ("parents", "child_index", "child_count"),
+    [
+        ([-1], 1, 2),
+        ([2], 1, 2),
+        ([True], 2, 3),
+        ([False], 1, 2),
+        ([0, True], 2, 3),
+    ],
+    ids=["negative", "out-of-range", "true", "false", "mixed"],
+)
+def test_decompose_rejects_invalid_parent_indices_atomically(
+    kanban_home, parents, child_index, child_count
+):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+
+    children = [
+        {"title": f"child {idx}", "parents": []}
+        for idx in range(child_count)
+    ]
+    children[child_index]["parents"] = parents
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="parents"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=children,
+                author="alice",
+            )
+
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        task_count = conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"]
+        link_count = conn.execute("SELECT COUNT(*) AS count FROM task_links").fetchone()["count"]
+    assert root is not None
+    assert root.status == "triage"
+    assert task_count == 1
+    assert link_count == 0
+
+
+@pytest.mark.parametrize("parents", [True, False, None], ids=["true", "false", "null"])
+def test_decompose_rejects_present_non_list_parents(kanban_home, parents):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="parents must be a list"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[
+                    {"title": "parallel"},
+                    {"title": "invalid", "parents": parents},
+                ],
+                author="alice",
+            )
+
+
 
 
