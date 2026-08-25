@@ -226,7 +226,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                     logger.info(
                         "Token refresh recovered from disk for %s "
                         "(peer process rotated the refresh token)",
-                        getattr(self, "_hermes_server_name", "?"),
+                        self._hermes_server_name,
                     )
                     return True
                 self.context.clear_tokens()
