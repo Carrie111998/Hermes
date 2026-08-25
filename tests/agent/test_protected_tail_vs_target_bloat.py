@@ -151,3 +151,31 @@ def test_legacy_mode_still_recalibrates_budget_on_model_switch():
     assert comp.tail_mode == "legacy"
     comp.update_model("m", context_length=10_000)
     assert comp.tail_token_budget == int(comp.threshold_tokens * 0.20)
+
+
+def test_no_second_ratio_writer_for_lean_mode():
+    """Reviewer pin (#92738): any SECOND writer applying the legacy ratio
+    formula would reintroduce the lean-revert bug through a side door. The
+    only production writer is update_model() — simulate its two callers
+    (explicit switch + fallback activation) and assert lean stays window-
+    derived; also lock invalidate_tail_budget() as the public cache hook."""
+    comp = ContextCompressor(
+        "m", threshold_percent=0.85, quiet_mode=True, tail_mode="lean",
+    )
+    # fallback activation re-runs update_model with the same model id
+    for _ in range(2):
+        comp.update_model("m", context_length=32_768)
+    expected = max(LEAN_TAIL_FLOOR_TOKENS,
+                   min(LEAN_TAIL_CAP_TOKENS, int(32_768 * 0.025)))
+    assert comp.tail_token_budget == expected
+
+    # public invalidation hook recomputes identically (no private-attr poke)
+    comp.invalidate_tail_budget()
+    assert comp._tail_token_budget is None
+    assert comp.tail_token_budget == expected
+
+    # legacy mode still writes through the setter (the ratio path) — the
+    # asymmetry is the contract: lean derives, legacy assigns.
+    legacy = ContextCompressor("m", threshold_percent=0.50, quiet_mode=True)
+    legacy.update_model("m", context_length=10_000)
+    assert legacy._tail_token_budget == int(legacy.threshold_tokens * 0.20)

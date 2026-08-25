@@ -2259,6 +2259,16 @@ class ContextCompressor(ContextEngine):
     def tail_token_budget(self, value: int) -> None:
         self._tail_token_budget = value
 
+    def invalidate_tail_budget(self) -> None:
+        """Drop the cached derived tail budget so it re-derives on next read.
+
+        Public invalidation hook so callers (``update_model()``) don't reach
+        into the private ``_tail_token_budget`` cache attribute — a future
+        refactor of the property's caching internals then can't silently
+        break model-switch recalibration.
+        """
+        self._tail_token_budget = None
+
     @property
     def max_summary_tokens(self) -> int:
         if self._max_summary_tokens is None:
@@ -2811,7 +2821,7 @@ class ContextCompressor(ContextEngine):
         # ratio-based formula below (which would silently revert lean to a
         # legacy-sized tail on every model switch/fallback). (#compaction-v2)
         if getattr(self, "tail_mode", "legacy") == "lean":
-            self._tail_token_budget = None
+            self.invalidate_tail_budget()
         else:
             target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
             self.tail_token_budget = target_tokens
