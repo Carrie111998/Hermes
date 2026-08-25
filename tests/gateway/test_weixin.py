@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -271,6 +272,206 @@ class TestWeixinChunkDelivery:
         assert sleep_mock.await_count == 1
 
 
+class TestWeixinRateLimitRecovery:
+    """Regression tests for #94146.
+
+    After a rate-limit episode, Weixin live replies were silently lost: once
+    the rate-limit circuit opened, ``send()`` reported a plain failure that
+    the gateway's retry layer misclassified as a *formatting* failure
+    (mangling the reply into a duplicate "plain text" send), and iLink
+    responses were treated as accepted even when they carried error codes.
+    These tests pin the observable/recoverable contract:
+
+    - rate-limited sends carry ``rate_limited`` kind + ``retryable`` +
+      ``retry_after`` so the gateway retries after the cooldown instead of
+      mangling the message;
+    - a stale cached context token is invalidated when the circuit opens;
+    - every sendmessage response is logged (sanitized) so an accepted-but-
+      dropped send is distinguishable in logs;
+    - media/typing paths surface iLink error responses instead of reporting
+      success and logging nothing;
+    - blank replies are a visible failure, not a false success.
+    """
+
+    def _connected_adapter(self) -> WeixinAdapter:
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        return adapter
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_circuit_open_send_is_rate_limited_retryable(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 3
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._rate_limit_circuit_threshold = 2
+        adapter._rate_limit_circuit_window_seconds = 60
+        adapter._rate_limit_circuit_open_seconds = 60
+
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "frequency limit",
+        }
+
+        asyncio.run(adapter.send("wxid_test123", "first"))
+        result = asyncio.run(adapter.send("wxid_test123", "second"))
+
+        assert result.success is False
+        assert "cooldown" in (result.error or "")
+        # The gateway retry layer must treat this as a throttle, not a
+        # formatting failure, and honor the cooldown before retrying.
+        assert result.error_kind == "rate_limited"
+        assert result.retryable is True
+        assert result.retry_after is not None and result.retry_after > 0
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_rate_limit_loop_exhaustion_keeps_retryable_semantics(
+        self, send_message_mock, sleep_mock,
+    ):
+        # -2 responses below the circuit threshold exhaust the per-chunk
+        # retry loop without opening the circuit; the result must still
+        # advertise rate_limited semantics so the outer retry layer waits.
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 0
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._rate_limit_circuit_threshold = 10
+
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "frequency limit",
+        }
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert result.error_kind == "rate_limited"
+        assert result.retryable is True
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_circuit_open_invalidates_cached_context_token(
+        self, send_message_mock, sleep_mock, tmp_path, caplog,
+    ):
+        adapter = self._connected_adapter()
+        adapter._token_store = ContextTokenStore(str(tmp_path))
+        adapter._token_store.set(adapter._account_id, "wxid_test123", "ctx-token")
+        adapter._send_chunk_retries = 3
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._rate_limit_circuit_threshold = 2
+        adapter._rate_limit_circuit_window_seconds = 60
+        adapter._rate_limit_circuit_open_seconds = 60
+
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "frequency limit",
+        }
+
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.weixin"):
+            asyncio.run(adapter.send("wxid_test123", "first"))
+
+        # A stale/poisoned context token can keep the server-side session
+        # suppressed; opening the circuit must stop reusing it so the next
+        # send falls back to the tokenless degraded path.
+        assert adapter._token_store.get(adapter._account_id, "wxid_test123") is None
+        assert any("invalidated" in r.message for r in caplog.records)
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_successful_send_logs_sanitized_response(self, send_message_mock, sleep_mock, caplog):
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = {"ret": 0, "errcode": 0, "errmsg": ""}
+
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.weixin"):
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert any(
+            r.message.startswith("[Weixin]")
+            and "sendmessage" in r.message
+            and "ret=0" in r.message
+            and "client_id=" in r.message
+            for r in caplog.records
+        )
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_unexpected_response_is_not_silent_success(self, send_message_mock, sleep_mock):
+        # A non-dict response previously fell through every error check and
+        # was reported as delivered — the silent-drop false-success state.
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = ["not", "a", "dict"]
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert "unexpected" in (result.error or "").lower()
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_blank_reply_returns_visible_failure(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+
+        result = asyncio.run(adapter.send("wxid_test123", "   "))
+
+        assert result.success is False
+        assert "no deliverable" in (result.error or "")
+        send_message_mock.assert_not_called()
+
+    def test_send_document_surfaces_link_error_response(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._token_store.get = lambda account_id, chat_id: None
+
+        image_path = tmp_path / "demo.png"
+        image_path.write_bytes(b"fake-png-bytes")
+
+        with (
+            patch("gateway.platforms.weixin._get_upload_url", new_callable=AsyncMock) as upload_mock,
+            patch("gateway.platforms.weixin._upload_ciphertext", new_callable=AsyncMock) as cipher_mock,
+            patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock) as api_post_mock,
+        ):
+            upload_mock.return_value = {"ret": 0, "upload_full_url": "https://cdn.example.com/up"}
+            cipher_mock.return_value = "enc-param"
+            api_post_mock.return_value = {
+                "ret": weixin.RATE_LIMIT_ERRCODE,
+                "errcode": weixin.RATE_LIMIT_ERRCODE,
+                "errmsg": "frequency limit",
+            }
+            result = asyncio.run(adapter.send_document("wxid_test123", str(image_path)))
+
+        # Previously the media sendmessage response was never inspected:
+        # iLink's -2 was silently ignored and success=True returned.
+        assert result.success is False
+        assert "rate limit" in (result.error or "").lower()
+        assert result.error_kind == "rate_limited"
+
+    def test_typing_rate_limit_is_logged_at_warning(self, caplog):
+        adapter = self._connected_adapter()
+        adapter._typing_cache.set("wxid_test123", "ticket-1")
+
+        with patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock) as api_post_mock:
+            api_post_mock.return_value = {
+                "ret": weixin.RATE_LIMIT_ERRCODE,
+                "errcode": weixin.RATE_LIMIT_ERRCODE,
+                "errmsg": "frequency limit",
+            }
+            with caplog.at_level(logging.WARNING, logger="gateway.platforms.weixin"):
+                asyncio.run(adapter.send_typing("wxid_test123"))
+
+        assert any("limit" in r.message.lower() for r in caplog.records)
+
+
 class TestWeixinOutboundMedia:
 
 
@@ -322,6 +523,9 @@ class TestWeixinOutboundMedia:
              patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock) as api_post_mock, \
              patch("gateway.platforms.weixin.secrets.token_hex", return_value="filekey-123"), \
              patch("gateway.platforms.weixin.secrets.token_bytes", return_value=aes_key):
+            # The media sendmessage response is inspected since #94146;
+            # an accepted response keeps the send flowing.
+            api_post_mock.return_value = {"ret": 0, "errcode": 0}
             message_id = asyncio.run(adapter._send_file("wxid_test123", str(image_path), ""))
 
         assert message_id.startswith("hermes-weixin-")
