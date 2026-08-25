@@ -328,9 +328,39 @@ def cmd_sessions(args, sessions_parser=None):
 
     if action == "list":
         from hermes_state import workspace_key as _ws_key
+        from hermes_cli.session_filters import parse_point_in_time
+
+        # Explicit start-time window (#91900): --after inclusive, --before
+        # exclusive — same vocabulary and parsing as archive/prune/export.
+        started_after = None
+        started_before = None
+        _after_raw = getattr(args, "after", None)
+        _before_raw = getattr(args, "before", None)
+        try:
+            if _after_raw:
+                started_after = parse_point_in_time(_after_raw, "--after")
+            if _before_raw:
+                started_before = parse_point_in_time(_before_raw, "--before")
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        if (
+            started_after is not None
+            and started_before is not None
+            and started_after >= started_before
+        ):
+            print(
+                f"Error: --after ({_after_raw}) is not earlier than "
+                f"--before ({_before_raw})."
+            )
+            return
 
         sessions = db.list_sessions_rich(
-            source=args.source, exclude_sources=_exclude, limit=args.limit
+            source=args.source,
+            exclude_sources=_exclude,
+            limit=args.limit,
+            started_after=started_after,
+            started_before=started_before,
         )
 
         # Workspace filter: match a session by its workspace key (git repo

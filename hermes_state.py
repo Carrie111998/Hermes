@@ -9833,6 +9833,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         include_children: bool = False,
         min_message_count: int = 0,
+        started_after: float = None,
+        started_before: float = None,
         project_compression_tips: bool = True,
         order_by_last_active: bool = False,
         include_archived: bool = False,
@@ -9941,6 +9943,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
+        # Explicit start-time window (#91900): --after is the inclusive lower
+        # bound, --before the exclusive upper bound — matching the archive /
+        # prune / export vocabulary.
+        if started_after is not None:
+            where_clauses.append("s.started_at >= ?")
+            params.append(started_after)
+        if started_before is not None:
+            where_clauses.append("s.started_at < ?")
+            params.append(started_before)
         if archived_only:
             where_clauses.append("s.archived = 1")
         elif not include_archived:
