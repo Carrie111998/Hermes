@@ -57,4 +57,9 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # the NAS relay's bearer-only callback reaches the verifier instead of a
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
+    # Hosted peer-to-peer message ingress carries its own per-agent peer key.
+    # Let that route validate the bearer credential instead of consuming it as
+    # a dashboard OAuth access token (which misreports opaque peer keys as a
+    # Nous auth-provider outage before the message handler can run).
+    "/api/v1/message",
 })
