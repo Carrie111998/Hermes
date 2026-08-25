@@ -524,6 +524,19 @@ _BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
 
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
+_DIRECT_ALIASES_CACHE_KEY: Optional[tuple[str, int, int]] = None
+
+
+def _direct_aliases_cache_key() -> tuple[str, int, int]:
+    """Return the config identity used to cache direct aliases."""
+    from hermes_cli.config import get_config_path
+
+    path = get_config_path()
+    try:
+        st = path.stat()
+        return (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (str(path), 0, 0)
 
 
 def _load_direct_aliases() -> dict[str, DirectAlias]:
@@ -594,15 +607,21 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
 
 
 def _ensure_direct_aliases() -> None:
-    """Lazy-load direct aliases on first use.
+    """Load direct aliases and refresh them when config.yaml changes.
 
-    Mutates the existing DIRECT_ALIASES dict in place rather than rebinding
-    the module attribute. This keeps `from hermes_cli.model_switch import
-    DIRECT_ALIASES` references valid in callers — rebinding would leave them
-    pointing at a stale empty dict.
+    The cache key is the loaded sentinel, rather than the mapping's truthiness:
+    a valid config with no aliases must still be cached. The mapping is mutated
+    in place so imports that hold a reference to ``DIRECT_ALIASES`` remain
+    valid.
     """
-    if not DIRECT_ALIASES:
-        DIRECT_ALIASES.update(_load_direct_aliases())
+    global _DIRECT_ALIASES_CACHE_KEY
+
+    key = _direct_aliases_cache_key()
+    if key == _DIRECT_ALIASES_CACHE_KEY:
+        return
+    DIRECT_ALIASES.clear()
+    DIRECT_ALIASES.update(_load_direct_aliases())
+    _DIRECT_ALIASES_CACHE_KEY = key
 
 
 # ---------------------------------------------------------------------------
