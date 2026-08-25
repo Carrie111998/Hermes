@@ -192,10 +192,10 @@ def _install_literal_key_data_patch() -> bool:
     receives the raw escape sequence as literal text — the mapping alone
     fixes what the key *is* but not what it *types*.
 
-    This narrows ``data`` to the character for exactly that case. The
-    parser's fallback path already calls the handler with ``key is data``
-    for ordinary typing, and stock prompt_toolkit ships no character-valued
-    table entries, so nothing else changes shape.
+    This narrows ``data`` to the character for that CSI→char case. Stock
+    Keys-valued table entries and the plain-typing path (where ``key`` is
+    already ``data``) keep prior behavior. Multi-key ANSI matches that
+    intentionally blank trailing ``insert_text`` are also left alone.
 
     Idempotent; returns True when this call installed the patch.
     """
@@ -227,6 +227,10 @@ def _install_literal_key_data_patch() -> bool:
         # key after the first in a multi-key ANSI match (Alt+letter →
         # (Escape, "a") with "" on the letter). Reviving that blank would
         # insert the letter and break meta chords (Shift+Alt+a → "A").
+        #
+        # Keys is a str Enum, so Keys members are isinstance(..., str). The
+        # `not isinstance(key, Keys)` check is load-bearing — do not drop it
+        # even though no current Keys value has len == 1.
         if (
             isinstance(key, str)
             and not isinstance(key, Keys)
