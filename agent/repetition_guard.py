@@ -93,3 +93,22 @@ def _line_repetition_dominated(text: str, n: int) -> bool:
         if c >= _MIN_REPEAT_COUNT and c * len(line) >= n * _DOMINANCE_RATIO:
             return True
     return False
+
+
+class StreamDegenerationError(Exception):
+    """A live stream turned repetition-dominated and was aborted (#94224).
+
+    Raised by the streaming paths in ``chat_completion_helpers.py`` while
+    deltas are still arriving, when the accumulated visible text trips
+    :func:`is_repetition_dominated` — the same heuristic the post-truncation
+    guard applies after ``finish_reason=length`` (#86581), but moved upstream
+    so the abort happens while the loop is still running instead of after the
+    model burned its entire output budget.
+
+    Consumers must treat this as terminal-for-the-request, never transient:
+    retrying or falling back would ask the same degenerating model to try
+    again and re-enter the same loop. The caller that can actually honour
+    that contract is the conversation loop, which discards the aborted draft,
+    keeps it out of history, and shows a user-facing explanation — mirroring
+    the post-truncation repetition guard there.
+    """
