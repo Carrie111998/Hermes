@@ -4,11 +4,14 @@ import sqlite3
 import time
 import pytest
 
+from datetime import datetime, timedelta
+
 from hermes_state import SessionDB
 from agent.insights import (
     InsightsEngine,
     _estimate_cost,
     _bar_chart,
+    parse_calendar_day,
 )
 from agent.usage_pricing import (
     format_duration_compact as _format_duration,
@@ -218,6 +221,21 @@ class TestBarChart:
 
 
 
+class TestParseCalendarDay:
+    def test_start_of_day(self):
+        ts = parse_calendar_day("2026-08-24")
+        assert datetime.fromtimestamp(ts) == datetime(2026, 8, 24, 0, 0, 0)
+
+    def test_end_of_day_is_start_of_next_day(self):
+        start = parse_calendar_day("2026-08-24")
+        end = parse_calendar_day("2026-08-24", end_of_day=True)
+        assert end - start == timedelta(days=1).total_seconds()
+
+    def test_invalid_format_raises(self):
+        with pytest.raises(ValueError):
+            parse_calendar_day("08/24/2026")
+
+
 # =========================================================================
 # InsightsEngine — empty DB
 # =========================================================================
@@ -259,6 +277,30 @@ class TestInsightsPopulated:
         assert overview["total_input_tokens"] == expected_input
         assert overview["total_output_tokens"] == expected_output
         assert overview["total_tokens"] == expected_input + expected_output
+
+
+    def test_since_until_filters_to_calendar_window(self, populated_db):
+        """#94409: --since/--until should scope every stat, not just the
+        session list — excludes s1 (-2d, 50k in) and s4 (-1d, 10k in),
+        keeps only s2 (-5d, 20k in) and s3 (-10d, 100k in).
+        """
+        now = time.time()
+        day = 86400
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(since=now - 11 * day, until=now - 3 * day)
+
+        assert report["overview"]["total_sessions"] == 2
+        assert report["overview"]["total_input_tokens"] == 20000 + 100000
+
+    def test_since_overrides_days(self, populated_db):
+        """An explicit ``since`` wins over ``days`` when both are passed."""
+        now = time.time()
+        day = 86400
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=1, since=now - 11 * day)
+
+        # days=1 alone would find nothing; since=-11d pulls in all 4 sessions.
+        assert report["overview"]["total_sessions"] == 4
 
 
 
@@ -376,10 +418,10 @@ class TestInsightsPopulated:
     # optimization — output is identical whether or not it is selected.
     _INDEX = "idx_messages_assistant_calls_by_session"
     _PINNED_QUERIES = (
-        ("_GET_TOOL_CALLS_ALL", (0.0,)),
-        ("_GET_TOOL_CALLS_WITH_SOURCE", (0.0, "cli")),
-        ("_GET_SKILL_CALLS_ALL", (0.0,)),
-        ("_GET_SKILL_CALLS_WITH_SOURCE", (0.0, "cli")),
+        ("_GET_TOOL_CALLS_ALL", (0.0, float("inf"))),
+        ("_GET_TOOL_CALLS_WITH_SOURCE", (0.0, float("inf"), "cli")),
+        ("_GET_SKILL_CALLS_ALL", (0.0, float("inf"))),
+        ("_GET_SKILL_CALLS_WITH_SOURCE", (0.0, float("inf"), "cli")),
     )
 
     def test_assistant_call_queries_use_partial_index_without_analyze(
