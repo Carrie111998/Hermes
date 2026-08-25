@@ -75,6 +75,24 @@ describe('delegateRowsFromCall', () => {
   it('still lists a background dispatch whose goals only survive in the result', () => {
     expect(delegateRowsFromCall({}, { status: 'dispatched', goals: ['A', 'B'] }).map(r => r.goal)).toEqual(['A', 'B'])
   })
+
+  it('surfaces requested and effective routes from spawn metadata', () => {
+    const rows = delegateRowsFromCall(
+      { goal: 'A' },
+      {
+        status: 'dispatched',
+        goals: ['A'],
+        delegation_route: {
+          requested: { provider: 'nous', model: 'ox-alpha', reasoning_effort: 'nope' },
+          effective: { provider: 'nous', model: 'ox-alpha', reasoning_effort: 'high' }
+        }
+      }
+    )
+
+    expect(rows[0].requestedRoute).toBe('nous/ox-alpha nope')
+    expect(rows[0].effectiveRoute).toBe('nous/ox-alpha high')
+    expect(rows[0].model).toBe('ox-alpha')
+  })
 })
 
 describe('mergeDelegateRows', () => {

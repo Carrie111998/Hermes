@@ -3632,6 +3632,31 @@ class CLICommandsMixin:
         else:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (this session — use --global to persist){_RST}")
 
+    def _handle_delegate_route_command(self, cmd: str):
+        """Authorize a user-owned session delegation route."""
+        from agent.delegation_session_route import (
+            DelegationRouteError,
+            handle_delegate_route_command,
+            live_session_row_id,
+        )
+        from cli import _ACCENT, _DIM, _RST, _cprint
+
+        parts = cmd.strip().split(maxsplit=1)
+        raw_args = parts[1] if len(parts) > 1 else ""
+        agent = getattr(self, "agent", None)
+        session_id = live_session_row_id(
+            parent=agent
+        ) or (getattr(self, "session_id", "") or "")
+        try:
+            text = handle_delegate_route_command(
+                raw_args, self._session_db, session_id
+            )
+        except DelegationRouteError as exc:
+            _cprint(f"  {_DIM}{exc}{_RST}")
+            return
+        for line in text.splitlines():
+            _cprint(f"  {_ACCENT}{line}{_RST}")
+
     def _handle_busy_command(self, cmd: str):
         """Handle /busy — control what Enter does while Hermes is working.
 

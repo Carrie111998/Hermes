@@ -77,8 +77,13 @@ function DelegateRowView({ row }: { row: DelegateRow }) {
       ? copy.statusError
       : copy.statusDone
 
+  const routeMeta = row.effectiveRoute
+    ? row.requestedRoute && row.requestedRoute !== row.effectiveRoute
+      ? `${row.effectiveRoute} (requested ${row.requestedRoute})`
+      : row.effectiveRoute
+    : row.requestedRoute || (row.model ? displayModelName(row.model) : '')
   const meta = [
-    row.model ? displayModelName(row.model) : '',
+    routeMeta,
     !live && row.durationSeconds ? formatDurationSeconds(row.durationSeconds) : ''
   ].filter(Boolean)
 

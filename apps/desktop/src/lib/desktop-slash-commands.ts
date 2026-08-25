@@ -134,6 +134,41 @@ export interface DesktopCommandSpec {
   argumentMode?: DesktopSlashArgumentMode
 }
 
+export function describeDelegateRouteAuthorization(arg: string): string {
+  const tokens = arg.match(/(?:[^\s"]+|"[^"]*")+/g) ?? []
+  let provider = ''
+  let model = ''
+  let effort = ''
+  let scope = 'next'
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i].replace(/^["']|["']$/g, '')
+    const value = (tokens[i + 1] || '').replace(/^["']|["']$/g, '')
+    if (token === '--provider' || token === '-p') {
+      provider = value
+      i += 1
+    } else if (token === '--model' || token === '-m') {
+      model = value
+      i += 1
+    } else if (token === '--reasoning-effort' || token === '--effort' || token === '-e') {
+      effort = value
+      i += 1
+    } else if (token === '--scope') {
+      scope = value || scope
+      i += 1
+    }
+  }
+  const lines = [
+    'Approve this exact route for delegated subagents only.',
+    'The parent conversation stays on its current model.',
+    '',
+    `Provider: ${provider || '(missing)'}`,
+    `Model: ${model || '(missing)'}`,
+    `Reasoning effort: ${effort || '(inherit)'}`,
+    `Scope: ${scope === 'session' ? 'this session until cleared' : 'next delegation only'}`
+  ]
+  return lines.join('\n')
+}
+
 const exec = (): DesktopCommandSurface => ({ kind: 'exec' })
 const action = (id: DesktopActionId): DesktopCommandSurface => ({ kind: 'action', action: id })
 const picker = (id: DesktopPickerId): DesktopCommandSurface => ({ kind: 'picker', picker: id })
@@ -260,6 +295,13 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     argumentMode: 'text'
   },
   { name: '/debug', description: 'Create a debug report', surface: exec() },
+  {
+    name: '/delegate-route',
+    description: 'Authorize a one-shot or session subagent route',
+    aliases: ['/delegate_route'],
+    surface: exec(),
+    argumentMode: 'mixed'
+  },
   {
     name: '/goal',
     description: 'Manage the standing goal for this session',
