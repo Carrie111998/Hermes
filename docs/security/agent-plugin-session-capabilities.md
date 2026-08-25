@@ -54,6 +54,11 @@ rereads consent, rejects caches or symlinks, recomputes the package digest, and
 checks the approved binding. Updating any included package byte changes the
 digest and requires a new explicit grant.
 
+The dashboard MCP page lists enabled portable MCP servers as read-only,
+plugin-managed entries. Their lifecycle stays on the Plugins page; ordinary
+MCP config endpoints cannot toggle, test, or delete a capability-bearing
+package server independently of its reviewed package.
+
 ## Per-call binding
 
 For an authorised call Hermes mints a short-lived process-local HMAC capability

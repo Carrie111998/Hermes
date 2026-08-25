@@ -46,6 +46,49 @@ class TestMcpEndpoints:
         srv = self.client.get("/api/mcp/servers").json()["servers"][0]
         assert srv["env"]["API_KEY"] != "sk-secret-1234567890"
 
+    def test_list_includes_read_only_portable_plugin_mcps(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        self.client.post(
+            "/api/mcp/servers",
+            json={"name": "configured", "url": "https://example.com/mcp"},
+        )
+
+        class FakeManager:
+            def get_enabled_portable_mcp_server_descriptors(self, raw_config):
+                assert "configured" in raw_config["mcp_servers"]
+                return [
+                    {
+                        "name": "agent-plugin-hermes-g2-workflows__workflows",
+                        "server_name": "workflows",
+                        "plugin": "hermes-g2-workflows",
+                        "plugin_key": "hermes-g2-workflows",
+                        "plugin_version": "0.3.2",
+                        "config": {
+                            "command": "/plugin/server.py",
+                            "args": ["-I", "-S", "-B"],
+                        },
+                    }
+                ]
+
+        monkeypatch.setattr(plugins_mod, "PluginManager", FakeManager)
+
+        response = self.client.get("/api/mcp/servers")
+        assert response.status_code == 200
+        servers = {item["source"]: item for item in response.json()["servers"]}
+
+        configured = servers["profile"]
+        assert configured["name"] == "configured"
+        assert configured["read_only"] is False
+        assert configured["managed_by"] is None
+
+        managed = servers["plugin"]
+        assert managed["display_name"] == "hermes-g2-workflows / workflows"
+        assert managed["managed_by"] == "hermes-g2-workflows"
+        assert managed["plugin_version"] == "0.3.2"
+        assert managed["read_only"] is True
+        assert managed["enabled"] is True
+
     def test_http_bearer_auth_separates_secret_from_config(
         self, _isolate_hermes_home
     ):

@@ -1472,6 +1472,7 @@ export interface SkillHubScan {
 
 export interface McpServer {
   name: string;
+  display_name?: string;
   transport: "http" | "stdio" | "unknown";
   url: string | null;
   command: string | null;
@@ -1480,6 +1481,10 @@ export interface McpServer {
   auth: "header" | "oauth" | null;
   enabled: boolean;
   tools: string[] | null;
+  source?: "profile" | "plugin";
+  managed_by?: string | null;
+  plugin_version?: string | null;
+  read_only?: boolean;
 }
 
 export interface McpCatalogEntry {

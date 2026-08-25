@@ -604,7 +604,7 @@ export default function McpPage() {
         {servers.length === 0 && (
           <Card>
             <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              No MCP servers configured.
+              No MCP servers configured or provided by enabled plugins.
             </CardContent>
           </Card>
         )}
@@ -612,6 +612,7 @@ export default function McpPage() {
         {servers.map((server) => {
           const envCount = Object.keys(server.env ?? {}).length;
           const result = testResults[server.name];
+          const isPluginManaged = server.source === "plugin";
 
           return (
             <Card key={server.name}>
@@ -624,7 +625,7 @@ export default function McpPage() {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-1">
                     <span className="font-medium text-sm truncate">
-                      {server.name}
+                      {server.display_name ?? server.name}
                     </span>
                     <Badge
                       tone={TRANSPORT_TONE[server.transport] ?? "secondary"}
@@ -637,10 +638,18 @@ export default function McpPage() {
                         {server.auth === "header" ? "bearer" : server.auth}
                       </Badge>
                     )}
+                    {isPluginManaged && <Badge tone="secondary">plugin</Badge>}
                     {!server.enabled && <Badge tone="outline">disabled</Badge>}
                   </div>
                   <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                    {server.transport === "http" ? (
+                    {isPluginManaged ? (
+                      <span>
+                        Managed by Agent Plugin {server.managed_by}
+                        {server.plugin_version
+                          ? ` v${server.plugin_version}`
+                          : ""}
+                      </span>
+                    ) : server.transport === "http" ? (
                       <span className="font-mono truncate">
                         {server.url ?? "—"}
                       </span>
@@ -651,7 +660,7 @@ export default function McpPage() {
                           .join(" ") || "—"}
                       </span>
                     )}
-                    {envCount > 0 && (
+                    {!isPluginManaged && envCount > 0 && (
                       <span>
                         {envCount} env var{envCount === 1 ? "" : "s"}
                       </span>
@@ -677,61 +686,67 @@ export default function McpPage() {
                 </div>
 
                 <div className="flex items-center gap-1 shrink-0">
-                  {server.auth === "oauth" && (
-                    <Button
-                      ghost
-                      size="sm"
-                      title="Authenticate with OAuth"
-                      onClick={() => handleAuthenticate(server)}
-                      disabled={authenticating === server.name}
-                      prefix={
-                        authenticating === server.name ? (
-                          <Spinner />
-                        ) : (
-                          <KeyRound />
-                        )
-                      }
-                    >
-                      Authenticate
-                    </Button>
+                  {isPluginManaged ? (
+                    <Badge tone="success">enabled</Badge>
+                  ) : (
+                    <>
+                      {server.auth === "oauth" && (
+                        <Button
+                          ghost
+                          size="sm"
+                          title="Authenticate with OAuth"
+                          onClick={() => handleAuthenticate(server)}
+                          disabled={authenticating === server.name}
+                          prefix={
+                            authenticating === server.name ? (
+                              <Spinner />
+                            ) : (
+                              <KeyRound />
+                            )
+                          }
+                        >
+                          Authenticate
+                        </Button>
+                      )}
+
+                      <Button
+                        ghost
+                        size="sm"
+                        title={server.enabled ? "Disable" : "Enable"}
+                        aria-label={server.enabled ? "Disable" : "Enable"}
+                        onClick={() => handleToggleEnabled(server)}
+                        disabled={togglingName === server.name}
+                        prefix={
+                          togglingName === server.name ? <Spinner /> : <Power />
+                        }
+                        className={server.enabled ? "text-success" : undefined}
+                      >
+                        {server.enabled ? "Disable" : "Enable"}
+                      </Button>
+
+                      <Button
+                        ghost
+                        size="icon"
+                        title="Test connection"
+                        aria-label="Test connection"
+                        onClick={() => handleTest(server)}
+                        disabled={testing === server.name}
+                      >
+                        {testing === server.name ? <Spinner /> : <Zap />}
+                      </Button>
+
+                      <Button
+                        ghost
+                        destructive
+                        size="icon"
+                        title="Delete"
+                        aria-label="Delete"
+                        onClick={() => serverDelete.requestDelete(server.name)}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </>
                   )}
-
-                  <Button
-                    ghost
-                    size="sm"
-                    title={server.enabled ? "Disable" : "Enable"}
-                    aria-label={server.enabled ? "Disable" : "Enable"}
-                    onClick={() => handleToggleEnabled(server)}
-                    disabled={togglingName === server.name}
-                    prefix={
-                      togglingName === server.name ? <Spinner /> : <Power />
-                    }
-                    className={server.enabled ? "text-success" : undefined}
-                  >
-                    {server.enabled ? "Disable" : "Enable"}
-                  </Button>
-
-                  <Button
-                    ghost
-                    size="icon"
-                    title="Test connection"
-                    aria-label="Test connection"
-                    onClick={() => handleTest(server)}
-                    disabled={testing === server.name}
-                  >
-                    {testing === server.name ? <Spinner /> : <Zap />}
-                  </Button>
-
-                  <Button
-                    ghost
-                    destructive
-                    size="icon"
-                    title="Delete"
-                    aria-label="Delete"
-                    onClick={() => serverDelete.requestDelete(server.name)}
-                  >
-                    <Trash2 />
-                  </Button>
                 </div>
               </CardContent>
             </Card>

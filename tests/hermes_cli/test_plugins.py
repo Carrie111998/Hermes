@@ -208,6 +208,16 @@ class TestPluginDiscovery:
         assert set(manager.get_portable_mcp_servers()) == {
             qualified["name"].split(":", 1)[0] + "__worker"
         }
+        [descriptor] = manager.get_enabled_portable_mcp_server_descriptors(
+            {"plugins": {"enabled": ["portable.test", "native"]}}
+        )
+        assert descriptor["name"] == (
+            qualified["name"].split(":", 1)[0] + "__worker"
+        )
+        assert descriptor["server_name"] == "worker"
+        assert descriptor["plugin"] == "portable.test"
+        assert descriptor["plugin_key"] == "portable.test"
+        assert descriptor["config"]["command"] == "python"
         assert manager._plugins["portable.test"].enabled is True
         assert manager._plugins["native"].enabled is True
         assert manager._plugins["native"].module is not None

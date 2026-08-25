@@ -4342,22 +4342,24 @@ class PluginManager:
 
         return manifests
 
-    def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
-        """Probe enabled portable MCP packages without loading plugins.
+    def get_enabled_portable_mcp_server_descriptors(
+        self, raw_config: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Describe enabled portable MCP packages without loading plugins.
 
         The directory manifest collection is shared with full discovery, so
         native ``plugin.yaml`` precedence, source ordering, depth limits, and
         project-plugin gating cannot diverge between startup and runtime.
         """
         if _env_enabled("HERMES_SAFE_MODE"):
-            return False
+            return []
 
         plugins_config = raw_config.get("plugins")
         if not isinstance(plugins_config, dict):
-            return False
+            return []
         enabled_value = plugins_config.get("enabled")
         if not isinstance(enabled_value, list):
-            return False
+            return []
         enabled = {value for value in enabled_value if isinstance(value, str)}
         disabled_value = plugins_config.get("disabled", [])
         disabled = (
@@ -4366,16 +4368,16 @@ class PluginManager:
             else set()
         )
         if not enabled:
-            return False
+            return []
 
         winners: Dict[str, PluginManifest] = {}
         for manifest in self._collect_directory_manifests():
             winners[manifest.key or manifest.name] = manifest
 
-        for manifest in winners.values():
+        descriptors: List[Dict[str, Any]] = []
+        for lookup_key, manifest in sorted(winners.items()):
             if not manifest.portable:
                 continue
-            lookup_key = manifest.key or manifest.name
             if lookup_key in disabled or manifest.name in disabled:
                 continue
             if lookup_key not in enabled and manifest.name not in enabled:
@@ -4383,20 +4385,36 @@ class PluginManager:
             try:
                 from hermes_cli.agent_plugins import _discover_mcp
 
-                if _discover_mcp(
+                servers = _discover_mcp(
                     Path(manifest.path),
                     get_hermes_home()
                     / "plugin-data"
                     / (manifest.skill_namespace or lookup_key),
                     [],
                     create_data=False,
-                ):
-                    return True
+                )
             except (OSError, RuntimeError, ValueError):
                 # Full discovery will report component diagnostics. Startup
                 # probing should fail closed for an unreadable package.
                 continue
-        return False
+            prefix = f"{manifest.skill_namespace}__"
+            for server_name, config in sorted(servers.items()):
+                descriptors.append(
+                    {
+                        "name": f"{prefix}{server_name}",
+                        "server_name": server_name,
+                        "plugin": manifest.name,
+                        "plugin_key": lookup_key,
+                        "plugin_version": manifest.version,
+                        "config": dict(config),
+                    }
+                )
+        return descriptors
+
+    def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
+        """Probe enabled portable MCP packages without loading plugins."""
+
+        return bool(self.get_enabled_portable_mcp_server_descriptors(raw_config))
 
     # -----------------------------------------------------------------------
     # Directory scanning
