@@ -107,6 +107,43 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+def test_run_job_no_agent_authoritative_scope_skips_process_dotenv_reload(
+    hermes_env,
+):
+    """Multiplex/Desktop workers must not copy one profile's .env into the
+    process-global environment shared by other profile jobs."""
+    from agent.secret_scope import (
+        reset_authoritative_secret_scope,
+        set_authoritative_secret_scope,
+    )
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    script_path = hermes_env / "scripts" / "probe.sh"
+    script_path.write_text("#!/bin/bash\necho ok\n")
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="probe.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    tokens = set_authoritative_secret_scope({"PROFILE_ONLY": "brand"})
+    try:
+        with patch("hermes_cli.env_loader.load_hermes_dotenv") as reload_env, patch(
+            "cron.scheduler._run_job_script_with_claim_heartbeat",
+            return_value=(True, "ok"),
+        ):
+            success, _doc, final, error = run_job(job)
+    finally:
+        reset_authoritative_secret_scope(tokens)
+
+    assert success is True
+    assert final == "ok"
+    assert error is None
+    reload_env.assert_not_called()
+
+
 def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
     """Regression: a standalone cron tick process starts without home-channel
     vars in its environment, and the agent path's per-run dotenv reload never

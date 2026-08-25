@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import inspect
 import threading
+import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
@@ -237,6 +239,267 @@ class CronScheduler(ABC):
         return None
 
 
+_OWNED_EXTERNAL_PROVIDERS: dict[str, "OwnedExternalCronScheduler"] = {}
+_OWNED_EXTERNAL_PROVIDERS_LOCK = threading.Lock()
+
+
+def _owned_provider_key(profile_home: Path | str) -> str:
+    return str(Path(profile_home).expanduser().resolve(strict=False))
+
+
+class OwnedExternalCronScheduler(CronScheduler):
+    """Ownership-fenced proxy for a single-profile external provider.
+
+    External providers may return from ``start`` after one reconciliation. The
+    proxy keeps their scheduler thread alive to renew the profile lease and
+    fences every later registry/fire hook through the same token.
+    """
+
+    def __init__(
+        self,
+        provider: CronScheduler,
+        *,
+        profile_home: Path | str,
+        profile: str,
+        runtime_id: str,
+        owner_kind: str,
+        poll_interval: float = 30.0,
+    ) -> None:
+        from cron.scheduler_ownership import SchedulerOwnershipLease
+
+        self._provider = provider
+        self._profile_home = Path(profile_home).expanduser().resolve(strict=False)
+        self._profile = profile
+        self._poll_interval = max(0.01, float(poll_interval))
+        self._lease = SchedulerOwnershipLease(
+            profile_home=self._profile_home,
+            profile=profile,
+            runtime_id=runtime_id,
+            owner_kind=owner_kind,
+        )
+        self._eager_stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._provider_started = False
+        self._provider_thread: threading.Thread | None = None
+        self._provider_stop_event: threading.Event | None = None
+
+    @property
+    def name(self) -> str:
+        return self._provider.name
+
+    def is_available(self) -> bool:
+        return self._provider.is_available()
+
+    @property
+    def supports_force_fire(self) -> bool:
+        return self._provider.supports_force_fire
+
+    def _start_provider_if_needed(
+        self,
+        *,
+        adapters: Any,
+        loop: Any,
+        interval: int,
+        kwargs: dict[str, Any],
+    ) -> None:
+        with self._state_lock:
+            if self._provider_started:
+                return
+            provider_stop = threading.Event()
+
+            def _run_provider() -> None:
+                try:
+                    self._provider.start(
+                        provider_stop,
+                        adapters=adapters,
+                        loop=loop,
+                        interval=interval,
+                        **kwargs,
+                    )
+                except BaseException as exc:
+                    import logging
+
+                    logging.getLogger("cron.scheduler_provider").error(
+                        "External cron provider '%s' start failed: %s",
+                        self.name,
+                        exc,
+                        exc_info=True,
+                    )
+
+            provider_thread = threading.Thread(
+                target=_run_provider,
+                daemon=True,
+                name=f"cron-provider-{self.name}",
+            )
+            self._provider_started = True
+            self._provider_stop_event = provider_stop
+            self._provider_thread = provider_thread
+            provider_thread.start()
+
+    def _stop_provider_if_started(self) -> None:
+        with self._state_lock:
+            if not self._provider_started:
+                return
+            self._provider_started = False
+            provider_stop = self._provider_stop_event
+            provider_thread = self._provider_thread
+            self._provider_stop_event = None
+            self._provider_thread = None
+        if provider_stop is not None:
+            provider_stop.set()
+        try:
+            self._provider.stop()
+        except Exception:
+            import logging
+
+            logging.getLogger("cron.scheduler_provider").debug(
+                "External cron provider stop failed", exc_info=True
+            )
+        if provider_thread is not None and provider_thread is not threading.current_thread():
+            provider_thread.join(timeout=2.0)
+
+    def start(
+        self,
+        stop_event: threading.Event,
+        *,
+        adapters: Any = None,
+        loop: Any = None,
+        interval: int = 60,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            while not stop_event.is_set() and not self._eager_stop.is_set():
+                if not self._lease.claim():
+                    self._stop_provider_if_started()
+                    stop_event.wait(self._poll_interval)
+                    continue
+                with self._lease.dispatch_guard() as allowed:
+                    if allowed:
+                        # Submit provider activation while ownership is fenced,
+                        # but never hold the mutex for the provider's lifetime.
+                        self._start_provider_if_needed(
+                            adapters=adapters,
+                            loop=loop,
+                            interval=interval,
+                            kwargs=kwargs,
+                        )
+                stop_event.wait(self._poll_interval)
+        finally:
+            self._stop_provider_if_started()
+            self._lease.release()
+            key = _owned_provider_key(self._profile_home)
+            with _OWNED_EXTERNAL_PROVIDERS_LOCK:
+                if _OWNED_EXTERNAL_PROVIDERS.get(key) is self:
+                    _OWNED_EXTERNAL_PROVIDERS.pop(key, None)
+
+    def stop(self) -> None:
+        self._eager_stop.set()
+        self._stop_provider_if_started()
+
+    def on_jobs_changed(self) -> None:
+        with self._lease.dispatch_guard() as allowed:
+            if allowed:
+                self._provider.on_jobs_changed()
+
+    def register_job(self, job: dict[str, Any]) -> None:
+        with self._lease.dispatch_guard() as allowed:
+            if not allowed:
+                raise RuntimeError(
+                    f"Cron scheduler registration refused: profile {self._profile} "
+                    "is owned by another runtime"
+                )
+            self._provider.register_job(job)
+
+    def recover_interrupted(self) -> int:
+        with self._lease.dispatch_guard() as allowed:
+            return self._provider.recover_interrupted() if allowed else 0
+
+    def reconcile(self) -> None:
+        with self._lease.dispatch_guard() as allowed:
+            if allowed:
+                self._provider.reconcile()
+
+    def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
+        with self._lease.dispatch_guard() as allowed:
+            if not allowed:
+                return None
+            return self._provider.claim_fire(job_id, force=force)
+
+    def fire_claimed(
+        self,
+        claimed_job: dict,
+        *,
+        adapters: Any = None,
+        loop: Any = None,
+        cancel_event: Any = None,
+    ) -> bool:
+        # A durable claim already belongs to this process. Finish it even if a
+        # takeover occurs between admission and worker execution.
+        kwargs = {"adapters": adapters, "loop": loop}
+        if provider_supports_fire_cancel(self._provider):
+            kwargs["cancel_event"] = cancel_event
+        return self._provider.fire_claimed(claimed_job, **kwargs)
+
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        adapters: Any = None,
+        loop: Any = None,
+        force: bool = False,
+    ) -> bool:
+        with self._lease.dispatch_guard() as allowed:
+            if not allowed:
+                return False
+            if self._provider.supports_force_fire:
+                return self._provider.fire_due(
+                    job_id,
+                    adapters=adapters,
+                    loop=loop,
+                    force=force,
+                )
+            return self._provider.fire_due(job_id, adapters=adapters, loop=loop)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._provider, name)
+
+
+def bind_external_scheduler_ownership(
+    provider: CronScheduler,
+    *,
+    profile_home: Path | str,
+    profile: str,
+    runtime_id: str,
+    owner_kind: str,
+    poll_interval: float = 30.0,
+) -> CronScheduler:
+    """Bind one external provider lifecycle to a profile ownership lease."""
+    if isinstance(provider, (InProcessCronScheduler, OwnedExternalCronScheduler)):
+        return provider
+    owned = OwnedExternalCronScheduler(
+        provider,
+        profile_home=profile_home,
+        profile=profile,
+        runtime_id=runtime_id,
+        owner_kind=owner_kind,
+        poll_interval=poll_interval,
+    )
+    with _OWNED_EXTERNAL_PROVIDERS_LOCK:
+        _OWNED_EXTERNAL_PROVIDERS[_owned_provider_key(profile_home)] = owned
+    return owned
+
+
+def _active_owned_external_provider() -> CronScheduler | None:
+    try:
+        from hermes_constants import get_hermes_home
+
+        key = _owned_provider_key(get_hermes_home())
+    except Exception:
+        return None
+    with _OWNED_EXTERNAL_PROVIDERS_LOCK:
+        return _OWNED_EXTERNAL_PROVIDERS.get(key)
+
+
 def provider_supports_force_fire(provider: Any) -> bool:
     """Return whether a provider can safely receive ``fire_due(force=...)``."""
     try:
@@ -257,6 +520,9 @@ def provider_supports_force_fire(provider: Any) -> bool:
 def provider_supports_split_fire(provider: Any) -> bool:
     """Return whether a provider implements the two-phase fire contract.
 
+    Ownership wrappers preserve the underlying provider's fire contract. A
+    legacy custom ``fire_due`` must stay on its single-phase path.
+
     The webhook admission path uses ``claim_fire`` + ``fire_claimed`` so the
     202 response is backed by a durable, owner-fenced claim. A legacy
     third-party provider that overrides the documented single-phase
@@ -266,6 +532,8 @@ def provider_supports_split_fire(provider: Any) -> bool:
     behavior. Providers that customize ``claim_fire`` itself are already
     split-aware and keep the two-phase path.
     """
+    if isinstance(provider, OwnedExternalCronScheduler):
+        return provider_supports_split_fire(provider._provider)
     cls = type(provider)
     fire_due_impl = getattr(cls, "fire_due", None)
     claim_fire_impl = getattr(cls, "claim_fire", None)
@@ -459,6 +727,10 @@ def resolve_cron_scheduler() -> "CronScheduler":
 
     logger = logging.getLogger("cron.scheduler_provider")
 
+    active_owned = _active_owned_external_provider()
+    if active_owned is not None:
+        return active_owned
+
     name = ""
     try:
         from hermes_cli.config import cfg_get, load_config
@@ -532,6 +804,9 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
+        owner_kind=None,
+        runtime_id=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -556,9 +831,12 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                profile_adapters=profile_adapters,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                owner_kind=owner_kind,
+                runtime_id=runtime_id,
             )
             return
 
@@ -627,19 +905,31 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
+        owner_kind=None,
+        runtime_id=None,
     ):
-        """Tick every served profile's cron store when multiplex_profiles is on.
+        """Tick each profile only while this runtime owns its scheduler lease.
 
-        Each profile uses ``set_hermes_home_override()`` + ``use_cron_store()``
-        to scope its tick, heartbeat, recovery, lock file, config/.env, and
-        agent execution to that profile's home — mirroring how
-        ``_profile_runtime_scope`` scopes the multiplexed inbound path and
-        ``web_server.py`` scopes per-profile cron API calls.
+        The profile's home, cron store, secret scope, and adapter map are bound
+        together before recovery, heartbeat, and dispatch. Ownership is checked
+        atomically under the lease mutex through ``cron_tick`` submission, so a
+        higher-priority dedicated gateway can take over from Desktop without a
+        check-then-dispatch race.
         """
+        import contextlib
         import logging
+
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            reset_authoritative_secret_scope,
+            reset_secret_scope,
+            set_authoritative_secret_scope,
+            set_secret_scope,
+        )
         from cron.scheduler import tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
@@ -647,78 +937,173 @@ class InProcessCronScheduler(CronScheduler):
             record_ticker_heartbeat,
             use_cron_store,
         )
+        from cron.scheduler_ownership import SchedulerOwnershipLease
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
         logger = logging.getLogger("cron.scheduler_provider")
+        entries = [
+            (entry[0], entry[1]) if isinstance(entry, tuple) else (entry.name, entry)
+            for entry in profile_homes
+        ]
         logger.info(
-            "Multiplex cron scheduler started for %d profile(s): %s",
-            len(profile_homes),
-            [p[0] if isinstance(p, tuple) else p for p in profile_homes],
+            "Profile-aware cron scheduler started for %d candidate profile(s): %s",
+            len(entries),
+            [name for name, _home in entries],
         )
 
-        # Recovery + initial heartbeat for every profile.
-        for entry in profile_homes:
-            home = entry[1] if isinstance(entry, tuple) else entry
+        leases = {}
+        ownership_identity_requested = bool(owner_kind or runtime_id)
+        ownership_identity_valid = not ownership_identity_requested
+        if ownership_identity_requested:
+            if not owner_kind or not runtime_id:
+                logger.error(
+                    "Cron scheduler ownership identity is incomplete; refusing all profile dispatch"
+                )
+            else:
+                ownership_identity_valid = True
+                leases = {
+                    name: SchedulerOwnershipLease(
+                        profile_home=home,
+                        profile=name,
+                        runtime_id=runtime_id,
+                        owner_kind=owner_kind,
+                    )
+                    for name, home in entries
+                }
+
+        authoritative_secret_scope = not (
+            owner_kind == "gateway-dedicated" and len(entries) == 1
+        )
+
+        @contextlib.contextmanager
+        def _runtime_scope(home):
             home_token = set_hermes_home_override(str(home))
+            hydrate_profile_secret_sources(home)
+            secrets = build_profile_secret_scope(home)
+            if authoritative_secret_scope:
+                secret_tokens = set_authoritative_secret_scope(secrets)
+            else:
+                secret_token = set_secret_scope(secrets)
             try:
                 with use_cron_store(home):
+                    yield
+            finally:
+                if authoritative_secret_scope:
+                    reset_authoritative_secret_scope(secret_tokens)
+                else:
+                    reset_secret_scope(secret_token)
+                reset_hermes_home_override(home_token)
+
+        def _profile_adapters(name):
+            if profile_adapters is not None:
+                return profile_adapters.get(name)
+            if len(entries) == 1:
+                return adapters
+            # A shared adapter map in a multi-profile process can carry another
+            # profile's delivery identity. Fail closed unless the caller supplies
+            # an explicit per-profile map.
+            return None
+
+        def _claim(name):
+            if not ownership_identity_valid:
+                return False
+            lease = leases.get(name)
+            if lease is None:
+                # Compatibility for direct/test callers that do not yet pass an
+                # ownership identity. Production Desktop/gateway entry points do.
+                return True
+            return lease.claim()
+
+        # Recovery + initial heartbeat only for profiles this runtime owns.
+        active = []
+        for name, home in entries:
+            if not _claim(name):
+                continue
+            lease = leases.get(name)
+            guard = lease.dispatch_guard() if lease is not None else contextlib.nullcontext(True)
+            with guard as allowed:
+                if not allowed:
+                    continue
+                with _runtime_scope(home):
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(
-                            "Marked %d interrupted cron execution(s) for profile at %s",
+                            "Marked %d interrupted cron execution(s) for profile %s unknown",
                             recovered,
-                            home,
+                            name,
                         )
                     record_ticker_heartbeat()
-            finally:
-                reset_hermes_home_override(home_token)
+                active.append(name)
+        logger.info("Cron scheduler currently owns %d profile(s): %s", len(active), active)
 
         consecutive_failures = 0
-        while not stop_event.is_set():
-            ok = False
-            _tick_error = None
-            try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    for entry in profile_homes:
-                        home = entry[1] if isinstance(entry, tuple) else entry
-                        home_token = set_hermes_home_override(str(home))
-                        try:
-                            with use_cron_store(home):
+        try:
+            while not stop_event.is_set():
+                cycle_failed = False
+                owned_in_cycle = False
+                for name, home in entries:
+                    if stop_event.is_set():
+                        break
+                    if can_dispatch is not None and not can_dispatch():
+                        logger.debug("Cron dispatch paused while gateway drains existing work")
+                        break
+                    if not _claim(name):
+                        continue
+                    # The ownership claim can wait behind another runtime's
+                    # dispatch guard. Re-check shutdown after that wait so a
+                    # stopped successor cannot dispatch one late fire after the
+                    # prior owner releases during restart.
+                    if stop_event.is_set():
+                        break
+                    lease = leases.get(name)
+                    guard = (
+                        lease.dispatch_guard()
+                        if lease is not None
+                        else contextlib.nullcontext(True)
+                    )
+                    with guard as allowed:
+                        if not allowed:
+                            continue
+                        owned_in_cycle = True
+                        ok = False
+                        tick_error = None
+                        with _runtime_scope(home):
+                            try:
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=_profile_adapters(name),
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
                                 )
-                        finally:
-                            reset_hermes_home_override(home_token)
-                ok = True
-            except BaseException as e:
-                logger.error("Cron tick error: %s", e, exc_info=True)
-                _tick_error = f"{type(e).__name__}: {e}"
-                # EMFILE: reclaim fds + exponential backoff (#87644).
-                consecutive_failures = _note_tick_failure(e, consecutive_failures)
-            else:
-                _tick_error = None
-            # Record per-profile heartbeat after each tick cycle.
-            for entry in profile_homes:
-                home = entry[1] if isinstance(entry, tuple) else entry
-                home_token = set_hermes_home_override(str(home))
-                try:
-                    with use_cron_store(home):
-                        record_ticker_heartbeat(success=ok)
-                        # Surface the failure reason (or clear it) per profile
-                        # so `hermes cron status` can show WHY ticks fail
-                        # (#68483).
-                        if ok:
-                            clear_ticker_error()
-                        elif _tick_error:
-                            record_ticker_error(_tick_error)
-                finally:
-                    reset_hermes_home_override(home_token)
-            if ok:
-                consecutive_failures = 0
-            stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+                                ok = True
+                            except BaseException as exc:
+                                cycle_failed = True
+                                tick_error = f"{type(exc).__name__}: {exc}"
+                                logger.error(
+                                    "Cron tick error for profile %s: %s",
+                                    name,
+                                    exc,
+                                    exc_info=True,
+                                )
+                                consecutive_failures = _note_tick_failure(
+                                    exc, consecutive_failures
+                                )
+                            record_ticker_heartbeat(success=ok)
+                            if ok:
+                                clear_ticker_error()
+                            elif tick_error:
+                                record_ticker_error(tick_error)
+                if not cycle_failed:
+                    consecutive_failures = 0
+                wait_seconds = _backoff_wait_seconds(interval, consecutive_failures)
+                if leases and not owned_in_cycle:
+                    # A dedicated gateway may be waiting behind Desktop's short
+                    # dispatch guard. Retry standby ownership promptly instead
+                    # of sleeping a full scheduler interval after lock timeout.
+                    wait_seconds = min(wait_seconds, 1.0)
+                stop_event.wait(wait_seconds)
+        finally:
+            for lease in leases.values():
+                lease.release()

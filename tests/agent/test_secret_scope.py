@@ -92,6 +92,29 @@ class TestScopedSingleProfile:
             ss.reset_secret_scope(token)
 
 
+class TestAuthoritativeScopeProcessMutation:
+    def test_load_hermes_dotenv_is_inert(self, tmp_path, monkeypatch):
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        home = tmp_path / ".hermes" / "profiles" / "brand"
+        home.mkdir(parents=True)
+        (home / ".env").write_text(
+            "CROSS_PROFILE_SENTINEL=brand\n", encoding="utf-8"
+        )
+        monkeypatch.delenv("CROSS_PROFILE_SENTINEL", raising=False)
+
+        tokens = ss.set_authoritative_secret_scope(
+            {"CROSS_PROFILE_SENTINEL": "brand"}
+        )
+        try:
+            loaded = load_hermes_dotenv(hermes_home=home)
+        finally:
+            ss.reset_authoritative_secret_scope(tokens)
+
+        assert loaded == []
+        assert "CROSS_PROFILE_SENTINEL" not in __import__("os").environ
+
+
 class TestScopeIsolation:
     """Two scopes never see each other's secrets."""
 

@@ -41,6 +41,77 @@ def test_cron_profile_homes_follow_allowlist(tmp_path, monkeypatch):
     assert [name for name, _home in homes] == ["default", "worker"]
 
 
+def test_dedicated_gateway_cron_start_kwargs_bind_one_profile(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    brand_home = tmp_path / ".hermes" / "profiles" / "brand"
+    runner = type(
+        "Runner",
+        (),
+        {
+            "config": GatewayConfig(multiplex_profiles=False),
+            "adapters": {"slack": "brand-adapter"},
+            "_profile_adapters": {},
+            "_draining": False,
+            "_external_drain_active": False,
+            "_active_profile_name": lambda self: "brand",
+        },
+    )()
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: brand_home)
+
+    kwargs = gateway_run._cron_scheduler_start_kwargs(
+        runner,
+        InProcessCronScheduler(),
+        loop="loop",
+    )
+
+    assert kwargs["profile_homes"] == [("brand", brand_home)]
+    assert kwargs["profile_adapters"] == {"brand": {"slack": "brand-adapter"}}
+    assert kwargs["owner_kind"] == "gateway-dedicated"
+    assert kwargs["runtime_id"].startswith("gateway:brand:")
+    assert kwargs["loop"] == "loop"
+
+
+def test_intentional_multiplex_gateway_keeps_configured_profile_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    import gateway.run as gateway_run
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / ".hermes"
+    brand_home = default_home / "profiles" / "brand"
+    homes = [("default", default_home), ("brand", brand_home)]
+    runner = type(
+        "Runner",
+        (),
+        {
+            "config": GatewayConfig(multiplex_profiles=True),
+            "adapters": {"slack": "aya-adapter"},
+            "_profile_adapters": {"brand": {"slack": "brand-adapter"}},
+            "_draining": False,
+            "_external_drain_active": False,
+            "_active_profile_name": lambda self: "default",
+        },
+    )()
+    monkeypatch.setattr(gateway_run, "_multiplex_profile_homes", lambda _cfg: homes)
+
+    kwargs = gateway_run._cron_scheduler_start_kwargs(
+        runner,
+        InProcessCronScheduler(),
+        loop="loop",
+    )
+
+    assert kwargs["profile_homes"] == homes
+    assert kwargs["profile_adapters"] == {
+        "default": {"slack": "aya-adapter"},
+        "brand": {"slack": "brand-adapter"},
+    }
+    assert kwargs["owner_kind"] == "gateway-multiplex"
+    assert kwargs["runtime_id"].startswith("gateway:default:")
+
+
 class TestNamedProfileMultiplexerGuard:
     """_guard_named_profile_under_multiplexer is inert unless all conditions hold."""
 

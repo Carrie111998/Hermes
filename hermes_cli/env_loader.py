@@ -484,6 +484,17 @@ def load_hermes_dotenv(
       ``load_external_secrets=False`` to avoid loading optional secret-manager
       dependencies into the process that replaces that same environment.
     """
+    # An authoritative profile scope already contains the complete credential
+    # snapshot for this cron/turn. Mutating os.environ here would leak that
+    # profile into concurrent sibling-profile work in the same process.
+    try:
+        from agent.secret_scope import is_secret_scope_authoritative
+
+        if is_secret_scope_authoritative():
+            return []
+    except ImportError:
+        pass
+
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))

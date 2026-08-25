@@ -252,8 +252,8 @@ def _job_running_in_this_process(job_id: str) -> bool:
     module-level import here would be circular.
     """
     try:
-        from cron.scheduler import get_running_job_ids
-        return job_id in get_running_job_ids()
+        from cron.scheduler import is_cron_job_running
+        return is_cron_job_running(job_id)
     except Exception:
         logger.warning(
             "Cron running-set liveness check failed for job %r; keeping the "
