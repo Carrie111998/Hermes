@@ -97,8 +97,10 @@ class TestFallbackChainAdvancement:
             {"provider": "zai", "model": "glm-4.7"},
         ]
         agent = _make_agent(fallback_model=fbs)
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    return_value=(_mock_client(), "gpt-4o")):
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
             assert agent._try_activate_fallback() is True
             assert agent._fallback_index == 1
             assert agent.model == "gpt-4o"
@@ -110,8 +112,10 @@ class TestFallbackChainAdvancement:
             {"provider": "zai", "model": "glm-4.7"},
         ]
         agent = _make_agent(fallback_model=fbs)
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    return_value=(_mock_client(), "resolved")):
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "resolved"),
+        ):
             assert agent._try_activate_fallback() is True
             assert agent.model == "gpt-4o"
             assert agent._try_activate_fallback() is True
@@ -121,8 +125,10 @@ class TestFallbackChainAdvancement:
     def test_all_exhausted_returns_false(self):
         fbs = [{"provider": "openai", "model": "gpt-4o"}]
         agent = _make_agent(fallback_model=fbs)
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    return_value=(_mock_client(), "gpt-4o")):
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
             assert agent._try_activate_fallback() is True
             assert agent._try_activate_fallback() is False
 
@@ -135,8 +141,8 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=fbs)
         with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
             mock_rpc.side_effect = [
-                (None, None),                    # broken provider
-                (_mock_client(), "gpt-4o"),       # fallback succeeds
+                (None, None),
+                (_mock_client(), "gpt-4o"),
             ]
             assert agent._try_activate_fallback() is True
             assert agent.model == "gpt-4o"
@@ -208,10 +214,19 @@ class TestFallbackChainAdvancement:
                 return _mock_client(), model
 
             with (
-                patch("hermes_cli.config.load_config", return_value={"provider_rotation": {"enabled": True}}),
+                patch(
+                    "hermes_cli.config.load_config",
+                    return_value={"provider_rotation": {"enabled": True}},
+                ),
                 patch("time.time", return_value=1200.0),
-                patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve),
-                patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    side_effect=_resolve,
+                ),
+                patch(
+                    "hermes_cli.model_normalize.normalize_model_for_provider",
+                    side_effect=lambda m, p: m,
+                ),
             ):
                 assert agent._try_activate_fallback() is True
 
@@ -221,7 +236,7 @@ class TestFallbackChainAdvancement:
             reset_hermes_home_override(token)
 
     def test_provider_rotation_marks_failed_provider_unavailable(self, tmp_path):
-        """Capacity failover should persist cooldown state for next turns/sessions."""
+        """Durable quota evidence should persist cooldown state across sessions."""
         from agent.error_classifier import FailoverReason
         from agent.provider_rotation import ProviderRotationState
 
@@ -231,6 +246,11 @@ class TestFallbackChainAdvancement:
             agent = _make_agent(fallback_model=fbs)
             agent.provider = "openai-codex"
             agent.model = "gpt-5.3-codex"
+            rate_limit_headers = {
+                "x-ratelimit-limit-requests-1h": "800",
+                "x-ratelimit-remaining-requests-1h": "0",
+                "x-ratelimit-reset-requests-1h": "7200",
+            }
 
             with (
                 patch(
@@ -244,13 +264,81 @@ class TestFallbackChainAdvancement:
                 ),
                 patch("time.time", return_value=2000.0),
                 patch("time.monotonic", return_value=2000.0),
-                patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_client(), "claude-sonnet-4-6")),
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "claude-sonnet-4-6"),
+                ),
             ):
-                assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
+                assert (
+                    agent._try_activate_fallback(
+                        FailoverReason.rate_limit,
+                        rate_limit_headers=rate_limit_headers,
+                    )
+                    is True
+                )
 
             state = ProviderRotationState.load()
-            assert state.is_unavailable("openai-codex", "gpt-5.3-codex", now=9000.0)
-            assert not state.is_unavailable("openai-codex", "gpt-5.3-codex", now=9201.0)
+            assert state.is_unavailable(
+                "openai-codex",
+                "gpt-5.3-codex",
+                base_url="https://openrouter.ai/api/v1",
+                now=9000.0,
+            )
+            assert not state.is_unavailable(
+                "openai-codex",
+                "gpt-5.3-codex",
+                base_url="https://openrouter.ai/api/v1",
+                now=9201.0,
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_provider_rotation_skips_persist_for_transient_rate_limit(self, tmp_path):
+        """Healthy buckets on a 429 should not write cross-session cooldown state."""
+        from agent.error_classifier import FailoverReason
+        from agent.provider_rotation import ProviderRotationState
+
+        token = set_hermes_home_override(tmp_path)
+        try:
+            fbs = [{"provider": "anthropic", "model": "claude-sonnet-4-6"}]
+            agent = _make_agent(fallback_model=fbs)
+            agent.provider = "openai-codex"
+            agent.model = "gpt-5.3-codex"
+            rate_limit_headers = {
+                "x-ratelimit-limit-requests": "200",
+                "x-ratelimit-remaining-requests": "198",
+                "x-ratelimit-reset-requests": "20",
+                "x-ratelimit-limit-requests-1h": "800",
+                "x-ratelimit-remaining-requests-1h": "790",
+                "x-ratelimit-reset-requests-1h": "1800",
+            }
+
+            with (
+                patch(
+                    "hermes_cli.config.load_config",
+                    return_value={"provider_rotation": {"enabled": True}},
+                ),
+                patch("time.time", return_value=2000.0),
+                patch("time.monotonic", return_value=2000.0),
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "claude-sonnet-4-6"),
+                ),
+            ):
+                assert (
+                    agent._try_activate_fallback(
+                        FailoverReason.rate_limit,
+                        rate_limit_headers=rate_limit_headers,
+                    )
+                    is True
+                )
+
+            state = ProviderRotationState.load()
+            assert not state.is_unavailable(
+                "openai-codex",
+                "gpt-5.3-codex",
+                now=2001.0,
+            )
         finally:
             reset_hermes_home_override(token)
 
@@ -266,20 +354,67 @@ class TestFallbackChainAdvancement:
             agent.model = "gpt-5.3-codex"
             agent._primary_runtime["provider"] = "openai-codex"
             agent._primary_runtime["model"] = "gpt-5.3-codex"
+            agent._primary_runtime["base_url"] = "https://openrouter.ai/api/v1"
             ProviderRotationState.load().mark_unavailable(
                 provider="openai-codex",
                 model="gpt-5.3-codex",
+                base_url="https://openrouter.ai/api/v1",
                 reason="rate_limit",
                 cooldown_seconds=3600,
                 now=1000.0,
             )
 
             with (
-                patch("hermes_cli.config.load_config", return_value={"provider_rotation": {"enabled": True}}),
+                patch(
+                    "hermes_cli.config.load_config",
+                    return_value={"provider_rotation": {"enabled": True}},
+                ),
                 patch("time.time", return_value=1200.0),
-                patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_client(), "claude-sonnet-4-6")),
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "claude-sonnet-4-6"),
+                ),
             ):
                 assert agent._restore_primary_runtime() is True
+
+            assert agent.provider == "anthropic"
+            assert agent.model == "claude-sonnet-4-6"
+            assert agent._fallback_activated is True
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_restore_path_respects_persisted_primary_cooldown_after_60s_gate(self, tmp_path):
+        """Expired transient gate must not restore a primary still on durable cooldown."""
+        from agent.provider_rotation import ProviderRotationState
+
+        token = set_hermes_home_override(tmp_path)
+        try:
+            agent = _make_agent(fallback_model=[{"provider": "anthropic", "model": "claude-sonnet-4-6"}])
+            agent.provider = "anthropic"
+            agent.model = "claude-sonnet-4-6"
+            agent.base_url = "https://api.anthropic.com/v1"
+            agent._fallback_activated = True
+            agent._rate_limited_until = 0
+            agent._primary_runtime["provider"] = "openai-codex"
+            agent._primary_runtime["model"] = "gpt-5.3-codex"
+            agent._primary_runtime["base_url"] = "https://openrouter.ai/api/v1"
+            ProviderRotationState.load().mark_unavailable(
+                provider="openai-codex",
+                model="gpt-5.3-codex",
+                base_url="https://openrouter.ai/api/v1",
+                reason="rate_limit",
+                cooldown_seconds=3600,
+                now=1000.0,
+            )
+
+            with (
+                patch(
+                    "hermes_cli.config.load_config",
+                    return_value={"provider_rotation": {"enabled": True}},
+                ),
+                patch("time.time", return_value=1200.0),
+            ):
+                assert agent._restore_primary_runtime() is False
 
             assert agent.provider == "anthropic"
             assert agent.model == "claude-sonnet-4-6"
@@ -340,9 +475,7 @@ class TestFallbackChainDedup:
         """Chain has [same-as-current, real-fallback]; activate must skip
         the first and use the second."""
         fbs = [
-            # First entry == current state. Should be skipped.
             {"provider": "openrouter", "model": "z-ai/glm-4.7"},
-            # Second entry: real fallback.
             {"provider": "zai", "model": "glm-4.7"},
         ]
         agent = _make_agent(fallback_model=fbs)
@@ -350,18 +483,20 @@ class TestFallbackChainDedup:
         agent.model = "z-ai/glm-4.7"
         agent.base_url = "https://openrouter.ai/api/v1"
 
-        # Stub out resolve_provider_client so we can assert which entry was
-        # actually used — return a MagicMock client tagged with the provider.
         called = []
+
         def _resolve(provider, model=None, raw_codex=False, **kwargs):
             called.append((provider, model))
             return _mock_client(), model
+
         with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
-            with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
+            with patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ):
                 ok = agent._try_activate_fallback()
 
         assert ok is True
-        # The first entry was skipped — only the second reached resolve.
         assert called == [("zai", "glm-4.7")], (
             f"expected fallback to skip same-state entry, got call order: {called}"
         )
@@ -370,10 +505,11 @@ class TestFallbackChainDedup:
         """Two custom_providers entries pointing at the same shim URL
         with the same model should dedup even if their provider names differ."""
         fbs = [
-            # Different provider name but same shim URL + model — same backend.
-            {"provider": "claude-cli-alt", "model": "claude-opus-4.7",
-             "base_url": "http://127.0.0.1:7891/v1"},
-            # Real different fallback.
+            {
+                "provider": "claude-cli-alt",
+                "model": "claude-opus-4.7",
+                "base_url": "http://127.0.0.1:7891/v1",
+            },
             {"provider": "openrouter", "model": "anthropic/claude-opus-4.7"},
         ]
         agent = _make_agent(fallback_model=fbs)
@@ -382,15 +518,19 @@ class TestFallbackChainDedup:
         agent.base_url = "http://127.0.0.1:7891/v1"
 
         called = []
+
         def _resolve(provider, model=None, raw_codex=False, **kwargs):
             called.append((provider, model))
             return _mock_client(), model
+
         with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
-            with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
+            with patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ):
                 ok = agent._try_activate_fallback()
 
         assert ok is True
-        # Same shim/base_url+model entry skipped, second one used.
         assert called == [("openrouter", "anthropic/claude-opus-4.7")], (
             f"expected base_url-aware dedup, got call order: {called}"
         )

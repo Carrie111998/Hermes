@@ -3148,10 +3148,21 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(
+        self,
+        reason: "FailoverReason | None" = None,
+        *,
+        rate_limit_headers: Any = None,
+        error_context: dict[str, Any] | None = None,
+    ) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(
+            self,
+            reason,
+            rate_limit_headers=rate_limit_headers,
+            error_context=error_context,
+        )
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 

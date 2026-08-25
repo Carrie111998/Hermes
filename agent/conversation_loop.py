@@ -2430,7 +2430,16 @@ def run_conversation(
                     )
                     if not pool_may_recover:
                         agent._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        _err_resp = getattr(api_error, "response", None)
+                        _err_hdrs = (
+                            getattr(_err_resp, "headers", None)
+                            if _err_resp else None
+                        )
+                        if agent._try_activate_fallback(
+                            reason=classified.reason,
+                            rate_limit_headers=_err_hdrs,
+                            error_context=error_context,
+                        ):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False

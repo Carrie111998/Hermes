@@ -867,11 +867,20 @@ def restore_primary_runtime(agent) -> bool:
             rotation_config = load_config()
             primary_provider = ((agent._primary_runtime or {}).get("provider") or getattr(agent, "provider", "") or "").strip()
             primary_model = ((agent._primary_runtime or {}).get("model") or getattr(agent, "model", "") or "").strip()
+            primary_base_url = str(
+                (agent._primary_runtime or {}).get("base_url")
+                or getattr(agent, "base_url", "")
+                or ""
+            ).strip()
             if (
                 is_rotation_enabled(rotation_config)
                 and primary_provider
                 and primary_model
-                and ProviderRotationState.load().is_unavailable(primary_provider, primary_model)
+                and ProviderRotationState.load().is_unavailable(
+                    primary_provider,
+                    primary_model,
+                    base_url=primary_base_url,
+                )
             ):
                 logging.info(
                     "Provider rotation: primary %s (%s) is cooling down; trying fallback",
@@ -885,6 +894,34 @@ def restore_primary_runtime(agent) -> bool:
 
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
+
+    try:
+        from hermes_cli.config import load_config
+        from agent.provider_rotation import ProviderRotationState, is_rotation_enabled
+
+        rotation_config = load_config()
+        rt = agent._primary_runtime
+        primary_provider = (rt.get("provider") or "").strip()
+        primary_model = (rt.get("model") or "").strip()
+        primary_base_url = str(rt.get("base_url") or "").strip()
+        if (
+            is_rotation_enabled(rotation_config)
+            and primary_provider
+            and primary_model
+            and ProviderRotationState.load().is_unavailable(
+                primary_provider,
+                primary_model,
+                base_url=primary_base_url,
+            )
+        ):
+            logging.info(
+                "Provider rotation: primary %s (%s) still cooling down after transient gate; staying on fallback",
+                primary_model,
+                primary_provider,
+            )
+            return False
+    except Exception:
+        logging.debug("Provider rotation restore-path check skipped", exc_info=True)
 
     rt = agent._primary_runtime
     try:

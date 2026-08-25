@@ -717,7 +717,13 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    rate_limit_headers: Any = None,
+    error_context: dict[str, Any] | None = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -745,24 +751,33 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         from agent.provider_rotation import (
             ProviderRotationState,
             cooldown_for_reason,
+            has_durable_rate_limit_evidence,
             is_rotation_enabled,
         )
 
         rotation_config = load_config()
         rotation_enabled = is_rotation_enabled(rotation_config)
         if rotation_enabled and reason in {FailoverReason.rate_limit, FailoverReason.billing}:
-            current_provider_for_state = (getattr(agent, "provider", "") or "").strip()
-            current_model_for_state = (getattr(agent, "model", "") or "").strip()
-            if current_provider_for_state and current_model_for_state:
-                ProviderRotationState.load().mark_unavailable(
-                    provider=current_provider_for_state,
-                    model=current_model_for_state,
-                    reason=getattr(reason, "value", str(reason)),
-                    cooldown_seconds=cooldown_for_reason(
-                        rotation_config,
-                        getattr(reason, "value", str(reason)),
-                    ),
-                )
+            should_persist_cooldown = reason == FailoverReason.billing or has_durable_rate_limit_evidence(
+                headers=rate_limit_headers,
+                last_known_state=getattr(agent, "_rate_limit_state", None),
+                error_context=error_context,
+            )
+            if should_persist_cooldown:
+                current_provider_for_state = (getattr(agent, "provider", "") or "").strip()
+                current_model_for_state = (getattr(agent, "model", "") or "").strip()
+                current_base_url_for_state = str(getattr(agent, "base_url", "") or "").strip()
+                if current_provider_for_state and current_model_for_state:
+                    ProviderRotationState.load().mark_unavailable(
+                        provider=current_provider_for_state,
+                        model=current_model_for_state,
+                        base_url=current_base_url_for_state,
+                        reason=getattr(reason, "value", str(reason)),
+                        cooldown_seconds=cooldown_for_reason(
+                            rotation_config,
+                            getattr(reason, "value", str(reason)),
+                        ),
+                    )
     except Exception:
         logger.debug("Provider rotation state update skipped", exc_info=True)
 
@@ -780,6 +795,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 and ProviderRotationState.load().is_unavailable(
                     fb.get("provider") or "",
                     fb.get("model") or "",
+                    base_url=fb.get("base_url") or "",
                 )
                 and agent._fallback_index < len(agent._fallback_chain)
             ):
@@ -788,6 +804,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             if isinstance(fb, dict) and ProviderRotationState.load().is_unavailable(
                 fb.get("provider") or "",
                 fb.get("model") or "",
+                base_url=fb.get("base_url") or "",
             ):
                 return False
         except Exception:
