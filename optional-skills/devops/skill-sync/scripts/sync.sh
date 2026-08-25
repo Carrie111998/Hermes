@@ -59,7 +59,15 @@ try_ssh() {
 }
 
 get_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+    # GNU first: BSD stat rejects -c with no stdout. The reverse order is a
+    # trap — GNU 'stat -f %m <file>' is FILESYSTEM mode, which dumps a
+    # multi-line info block to stdout (exit 1) that pollutes the capture.
+    local m
+    m=$(stat -c %Y "$1" 2>/dev/null) || m=$(stat -f %m "$1" 2>/dev/null) || m=0
+    case "$m" in
+        ''|*[!0-9]*) m=0 ;;
+    esac
+    echo "$m"
 }
 
 # Archived/backup copies are never synced.
