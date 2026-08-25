@@ -424,9 +424,13 @@ export function quickEntryWindowBounds(workArea?: { height: number; width: numbe
  * GlobalShortcuts portal is not implemented: the compositor spawns
  * `hermes desktop --quick-entry`, the second instance exits through the
  * single-instance lock, and the live instance routes here via argv.
+ *
+ * Accepts both the bare flag and the `--quick-entry=<value>` form: Electron
+ * passes either through verbatim, and a silently-ignored variant is a
+ * "keybind does nothing" bug that is miserable to diagnose from the user side.
  */
 export function hasQuickEntryFlag(argv: readonly string[]): boolean {
-  return argv.includes('--quick-entry')
+  return argv.some(arg => arg === '--quick-entry' || arg.startsWith('--quick-entry='))
 }
 
 export { DEFAULT_QUICK_ENTRY_SHORTCUT, QUICK_ENTRY_TOP_FRACTION, QUICK_ENTRY_WINDOW_HEIGHT, QUICK_ENTRY_WINDOW_WIDTH }

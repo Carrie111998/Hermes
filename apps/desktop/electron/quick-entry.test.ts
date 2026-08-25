@@ -246,6 +246,11 @@ describe('hasQuickEntryFlag', () => {
     expect(hasQuickEntryFlag(['Hermes', '--quick-entry', '--source'])).toBe(true)
   })
 
+  it('accepts the --quick-entry=<value> form Electron passes through verbatim', () => {
+    expect(hasQuickEntryFlag(['Hermes', '--quick-entry=1'])).toBe(true)
+    expect(hasQuickEntryFlag(['--quick-entry=true'])).toBe(true)
+  })
+
   it('ignores other argv and empty argv', () => {
     expect(hasQuickEntryFlag(['Hermes'])).toBe(false)
     expect(hasQuickEntryFlag(['--quick'])).toBe(false)
