@@ -370,7 +370,11 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
     return not result.stdout.strip()
 
 
-def _preserve_venv_shebang_in_launcher() -> None:
+def _preserve_venv_shebang_in_launcher(
+    *,
+    launcher_path: Path | None = None,
+    venv_py: str | Path | None = None,
+) -> None:
     """Preserve venv-pointing shebang in the hermes launcher script after git pull.
 
     The launcher script in the repository has ``#!/usr/bin/env python3`` so it
@@ -398,13 +402,17 @@ def _preserve_venv_shebang_in_launcher() -> None:
     patches the shebang.
     """
     try:
-        launcher = _m().PROJECT_ROOT / "hermes"
+        launcher = (
+            Path(launcher_path)
+            if launcher_path is not None
+            else _m().PROJECT_ROOT / "hermes"
+        )
         if not launcher.is_file():
             # Not a checkout install (PyPI wheel, system package, etc.) — no
             # launcher script to patch.
             return
 
-        venv_py = venv_python_path()
+        venv_py = venv_py if venv_py is not None else venv_python_path()
         if not venv_py or not Path(venv_py).is_file():
             # No venv or venv Python not found — leave the shebang alone.
             logger.debug(
@@ -426,6 +434,12 @@ def _preserve_venv_shebang_in_launcher() -> None:
             )
             return
 
+        # Keep the unresolved absolute path for the shebang. On POSIX,
+        # ``venv/bin/python3`` is commonly a symlink to the base interpreter;
+        # resolving it here would point the launcher at the system Python and
+        # lose the venv's site-packages.
+        target_python = Path(venv_py).absolute()
+
         # Read the current launcher content.
         try:
             lines = launcher.read_text(encoding="utf-8").splitlines(keepends=True)
@@ -437,17 +451,32 @@ def _preserve_venv_shebang_in_launcher() -> None:
             # No shebang line — leave it alone.
             return
 
-        target_shebang = f"#!{venv_exe}\n"
+        target_shebang = f"#!{target_python}\n"
+        if len(target_shebang) > 253:
+            logger.warning(
+                "Launcher shebang is longer than Linux's safe limit (%d bytes): %s",
+                len(target_shebang),
+                target_shebang.strip(),
+            )
         if lines[0] == target_shebang:
             # Already pointing at the venv — nothing to do.
             return
 
-        # Rewrite the shebang to point at the venv Python.
+        # Rewrite atomically so an interrupted update cannot leave a truncated
+        # launcher. Preserve the original mode explicitly because write_text()
+        # would otherwise create a replacement using the process umask.
         lines[0] = target_shebang
+        temporary = launcher.with_name(f".{launcher.name}.tmp-{os.getpid()}")
         try:
-            launcher.write_text("".join(lines), encoding="utf-8")
+            temporary.write_text("".join(lines), encoding="utf-8")
+            temporary.chmod(launcher.stat().st_mode & 0o7777)
+            os.replace(temporary, launcher)
             logger.debug("Rewrote launcher shebang to %s", target_shebang.strip())
         except OSError as exc:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
             logger.debug("Could not rewrite launcher shebang in %s: %s", launcher, exc)
 
     except Exception as exc:
