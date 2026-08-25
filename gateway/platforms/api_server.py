@@ -1440,6 +1440,15 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Idempotent run admission: caller key -> request fingerprint + run id.
+        # This is process-local like run status itself and is swept with the
+        # corresponding terminal status record.
+        self._run_idempotency: Dict[str, Dict[str, Any]] = {}
+        # Admission for /v1/runs is serialized so the idempotency check and
+        # registration are atomic across the session-history reload. Without it,
+        # two same-key requests arriving in that await window both pass the
+        # empty check and both start a run (two handles for one operation).
+        self._run_idempotency_lock: "asyncio.Lock" = asyncio.Lock()
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -6686,12 +6695,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         try:
             body = await request.json()
         except Exception:
@@ -6765,52 +6768,126 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        session_id = session_id or run_id
-        # Approval queues gate host-side tool execution and must be isolated
-        # per API run.  Client-provided session IDs and memory session keys are
-        # conversation/memory scopes, not authorization namespaces: multiple
-        # concurrent runs can intentionally share them, and resolving an
-        # approval for one run must not unblock another run's dangerous command.
-        approval_session_key = run_id
-        ephemeral_system_prompt = instructions
-        loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = created_at
-        self._run_approval_sessions[run_id] = approval_session_key
+        # A replay must resolve even while the original run consumes the last
+        # concurrency slot. Check idempotency before enforcing the limit so a
+        # caller recovering from a lost 202 response receives the original
+        # run id instead of an unrelated 429.
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if len(idempotency_key) > 255 or re.search(r"[\r\n\x00]", idempotency_key):
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key must be at most 255 characters and contain no control newlines",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+        async with self._run_idempotency_lock:
+            idempotency_fingerprint = ""
+            if idempotency_key:
+                idempotency_fingerprint = _make_request_fingerprint(
+                    body,
+                    [
+                        "input",
+                        "session_id",
+                        "instructions",
+                        "conversation_history",
+                        "previous_response_id",
+                        "model",
+                        "provider",
+                        "model_options",
+                    ],
+                )
+                previous = self._run_idempotency.get(idempotency_key)
+                if previous is not None:
+                    if previous.get("fingerprint") != idempotency_fingerprint:
+                        return web.json_response(
+                            _openai_error(
+                                "Idempotency-Key was already used with a different request",
+                                code="idempotency_conflict",
+                            ),
+                            status=409,
+                        )
+                    previous_run_id = str(previous.get("run_id") or "")
+                    previous_status = self._run_statuses.get(previous_run_id)
+                    if previous_status is not None:
+                        return web.json_response(
+                            {
+                                "run_id": previous_run_id,
+                                "status": previous_status.get("status", "queued"),
+                                "replayed": True,
+                            },
+                            status=202,
+                        )
+                    # Status retention is the public lifetime of a run handle.
+                    # If it has expired, let the key start a fresh run.
+                    self._run_idempotency.pop(idempotency_key, None)
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+            # Enforce concurrency only for a genuinely new run.
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
 
-        def _put_event_if_active(event: Optional[Dict]) -> None:
-            """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+            # Native session callers expect continuity from session_id alone.
+            # Explicit history and previous_response_id still win. The durable
+            # turn lease reloads once more after a contended wait, closing the
+            # race where another process appends after this snapshot.
+            if not conversation_history and session_id and not previous_response_id:
+                conversation_history = await self._conversation_history_for_session(
+                    str(session_id)
+                )
 
-        # Also wire stream_delta_callback so message.delta events flow through.
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
-            if run_id not in self._run_streams:
-                return
-            try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
-                    "event": "message.delta",
+            run_id = f"run_{uuid.uuid4().hex}"
+            session_id = session_id or run_id
+            # Approval queues gate host-side tool execution and must be isolated
+            # per API run.  Client-provided session IDs and memory session keys are
+            # conversation/memory scopes, not authorization namespaces: multiple
+            # concurrent runs can intentionally share them, and resolving an
+            # approval for one run must not unblock another run's dangerous command.
+            approval_session_key = run_id
+            ephemeral_system_prompt = instructions
+            loop = asyncio.get_running_loop()
+            q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+            created_at = time.time()
+            self._run_streams[run_id] = q
+            self._run_streams_created[run_id] = created_at
+            self._run_approval_sessions[run_id] = approval_session_key
+
+            event_cb = self._make_run_event_callback(run_id, loop)
+
+            def _put_event_if_active(event: Optional[Dict]) -> None:
+                """Enqueue only while this run still owns live transport state."""
+                if self._run_streams.get(run_id) is q:
+                    q.put_nowait(event)
+
+            # Also wire stream_delta_callback so message.delta events flow through.
+            def _text_cb(delta: Optional[str]) -> None:
+                if delta is None:
+                    return
+                if run_id not in self._run_streams:
+                    return
+                try:
+                    loop.call_soon_threadsafe(_put_event_if_active, {
+                        "event": "message.delta",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "delta": delta,
+                    })
+                except Exception:
+                    pass
+
+            self._set_run_status(
+                run_id,
+                "queued",
+                created_at=created_at,
+                session_id=session_id,
+                model=body.get("model", self._model_name),
+            )
+            if idempotency_key:
+                self._run_idempotency[idempotency_key] = {
+                    "fingerprint": idempotency_fingerprint,
                     "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
-
-        self._set_run_status(
-            run_id,
-            "queued",
-            created_at=created_at,
-            session_id=session_id,
-            model=body.get("model", self._model_name),
-        )
+                    "created_at": created_at,
+                }
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
@@ -7089,7 +7166,7 @@ class APIServerAdapter(BasePlatformAdapter):
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {"run_id": run_id, "status": "started", "replayed": False},
             status=202,
             headers=response_headers,
         )
@@ -7388,6 +7465,10 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+        live_run_ids = set(self._run_statuses)
+        for key, record in list(self._run_idempotency.items()):
+            if record.get("run_id") not in live_run_ids:
+                self._run_idempotency.pop(key, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

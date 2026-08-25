@@ -12,7 +12,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -146,6 +146,163 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_start_replays_same_idempotency_key_without_second_run(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "peer-ticket-123"}
+
+                first = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=headers
+                )
+                second = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=headers
+                )
+                first_data = await first.json()
+                second_data = await second.json()
+
+                assert first.status == second.status == 202
+                assert second_data["run_id"] == first_data["run_id"]
+                assert second_data["replayed"] is True
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{first_data['run_id']}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_serializes_concurrent_same_idempotency_key(self, adapter):
+        """Concurrent requests with the same Idempotency-Key must not both start a run.
+
+        The idempotency check and registration are separated by an ``await``
+        (the session-history reload). Two same-key requests arriving in that
+        window would both pass the empty check and both create a run, leaving
+        two handles for one logical operation. The admission must serialize so
+        the loser resolves to the winner's run_id and no duplicate agent runs.
+        """
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+
+            async def _slow_history(session_id):
+                await asyncio.sleep(0.05)
+                return []
+
+            with (
+                patch.object(adapter, "_conversation_history_for_session", new=_slow_history),
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "peer-concurrent-777"}
+
+                async def _post():
+                    return await cli.post(
+                        "/v1/runs",
+                        json={"input": "hello", "session_id": "bot-chat"},
+                        headers=headers,
+                    )
+
+                first_resp, second_resp = await asyncio.gather(_post(), _post())
+                first_data = await first_resp.json()
+                second_data = await second_resp.json()
+
+                assert first_resp.status == second_resp.status == 202
+                assert second_data["run_id"] == first_data["run_id"]
+                assert second_data["replayed"] is True
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{first_data['run_id']}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_idempotency_key_reuse_for_different_request(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "peer-ticket-123"}
+
+                first = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=headers
+                )
+                second = await cli.post(
+                    "/v1/runs", json={"input": "different"}, headers=headers
+                )
+                second_data = await second.json()
+
+                assert first.status == 202
+                assert second.status == 409
+                assert second_data["error"]["code"] == "idempotency_conflict"
+
+    @pytest.mark.asyncio
+    async def test_start_loads_history_for_existing_session_id(self, adapter):
+        app = _create_runs_app(adapter)
+        history = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "context"},
+        ]
+        load_history = AsyncMock(return_value=history)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    new=load_history,
+                ),
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "continue", "session_id": "bot-chat"},
+                )
+                data = await resp.json()
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        load_history.assert_awaited_once_with("bot-chat")
+        assert (
+            mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+            == history
+        )
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
