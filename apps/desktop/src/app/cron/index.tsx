@@ -4,8 +4,8 @@ import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { PageLoader } from '@/components/page-loader'
 import { ModelPickerDialog } from '@/components/model-picker'
+import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
@@ -702,9 +702,6 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
               busy={busyJobTokens.has(selectedJob.id) || triggeringJobKeys.has(`${profile}:${selectedJob.id}`)}
               c={c}
               job={selectedJob}
-              onOpenSession={onOpenSession}
-              onPauseResume={() => void handlePauseResume(selectedJob)}
-              onTrigger={() => void handleTrigger(selectedJob)}
               onModelChange={async (provider, model) => {
                 const { refreshError, stale } = await mutateAndRefreshCronJobs(profile, () =>
                   updateCronJob(selectedJob.id, {
@@ -721,6 +718,9 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
                   notifyError(refreshError, c.failedLoad)
                 }
               }}
+              onOpenSession={onOpenSession}
+              onPauseResume={() => void handlePauseResume(selectedJob)}
+              onTrigger={() => void handleTrigger(selectedJob)}
             />
           ) : query.trim() ? (
             // A search with no selected job: search-flavored copy is right.
@@ -798,18 +798,18 @@ function CronJobDetail({
   busy,
   c,
   job,
+  onModelChange,
   onOpenSession,
   onPauseResume,
-  onTrigger,
-  onModelChange
+  onTrigger
 }: {
   busy: boolean
   c: Translations['cron']
   job: CronJob
+  onModelChange?: (provider: string, model: string) => Promise<void>
   onOpenSession?: (sessionId: string) => void
   onPauseResume: () => void
   onTrigger: () => void
-  onModelChange?: (provider: string, model: string) => Promise<void>
 }) {
   const state = jobState(job)
   const isPaused = state === 'paused'
