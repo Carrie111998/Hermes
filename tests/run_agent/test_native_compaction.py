@@ -83,6 +83,14 @@ class TestRequestGate:
             {"type": "compaction", "compact_threshold": DEFAULT_COMPACT_THRESHOLD}
         ]
 
+    def test_taie_emergency_allowlist_gets_payload(self):
+        payload = native_compaction_context_management(
+            _agent(base_url="https://api.taie.cc"), is_codex_backend=False
+        )
+        assert payload == [
+            {"type": "compaction", "compact_threshold": DEFAULT_COMPACT_THRESHOLD}
+        ]
+
     def test_codex_backend_gets_payload(self):
         payload = native_compaction_context_management(
             _agent(base_url="https://chatgpt.com/backend-api/codex"),

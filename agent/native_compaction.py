@@ -17,11 +17,11 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
   path (90s watchdog x 3 retries = a dead turn). There is no structured
   "unsupported" rejection to downgrade on, so the only safe gate is an
   explicit model-family check.
-* **Direct OpenAI routes only:** api.openai.com (API key) or the ChatGPT
-  Codex backend (subscription OAuth). Every other Responses surface
-  (xAI, GitHub/Copilot, relays, local servers) never sees the field —
-  most would 400 on the unknown parameter, and none can mint or decrypt
-  the compaction blob.
+* **Direct OpenAI routes plus explicit emergency exceptions:** api.openai.com
+  (API key), the ChatGPT Codex backend (subscription OAuth), or a narrowly
+  allowlisted relay. Every other Responses surface (xAI, GitHub/Copilot,
+  relays, local servers) never sees the field — most would 400 on the unknown
+  parameter, and none can be assumed to preserve the compaction blob.
 
 Ownership model: Hermes' local compression stays fully armed as the
 fallback owner. The native threshold is clamped safely below the local
@@ -61,6 +61,10 @@ DEFAULT_COMPACT_THRESHOLD = 200_000
 # snapshots (gpt-5.6-2026-07-xx) and variants (gpt-5.6-mini) stay eligible.
 _ELIGIBLE_MODEL_MARKER = "gpt-5.6"
 
+# Operator-approved emergency exception for the TAIE/sub2api Responses relay.
+# Keep this exact-host only; replace it with a provider capability flag later.
+_TRUSTED_RELAY_HOSTNAMES = frozenset({"api.taie.cc"})
+
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
     """True when the model is in the gpt-5.6 family."""
@@ -72,14 +76,14 @@ def is_direct_openai_route(
     *,
     is_codex_backend: bool = False,
 ) -> bool:
-    """True for api.openai.com or the ChatGPT Codex backend — nothing else."""
+    """True for direct OpenAI routes or an explicit emergency relay exception."""
     if is_codex_backend:
         return True
     try:
         hostname = (urlsplit(base_url or "").hostname or "").lower()
     except ValueError:
         return False
-    return hostname == "api.openai.com"
+    return hostname == "api.openai.com" or hostname in _TRUSTED_RELAY_HOSTNAMES
 
 
 def resolve_compact_threshold(
