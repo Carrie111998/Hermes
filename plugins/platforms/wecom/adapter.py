@@ -1466,9 +1466,24 @@ class WeComAdapter(BasePlatformAdapter):
         # Busy-ack and similar receipts for a NEW message must not touch the
         # still-running turn's stream — deliver as standalone markdown.
         no_stream = bool(metadata and metadata.get("_wecom_no_stream"))
+        # A redirect ack CLOSES the old visual turn: finish the open bubble
+        # with the "adjusted" notice so the next send_typing opens a fresh
+        # bubble that carries the redirected answer.
+        is_redirect_ack = bool(metadata and metadata.get("_wecom_redirect"))
 
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
+
+        if is_redirect_ack:
+            from agent.i18n import t
+            closed = await self._finish_thinking(
+                chat_id, t("gateway.busy_ack.redirect_short"))
+            if not closed:
+                # No live bubble (or expired) — fall through to a standalone
+                # message so the receipt still reaches the user.
+                pass
+            else:
+                return SendResult(success=True)
 
         # Live bubble open → write into it. Mid-turn: finish=false (bubble
         # content updates, stays "thinking"); final: finish=true (replaced by
@@ -1635,8 +1650,11 @@ class WeComAdapter(BasePlatformAdapter):
             """Independent heartbeat — same role as bridge's setInterval.
 
             Self-terminates when the stream exceeds its ~6min server lifetime
-            (further frames would be rejected anyway) or when finished.
+            (further frames would be rejected anyway) or when finished. At the
+            deadline it writes one visible hint frame first, so the user sees
+            "still working" instead of the bubble silently going blank.
             """
+            from agent.i18n import t
             deadline = time.monotonic() + self.THINKING_STREAM_MAX_S
             while True:
                 await asyncio.sleep(self.THINKING_KEEPALIVE_S)
@@ -1644,6 +1662,19 @@ class WeComAdapter(BasePlatformAdapter):
                 if cur is None or cur["id"] != stream_id:
                     return  # finished or replaced
                 if time.monotonic() > deadline:
+                    # One last VISIBLE frame before giving up: replace the
+                    # blank placeholder with a still-working notice.
+                    try:
+                        if self._ws and not self._ws.closed:
+                            await self._ws.send_json({
+                                "cmd": APP_CMD_RESPONSE,
+                                "headers": {"req_id": cur["req"]},
+                                "body": {"msgtype": "stream",
+                                         "stream": {"id": stream_id, "finish": False,
+                                                    "content": t("gateway.busy_ack.still_working")}},
+                            })
+                    except Exception:
+                        pass
                     return  # stream expired server-side; stop feeding frames
                 try:
                     if self._ws and not self._ws.closed:

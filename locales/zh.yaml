@@ -452,6 +452,8 @@ Future messages in this room will use that transcript until `/reset` or another 
     status_detail:              "（{parts}）"
     steered:                    "⏩ 已转入当前运行{detail}。你的消息将在下一个工具调用结束后生效。"
     redirected:                 "↪ 已重定向当前运行{detail}。我会根据你的纠正调整。"
+    redirect_short:             "↪ 已按你的补充调整方向，正在重新处理…"
+    still_working:              "⏳ 仍在处理中（任务较大，请稍候）…"
     queued_subagent:            "⏳ 子代理运行中{detail}——你的消息已排队，等它结束后处理（用 /stop 可全部取消）。"
     queued_compression:         "⏳ 正在压缩上下文{detail}——你的消息已排队，完成后处理（用 /stop 可全部取消）。"
     queued:                     "⏳ 已排队等待下一轮{detail}。当前任务完成后我会回复你。"

@@ -10604,9 +10604,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # WeCom single-stream: the busy-ack is a receipt for the NEW message,
         # not part of the still-running turn's stream — mark it so adapter
         # send() delivers it as a standalone markdown message instead of
-        # overwriting the open thinking bubble.
+        # overwriting the open thinking bubble. EXCEPTION: a successful
+        # redirect IS the closure of the old visual turn — the adapter turns
+        # the open bubble into "↪ adjusted" and the next send_typing opens a
+        # fresh one, matching the desktop UX (old bubble settles, new bubble
+        # carries the redirected answer).
         if isinstance(thread_meta, dict):
-            thread_meta["_wecom_no_stream"] = True
+            if is_redirect_mode:
+                thread_meta["_wecom_redirect"] = True
+            else:
+                thread_meta["_wecom_no_stream"] = True
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,

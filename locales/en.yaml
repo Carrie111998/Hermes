@@ -465,6 +465,8 @@ gateway:
     status_detail:              " ({parts})"
     steered:                    "⏩ Steered into current run{detail}. Your message arrives after the next tool call."
     redirected:                 "↪ Redirected current run{detail}. I'll adjust using your correction."
+    redirect_short:             "↪ Adjusting based on your follow-up…"
+    still_working:              "⏳ Still working on it (this one is a big task)…"
     queued_subagent:            "⏳ Subagent working{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
     queued_compression:         "⏳ Compressing context{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
     queued:                     "⏳ Queued for the next turn{detail}. I'll respond once the current task finishes."
