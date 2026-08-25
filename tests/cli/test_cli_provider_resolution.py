@@ -260,6 +260,55 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
 
 
 
+def test_primary_auth_failure_custom_fallback_forwards_target_model(monkeypatch):
+    cli = _import_cli()
+    monkeypatch.setenv("FALLBACK_CUSTOM_KEY", "fallback-secret")
+    calls = []
+
+    def _runtime_resolve(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise AuthError("primary auth failed")
+        return {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": kwargs["explicit_base_url"],
+            "api_key": kwargs["explicit_api_key"],
+            "source": "direct-alias",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _runtime_resolve,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.format_runtime_provider_error",
+        lambda exc: str(exc),
+    )
+
+    shell = cli.HermesCLI(model="claude-sonnet-4-6", compact=True, max_turns=1)
+    shell.requested_provider = "anthropic"
+    shell._fallback_model = [
+        {
+            "provider": "custom",
+            "model": "local-fallback-model",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "api_key_env": "FALLBACK_CUSTOM_KEY",
+        }
+    ]
+
+    assert shell._ensure_runtime_credentials() is True
+    assert calls[1] == {
+        "requested": "custom",
+        "target_model": "local-fallback-model",
+        "explicit_api_key": "fallback-secret",
+        "explicit_base_url": "http://127.0.0.1:8080/v1",
+    }
+    assert shell.provider == "custom"
+    assert shell.base_url == "http://127.0.0.1:8080/v1"
+    assert shell.api_key == "fallback-secret"
+
+
 
 def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     cli = _import_cli()
