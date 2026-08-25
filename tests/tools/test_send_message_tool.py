@@ -356,6 +356,66 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_forwarded_computer_use_screenshot_path_is_repaired_before_extraction(self):
+        # A model that just ran computer_use and forwards the screenshot via
+        # send_message (instead of putting MEDIA: in its own final response)
+        # can mangle the absolute path the same way it can in a final turn
+        # response. The turn-completion delivery surfaces already repair
+        # this (gateway/run.py, cron/scheduler.py); send_message must too,
+        # using the `messages` conversation history passed through
+        # model_tools.handle_function_call for tools in
+        # _MEDIA_REPAIR_ELIGIBLE_TOOL_NAMES.
+        from gateway.platforms.base import BasePlatformAdapter
+
+        config, telegram_cfg = _make_config()
+        basename_hex = "a" * 32
+        canonical_path = (
+            f"C:\\Users\\Alice\\AppData\\Local\\Hermes\\cache\\computer_use_{basename_hex}.png"
+        )
+        mangled_path = (
+            f"/Users/Alice/AppData/Local/Hermes/cache/computer_use_{basename_hex}.png"
+        )
+        conversation_messages = [
+            {"role": "user", "content": "take a screenshot and DM it to alice"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "computer_use",
+                "content": (
+                    "Screenshot captured. "
+                    f"(shareable screenshot saved to {canonical_path})"
+                ),
+            },
+        ]
+
+        real_extract_media = BasePlatformAdapter.extract_media
+        captured: dict = {}
+
+        def _spy_extract_media(content):
+            captured["content"] = content
+            return real_extract_media(content)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session", return_value=True), \
+             patch.object(BasePlatformAdapter, "extract_media", staticmethod(_spy_extract_media)):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": f"Here you go\nMEDIA:{mangled_path}",
+                    },
+                    messages=conversation_messages,
+                )
+            )
+
+        assert result["success"] is True
+        assert canonical_path in captured["content"]
+        assert mangled_path not in captured["content"]
+
     def test_top_level_send_failure_redacts_query_token(self):
         config, _telegram_cfg = _make_config()
         leaked = "very-secret-query-token-123456"

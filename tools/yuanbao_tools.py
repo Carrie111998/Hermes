@@ -468,6 +468,15 @@ async def _handle_yb_send_dm(args, **kw):
     # Extract MEDIA:<path> tags embedded in the message text (LLM often puts
     # file paths there instead of using the media_files parameter).
     message = args.get("message", "")
+    conversation_messages = kw.get("messages")
+    if conversation_messages:
+        # A model that just ran computer_use and now forwards that
+        # screenshot via yb_send_dm can mangle the absolute path the same
+        # way it can in a final turn response — recover it before media
+        # extraction/validation, mirroring the repair every other delivery
+        # surface (gateway/run.py, cron/scheduler.py) already applies.
+        from gateway.media_repair import repair_explicit_computer_use_media_paths
+        message = repair_explicit_computer_use_media_paths(message, conversation_messages)
     from gateway.platforms.base import BasePlatformAdapter
     embedded_media, message = BasePlatformAdapter.extract_media(message)
     if embedded_media:
