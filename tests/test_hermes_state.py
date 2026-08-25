@@ -1657,6 +1657,15 @@ class TestSanitizeTitle:
         assert SessionDB.sanitize_title("a\u200db") == "ab"
         assert SessionDB.sanitize_title("a\u202eb") == "ab"
 
+    def test_line_and_paragraph_separators_keep_word_gap(self):
+        # U+2028 (LINE SEPARATOR) / U+2029 (PARAGRAPH SEPARATOR) are
+        # whitespace in pasted multi-line text, same class as U+200B:
+        # deleting them glued words ("a<2028>b" -> "ab"). They must
+        # normalize to a real space like the zero-width cases above.
+        assert SessionDB.sanitize_title("a\u2028b") == "a b"
+        assert SessionDB.sanitize_title("Alpha\u2029Beta") == "Alpha Beta"
+        assert SessionDB.sanitize_title("Notes\u2028\u2029draft") == "Notes draft"
+
 
 
 

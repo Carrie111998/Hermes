@@ -9116,8 +9116,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         - Strips leading/trailing whitespace
         - Removes ASCII control characters (0x00-0x1F, 0x7F)
-        - Normalizes zero-width space characters (U+200B, U+FEFF) to plain
-          spaces so pasted titles keep their visible word gaps
+        - Normalizes zero-width space characters (U+200B, U+FEFF) and
+          line/paragraph separators (U+2028, U+2029) to plain spaces so
+          pasted titles keep their visible word gaps
         - Removes remaining problematic Unicode control chars (joiners,
           RTL/LTR overrides, etc.)
         - Collapses internal whitespace runs to single spaces
@@ -9143,16 +9144,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # are word separators in text pasted from web pages and chat apps.
         # Convert them to a real space before the whitespace collapse so a
         # title like "a\u200bb" keeps its visible word gap instead of being
-        # silently stored as "ab" (#93968).
+        # silently stored as "ab" (#93968). U+2028 (LINE SEPARATOR) and
+        # U+2029 (PARAGRAPH SEPARATOR) are whitespace the same way: pasted
+        # multi-line text uses them where a newline would be.
         cleaned = cleaned.replace('\u200b', ' ').replace('\ufeff', ' ')
+        cleaned = cleaned.replace('\u2028', ' ').replace('\u2029', ' ')
 
         # Remove problematic Unicode control characters:
         # - Joiners and directional marks (U+200C-U+200F)
-        # - Line/paragraph separators (U+2028-U+2029), directional
-        #   overrides (U+202A-U+202E), isolates (U+2066-U+2069)
+        # - Directional overrides (U+202A-U+202E), isolates (U+2066-U+2069)
         # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
         cleaned = re.sub(
-            r'[\u200c-\u200f\u2028-\u202e\u2060-\u2069\ufffc\ufff9-\ufffb]',
+            r'[\u200c-\u200f\u202a-\u202e\u2060-\u2069\ufffc\ufff9-\ufffb]',
             '', cleaned,
         )
 
