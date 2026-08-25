@@ -1233,10 +1233,10 @@ export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number 
 }
 
 export const workspaceCwdForNewSession = (): string => {
-  // Both remote and local connections check the remembered workspace cwd,
-  // which is now scoped per-profile (see workspaceCwdKey above). This
-  // prevents a profile switch from inheriting the previous profile's
-  // working directory (#81492).
+  // Check the remembered workspace cwd for BOTH remote and local connections.
+  // The remembered cwd is scoped per-profile (see workspaceCwdKey), so this
+  // honors each profile's own workspace instead of leaking the previous
+  // profile's directory (#81492 follow-up to the key-scoping fix).
   const remembered = getRememberedWorkspaceCwd()
   if (remembered) {
     return remembered
