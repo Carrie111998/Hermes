@@ -2115,7 +2115,15 @@ def _tui_need_npm_install(root: Path) -> bool:
         return lock.stat().st_mtime > marker.stat().st_mtime
 
     def comparable(pkg: dict) -> dict:
-        return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
+        # "dev"/"devOptional" are npm's recorded dependency-role annotations
+        # and legitimately differ between the canonical lock and the hidden
+        # lock after a scoped install actualizes the tree; they don't change
+        # what is on disk.
+        return {
+            k: v
+            for k, v in pkg.items()
+            if k not in _NPM_LOCK_RUNTIME_KEYS | {"dev", "devOptional"}
+        }
 
     for name, pkg in wanted.items():
         if not name:
@@ -2126,6 +2134,20 @@ def _tui_need_npm_install(root: Path) -> bool:
 
         if name not in installed:
             if pkg.get("optional") or pkg.get("peer"):
+                continue
+            # Scoped installs (e.g. `npm install --workspace ui-tui`) never
+            # materialize packages belonging to other workspaces — apps/,
+            # tests-js/, or root-hoisted deps of those workspaces — so they
+            # will always be missing from the hidden lockfile.  Only require
+            # TUI-workspace entries to be present; anything else being absent
+            # is expected and would otherwise trigger a spurious reinstall on
+            # every launch.  See #38772 / #42973 for related scoped-install
+            # fixes.
+            if not (
+                name.startswith(("ui-tui/", "packages/"))
+                or "/node_modules/ui-tui/" in f"/{name}"
+                or name.startswith("node_modules/@hermes/ink")
+            ):
                 continue
             return True
 
