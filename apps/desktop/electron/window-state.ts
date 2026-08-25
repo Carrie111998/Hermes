@@ -18,6 +18,15 @@ const MIN_HEIGHT = 620
 // a saved position, so the title bar stays grabbable after a monitor unplugs.
 const MIN_VISIBLE = 48
 
+// A stale normal-bounds snapshot can be almost identical to the work area while
+// isMaximized=false (for example after a DPI/display transition). Restoring that
+// verbatim leaves Windows with no meaningful restore-down size. Treat a window
+// that covers at least 90% of both work-area dimensions and starts near that
+// work area's origin as the stuck-fullscreen shape, then recover to a centered
+// 80% windowed size.
+const STALE_FULLSCREEN_RATIO = 0.9
+const RECOVERED_WINDOW_RATIO = 0.8
+
 const finite = v => typeof v === 'number' && Number.isFinite(v)
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(v, hi))
 
@@ -76,6 +85,35 @@ interface WindowOptions {
   y?: number
 }
 
+function staleFullscreenWorkArea(state, displays) {
+  if (
+    !state ||
+    state.isMaximized ||
+    !finite(state.x) ||
+    !finite(state.y) ||
+    !finite(state.width) ||
+    !finite(state.height) ||
+    !Array.isArray(displays)
+  ) {
+    return null
+  }
+
+  return (
+    displays.find(({ workArea: a } = {}) => {
+      if (!a || !finite(a.x) || !finite(a.y) || !finite(a.width) || !finite(a.height)) {
+        return false
+      }
+
+      const nearOriginX = Math.abs(state.x - a.x) <= a.width * (1 - STALE_FULLSCREEN_RATIO)
+      const nearOriginY = Math.abs(state.y - a.y) <= a.height * (1 - STALE_FULLSCREEN_RATIO)
+      const fillsWidth = state.width >= a.width * STALE_FULLSCREEN_RATIO
+      const fillsHeight = state.height >= a.height * STALE_FULLSCREEN_RATIO
+
+      return nearOriginX && nearOriginY && fillsWidth && fillsHeight
+    })?.workArea ?? null
+  )
+}
+
 // Sanitized state (or null) → BrowserWindow size/position options. Always sets
 // width/height, capped to the largest current display so a size saved on a
 // since-disconnected bigger monitor can't exceed any screen the user now has.
@@ -97,6 +135,13 @@ function computeWindowOptions(state, displays): WindowOptions {
   if (cap.width && cap.height) {
     opts.width = clamp(opts.width, MIN_WIDTH, cap.width)
     opts.height = clamp(opts.height, MIN_HEIGHT, cap.height)
+  }
+
+  const staleWorkArea = staleFullscreenWorkArea(state, displays)
+  if (staleWorkArea) {
+    opts.width = clamp(Math.round(staleWorkArea.width * RECOVERED_WINDOW_RATIO), MIN_WIDTH, staleWorkArea.width)
+    opts.height = clamp(Math.round(staleWorkArea.height * RECOVERED_WINDOW_RATIO), MIN_HEIGHT, staleWorkArea.height)
+    return opts
   }
 
   if (
