@@ -190,12 +190,17 @@ def _cron_anti_propagation_guidance(hint: str) -> str:
     ``_tui_embedded_pane_clarifier`` uses for its own runtime-surface
     qualifier — means the warning survives that override.
 
-    Idempotent and total: re-applying on an already-augmented hint is a
-    no-op, and an empty hint still yields the warning on its own (a cron
-    session must never end up with no anti-propagation guidance at all).
+    Always appended, never skipped: an override whose text happens to
+    contain the canonical warning (it's public — anyone can quote it back)
+    must not be able to neutralize it by trailing contradicting text after
+    the quoted copy. ``_effective_hint`` is freshly resolved once per
+    prompt build and this helper is applied to it exactly once, so there is
+    no real re-application path to guard against — an "already present"
+    short-circuit would only ever fire on a crafted override, which is
+    precisely the case that must still get the guidance appended last.
+    An empty hint still yields the warning on its own (a cron session must
+    never end up with no anti-propagation guidance at all).
     """
-    if _CRON_ANTI_PROPAGATION_HINT in hint:
-        return hint
     if not hint:
         return _CRON_ANTI_PROPAGATION_HINT
     return f"{hint}\n\n{_CRON_ANTI_PROPAGATION_HINT}"
