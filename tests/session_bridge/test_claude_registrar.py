@@ -4154,3 +4154,65 @@ def test_cursor_forward_input_modal_signature_still_matches() -> None:
         "\x1b[1CYes,\x1b[1Ctry\x1b[1Cit\x1b[1CNot\x1b[1Cnow\x1b[0m"
     )
     assert _known_claude_input_modal_visible(welded) is True
+
+
+def test_factory_strips_inherited_claude_code_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host agent session exports CLAUDE_CODE_* into everything it spawns.
+
+    An inherited copy makes the launched CLI ignore ~/.claude/.credentials.json
+    and report itself logged out, so the registration turn never runs and no
+    transcript is written -- which is indistinguishable, from the job's side,
+    from a prompt that was never submitted.  Measured live 2026-08-24 as a
+    controlled pair from one cwd: with these stripped the launch wrote a
+    transcript, with them inherited it wrote none.  session-bridge is started by
+    launch-session-bridge.ps1, which does not scrub them, and in practice that
+    launcher is run from an agent session -- so the service carries them and
+    hands them to every registrar child.
+
+    Only the prefix is dropped.  Unrelated inherited variables must survive,
+    because the child still needs PATH, USERPROFILE and the rest of the host
+    environment to run at all.
+    """
+
+    observed: dict[str, Any] = {}
+
+    class ProcessType:
+        @staticmethod
+        def spawn(
+            argv: list[str],
+            *,
+            cwd: str,
+            env: dict[str, str],
+            dimensions: tuple[int, int],
+        ) -> object:
+            observed["env"] = env
+            return object()
+
+    monkeypatch.setattr(
+        "session_bridge.claude_registrar._registrar_pywinpty_process_type",
+        lambda: ProcessType,
+    )
+    for name, value in (
+        ("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "1"),
+        ("CLAUDE_CODE_OAUTH_SCOPES", "inherited scopes"),
+        ("CLAUDE_CODE_SESSION_ID", "host-session-id"),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "host-token"),
+        ("CLAUDE_CODE_EXECPATH", "C:/host/claude.exe"),
+        ("PATH_SENTINEL_FOR_TEST", "must-survive"),
+    ):
+        monkeypatch.setenv(name, value)
+
+    WindowsConPtyFactory()._spawn_process(["claude"], cwd="C:/exact")
+
+    env = observed["env"]
+    assert sorted(n for n in env if n.startswith("CLAUDE_CODE_")) == [
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "CLAUDE_CODE_ENTRYPOINT",
+    ]
+    assert env["CLAUDE_CODE_ENTRYPOINT"] == "cli"
+    assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert env["PATH_SENTINEL_FOR_TEST"] == "must-survive"
+    # The host's own environment must not be mutated on the way past.
+    assert os.environ["CLAUDE_CODE_SESSION_ID"] == "host-session-id"
