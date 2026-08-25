@@ -369,6 +369,31 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
         return False
     return not result.stdout.strip()
 
+def _validate_python_files_syntax(
+    root, relpaths
+) -> tuple[bool, str | None, str | None]:
+    """Compile selected Python files without writing bytecode into the tree."""
+    import py_compile
+    import tempfile
+
+    root = Path(root)
+    with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
+        for index, relpath in enumerate(relpaths):
+            path = root / relpath
+            if not path.exists():
+                continue
+            cfile = Path(tmpdir) / (
+                f"{index}__{str(relpath).replace('/', '__')}c"
+            )
+            try:
+                py_compile.compile(str(path), cfile=str(cfile), doraise=True)
+            except py_compile.PyCompileError as exc:
+                return False, str(path), str(exc)
+            except OSError as exc:
+                return False, str(path), f"could not read: {exc}"
+    return True, None, None
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -388,27 +413,7 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
     Returns ``(ok, failing_path, error_message)``. ``ok=True`` means every
     file parsed cleanly.
     """
-    import py_compile
-    import tempfile
-
-    root = Path(root)
-    with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
-        for relpath in _UPDATE_CRITICAL_FILES:
-            path = root / relpath
-            if not path.exists():
-                # Missing file is suspicious but not necessarily fatal — a future
-                # refactor may legitimately remove one of these. Skip and move on.
-                continue
-            # Mirror the relative path under the tmpdir so two different
-            # files with the same basename don't collide on the cfile name.
-            cfile = Path(tmpdir) / (relpath.replace("/", "__") + "c")
-            try:
-                py_compile.compile(str(path), cfile=str(cfile), doraise=True)
-            except py_compile.PyCompileError as exc:
-                return False, str(path), str(exc)
-            except OSError as exc:
-                return False, str(path), f"could not read: {exc}"
-    return True, None, None
+    return _validate_python_files_syntax(root, _UPDATE_CRITICAL_FILES)
 
 
 # Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
@@ -423,7 +428,9 @@ _UPDATE_CRITICAL_MODULES = (
 )
 
 
-def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
+def _validate_critical_modules_import(
+    root, *, strict: bool = False
+) -> tuple[bool, str | None, str | None]:
     """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
 
     ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
@@ -446,6 +453,13 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
     different Python than the install's own, and probing the wrong
     interpreter would test a tree the user never runs.
 
+    ``strict=True`` is used after applying user source changes. In that phase,
+    failing to execute the proof is itself unsafe: the updater must not drop
+    the recovery stash or proceed to a gateway restart without a verdict.
+    Existing post-install callers keep the historical best-effort behavior
+    with the default ``strict=False`` because they may run before dependency
+    installation.
+
     Returns ``(ok, failing_module, error_message)``.
     """
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
@@ -465,6 +479,9 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
         "            sys.stdout.write(name + '\\n' + str(exc))\n"
         "            raise SystemExit(3)\n"
         "    except ImportError as exc:\n"
+        "        sys.stdout.write(name + '\\n' + str(exc))\n"
+        "        raise SystemExit(3)\n"
+        "    except SyntaxError as exc:\n"
         "        sys.stdout.write(name + '\\n' + str(exc))\n"
         "        raise SystemExit(3)\n"
         "    except Exception:\n"
@@ -491,14 +508,25 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
             errors="replace",
             timeout=120,
         )
-    except (OSError, subprocess.SubprocessError):
-        # Can't run the probe — don't block the update on our own tooling.
+    except (OSError, subprocess.SubprocessError) as exc:
+        if strict:
+            return False, "critical-module-import-probe", f"could not run probe: {exc}"
+        # The pre-dependency-install callers cannot always execute the probe;
+        # preserve their existing best-effort behavior.
         return True, None, None
     if result.returncode == 3:
         parts = (result.stdout or "").split("\n", 1)
         module = parts[0].strip() or "unknown"
         detail = parts[1].strip() if len(parts) > 1 else ""
         return False, module, detail
+    if strict and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        suffix = f": {detail[:400]}" if detail else ""
+        return (
+            False,
+            "critical-module-import-probe",
+            f"probe exited with status {result.returncode}{suffix}",
+        )
     return True, None, None
 
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
@@ -2103,6 +2131,127 @@ def _park_stashed_changes(stash_ref: str) -> None:
     print(f"  Restore manually with: git stash apply {stash_ref}")
 
 
+def _git_nul_paths(
+    git_cmd: list[str], cwd: Path, args: list[str]
+) -> tuple[tuple[str, ...], str | None]:
+    """Run a Git path query without losing filenames containing whitespace.
+
+    A failed inventory is not equivalent to an empty inventory. The updater
+    uses this distinction as a safety boundary: it must never drop a stash
+    merely because a Git query failed to prove which files were restored.
+    """
+    command = git_cmd + args
+    rendered = " ".join(str(part) for part in command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError as exc:
+        return (), f"{rendered} could not run: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        suffix = f": {detail.splitlines()[0][:400]}" if detail else ""
+        return (), f"{rendered} exited with status {result.returncode}{suffix}"
+    return tuple(path for path in (result.stdout or "").split("\0") if path), None
+
+
+def _untracked_paths(
+    git_cmd: list[str], cwd: Path
+) -> tuple[set[str], str | None]:
+    paths, error = _git_nul_paths(
+        git_cmd,
+        cwd,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    return set(paths), error
+
+
+def _restored_python_paths(
+    git_cmd: list[str], cwd: Path
+) -> tuple[tuple[str, ...], str | None]:
+    """Find every tracked or untracked Python file visible after restore.
+
+    ``git diff`` does not report untracked files, while the update stash is
+    created with ``--include-untracked``. Both inventories are therefore part
+    of the proof. If either query fails, returning an empty list would turn a
+    tool failure into a false health verdict, so the error is propagated.
+    """
+    changed, error = _git_nul_paths(
+        git_cmd,
+        cwd,
+        ["diff", "--name-only", "-z", "HEAD", "--", "*.py"],
+    )
+    if error:
+        return (), f"could not enumerate restored Python files: {error}"
+
+    untracked, error = _untracked_paths(git_cmd, cwd)
+    if error:
+        return (), f"could not enumerate restored untracked files: {error}"
+
+    paths = set(changed)
+    paths.update(path for path in untracked if path.endswith(".py"))
+    return tuple(sorted(paths)), None
+
+
+def _reject_unsafe_stash_restore(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: str,
+    preexisting_untracked: set[str],
+    failing_target: str,
+    detail: str | None,
+) -> None:
+    """Reset to the updated tree and abort without dropping the recovery stash."""
+    print()
+    print("✗ Restored local changes failed the Hermes agent health proof.")
+    print(f"  Health check failed: {failing_target}")
+    if detail:
+        for line in str(detail).splitlines()[:6]:
+            print(f"    {line}")
+
+    current_untracked, inventory_error = _untracked_paths(git_cmd, cwd)
+    if inventory_error:
+        print(f"  Cleanup inventory failed: {inventory_error}")
+        restored_untracked: set[str] = set()
+    else:
+        restored_untracked = current_untracked - preexisting_untracked
+
+    try:
+        reset = subprocess.run(
+            git_cmd + ["reset", "--hard", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+        )
+        if reset.returncode != 0:
+            print("  Could not reset the tracked files automatically.")
+    except OSError as exc:
+        print(f"  Could not reset the tracked files automatically: {exc}")
+
+    if restored_untracked:
+        try:
+            clean = subprocess.run(
+                git_cmd + ["clean", "-fd", "--", *sorted(restored_untracked)],
+                cwd=cwd,
+                capture_output=True,
+            )
+            if clean.returncode != 0:
+                print("  Some restored untracked files could not be removed.")
+        except OSError as exc:
+            print(f"  Some restored untracked files could not be removed: {exc}")
+
+    print("  The gateway was not allowed to restart on an unproven tree.")
+    print("  Platform connectivity alone does not prove agent-turn health.")
+    print(f"  Your local changes remain preserved in stash: {stash_ref}")
+    print(f"  Inspect them with: git stash show --stat {stash_ref}")
+    print(f"  Restore manually after fixing them: git stash apply {stash_ref}")
+    raise SystemExit(1)
+
+
 def _restore_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
@@ -2111,15 +2260,19 @@ def _restore_stashed_changes(
     input_fn=None,
 ) -> bool:
     if prompt_user:
+        remote_prompt = input_fn is not None
+        prompt_suffix = "[y/N]" if remote_prompt else "[Y/n]"
         print()
         print("⚠ Local changes were stashed before updating.")
         print(
             "  Restoring them may reapply local customizations onto the updated codebase."
         )
         print("  Review the result afterward if Hermes behaves unexpectedly.")
-        print("Restore local changes now? [Y/n]")
+        print(f"Restore local changes now? {prompt_suffix}")
         if input_fn is not None:
-            response = input_fn("Restore local changes now? [Y/n]", "y")
+            response = str(
+                input_fn(f"Restore local changes now? {prompt_suffix}", "n") or ""
+            ).strip().lower()
         else:
             try:
                 response = input().strip().lower()
@@ -2130,11 +2283,20 @@ def _restore_stashed_changes(
                 # skip-restore path below, which already explains how to
                 # restore manually from git stash.
                 response = "n"
-        if response not in {"", "y", "yes"}:
+        accepted = response in {"y", "yes"} or (not remote_prompt and response == "")
+        if not accepted:
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
             print(f"Restore manually with: git stash apply {stash_ref}")
             return False
+
+    preexisting_untracked, inventory_error = _untracked_paths(git_cmd, cwd)
+    if inventory_error:
+        print("✗ Cannot safely restore local changes because the file inventory failed.")
+        print(f"  {inventory_error}")
+        print(f"  Your changes remain preserved in stash: {stash_ref}")
+        print(f"  Restore manually after checking the checkout: git stash apply {stash_ref}")
+        raise SystemExit(1)
 
     print("→ Restoring local changes...")
     restore = subprocess.run(
@@ -2196,6 +2358,43 @@ def _restore_stashed_changes(
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.
         return False
+
+    restored_python, inventory_error = _restored_python_paths(git_cmd, cwd)
+    if inventory_error:
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            "restored-file inventory",
+            inventory_error,
+        )
+
+    syntax_ok, failing_path, syntax_error = _validate_python_files_syntax(
+        cwd, restored_python
+    )
+    if not syntax_ok:
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            failing_path or "restored Python source",
+            syntax_error,
+        )
+
+    import_ok, failing_module, import_error = _validate_critical_modules_import(
+        cwd, strict=True
+    )
+    if not import_ok:
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            f"agent import {failing_module or 'unknown'}",
+            import_error,
+        )
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
     if stash_selector is None:
