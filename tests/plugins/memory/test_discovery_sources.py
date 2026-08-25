@@ -267,3 +267,51 @@ def test_profile_clone_resolves_provider_through_canonical_config_loader(
         },
     )]
     assert get_hermes_home() == ambient_home
+
+
+def test_profile_clone_runs_provider_declared_by_manifest(tmp_path, monkeypatch):
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    provider_dir = tmp_path / "legacy-memory"
+    source_dir.mkdir()
+    profile_dir.mkdir()
+    provider_dir.mkdir()
+    (provider_dir / "plugin.yaml").write_text(
+        "name: legacy-memory\nprofile_clone: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        memory_plugins,
+        "_iter_provider_dirs",
+        lambda: [("legacy-memory", provider_dir)],
+    )
+
+    calls = []
+
+    class Provider:
+        def clone_profile(self, profile_name, **kwargs):
+            calls.append((profile_name, kwargs))
+            return "legacy-cloned"
+
+    monkeypatch.setattr(
+        memory_plugins,
+        "load_memory_provider",
+        lambda name, **kwargs: Provider() if name == "legacy-memory" else None,
+    )
+
+    result = memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+        clone_all=True,
+    )
+
+    assert result == ["legacy-cloned"]
+    assert calls == [(
+        "coder",
+        {
+            "source_dir": source_dir,
+            "profile_dir": profile_dir,
+            "clone_all": True,
+        },
+    )]

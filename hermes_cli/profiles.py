@@ -1276,7 +1276,11 @@ def create_profile(
                 clone_all=clone_all,
             )
         except Exception:
-            pass  # provider clone integration is best-effort
+            logger.debug(
+                "Memory provider profile-clone integration failed for '%s'",
+                canon,
+                exc_info=True,
+            )
 
     return profile_dir
 

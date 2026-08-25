@@ -18,6 +18,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 import yaml
 
+import plugins.memory as memory_plugins
 import plugins.memory.honcho.cli as honcho_cli
 
 from hermes_cli import profiles
@@ -225,8 +226,27 @@ class TestCreateProfile:
         honcho = json.loads((default_home / "honcho.json").read_text())
         assert honcho["hosts"]["hermes_coder"]["aiPeer"] == "shared-assistant"
 
+    def test_clone_logs_memory_provider_hook_failure(
+        self, profile_env, monkeypatch, caplog
+    ):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("model: test")
 
+        def fail_clone(*args, **kwargs):
+            raise RuntimeError("provider clone failed")
 
+        monkeypatch.setattr(
+            memory_plugins,
+            "clone_memory_provider_profile",
+            fail_clone,
+        )
+
+        with caplog.at_level("DEBUG", logger="hermes_cli.profiles"):
+            profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert profile_dir.is_dir()
+        assert "Memory provider profile-clone integration failed for 'coder'" in caplog.text
+        assert "RuntimeError: provider clone failed" in caplog.text
 
 
 # ===================================================================

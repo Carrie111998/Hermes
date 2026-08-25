@@ -128,7 +128,17 @@ class MyMemoryProvider(MemoryProvider):
 | `on_session_end(messages)` | Conversation ends | Final extraction/flush |
 | `on_pre_compress(messages)` | Before context compression | Save insights before discard |
 | `on_memory_write(action, target, content)` | Built-in memory writes | Mirror to your backend |
+| `clone_profile(profile_name, *, source_dir, profile_dir, clone_all=False)` | After a profile clone is created | Copy or reconcile provider-owned identity/connection state |
 | `shutdown()` | Process exit | Clean up connections |
+
+`clone_profile()` has a no-op default for compatibility. Hermes invokes it for
+the provider selected by the source profile's `memory.provider`. A directory
+provider that must inspect legacy state even when it is not selected can also
+declare `profile_clone: true` in `plugin.yaml`; Hermes then invokes its hook on
+profile clones. Keep the hook idempotent and treat `source_dir` and
+`profile_dir` as the authoritative profile roots. `clone_all=True` means the
+source tree was copied in full before the hook runs, so update the copied state
+in `profile_dir` rather than the source.
 
 ## Config Schema
 
@@ -215,6 +225,9 @@ version: 1.0.0
 description: "Short description of what this provider does."
 hooks:
   - on_session_end    # list hooks you implement
+# Optional: run clone_profile() even when this provider is not selected, for
+# legacy provider state stored outside config.yaml.
+profile_clone: true
 ```
 
 ## Threading Contract
