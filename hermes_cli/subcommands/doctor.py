@@ -23,6 +23,17 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         "--fix", action="store_true", help="Attempt to fix issues automatically"
     )
     doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help=(
+            "Append a machine-readable summary to the output: a "
+            "'----- doctor-json v1 -----' marker line followed by one JSON "
+            "document with per-check findings, counts, and action lists. "
+            "Scripts slice from the marker; the human report is unchanged."
+        ),
+    )
+    doctor_parser.add_argument(
         "--live",
         action="store_true",
         help=(

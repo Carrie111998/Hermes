@@ -6,9 +6,11 @@ Diagnoses issues with Hermes Agent setup.
 
 import os
 import sys
+import json
 import subprocess
 import shutil
 import importlib.util
+from datetime import datetime
 from pathlib import Path
 
 from hermes_cli.config import (
@@ -391,16 +393,36 @@ def _has_healthy_oauth_fallback_for_apikey_provider(provider_label: str) -> bool
     return False
 
 
+# ── Machine-readable output (--json) ────────────────────────────────────────
+# When --json is passed, every check_ok/warn/fail/info finding is recorded
+# here in addition to being printed. At the end of the run a marker line and
+# a single JSON document (counts, findings, action lists) are appended to
+# stdout so fleet tooling can parse doctor results without scraping prose.
+
+_DOCTOR_JSON_FINDINGS: list = None  # list[dict] while a --json run is active
+
+
+def _record_finding(severity: str, text: str, detail: str = "") -> None:
+    if _DOCTOR_JSON_FINDINGS is not None:
+        _DOCTOR_JSON_FINDINGS.append(
+            {"severity": severity, "check": text, "detail": detail}
+        )
+
+
 def check_ok(text: str, detail: str = ""):
+    _record_finding("ok", text, detail)
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
 def check_warn(text: str, detail: str = ""):
+    _record_finding("warn", text, detail)
     print(f"  {color('⚠', Colors.YELLOW)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
 def check_fail(text: str, detail: str = ""):
+    _record_finding("fail", text, detail)
     print(f"  {color('✗', Colors.RED)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
 def check_info(text: str):
+    _record_finding("info", text)
     print(f"    {color('→', Colors.CYAN)} {text}")
 
 
@@ -1045,7 +1067,13 @@ def managed_scope_check() -> None:
 
 def run_doctor(args):
     """Run diagnostic checks."""
+    global _DOCTOR_JSON_FINDINGS
     should_fix = getattr(args, 'fix', False)
+    if getattr(args, 'json', False):
+        # Activate finding collection for the machine-readable tail.
+        _DOCTOR_JSON_FINDINGS = []
+    else:
+        _DOCTOR_JSON_FINDINGS = None
     ack_target = getattr(args, 'ack', None)
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
@@ -3187,5 +3215,27 @@ def run_doctor(args):
     else:
         print(color("─" * 60, Colors.GREEN))
         print(color("  All checks passed! 🎉", Colors.GREEN, Colors.BOLD))
-    
+
     print()
+
+    # Machine-readable tail (--json): a marker line followed by one JSON
+    # document with counts, every finding, and the action lists. Scripts
+    # slice from the marker; humans see the normal report unchanged above.
+    if getattr(args, "json", False):
+        import json as _doctor_json
+
+        findings = _DOCTOR_JSON_FINDINGS or []
+        counts = {
+            s: sum(1 for f in findings if f["severity"] == s)
+            for s in ("ok", "info", "warn", "fail")
+        }
+        print("----- doctor-json v1 -----")
+        print(_doctor_json.dumps({
+            "schema": "doctor-json/v1",
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "fixed_count": fixed_count,
+            "counts": counts,
+            "findings": findings,
+            "issues": issues,
+            "manual_issues": manual_issues,
+        }, indent=2, ensure_ascii=False))
