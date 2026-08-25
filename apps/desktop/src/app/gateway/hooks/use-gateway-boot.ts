@@ -144,6 +144,7 @@ interface GatewayBootOptions {
     connection: Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnection']>> | null
   ) => void
   onGatewayReady: (gateway: HermesGateway | null) => void
+  refreshActiveTranscript: () => Promise<unknown> | unknown
   refreshHermesConfig: () => Promise<void>
   refreshSessions: () => Promise<void>
 }
@@ -153,6 +154,7 @@ export function useGatewayBoot({
   handleGatewayEvent,
   onConnectionReady,
   onGatewayReady,
+  refreshActiveTranscript,
   refreshHermesConfig,
   refreshSessions
 }: GatewayBootOptions) {
@@ -161,6 +163,7 @@ export function useGatewayBoot({
     handleGatewayEvent,
     onConnectionReady,
     onGatewayReady,
+    refreshActiveTranscript,
     refreshHermesConfig,
     refreshSessions
   })
@@ -170,6 +173,7 @@ export function useGatewayBoot({
     handleGatewayEvent,
     onConnectionReady,
     onGatewayReady,
+    refreshActiveTranscript,
     refreshHermesConfig,
     refreshSessions
   }
@@ -332,6 +336,11 @@ export function useGatewayBoot({
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
+        // sessions.changed is an invalidation edge, not a replayable log. A
+        // write from cron, CLI, or another surface can land while this socket
+        // is down, so the open transcript needs the same reconnect reseed as
+        // the sidebar instead of waiting indefinitely for another write.
+        await Promise.resolve(callbacksRef.current.refreshActiveTranscript()).catch(() => undefined)
       } catch (err) {
         // OAuth session expired mid-reconnect: surface the actionable "sign in
         // again" recovery overlay once instead of silently looping the backoff

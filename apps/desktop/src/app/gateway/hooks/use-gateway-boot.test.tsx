@@ -203,13 +203,19 @@ function fakeDesktop() {
 
 function Harness({
   beforeConnectionSwitch = () => undefined,
+  refreshActiveTranscript,
   refreshSessions
-}: { beforeConnectionSwitch?: () => void; refreshSessions?: () => Promise<void> } = {}) {
+}: {
+  beforeConnectionSwitch?: () => void
+  refreshActiveTranscript?: () => Promise<void>
+  refreshSessions?: () => Promise<void>
+} = {}) {
   useGatewayBoot({
     beforeConnectionSwitch,
     handleGatewayEvent: () => undefined,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
+    refreshActiveTranscript: refreshActiveTranscript ?? (async () => undefined),
     refreshHermesConfig: async () => undefined,
     refreshSessions: refreshSessions ?? (async () => undefined)
   })
@@ -450,8 +456,14 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
   })
 
   it('FIX: a successful reconnect after a prolonged drop restores the open gateway', async () => {
-    render(<Harness />)
+    const refreshActiveTranscript = vi.fn(async () => undefined)
+
+    render(<Harness refreshActiveTranscript={refreshActiveTranscript} />)
     await flushAsync()
+
+    // Cold boot hydrates through the normal resume path. This backstop is only
+    // for a socket that actually disconnected.
+    expect(refreshActiveTranscript).not.toHaveBeenCalled()
 
     FakeWebSocket.mode = 'fail'
     act(() => FakeWebSocket.instances[0].drop())
@@ -469,6 +481,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     expect($desktopBoot.get().error).toBeNull()
+    expect(refreshActiveTranscript).toHaveBeenCalledOnce()
   })
 
   it('a getConnection() that hangs on reconnect does not permanently latch the backoff loop (#93454)', async () => {

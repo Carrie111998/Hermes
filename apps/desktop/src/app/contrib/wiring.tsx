@@ -859,6 +859,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onGatewayReady: g => {
       gatewayRef.current = g
     },
+    refreshActiveTranscript,
     refreshHermesConfig,
     refreshSessions
   })
