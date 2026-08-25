@@ -477,6 +477,59 @@ class TestWebServerEndpoints:
             "sidebar-stale"
         ]
 
+    def test_profiles_sidebar_returns_taxonomy_slices(self):
+        """The batched sidebar route returns projects + archives slices.
+
+        The taxonomy-driven sidebar renders Projects (disposition=project) and
+        Archives (disposition=archive) as the primary organization; transient
+        and junk never surface as their own slice, and recents/messaging can
+        exclude them via the disposition exclusion params.
+        """
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("proj-a", source="cli")
+            seed.append_message(session_id="proj-a", role="user", content="Build the fusion router plugin")
+            seed.set_session_disposition("proj-a", "project", "Hermes Community Extensions", "Fusion Router")
+
+            seed.create_session("proj-b", source="telegram")
+            seed.append_message(session_id="proj-b", role="user", content="Thin remote PWA grid")
+            seed.set_session_disposition("proj-b", "project", "Hermes Community Extensions", "Thin Remote")
+
+            seed.create_session("arch-a", source="cli")
+            seed.append_message(session_id="arch-a", role="user", content="Old finished work")
+            seed.set_session_disposition("arch-a", "archive", "Hermes infra", None)
+
+            seed.create_session("noise-a", source="cron")
+            seed.append_message(session_id="noise-a", role="user", content="scheduled run")
+            seed.set_session_disposition("noise-a", "transient", None, None)
+        finally:
+            seed.close()
+
+        # Recents without exclusions still carries everything (back-compat).
+        response = self.client.get("/api/profiles/sessions/sidebar?recents_limit=50")
+        assert response.status_code == 200
+        payload = response.json()
+        assert {row["id"] for row in payload["projects"]["sessions"]} == {"proj-a", "proj-b"}
+        assert [row["id"] for row in payload["archives"]["sessions"]] == ["arch-a"]
+        # Taxonomy rows carry the grouping fields to the renderer.
+        proj = next(row for row in payload["projects"]["sessions"] if row["id"] == "proj-a")
+        assert proj["project_group"] == "Hermes Community Extensions"
+        assert proj["project"] == "Fusion Router"
+        assert proj["disposition"] == "project"
+
+        # With exclusions, transient/junk disappear from recents.
+        response = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_limit=50&recents_exclude_dispositions=transient,junk"
+        )
+        assert response.status_code == 200
+        recents_ids = {row["id"] for row in response.json()["recents"]["sessions"]}
+        assert "noise-a" not in recents_ids
+        assert "proj-a" in recents_ids
+
     def test_startup_eager_reconcile_heals_stale_store(self):
         """The lifespan's eager reconcile brings a stale store current.
 
