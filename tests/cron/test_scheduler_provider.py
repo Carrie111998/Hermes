@@ -640,3 +640,66 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_does_not_recreate_archived_profile(tmp_path):
+    """A profile home removed after the ticker captured its (fixed) profile_homes
+    list must not be recreated by the next tick's ensure_dirs()/mkdir (#94590).
+
+    ``_start_multiplex`` never re-scans ``profiles/`` — it ticks the same list
+    of homes for as long as the ticker thread lives. If an admin archives a
+    profile (moves its directory away) mid-run, the stale entry's heartbeat
+    write used to mkdir the directory straight back into existence every
+    interval.
+
+    Runs the ticker loop synchronously (no background thread) via a fake
+    stop_event whose ``wait()`` steps one iteration at a time, so the profile
+    can be archived deterministically between iteration 1 and 2 with no race
+    against a live ticker thread.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "research"
+    for d in (p1, p2):
+        (d / "cron").mkdir(parents=True)
+
+    profile_homes = [("default", p1), ("research", p2)]
+
+    class _StepStopEvent:
+        """Runs exactly `iterations` loop passes, invoking `on_wait` (in the
+        same thread, between passes) where the real code calls
+        stop_event.wait(interval)."""
+
+        def __init__(self, iterations, on_wait):
+            self._remaining = iterations
+            self._on_wait = on_wait
+
+        def is_set(self):
+            return self._remaining <= 0
+
+        def wait(self, timeout=None):
+            self._remaining -= 1
+            self._on_wait()
+            return False
+
+    archived = []
+
+    def _archive_research_once():
+        # Only ever archive once — a second call would silently mask a
+        # recreation the guard failed to prevent during iteration 2.
+        if not archived:
+            archived.append(True)
+            import shutil
+            shutil.rmtree(p2)
+
+    stop = _StepStopEvent(iterations=3, on_wait=_archive_research_once)
+    prov = InProcessCronScheduler()
+
+    with patch("cron.scheduler.tick", return_value=0):
+        # Iteration 1 ticks both profiles normally, then on_wait archives
+        # "research" before iteration 2 starts. Iterations 2 and 3 must not
+        # recreate it.
+        prov.start(stop, interval=0, profile_homes=profile_homes)
+
+    assert not p2.exists(), "archived profile directory must not be recreated by the ticker"
+
+

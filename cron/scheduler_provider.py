@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import threading
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
@@ -638,6 +639,15 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``profile_homes`` is captured once when the ticker starts and never
+        re-scanned. If an admin archives a profile (moves its directory out
+        from under ``profiles/``) while the ticker is running, the stale
+        entry must not keep being ticked — ``ensure_dirs()``'s
+        ``mkdir(parents=True, exist_ok=True)`` on the heartbeat/tick path
+        would otherwise silently recreate the directory the admin just
+        removed (#94590). Re-checking ``home.is_dir()`` every cycle is cheap
+        and self-heals without a restart once the directory is gone.
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -659,6 +669,8 @@ class InProcessCronScheduler(CronScheduler):
         # Recovery + initial heartbeat for every profile.
         for entry in profile_homes:
             home = entry[1] if isinstance(entry, tuple) else entry
+            if not Path(home).is_dir():
+                continue  # archived/removed since the ticker captured this list (#94590)
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
@@ -683,6 +695,8 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for entry in profile_homes:
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        if not Path(home).is_dir():
+                            continue  # archived/removed since the ticker captured this list (#94590)
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
@@ -706,6 +720,8 @@ class InProcessCronScheduler(CronScheduler):
             # Record per-profile heartbeat after each tick cycle.
             for entry in profile_homes:
                 home = entry[1] if isinstance(entry, tuple) else entry
+                if not Path(home).is_dir():
+                    continue  # archived/removed since the ticker captured this list (#94590)
                 home_token = set_hermes_home_override(str(home))
                 try:
                     with use_cron_store(home):
