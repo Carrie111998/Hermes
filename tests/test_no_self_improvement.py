@@ -445,6 +445,21 @@ class TestCuratorStartupSuppression:
         call_kwargs = mock_curator.call_args
         assert call_kwargs.kwargs.get("on_summary") is sentinel
 
+    def test_curator_exception_logged_as_debug(self, monkeypatch):
+        """Curator exceptions must be logged at DEBUG with traceback."""
+        mock_curator = MagicMock(side_effect=RuntimeError("boom"))
+        monkeypatch.setattr("agent.curator.maybe_run_curator", mock_curator)
+        mock_debug = MagicMock()
+        monkeypatch.setattr("cli.logger", MagicMock(debug=mock_debug))
+
+        from cli import _maybe_run_curator_on_startup
+        _maybe_run_curator_on_startup(no_self_improvement=False)
+
+        mock_debug.assert_called_once()
+        call_args = mock_debug.call_args
+        assert "curator startup hook failed" in call_args.args[0]
+        assert call_args.kwargs.get("exc_info") is True
+
 
 # ---------------------------------------------------------------------------
 # 8. Session lifecycle — real parser, real flag propagation

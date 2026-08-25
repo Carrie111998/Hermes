@@ -5180,26 +5180,9 @@ def _should_seed_interactive(query, image, quiet: bool, oneshot: bool) -> bool:
         return bool(sys.stdin.isatty() and sys.stdout.isatty())
     except Exception:
         return False
-
-
-def _skip_curator_for_invocation(no_self_improvement: bool) -> bool:
-    """Return True when the curator startup pass should be skipped.
-
-    The ``--no-self-improvement`` flag is session-scoped and never
-    persisted to config.yaml.  This helper makes the guard testable
-    without duplicating the ``if`` inline.
-    """
-    return bool(no_self_improvement)
-
-
 def _maybe_run_curator_on_startup(no_self_improvement: bool, on_summary=None) -> None:
-    """Run the curator startup pass unless ``--no-self-improvement`` is set.
-
-    Extracted so the guard is exercised by tests (monkeypatch
-    ``agent.curator.maybe_run_curator``) rather than re-implemented
-    inline.
-    """
-    if _skip_curator_for_invocation(no_self_improvement):
+    """Run the curator startup pass unless ``--no-self-improvement`` is set."""
+    if no_self_improvement:
         return
     try:
         from agent.curator import maybe_run_curator
@@ -5208,7 +5191,7 @@ def _maybe_run_curator_on_startup(no_self_improvement: bool, on_summary=None) ->
             on_summary=on_summary,
         )
     except Exception:
-        pass
+        logger.debug("curator startup hook failed", exc_info=True)
 
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
@@ -18396,7 +18379,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # never blocks the interactive loop.  Best-effort; any failure is
         # swallowed to avoid breaking session startup.
         _maybe_run_curator_on_startup(
-            getattr(self, "no_self_improvement", False),
+            self.no_self_improvement,
             on_summary=lambda msg: self._console_print(
                 f"[dim #6b7684]💾 {msg}[/]"
             ),
