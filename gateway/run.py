@@ -2705,8 +2705,6 @@ from gateway.restart import (
     parse_restart_drain_timeout,
     resolve_cron_drain_budget,
 )
-
-
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -2715,6 +2713,10 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S = 1.0
+_LOOP_HEARTBEAT_RESTART_MAX_DELAY_S = 60.0
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -6845,6 +6847,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # real values are set in __init__ / start() / stop().
     _loop_heartbeat_task: Optional["asyncio.Task"] = None
     _loop_heartbeat_restart_handle: Optional[Any] = None
+    _loop_heartbeat_restart_delay_s: float = _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S
     _loop_floor_timer_handle: Optional[Any] = None
     _loop_liveness_watchdog: Optional[Any] = None
     _gateway_started_at: float = 0.0
@@ -7263,6 +7266,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._gateway_started_at: float = time.time()
         self._loop_heartbeat_task: Optional[asyncio.Task] = None
         self._loop_heartbeat_restart_handle = None
+        self._loop_heartbeat_restart_delay_s = _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S
         self._loop_floor_timer_handle = None
         self._loop_liveness_watchdog = None
 
@@ -12488,6 +12492,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     start_time=getattr(self, "_gateway_started_at", 0.0),
                 )
             )
+            self._loop_heartbeat_task._hermes_heartbeat_started_at = (  # type: ignore[attr-defined]
+                self._loop_heartbeat_task.get_loop().time()
+            )
             # PERMANENT for the process lifetime, same as a
             # _spawn_supervised watcher — tag it so
             # _scale_to_zero_has_live_background_work() doesn't treat an
@@ -12513,12 +12520,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return
 
+        loop = task.get_loop()
+        started_at = getattr(task, "_hermes_heartbeat_started_at", loop.time())
+        if loop.time() - started_at >= DEFAULT_HEARTBEAT_INTERVAL_S:
+            self._loop_heartbeat_restart_delay_s = (
+                _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S
+            )
+        restart_delay = min(
+            max(
+                float(
+                    getattr(
+                        self,
+                        "_loop_heartbeat_restart_delay_s",
+                        _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S,
+                    )
+                ),
+                _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S,
+            ),
+            _LOOP_HEARTBEAT_RESTART_MAX_DELAY_S,
+        )
+        self._loop_heartbeat_restart_delay_s = min(
+            restart_delay * 2,
+            _LOOP_HEARTBEAT_RESTART_MAX_DELAY_S,
+        )
+
         exc = task.exception()
         if exc is None:
-            logger.warning("Gateway loop heartbeat stopped unexpectedly; restarting")
+            logger.warning(
+                "Gateway loop heartbeat stopped unexpectedly; restarting in %.0fs",
+                restart_delay,
+            )
         else:
             logger.warning(
-                "Gateway loop heartbeat failed; restarting",
+                "Gateway loop heartbeat failed; restarting in %.0fs",
+                restart_delay,
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
         self._loop_heartbeat_task = None
@@ -12532,7 +12567,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             self._start_loop_heartbeat_task()
 
-        self._loop_heartbeat_restart_handle = task.get_loop().call_later(1.0, _restart)
+        self._loop_heartbeat_restart_handle = loop.call_later(restart_delay, _restart)
 
     async def start(self) -> bool:
         """

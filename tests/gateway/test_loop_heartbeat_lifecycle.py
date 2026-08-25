@@ -23,6 +23,7 @@ async def test_start_arms_heartbeat_before_startup_diagnostics():
 
     task = runner._loop_heartbeat_task
     assert task is not None
+    assert not task.done()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -59,6 +60,44 @@ async def test_failed_heartbeat_is_logged_and_restarted(monkeypatch, caplog):
     assert "Gateway loop heartbeat failed; restarting" in caplog.text
     replacement_task.cancel()
     await asyncio.gather(replacement_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_repeated_heartbeat_failures_back_off_and_stable_run_resets(monkeypatch):
+    loop = asyncio.get_running_loop()
+    scheduled_delays = []
+
+    class RestartHandle:
+        def cancelled(self):
+            return False
+
+    def capture_call_later(delay, _callback):
+        scheduled_delays.append(delay)
+        return RestartHandle()
+
+    monkeypatch.setattr(loop, "call_later", capture_call_later)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._draining = False
+    runner._shutdown_event = asyncio.Event()
+    runner._loop_heartbeat_restart_delay_s = 1.0
+
+    async def fail():
+        raise RuntimeError("heartbeat failed")
+
+    for _ in range(8):
+        task = loop.create_task(fail())
+        task._hermes_heartbeat_started_at = loop.time()
+        await asyncio.sleep(0)
+        runner._loop_heartbeat_task = task
+        runner._restart_loop_heartbeat_after_failure(task)
+
+    stable_task = loop.create_task(fail())
+    stable_task._hermes_heartbeat_started_at = loop.time() - 10_000
+    await asyncio.sleep(0)
+    runner._loop_heartbeat_task = stable_task
+    runner._restart_loop_heartbeat_after_failure(stable_task)
+
+    assert scheduled_delays == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 1.0]
 
 
 @pytest.mark.asyncio
