@@ -8,6 +8,7 @@ import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { setCurrentModel, setCurrentProvider } from '@/store/session'
+import { $sessionTiles } from '@/store/session-states'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from './utils'
@@ -46,12 +47,14 @@ beforeEach(() => {
   refreshSessions = vi.fn<() => Promise<void>>(async () => undefined)
   hydrateFromStoredSession = vi.fn<() => Promise<void>>(async () => undefined)
   queryClient = new QueryClient()
+  $sessionTiles.set([])
   setCurrentModel('')
   setCurrentProvider('')
 })
 
 afterEach(() => {
   cleanup()
+  $sessionTiles.set([])
   setCurrentModel('')
   setCurrentProvider('')
   vi.useRealTimers()
@@ -144,6 +147,91 @@ describe('session.info model-options invalidation gating', () => {
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ownerKey })
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ambientKey })
+  })
+
+  it('invalidates an alias route’s backend target catalog without touching socket or ambient keys', () => {
+    setApiRequestConnection('ambient-remote')
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+    const ownerRoute = {
+      connectionId: 'remote-owner',
+      mode: 'remote' as const,
+      profile: 'bot-alias',
+      targetProfile: 'backend-bot'
+    }
+
+    const targetKey = modelOptionsQueryKey(
+      { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile },
+      ACTIVE_SID
+    )
+
+    const socketKey = modelOptionsQueryKey(
+      { connectionId: ownerRoute.connectionId, profile: ownerRoute.profile },
+      ACTIVE_SID
+    )
+
+    const ambientKey = modelOptionsQueryKey(ACTIVE_PROFILE, ACTIVE_SID)
+
+    $sessionTiles.set([{ ownerRoute, runtimeId: ACTIVE_SID, storedSessionId: 'stored-bot-chat' }])
+    sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
+    invalidate.mockClear()
+
+    act(() =>
+      stream.handleEvent({
+        connectionId: ownerRoute.connectionId,
+        payload: {
+          model: 'm2',
+          provider: 'p1',
+          running: true,
+          stored_session_id: 'stored-bot-chat'
+        },
+        profile: ownerRoute.profile,
+        session_id: ACTIVE_SID,
+        type: 'session.info'
+      })
+    )
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: targetKey })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: socketKey })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ambientKey })
+  })
+
+  it('fails closed instead of invalidating a guessed catalog when exact owner routes conflict', () => {
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const source = { connectionId: 'remote-owner', profile: 'bot-alias' }
+
+    $sessionTiles.set([
+      {
+        ownerRoute: { ...source, mode: 'remote', targetProfile: 'backend-bot-a' },
+        runtimeId: ACTIVE_SID,
+        storedSessionId: 'stored-bot-chat'
+      },
+      {
+        ownerRoute: { ...source, mode: 'remote', targetProfile: 'backend-bot-b' },
+        runtimeId: ACTIVE_SID,
+        storedSessionId: 'stored-bot-chat'
+      }
+    ])
+    sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
+    invalidate.mockClear()
+
+    act(() =>
+      stream.handleEvent({
+        ...source,
+        payload: {
+          model: 'm2',
+          provider: 'p1',
+          running: true,
+          stored_session_id: 'stored-bot-chat'
+        },
+        session_id: ACTIVE_SID,
+        type: 'session.info'
+      })
+    )
+
+    expect(invalidate).not.toHaveBeenCalled()
   })
 })
 

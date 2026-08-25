@@ -861,6 +861,75 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
   return sessionTileOwnerRoute(storedSessionId) ?? knownSessionProfile($sessions.get(), storedSessionId)
 }
 
+export type SessionEventOwnerRouteResolution =
+  | { kind: 'ambiguous' }
+  | { kind: 'known'; route: SessionProfileRoute }
+  | { kind: 'unknown' }
+
+/**
+ * Resolve the authoritative owner route for one registry event. The registry
+ * tags events with the socket route (`profile`), while a persisted tile/hint
+ * may additionally name the backend `targetProfile` that owns its catalog.
+ * Match both the event source and session identity; never borrow an alias from
+ * another connection that happens to reuse the same runtime/stored id.
+ */
+export function sessionEventOwnerRoute(
+  runtimeSessionId: null | string | undefined,
+  storedSessionId: null | string | undefined,
+  source: Pick<SessionProfileRoute, 'connectionId' | 'profile'>
+): SessionEventOwnerRouteResolution {
+  const runtimeId = runtimeSessionId?.trim() || ''
+  const storedId = storedSessionId?.trim() || ''
+  const connectionId = source.connectionId.trim()
+  const profile = source.profile.trim() || 'default'
+
+  if (!connectionId || (!runtimeId && !storedId)) {
+    return { kind: 'unknown' }
+  }
+
+  const sourceMatches = (route: SessionProfileRoute | undefined) =>
+    route?.connectionId.trim() === connectionId && (route.profile.trim() || 'default') === profile
+
+  const tileRoutes = $sessionTiles
+    .get()
+    .filter(tile =>
+      storedId
+        ? tile.storedSessionId === storedId && (!runtimeId || !tile.runtimeId || tile.runtimeId === runtimeId)
+        : tile.runtimeId === runtimeId || tile.storedSessionId === runtimeId
+    )
+    .map(tile => tile.ownerRoute)
+    .filter((route): route is SessionProfileRoute => sourceMatches(route))
+
+  if (tileRoutes.length > 1) {
+    return { kind: 'ambiguous' }
+  }
+
+  if (tileRoutes.length === 1) {
+    return { kind: 'known', route: tileRoutes[0] }
+  }
+
+  const hintRoutes = [...new Set([storedId, runtimeId].filter(Boolean))]
+    .map(id => getSessionOwnerHint(id, { connectionId, profile }))
+    .filter((route): route is SessionProfileRoute => Boolean(route))
+
+  if (hintRoutes.length > 1) {
+    const first = hintRoutes[0]
+
+    const sameRoute = hintRoutes.every(
+      route =>
+        route.connectionId === first.connectionId &&
+        route.profile === first.profile &&
+        route.targetProfile === first.targetProfile
+    )
+
+    if (!sameRoute) {
+      return { kind: 'ambiguous' }
+    }
+  }
+
+  return hintRoutes[0] ? { kind: 'known', route: hintRoutes[0] } : { kind: 'unknown' }
+}
+
 /**
  * Dispatch a session-scoped RPC through the OWNER of `sessionId` (tile route →
  * known profile), falling back to the ambient dispatcher only when no owner is
