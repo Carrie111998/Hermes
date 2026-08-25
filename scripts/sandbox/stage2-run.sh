@@ -196,6 +196,20 @@ if [ "$DEV_SANDBOX_INTERACTIVE" = true ]; then
   dev_mounts=(--dev /dev)
 fi
 
+# CA trust inside the sandbox is asymmetric across runtimes, by design of
+# their stores:
+#   * curl / Python / git honor the env vars below pointing at ca.pem -- the
+#     sandbox CA whose private key proxy.py uses to mint per-host leaf certs.
+#   * Node.js ignores SSL_CERT_FILE/CURL_CA_BUNDLE entirely (unless built or
+#     run with --use-openssl-ca): it carries a bundled Mozilla store and only
+#     ADDS NODE_EXTRA_CA_CERTS to it. So Node must be handed ca.pem itself --
+#     every proxied TLS connection terminates in one of those minted certs.
+#     Pointing this at real-ca.pem (the public roots) instead made npm reject
+#     every handshake with an SSLEOFError storm in proxy.log, which the
+#     installer treats as fatal since #85297 -- the install-update E2E's
+#     `installer` legs failed on exactly that. A Node process that bypasses
+#     the proxy with a raw socket still trusts its bundled store, so real
+#     upstream CAs are not lost by this.
 exec bwrap \
   --unshare-pid \
   --die-with-parent --proc /proc --tmpfs /tmp \
@@ -216,7 +230,7 @@ exec bwrap \
   --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
   --setenv SSL_CERT_FILE /work/certs/ca.pem \
   --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
-  --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
+  --setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \
