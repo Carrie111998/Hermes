@@ -792,6 +792,8 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+        # Outbound file sends awaiting user consent (token -> file details).
+        self._pending_file_sends: Dict[str, Dict[str, Any]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Defensive re-check: create_adapter() already ran the installer
@@ -855,6 +857,10 @@ class TeamsAdapter(BasePlatformAdapter):
                 ctx: ActivityContext[AdaptiveCardInvokeActivity],
             ) -> InvokeResponse[AdaptiveCardActionMessageResponse]:
                 return await self._on_card_action(ctx)
+
+            @self._app.on_file_consent
+            async def _handle_file_consent(ctx):
+                await self._on_file_consent(ctx)
 
             # initialize() calls register_route() on the bridge, which adds
             # POST /api/messages to aiohttp_app automatically
@@ -1470,6 +1476,15 @@ class TeamsAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
+        # Local files go through the Teams file-consent flow (personal scope):
+        # Teams rejects large/base64 data-URI document attachments with 400.
+        if not (file_path.startswith("http://") or file_path.startswith("https://")):
+            return await self._send_file_consent_card(
+                chat_id=chat_id,
+                file_path=file_path.removeprefix("file://"),
+                caption=caption,
+                file_name=file_name,
+            )
         return await self._send_media_attachment(
             chat_id=chat_id,
             source=file_path,
@@ -1477,6 +1492,168 @@ class TeamsAdapter(BasePlatformAdapter):
             caption=caption,
             media_label="document",
         )
+
+    async def _send_file_consent_card(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        """Offer a file via FileConsentCard; upload happens on user accept.
+
+        Teams personal-scope bots cannot attach file bytes directly: the
+        bot offers the file, the user clicks Accept, Teams returns a
+        pre-authorised OneDrive upload URL, and _on_file_consent uploads
+        the bytes there. The file lands in the user's OneDrive
+        ("Microsoft Teams Chat Files").
+        """
+        import os as _os
+        import uuid as _uuid
+
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        try:
+            size = _os.path.getsize(file_path)
+        except OSError as e:
+            return SendResult(success=False, error=f"Cannot read file: {e}")
+
+        filename = file_name or _os.path.basename(file_path)
+        token = _uuid.uuid4().hex
+        self._pending_file_sends[token] = {
+            "path": file_path,
+            "filename": filename,
+            "chat_id": chat_id,
+        }
+        # Cap pending map (drop oldest) so declined/ignored cards don't leak.
+        while len(self._pending_file_sends) > 50:
+            self._pending_file_sends.pop(next(iter(self._pending_file_sends)))
+
+        try:
+            from microsoft_teams.api import Attachment, MessageActivityInput
+
+            consent_content = {
+                "description": caption or f"Hermes wants to send you '{filename}'",
+                "sizeInBytes": size,
+                "acceptContext": {"hermes_file_token": token},
+                "declineContext": {"hermes_file_token": token},
+            }
+            attachment = Attachment(
+                content_type="application/vnd.microsoft.teams.card.file.consent",
+                name=filename,
+                content=consent_content,
+            )
+            activity = MessageActivityInput().add_attachments(attachment)
+            conv_ref = self._conv_refs.get(chat_id)
+            if conv_ref:
+                result = await self._app.activity_sender.send(activity, conv_ref)
+            else:
+                result = await self._app.send(chat_id, activity)
+            card_id = getattr(result, "id", None)
+            if token in self._pending_file_sends:
+                self._pending_file_sends[token]["card_activity_id"] = card_id
+            return SendResult(success=True, message_id=card_id)
+        except Exception as e:
+            self._pending_file_sends.pop(token, None)
+            logger.error("[teams] send file consent card failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    async def _on_file_consent(self, ctx) -> None:
+        """Handle fileConsent/invoke: upload on accept, clean up on decline."""
+        import httpx
+
+        activity = ctx.activity
+        value = activity.value  # FileConsentCardResponse
+        action = getattr(value, "action", None)
+        context = getattr(value, "context", None) or {}
+        if not isinstance(context, dict):
+            context = getattr(context, "__dict__", {}) or {}
+        token = context.get("hermes_file_token") or context.get("hermesFileToken")
+        pending = self._pending_file_sends.pop(token, None) if token else None
+
+        conv = getattr(activity, "conversation", None)
+        chat_id = getattr(conv, "id", None) or (pending or {}).get("chat_id")
+
+        async def _say(text: str) -> None:
+            if chat_id and self._app:
+                try:
+                    await self._app.send(chat_id, text)
+                except Exception:
+                    logger.warning("[teams] file-consent notify failed", exc_info=True)
+
+        async def _remove_card() -> None:
+            """Delete the consent-card message so the chat shows only the outcome.
+
+            The FileConsentCard does not auto-update after the invoke; the
+            documented pattern is for the bot to delete it (Teams samples do
+            the same). Best-effort: a failure just leaves the stale card.
+            """
+            card_id = (pending or {}).get("card_activity_id")
+            if card_id and chat_id and self._app:
+                try:
+                    await self._app.api.conversations.delete_activity(chat_id, card_id)
+                except Exception:
+                    logger.warning("[teams] could not delete consent card", exc_info=True)
+
+        if action != "accept":
+            logger.info("[teams] file consent declined (token=%s)", token)
+            await _remove_card()
+            if pending:
+                await _say(f"Ok — '{pending['filename']}' blev ikke sendt.")
+            return
+
+        if not pending:
+            await _say("⚠️ This file offer has expired — please ask for the file again.")
+            return
+
+        upload_info = getattr(value, "upload_info", None)
+        upload_url = getattr(upload_info, "upload_url", None) if upload_info else None
+        if not upload_url:
+            await _say("⚠️ Teams did not provide an upload URL — file not sent.")
+            return
+
+        await _remove_card()
+
+        try:
+            with open(pending["path"], "rb") as f:
+                data = f.read()
+            total = len(data)
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.put(
+                    upload_url,
+                    content=data,
+                    headers={
+                        "Content-Length": str(total),
+                        "Content-Range": f"bytes 0-{total - 1}/{total}",
+                    },
+                )
+                resp.raise_for_status()
+
+            # Confirm with a file info card so the chat shows a real file chip.
+            from microsoft_teams.api import Attachment, MessageActivityInput
+
+            info = Attachment(
+                content_type="application/vnd.microsoft.teams.card.file.info",
+                content_url=getattr(upload_info, "content_url", None),
+                name=getattr(upload_info, "name", None) or pending["filename"],
+                content={
+                    "uniqueId": getattr(upload_info, "unique_id", None),
+                    "fileType": getattr(upload_info, "file_type", None),
+                },
+            )
+            activity_out = MessageActivityInput().add_attachments(info)
+            conv_ref = self._conv_refs.get(chat_id) if chat_id else None
+            if conv_ref and self._app:
+                await self._app.activity_sender.send(activity_out, conv_ref)
+            elif chat_id and self._app:
+                await self._app.send(chat_id, activity_out)
+            logger.info(
+                "[teams] file '%s' uploaded via consent flow (%d bytes)",
+                pending["filename"], total,
+            )
+        except Exception as e:
+            logger.error("[teams] file upload failed: %s", e, exc_info=True)
+            await _say(f"⚠️ Upload of '{pending['filename']}' failed: {e}")
 
     async def get_chat_info(self, chat_id: str) -> dict:
         return {"name": chat_id, "type": "unknown", "chat_id": chat_id}
