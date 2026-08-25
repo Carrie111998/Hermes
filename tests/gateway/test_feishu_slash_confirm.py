@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -52,6 +53,19 @@ def _make_adapter() -> FeishuAdapter:
     adapter = FeishuAdapter(config)
     adapter._client = MagicMock()
     return adapter
+
+
+def _make_state(**overrides) -> dict:
+    """Build a fresh (non-expired) slash-confirm state entry."""
+    state = {
+        "session_key": "sess-1",
+        "confirm_id": "gw-1",
+        "message_id": "msg-1",
+        "chat_id": "oc_12345",
+        "created_at": time.time(),
+    }
+    state.update(overrides)
+    return state
 
 
 def _make_card_action_data(
@@ -139,6 +153,8 @@ class TestFeishuSendSlashConfirm:
         assert len(actions) == 3
         choices = [a["value"]["hermes_slash_confirm_action"] for a in actions]
         assert choices == ["once", "always", "cancel"]
+        # The button value carries the prompt id under an unambiguous key.
+        assert all(a["value"]["prompt_id"] for a in actions)
 
     @pytest.mark.asyncio
     async def test_stores_confirm_state(self):
@@ -167,6 +183,7 @@ class TestFeishuSendSlashConfirm:
         assert state["confirm_id"] == "gw-7"
         assert state["message_id"] == "msg_sc_002"
         assert state["chat_id"] == "oc_12345"
+        assert "created_at" in state
 
 
 # ===========================================================================
@@ -181,15 +198,10 @@ class TestHandleSlashConfirmCardAction:
         adapter._loop = MagicMock()
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_bob"}
-        adapter._slash_confirm_state["1"] = {
-            "session_key": "sess-1",
-            "confirm_id": "gw-1",
-            "message_id": "msg-1",
-            "chat_id": "oc_12345",
-        }
+        adapter._slash_confirm_state["1"] = _make_state()
         adapter._sender_name_cache["ou_bob"] = ("Bob", 9999999999)
         data = _make_card_action_data(
-            {"hermes_slash_confirm_action": "once", "confirm_id": "1"},
+            {"hermes_slash_confirm_action": "once", "prompt_id": "1"},
             open_id="ou_bob",
         )
 
@@ -208,15 +220,10 @@ class TestHandleSlashConfirmCardAction:
         adapter._loop = MagicMock()
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_bob"}
-        adapter._slash_confirm_state["2"] = {
-            "session_key": "sess-2",
-            "confirm_id": "gw-2",
-            "message_id": "msg-2",
-            "chat_id": "oc_12345",
-        }
+        adapter._slash_confirm_state["2"] = _make_state()
         adapter._sender_name_cache["ou_bob"] = ("Bob", 9999999999)
         data = _make_card_action_data(
-            {"hermes_slash_confirm_action": "cancel", "confirm_id": "2"},
+            {"hermes_slash_confirm_action": "cancel", "prompt_id": "2"},
             open_id="ou_bob",
         )
 
@@ -232,14 +239,9 @@ class TestHandleSlashConfirmCardAction:
         adapter._loop = MagicMock()
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_allowed"}
-        adapter._slash_confirm_state["3"] = {
-            "session_key": "sess-3",
-            "confirm_id": "gw-3",
-            "message_id": "msg-3",
-            "chat_id": "oc_12345",
-        }
+        adapter._slash_confirm_state["3"] = _make_state()
         data = _make_card_action_data(
-            {"hermes_slash_confirm_action": "once", "confirm_id": "3"},
+            {"hermes_slash_confirm_action": "once", "prompt_id": "3"},
             open_id="ou_attacker",
         )
 
@@ -255,14 +257,9 @@ class TestHandleSlashConfirmCardAction:
         adapter._loop = MagicMock()
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_bob"}
-        adapter._slash_confirm_state["4"] = {
-            "session_key": "sess-4",
-            "confirm_id": "gw-4",
-            "message_id": "msg-4",
-            "chat_id": "oc_expected",
-        }
+        adapter._slash_confirm_state["4"] = _make_state(chat_id="oc_expected")
         data = _make_card_action_data(
-            {"hermes_slash_confirm_action": "once", "confirm_id": "4"},
+            {"hermes_slash_confirm_action": "once", "prompt_id": "4"},
             chat_id="oc_mismatch",
             open_id="ou_bob",
         )
@@ -273,6 +270,24 @@ class TestHandleSlashConfirmCardAction:
         assert response.card is None
         mock_submit.assert_not_called()
         assert "4" in adapter._slash_confirm_state
+
+    def test_expired_confirm_is_dropped(self):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_bob"}
+        adapter._slash_confirm_state["9"] = _make_state(created_at=time.time() - 1000)
+        data = _make_card_action_data(
+            {"hermes_slash_confirm_action": "once", "prompt_id": "9"},
+            open_id="ou_bob",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response.card is None
+        mock_submit.assert_not_called()
+        assert "9" not in adapter._slash_confirm_state
 
 
 # ===========================================================================
@@ -285,12 +300,8 @@ class TestResolveSlashConfirm:
     @pytest.mark.asyncio
     async def test_resolves_once(self):
         adapter = _make_adapter()
-        adapter._slash_confirm_state["1"] = {
-            "session_key": "sess-1",
-            "confirm_id": "gw-1",
-            "message_id": "msg-1",
-            "chat_id": "oc_12345",
-        }
+        adapter._admins = {"ou_bob"}
+        adapter._slash_confirm_state["1"] = _make_state()
 
         with patch("tools.slash_confirm.resolve", new_callable=AsyncMock, return_value="ok") as mock_resolve:
             await adapter._resolve_slash_confirm("1", "once", "Bob", open_id="ou_bob", chat_id="oc_12345")
@@ -302,15 +313,39 @@ class TestResolveSlashConfirm:
     async def test_unauthorized_click_does_not_resolve(self):
         adapter = _make_adapter()
         adapter._admins = {"ou_admin"}
-        adapter._slash_confirm_state["5"] = {
-            "session_key": "sess-5",
-            "confirm_id": "gw-5",
-            "message_id": "msg-5",
-            "chat_id": "oc_12345",
-        }
+        adapter._slash_confirm_state["5"] = _make_state()
 
         with patch("tools.slash_confirm.resolve", new_callable=AsyncMock) as mock_resolve:
             await adapter._resolve_slash_confirm("5", "once", "Mallory", open_id="ou_intruder", chat_id="oc_12345")
 
         mock_resolve.assert_not_called()
-        assert "5" in adapter._slash_confirm_state
+        # State is claimed atomically at coroutine entry, so the unauthorized
+        # click still consumes it even though the resolver refuses to run.
+        assert "5" not in adapter._slash_confirm_state
+
+    @pytest.mark.asyncio
+    async def test_double_resolve_runs_once(self):
+        adapter = _make_adapter()
+        adapter._admins = {"ou_bob"}
+        adapter._slash_confirm_state["1"] = _make_state()
+
+        with patch("tools.slash_confirm.resolve", new_callable=AsyncMock, return_value="ok") as mock_resolve:
+            await adapter._resolve_slash_confirm("1", "once", "Bob", open_id="ou_bob", chat_id="oc_12345")
+            await adapter._resolve_slash_confirm("1", "once", "Bob", open_id="ou_bob", chat_id="oc_12345")
+
+        mock_resolve.assert_called_once_with("sess-1", "gw-1", "once")
+
+    @pytest.mark.asyncio
+    async def test_resolve_none_sends_expiry_notice(self):
+        adapter = _make_adapter()
+        adapter._admins = {"ou_bob"}
+        adapter._slash_confirm_state["6"] = _make_state()
+
+        with patch("tools.slash_confirm.resolve", new_callable=AsyncMock, return_value=None) as mock_resolve, \
+             patch.object(adapter, "send", new_callable=AsyncMock) as mock_send:
+            await adapter._resolve_slash_confirm("6", "once", "Bob", open_id="ou_bob", chat_id="oc_12345")
+
+        mock_resolve.assert_called_once()
+        mock_send.assert_awaited_once()
+        notice = mock_send.call_args[0][1]
+        assert "expired" in notice

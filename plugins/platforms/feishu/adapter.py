@@ -282,6 +282,10 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
 _FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
+# Un-clicked slash-confirm cards are dropped after this many seconds (matches
+# tools.slash_confirm.DEFAULT_TIMEOUT_SECONDS); otherwise ignored cards would
+# leak state forever and stale clicks would resolve long-dead prompts.
+_FEISHU_SLASH_CONFIRM_TTL_SECONDS = 300
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -2209,7 +2213,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "type": btn_type,
                 "value": {
                     "hermes_slash_confirm_action": action,
-                    "confirm_id": str(prompt_id),
+                    "prompt_id": str(prompt_id),
                 },
             }
 
@@ -2266,6 +2270,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "confirm_id": str(confirm_id),
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "created_at": time.time(),
                 }
             return result
         except Exception as exc:
@@ -3000,13 +3005,19 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _handle_slash_confirm_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule slash-confirm resolution and build the synchronous callback response."""
-        prompt_id = action_value.get("confirm_id")
+        prompt_id = action_value.get("prompt_id")
         if prompt_id is None:
-            logger.debug("[Feishu] Card action missing confirm_id, ignoring")
+            logger.debug("[Feishu] Card action missing prompt_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         state = self._slash_confirm_state.get(str(prompt_id))
         if not state:
             logger.debug("[Feishu] Slash confirm %s already resolved or unknown", prompt_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+        if time.time() - float(state.get("created_at", 0) or 0) > _FEISHU_SLASH_CONFIRM_TTL_SECONDS:
+            # The module-level pending confirm has already timed out; drop the
+            # stale card state so ignored cards can't leak or resolve late.
+            self._slash_confirm_state.pop(str(prompt_id), None)
+            logger.debug("[Feishu] Slash confirm %s expired, ignoring", prompt_id)
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
         choice = str(action_value.get("hermes_slash_confirm_action", "") or "").strip().lower()
@@ -3159,12 +3170,20 @@ class FeishuAdapter(BasePlatformAdapter):
         open_id: str = "",
         chat_id: str = "",
     ) -> None:
-        """Pop slash-confirm state and run the pending handler via tools.slash_confirm."""
-        state = self._slash_confirm_state.get(prompt_id)
+        """Atomically claim the pending confirm and run the handler via tools.slash_confirm."""
+        # Pop at coroutine entry: a double-click schedules two coroutines and
+        # only the first may claim the state, so the pending command's approve
+        # side can never run twice. The synchronous click handler's ``get``
+        # remains a cheap dedupe for the common single-click case.
+        state = self._slash_confirm_state.pop(prompt_id, None)
         if not state:
             logger.debug("[Feishu] Slash confirm %s already resolved or unknown", prompt_id)
             return
-        if not self._is_interactive_operator_authorized(open_id):
+        # Re-authorize with the same predicate the click handler used
+        # (_allow_group_message) so a card can never promise an approval the
+        # resolver would then refuse (phantom approval).
+        sender_id = SimpleNamespace(open_id=open_id, user_id="")
+        if not self._allow_group_message(sender_id, str(state.get("chat_id", "") or ""), is_bot=False):
             logger.warning(
                 "[Feishu] Unauthorized slash confirm click by %s for confirm %s",
                 open_id or "<unknown>", prompt_id,
@@ -3176,10 +3195,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 "[Feishu] Slash confirm %s chat mismatch (expected=%s, got=%s)",
                 prompt_id, expected_chat_id, chat_id,
             )
-            return
-        state = self._slash_confirm_state.pop(prompt_id, None)
-        if not state:
-            logger.debug("[Feishu] Slash confirm %s already resolved while validating callback", prompt_id)
             return
         try:
             from tools.slash_confirm import resolve as resolve_slash_confirm
@@ -3197,6 +3212,20 @@ class FeishuAdapter(BasePlatformAdapter):
                         await self.send(_chat, result)
                     except Exception:
                         logger.debug("[Feishu] slash-confirm follow-up send failed", exc_info=True)
+            elif choice != "cancel":
+                # The callback card already showed a resolved state, but nothing
+                # was pending — the confirm timed out or was resolved elsewhere.
+                # Correct the record (mirrors _resolve_approval's expiry notice).
+                _chat = str(state.get("chat_id", "") or chat_id or "")
+                if _chat:
+                    try:
+                        await self.send(
+                            _chat,
+                            "⌛ That confirmation had already expired — the command "
+                            "was not run (it timed out or was resolved elsewhere).",
+                        )
+                    except Exception:
+                        logger.debug("[Feishu] expired slash-confirm notice failed", exc_info=True)
         except Exception as exc:
             logger.error("Failed to resolve Feishu slash confirm: %s", exc)
 
