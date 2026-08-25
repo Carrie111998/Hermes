@@ -380,6 +380,19 @@ def test_late_prompt_response_is_idempotent(server, method, value_key):
     assert response["result"] == {"status": "expired"}
 
 
+def test_late_preview_action_response_does_not_retain_answer(server):
+    response = server.handle_request(
+        {
+            "id": "late-preview-response",
+            "method": "preview.act.respond",
+            "params": {"request_id": "expired-preview", "text": "late"},
+        }
+    )
+
+    assert response["result"] == {"status": "expired"}
+    assert "expired-preview" not in server._answers
+
+
 # ── clarify batch (multi-question) bridge ────────────────────────────
 
 

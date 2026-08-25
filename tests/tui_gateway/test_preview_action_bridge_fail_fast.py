@@ -69,6 +69,34 @@ def test_repeated_preview_actions_short_circuit_after_unanswered_probe(session, 
     assert len(bridge.calls) == 1
 
 
+def test_unknown_session_fails_without_creating_or_probing(bridge):
+    server._sessions.pop("missing", None)
+
+    result = server._preview_action_request("missing", {"action": "elements"})
+
+    assert json.loads(result)["success"] is False
+    assert "missing" not in server._sessions
+    assert bridge.calls == []
+
+
+def test_unanswered_bridge_reprobes_after_cooldown(session, bridge, monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(server.time, "monotonic", lambda: now)
+
+    server._preview_action_request("s1", {"action": "elements"})
+    now += server._PREVIEW_ACTION_REPROBE_COOLDOWN_S - 0.1
+    server._preview_action_request("s1", {"action": "elements"})
+    assert len(bridge.calls) == 1
+
+    now += 0.1
+    bridge.answers = [json.dumps({"success": True})]
+    result = server._preview_action_request("s1", {"action": "elements"})
+
+    assert json.loads(result)["success"] is True
+    assert len(bridge.calls) == 2
+    assert session["preview_action_bridge"] == "answered"
+
+
 def test_interrupted_preview_probe_does_not_poison_session(session, monkeypatch):
     calls = 0
 

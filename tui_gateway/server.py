@@ -4240,15 +4240,16 @@ def _tour_request(sid: str, payload: dict) -> str:
 
 _PREVIEW_ACTION_TIMEOUT_S = 45
 _PREVIEW_ACTION_PROBE_TIMEOUT_S = 10
+_PREVIEW_ACTION_REPROBE_COOLDOWN_S = 30
 
 _PREVIEW_ACTION_BRIDGE_UNAVAILABLE = json.dumps(
     {
         "success": False,
         "error": (
             "No Hermes Desktop window answered the preview action request. "
-            "The Desktop renderer bridge is unavailable for this session. "
-            "Update Hermes Desktop and start a new session. Do not retry "
-            "drive_preview or annotate_preview in this session."
+            "The Desktop renderer bridge is temporarily unavailable for this session. "
+            "Check that Hermes Desktop is open; another preview action can "
+            "probe the bridge again after a short cooldown."
         ),
     }
 )
@@ -4256,14 +4257,23 @@ _PREVIEW_ACTION_BRIDGE_UNAVAILABLE = json.dumps(
 
 def _preview_action_request(sid: str, payload: dict) -> str:
     """Bridge preview actions without repeatedly waiting on an absent renderer."""
-    session = _sessions.get(sid)
+    with _sessions_lock:
+        session = _sessions.get(sid)
     if session is None:
-        session = {}
+        return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+
+    now = time.monotonic()
     with _prompt_lock:
         state = session.get("preview_action_bridge")
 
     if state == "unanswered":
-        return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+        with _prompt_lock:
+            retry_at = session.get("preview_action_bridge_retry_at")
+            if retry_at is None:
+                retry_at = now + _PREVIEW_ACTION_REPROBE_COOLDOWN_S
+                session["preview_action_bridge_retry_at"] = retry_at
+        if now < retry_at:
+            return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
 
     block_result = _block(
         "preview.act.request",
@@ -4286,8 +4296,12 @@ def _preview_action_request(sid: str, payload: dict) -> str:
     with _prompt_lock:
         if answer:
             session["preview_action_bridge"] = "answered"
+            session.pop("preview_action_bridge_retry_at", None)
         elif timed_out and session.get("preview_action_bridge") != "answered":
             session["preview_action_bridge"] = "unanswered"
+            session["preview_action_bridge_retry_at"] = (
+                time.monotonic() + _PREVIEW_ACTION_REPROBE_COOLDOWN_S
+            )
 
     return answer or _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
 
