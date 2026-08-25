@@ -1580,6 +1580,27 @@ class APIServerAdapter(BasePlatformAdapter):
         return max(0, value)
 
     @staticmethod
+    def _current_request_profile_name() -> str:
+        """Return the request-selected profile when present, else active profile."""
+        profile_name = ""
+        try:
+            profile = _api_request_profile.get()
+            if profile and profile not in {"default", "custom"}:
+                return profile
+        except Exception:
+            pass
+
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name()
+            if profile and profile not in {"default", "custom"}:
+                profile_name = profile
+        except Exception:
+            pass
+        return profile_name
+
+    @staticmethod
     def _resolve_model_name(explicit: str) -> str:
         """Derive the advertised model name for /v1/models.
 
@@ -1594,14 +1615,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         from hermes_cli.model_switch import resolve_effective_model
 
-        profile_name = ""
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            profile = get_active_profile_name()
-            if profile and profile not in {"default", "custom"}:
-                profile_name = profile
-        except Exception:
-            pass
+        profile_name = APIServerAdapter._current_request_profile_name()
         return resolve_effective_model(explicit, profile_name, "hermes-agent")
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
@@ -2988,12 +3002,15 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from hermes_cli.inventory import build_model_options_payload, load_picker_context
 
+            request_profile = _api_request_profile.get()
+
             def _build_payload() -> Dict[str, Any]:
-                return build_model_options_payload(
-                    load_picker_context(),
-                    include_unconfigured=True,
-                    refresh=refresh,
-                )
+                with self._profile_scope(request_profile):
+                    return build_model_options_payload(
+                        load_picker_context(),
+                        include_unconfigured=True,
+                        refresh=refresh,
+                    )
 
             # Inventory enrichment can fetch pricing and provider catalogs.
             # Keep all synchronous picker work off aiohttp's event loop.
@@ -3111,7 +3128,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             from tools.skills_tool import _find_all_skills, _sort_skills
-            skills = _sort_skills(_find_all_skills(skip_disabled=False))
+            request_profile = _api_request_profile.get()
+            with self._profile_scope(request_profile):
+                skills = _sort_skills(_find_all_skills(skip_disabled=False))
         except Exception:
             logger.exception("GET /v1/skills failed")
             return web.json_response(
@@ -3147,28 +3166,30 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             from toolsets import resolve_toolset
 
-            config = load_config()
-            enabled_toolsets = _get_platform_tools(
-                config,
-                "api_server",
-                include_default_mcp_servers=False,
-            )
-            features = get_nous_subscription_features(config)
-            data: List[Dict[str, Any]] = []
-            for name, label, desc in _get_effective_configurable_toolsets():
-                try:
-                    tools = sorted(set(resolve_toolset(name)))
-                except Exception:
-                    tools = []
-                is_enabled = name in enabled_toolsets
-                data.append({
-                    "name": name,
-                    "label": label,
-                    "description": desc,
-                    "enabled": is_enabled,
-                    "configured": _toolset_has_keys(name, config, features=features),
-                    "tools": tools,
-                })
+            request_profile = _api_request_profile.get()
+            with self._profile_scope(request_profile):
+                config = load_config()
+                enabled_toolsets = _get_platform_tools(
+                    config,
+                    "api_server",
+                    include_default_mcp_servers=False,
+                )
+                features = get_nous_subscription_features(config)
+                data: List[Dict[str, Any]] = []
+                for name, label, desc in _get_effective_configurable_toolsets():
+                    try:
+                        tools = sorted(set(resolve_toolset(name)))
+                    except Exception:
+                        tools = []
+                    is_enabled = name in enabled_toolsets
+                    data.append({
+                        "name": name,
+                        "label": label,
+                        "description": desc,
+                        "enabled": is_enabled,
+                        "configured": _toolset_has_keys(name, config, features=features),
+                        "tools": tools,
+                    })
         except Exception:
             logger.exception("GET /v1/toolsets failed")
             return web.json_response(

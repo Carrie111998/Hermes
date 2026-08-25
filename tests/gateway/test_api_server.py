@@ -31,6 +31,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
+    _api_request_profile,
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
@@ -795,6 +796,14 @@ class TestModelsEndpoint:
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
             assert APIServerAdapter._resolve_model_name("") == "hermes-agent"
 
+    def test_current_request_profile_name_prefers_request_scope(self):
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+            token = _api_request_profile.set("coder")
+            try:
+                assert APIServerAdapter._current_request_profile_name() == "coder"
+            finally:
+                _api_request_profile.reset(token)
+
 
     @pytest.mark.asyncio
     async def test_model_options_returns_shared_inventory(self, adapter, monkeypatch):
@@ -843,6 +852,46 @@ class TestModelsEndpoint:
             "include_unconfigured": True,
             "refresh": True,
         }
+
+    @pytest.mark.asyncio
+    async def test_model_options_re_enters_request_profile_scope_inside_worker_thread(self, adapter, monkeypatch):
+        from hermes_cli import inventory
+
+        payload = {"provider": "coder-provider", "model": "coder-model"}
+        seen = {}
+
+        monkeypatch.setattr(inventory, "load_picker_context", lambda: "ctx")
+
+        def fake_build_model_options_payload(received_ctx, **kwargs):
+            seen["ctx"] = received_ctx
+            seen["profile"] = _api_request_profile.get()
+            seen["kwargs"] = kwargs
+            return payload
+
+        async def fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(inventory, "build_model_options_payload", fake_build_model_options_payload)
+        monkeypatch.setattr("gateway.platforms.api_server.asyncio.to_thread", fake_to_thread)
+
+        adapter._expected_api_key = lambda: "test-key"
+        token = _api_request_profile.set("coder")
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/api/model/options",
+                    headers={"Authorization": "Bearer test-key"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        finally:
+            _api_request_profile.reset(token)
+
+        assert data == payload
+        assert seen["ctx"] == "ctx"
+        assert seen["profile"] == "coder"
+        assert seen["kwargs"] == {"include_unconfigured": True, "refresh": False}
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +954,30 @@ class TestSkillsEndpoint:
                 for entry in data["data"]:
                     assert set(entry.keys()) >= {"name", "description", "category"}
 
+    @pytest.mark.asyncio
+    async def test_skills_uses_request_profile_scope(self, adapter):
+        fake_skills = [{"name": "coder-skill", "description": "", "category": "test"}]
+
+        def fake_find_all_skills(skip_disabled=False):
+            assert _api_request_profile.get() == "coder"
+            return list(fake_skills)
+
+        adapter._expected_api_key = lambda: "test-key"
+        token = _api_request_profile.set("coder")
+        try:
+            with patch("tools.skills_tool._find_all_skills", side_effect=fake_find_all_skills):
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    resp = await cli.get(
+                        "/v1/skills",
+                        headers={"Authorization": "Bearer test-key"},
+                    )
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["data"][0]["name"] == "coder-skill"
+        finally:
+            _api_request_profile.reset(token)
+
 
 class TestToolsetsEndpoint:
     @pytest.mark.asyncio
@@ -953,6 +1026,52 @@ class TestToolsetsEndpoint:
             call.kwargs["features"] is feature_snapshot
             for call in has_keys.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_toolsets_uses_request_profile_scope(self, adapter):
+        fake_toolsets = [("default", "Default Tools", "Core tools")]
+
+        def fake_load_config():
+            assert _api_request_profile.get() == "coder"
+            return object()
+
+        def fake_get_platform_tools(config, platform, include_default_mcp_servers=False):
+            assert _api_request_profile.get() == "coder"
+            return {"default"}
+
+        adapter._expected_api_key = lambda: "test-key"
+        token = _api_request_profile.set("coder")
+        try:
+            with patch(
+                "hermes_cli.config.load_config",
+                side_effect=fake_load_config,
+            ), patch(
+                "hermes_cli.tools_config._get_effective_configurable_toolsets",
+                return_value=fake_toolsets,
+            ), patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                side_effect=fake_get_platform_tools,
+            ), patch(
+                "hermes_cli.tools_config.get_nous_subscription_features",
+                return_value=object(),
+            ), patch(
+                "hermes_cli.tools_config._toolset_has_keys",
+                return_value=True,
+            ), patch(
+                "toolsets.resolve_toolset",
+                return_value=["terminal"],
+            ):
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    resp = await cli.get(
+                        "/v1/toolsets",
+                        headers={"Authorization": "Bearer test-key"},
+                    )
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["data"][0]["name"] == "default"
+        finally:
+            _api_request_profile.reset(token)
 
 
 # ---------------------------------------------------------------------------
