@@ -801,9 +801,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- stats ---
     p_stats = sub.add_parser(
-        "stats", help="Per-status + per-assignee counts + oldest-ready age",
+        "stats", help="Profile execution, assignment, queue, and failure statistics",
     )
     p_stats.add_argument("--json", action="store_true")
+    p_stats.add_argument("--profile", default=None, help="Filter to one profile's assignments and attempts")
+    p_stats.add_argument("--tenant", default=None, help="Filter tasks to one tenant")
+    p_stats.add_argument("--status", choices=sorted(kb.VALID_STATUSES), default=None)
+    p_stats.add_argument("--since", type=kb._to_epoch, default=None, metavar="EPOCH_OR_ISO")
+    p_stats.add_argument("--until", type=kb._to_epoch, default=None, metavar="EPOCH_OR_ISO")
+    p_stats.add_argument("--include-archived", action="store_true", help="Include archived task history")
 
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
@@ -2918,22 +2924,27 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_stats
     with kb.connect_closing() as conn:
-        stats = kb.board_stats(conn)
+        stats = kanban_stats.build_report(
+            conn,
+            profile=args.profile,
+            tenant=args.tenant,
+            status=args.status,
+            since=args.since,
+            until=args.until,
+            include_archived=args.include_archived,
+        )
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
-    print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
-    if stats["by_assignee"]:
-        print("\nBy assignee:")
-        for who, counts in sorted(stats["by_assignee"].items()):
-            parts = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-            print(f"  {who:20s}  {parts}")
-    age = stats["oldest_ready_age_seconds"]
-    if age is not None:
-        print(f"\nOldest ready task age: {int(age)}s")
+    print(f"Board: {stats['board']}  tasks={stats['task_count']}  attempts={stats['attempt_count']}")
+    print("\nProfile                              state             assigned attempts running failed completed")
+    for row in stats["profiles"]:
+        print(f"{row['name'][:34]:34s}  {row['telemetry_state']:16s}  "
+              f"{row['assigned_tasks']:8d} {row['attempts']:8d} {row['running_attempts']:7d} "
+              f"{row['failed_attempts']:6d} {row['completed_tasks']:9d}")
+    print("\nCounts are distinct task rows for assignments/completions and task_runs for attempts.")
     return 0
 
 

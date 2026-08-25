@@ -213,6 +213,16 @@ hermes kanban list
 hermes kanban stats
 ```
 
+`stats` is a secret-safe, attempt-aware profile report. It keeps distinct task-row counts (assignment, lifecycle, and completed tasks) from `task_runs` attempt counts, and identifies `observed_zero` configured profiles separately from `unavailable` attribution (for example, a deleted profile or a run without a recorded profile). Use filters when investigating a routing window:
+
+```bash
+hermes kanban stats --profile researcher --tenant default --since 2026-08-01
+hermes kanban stats --status blocked --json
+hermes kanban stats --include-archived --until 2026-08-31
+```
+
+The report attributes attempts to the immutable `task_runs.profile`, while current assignment and blocker lifecycle signals use `tasks.assignee`; this makes reassignment and retries visible without rewriting history. Duration and queue-wait summaries are in seconds, with average, median, and p95 values. Operators can use high running/queue-wait values to identify overload, `observed_zero` to identify capacity, and failed/protocol/stale/reclaimed counts to identify routing or worker-protocol problems. The report is scoped to the selected board (`--board <slug>`), and archived history is opt-in.
+
 When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
 
 ### Gateway-embedded dispatcher (default)
