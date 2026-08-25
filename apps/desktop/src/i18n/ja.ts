@@ -753,7 +753,25 @@ export const ja = defineLocale({
         mcp: { label: 'MCP', hint: 'MCP ツールルーティング' },
         title_generation: { label: 'タイトル生成', hint: 'セッションタイトル' },
         curator: { label: 'キュレーター', hint: 'スキル使用レビュー' }
-      }
+      },
+      moa: {
+        title: 'Mixture of Agents',
+        description:
+          'Mixture of Agents プロバイダー配下のモデルとして表示される名前付きプリセットを構成します。アグリゲーターが実際に動作するモデルです。',
+        preset: 'プリセット',
+        setDefault: 'デフォルトに設定',
+        delete: '削除',
+        newPreset: '新規プリセット',
+        addPreset: 'プリセットを追加',
+        defaultLabel: 'デフォルト：',
+        remove: '削除',
+        addReferenceModel: '参照モデルを追加',
+        referenceModel: n => `参照モデル ${n}`,
+        aggregator: 'アグリゲーター'
+      },
+      staleAuxNotice: (count: number, names: string, where: string) =>
+        `${count} 個の補助タスク（${names}）はまだ ${where} で実行されています（メインモデルではありません）。`,
+      otherProviders: '他のプロバイダー'
     },
     providers: {
       connectAccount: 'アカウントを接続',
@@ -833,6 +851,35 @@ export const ja = defineLocale({
       postSetupErrorTitle: 'セットアップはエラーで終了しました',
       postSetupErrorMessage: step => `${step} のログを確認してください。`,
       postSetupFailed: step => `${step} のセットアップの実行に失敗しました`
+    },
+    uninstall: {
+      dangerZone: '危険ゾーン',
+      checkingInstalled: 'インストール内容を確認中…',
+      title: 'Hermes をアンインストール',
+      chooseHowMuch: '削除する範囲を選択してください。完了するためにアプリが閉じます。インストーラーを開き直せばいつでも戻れます。',
+      confirmTitle: 'アンインストールの確認',
+      confirmBody: what => `${what} が削除されます。この操作は取り消せません。`,
+      appLabel: 'アプリ：',
+      couldNotStart: 'アンインストールを開始できませんでした。',
+      uninstalling: 'アンインストール中…',
+      yesUninstall: 'はい、アンインストール',
+      options: {
+        gui: {
+          title: 'Chat GUI のみアンインストール',
+          description: 'このデスクトップアプリを削除します。Hermes エージェント、設定、チャットはすべて残ります。',
+          consequence: 'デスクトップ Chat GUI（このアプリとそのデータ）'
+        },
+        lite: {
+          title: 'GUI とエージェントをアンインストール、データは保持',
+          description: 'アプリと Hermes エージェントを削除しますが、将来の再インストールに備えて設定・チャット・シークレットは保持します。',
+          consequence: 'Chat GUI と Hermes エージェント（設定・チャット・シークレットは保持）'
+        },
+        full: {
+          title: 'すべてアンインストール',
+          description: 'アプリ、エージェント、すべてのユーザーデータ（設定、チャット、定期ジョブ、シークレット、ログ）を削除します。',
+          consequence: 'すべて——Chat GUI、Hermes エージェント、およびすべての設定・チャット・シークレット・ログ'
+        }
+      }
     }
   },
 

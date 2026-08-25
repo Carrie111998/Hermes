@@ -636,7 +636,25 @@ export const en: Translations = {
         mcp: { label: 'MCP', hint: 'MCP tool routing' },
         title_generation: { label: 'Title gen', hint: 'Session titles' },
         curator: { label: 'Curator', hint: 'Skill-usage review' }
-      }
+      },
+      moa: {
+        title: 'Mixture of Agents',
+        description:
+          'Configure named presets that appear as models under the Mixture of Agents provider. The aggregator is the acting model.',
+        preset: 'Preset',
+        setDefault: 'Set default',
+        delete: 'Delete',
+        newPreset: 'new preset',
+        addPreset: 'Add preset',
+        defaultLabel: 'Default:',
+        remove: 'Remove',
+        addReferenceModel: 'Add reference model',
+        referenceModel: n => `Reference ${n}`,
+        aggregator: 'Aggregator'
+      },
+      staleAuxNotice: (count: number, names: string, where: string) =>
+        `${count} auxiliary task${count === 1 ? '' : 's'} (${names}) still run on ${where}, not your main model.`,
+      otherProviders: 'other providers'
     },
     providers: {
       connectAccount: 'Connect an account',
@@ -721,6 +739,36 @@ export const en: Translations = {
       postSetupErrorTitle: 'Setup finished with errors',
       postSetupErrorMessage: step => `Check the ${step} log.`,
       postSetupFailed: step => `Failed to run ${step} setup`
+    },
+    uninstall: {
+      dangerZone: 'Danger zone',
+      checkingInstalled: 'Checking what’s installed…',
+      title: 'Uninstall Hermes',
+      chooseHowMuch:
+        'Choose how much to remove. The app closes to finish the job; reopen the installer any time to come back.',
+      confirmTitle: 'Confirm uninstall',
+      confirmBody: what => `This removes ${what}. This can’t be undone.`,
+      appLabel: 'App:',
+      couldNotStart: 'Uninstall could not start.',
+      uninstalling: 'Uninstalling…',
+      yesUninstall: 'Yes, uninstall',
+      options: {
+        gui: {
+          title: 'Uninstall Chat GUI only',
+          description: 'Remove this desktop app. The Hermes agent, your config, and chats all stay.',
+          consequence: 'the desktop Chat GUI (this app and its data)'
+        },
+        lite: {
+          title: 'Uninstall GUI + agent, keep my data',
+          description: 'Remove the app and the Hermes agent, but keep config, chats, and secrets for a future reinstall.',
+          consequence: 'the Chat GUI and the Hermes agent (config, chats, and secrets are kept)'
+        },
+        full: {
+          title: 'Uninstall everything',
+          description: 'Remove the app, the agent, and all user data — config, chats, scheduled jobs, secrets, logs.',
+          consequence: 'EVERYTHING — the Chat GUI, the Hermes agent, and all of your config, chats, secrets, and logs'
+        }
+      }
     }
   },
 

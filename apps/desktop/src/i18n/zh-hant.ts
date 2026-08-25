@@ -730,7 +730,24 @@ export const zhHant = defineLocale({
         mcp: { label: 'MCP', hint: 'MCP 工具路由' },
         title_generation: { label: '標題生成', hint: '工作階段標題' },
         curator: { label: '策展器', hint: '技能使用審查' }
-      }
+      },
+      moa: {
+        title: '混合智能體',
+        description: '設定具名預設，它們會以 Mixture of Agents 提供方下的模型形式出現。聚合器（Aggregator）是實際執行的模型。',
+        preset: '預設',
+        setDefault: '設為預設',
+        delete: '刪除',
+        newPreset: '新預設',
+        addPreset: '新增預設',
+        defaultLabel: '預設：',
+        remove: '移除',
+        addReferenceModel: '新增參考模型',
+        referenceModel: n => `參考模型 ${n}`,
+        aggregator: '聚合器'
+      },
+      staleAuxNotice: (count: number, names: string, where: string) =>
+        `${count} 個輔助任務（${names}）仍在 ${where} 上執行，而非主要模型。`,
+      otherProviders: '其他提供方'
     },
     providers: {
       connectAccount: '連結帳號',
@@ -805,6 +822,35 @@ export const zhHant = defineLocale({
       postSetupErrorTitle: '設定完成但有錯誤',
       postSetupErrorMessage: step => `請檢查 ${step} 日誌。`,
       postSetupFailed: step => `執行 ${step} 設定失敗`
+    },
+    uninstall: {
+      dangerZone: '危險區域',
+      checkingInstalled: '正在檢查已安裝內容…',
+      title: '解除安裝 Hermes',
+      chooseHowMuch: '選擇要移除的內容。應用程式會關閉以完成作業；隨時重新開啟安裝程式即可返回。',
+      confirmTitle: '確認解除安裝',
+      confirmBody: what => `這將移除${what}。此操作無法復原。`,
+      appLabel: '應用程式：',
+      couldNotStart: '無法開始解除安裝。',
+      uninstalling: '正在解除安裝…',
+      yesUninstall: '是，解除安裝',
+      options: {
+        gui: {
+          title: '僅解除安裝聊天 GUI',
+          description: '移除此桌面應用程式。Hermes 代理、你的設定和聊天記錄都會保留。',
+          consequence: '桌面聊天 GUI（此應用程式及其資料）'
+        },
+        lite: {
+          title: '解除安裝 GUI 與代理，保留資料',
+          description: '移除應用程式和 Hermes 代理，但保留設定、聊天記錄和機密，以便日後重新安裝。',
+          consequence: '聊天 GUI 和 Hermes 代理（設定、聊天記錄和機密會保留）'
+        },
+        full: {
+          title: '解除安裝全部',
+          description: '移除應用程式、代理和所有使用者資料——設定、聊天記錄、排程工作、機密和日誌。',
+          consequence: '全部內容——聊天 GUI、Hermes 代理，以及你的所有設定、聊天記錄、機密和日誌'
+        }
+      }
     }
   },
 

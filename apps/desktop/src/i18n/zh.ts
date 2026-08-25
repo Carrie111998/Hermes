@@ -825,7 +825,24 @@ export const zh: Translations = {
         mcp: { label: 'MCP', hint: 'MCP 工具路由' },
         title_generation: { label: '标题生成', hint: '会话标题' },
         curator: { label: '维护器', hint: '技能使用审查' }
-      }
+      },
+      moa: {
+        title: '混合智能体',
+        description: '配置具名预设，它们将作为 Mixture of Agents 提供方下的模型出现。聚合器（Aggregator）是实际执行的模型。',
+        preset: '预设',
+        setDefault: '设为默认',
+        delete: '删除',
+        newPreset: '新预设',
+        addPreset: '添加预设',
+        defaultLabel: '默认：',
+        remove: '移除',
+        addReferenceModel: '添加参考模型',
+        referenceModel: n => `参考模型 ${n}`,
+        aggregator: '聚合器'
+      },
+      staleAuxNotice: (count: number, names: string, where: string) =>
+        `${count} 个辅助任务（${names}）仍在 ${where} 上运行，而非主模型。`,
+      otherProviders: '其他提供方'
     },
     providers: {
       connectAccount: '连接账号',
@@ -905,6 +922,35 @@ export const zh: Translations = {
       postSetupErrorTitle: '设置完成但有错误',
       postSetupErrorMessage: step => `请检查 ${step} 日志。`,
       postSetupFailed: step => `运行 ${step} 设置失败`
+    },
+    uninstall: {
+      dangerZone: '危险区域',
+      checkingInstalled: '正在检查已安装内容…',
+      title: '卸载 Hermes',
+      chooseHowMuch: '选择要删除的内容。应用会关闭以完成卸载；随时重新打开安装程序即可恢复。',
+      confirmTitle: '确认卸载',
+      confirmBody: what => `这将删除${what}。此操作无法撤销。`,
+      appLabel: '应用：',
+      couldNotStart: '无法开始卸载。',
+      uninstalling: '正在卸载…',
+      yesUninstall: '是，卸载',
+      options: {
+        gui: {
+          title: '仅卸载聊天图形界面',
+          description: '仅移除此桌面应用。Hermes 智能体、你的配置和聊天记录都会保留。',
+          consequence: '桌面聊天图形界面（此应用及其数据）'
+        },
+        lite: {
+          title: '卸载图形界面和智能体，保留数据',
+          description: '移除应用和 Hermes 智能体，但保留配置、聊天记录和密钥，以便将来重新安装。',
+          consequence: '聊天图形界面和 Hermes 智能体（配置、聊天记录和密钥会保留）'
+        },
+        full: {
+          title: '全部卸载',
+          description: '移除应用、智能体和所有用户数据——配置、聊天记录、定时任务、密钥和日志。',
+          consequence: '全部内容——聊天图形界面、Hermes 智能体以及你的所有配置、聊天记录、密钥和日志'
+        }
+      }
     }
   },
 

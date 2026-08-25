@@ -47,6 +47,12 @@ interface AuxTaskCopy {
   hint: string
 }
 
+export interface UninstallOptionCopy {
+  title: string
+  description: string
+  consequence: string
+}
+
 export interface Translations {
   common: {
     apply: string
@@ -539,6 +545,22 @@ export interface Translations {
       autoUseMain: string
       providerDefault: string
       tasks: Record<string, AuxTaskCopy>
+      moa: {
+        title: string
+        description: string
+        preset: string
+        setDefault: string
+        delete: string
+        newPreset: string
+        addPreset: string
+        defaultLabel: string
+        remove: string
+        addReferenceModel: string
+        aggregator: string
+        referenceModel: (n: number) => string
+      }
+      staleAuxNotice: (count: number, names: string, where: string) => string
+      otherProviders: string
     }
     providers: {
       connectAccount: string
@@ -618,6 +640,23 @@ export interface Translations {
       postSetupErrorTitle: string
       postSetupErrorMessage: (step: string) => string
       postSetupFailed: (step: string) => string
+    }
+    uninstall: {
+      dangerZone: string
+      checkingInstalled: string
+      title: string
+      chooseHowMuch: string
+      confirmTitle: string
+      confirmBody: (what: string) => string
+      appLabel: string
+      couldNotStart: string
+      uninstalling: string
+      yesUninstall: string
+      options: {
+        gui: UninstallOptionCopy
+        lite: UninstallOptionCopy
+        full: UninstallOptionCopy
+      }
     }
   }
 
