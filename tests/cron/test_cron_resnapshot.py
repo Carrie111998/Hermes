@@ -203,3 +203,15 @@ class TestResnapshot:
         # model/provider pins): an agent must not silently re-baseline a
         # drift guard that is blocking unattended spend.
         assert "resnapshot" not in CRONJOB_SCHEMA["parameters"]["properties"]
+
+    def test_strict_bool_rejects_string_false(self):
+        """bool("false") is True — the strict parser must reject string
+        falses so a dashboard/query payload can never flip the flag."""
+        from cron.jobs import _strict_bool
+
+        assert _strict_bool("false") is False
+        assert _strict_bool("FALSE") is False
+        assert _strict_bool("0") is False
+        assert _strict_bool("true") is True
+        assert _strict_bool(True) is True
+        assert _strict_bool(False) is False

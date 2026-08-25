@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
+    _strict_bool,
     claim_job_for_fire,
     effective_job_state,
     get_job,
@@ -1470,7 +1471,7 @@ def cronjob(
                 # drift-guard snapshots of an unpinned job to the current
                 # global default without pinning it. update_job() consumes it
                 # and never persists it.
-                updates["resnapshot"] = bool(resnapshot)
+                updates["resnapshot"] = _strict_bool(resnapshot)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.

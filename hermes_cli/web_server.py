@@ -11841,6 +11841,8 @@ def _normalize_dashboard_cron_updates(
     """
     normalized = dict(updates or {})
 
+    from cron import jobs as _cron_jobs
+
     for key in ("model", "provider", "workdir"):
         if key in normalized:
             normalized[key] = _cron_optional_text(normalized[key])
@@ -11862,7 +11864,7 @@ def _normalize_dashboard_cron_updates(
     if "resnapshot" in normalized:
         # Control flag consumed by update_job() (never persisted). Kept a
         # strict boolean so the dashboard cannot smuggle arbitrary values.
-        normalized["resnapshot"] = bool(normalized["resnapshot"])
+        normalized["resnapshot"] = _cron_jobs._strict_bool(normalized["resnapshot"])
     return normalized
 
 

@@ -41,6 +41,22 @@ logger = logging.getLogger(__name__)
 from hermes_time import now as _hermes_now
 from utils import atomic_replace, atomic_write_text
 
+
+def _strict_bool(value: Any) -> bool:
+    """Coerce a control-flag value to bool without Python's truthiness trap.
+
+    bool("false") is True, which has silently flipped update flags sent as
+    strings (CLI/query/dashboard payloads). Real bools pass through; strings
+    are matched case-insensitively ("true"/"1"/"yes"/"on" => True,
+    "false"/"0"/"no"/"off" => False); anything else is False, so a control
+    flag can never accidentally turn itself on.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
 # ``croniter`` compiles ~15 ms of regexes at import and only matters for
 # 5-field cron expressions. Resolve lazily; ``HAS_CRONITER`` stays a module
 # attribute (tests monkeypatch it, and a monkeypatched value wins because
@@ -1902,7 +1918,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # the drift-guard snapshots of an unpinned job to the current global
             # default without pinning it (#75375). Pop it before the merge so it
             # never lands in the stored record.
-            resnapshot_requested = bool(updates.pop("resnapshot", False))
+            resnapshot_requested = _strict_bool(updates.pop("resnapshot", False))
             updated = _apply_skill_fields({**job, **updates})
 
             # Re-check execution-mode invariants on the MERGED record when
