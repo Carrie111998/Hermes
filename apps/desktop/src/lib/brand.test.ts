@@ -1,16 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
+import { DEFAULT_WORKSPACE_ROUTE, FOUNDRLY_ROUTE, NEW_CHAT_ROUTE } from '@/app/routes'
+
 import foundrlyBrand from '../../brands/foundrly.json'
 import ixAgencyBrand from '../../brands/ix-agency.json'
 import quizverseBrand from '../../brands/quizverse.json'
 
-import {
-  BRAND,
-  DESKTOP_BRAND_ID,
-  IS_FOUNDRLY_BRAND,
-  IS_IX_AGENCY_BRAND,
-  IS_QUIZVERSE_BRAND
-} from './brand'
+import { BRAND, DESKTOP_BRAND_ID, IS_FOUNDRLY_BRAND, IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from './brand'
 
 const MANIFESTS = [ixAgencyBrand, quizverseBrand, foundrlyBrand]
 
@@ -71,6 +67,7 @@ describe('brand manifests', () => {
   it('foundrly manifest declares product web + admin portal URLs', () => {
     expect(foundrlyBrand.foundrly.webUrl).toMatch(/^https:\/\//)
     expect(foundrlyBrand.foundrly.adminPortalUrl).toMatch(/^https:\/\//)
+    expect(foundrlyBrand.foundrly.adminChatUrl).toMatch(/\/admin\/portal\/chat$/)
   })
 })
 
@@ -82,5 +79,9 @@ describe('active brand resolution', () => {
     expect(BRAND.workspace).toBe(BRAND.id)
     expect(['ix-agency', 'quizverse', 'foundrly']).toContain(DESKTOP_BRAND_ID)
     expect(BRAND.id).toBe(DESKTOP_BRAND_ID)
+  })
+
+  it('opens Foundrly on its cloud copilot instead of unconfigured local chat', () => {
+    expect(DEFAULT_WORKSPACE_ROUTE).toBe(IS_FOUNDRLY_BRAND ? FOUNDRLY_ROUTE : NEW_CHAT_ROUTE)
   })
 })

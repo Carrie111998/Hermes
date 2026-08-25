@@ -25,13 +25,13 @@ const otherBrands = KNOWN_BRANDS.filter(id => id !== brandId)
 const WORKSPACE_MARKERS = {
   'ix-agency': ['Search invoices', 'Org skills'],
   quizverse: ['persist:quizverse-tutor', 'persist:quizverse-web', 'TutorX'],
-  foundrly: ['persist:foundrly-home', 'Overnight visibility', 'Foundrly home']
+  foundrly: ['persist:foundrly-home', 'persist:foundrly-portal', 'Overnight visibility', 'Foundrly home']
 }
 
 const MAIN_MARKERS = {
   'ix-agency': ['hermes:ix-agency:', 'persist:ix-agency-portal', 'wg-quick'],
   quizverse: ['hermes:quizverse:', 'tutor.intelli-verse-x.ai', 'DeepTutorSupervisor', 'persist:quizverse-tutor'],
-  foundrly: ['hermes:foundrly:', 'persist:foundrly-home']
+  foundrly: ['hermes:foundrly:', 'persist:foundrly-home', 'persist:foundrly-portal']
 }
 
 const IPC_PREFIX = {

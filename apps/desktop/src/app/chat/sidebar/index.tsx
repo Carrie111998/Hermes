@@ -102,9 +102,9 @@ import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/st
 import {
   type AppView,
   ARTIFACTS_ROUTE,
+  FOUNDRLY_ROUTE,
   IX_AGENCY_ROUTE,
   MESSAGING_ROUTE,
-  FOUNDRLY_ROUTE,
   QUIZVERSE_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
@@ -160,21 +160,24 @@ const BRAND_WORKSPACE_NAV: SidebarNavItem = IS_QUIZVERSE_BRAND
         route: FOUNDRLY_ROUTE
       }
     : {
-      id: 'ix-agency',
-      label: BRAND.workspaceLabel,
-      icon: props => <Codicon name="organization" {...props} />,
-      route: IX_AGENCY_ROUTE
-    }
-
+        id: 'ix-agency',
+        label: BRAND.workspaceLabel,
+        icon: props => <Codicon name="organization" {...props} />,
+        route: IX_AGENCY_ROUTE
+      }
 
 const SIDEBAR_NAV: SidebarNavItem[] = [
-  {
-    id: 'new-session',
-    label: '',
-    icon: props => <Codicon name="robot" {...props} />,
-    action: 'new-session',
-    keybindActionId: 'session.new'
-  },
+  ...(IS_FOUNDRLY_BRAND
+    ? []
+    : [
+        {
+          id: 'new-session',
+          label: '',
+          icon: (props: { className?: string }) => <Codicon name="robot" {...props} />,
+          action: 'new-session',
+          keybindActionId: 'session.new'
+        } as SidebarNavItem
+      ]),
   {
     id: 'skills',
     label: '',
@@ -1087,7 +1090,8 @@ export function ChatSidebar({
 
   const showSessionSkeletons = sessionsLoading && sortedSessions.length === 0
 
-  const showSessionSections = showSessionSkeletons || sortedSessions.length > 0 || projectModel.length > 0
+  const showSessionSections =
+    !IS_FOUNDRLY_BRAND && (showSessionSkeletons || sortedSessions.length > 0 || projectModel.length > 0)
 
   // Each reorderable list reports its OWN new id order; persisting is a direct,
   // typed write — no id-prefix sniffing to figure out which level moved.
@@ -1514,7 +1518,7 @@ export function ChatSidebar({
           </div>
         )}
 
-        {!showSessionSections && <SidebarBlankState onNewProject={openProjectCreate} />}
+        {!IS_FOUNDRLY_BRAND && !showSessionSections && <SidebarBlankState onNewProject={openProjectCreate} />}
 
         <div className="shrink-0 px-0.5 pb-1 pt-0.5">
           <ProfileRail />

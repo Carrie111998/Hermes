@@ -39,6 +39,8 @@ export interface DesktopBrand {
   foundrly?: {
     webUrl: string
     adminPortalUrl: string
+    /** Live admin copilot (same /admin/portal/chat as Intelliverse-X-Webfrontend). */
+    adminChatUrl: string
   }
 }
 

@@ -18,6 +18,8 @@ export const STARMAP_ROUTE = '/starmap'
 export const IX_AGENCY_ROUTE = '/ix-agency'
 export const QUIZVERSE_ROUTE = '/quizverse'
 export const FOUNDRLY_ROUTE = '/foundrly'
+/** Foundrly's cloud copilot is its primary chat and needs no local API key. */
+export const DEFAULT_WORKSPACE_ROUTE = IS_FOUNDRLY_BRAND ? FOUNDRLY_ROUTE : NEW_CHAT_ROUTE
 
 export type AppView =
   | 'agents'

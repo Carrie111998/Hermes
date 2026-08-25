@@ -19,7 +19,7 @@ import { $freshDraftReady, $gatewayState } from '@/store/session'
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
-import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
+import { contributedRoutes, DEFAULT_WORKSPACE_ROUTE, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
 import { useStatusbarItems } from '../shell/hooks/use-statusbar-items'
 import { ModelMenuPanel } from '../shell/model-menu-panel'
@@ -34,10 +34,13 @@ import type { SidebarActions, WiringActions } from './types'
 const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')).ArtifactsView }))
 const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
 const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
+
 // Brand workspaces: only the active brand's workspace exists in the bundle —
 // IS_*_BRAND are compile-time constants, so the other branch (and its whole
 // import graph) is dead-code-eliminated by the renderer build.
-const IxAgencyView = IS_IX_AGENCY_BRAND ? lazy(async () => ({ default: (await import('../ix-agency')).IxAgencyView })) : null
+const IxAgencyView = IS_IX_AGENCY_BRAND
+  ? lazy(async () => ({ default: (await import('../ix-agency')).IxAgencyView }))
+  : null
 
 const QuizverseView = IS_QUIZVERSE_BRAND
   ? lazy(async () => ({ default: (await import('@/app/quizverse-brand')).QuizverseView }))
@@ -188,7 +191,12 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
 
   return (
     <Routes>
-      <Route element={chatView} index />
+      <Route
+        element={
+          DEFAULT_WORKSPACE_ROUTE === NEW_CHAT_ROUTE ? chatView : <Navigate replace to={DEFAULT_WORKSPACE_ROUTE} />
+        }
+        index
+      />
       <Route element={chatView} path=":sessionId" />
       <Route element={page(<SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="skills" />
       <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
@@ -212,9 +220,9 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
           path={route.path.slice(1)}
         />
       ))}
-      <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="new" />
+      <Route element={<Navigate replace to={DEFAULT_WORKSPACE_ROUTE} />} path="new" />
       <Route element={<LegacySessionRedirect />} path="sessions/:sessionId" />
-      <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="*" />
+      <Route element={<Navigate replace to={DEFAULT_WORKSPACE_ROUTE} />} path="*" />
     </Routes>
   )
 })

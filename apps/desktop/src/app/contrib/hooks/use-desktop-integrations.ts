@@ -9,7 +9,7 @@ import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/
 import { isSecondaryWindow } from '@/store/windows'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
-import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
+import { appViewForPath, DEFAULT_WORKSPACE_ROUTE, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 
 interface DesktopIntegrationsParams {
   chatOpen: boolean
@@ -84,6 +84,13 @@ export function useDesktopIntegrations({
     }
 
     restoredRef.current = true
+
+    if (DEFAULT_WORKSPACE_ROUTE !== NEW_CHAT_ROUTE) {
+      navigate(DEFAULT_WORKSPACE_ROUTE, { replace: true })
+
+      return
+    }
+
     const route = getRememberedRoute()
 
     if (route && route !== NEW_CHAT_ROUTE && !isOverlayView(appViewForPath(route))) {
