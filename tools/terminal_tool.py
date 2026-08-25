@@ -3478,6 +3478,33 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
+                            # The rest of the structured return address. Until
+                            # these were captured here, a completion had to be
+                            # reconstructed by splitting the session_key on
+                            # ":" — which is lossy for real key grammar (a
+                            # Matrix room id is ``!room:server``; a Slack key
+                            # carries the workspace id before the chat id) —
+                            # and the chat_type slot was simply left empty.
+                            proc_session.watcher_chat_type = _gse(
+                                "HERMES_SESSION_CHAT_TYPE", ""
+                            )
+                            proc_session.watcher_scope_id = _gse(
+                                "HERMES_SESSION_SCOPE_ID", ""
+                            )
+                            # Runtime namespace...
+                            proc_session.watcher_profile = _gse(
+                                "HERMES_SESSION_PROFILE", ""
+                            )
+                            # ...and, separately, TRANSPORT PROVENANCE: which
+                            # profile owns the adapter this turn arrived on.
+                            # The two differ whenever one shared credential
+                            # serves several routed runtimes, and only this one
+                            # identifies the bot that must deliver the
+                            # completion (see
+                            # GatewayAuthorizationMixin._transport_owner_profile).
+                            proc_session.watcher_transport_profile = _gse(
+                                "HERMES_SESSION_TRANSPORT_PROFILE", ""
+                            )
                             # Stamp the spawning conversation's session-db id
                             # so the gateway's completion pre-flight
                             # (_classify_completion_target) can drop the
@@ -3520,10 +3547,14 @@ def terminal_tool(
                             "session_key": session_key,
                             "platform": proc_session.watcher_platform,
                             "chat_id": proc_session.watcher_chat_id,
+                            "chat_type": proc_session.watcher_chat_type,
+                            "scope_id": proc_session.watcher_scope_id,
                             "user_id": proc_session.watcher_user_id,
                             "user_name": proc_session.watcher_user_name,
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
+                            "profile": proc_session.watcher_profile,
+                            "transport_profile": proc_session.watcher_transport_profile,
                             "notify_on_complete": True,
                             "parent_session_id": proc_session.parent_session_id,
                         })

@@ -202,6 +202,35 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+# The STRUCTURED return address an async delegation must carry from the
+# commissioning turn to its completion, mapped to the session contextvar that
+# holds each field.
+#
+# ``session_key`` alone is not a return address: it is colon-delimited and its
+# grammar is platform-specific (a Matrix room id is ``!room:server``; a Slack
+# key carries the workspace id between the chat-type slot and the chat id), so
+# a completion reconstructed by splitting it can target the wrong chat. And
+# ``profile`` — the runtime namespace — is not the transport owner: one shared
+# credential can serve several routed runtimes, so ``transport_profile`` is
+# carried separately and is what the gateway re-resolves the delivering adapter
+# from (see GatewayAuthorizationMixin._transport_owner_profile).
+_ROUTING_ORIGIN_FIELDS = (
+    ("platform", "HERMES_SESSION_PLATFORM"),
+    ("chat_type", "HERMES_SESSION_CHAT_TYPE"),
+    ("chat_id", "HERMES_SESSION_CHAT_ID"),
+    ("thread_id", "HERMES_SESSION_THREAD_ID"),
+    ("scope_id", "HERMES_SESSION_SCOPE_ID"),
+    ("user_id", "HERMES_SESSION_USER_ID"),
+    ("user_name", "HERMES_SESSION_USER_NAME"),
+    ("profile", "HERMES_SESSION_PROFILE"),
+    ("transport_profile", "HERMES_SESSION_TRANSPORT_PROFILE"),
+)
+
+#: The keys :func:`_capture_routing_origin` can produce — persisted with the
+#: durable record and replayed onto the completion event.
+_ROUTING_ORIGIN_KEYS = tuple(key for key, _ in _ROUTING_ORIGIN_FIELDS)
+
+
 def _capture_routing_origin() -> Dict[str, Any]:
     """Snapshot the dispatching turn's routing origin for the completion event.
 
@@ -220,11 +249,7 @@ def _capture_routing_origin() -> Dict[str, Any]:
     try:
         from gateway.session_context import get_session_env
 
-        for evt_key, env_name in (
-            ("scope_id", "HERMES_SESSION_SCOPE_ID"),
-            ("user_id", "HERMES_SESSION_USER_ID"),
-            ("user_name", "HERMES_SESSION_USER_NAME"),
-        ):
+        for evt_key, env_name in _ROUTING_ORIGIN_FIELDS:
             value = get_session_env(env_name, "")
             if value:
                 origin[evt_key] = value
@@ -244,10 +269,12 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
-            # Routing origin (scope_id/user_id/user_name): persisted so a
-            # restart-recovered completion can reconstruct a full
-            # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            # Structured return address + transport provenance: persisted so
+            # a restart-recovered completion reconstructs the SAME
+            # SessionSource and delivers through the SAME transport, without
+            # re-deriving either from the session key — see
+            # _capture_routing_origin.
+            *_ROUTING_ORIGIN_KEYS,
         )
         if key in record
     }
@@ -373,9 +400,10 @@ def recover_abandoned_delegations() -> int:
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
             # Routing origin persisted at dispatch (see _capture_routing_origin):
-            # restores scope_id/user_id for the reconstructed SessionSource so
-            # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            # restores the full structured return address AND the transport
+            # provenance, so a completion replayed after a restart routes to
+            # the same chat through the same bot.
+            for _k in _ROUTING_ORIGIN_KEYS:
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -986,9 +1014,9 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     # Routing origin captured at dispatch (see _capture_routing_origin):
-    # additive, lets the gateway reconstruct a full SessionSource (incl.
-    # scope_id for relay tenant egress) when its own caches are cold.
-    for _k in ("scope_id", "user_id", "user_name"):
+    # the full structured return address plus transport provenance, so the
+    # gateway never has to re-derive either from the session key.
+    for _k in _ROUTING_ORIGIN_KEYS:
         if record.get(_k):
             evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
@@ -1202,7 +1230,7 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in _ROUTING_ORIGIN_KEYS:
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on

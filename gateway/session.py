@@ -10,6 +10,7 @@ Handles:
 
 import asyncio
 import hashlib
+import re
 import logging
 import os
 import json
@@ -1209,6 +1210,111 @@ def build_session_key(
         key_parts.append(str(participant_id))
 
     return ":".join(str(part) for part in key_parts)
+
+
+# ---------------------------------------------------------------------------
+# Session-key parsing — the inverse of build_session_key
+# ---------------------------------------------------------------------------
+
+# Platforms whose identifiers are THEMSELVES colon-delimited. A Matrix room is
+# ``!localpart:homeserver`` and a Matrix user is ``@localpart:homeserver``, so a
+# positional ``split(":")`` over a Matrix key shears the id in half: the key
+# ``agent:main:matrix:group:!room:example.org`` yields ``parts[4] == "!room"``
+# and silently discards ``:example.org``. Delivering to ``!room`` is delivering
+# to a room that does not exist.
+_COLON_ID_PLATFORMS = frozenset({"matrix"})
+# Matrix sigils: rooms ``!``, users ``@``, aliases ``#``, events ``$``. A Matrix
+# id that carries a server name has exactly one ``:`` separating localpart from
+# it, so re-joining exactly two tokens is exact, not heuristic — and the next
+# token is never itself sigil-prefixed (that would be the NEXT id in the key),
+# which is what keeps a sigil-only id such as a room-v4 event ``$hash`` from
+# swallowing the participant id that follows it.
+_COLON_ID_SIGILS = ("!", "@", "#", "$")
+
+# Slack workspace/team ids are ``T…`` (classic) or ``E…`` (Enterprise Grid);
+# conversation ids are ``C``/``G``/``D``/``im``/``mpim`` and user ids ``U``/``W``.
+# ``build_session_key`` inserts the workspace id BETWEEN the chat-type slot and
+# the chat id (and only when ``source.scope_id`` is set), so the slot after the
+# chat type is the scope on a scoped key and the chat id on an unscoped one.
+# The two are told apart by Slack's own id grammar.
+_SLACK_SCOPE_ID_RE = re.compile(r"^[TE][A-Z0-9]{2,}$")
+
+
+def _take_key_id(tokens: List[str], platform: str) -> tuple:
+    """Consume one identifier from *tokens*, honouring colon-bearing ids."""
+    if not tokens:
+        return "", tokens
+    head = tokens[0]
+    if (
+        platform in _COLON_ID_PLATFORMS
+        and len(tokens) >= 2
+        and head[:1] in _COLON_ID_SIGILS
+        and tokens[1][:1] not in _COLON_ID_SIGILS
+    ):
+        return f"{head}:{tokens[1]}", tokens[2:]
+    return head, tokens[1:]
+
+
+def parse_session_key(session_key: str) -> Optional[Dict[str, Any]]:
+    """Parse a session key back into routing fields — the inverse of
+    :func:`build_session_key`.
+
+    Returns ``platform``, ``chat_type``, ``chat_id``, ``profile`` and
+    (when present) ``scope_id`` / ``thread_id``, or ``None`` when *session_key*
+    is not a structured agent key at all (a raw ``api_server`` session id, say).
+
+    This mirrors the grammar ``build_session_key`` emits, per platform, instead
+    of indexing a flat ``split(":")``:
+
+    * ``parts[1]`` is the namespace slot :func:`_session_key_namespace` writes —
+      the literal ``main`` for the default profile (reported as ``profile=None``
+      so it can be handed straight to the profile-aware resolvers) and the
+      profile name for every other profile.
+    * Matrix ids are re-joined (see ``_COLON_ID_PLATFORMS``).
+    * A Slack workspace id is consumed from the scope slot ``build_session_key``
+      writes it into (see ``_SLACK_SCOPE_ID_RE``).
+
+    **A session key is not a return address.** Even inverted exactly, the tail
+    of a group key is ambiguous by construction — ``build_session_key`` appends
+    a bare participant id after the chat id with no delimiter change, so a
+    6th token may be a thread or a user (which is why ``thread_id`` is reported
+    only for the ``dm``/``thread`` shapes, where the grammar is unambiguous).
+    Callers that need a route must carry the structured routing fields from the
+    commissioning turn; this parser exists for legacy records that predate that
+    capture, and for the "is this a structured key at all?" test.
+    """
+    if not session_key:
+        return None
+    parts = session_key.split(":")
+    if len(parts) < 5 or parts[0] != "agent" or not parts[1]:
+        return None
+    namespace = parts[1]
+    platform = parts[2]
+    chat_type = parts[3]
+    rest = parts[4:]
+
+    scope_id = None
+    if platform == "slack" and len(rest) >= 2 and _SLACK_SCOPE_ID_RE.match(rest[0]):
+        scope_id = rest[0]
+        rest = rest[1:]
+
+    chat_id, rest = _take_key_id(rest, platform)
+
+    result: Dict[str, Any] = {
+        "platform": platform,
+        "chat_type": chat_type,
+        "chat_id": chat_id,
+        # ``main`` is the default profile's static namespace literal, not a
+        # profile name — normalise it to None.
+        "profile": None if namespace == "main" else namespace,
+    }
+    if scope_id:
+        result["scope_id"] = scope_id
+    if chat_type in {"dm", "thread"} and rest:
+        thread_id, rest = _take_key_id(rest, platform)
+        if thread_id:
+            result["thread_id"] = thread_id
+    return result
 
 
 class _SessionFlight:

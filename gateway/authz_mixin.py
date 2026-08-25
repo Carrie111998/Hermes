@@ -28,6 +28,12 @@ from gateway.whatsapp_identity import (
 )
 
 
+# Provenance token for "the process-default adapter map" (``self.adapters``).
+# Deliberately the same string ``_authorization_adapter`` already treats as the
+# default map, so a recorded provenance token can be handed straight back to it.
+TRANSPORT_PROFILE_DEFAULT = "default"
+
+
 def _platform_gate_env(name: str, default: str = "") -> str:
     """Read a platform allow/deny gate env var with per-profile isolation.
 
@@ -187,6 +193,63 @@ class GatewayAuthorizationMixin:
                 if adapter is profile_adapters.get(platform):
                     return profile
         return getattr(source, "profile", None)
+
+    def _transport_owner_profile(self, source) -> Optional[str]:
+        """Return DURABLE transport provenance for the turn *source* arrived on.
+
+        ``source.profile`` is the runtime namespace — which agent config,
+        credentials and session lane the turn is routed to. It is NOT the
+        transport owner: one shared credential (a single Matrix bot, say) can
+        serve several routed runtimes, so a completion resolved from the
+        runtime namespace is either dropped (that runtime registers no adapter
+        for the platform) or answered from a different bot than the one the
+        user spoke to.
+
+        This returns the profile that OWNS the receiving adapter, as a token
+        that survives serialization onto a durable record:
+
+        * ``"default"`` — the process-default adapter map (``self.adapters``).
+        * ``"<name>"``  — ``_profile_adapters["<name>"]``.
+        * ``None``      — no live transport provenance on this source (a
+          restored or hand-built source), i.e. legacy: the caller must fall
+          back to the runtime profile.
+
+        The token is deliberately the same vocabulary
+        :meth:`_authorization_adapter` already accepts, so re-resolving the
+        CURRENT LIVE adapter at completion time is a single call with no new
+        lookup rules — and no new fail-open path.
+        """
+        adapter = self._registered_transport_adapter(source)
+        if adapter is None:
+            return None
+        # #89860's ownership API is the adapter's own declaration of which
+        # profile's credentials it holds. Prefer it; it is set by
+        # ``_configure_profile_adapter`` before any inbound event is handled.
+        owner = getattr(adapter, "_owner_profile", None)
+        if isinstance(owner, str) and owner.strip():
+            return owner.strip()
+        platform = getattr(source, "platform", None)
+        if adapter is (getattr(self, "adapters", None) or {}).get(platform):
+            return TRANSPORT_PROFILE_DEFAULT
+        for profile, profile_adapters in (
+            getattr(self, "_profile_adapters", None) or {}
+        ).items():
+            if adapter is profile_adapters.get(platform):
+                return profile
+        return None
+
+    def _adapter_for_transport_profile(self, platform, transport_profile):
+        """Re-resolve the CURRENT LIVE adapter for a recorded provenance token.
+
+        The adapter object captured at commissioning time must never be held
+        across a completion: it may have been disconnected and replaced by the
+        reconnect path (``_run_secondary_profile_reconnect``), or the whole
+        process may have restarted. Provenance is recorded as a *name*; this
+        turns the name back into whatever adapter is live NOW.
+        """
+        if not transport_profile:
+            return None
+        return self._authorization_adapter(platform, transport_profile)
 
     def _adapter_authorization_is_upstream(
         self,

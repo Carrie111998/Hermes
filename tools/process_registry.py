@@ -373,6 +373,27 @@ def format_uptime_short(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
+def _watcher_return_address(session: "ProcessSession") -> Dict[str, Any]:
+    """The structured return address recorded when *session* was commissioned.
+
+    One place, so every event this registry queues carries the same complete
+    address — including the transport provenance the gateway re-resolves the
+    delivering adapter from.
+    """
+    return {
+        "platform": session.watcher_platform,
+        "chat_id": session.watcher_chat_id,
+        "chat_type": session.watcher_chat_type,
+        "scope_id": session.watcher_scope_id,
+        "user_id": session.watcher_user_id,
+        "user_name": session.watcher_user_name,
+        "thread_id": session.watcher_thread_id,
+        "message_id": session.watcher_message_id,
+        "profile": session.watcher_profile,
+        "transport_profile": session.watcher_transport_profile,
+    }
+
+
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -398,6 +419,23 @@ class ProcessSession:
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
+    # The rest of the STRUCTURED return address, captured when the process was
+    # commissioned (tools/terminal_tool.py). Before these existed the gateway
+    # had to recover chat_type/scope_id/profile by splitting the session_key on
+    # ":", which is lossy for real key grammar (Matrix ids are ``!room:server``;
+    # Slack keys carry the workspace id before the chat id) — see
+    # gateway.session.parse_session_key.
+    watcher_chat_type: str = ""
+    watcher_scope_id: str = ""
+    # Runtime namespace this process's turn was routed to.
+    watcher_profile: str = ""
+    # TRANSPORT PROVENANCE: the profile that owns the ADAPTER the commissioning
+    # turn arrived on ("default" for the process-default adapter map). Distinct
+    # from watcher_profile: one shared credential can serve several routed
+    # runtimes, and only this identifies the bot that must answer. Recorded as a
+    # NAME, never an adapter object, so it survives reconnects and restarts and
+    # is re-resolved to whatever adapter is live at completion time.
+    watcher_transport_profile: str = ""
     watcher_user_id: str = ""
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
@@ -625,12 +663,7 @@ class ProcessRegistry:
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
-                    "platform": session.watcher_platform,
-                    "chat_id": session.watcher_chat_id,
-                    "user_id": session.watcher_user_id,
-                    "user_name": session.watcher_user_name,
-                    "thread_id": session.watcher_thread_id,
-                    "message_id": session.watcher_message_id,
+                    **_watcher_return_address(session),
                     "message": (
                         f"Watch patterns disabled for process {session.id} — "
                         f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -665,12 +698,7 @@ class ProcessRegistry:
             "pattern": matched_pattern,
             "output": output,
             "suppressed": suppressed,
-            "platform": session.watcher_platform,
-            "chat_id": session.watcher_chat_id,
-            "user_id": session.watcher_user_id,
-            "user_name": session.watcher_user_name,
-            "thread_id": session.watcher_thread_id,
-            "message_id": session.watcher_message_id,
+            **_watcher_return_address(session),
         }
         _redact_process_result(notification)
         self.completion_queue.put(notification)
@@ -688,12 +716,7 @@ class ProcessRegistry:
             "command": session.command,
             "type": "watch_disabled",
             "suppressed": 0,
-            "platform": session.watcher_platform,
-            "chat_id": session.watcher_chat_id,
-            "user_id": session.watcher_user_id,
-            "user_name": session.watcher_user_name,
-            "thread_id": session.watcher_thread_id,
-            "message_id": session.watcher_message_id,
+            **_watcher_return_address(session),
             "message": (
                 f"Watch patterns disabled for process {session.id} — "
                 f"reached the lifetime cap of {WATCH_LIFETIME_MAX_HITS} delivered "
@@ -2756,6 +2779,15 @@ class ProcessRegistry:
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
+                            # Structured return address + transport provenance:
+                            # persisted so a completion that lands AFTER a
+                            # gateway restart still re-resolves the originating
+                            # transport instead of falling back to the runtime
+                            # profile's adapter map (or to a session_key split).
+                            "watcher_chat_type": s.watcher_chat_type,
+                            "watcher_scope_id": s.watcher_scope_id,
+                            "watcher_profile": s.watcher_profile,
+                            "watcher_transport_profile": s.watcher_transport_profile,
                             "watcher_user_id": s.watcher_user_id,
                             "watcher_user_name": s.watcher_user_name,
                             "watcher_thread_id": s.watcher_thread_id,
@@ -2853,6 +2885,13 @@ class ProcessRegistry:
                 detached=True,  # Can't read output, but can report status + kill
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),
+                # Absent on pre-existing checkpoints — an empty transport
+                # provenance is the documented "legacy record" signal and the
+                # gateway falls back to runtime-profile resolution for it.
+                watcher_chat_type=entry.get("watcher_chat_type", ""),
+                watcher_scope_id=entry.get("watcher_scope_id", ""),
+                watcher_profile=entry.get("watcher_profile", ""),
+                watcher_transport_profile=entry.get("watcher_transport_profile", ""),
                 watcher_user_id=entry.get("watcher_user_id", ""),
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
@@ -2873,12 +2912,7 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
-                    "platform": session.watcher_platform,
-                    "chat_id": session.watcher_chat_id,
-                    "user_id": session.watcher_user_id,
-                    "user_name": session.watcher_user_name,
-                    "thread_id": session.watcher_thread_id,
-                    "message_id": session.watcher_message_id,
+                    **_watcher_return_address(session),
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })

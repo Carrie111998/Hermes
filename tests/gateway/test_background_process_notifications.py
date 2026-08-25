@@ -518,19 +518,23 @@ def test_parse_session_key_with_extra_parts():
 
 
 def test_parse_session_key_accepts_profile_namespace():
-    """A named profile's key (``agent:alpha:...``) must parse, and report the
-    profile.
+    """A named profile's key (``agent:alpha:...``) must parse, report the
+    profile, and keep the WHOLE Matrix room id.
 
     ``_session_key_namespace`` reuses ``parts[1]`` to carry the profile under
     ``gateway.multiplex_profiles``. Requiring the literal ``main`` here made
     every secondary profile's session unparseable, which stripped the routing
     metadata off its completions.
+
+    And a Matrix room id is ``!localpart:homeserver``, so the positional
+    ``split(":")`` this parser used to be returned ``chat_id == "!room"`` —
+    a room that does not exist. See gateway.session.parse_session_key.
     """
     result = _parse_session_key("agent:alpha:matrix:group:!room:example.org")
     assert result == {
         "platform": "matrix",
         "chat_type": "group",
-        "chat_id": "!room",
+        "chat_id": "!room:example.org",
         "profile": "alpha",
     }
 
