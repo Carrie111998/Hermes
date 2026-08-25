@@ -4276,6 +4276,21 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         if any(kw in err_lower for kw in (
             "rate limit", "rate_limit", "too many requests",
             "try again", "retry after", "resets in",
+            # Upstream "temporarily at capacity" 429 — server-side
+            # saturation, credential is healthy, retry the same provider
+            # with backoff. The body says "please retry shortly" which is
+            # the contract we honour here. The classifier's
+            # ``FailoverReason.upstream_capacity`` is the canonical reason;
+            # this function only decides which path the auxiliary retry
+            # loop takes (same-provider retry vs pool rotation vs
+            # fallback). (#94978)
+            "temporarily at capacity",
+            "at capacity upstream",
+            "upstream capacity",
+            "upstream at capacity",
+            "currently at capacity",
+            "model is at capacity",
+            "retry shortly",
         )):
             return True
         # Generic 429 without billing keywords = likely a rate limit
@@ -4289,6 +4304,34 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         )):
             return True
     return False
+
+
+def _is_upstream_capacity_error(exc: Exception) -> bool:
+    """HTTP 429 with an upstream-saturation body — retry the same key, NOT fallback.
+
+    Server-side capacity stalling (e.g. "temporarily at capacity upstream",
+    "please retry shortly") means the credential is healthy. Fallback to a
+    different provider would be wrong: a different model on the same
+    gateway typically shares the same saturated upstream pool, and a
+    different provider may itself be saturated. The right recovery is a
+    same-provider backoff retry; only when the contract is exhausted do we
+    surface the failure. (#94978)
+    """
+    status = getattr(exc, "status_code", None)
+    if status != 429:
+        return False
+    err_lower = str(exc).lower()
+    return any(
+        kw in err_lower for kw in (
+            "temporarily at capacity",
+            "at capacity upstream",
+            "upstream capacity",
+            "upstream at capacity",
+            "currently at capacity",
+            "model is at capacity",
+            "retry shortly",
+        )
+    )
 
 
 def _is_timeout_error(exc: Exception) -> bool:
@@ -10040,7 +10083,8 @@ def _call_llm_impl(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
+            or (_is_rate_limit_error(first_err)
+                and not _is_upstream_capacity_error(first_err))
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -10055,6 +10099,9 @@ def _call_llm_impl(
         # literally cannot serve this request regardless of user intent.
         # Rate limits are included: after retries are exhausted, a 429 means
         # the provider cannot serve this request — fall back. See #52228.
+        # Upstream-capacity 429s are EXCLUDED: the server explicitly said
+        # "retry shortly", so honour the contract and retry the same key;
+        # #94978.
         # Model-incompatibility 400s are also a hard capability mismatch (the
         # route cannot run this model at all — e.g. a codex/ChatGPT-account
         # fallback asked to compress a glm-5.2 conversation), so they bypass
@@ -10063,7 +10110,8 @@ def _call_llm_impl(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
+            or (_is_rate_limit_error(first_err)
+                and not _is_upstream_capacity_error(first_err))
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
