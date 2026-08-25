@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
-import test from 'node:test'
 
-const { assertFoundrlyIsolatedHome, resolveFoundrlyEffectiveHermesHome } = await import(
-  new URL('./foundrly-home.ts', import.meta.url).href
-)
+import { test } from 'vitest'
+
+import { assertFoundrlyIsolatedHome, resolveFoundrlyEffectiveHermesHome } from './foundrly-home'
 
 test('resolves default and named Foundrly profiles under the isolated root', () => {
   const base = path.join(path.sep, 'tmp', 'foundrly', 'hermes-home')
