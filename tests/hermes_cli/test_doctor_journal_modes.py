@@ -445,6 +445,25 @@ class TestReportDatabaseJournalModes:
         assert "state.db is empty (0 bytes)" in out
         assert "cannot rule out WAL exposure" not in out
 
+    def test_empty_database_warns_even_if_error_wording_changes(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The warning is keyed on st_size == 0, not on matching the exact
+        "file is empty" string from `_read_journal_mode`. If that message is
+        ever reworded, this must keep warning instead of silently falling
+        back to the buried info path.
+        """
+        (tmp_path / "state.db").touch()
+        monkeypatch.setattr(
+            doctor, "_read_journal_mode", lambda path: (None, "0-byte file")
+        )
+
+        doctor._report_database_journal_modes(tmp_path, (3, 51, 3))
+
+        out = capsys.readouterr().out
+        assert "⚠" in out
+        assert "state.db is empty (0 bytes)" in out
+
     def test_report_creates_no_wal_sidecars(self, tmp_path, capsys):
         db = tmp_path / "state.db"
         _make_db(db, journal_mode="WAL")
