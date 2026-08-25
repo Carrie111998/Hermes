@@ -260,17 +260,18 @@ class TestProvidersDictApiModeAnthropicMessages:
             AnthropicAuxiliaryClient,
             AsyncAnthropicAuxiliaryClient,
         )
-        sync_client, sync_model = resolve_provider_client("myrelay", async_mode=False)
-        assert isinstance(sync_client, AnthropicAuxiliaryClient), (
-            f"expected AnthropicAuxiliaryClient, got {type(sync_client).__name__}"
-        )
-        assert sync_model == "claude-opus-4-7"
+        with patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
+            sync_client, sync_model = resolve_provider_client("myrelay", async_mode=False)
+            assert isinstance(sync_client, AnthropicAuxiliaryClient), (
+                f"expected AnthropicAuxiliaryClient, got {type(sync_client).__name__}"
+            )
+            assert sync_model == "claude-opus-4-7"
 
-        async_client, async_model = resolve_provider_client("myrelay", async_mode=True)
-        assert isinstance(async_client, AsyncAnthropicAuxiliaryClient), (
-            f"expected AsyncAnthropicAuxiliaryClient, got {type(async_client).__name__}"
-        )
-        assert async_model == "claude-opus-4-7"
+            async_client, async_model = resolve_provider_client("myrelay", async_mode=True)
+            assert isinstance(async_client, AsyncAnthropicAuxiliaryClient), (
+                f"expected AsyncAnthropicAuxiliaryClient, got {type(async_client).__name__}"
+            )
+            assert async_model == "claude-opus-4-7"
 
 
 

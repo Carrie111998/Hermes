@@ -130,11 +130,15 @@ def test_resolve_provider_client_kimi_coding_wraps_anthropic(monkeypatch, tmp_pa
     # sk-kimi- prefix triggers /coding endpoint auto-detection
     monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-faketesttoken123")
 
-    client, model = resolve_provider_client("kimi-coding", "kimi-for-coding")
-    assert client is not None, "Should resolve a client"
-    assert isinstance(client, AnthropicAuxiliaryClient), (
-        "Kimi Coding Plan endpoint (api.kimi.com/coding) speaks Anthropic "
-        "Messages — aux client MUST be AnthropicAuxiliaryClient, got "
-        f"{type(client).__name__}"
-    )
-    assert "kimi.com/coding" in str(client.base_url)
+    with patch(
+        "agent.anthropic_adapter.build_anthropic_client",
+        return_value=MagicMock(base_url="https://api.kimi.com/coding"),
+    ):
+        client, model = resolve_provider_client("kimi-coding", "kimi-for-coding")
+        assert client is not None, "Should resolve a client"
+        assert isinstance(client, AnthropicAuxiliaryClient), (
+            "Kimi Coding Plan endpoint (api.kimi.com/coding) speaks Anthropic "
+            "Messages — aux client MUST be AnthropicAuxiliaryClient, got "
+            f"{type(client).__name__}"
+        )
+        assert "kimi.com/coding" in str(client.base_url)
