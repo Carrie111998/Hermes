@@ -211,6 +211,28 @@ class TestSessionScopedMountResolution:
             == "/Users/prev/dev/oldrepo"
         )
 
+    def test_shared_mode_falls_back_to_task_cwd_override(self, monkeypatch, tmp_path):
+        """#94454: Desktop/ACP sessions track cwd via a per-task override, not
+        the process-global TERMINAL_CWD env var. In shared (container_persistent:
+        true) mode, with no process-global host_cwd, the mount must still pick
+        up the session's attached workspace instead of silently no-opping."""
+        _disable_isolation(monkeypatch)
+        ws = tmp_path / "vault"
+        ws.mkdir()
+        terminal_tool.register_task_env_overrides("acp:sess-1", {"cwd": str(ws)})
+        cfg = self._config(host_cwd=None)
+        assert terminal_tool._resolve_task_host_cwd(cfg, "acp:sess-1") == str(ws)
+
+    def test_shared_mode_ignores_process_tagged_override(self, monkeypatch, tmp_path):
+        """A cwd_source='process' override is a launch artifact, not an
+        attached workspace, even in shared mode."""
+        _disable_isolation(monkeypatch)
+        terminal_tool.register_task_env_overrides(
+            "acp:sess-1", {"cwd": str(tmp_path), "cwd_source": "process"}
+        )
+        cfg = self._config(host_cwd=None)
+        assert terminal_tool._resolve_task_host_cwd(cfg, "acp:sess-1") is None
+
     def test_non_docker_backend_never_mounts(self, monkeypatch):
         _disable_isolation(monkeypatch)
         cfg = self._config()
