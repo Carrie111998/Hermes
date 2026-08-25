@@ -1145,10 +1145,15 @@ class OneBotAdapter(BasePlatformAdapter):
             # 后发。为省空间：interim 文本缓冲起来，final 时先合并转发
             # 并撤回那些单独消息，再发最终内容（含 t2i 图片）。
             meta = metadata or {}
-            # interim: gateway 中间评论（_send_commentary 现在带 interim=True）
+            # interim: gateway 中间评论（_send_commentary 带 _interim_send=True；
+            # main 于 2026-08-16 独立实现了该标记，旧 key `interim` 一并兼容）
             # final: 流式最终回复带 notify=True；非流式最终回复无标记——
             # 无标记即视为最终（interim 都有标记，无标记=回复周期收尾）
-            is_interim = bool(meta.get("interim")) or bool(meta.get("expect_edits"))
+            is_interim = (
+                bool(meta.get("interim"))
+                or bool(meta.get("_interim_send"))
+                or bool(meta.get("expect_edits"))
+            )
             is_final = bool(meta.get("notify")) or not is_interim
             logger.info(
                 "[onebot] send: chat=%s len=%d final=%s interim=%s meta_keys=%s buf=%d",
