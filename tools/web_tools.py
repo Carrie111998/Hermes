@@ -578,6 +578,30 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     return rescued
 
 
+def _resolved_search_provider(provider_name: str, response: dict) -> str:
+    """Return the backend that actually served a search response."""
+    data = response.get("data")
+    if isinstance(data, dict):
+        served_by = data.get("served_by")
+        if isinstance(served_by, str) and served_by.strip():
+            return served_by.strip()
+    return provider_name
+
+
+def _resolved_extract_provider(provider_name: str, results: list) -> str:
+    """Return the backend that actually served an extract batch."""
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        metadata = result.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        served_by = metadata.get("served_by")
+        if isinstance(served_by, str) and served_by.strip():
+            return served_by.strip()
+    return provider_name
+
+
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -853,6 +877,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         str: JSON string containing search results with the following structure:
              {
                  "success": bool,
+                 "provider": str,
                  "data": {
                      "web": [
                          {
@@ -988,6 +1013,11 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                         limit,
                     )
 
+            response_data = dict(response_data)
+            response_data["provider"] = _resolved_search_provider(
+                provider.name, response_data
+            )
+
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
@@ -1032,7 +1062,7 @@ async def web_extract_tool(
     Security: URLs are checked for embedded secrets before fetching.
 
     Returns:
-        str: JSON string with a ``results`` list; each entry has
+        str: JSON string with ``provider`` plus a ``results`` list; each entry has
              ``url``, ``title``, ``content``, ``error``. ``content`` is the
              (possibly truncated) clean page text.
 
@@ -1100,6 +1130,7 @@ async def web_extract_tool(
         "processing_applied": []
     }
     
+    provider_name: Optional[str] = None
     try:
         logger.info("Extracting content from %d URL(s)", len(normalized_urls))
 
@@ -1225,6 +1256,7 @@ async def web_extract_tool(
             logger.info(
                 "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
             )
+            provider_name = provider.name
 
             # Async-or-sync dispatch: parallel + firecrawl have async
             # extract(); exa + tavily are sync.
@@ -1262,6 +1294,8 @@ async def web_extract_tool(
                         _rescue_extract, provider.name, safe_urls, results
                     )
 
+            provider_name = _resolved_extract_provider(provider.name, results)
+
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
         # order of the safe URL list they receive.
@@ -1282,7 +1316,9 @@ async def web_extract_tool(
             by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
             results = [by_index[index] for index in range(len(urls))]
 
-        response = {"results": results}
+        response: Dict[str, Any] = {"results": results}
+        if provider_name is not None:
+            response["provider"] = provider_name
         
         pages_extracted = len(response.get('results', []))
         logger.info("Extracted content from %d pages", pages_extracted)
@@ -1333,7 +1369,9 @@ async def web_extract_tool(
             }
             for r in response.get("results", [])
         ]
-        trimmed_response = {"results": trimmed_results}
+        trimmed_response: Dict[str, Any] = {"results": trimmed_results}
+        if provider_name is not None:
+            trimmed_response["provider"] = provider_name
 
         if trimmed_response.get("results") == []:
             result_json = tool_error("Content was inaccessible or not found")
@@ -1531,7 +1569,7 @@ from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
-    "description": "Search the web for information. Returns up to 5 results by default with titles, URLs, and descriptions. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
+    "description": "Search the web for information. Returns the resolved provider plus up to 5 results by default with titles, URLs, and descriptions. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1553,7 +1591,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
+    "description": "Extract content from web page URLs. Returns the resolved provider plus clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages are head+tail truncated with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
     "parameters": {
         "type": "object",
         "properties": {

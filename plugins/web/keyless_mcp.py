@@ -861,6 +861,10 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
             e and _is_rate_limitish(e) for e in errors
         )
         if not all_throttled:
+            if vendor != name:
+                for result in results:
+                    if isinstance(result, dict):
+                        result.setdefault("metadata", {})["served_by"] = vendor
             return results
         last = results
         nxt = order[i + 1] if i + 1 < len(order) else None

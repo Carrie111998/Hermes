@@ -68,7 +68,13 @@ def _keyed_tavily_env(monkeypatch):
 
 
 def _ring_ok(vendor="exa"):
-    return {"success": True, "data": {"web": [{"url": f"https://{vendor}.example"}]}}
+    return {
+        "success": True,
+        "data": {
+            "web": [{"url": f"https://{vendor}.example"}],
+            "served_by": vendor,
+        },
+    }
 
 
 class TestEligibility:
@@ -116,6 +122,7 @@ class TestSearchRescue:
         ) as ring:
             out = self._dispatch(monkeypatch, _KeyedBoomProvider())
         assert out["success"] is True
+        assert out["provider"] == "exa"
         assert out["data"]["rescued_from"] == "tavily"
         assert "HTTP 500" in out["data"]["backend_error"]
         assert "next call" in out["data"]["backend_error"].lower()
@@ -181,25 +188,28 @@ class TestExtractRescue:
 
         monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_all)
         raw = await web_tools.web_extract_tool(list(urls))
-        data = json.loads(raw)
-        return data["results"] if isinstance(data, dict) and "results" in data else data
+        return json.loads(raw)
 
     @pytest.mark.asyncio
     async def test_whole_batch_failure_rescued(self, monkeypatch):
         good = [
             {"url": "https://a", "title": "A", "content": "x" * 50,
-             "raw_content": "x" * 50, "metadata": {"sourceURL": "https://a"}},
+             "raw_content": "x" * 50,
+             "metadata": {"sourceURL": "https://a", "served_by": "exa"}},
             {"url": "https://b", "title": "B", "content": "y" * 50,
-             "raw_content": "y" * 50, "metadata": {"sourceURL": "https://b"}},
+             "raw_content": "y" * 50,
+             "metadata": {"sourceURL": "https://b", "served_by": "exa"}},
         ]
         with patch.object(
             keyless_mcp, "extract_with_failover", return_value=good
         ) as ring:
-            results = await self._dispatch(
+            data = await self._dispatch(
                 monkeypatch, _KeyedBoomProvider(), ["https://a", "https://b"]
             )
+        results = data["results"]
         assert all(not r.get("error") for r in results)
         assert results[0]["content"].startswith("x")
+        assert data["provider"] == "exa"
         ring.assert_called_once()
 
     def test_rescue_extract_annotates_results(self, monkeypatch):
@@ -226,9 +236,10 @@ class TestExtractRescue:
                 ]
 
         with patch.object(keyless_mcp, "extract_with_failover") as ring:
-            results = await self._dispatch(
+            data = await self._dispatch(
                 monkeypatch, _Partial(), ["https://a", "https://b"]
             )
+        results = data["results"]
         assert results[1].get("error")
         ring.assert_not_called()
 
@@ -241,7 +252,8 @@ class TestExtractRescue:
         with patch.object(
             keyless_mcp, "extract_with_failover", return_value=still_bad
         ):
-            results = await self._dispatch(
+            data = await self._dispatch(
                 monkeypatch, _KeyedBoomProvider(), ["https://a", "https://b"]
             )
+        results = data["results"]
         assert all("HTTP 500" in r.get("error", "") for r in results)
