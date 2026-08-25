@@ -46,6 +46,19 @@ def test_packaging_declared_as_core_dependency():
     )
 
 
+def test_cold_archive_top_level_modules_are_packaged() -> None:
+    """Container/installed launches must resolve cold-archive runtime imports.
+
+    Repository-root tests can import undeclared top-level modules through the
+    working directory, masking a missing ``tool.setuptools.py-modules`` entry.
+    Docker and sealed/editable installs start elsewhere and expose the defect.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    packaged = set(data["tool"]["setuptools"]["py-modules"])
+
+    assert {"hermes_accounting_locks", "hermes_cold_archive_errors"} <= packaged
+
+
 def test_faster_whisper_is_not_a_base_dependency():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     deps = data["project"]["dependencies"]
