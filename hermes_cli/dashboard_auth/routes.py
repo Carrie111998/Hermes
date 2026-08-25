@@ -119,9 +119,43 @@ def _prefix(request: Request) -> str:
     cookie helpers (cookie name + Path attribute) and the gate's
     redirect builders (login_url construction). See
     ``hermes_cli.dashboard_auth.prefix`` for the normalisation rules.
+
+    Fallback: when the proxy forgets ``X-Forwarded-Prefix`` but the
+    operator set ``dashboard.public_url`` with a path (e.g.
+    ``https://ai.bakercloud.io/hermes``), derive the prefix from that
+    path so login links and post-login landings still work.
     """
-    from hermes_cli.dashboard_auth.prefix import prefix_from_request
-    return prefix_from_request(request)
+    from urllib.parse import urlparse
+
+    from hermes_cli.dashboard_auth.prefix import (
+        prefix_from_request,
+        resolve_public_url,
+    )
+
+    prefix = prefix_from_request(request)
+    if prefix:
+        return prefix
+    public = resolve_public_url()
+    if not public:
+        return ""
+    path = urlparse(public).path.rstrip("/")
+    return path if path.startswith("/") and path != "/" else ""
+
+
+def _public_path(request: Request, path: str) -> str:
+    """Return ``path`` under the active reverse-proxy prefix when needed."""
+    prefix = _prefix(request)
+    if not path:
+        path = "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if not prefix:
+        return path
+    if path == prefix or path.startswith(prefix + "/"):
+        return path
+    if path == "/":
+        return prefix + "/"
+    return prefix + path
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +173,7 @@ async def login_page(request: Request) -> HTMLResponse:
         request.query_params.get("next", "")
     )
     return HTMLResponse(
-        render_login_html(next_path=next_path),
+        render_login_html(next_path=next_path, prefix=_prefix(request)),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
@@ -588,6 +622,10 @@ async def auth_callback(
     # that lets attacker-controlled bytes into the cookie would otherwise
     # produce an open redirect.
     landing = _validate_post_login_target(next_from_cookie) or "/"
+    # Under X-Forwarded-Prefix (e.g. /hermes), next= is stored against the
+    # stripped backend path. Re-prefix so the browser lands on the public
+    # mount instead of the bare site root.
+    landing = _public_path(request, landing)
     resp = RedirectResponse(url=landing, status_code=302)
     set_session_cookies(
         resp,
