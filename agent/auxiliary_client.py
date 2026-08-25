@@ -5678,8 +5678,10 @@ _VISION_STRICT_BACKENDS = (
 # ``openrouter`` (08-24), ``deepinfra`` (08-24) -- leaving ``()``. Restoring
 # vision took a credential AND a code fix, because the DeepInfra vision
 # default was gated on ``os.environ`` while Hermes keeps credentials in
-# ``~/.hermes/.env`` and the auth pool, neither of which is loaded into the
-# process environment (see the DeepInfra profile's ``default_vision_model``).
+# ``~/.hermes/.env`` and the auth pool, which reach the environment only via
+# an explicit sync that not every entry point calls -- so the gate's answer
+# depended on which process asked (see the DeepInfra profile's
+# ``default_vision_model``).
 #
 # ``nous`` and ``openrouter`` stay OUT: still no credential in either store.
 # To restore one, add its credential and add its name here. Membership in

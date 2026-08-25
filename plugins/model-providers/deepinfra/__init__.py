@@ -31,17 +31,23 @@ class _DeepInfraProfile(ProviderProfile):
 
         The gate asks the SAME resolver that builds the client
         (``resolve_api_key_provider_credentials``), not ``os.environ``.
-        That matters: Hermes stores credentials in ``~/.hermes/.env`` and in
-        the auth pool, and **neither is loaded into the process
-        environment**. Verified 2026-08-25 -- with ``DEEPSEEK_API_KEY`` set
-        the normal way, ``get_env_value("DEEPSEEK_API_KEY")`` is truthy while
-        ``os.environ.get("DEEPSEEK_API_KEY")`` is None.
 
-        So the old ``os.environ`` gate meant a correctly-installed DeepInfra
-        key returned None here, the vision chain logged "deepinfra catalog
-        unreachable or returned no vision-tagged models -- skipping", and
-        vision stayed dead while blaming the network. The credential was
-        present and the diagnosis pointed elsewhere.
+        That matters because ``os.environ`` is **not reliably populated**
+        from where Hermes actually stores credentials (``~/.hermes/.env``
+        and the auth pool). ``.env`` reaches the environment only via an
+        explicit sync in ``hermes_cli.config``, which not every entry point
+        calls -- so the answer depended on WHICH PROCESS asked. Measured
+        2026-08-25 in a plain ``import agent.auxiliary_client``:
+        ``get_env_value("DEEPSEEK_API_KEY")`` truthy,
+        ``os.environ.get("DEEPSEEK_API_KEY")`` None.
+
+        Process-dependent is worse than uniformly broken. The old gate could
+        pass inside a long-lived gateway that had run the sync and fail in
+        ``hermes setup`` moments later, so a correctly-installed DeepInfra
+        key returned None here, the vision chain logged "catalog
+        unreachable", and vision stayed dead while blaming the network --
+        intermittently, which is the hardest shape to diagnose. Asking the
+        credential resolver removes the dependency entirely.
         """
         try:
             from hermes_cli.auth import resolve_api_key_provider_credentials
