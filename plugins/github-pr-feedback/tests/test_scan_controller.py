@@ -30,6 +30,7 @@ class FakeGitHub:
         self.feedback = feedback
         self.current = current or pull_request
         self.current_calls: list[tuple[str, int]] = []
+        self.actions_are_enabled = True
 
     def list_open_pull_requests(
         self, repository: str, owner_login: str
@@ -45,6 +46,10 @@ class FakeGitHub:
     def get_pull_request(self, repository: str, number: int) -> PullRequest:
         self.current_calls.append((repository, number))
         return self.current
+
+    def actions_enabled(self, repository: str) -> bool:
+        assert repository == self.pull_request.base_repository
+        return self.actions_are_enabled
 
 
 class MixedPullRequestGitHub(FakeGitHub):
@@ -234,6 +239,151 @@ def test_auto_dispatch_starts_an_admitted_exact_head_repair_ready_with_push_and_
     assert "post a factual PR reply" in task.instructions
     assert "Do not merge" in task.instructions
     assert "still equals the expected receipt SHA" in task.instructions
+    ledger.close()
+
+
+def test_scan_dispatches_one_read_only_exact_head_ci_audit_when_actions_are_disabled(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        local_ci_audit=True,
+    )
+    github = FakeGitHub(admitted_pull_request(sha), ())
+    github.actions_are_enabled = False
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    first = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+    second = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert first.created == 1
+    assert second.created == 0
+    assert len(kanban.tasks) == 1
+    task = kanban.tasks[0]
+    assert task.title == "Local PR CI audit: acme/widgets#17"
+    assert task.assignee == "pr-local-ci-auditor"
+    assert task.initial_status == "running"
+    assert task.max_retries == 3
+    assert task.evidence_heading == "Canonical PR audit receipt (JSON)"
+    assert task.evidence == {
+        "repository": "acme/widgets",
+        "pr_number": 17,
+        "expected_head_sha": sha,
+        "github_actions_enabled": False,
+        "post_results": True,
+    }
+    assert "Do not edit source files" in task.instructions
+    assert "Do not push, approve, or merge" in task.instructions
+    assert "post one factual audit summary" in task.instructions
+    assert "scripts/run_hygiene_lane.py" in task.instructions
+    assert "scripts/run_static_lane.py" in task.instructions
+    assert "scripts/run_test_lane.py" in task.instructions
+    ledger.close()
+
+
+def test_scan_does_not_dispatch_local_ci_when_github_actions_are_enabled(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        local_ci_audit=True,
+    )
+    github = FakeGitHub(admitted_pull_request(sha), ())
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 0
+    assert result.skipped["github_ci_enabled"] == 1
+    assert kanban.tasks == []
+    ledger.close()
+
+
+def test_scan_fails_closed_and_reports_degraded_when_actions_state_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    class UnavailableActionsGitHub(FakeGitHub):
+        def actions_enabled(self, repository: str) -> bool:
+            raise RuntimeError(f"cannot read {repository}")
+
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        local_ci_audit=True,
+    )
+    github = UnavailableActionsGitHub(admitted_pull_request(sha), ())
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 0
+    assert result.skipped["github_ci_state_unavailable"] == 1
+    assert result.degraded is True
+    assert kanban.tasks == []
+    ledger.close()
+
+
+def test_scan_dispatches_a_new_local_ci_audit_when_the_pr_head_changes(
+    tmp_path: Path,
+) -> None:
+    local_path, first_sha = initialized_repository(tmp_path)
+    policy = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        local_ci_audit=True,
+    )
+    github = FakeGitHub(admitted_pull_request(first_sha), ())
+    github.actions_are_enabled = False
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    scanner = ScanController(policy, ledger, github, kanban, RecordingLocalGit())
+
+    first = scanner.scan()
+    second_sha = "b" * 40
+    github.pull_request = admitted_pull_request(second_sha)
+    github.current = github.pull_request
+    second = scanner.scan()
+
+    assert first.created == 1
+    assert second.created == 1
+    assert [task.head_sha for task in kanban.tasks] == [first_sha, second_sha]
+    assert kanban.tasks[0].idempotency_key != kanban.tasks[1].idempotency_key
+    ledger.close()
+
+
+def test_scan_refetches_head_before_dispatching_a_local_ci_audit(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        local_ci_audit=True,
+    )
+    github = FakeGitHub(
+        admitted_pull_request(sha),
+        (),
+        current=admitted_pull_request("b" * 40),
+    )
+    github.actions_are_enabled = False
+    kanban = RecordingKanban()
+    local_git = RecordingLocalGit()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, local_git).scan()
+
+    assert result.created == 0
+    assert result.skipped["head_changed"] == 1
+    assert local_git.calls == []
+    assert kanban.tasks == []
     ledger.close()
 
 
@@ -920,9 +1070,14 @@ def git_output(path: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def configured_policy(local_path: Path, *, not_before: str, auto_dispatch: bool = False):
-    return load_policy(
-        {
+def configured_policy(
+    local_path: Path,
+    *,
+    not_before: str,
+    auto_dispatch: bool = False,
+    local_ci_audit: bool = False,
+):
+    raw = {
             "enabled": True,
             "repositories": [
                 {
@@ -942,7 +1097,13 @@ def configured_policy(local_path: Path, *, not_before: str, auto_dispatch: bool 
             "assignee": "repair-agent",
             "board": "repairs",
         }
-    )
+    if local_ci_audit:
+        raw["local_ci_audit"] = {
+            "enabled": True,
+            "assignee": "pr-local-ci-auditor",
+            "post_results": True,
+        }
+    return load_policy(raw)
 
 
 def admitted_pull_request(sha: str) -> PullRequest:

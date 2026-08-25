@@ -11,7 +11,9 @@ from typing import Mapping, Sequence
 
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_FEEDBACK_KINDS = frozenset({"issue_comment", "review_comment", "review"})
+_FEEDBACK_KINDS = frozenset(
+    {"issue_comment", "review_comment", "review", "pr_local_ci"}
+)
 MAX_ASSIGNEE_RULES = 32
 MAX_MATCH_TERMS_PER_RULE = 32
 
@@ -144,6 +146,14 @@ class AssigneeRule:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalCIAuditPolicy:
+    """Opt-in, read-only local CI coverage for repositories without Actions."""
+
+    assignee: str
+    post_results: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PluginPolicy:
     enabled: bool
     targets: Mapping[str, RepositoryTarget]
@@ -156,6 +166,7 @@ class PluginPolicy:
     assignee: str | None
     board: str | None
     assignee_rules: tuple[AssigneeRule, ...] = ()
+    local_ci_audit: LocalCIAuditPolicy | None = None
 
     def assignee_for(self, body: str) -> str:
         """Choose the unique highest-scoring specialist, otherwise the fallback."""
@@ -269,6 +280,21 @@ def _parse_assignee_rules(raw: object) -> tuple[AssigneeRule, ...]:
     return tuple(rules)
 
 
+def _parse_local_ci_audit(raw: object) -> LocalCIAuditPolicy | None:
+    if not isinstance(raw, Mapping):
+        raise ValueError("local_ci_audit must be a mapping")
+    if set(raw) != {"enabled", "assignee", "post_results"}:
+        raise ValueError("local_ci_audit has missing or unknown fields")
+    enabled = raw["enabled"]
+    post_results = raw["post_results"]
+    if not isinstance(enabled, bool) or not isinstance(post_results, bool):
+        raise ValueError("local_ci_audit booleans are invalid")
+    assignee = _nonempty_string(raw["assignee"], "local_ci_audit assignee")
+    if not enabled:
+        return None
+    return LocalCIAuditPolicy(assignee=assignee, post_results=post_results)
+
+
 def load_policy(raw: object) -> PluginPolicy:
     """Parse plugin configuration, retaining no enabled behavior on any omission."""
 
@@ -293,6 +319,7 @@ def load_policy(raw: object) -> PluginPolicy:
         "include_bot_feedback",
         "auto_dispatch",
         "assignee_rules",
+        "local_ci_audit",
     }
     if not required.issubset(raw) or set(raw) - required - optional:
         raise ValueError("enabled configuration has missing or unknown fields")
@@ -340,4 +367,5 @@ def load_policy(raw: object) -> PluginPolicy:
         _nonempty_string(raw["assignee"], "assignee"),
         _nonempty_string(raw["board"], "board"),
         _parse_assignee_rules(raw["assignee_rules"]) if "assignee_rules" in raw else (),
+        _parse_local_ci_audit(raw["local_ci_audit"]) if "local_ci_audit" in raw else None,
     )

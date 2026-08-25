@@ -163,6 +163,22 @@ def test_kanban_client_dispatches_an_opted_in_repair_as_ready() -> None:
     assert runner.calls[0][retries_index] == "3"
 
 
+def test_kanban_client_uses_the_task_specific_evidence_heading() -> None:
+    from github_pr_feedback.cli import KanbanSubprocessClient
+
+    runner = RecordingKanbanRunner('{"id": "task-123"}')
+    task = replace(
+        kanban_task(),
+        evidence_heading="Canonical PR audit receipt (JSON)",
+        evidence={"repository": "acme/widgets", "pr_number": 17},
+    )
+
+    KanbanSubprocessClient(runner).create_or_get_task(task)
+
+    assert "Canonical PR audit receipt (JSON):" in runner.calls[0][7]
+    assert "Untrusted evidence" not in runner.calls[0][7]
+
+
 def test_auto_dispatch_argv_is_accepted_by_the_real_kanban_parser() -> None:
     from github_pr_feedback.cli import _kanban_create_argv
     from hermes_cli.kanban import build_parser
@@ -311,6 +327,28 @@ def test_namespaced_context_loads_assignee_rules_for_runtime_routing(tmp_path: P
     assert policy.assignee_for("Reduce latency") == "performance-patch-steward"
 
 
+def test_namespaced_context_preserves_auto_dispatch_and_local_ci_audit_settings(
+    tmp_path: Path,
+) -> None:
+    from github_pr_feedback.cli import _load_policy_from_context
+
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    settings = enabled_settings(repository)
+    settings["auto_dispatch"] = True
+    settings["local_ci_audit"] = {
+        "enabled": True,
+        "assignee": "pr-local-ci-auditor",
+        "post_results": True,
+    }
+
+    policy = _load_policy_from_context(RecordingContext(settings))
+
+    assert policy.auto_dispatch is True
+    assert policy.local_ci_audit is not None
+    assert policy.local_ci_audit.assignee == "pr-local-ci-auditor"
+
+
 def test_doctor_read_only_verifies_every_runtime_dependency(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -328,8 +366,18 @@ def test_doctor_read_only_verifies_every_runtime_dependency(
     (profile_root / "profiles" / "repair-agent" / "config.yaml").write_text(
         "profile: repair-agent\n", encoding="utf-8"
     )
+    (profile_root / "profiles" / "pr-local-ci-auditor").mkdir(parents=True)
+    (profile_root / "profiles" / "pr-local-ci-auditor" / "config.yaml").write_text(
+        "profile: pr-local-ci-auditor\n", encoding="utf-8"
+    )
     ledger_path = profile_root / "github-pr-feedback" / "ledger.sqlite3"
-    context = RecordingContext(enabled_settings(repository))
+    settings = enabled_settings(repository)
+    settings["local_ci_audit"] = {
+        "enabled": True,
+        "assignee": "pr-local-ci-auditor",
+        "post_results": True,
+    }
+    context = RecordingContext(settings)
     responses = {
         ("/opt/tools/gh", "auth", "status", "--hostname", "github.com"): (0, ""),
         ("/opt/tools/hermes", "--version"): (0, "Hermes Agent test"),
@@ -426,6 +474,47 @@ def test_doctor_reports_degraded_but_still_runs_all_read_only_checks(
         "repository_worktree",
     }
     assert len(runner.calls) == 5
+
+
+def test_doctor_requires_the_configured_local_ci_auditor_profile(tmp_path: Path) -> None:
+    from github_pr_feedback.cli import DoctorProbe
+    from github_pr_feedback.policy import load_policy
+
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    profile_root = tmp_path / "profile"
+    (profile_root / "profiles" / "repair-agent").mkdir(parents=True)
+    (profile_root / "profiles" / "repair-agent" / "config.yaml").write_text(
+        "profile: repair-agent\n", encoding="utf-8"
+    )
+    settings = enabled_settings(repository)
+    settings["local_ci_audit"] = {
+        "enabled": True,
+        "assignee": "pr-local-ci-auditor",
+        "post_results": True,
+    }
+    policy = load_policy(settings)
+    responses = {
+        ("/opt/tools/gh", "auth", "status", "--hostname", "github.com"): (0, ""),
+        ("/opt/tools/hermes", "--version"): (0, "Hermes Agent test"),
+        ("/opt/tools/git", "-C", str(repository), "rev-parse", "--show-toplevel"): (
+            0,
+            f"{repository}\n",
+        ),
+        ("/opt/tools/git", "-C", str(repository), "rev-parse", "--git-common-dir"): (
+            0,
+            ".git\n",
+        ),
+        ("/opt/tools/git", "-C", str(repository), "worktree", "list", "--porcelain"): (
+            0,
+            f"worktree {repository}\n",
+        ),
+    }
+    probe = DoctorProbe(profile_root, RecordingDoctorRunner(responses))
+
+    checks = probe.checks(policy, profile_root / "ledger.sqlite3")
+
+    assert checks["assignee"] == "failed"
 
 
 def test_retry_passes_the_exact_immutable_receipt_to_controller_revalidation(
@@ -548,7 +637,9 @@ def test_doctor_fails_closed_for_an_incomplete_enabled_configuration(
         "reviewer_associations",
         "include_self_feedback",
         "include_bot_feedback",
+        "auto_dispatch",
         "assignee_rules",
+        "local_ci_audit",
         "not_before",
         "assignee",
         "board",
