@@ -242,13 +242,15 @@ def _reaction_payload(**overrides) -> _FakePayload:
     return _FakePayload(**defaults)
 
 
-def _patch_common(monkeypatch, adapter):
+def _patch_common(monkeypatch, adapter, *, authz_stub: bool = True):
     monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
                         lambda self: (True, None), raising=False)
     # Gate 8 stub: real _is_allowed_user FAILS CLOSED on bare instances.
-    monkeypatch.setattr(type(adapter), "_is_allowed_user",
-                        lambda self, user_id, author=None, **kw: True,
-                        raising=False)
+    # authz_stub=False keeps the REAL method (role-only deployment test).
+    if authz_stub:
+        monkeypatch.setattr(type(adapter), "_is_allowed_user",
+                            lambda self, user_id, author=None, **kw: True,
+                            raising=False)
     # Fake client: .user drives self-drop; get_channel/fetch_channel must
     # resolve ANY id so Gate 7 can build channel keys.
     def _get_channel(cid):
@@ -410,6 +412,14 @@ async def test_synthesis_snippet_miss_still_dispatches(monkeypatch):
     await adapter._handle_reaction_payload(_reaction_payload(), added=True)
     assert len(dispatched) == 1
     assert dispatched[0].reply_to_text is None   # unknown target still dispatches
+    # Known-but-empty map hit ("": captionless attachment) must ALSO render as
+    # None, not an empty pointer (photon precedent: content.get("targetText")
+    # or None).
+    adapter._remember_outbound_snippet("43", "")
+    await adapter._handle_reaction_payload(_reaction_payload(message_id=43),
+                                           added=True)
+    assert len(dispatched) == 2
+    assert dispatched[1].reply_to_text is None
 
 
 @pytest.mark.asyncio
@@ -472,7 +482,8 @@ async def test_hook_dict_shape(monkeypatch):
     assert h["event_name"] == "reaction:added"
     assert h["reaction"] == "👍"
     assert h["user_id"] == "555"
-    assert h["item_user_id"] == "999"
+    # REACTION_ADD carries the TRUE author of the reacted-to message
+    assert h["item_user_id"] == str(payload.message_author_id)
     assert h["channel_id"] == "2"
     assert h["message_ts"] == str(payload.message_id)
     assert isinstance(h["event_ts"], str)
@@ -480,3 +491,130 @@ async def test_hook_dict_shape(monkeypatch):
     # Discord parity omissions vs the Slack shape
     assert "item_type" not in h
     assert "team_id" not in h
+    # REMOVE payloads lack message_author_id -> item_user_id is None
+    await adapter._handle_reaction_payload(
+        _reaction_payload(user_id=556, message_author_id=None), added=False)
+    assert len(hooks) == 2
+    assert hooks[1]["event_name"] == "reaction:removed"
+    assert hooks[1]["item_user_id"] is None
+
+
+# ===========================================================================
+# Quality-review follow-ups: role_authorized propagation (gateway cold-path
+# delegation route), Gate 1 precedence, hook-failure isolation, fail-closed
+# channel resolution, remove-hydration semantics.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_role_authorized_stamped_on_source(monkeypatch):
+    # Deployments authorized via DISCORD_ALLOWED_ROLES pass Gate 8 with no env
+    # user allowlist; the gateway cold path (_is_user_authorized delegation,
+    # authz_mixin.py) then reads source.role_authorized — it MUST be True on
+    # every synthesized source or every reaction event is dropped there.
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)   # authz stub: True
+    adapter._allowed_role_ids = {"111222333"}                 # post-patch stamp
+    await adapter._handle_reaction_payload(_reaction_payload(), added=True)
+    assert len(dispatched) == 1
+    assert dispatched[0].source.role_authorized is True
+
+
+@pytest.mark.asyncio
+async def test_role_only_deployment_dispatches_with_real_authz(monkeypatch):
+    # REAL _is_allowed_user — no authz stub. Invariant: a deployment authorized
+    # ONLY by DISCORD_ALLOWED_ROLES lets a role-holding reactor through Gate 8,
+    # and the synthesized source carries the grant for gateway cold-path authz.
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter, authz_stub=False)
+    # Real _get_allowed_roles() stores INTS (int(str(entry)), adapter.py),
+    # and _is_allowed_user matches `r.id in allowed_roles` directly — so the
+    # configured id and the fake role id must both be ints to match.
+    adapter._allowed_role_ids = {111222333}
+    adapter._allowed_user_ids = set()
+    reactor = SimpleNamespace(id=555000111222333444, name="reactor",
+                              roles=[SimpleNamespace(id=111222333)])
+    # The real matcher takes its DM-role branch when guild context is None
+    # (disabled by default) — the resolved channel must carry a guild so the
+    # guild-scoped member.roles path runs.
+    def _guilded_channel(cid):
+        return SimpleNamespace(id=int(cid), name="general", parent_id=None,
+                               parent=None, guild=SimpleNamespace(id=777))
+
+    async def _unresolvable(cid):
+        return None
+
+    adapter._client.get_channel = _guilded_channel
+    adapter._client.fetch_channel = _unresolvable
+    payload = _reaction_payload(user_id=555000111222333444, member=reactor)
+    await adapter._handle_reaction_payload(payload, added=True)
+    assert len(dispatched) == 1        # role-only grant authorizes dispatch
+    assert dispatched[0].source.role_authorized is True
+
+
+@pytest.mark.asyncio
+async def test_gate_1_malformed_payload_silently_dropped(monkeypatch):
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)
+    await adapter._handle_reaction_payload(
+        _reaction_payload(emoji=None), added=True)
+    await adapter._handle_reaction_payload(
+        _reaction_payload(message_id=""), added=True)
+    assert dispatched == []          # Gate 1 drops malformed payloads
+    assert hooks == []               # ...and precedes hook fan-out (Gate 3)
+
+
+@pytest.mark.asyncio
+async def test_raising_hook_handler_does_not_break_dispatch(monkeypatch):
+    adapter = _make_adapter()
+    dispatched, _hooks = _patch_common(monkeypatch, adapter)
+
+    async def _exploding_handler(ctx):
+        raise RuntimeError("hook handler exploded")
+
+    adapter._reaction_handler = _exploding_handler
+    await adapter._handle_reaction_payload(_reaction_payload(), added=True)
+    # The swallow in _emit_reaction_hook protects the dispatch pipeline
+    assert len(dispatched) == 1
+    assert dispatched[0].text == "reaction:added:👍"
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_guild_channel_drops_fail_closed(monkeypatch):
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)
+    # Fresh fake client: get_channel AND fetch_channel both resolve nothing.
+    async def _none_async(cid):
+        return None
+
+    adapter._client = type("C", (), {
+        "user": _FakeClientUser(),
+        "get_channel": staticmethod(lambda cid: None),
+        "fetch_channel": staticmethod(_none_async),
+        "fetch_user": staticmethod(lambda uid: SimpleNamespace(id=int(uid))),
+    })()
+    await adapter._handle_reaction_payload(_reaction_payload(), added=True)
+    assert dispatched == []          # unresolvable guild channel -> drop
+    assert len(hooks) == 1           # hook still fired (Gate 3 precedes Gate 7)
+
+
+@pytest.mark.asyncio
+async def test_remove_uses_map_snippet_over_fetch(monkeypatch):
+    # REACTION_REMOVE hydration semantics: the single fetch still runs (it is
+    # what proves bot authorship at Gate 6b), but a known map snippet wins for
+    # reply_to_text over whatever the fetch returned.
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)
+    adapter._remember_outbound_snippet(str(42), "map text")
+    fetch_calls = []
+
+    async def counting_resolve(mid, pl):
+        fetch_calls.append(mid)
+        return True, "fetched text"
+
+    monkeypatch.setattr(adapter, "_resolve_reaction_target", counting_resolve,
+                        raising=False)
+    await adapter._handle_reaction_payload(
+        _reaction_payload(message_author_id=None), added=False)
+    assert len(fetch_calls) == 1     # EXACTLY ONE fetch, still for authorship
+    assert len(dispatched) == 1
+    assert dispatched[0].text == "reaction:removed:👍"
+    assert dispatched[0].reply_to_text == "map text"   # map wins for hydration

@@ -3485,9 +3485,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
                 target_text = target_text or fetched_text
 
-            # Gate 7: channel policy. Cheap and REST-free (channel cache first),
-            # placed BEFORE authorization exactly like the ingress ordering of
-            # channel gates ahead of user gates.
+            # Gate 7: Channel policy before authorization: outcome-equivalent
+            # to ingress (both must pass); channel-first avoids potential
+            # fetch_channel REST calls for unauthorized reactors.
             guild_id_raw = getattr(payload, "guild_id", None)
             is_dm = guild_id_raw is None
             channel_obj = None
@@ -3556,6 +3556,14 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 return
 
+            # Role-grant stamp, mirroring ingress (:1633): a deployment
+            # authorized solely via DISCORD_ALLOWED_ROLES passes Gate 8 but has
+            # no env user allowlist, so the gateway cold path
+            # (_is_user_authorized's adapter-delegation route,
+            # authz_mixin.py) drops every event unless the source carries the
+            # grant. Stamp it onto EVERY source synthesized below.
+            role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+
             # Source: DM payloads build chat_type="dm" directly (the shared
             # helper hardcodes thread/group); guild payloads are thread-aware.
             user_name = None
@@ -3571,6 +3579,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     user_id=reactor_id,
                     user_name=user_name,
                     message_id=message_id,
+                    role_authorized=role_authorized,
                 )
             else:
                 thread_id, chat_id = self._thread_id_and_chat_for_channel(channel_obj)
@@ -3589,6 +3598,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     guild_id=str(guild_id_raw) if guild_id_raw else None,
                     parent_chat_id=parent_channel_id,
                     message_id=message_id,
+                    role_authorized=role_authorized,
                 )
 
             # MessageEvent/MessageType already imported module-top — no re-import.
@@ -3598,7 +3608,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 source=source,
                 message_id=message_id,
                 reply_to_message_id=message_id,
-                reply_to_text=target_text,
+                # "" (known-but-empty map hit) must not render as an empty
+                # pointer — photon precedent: content.get("targetText") or None.
+                reply_to_text=(target_text or None),
                 reply_to_is_own_message=True,
                 raw_message=payload,
                 timestamp=dt.datetime.now(dt.timezone.utc),
@@ -3645,13 +3657,19 @@ class DiscordAdapter(BasePlatformAdapter):
         if handler is None:
             return
         try:
-            client_user = getattr(getattr(self, "_client", None), "user", None)
             await handler({
                 "platform": "discord",
                 "event_name": f"reaction:{'added' if added else 'removed'}",
                 "reaction": emoji,
                 "user_id": reactor_id,
-                "item_user_id": str(getattr(client_user, "id", "")),
+                # REACTION_ADD carries the TRUE author of the reacted-to
+                # message (parity with Slack's item_user); REACTION_REMOVE
+                # lacks it -> None. Hooks observe ALL human reactions
+                # pre-Gate-6, so the bot id does not belong here.
+                "item_user_id": (
+                    str(payload.message_author_id)
+                    if getattr(payload, "message_author_id", None) else None
+                ),
                 "channel_id": str(getattr(payload, "channel_id", "")),
                 "message_ts": str(getattr(payload, "message_id", "")),
                 "event_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
