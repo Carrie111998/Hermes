@@ -1179,16 +1179,10 @@ class BaseEnvironment(ABC):
                 return
             idle_after_exit = 0
             try:
-                # select.select() only accepts fds below FD_SETSIZE (usually
-                # 1024).  Once the Electron/desktop process accumulates more
-                # than 1024 open fds, the terminal's stdout pipe lands at
-                # fd >= 1024 and select() raises "ValueError: filedescriptor
-                # out of range in select()" — which the old handler misread as
-                # "fd already closed", silently discarding ALL of the command's
-                # output while still reporting a correct exit code (#94928).
-                # selectors.DefaultSelector() (epoll/kqueue/poll on POSIX) has
-                # no fd-number limit, and a genuine readiness error is now
-                # logged instead of swallowed.
+                # select.select() only accepts fds < FD_SETSIZE (1024), so a
+                # pipe fd >= 1024 raised ValueError, misread as EOF — silently
+                # discarding all output (#94928). selectors.DefaultSelector()
+                # has no fd limit and logs a genuine readiness error instead.
                 _selector = selectors.DefaultSelector()
                 try:
                     try:
