@@ -618,15 +618,21 @@ def _ensure_direct_aliases() -> None:
     global _DIRECT_ALIASES_CACHE_KEY, _DIRECT_ALIASES_CACHE_SNAPSHOT
 
     key = _direct_aliases_cache_key()
+    if _DIRECT_ALIASES_CACHE_SNAPSHOT is None and DIRECT_ALIASES:
+        # A caller populated the public mapping before the first lazy load.
+        _DIRECT_ALIASES_CACHE_KEY = key
+        _DIRECT_ALIASES_CACHE_SNAPSHOT = dict(DIRECT_ALIASES)
+        return
+    if (
+        _DIRECT_ALIASES_CACHE_SNAPSHOT is not None
+        and DIRECT_ALIASES != _DIRECT_ALIASES_CACHE_SNAPSHOT
+    ):
+        # Preserve deliberate public-map mutations even if an unrelated config
+        # write changed the stat key between two lookups.
+        _DIRECT_ALIASES_CACHE_KEY = key
+        _DIRECT_ALIASES_CACHE_SNAPSHOT = dict(DIRECT_ALIASES)
+        return
     if key == _DIRECT_ALIASES_CACHE_KEY:
-        # DIRECT_ALIASES is a long-standing public mutable mapping. Preserve
-        # deliberate caller/test injections made in place while the config
-        # identity is unchanged; an empty loaded mapping remains cacheable.
-        if (
-            _DIRECT_ALIASES_CACHE_SNAPSHOT is not None
-            and DIRECT_ALIASES != _DIRECT_ALIASES_CACHE_SNAPSHOT
-        ):
-            _DIRECT_ALIASES_CACHE_SNAPSHOT = dict(DIRECT_ALIASES)
         return
     DIRECT_ALIASES.clear()
     DIRECT_ALIASES.update(_load_direct_aliases())
