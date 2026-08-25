@@ -76,9 +76,16 @@ def resolve_exec_command() -> str:
             # installer's bash wrapper). Launched from the .desktop entry that
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
-            # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # Prefer the venv interpreter that lives next to the repo script;
+            # sys.executable is only correct when Hermes itself runs from the
+            # venv (desktop-update/relaunch paths can run the BASE python
+            # that created the venv, which has no third-party imports).
+            sibling_venv = resolved.parent / "venv" / "bin" / "python"
+            interpreter = (
+                sibling_venv if sibling_venv.is_file()
+                else Path(sys.executable).resolve()
+            )
+            argv = [str(interpreter), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
