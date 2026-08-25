@@ -495,6 +495,36 @@ class TestAllowlist:
         session = self._complete(provider, rsa_keypair)
         assert session.email == "alice@example.com"
 
+    def test_falls_back_to_config_yaml_when_env_unset(self, provider, rsa_keypair, monkeypatch):
+        monkeypatch.delenv("DASHBOARD_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"dashboard": {"oauth": {"google_allowed_users": "bob@example.com"}}},
+        )
+        with pytest.raises(InvalidCodeError, match="not on the dashboard allowlist"):
+            self._complete(provider, rsa_keypair, email="alice@example.com")
+
+    def test_env_allowlist_takes_precedence_over_config_yaml(self, provider, rsa_keypair, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_ALLOWED_USERS", "alice@example.com")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"dashboard": {"oauth": {"google_allowed_users": "someone-else@example.com"}}},
+        )
+        session = self._complete(provider, rsa_keypair)
+        assert session.email == "alice@example.com"
+
+    def test_config_yaml_load_failure_falls_back_to_no_allowlist(self, provider, rsa_keypair, monkeypatch):
+        monkeypatch.delenv("DASHBOARD_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+
+        def _broken():
+            raise RuntimeError("disk error")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _broken)
+        session = self._complete(provider, rsa_keypair)
+        assert session.email == "alice@example.com"
+
 
 # ---------------------------------------------------------------------------
 # verify_session
@@ -607,6 +637,26 @@ class TestRefreshAndRevoke:
             with pytest.raises(RefreshExpiredError, match="invalid_grant"):
                 provider.refresh_session(refresh_token="rt_old")
 
+    def test_refresh_rejects_email_removed_from_allowlist(self, provider, rsa_keypair, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_ALLOWED_USERS", "bob@example.com")
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        mock_resp = _mock_post(
+            200, {"access_token": "ya29.new", "token_type": "Bearer", "id_token": id_token}
+        )
+        with patch("plugins.dashboard_auth.google.httpx.post", return_value=mock_resp):
+            with pytest.raises(RefreshExpiredError, match="not on the dashboard allowlist"):
+                provider.refresh_session(refresh_token="rt_old")
+
+    def test_refresh_permits_allowlisted_email(self, provider, rsa_keypair, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_ALLOWED_USERS", "alice@example.com")
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        mock_resp = _mock_post(
+            200, {"access_token": "ya29.new", "token_type": "Bearer", "id_token": id_token}
+        )
+        with patch("plugins.dashboard_auth.google.httpx.post", return_value=mock_resp):
+            session = provider.refresh_session(refresh_token="rt_old")
+        assert session.email == "alice@example.com"
+
     def test_revoke_is_best_effort_and_does_not_raise(self, provider):
         with patch(
             "plugins.dashboard_auth.google.httpx.post",
@@ -628,6 +678,14 @@ class TestRefreshAndRevoke:
         args, kwargs = mock_post.call_args
         assert args[0] == "https://oauth2.googleapis.com/revoke"
         assert kwargs["data"] == {"token": "rt"}
+
+    def test_revoke_logs_non_200_status_without_raising(self, provider, caplog):
+        mock_resp = _mock_post(400, {"error": "invalid_token"})
+        with patch("plugins.dashboard_auth.google.httpx.post", return_value=mock_resp):
+            with caplog.at_level("DEBUG", logger="plugins.dashboard_auth.google"):
+                result = provider.revoke_session(refresh_token="already-expired")
+        assert result is None
+        assert any("status_code=400" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

@@ -284,12 +284,18 @@ class GoogleDashboardAuthProvider(DashboardAuthProvider):
             "client_secret": self._client_secret,
             "refresh_token": refresh_token,
         }
-        return self._exchange(
+        session = self._exchange(
             disco["token_endpoint"],
             data,
             bad_request_exc=RefreshExpiredError,
             previous_refresh_token=refresh_token,
         )
+        # Sessions are stateless JWTs, so without this re-check a user
+        # removed from the allowlist keeps a working dashboard until their
+        # current ID token expires rather than being cut off at the next
+        # refresh.
+        self._check_allowlist(session.email, denied_exc=RefreshExpiredError)
+        return session
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
         # The session cookie stores the ID token in the access-token slot
@@ -313,11 +319,20 @@ class GoogleDashboardAuthProvider(DashboardAuthProvider):
         if not refresh_token:
             return None
         try:
-            httpx.post(
+            response = httpx.post(
                 _GOOGLE_REVOKE_URL,
                 data={"token": refresh_token},
                 timeout=_TOKEN_ENDPOINT_TIMEOUT_SEC,
             )
+            if response.status_code != 200:
+                # Non-fatal (e.g. an already-expired token yields 400) —
+                # logged so logout auditing can distinguish "revoked" from
+                # "Google rejected the revoke call" without changing
+                # behavior.
+                logger.debug(
+                    "dashboard-auth-google: revoke returned status_code=%s",
+                    response.status_code,
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.debug(
                 "dashboard-auth-google: revoke failed (ignored): %s", exc
@@ -575,10 +590,21 @@ class GoogleDashboardAuthProvider(DashboardAuthProvider):
 
     @staticmethod
     def _resolve_allowlist() -> list[str]:
-        """Return the effective allowlist from env vars."""
+        """Return the effective allowlist from env vars, falling back to
+        config.yaml (dashboard.oauth.google_allowed_users) — mirrors the
+        env-wins-over-config precedence used by ``_resolve_config``."""
         raw = os.environ.get("DASHBOARD_ALLOWED_USERS", "") or os.environ.get(
             "GATEWAY_ALLOWED_USERS", ""
         )
+        if not raw.strip():
+            try:
+                from hermes_cli.config import cfg_get, load_config
+
+                oauth = cfg_get(load_config(), "dashboard", "oauth", default=None)
+                if isinstance(oauth, dict):
+                    raw = str(oauth.get("google_allowed_users", "") or "")
+            except Exception:
+                raw = ""
         if not raw.strip():
             return []
         return [
@@ -587,15 +613,17 @@ class GoogleDashboardAuthProvider(DashboardAuthProvider):
             if entry.strip()
         ]
 
-    def _check_allowlist(self, email: str) -> None:
-        """Raise InvalidCodeError if the allowlist is set and email is not on it."""
+    def _check_allowlist(
+        self, email: str, *, denied_exc: type[Exception] = InvalidCodeError
+    ) -> None:
+        """Raise ``denied_exc`` if the allowlist is set and email is not on it."""
         allowed = self._resolve_allowlist()
         if not allowed:
             # Empty allowlist = any authenticated user (backward-compat)
             return
         if email.lower() in (a.lower() for a in allowed):
             return
-        raise InvalidCodeError(
+        raise denied_exc(
             f"Access denied: {email} is not on the dashboard allowlist. "
             f"Set DASHBOARD_ALLOWED_USERS in .env to grant access."
         )
