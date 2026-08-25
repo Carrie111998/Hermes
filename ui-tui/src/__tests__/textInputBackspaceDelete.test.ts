@@ -1,0 +1,84 @@
+import { describe, expect, it } from 'vitest'
+
+import { backspaceDelete, canFastBackspaceShape } from '../components/textInput.js'
+
+// Upstream #94512: the TUI composer snapped Backspace to a grapheme-cluster
+// boundary (prevPos → Intl.Segmenter), so deleting a Thai syllable like กิ
+// (ก U+0E01 + ◌ิ U+0E34) removed the whole cluster — base consonant included.
+// Native text fields delete one code point at a time, so a vowel/tone typo
+// only removes the trailing mark. These tests pin the corrected semantics:
+// per-code-point Backspace at end-of-input over a combining mark, with the
+// deliberate grapheme-cluster model preserved everywhere else.
+
+const KO_KAI = '\u0e01' // ก  Thai base consonant
+const SARA_I = '\u0e34' // ◌ิ  Thai combining vowel
+const MAI_THO = '\u0e49' // ◌้  Thai combining tone
+
+describe('backspaceDelete', () => {
+  it('deletes one combining mark at a time at end-of-input (Thai กิ → ก)', () => {
+    const thai = KO_KAI + SARA_I // กิ
+
+    expect(backspaceDelete(thai, thai.length)).toEqual({ cursor: 1, value: KO_KAI })
+  })
+
+  it('peels a base + 2 combining marks one Backspace per mark', () => {
+    const cluster = KO_KAI + SARA_I + MAI_THO // ก�้
+
+    const afterOne = backspaceDelete(cluster, cluster.length) // ก�
+    const afterTwo = backspaceDelete(afterOne.value, afterOne.value.length) // ก
+
+    expect(afterOne).toEqual({ cursor: 2, value: KO_KAI + SARA_I })
+    expect(afterTwo).toEqual({ cursor: 1, value: KO_KAI })
+  })
+
+  it('extends to Devanagari vowel signs (क + ि → क)', () => {
+    const deva = '\u0915\u093f' // क + ि (U+093F DEVANAGARI VOWEL SIGN I)
+
+    expect(backspaceDelete(deva, deva.length)).toEqual({ cursor: 1, value: '\u0915' })
+  })
+
+  it('leaves plain ASCII backspace unchanged (ab → a)', () => {
+    expect(backspaceDelete('ab', 2)).toEqual({ cursor: 1, value: 'a' })
+    expect(backspaceDelete('a', 1)).toEqual({ cursor: 0, value: '' })
+  })
+
+  it('never splits a surrogate pair: one Backspace removes a whole emoji', () => {
+    const value = 'a😀' // U+1F600 = two UTF-16 units
+
+    expect(value.length).toBe(3)
+    expect(backspaceDelete(value, value.length)).toEqual({ cursor: 1, value: 'a' })
+    expect(backspaceDelete('😀', 2)).toEqual({ cursor: 0, value: '' })
+  })
+
+  it('keeps grapheme-cluster delete for ZWJ emoji sequences (non-combining tail)', () => {
+    // man + ZWJ + woman + ZWJ + girl — one grapheme; the tail code point is an
+    // emoji, not a combining mark, so the whole sequence still deletes at once.
+    const family = '👨\u200d👩\u200d👧'
+
+    expect(backspaceDelete(family, family.length)).toEqual({ cursor: 0, value: '' })
+  })
+
+  it('keeps grapheme-cluster delete for mid-text Backspace (only end-of-input changes)', () => {
+    // Cursor before the trailing 'x' is NOT at end-of-input, so the ก� cluster
+    // is still removed whole — cursor movement/selection granularity is intact.
+    const value = KO_KAI + SARA_I + 'x'
+
+    expect(backspaceDelete(value, 2)).toEqual({ cursor: 0, value: 'x' })
+  })
+
+  it('is a no-op at cursor 0', () => {
+    expect(backspaceDelete(KO_KAI + SARA_I, 0)).toEqual({ cursor: 0, value: KO_KAI + SARA_I })
+  })
+})
+
+describe('backspaceDelete ↔ fast-echo path consistency (#94512)', () => {
+  it('excludes a Thai combining cluster from the raw \\b \\b fast path', () => {
+    // The fast-echo bypass writes "\b \b" and only clears one cell, so it must
+    // never run for a combining cluster. canFastBackspaceShape already rejects
+    // non-ASCII removed graphemes; pin that so the per-codepoint normal path
+    // (backspaceDelete) is what handles Thai.
+    const thai = KO_KAI + SARA_I
+
+    expect(canFastBackspaceShape(thai, thai.length)).toBe(false)
+  })
+})
