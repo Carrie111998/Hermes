@@ -4406,7 +4406,13 @@ class PluginManager:
                         "plugin": manifest.name,
                         "plugin_key": lookup_key,
                         "plugin_version": manifest.version,
-                        "config": dict(config),
+                        "transport": (
+                            "http"
+                            if config.get("url")
+                            else "stdio"
+                            if config.get("command")
+                            else "unknown"
+                        ),
                     }
                 )
         return descriptors

@@ -107,6 +107,63 @@ class TestProfileScopedEnv:
 
 class TestProfileScopedMcp:
 
+    def test_mcp_list_includes_only_selected_profiles_portable_plugins(
+        self, client, isolated_profiles
+    ):
+        from hermes_cli.agent_plugins import MCP_SCHEMA_V1, PLUGIN_SCHEMA_V1
+
+        worker_home = isolated_profiles["worker_beta"]
+        plugin_dir = worker_home / "plugins" / "worker-portable"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "$schema": PLUGIN_SCHEMA_V1,
+                    "name": "worker.portable",
+                    "version": "1.2.3",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (plugin_dir / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "$schema": MCP_SCHEMA_V1,
+                    "mcpServers": {
+                        "workflow": {"type": "stdio", "command": "python"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        worker_cfg = _cfg(worker_home)
+        worker_cfg["plugins"] = {"enabled": ["worker.portable"]}
+        (worker_home / "config.yaml").write_text(
+            yaml.safe_dump(worker_cfg), encoding="utf-8"
+        )
+
+        worker_response = client.get(
+            "/api/mcp/servers", params={"profile": "worker_beta"}
+        )
+        assert worker_response.status_code == 200
+        [managed] = [
+            server
+            for server in worker_response.json()["servers"]
+            if server["source"] == "plugin"
+        ]
+        assert managed["display_name"] == "worker.portable / workflow"
+        assert managed["plugin_version"] == "1.2.3"
+        assert managed["read_only"] is True
+        assert managed["command"] is None
+        assert managed["env"] == {}
+
+        default_response = client.get("/api/mcp/servers")
+        assert default_response.status_code == 200
+        assert all(
+            server["source"] != "plugin"
+            for server in default_response.json()["servers"]
+        )
+
     def test_mcp_bearer_secret_is_profile_scoped(self, client, isolated_profiles):
         secret = "worker-only-secret"
         response = client.post(

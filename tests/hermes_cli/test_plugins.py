@@ -217,7 +217,7 @@ class TestPluginDiscovery:
         assert descriptor["server_name"] == "worker"
         assert descriptor["plugin"] == "portable.test"
         assert descriptor["plugin_key"] == "portable.test"
-        assert descriptor["config"]["command"] == "python"
+        assert descriptor["transport"] == "stdio"
         assert manager._plugins["portable.test"].enabled is True
         assert manager._plugins["native"].enabled is True
         assert manager._plugins["native"].module is not None
@@ -341,6 +341,14 @@ class TestPluginDiscovery:
         assert manager._plugins["portable.test"].enabled is False
         assert manager.list_plugin_skill_metadata() == []
         assert manager.get_portable_mcp_servers() == {}
+        assert manager.get_enabled_portable_mcp_server_descriptors(
+            {
+                "plugins": {
+                    "enabled": ["portable.test"],
+                    "disabled": ["portable.test"],
+                }
+            }
+        ) == []
 
     def test_portable_author_object_is_normalized_to_stable_string(
         self, tmp_path, monkeypatch

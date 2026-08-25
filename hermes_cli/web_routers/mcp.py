@@ -96,19 +96,24 @@ async def list_mcp_servers(profile: Optional[str] = None):
             # Runtime loading gives an explicitly configured server priority
             # over a portable MCP with the same internal name.
             continue
-        summary = _mcp_server_summary(name, descriptor["config"])
         plugin = descriptor["plugin"]
         server_name = descriptor["server_name"]
-        summary.update(
-            {
-                "display_name": f"{plugin} / {server_name}",
-                "source": "plugin",
-                "managed_by": plugin,
-                "plugin_version": descriptor["plugin_version"] or None,
-                "read_only": True,
-                "enabled": True,
-            }
-        )
+        summary = {
+            "name": name,
+            "display_name": f"{plugin} / {server_name}",
+            "transport": descriptor["transport"],
+            "url": None,
+            "command": None,
+            "args": [],
+            "env": {},
+            "auth": None,
+            "enabled": True,
+            "tools": None,
+            "source": "plugin",
+            "managed_by": plugin,
+            "plugin_version": descriptor["plugin_version"] or None,
+            "read_only": True,
+        }
         summaries.append(summary)
 
     summaries.sort(key=lambda item: (item["display_name"].casefold(), item["name"]))

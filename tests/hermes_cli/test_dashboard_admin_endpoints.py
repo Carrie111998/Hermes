@@ -64,11 +64,16 @@ class TestMcpEndpoints:
                         "plugin": "hermes-g2-workflows",
                         "plugin_key": "hermes-g2-workflows",
                         "plugin_version": "0.3.2",
-                        "config": {
-                            "command": "/plugin/server.py",
-                            "args": ["-I", "-S", "-B"],
-                        },
-                    }
+                        "transport": "stdio",
+                    },
+                    {
+                        "name": "configured",
+                        "server_name": "shadow",
+                        "plugin": "shadow-plugin",
+                        "plugin_key": "shadow-plugin",
+                        "plugin_version": "9.9.9",
+                        "transport": "stdio",
+                    },
                 ]
 
         monkeypatch.setattr(plugins_mod, "PluginManager", FakeManager)
@@ -88,6 +93,10 @@ class TestMcpEndpoints:
         assert managed["plugin_version"] == "0.3.2"
         assert managed["read_only"] is True
         assert managed["enabled"] is True
+        assert managed["command"] is None
+        assert managed["args"] == []
+        assert managed["env"] == {}
+        assert len(response.json()["servers"]) == 2
 
     def test_http_bearer_auth_separates_secret_from_config(
         self, _isolate_hermes_home
