@@ -59,6 +59,11 @@ jobs:
       - id: pick
         run: |
           set -euo pipefail
+          # The candidate may live in a fork whose tags are stale. Release
+          # selection belongs to the canonical base repository, while code
+          # execution remains bound to the submitted head.
+          git fetch --force --tags --no-recurse-submodules \
+            "https://github.com/${GITHUB_REPOSITORY}.git"
           actual="$(git rev-parse HEAD)"
           expected='${{ github.event.pull_request.head.sha || github.sha }}'
           test "$actual" = "$expected"

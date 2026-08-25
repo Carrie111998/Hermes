@@ -57,6 +57,11 @@ def test_pull_request_receipt_binds_to_the_submitted_head() -> None:
     assert f"EXPECTED_SHA: {head_expression}" in reusable
     assert "steps.candidate.outputs.sha" in reusable
     assert f"ref: {head_expression}" in acceptance
+    assert (
+        'git fetch --force --tags --no-recurse-submodules \\\n'
+        '            "https://github.com/${GITHUB_REPOSITORY}.git"'
+        in acceptance
+    )
 
 
 def test_uv_fixture_does_not_hardcode_the_runner_architecture() -> None:
