@@ -269,9 +269,13 @@ def _approval_bypass_active(session_id: str) -> bool:
     return False
 
 
-def _cua_permission_mode(session_id: str) -> str:
+def _cua_permission_mode(
+    session_id: str, *, bypass_active: Optional[bool] = None
+) -> str:
     """Map Hermes's explicit approval bypass onto Cua's immutable mode."""
-    if _approval_bypass_active(session_id):
+    if bypass_active is None:
+        bypass_active = _approval_bypass_active(session_id)
+    if bypass_active:
         _warn_bypass_escalation(session_id)
         return "unrestricted"
     try:
@@ -311,7 +315,9 @@ def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
         return False
 
 
-def _get_backend(session_id: str = "") -> ComputerUseBackend:
+def _get_backend(
+    session_id: str = "", *, bypass_active: Optional[bool] = None
+) -> ComputerUseBackend:
     global _backend
     sid = str(session_id or "")
     while True:
@@ -321,7 +327,9 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
             # Resolve the mode while holding the cache lock. Session YOLO
             # mutation never holds the approval lock while releasing this
             # cache, so the lock order cannot cycle.
-            permission_mode = _cua_permission_mode(sid)
+            permission_mode = _cua_permission_mode(
+                sid, bypass_active=bypass_active
+            )
             if sid == "" and _backend is not None and sid not in _backends:
                 # Preserve the long-standing empty-session injection hook used
                 # by integrations and tests while normalizing it into the
@@ -590,10 +598,16 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             "code": "bring_to_front_requires_foreground",
         })
 
+    # Resolve once so the wrapper gates and immutable backend mode use the
+    # same authorization snapshot for this action.
+    bypass_active = _approval_bypass_active(session_id)
+
     # Approval gate (destructive actions only). A durable config grant is
     # already the user's authorization, so it stands in for the prompt.
     if action in _DESTRUCTIVE_ACTIONS and not _config_preauthorized(action, args):
-        err = _request_approval(action, args, session_id)
+        err = _request_approval(
+            action, args, session_id, bypass_active=bypass_active
+        )
         if err is not None:
             return err
     # Persistent focus is a separate, visible side effect from the input
@@ -602,13 +616,17 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     if args.get("bring_to_front") or (
         action == "focus_app" and args.get("raise_window")
     ):
-        err = _request_approval("bring_to_front", args, session_id)
+        err = _request_approval(
+            "bring_to_front", args, session_id, bypass_active=bypass_active
+        )
         if err is not None:
             return err
 
     # Dispatch to backend.
     try:
-        backend = _get_backend(session_id=session_id)
+        backend = _get_backend(
+            session_id=session_id, bypass_active=bypass_active
+        )
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
@@ -627,7 +645,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 
 
 def _request_approval(action: str, args: Dict[str, Any],
-                      session_id: str = "") -> Optional[str]:
+                      session_id: str = "", *,
+                      bypass_active: Optional[bool] = None) -> Optional[str]:
     """Return None if approved, or a JSON error string if denied.
 
     Approval is scoped by (action, delivery_mode) AND by session_id.
@@ -649,7 +668,9 @@ def _request_approval(action: str, args: Dict[str, Any],
     # Hard safety validation runs in ``handle_computer_use`` before reaching
     # this prompt gate. The canonical approval bypass suppresses only the
     # duplicate interactive wrapper prompt; it does not bypass those guards.
-    if _approval_bypass_active(session_id):
+    if bypass_active is None:
+        bypass_active = _approval_bypass_active(session_id)
+    if bypass_active:
         return None
     cb = _approval_callback
     if cb is None:
@@ -1231,6 +1252,8 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         summary_lines.append(
             f"  (shareable screenshot saved to {screenshot_path})"
         )
+    if cap.note:
+        summary_lines.append(f"  ({cap.note})")
     if elements_file:
         summary_lines.append(
             f"  (full element tree with untruncated labels saved to "

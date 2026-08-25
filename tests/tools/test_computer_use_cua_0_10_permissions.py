@@ -114,6 +114,41 @@ def test_approval_mode_off_bypasses_wrapper_and_bring_to_front(monkeypatch):
     callback.assert_not_called()
 
 
+def test_handle_resolves_approval_bypass_once_per_action(monkeypatch):
+    from tools.computer_use import tool as computer_use
+
+    bypass = Mock(return_value=True)
+    backend = object()
+    get_backend = Mock(return_value=backend)
+    dispatch = Mock(return_value="ok")
+    callback = Mock(return_value="deny")
+    monkeypatch.setattr(computer_use, "_approval_bypass_active", bypass)
+    monkeypatch.setattr(computer_use, "_get_backend", get_backend)
+    monkeypatch.setattr(computer_use, "_dispatch", dispatch)
+    monkeypatch.setattr(computer_use, "_approval_callback", callback)
+
+    result = computer_use.handle_computer_use(
+        {
+            "action": "click",
+            "delivery_mode": "foreground",
+            "bring_to_front": True,
+        },
+        session_id="session-a",
+    )
+
+    assert result == "ok"
+    bypass.assert_called_once_with("session-a")
+    get_backend.assert_called_once_with(
+        session_id="session-a", bypass_active=True
+    )
+    dispatch.assert_called_once_with(backend, "click", {
+        "action": "click",
+        "delivery_mode": "foreground",
+        "bring_to_front": True,
+    })
+    callback.assert_not_called()
+
+
 def test_wrapper_approval_still_prompts_without_bypass(monkeypatch):
     from tools import approval
     from tools.computer_use import tool as computer_use
