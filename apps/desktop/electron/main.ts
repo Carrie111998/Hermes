@@ -35,6 +35,10 @@ import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } fro
 import { appIconCandidates, resolveAppIcon } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
+  teardownSshConnectionProcessTree,
+  teardownSshConnectionWithProcessTree
+} from './ssh-process-teardown'
+import {
   type BackendOutputTail,
   claimDecision,
   createBackendOutputTail,
@@ -87,7 +91,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { applyConnectionChange, teardownSshState } from './connection-apply'
+import { applyConnectionChange } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
@@ -9865,23 +9869,28 @@ async function teardownSshConnection(profile) {
   // alone leaves the backend at pid 1 holding state.db (#91668).
   // Windows remotes use a different lifecycle (connectWindowsRemote) and
   // are left to a follow-up; POSIX is the leak that OOM'd gateways.
-  await teardownSshState(
-    {
-      ...state,
-      ownershipId: state.ownershipId || sshOwnershipKey(profile)
-    },
-    {
-      cleanupRemote:
-        state.remotePlatform === 'Windows'
-          ? async () => {
-              // connectWindowsRemote does not share POSIX lock/kill. Stay
-              // silent on the kill path, but leave a log so quit is not a
-              // mysterious no-op on Windows remotes.
-              sshRememberLog('[ssh] skip remote serve teardown on Windows remotes; POSIX disconnect does not apply')
-            }
-          : remoteLifecycle.disconnect
+  // Best-effort: a failed remote cleanup cannot trap quit.
+  try {
+    if (state.remotePlatform === 'Windows') {
+      // connectWindowsRemote does not share POSIX lock/kill. Stay silent on
+      // the kill path, but leave a log so quit is not a mysterious no-op on
+      // Windows remotes.
+      sshRememberLog('[ssh] skip remote serve teardown on Windows remotes; POSIX disconnect does not apply')
+    } else {
+      await remoteLifecycle.disconnect(state.ssh, state.ownershipId || sshOwnershipKey(profile))
     }
-  )
+  } catch {
+    // Remote teardown is best-effort; always release the local tunnel below.
+  }
+
+  // Tree-kill the local ssh child BEFORE closing the SSH channel (#94959):
+  // `ssh.close()` only tears down the SSH control channel and may leave the
+  // local ssh binary + its port-forward listeners alive long enough to hold
+  // the remote dashboard's python children in the user's Task Manager.
+  // Killing the local pid first guarantees every descendant dies before the
+  // tunnel can outlive the kill. This runs after the remote cleanup above,
+  // which needs a live channel to exec its kill.
+  await teardownSshConnectionWithProcessTree(state, { forceKillProcessTree })
 }
 
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
@@ -10132,14 +10141,18 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   let ssh = sshConnections.get(scope)?.ssh
 
   if (ssh && !(await ssh.isAlive())) {
+    // The cached ssh handle is dead but the state (with local pid) is still
+    // in the map. Tree-kill the local pid so the dead ssh + any forward
+    // listeners cannot outlive this check (#94959, sibling to
+    // teardownSshConnection).
+    teardownSshConnectionProcessTree(sshConnections.get(scope), { forceKillProcessTree })
+    sshConnections.delete(scope)
     try {
       await ssh.close()
     } catch {
       void 0
     }
-
     ssh = null
-    sshConnections.delete(scope)
   }
 
   const created = !ssh
