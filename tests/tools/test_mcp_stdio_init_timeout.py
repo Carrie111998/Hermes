@@ -74,7 +74,7 @@ class TestStdioInitializeTimeout:
                  patch.object(mcp_tool, "ClientSession", _fake_client_session), \
                  patch.object(mcp_tool, "_resolve_stdio_command", lambda c, e: (c, e)), \
                  patch.object(mcp_tool, "_write_stderr_log_header", lambda *_a, **_k: None), \
-                 patch.object(mcp_tool, "_get_mcp_stderr_log", lambda: None), \
+                 patch.object(mcp_tool, "_get_mcp_stderr_log", lambda **_k: None), \
                  patch("tools.osv_check.check_package_for_malware",
                        lambda *_a, **_k: None):
                 start = time.monotonic()

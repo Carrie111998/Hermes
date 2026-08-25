@@ -72,9 +72,11 @@ def fake_session():
 @pytest.fixture(autouse=True)
 def _clean_trust_state():
     """Isolate the module-level trust metadata between tests."""
-    with patch.dict(mcp_tool._server_trust_levels, {}, clear=True), \
-         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True):
-        yield
+    mcp_tool._server_trust_levels.clear_all()
+    mcp_tool._tool_read_only_hints.clear_all()
+    yield
+    mcp_tool._server_trust_levels.clear_all()
+    mcp_tool._tool_read_only_hints.clear_all()
 
 
 def _set_trust(server: str, trust: str):

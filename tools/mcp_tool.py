@@ -110,7 +110,7 @@ import shutil
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -120,7 +120,12 @@ from urllib.parse import urlparse
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
-from hermes_constants import get_hermes_home_override, hermes_home_key
+from hermes_constants import (
+    get_hermes_home_override,
+    hermes_home_key,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,25 +192,46 @@ _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
 #
 # Fallback is os.devnull if opening the log file fails for any reason.
 
-_mcp_stderr_log_fh: Optional[Any] = None
+_mcp_stderr_log_fhs: Dict[str, Any] = {}
 _mcp_stderr_log_lock = threading.Lock()
+_stdio_spawn_attribution_lock: Optional[asyncio.Lock] = None
+_stdio_spawn_attribution_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
-def _get_mcp_stderr_log() -> Any:
-    """Return a shared append-mode file handle for MCP subprocess stderr.
+def _get_stdio_spawn_attribution_lock() -> asyncio.Lock:
+    """Serialize the SDK spawn/snapshot attribution window on its event loop."""
+    global _stdio_spawn_attribution_lock, _stdio_spawn_attribution_loop
+    loop = asyncio.get_running_loop()
+    if (
+        _stdio_spawn_attribution_lock is None
+        or _stdio_spawn_attribution_loop is not loop
+    ):
+        _stdio_spawn_attribution_lock = asyncio.Lock()
+        _stdio_spawn_attribution_loop = loop
+    return _stdio_spawn_attribution_lock
 
-    Opened once per process and reused for every stdio server.  Must have a
-    real OS-level file descriptor (``fileno()``) because asyncio's subprocess
-    machinery wires the child's stderr directly to that fd.  Falls back to
-    ``/dev/null`` if opening the log file fails.
+
+def _get_mcp_stderr_log(
+    scope: Optional[str] = None,
+    home: Optional[str] = None,
+) -> Any:
+    """Return one profile's append-mode file handle for MCP stderr.
+
+    Opened once per profile and reused by that profile's stdio servers. Must
+    have a real OS-level file descriptor (``fileno()``) because asyncio's
+    subprocess machinery wires the child's stderr directly to that fd. Falls
+    back to ``/dev/null`` if opening the log file fails.
     """
-    global _mcp_stderr_log_fh
+    scope = scope or current_mcp_scope(require=True)
     with _mcp_stderr_log_lock:
-        if _mcp_stderr_log_fh is not None:
-            return _mcp_stderr_log_fh
+        existing = _mcp_stderr_log_fhs.get(scope)
+        if existing is not None:
+            return existing
         try:
+            from pathlib import Path
             from hermes_constants import get_hermes_home
-            log_dir = get_hermes_home() / "logs"
+
+            log_dir = (Path(home) if home else get_hermes_home()) / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / "mcp-stderr.log"
             # Line-buffered so server output lands on disk promptly; errors=
@@ -214,26 +240,49 @@ def _get_mcp_stderr_log() -> Any:
             fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
             # Sanity-check: confirm a real fd is available before we commit.
             fh.fileno()
-            _mcp_stderr_log_fh = fh
         except Exception as exc:  # pragma: no cover — best-effort fallback
             logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)
             try:
-                _mcp_stderr_log_fh = open(os.devnull, "w", encoding="utf-8")
+                fh = open(os.devnull, "w", encoding="utf-8")
             except Exception:
                 # Last resort: the real stderr.  Not ideal for TUI users but
                 # it matches pre-fix behavior.
-                _mcp_stderr_log_fh = sys.stderr
-        return _mcp_stderr_log_fh
+                fh = sys.stderr
+        _mcp_stderr_log_fhs[scope] = fh
+        return fh
 
 
-def _write_stderr_log_header(server_name: str) -> None:
+def _close_mcp_stderr_log(scope: str) -> None:
+    """Close only the stderr handle owned by ``scope``."""
+    with _mcp_stderr_log_lock:
+        fh = _mcp_stderr_log_fhs.pop(scope, None)
+    if fh is not None and fh is not sys.stderr:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+def _close_all_mcp_stderr_logs() -> None:
+    """Close all profile-owned stderr handles during process teardown."""
+    with _mcp_stderr_log_lock:
+        scopes = list(_mcp_stderr_log_fhs)
+    for scope in scopes:
+        _close_mcp_stderr_log(scope)
+
+
+def _write_stderr_log_header(
+    server_name: str,
+    scope: Optional[str] = None,
+    home: Optional[str] = None,
+) -> None:
     """Write a human-readable session marker before launching a server.
 
     Gives operators a way to find each server's output in the shared
     ``mcp-stderr.log`` file without needing per-line prefixes (which would
     require a pipe + reader thread and complicate shutdown).
     """
-    fh = _get_mcp_stderr_log()
+    fh = _get_mcp_stderr_log(scope=scope, home=home)
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fh.write(f"\n===== [{ts}] starting MCP server '{server_name}' =====\n")
@@ -2386,6 +2435,7 @@ class MCPServerTask:
 
     __slots__ = (
         "name", "session", "tool_timeout",
+        "_owner_scope", "_owner_home",
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
         "_tools", "_error", "_config",
         "_sampling", "_elicitation",
@@ -2400,8 +2450,20 @@ class MCPServerTask:
         "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
     )
 
-    def __init__(self, name: str):
+    def __init__(
+        self,
+        name: str,
+        owner_scope: Optional[str] = None,
+        owner_home: Optional[str] = None,
+    ):
         self.name = name
+        if owner_scope:
+            self._owner_scope = owner_scope
+            self._owner_home = owner_home or owner_scope
+        else:
+            default_scope, default_home = current_mcp_owner()
+            self._owner_scope = default_scope
+            self._owner_home = owner_home or default_home
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
@@ -2499,6 +2561,20 @@ class MCPServerTask:
         # back to ``list_tools`` (the pre-ping probe) so we neither spam pings
         # nor reconnect-loop. Reset on each fresh transport connection.
         self._ping_unsupported: bool = False
+
+    @property
+    def owner_scope(self) -> str:
+        """Canonical profile scope that owns this server for its lifetime."""
+        return self._owner_scope
+
+    @property
+    def owner_home(self) -> str:
+        """HERMES_HOME path that owns this server for its lifetime."""
+        return self._owner_home
+
+    def scoped(self):
+        """Pin callbacks, reconnects and recovery to this server's owner."""
+        return _scoped_mcp_runtime(self._owner_scope, self._owner_home)
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -3176,6 +3252,8 @@ class MCPServerTask:
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
+        owner_scope = getattr(self, "_owner_scope", None) or current_mcp_scope()
+        owner_home = getattr(self, "_owner_home", None) or owner_scope
         if config.get("identity_header") is not None:
             # Headers don't exist on stdio transports — warn and ignore so a
             # copy-pasted HTTP config block doesn't silently mislead.
@@ -3259,27 +3337,38 @@ class MCPServerTask:
         if _MCP_LOGGING_CALLBACK_SUPPORTED:
             sampling_kwargs["logging_callback"] = self._make_logging_callback()
 
-        # Reap any orphaned subprocesses from prior failed connection
-        # attempts before spawning a new one.  Without this, each retry in
+        # Reap only orphaned subprocesses owned by this profile before a new
+        # attempt. Without this, each retry in
         # the run() reconnect loop spawns a fresh process pair while the
         # previous failed pair lingers — leading to rapid zombie
-        # accumulation (see #57355, #57228).  The unscoped sweep also
-        # opportunistically reaps orphans left by *other* servers that
-        # never reconnect; per-server filtering via ``server_name`` remains
-        # available for scoped call sites.  Run in a worker thread: the
+        # accumulation (see #57355, #57228). Run in a worker thread: the
         # reaper blocks up to 2s (SIGTERM → wait → SIGKILL) when orphans
         # exist, which would otherwise stall the shared MCP event loop.
-        await asyncio.to_thread(_kill_orphaned_mcp_children)
+        await asyncio.to_thread(
+            _kill_orphaned_mcp_children,
+            scope=owner_scope,
+        )
 
-        # Snapshot child PIDs before spawning so we can track the new one.
-        pids_before = _snapshot_child_pids()
+        # The SDK does not expose the PID. Serialize snapshot/spawn/snapshot
+        # so concurrent profile connections cannot claim one another's child.
+        spawn_lock = _get_stdio_spawn_attribution_lock()
+        await spawn_lock.acquire()
+        spawn_lock_held = True
         new_pids: set = set()
-        # Redirect subprocess stderr into a shared log file so MCP servers
-        # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
-        # the user's TTY and corrupt the TUI.  Preserves debuggability via
-        # ~/.hermes/logs/mcp-stderr.log.
-        _write_stderr_log_header(self.name)
-        _errlog = _get_mcp_stderr_log()
+        try:
+            pids_before = _snapshot_child_pids()
+            # Redirect subprocess stderr into a profile-local log file so MCP
+            # servers do not corrupt the user's TUI.
+            _write_stderr_log_header(
+                self.name, scope=owner_scope, home=owner_home
+            )
+            _errlog = _get_mcp_stderr_log(
+                scope=owner_scope, home=owner_home
+            )
+        except BaseException:
+            spawn_lock.release()
+            spawn_lock_held = False
+            raise
         try:
             async with stdio_client(server_params, errlog=_errlog) as (
                 read_stream,
@@ -3311,7 +3400,10 @@ class MCPServerTask:
                     with _lock:
                         for _pid in new_pids:
                             _stdio_pids[_pid] = self.name
+                            _stdio_pid_scopes[_pid] = owner_scope
                         _stdio_pgids.update(new_pgids)
+                spawn_lock.release()
+                spawn_lock_held = False
                 # Track the spawned children on the connection object for
                 # fast-fail of in-flight calls when the subprocess dies
                 # (#81995).
@@ -3355,6 +3447,8 @@ class MCPServerTask:
                     # consistency with _run_http.
                     return await self._wait_for_lifecycle_event()
         finally:
+            if spawn_lock_held:
+                spawn_lock.release()
             # Runs on clean exit, exceptions, AND asyncio cancellation.
             # If any of the spawned PIDs are still alive, the SDK's
             # teardown failed (common when the task is cancelled mid-way
@@ -3366,6 +3460,7 @@ class MCPServerTask:
                 with _lock:
                     for _pid in new_pids:
                         _stdio_pids.pop(_pid, None)
+                        _stdio_pid_scopes.pop(_pid, None)
                     for pid in new_pids:
                         # ``os.kill(pid, 0)`` is NOT a no-op on Windows
                         # (bpo-14484). Use the cross-platform check.
@@ -3385,6 +3480,7 @@ class MCPServerTask:
                         if pid_alive or pgroup_alive:
                             _orphan_stdio_pids.add(pid)
                             _orphan_stdio_pid_servers[pid] = self.name
+                            _orphan_stdio_pid_scopes[pid] = owner_scope
                         else:
                             # Nothing left to reap — drop the pgid entry so
                             # PID-reuse can't surface stale pgroup state later.
@@ -4473,6 +4569,75 @@ class MCPServerTask:
 _scope_key_cache: Dict[str, str] = {}
 
 
+class MCPScopeError(RuntimeError):
+    """The active MCP profile scope could not be determined safely."""
+
+
+_active_mcp_scope: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "mcp_active_scope", default=None
+)
+
+
+def _multiplex_active() -> bool:
+    """Return whether this process currently serves multiple profiles."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        return bool(is_multiplex_active())
+    except Exception:
+        return False
+
+
+def _explicit_mcp_scope() -> Optional[str]:
+    """Return only a trusted handler/session-established profile scope."""
+    pinned = _active_mcp_scope.get()
+    if pinned:
+        return pinned
+    try:
+        override = get_hermes_home_override()
+    except Exception:
+        return None
+    if not override:
+        return None
+    try:
+        return hermes_home_key(override)
+    except Exception:
+        return str(override)
+
+
+def current_mcp_scope(*, require: bool = False) -> str:
+    """Return the active canonical scope, failing closed under multiplexing."""
+    explicit = _explicit_mcp_scope()
+    if explicit:
+        return explicit
+    if require and _multiplex_active():
+        raise MCPScopeError(
+            "No MCP profile scope is active in a multiplexed process; "
+            "refusing to use the launch profile."
+        )
+    return _mcp_scope_key()
+
+
+@contextmanager
+def _scoped_mcp_runtime(scope: str, home: Optional[str] = None):
+    """Pin MCP state and HERMES_HOME to one immutable owner for a call."""
+    scope_token = _active_mcp_scope.set(scope)
+    home_token = set_hermes_home_override(home) if home else None
+    try:
+        yield
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+        _active_mcp_scope.reset(scope_token)
+
+
+def current_mcp_owner() -> Tuple[str, str]:
+    """Return the canonical scope and home that own a new MCP object."""
+    from hermes_constants import get_hermes_home
+
+    return current_mcp_scope(require=True), str(get_hermes_home())
+
+
 def _mcp_scope_key() -> str:
     """Return the canonical key of the profile that owns MCP state here.
 
@@ -4480,6 +4645,9 @@ def _mcp_scope_key() -> str:
     selected profile reads and writes that profile's MCP state.  Failures fall
     back to a single shared scope, which is exactly the pre-#67605 behavior.
     """
+    pinned = _active_mcp_scope.get()
+    if pinned:
+        return pinned
     try:
         raw = get_hermes_home_override() or os.environ.get("HERMES_HOME", "").strip()
     except Exception:
@@ -5200,6 +5368,27 @@ def _handle_auth_error_and_retry(
     retry_call,
     op_description: str,
 ):
+    """Run OAuth recovery and retry under the server's immutable owner."""
+    if not _is_auth_error(exc):
+        return None
+    with _lock:
+        srv = _servers.get(server_name)
+    if srv is not None and hasattr(srv, "scoped"):
+        with srv.scoped():
+            return _handle_auth_error_and_retry_scoped(
+                server_name, exc, retry_call, op_description
+            )
+    return _handle_auth_error_and_retry_scoped(
+        server_name, exc, retry_call, op_description
+    )
+
+
+def _handle_auth_error_and_retry_scoped(
+    server_name: str,
+    exc: BaseException,
+    retry_call,
+    op_description: str,
+):
     """Attempt auth recovery and one retry; return None to fall through.
 
     Called by the 5 MCP tool handlers when ``session.<op>()`` raises an
@@ -5401,6 +5590,27 @@ def _is_session_expired_error(exc: BaseException) -> bool:
 
 
 def _handle_session_expired_and_retry(
+    server_name: str,
+    exc: BaseException,
+    retry_call,
+    op_description: str,
+):
+    """Run reconnect and retry under the server's immutable owner."""
+    if not _is_session_expired_error(exc):
+        return None
+    with _lock:
+        srv = _servers.get(server_name)
+    if srv is not None and hasattr(srv, "scoped"):
+        with srv.scoped():
+            return _handle_session_expired_and_retry_scoped(
+                server_name, exc, retry_call, op_description
+            )
+    return _handle_session_expired_and_retry_scoped(
+        server_name, exc, retry_call, op_description
+    )
+
+
+def _handle_session_expired_and_retry_scoped(
     server_name: str,
     exc: BaseException,
     retry_call,
@@ -5625,6 +5835,7 @@ def _try_acquire_mcp_discovery_lock() -> Any:
 # fails or times out.  PIDs are added after connection and removed on
 # normal server shutdown.
 _stdio_pids: Dict[int, str] = {}  # pid -> server_name
+_stdio_pid_scopes: Dict[int, str] = {}  # pid -> immutable profile scope
 
 # PIDs that survived their session context exit (SDK teardown failed to
 # terminate them).  These are detected in _run_stdio's finally block and
@@ -5633,6 +5844,7 @@ _stdio_pids: Dict[int, str] = {}  # pid -> server_name
 # sessions (e.g. concurrent cron jobs or live user chats).
 _orphan_stdio_pids: set = set()
 _orphan_stdio_pid_servers: Dict[int, str] = {}
+_orphan_stdio_pid_scopes: Dict[int, str] = {}
 
 # Process-group IDs of stdio MCP subprocesses, captured at spawn time.
 # The MCP SDK spawns stdio children with ``start_new_session=True`` so each
@@ -6280,6 +6492,65 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+def _resolve_handler_owner(
+    owner_scope: Optional[str], owner_home: Optional[str]
+) -> Tuple[str, str]:
+    """Resolve immutable handler ownership at registration time."""
+    if owner_scope:
+        return owner_scope, owner_home or owner_scope
+    return current_mcp_owner()
+
+
+def _scope_guard(server_name: str, owner_scope: str) -> Optional[str]:
+    """Reject missing or mismatched explicit scope before any MCP work."""
+    if not _multiplex_active():
+        return None
+    active = _explicit_mcp_scope()
+    if active is None:
+        logger.error(
+            "MCP server '%s': refusing unscoped multiplexed call (owner=%s)",
+            server_name,
+            owner_scope,
+        )
+        return tool_error(
+            f"MCP server '{server_name}' is unavailable because this request "
+            "has no active profile scope.",
+            error_type="mcp_profile_scope",
+            server=server_name,
+        )
+    if active != owner_scope:
+        logger.error(
+            "MCP server '%s': refusing cross-profile call (active=%s, owner=%s)",
+            server_name,
+            active,
+            owner_scope,
+        )
+        return tool_error(
+            f"MCP server '{server_name}' belongs to a different profile.",
+            error_type="mcp_profile_scope",
+            server=server_name,
+        )
+    return None
+
+
+def _scope_bound_handler(
+    server_name: str,
+    owner_scope: str,
+    owner_home: str,
+    impl: Callable,
+) -> Callable:
+    """Run a handler only for, and always inside, its immutable owner."""
+
+    def _handler(args: dict, **kwargs):
+        guard = _scope_guard(server_name, owner_scope)
+        if guard is not None:
+            return guard
+        with _scoped_mcp_runtime(owner_scope, owner_home):
+            return impl(args, **kwargs)
+
+    return _handler
+
+
 @asynccontextmanager
 async def _track_inflight_rpc(server: Any, server_name: str, op: str):
     """Register the running RPC on the server so teardown can fail it fast.
@@ -6338,12 +6609,20 @@ def _ensure_healthy_or_recycle(server: Any, server_name: str) -> None:
         _signal_reconnect(server)
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    owner_scope: Optional[str] = None,
+    owner_home: Optional[str] = None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
     ``handler(args_dict, **kwargs) -> str``
     """
+
+    owner_scope, owner_home = _resolve_handler_owner(owner_scope, owner_home)
 
     def _handler(args: dict, **kwargs) -> str:
         # Trust-tier gate (security boundary): write-capable tools on
@@ -6665,11 +6944,18 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
             ))
 
-    return _handler
+    return _scope_bound_handler(server_name, owner_scope, owner_home, _handler)
 
 
-def _make_list_resources_handler(server_name: str, tool_timeout: float):
+def _make_list_resources_handler(
+    server_name: str,
+    tool_timeout: float,
+    owner_scope: Optional[str] = None,
+    owner_home: Optional[str] = None,
+):
     """Return a sync handler that lists resources from an MCP server."""
+
+    owner_scope, owner_home = _resolve_handler_owner(owner_scope, owner_home)
 
     def _handler(args: dict, **kwargs) -> str:
         server = _get_connected_server_for_call(server_name)
@@ -6724,11 +7010,18 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
             ))
 
-    return _handler
+    return _scope_bound_handler(server_name, owner_scope, owner_home, _handler)
 
 
-def _make_read_resource_handler(server_name: str, tool_timeout: float):
+def _make_read_resource_handler(
+    server_name: str,
+    tool_timeout: float,
+    owner_scope: Optional[str] = None,
+    owner_home: Optional[str] = None,
+):
     """Return a sync handler that reads a resource by URI from an MCP server."""
+
+    owner_scope, owner_home = _resolve_handler_owner(owner_scope, owner_home)
 
     def _handler(args: dict, **kwargs) -> str:
         server = _get_connected_server_for_call(server_name)
@@ -6785,11 +7078,18 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
             ))
 
-    return _handler
+    return _scope_bound_handler(server_name, owner_scope, owner_home, _handler)
 
 
-def _make_list_prompts_handler(server_name: str, tool_timeout: float):
+def _make_list_prompts_handler(
+    server_name: str,
+    tool_timeout: float,
+    owner_scope: Optional[str] = None,
+    owner_home: Optional[str] = None,
+):
     """Return a sync handler that lists prompts from an MCP server."""
+
+    owner_scope, owner_home = _resolve_handler_owner(owner_scope, owner_home)
 
     def _handler(args: dict, **kwargs) -> str:
         server = _get_connected_server_for_call(server_name)
@@ -6846,11 +7146,18 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
             ))
 
-    return _handler
+    return _scope_bound_handler(server_name, owner_scope, owner_home, _handler)
 
 
-def _make_get_prompt_handler(server_name: str, tool_timeout: float):
+def _make_get_prompt_handler(
+    server_name: str,
+    tool_timeout: float,
+    owner_scope: Optional[str] = None,
+    owner_home: Optional[str] = None,
+):
     """Return a sync handler that gets a prompt by name from an MCP server."""
+
+    owner_scope, owner_home = _resolve_handler_owner(owner_scope, owner_home)
 
     def _handler(args: dict, **kwargs) -> str:
         server = _get_connected_server_for_call(server_name)
@@ -6911,7 +7218,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
             ))
 
-    return _handler
+    return _scope_bound_handler(server_name, owner_scope, owner_home, _handler)
 
 
 def _make_check_fn(server_name: str):
@@ -7430,7 +7737,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     # Resolve once and remember it on the server: deregistration runs later
     # (shutdown, reconnect, list_changed) and must target the same overlay
     # this registration wrote to, whatever profile context it runs under.
-    registry_scope = _mcp_registry_scope()
+    owner_scope = server.owner_scope
+    owner_home = server.owner_home
+    registry_scope = owner_scope or None
     server._registered_scope = registry_scope
 
     # Selective tool loading: honour include/exclude lists from config.
@@ -7485,7 +7794,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    owner_scope=owner_scope,
+                    owner_home=owner_home,
                 ),
                 "check_fn": check_fn,
             }
@@ -7508,7 +7821,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"generated utility {handler_key!r}",
                 "schema": schema,
                 "handler": handler_factories[handler_key](
-                    name, server.tool_timeout
+                    name,
+                    server.tool_timeout,
+                    owner_scope=owner_scope,
+                    owner_home=owner_home,
                 ),
                 "check_fn": check_fn,
             }
@@ -7747,7 +8063,8 @@ def _register_from_cache_sync_locked(
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
-    registry_scope = _mcp_registry_scope()
+    owner_scope, owner_home = current_mcp_owner()
+    registry_scope = owner_scope or None
     fingerprint = config_fingerprint(config)
     tool_timeout = _resolve_tool_timeout(config)
     tools_filter = config.get("tools") or {}
@@ -7815,7 +8132,13 @@ def _register_from_cache_sync_locked(
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                raw_name,
+                tool_timeout,
+                owner_scope=owner_scope,
+                owner_home=owner_home,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
@@ -7849,7 +8172,12 @@ def _register_from_cache_sync_locked(
             name=util_name,
             toolset=toolset_name,
             schema=schema,
-            handler=handler_factories[handler_key](name, tool_timeout),
+            handler=handler_factories[handler_key](
+                name,
+                tool_timeout,
+                owner_scope=owner_scope,
+                owner_home=owner_home,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
@@ -8754,6 +9082,7 @@ def shutdown_mcp_servers():
             _server_connect_retry_after.clear_all()
             _server_connect_failures.clear_all()
         _stop_mcp_loop()
+        _close_all_mcp_stderr_logs()
         return
 
     async def _shutdown():
@@ -8798,6 +9127,7 @@ def shutdown_mcp_servers():
         _server_connect_failures.clear_all()
 
     _stop_mcp_loop()
+    _close_all_mcp_stderr_logs()
 
 
 def shutdown_current_profile_mcp_servers() -> None:
@@ -8884,6 +9214,11 @@ def _shutdown_current_profile_mcp_servers_locked(scope: str) -> None:
                 exc,
             )
 
+    # Reap only children owned by this profile. Sibling profile transports
+    # remain live on the shared MCP event loop.
+    _kill_orphaned_mcp_children(include_active=True, scope=scope)
+    _close_mcp_stderr_log(scope)
+
     # Lazy schema-cache registrations have no MCPServerTask to clean them up.
     if registered_names:
         from tools.registry import registry
@@ -8919,6 +9254,7 @@ def _shutdown_current_profile_mcp_servers_locked(scope: str) -> None:
 def _kill_orphaned_mcp_children(
     include_active: bool = False,
     server_name: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> None:
     """Best-effort graceful shutdown of stdio MCP subprocesses to reap orphans.
 
@@ -8954,10 +9290,13 @@ def _kill_orphaned_mcp_children(
             owner = _orphan_stdio_pid_servers.get(opid, "orphan")
             if server_name is not None and owner != server_name:
                 continue
+            if scope is not None and _orphan_stdio_pid_scopes.get(opid) != scope:
+                continue
             pids[opid] = owner
         for opid in pids:
             _orphan_stdio_pids.discard(opid)
             _orphan_stdio_pid_servers.pop(opid, None)
+            _orphan_stdio_pid_scopes.pop(opid, None)
         if include_active:
             active = dict(_stdio_pids)
             if server_name is not None:
@@ -8966,9 +9305,16 @@ def _kill_orphaned_mcp_children(
                     for pid, owner in active.items()
                     if owner == server_name
                 }
+            if scope is not None:
+                active = {
+                    pid: owner
+                    for pid, owner in active.items()
+                    if _stdio_pid_scopes.get(pid) == scope
+                }
             pids.update(active)
             for pid in active:
                 _stdio_pids.pop(pid, None)
+                _stdio_pid_scopes.pop(pid, None)
         # Snapshot pgids for the pids we're about to kill, then drop the
         # entries so a future spawn can't collide with stale state.
         pgids: Dict[int, int] = {pid: _stdio_pgids[pid] for pid in pids if pid in _stdio_pgids}

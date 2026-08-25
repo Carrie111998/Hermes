@@ -16,7 +16,10 @@ These tests pin the contract in both directions:
 """
 
 import asyncio
+import json
 import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -86,6 +89,16 @@ def _clean_mcp_state():
             container._by_scope.clear()
         mcp._profile_lifecycle_generations.clear()
         mcp._profile_lifecycle_locks.clear()
+        mcp._stdio_pids.clear()
+        mcp._stdio_pid_scopes.clear()
+        mcp._orphan_stdio_pids.clear()
+        mcp._orphan_stdio_pid_servers.clear()
+        mcp._orphan_stdio_pid_scopes.clear()
+        mcp._stdio_pgids.clear()
+        mcp._close_all_mcp_stderr_logs()
+        from agent.secret_scope import set_multiplex_active
+
+        set_multiplex_active(False)
 
     _wipe()
     yield
@@ -110,6 +123,204 @@ def _fake_server(name):
 # ---------------------------------------------------------------------------
 # Multi-profile: the limitation this change closes
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("caller", ["missing", "other"])
+@pytest.mark.parametrize(
+    "factory_name",
+    [
+        "_make_tool_handler",
+        "_make_list_resources_handler",
+        "_make_read_resource_handler",
+        "_make_list_prompts_handler",
+        "_make_get_prompt_handler",
+    ],
+)
+def test_bound_handler_rejects_untrusted_scope_before_transport(
+    profiles, monkeypatch, caller, factory_name
+):
+    """Every handler family rejects bad scope before lazy spawn/transport."""
+    from agent.secret_scope import set_multiplex_active
+
+    home_a, home_b = profiles
+    scope_b = hermes_home_key(home_b)
+    transport_calls = []
+
+    factory = getattr(mcp, factory_name)
+    positional = ("github", "whoami", 10) if factory_name == "_make_tool_handler" else ("github", 10)
+    handler = factory(
+        *positional,
+        owner_scope=scope_b,
+        owner_home=str(home_b),
+    )
+    monkeypatch.setattr(
+        mcp,
+        "_get_connected_server_for_call",
+        lambda name: transport_calls.append(name),
+    )
+
+    set_multiplex_active(True)
+    if caller == "missing":
+        raw = handler({})
+    else:
+        # Reuse profile B's handler while profile A is active.
+        with _scoped_to(home_a):
+            raw = handler({})
+
+    assert json.loads(raw)["error_type"] == "mcp_profile_scope"
+    assert transport_calls == []
+
+
+def test_server_accepts_complete_explicit_owner_without_ambient_scope(profiles):
+    """Explicit immutable ownership does not consult the launch profile."""
+    from agent.secret_scope import set_multiplex_active
+
+    _, home_b = profiles
+    scope_b = hermes_home_key(home_b)
+    set_multiplex_active(True)
+
+    server = mcp.MCPServerTask(
+        "github", owner_scope=scope_b, owner_home=str(home_b)
+    )
+
+    assert server.owner_scope == scope_b
+    assert server.owner_home == str(home_b)
+
+
+def test_concurrent_profile_stdio_spawns_claim_only_their_child(
+    profiles, monkeypatch
+):
+    """The snapshot attribution window is serialized across profiles."""
+    home_a, home_b = profiles
+    children = set()
+    a_spawned = asyncio.Event()
+    release_a = asyncio.Event()
+
+    @asynccontextmanager
+    async def fake_stdio(params, errlog):
+        del errlog
+        pid = 101 if params.command == "server-a" else 202
+        children.add(pid)
+        if pid == 101:
+            a_spawned.set()
+            await release_a.wait()
+        try:
+            yield object(), object()
+        finally:
+            children.discard(pid)
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def ready(*args, **kwargs):
+        return SimpleNamespace()
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mcp, "_ensure_mcp_sdk", lambda: True)
+    monkeypatch.setattr(
+        "tools.osv_check.check_package_for_malware", lambda *_args: None
+    )
+    monkeypatch.setattr(mcp, "_build_safe_env", lambda _env: {})
+    monkeypatch.setattr(mcp, "_resolve_stdio_command", lambda c, e: (c, e))
+    monkeypatch.setattr(mcp, "_wrap_command_with_watchdog", lambda c, a: (c, a))
+    monkeypatch.setattr(
+        mcp,
+        "StdioServerParameters",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(mcp, "stdio_client", fake_stdio)
+    monkeypatch.setattr(mcp, "ClientSession", FakeClientSession)
+    monkeypatch.setattr(mcp, "_snapshot_child_pids", lambda: set(children))
+    monkeypatch.setattr(mcp, "_filter_mcp_children", lambda pids: pids)
+    monkeypatch.setattr(mcp.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(mcp, "_kill_orphaned_mcp_children", lambda **_kw: None)
+    monkeypatch.setattr(mcp, "_write_stderr_log_header", lambda *_a, **_k: None)
+    monkeypatch.setattr(mcp, "_get_mcp_stderr_log", lambda *_a, **_k: object())
+    monkeypatch.setattr(mcp.MCPServerTask, "_negotiate_session", ready)
+    monkeypatch.setattr(mcp.MCPServerTask, "_discover_tools", noop)
+    monkeypatch.setattr(mcp.MCPServerTask, "_wait_for_lifecycle_event", noop)
+
+    async def scenario():
+        with _scoped_to(home_a):
+            server_a = mcp.MCPServerTask("same-name")
+        with _scoped_to(home_b):
+            server_b = mcp.MCPServerTask("same-name")
+
+        first = asyncio.create_task(server_a._run_stdio({"command": "server-a"}))
+        await a_spawned.wait()
+        second = asyncio.create_task(server_b._run_stdio({"command": "server-b"}))
+        await asyncio.sleep(0)
+        release_a.set()
+        await asyncio.gather(first, second)
+
+        assert server_a._stdio_child_pids == {101}
+        assert server_b._stdio_child_pids == {202}
+
+    asyncio.run(scenario())
+
+
+def test_stdio_stderr_handles_are_profile_local(profiles):
+    """Two profile homes never share the first-opened stderr descriptor."""
+    home_a, home_b = profiles
+    scope_a = hermes_home_key(home_a)
+    scope_b = hermes_home_key(home_b)
+
+    with _scoped_to(home_a):
+        fh_a = mcp._get_mcp_stderr_log()
+    with _scoped_to(home_b):
+        fh_b = mcp._get_mcp_stderr_log()
+
+    assert fh_a is not fh_b
+    assert Path(fh_a.name) == home_a / "logs" / "mcp-stderr.log"
+    assert Path(fh_b.name) == home_b / "logs" / "mcp-stderr.log"
+    assert mcp._mcp_stderr_log_fhs[scope_a] is fh_a
+    assert mcp._mcp_stderr_log_fhs[scope_b] is fh_b
+
+    mcp._close_mcp_stderr_log(scope_a)
+    assert fh_a.closed
+    assert not fh_b.closed
+    assert scope_a not in mcp._mcp_stderr_log_fhs
+    assert mcp._mcp_stderr_log_fhs[scope_b] is fh_b
+
+    mcp._close_all_mcp_stderr_logs()
+    assert fh_b.closed
+
+
+def test_profile_pid_reap_preserves_sibling_profile(profiles, monkeypatch):
+    """A profile reload filters active and orphan PID cleanup by owner."""
+    home_a, home_b = profiles
+    scope_a = hermes_home_key(home_a)
+    scope_b = hermes_home_key(home_b)
+
+    with mcp._lock:
+        mcp._stdio_pids.update({101: "shared", 202: "shared"})
+        mcp._stdio_pid_scopes.update({101: scope_a, 202: scope_b})
+        mcp._orphan_stdio_pids.update({303, 404})
+        mcp._orphan_stdio_pid_servers.update({303: "shared", 404: "shared"})
+        mcp._orphan_stdio_pid_scopes.update({303: scope_a, 404: scope_b})
+
+    monkeypatch.setattr(mcp.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(mcp.os, "kill", lambda *_args: None)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    mcp._kill_orphaned_mcp_children(include_active=True, scope=scope_a)
+
+    with mcp._lock:
+        assert 101 not in mcp._stdio_pids
+        assert 303 not in mcp._orphan_stdio_pids
+        assert mcp._stdio_pids == {202: "shared"}
+        assert mcp._stdio_pid_scopes == {202: scope_b}
+        assert mcp._orphan_stdio_pids == {404}
+        assert mcp._orphan_stdio_pid_scopes == {404: scope_b}
 
 
 def test_server_state_does_not_leak_between_profiles(profiles):

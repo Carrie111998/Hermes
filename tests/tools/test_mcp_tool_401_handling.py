@@ -16,6 +16,18 @@ import pytest
 pytest.importorskip("mcp.client.auth.oauth2")
 
 
+@pytest.fixture(autouse=True)
+def _clean_profile_scoped_trust_state():
+    """Other profile buckets must not affect these auth-path unit tests."""
+    from tools import mcp_tool
+
+    mcp_tool._server_trust_levels.clear_all()
+    mcp_tool._tool_read_only_hints.clear_all()
+    yield
+    mcp_tool._server_trust_levels.clear_all()
+    mcp_tool._tool_read_only_hints.clear_all()
+
+
 def test_is_auth_error_detects_oauth_flow_error():
     from tools.mcp_tool import _is_auth_error
     from mcp.client.auth import OAuthFlowError

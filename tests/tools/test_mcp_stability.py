@@ -72,6 +72,8 @@ class TestStdioPidTracking:
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pid_servers,
+            _orphan_stdio_pid_scopes,
+            _mcp_scope_key,
             _orphan_stdio_pids,
             _lock,
         )
@@ -80,6 +82,7 @@ class TestStdioPidTracking:
         fake_pid = 999999999
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_scopes[fake_pid] = _mcp_scope_key()
             _orphan_stdio_pid_servers[fake_pid] = "orphan"
 
         # Should not raise (ProcessLookupError is caught)
@@ -95,6 +98,8 @@ class TestStdioPidTracking:
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pids,
+            _orphan_stdio_pid_scopes,
+            _mcp_scope_key,
             _stdio_pids,
             _stdio_pgids,
             _lock,
@@ -106,6 +111,7 @@ class TestStdioPidTracking:
         fake_pid = 999999997
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_scopes[fake_pid] = _mcp_scope_key()
 
         server = MCPServerTask.__new__(MCPServerTask)
         server.name = "test-zombie-reap"
