@@ -204,6 +204,24 @@ def test_hydration_reremember_refreshes_recency_and_overwrites():
     assert adapter._lookup_outbound_snippet("2") is None
 
 
+def test_hydration_lookup_key_symmetric_with_remember():
+    # _remember normalizes Message-like objects via .id extraction; lookup
+    # MUST normalize identically or an object passed to lookup becomes
+    # "namespace(id=...)" and silently misses. All three key shapes must
+    # resolve to the SAME slot regardless of which shape was remembered.
+    adapter = _make_adapter()
+    adapter._remember_outbound_snippet(SimpleNamespace(id=123), "t")
+    assert adapter._lookup_outbound_snippet(SimpleNamespace(id=123)) == "t"
+    assert adapter._lookup_outbound_snippet(123) == "t"
+    assert adapter._lookup_outbound_snippet("123") == "t"
+
+    # Reverse direction: remembered as str/int, looked up as object.
+    adapter._remember_outbound_snippet("456", "s")
+    assert adapter._lookup_outbound_snippet(SimpleNamespace(id=456)) == "s"
+    adapter._remember_outbound_snippet(789, "i")
+    assert adapter._lookup_outbound_snippet(SimpleNamespace(id=789)) == "i"
+
+
 # ===========================================================================
 # Task 4: raw reaction listener + gate chain + synthesis (canonical order)
 #

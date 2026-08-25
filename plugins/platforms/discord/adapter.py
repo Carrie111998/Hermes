@@ -3421,8 +3421,12 @@ class DiscordAdapter(BasePlatformAdapter):
             self._reaction_targets.popitem(last=False)
 
     def _lookup_outbound_snippet(self, message_id: Any) -> Optional[str]:
+        # Key normalization MUST mirror _remember_outbound_snippet exactly:
+        # extract .id from Message-like objects, else stringify — otherwise an
+        # object passed to lookup becomes "namespace(id=...)" and misses.
+        mid = str(getattr(message_id, "id", message_id) or "").strip()
         targets = getattr(self, "_reaction_targets", None) or {}
-        return targets.get(str(message_id))
+        return targets.get(mid)
 
     async def _handle_reaction_payload(self, payload, *, added: bool) -> None:
         """Raw-reaction gate chain -> optional synthesized MessageEvent.
