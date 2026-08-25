@@ -54,6 +54,7 @@ import {
   PluginSlot,
   useConfigSectionIcons,
   useConfigSectionNames,
+  useConfigSectionOptionCounts,
 } from "@/plugins";
 
 /* ------------------------------------------------------------------ */
@@ -132,6 +133,7 @@ export default function ConfigPage() {
   const { setEnd } = usePageHeader();
   const pluginConfigSections = useConfigSectionNames();
   const pluginConfigSectionIcons = useConfigSectionIcons();
+  const pluginConfigSectionOptionCounts = useConfigSectionOptionCounts();
 
   useLayoutEffect(() => {
     if (!config || !schema) {
@@ -250,9 +252,12 @@ export default function ConfigPage() {
       const cat = String(s.category ?? "general");
       counts[cat] = (counts[cat] || 0) + 1;
     }
-    for (const cat of pluginConfigSections) counts[cat] = 1;
+    for (const cat of pluginConfigSections) {
+      const optionCount = pluginConfigSectionOptionCounts[cat];
+      if (optionCount !== undefined) counts[cat] = optionCount;
+    }
     return counts;
-  }, [schema, pluginConfigSections]);
+  }, [schema, pluginConfigSections, pluginConfigSectionOptionCounts]);
 
   /* ---- Search ---- */
   const isSearching = searchQuery.trim().length > 0;
@@ -603,7 +608,7 @@ export default function ConfigPage() {
                               : "text-text-tertiary"
                           }`}
                         >
-                          {categoryCounts[cat] || 0}
+                          {categoryCounts[cat] ?? ""}
                         </span>
                       </ListItem>
                     );
