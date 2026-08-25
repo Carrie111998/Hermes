@@ -54,6 +54,7 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
+from agent.context_compressor import awaiting_post_compression_usage
 from agent.interrupt_compat import request_hard_interrupt
 
 # prompt_toolkit for fixed input area TUI
@@ -6422,6 +6423,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             snapshot["context_length"] = context_length or None
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
             if context_length:
+                # Bridge the one transitional turn between a compaction and
+                # the next provider-reported usage: the -1 sentinel clamps to 0
+                # above, which rendered a hard "0 / 0%" — as if the context had
+                # been emptied rather than summarised. See
+                # awaiting_post_compression_usage() for why both compressor
+                # fields have to be consulted.
+                if not context_tokens and awaiting_post_compression_usage(compressor):
+                    context_tokens = compressor.last_compression_rough_tokens
+                    snapshot["context_tokens"] = context_tokens
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
         return snapshot

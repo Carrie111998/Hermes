@@ -48,6 +48,33 @@ from tools.todo_tool import TODO_INJECTION_HEADER
 logger = logging.getLogger(__name__)
 
 
+def awaiting_post_compression_usage(compressor: Any) -> bool:
+    """True while a compaction's rough estimate is the best context signal.
+
+    After a successful compaction ``conversation_compression.py`` parks
+    ``last_prompt_tokens`` at the -1 sentinel and records
+    ``last_compression_rough_tokens``; ``update_from_response()`` then clears
+    ``awaiting_real_usage_after_compression`` as soon as the provider reports
+    real usage for the now-shorter conversation. In between, the rough estimate
+    is the only occupancy figure available, and status surfaces should show it
+    rather than a hard zero (or nothing at all).
+
+    BOTH fields must be checked. ``last_compression_rough_tokens`` is never
+    zeroed, so on its own it stays truthy for the rest of the session and would
+    resurrect a stale, many-turns-old value on any later turn that happened to
+    report ``prompt_tokens=0`` — common behind OpenAI-compatible proxies whose
+    streams omit usage.
+
+    Duck-typed on purpose (plain ``getattr`` with defaults) so status-bar call
+    sites can pass any compressor-shaped object, including the lightweight
+    stand-ins used in tests and by external context engines.
+    """
+    return bool(
+        getattr(compressor, "awaiting_real_usage_after_compression", False)
+        and (getattr(compressor, "last_compression_rough_tokens", 0) or 0) > 0
+    )
+
+
 def _safe_int(value: Any) -> int | None:
     """Best-effort integer coercion for telemetry fields."""
     try:
