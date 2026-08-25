@@ -3826,89 +3826,6 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             elif isinstance(tc, dict):
                 tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
 
-    # --- Enforce positional tool_call <-> tool-result pairing ---
-    # Strict OpenAI-compatible providers require every assistant tool_calls
-    # message to be immediately followed by a contiguous run of tool results
-    # covering every declared call. A global id-presence check is insufficient:
-    # compaction or replay can repeat a call id whose only result is historical,
-    # so that old result masks a positionally unanswered replay (#94704).
-    #
-    # Walk one assistant/result transaction at a time. Match through the shared
-    # variant helpers so ``id``, ``call_id``, ``response_item_id`` and composite
-    # bridge spellings remain equivalent (#55626, #63000, #93251).
-    paired: List[Dict[str, Any]] = []
-    removed_positional_orphans = 0
-    added_positional_stubs = 0
-    index = 0
-    while index < len(messages):
-        msg = messages[index]
-        if msg.get("role") != "assistant":
-            if msg.get("role") == "tool" and tool_result_id_variants(
-                msg.get("tool_call_id")
-            ):
-                removed_positional_orphans += 1
-            else:
-                paired.append(msg)
-            index += 1
-            continue
-
-        paired.append(msg)
-        calls = [
-            (tc, tool_call_id_variants(tc))
-            for tc in msg.get("tool_calls") or []
-        ]
-        matched_calls: set[int] = set()
-        cursor = index + 1
-        while cursor < len(messages) and messages[cursor].get("role") == "tool":
-            result = messages[cursor]
-            result_variants = tool_result_id_variants(result.get("tool_call_id"))
-            if not result_variants:
-                # Preserve legacy/provider-specific tool rows with no usable id;
-                # the existing sanitizer deliberately treated these as opaque.
-                paired.append(result)
-            else:
-                candidates = [
-                    call_index
-                    for call_index, (_, call_variants) in enumerate(calls)
-                    if call_index not in matched_calls
-                    and call_variants
-                    and call_variants & result_variants
-                ]
-                if candidates:
-                    matched_calls.add(candidates[0])
-                    paired.append(result)
-                else:
-                    removed_positional_orphans += 1
-            cursor += 1
-
-        for call_index, (tc, variants) in enumerate(calls):
-            if call_index in matched_calls or not variants:
-                continue
-            cid = coalesce_tool_call_id(tc) or sorted(variants)[0]
-            paired.append({
-                "role": "tool",
-                "name": _ra().AIAgent._get_tool_call_name_static(tc),
-                "content": "[Result unavailable — see context summary above]",
-                "tool_call_id": cid,
-            })
-            added_positional_stubs += 1
-
-        index = cursor
-
-    if removed_positional_orphans or added_positional_stubs:
-        messages = paired
-    if removed_positional_orphans:
-        _ra().logger.debug(
-            "Pre-call sanitizer: removed %d positionally orphaned tool result(s)",
-            removed_positional_orphans,
-        )
-    if added_positional_stubs:
-        _ra().logger.debug(
-            "Pre-call sanitizer: added %d stub result(s) for positionally "
-            "unanswered tool call(s)",
-            added_positional_stubs,
-        )
-
     # 3. Deduplicate tool_call_ids. Strict providers (DeepSeek) reject a
     # payload where the same tool_call_id appears more than once with HTTP 400
     # "Duplicate value for 'tool_call_id'" (#58327). Duplicates can arise from
@@ -3966,6 +3883,12 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 msg = {**msg, "tool_calls": kept_tcs}
             elif len(kept_tcs) != len(msg.get("tool_calls") or []):
                 msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+                if not _msg_has_payload(msg):
+                    # Dedup runs after the early empty-message healer. If it
+                    # removes the only payload from a replayed assistant turn,
+                    # do not create a new empty non-final message that strict
+                    # providers reject.
+                    continue
             deduped.append(msg)
         elif role == "tool":
             result_variants = tool_result_id_variants(msg.get("tool_call_id"))
@@ -3998,6 +3921,114 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         _ra().logger.debug(
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
+        )
+
+    # --- Enforce positional tool_call <-> tool-result pairing ---
+    # Run this AFTER duplicate-call cleanup so a synthetic stub cannot make an
+    # outstanding duplicate look like a completed round. Strict providers
+    # require every assistant tool_calls message to be immediately followed by
+    # a contiguous run of tool results covering every declared call. A global
+    # id-presence check is insufficient: compaction/replay can repeat a call id
+    # whose only result is historical, masking a positionally unanswered replay
+    # (#94704; salvaged from #84481).
+    paired: List[Dict[str, Any]] = []
+    removed_positional_orphans = 0
+    added_positional_stubs = 0
+    index = 0
+    while index < len(messages):
+        msg = messages[index]
+        if msg.get("role") != "assistant":
+            if msg.get("role") == "tool" and tool_result_id_variants(
+                msg.get("tool_call_id")
+            ):
+                removed_positional_orphans += 1
+            else:
+                paired.append(msg)
+            index += 1
+            continue
+
+        # Canonicalise the whole assistant/tool segment up to the next user or
+        # system boundary. Compaction/replay can interleave declarations and
+        # results (A1, result(A1), A2, result(A1), result(A2)); a one-message
+        # lookahead loses real output in that shape. Assign each result to the
+        # nearest preceding assistant with an unmatched alias-equivalent call,
+        # then emit every assistant followed by its own contiguous result run.
+        batches: List[Dict[str, Any]] = []
+        cursor = index
+        while cursor < len(messages) and messages[cursor].get("role") in {
+            "assistant", "tool",
+        }:
+            current = messages[cursor]
+            if current.get("role") == "assistant":
+                batches.append({
+                    "message": current,
+                    "calls": [
+                        (tc, tool_call_id_variants(tc))
+                        for tc in current.get("tool_calls") or []
+                    ],
+                    "matched": set(),
+                    "results": [],
+                })
+                cursor += 1
+                continue
+
+            result_variants = tool_result_id_variants(current.get("tool_call_id"))
+            if not result_variants:
+                # Preserve legacy/provider-specific tool rows with no usable id;
+                # the pre-existing sanitizer deliberately treated these as opaque.
+                batches[-1]["results"].append(current)
+                cursor += 1
+                continue
+
+            owner = None
+            owner_call_index = None
+            for batch in reversed(batches):
+                for call_index, (_, call_variants) in enumerate(batch["calls"]):
+                    if (
+                        call_index not in batch["matched"]
+                        and call_variants
+                        and call_variants & result_variants
+                    ):
+                        owner = batch
+                        owner_call_index = call_index
+                        break
+                if owner is not None:
+                    break
+            if owner is None:
+                removed_positional_orphans += 1
+            else:
+                owner["matched"].add(owner_call_index)
+                owner["results"].append(current)
+            cursor += 1
+
+        for batch in batches:
+            paired.append(batch["message"])
+            paired.extend(batch["results"])
+            for call_index, (tc, variants) in enumerate(batch["calls"]):
+                if call_index in batch["matched"] or not variants:
+                    continue
+                cid = coalesce_tool_call_id(tc) or sorted(variants)[0]
+                paired.append({
+                    "role": "tool",
+                    "name": _ra().AIAgent._get_tool_call_name_static(tc),
+                    "content": "[Result unavailable — see context summary above]",
+                    "tool_call_id": cid,
+                })
+                added_positional_stubs += 1
+
+        index = cursor
+
+    messages = paired
+    if removed_positional_orphans:
+        _ra().logger.debug(
+            "Pre-call sanitizer: removed %d positionally orphaned tool result(s)",
+            removed_positional_orphans,
+        )
+    if added_positional_stubs:
+        _ra().logger.debug(
+            "Pre-call sanitizer: added %d stub result(s) for positionally "
+            "unanswered tool call(s)",
+            added_positional_stubs,
         )
     return messages
 

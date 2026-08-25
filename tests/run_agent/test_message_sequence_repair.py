@@ -761,6 +761,169 @@ def test_sanitize_dedup_drops_tool_calls_key_when_all_removed():
     assert "tool_calls" not in assistant2
     # Content should be preserved
     assert assistant2["content"] == "retrying"
+    assert [m["content"] for m in out if m.get("role") == "tool"] == ["result 1"]
+    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
+
+
+def test_sanitize_preserves_real_result_across_mid_run_splitter():
+    """A call-free assistant inside a parallel result run must not lose output."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "run both"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "one", "arguments": "{}"}},
+            {"id": "c2", "type": "function",
+             "function": {"name": "two", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "REAL r1"},
+        {"role": "assistant", "content": "interim commentary"},
+        {"role": "tool", "tool_call_id": "c2", "content": "REAL r2"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    assert [m["role"] for m in out] == [
+        "user", "assistant", "tool", "tool", "assistant",
+    ]
+    assert [m["content"] for m in out if m.get("role") == "tool"] == [
+        "REAL r1", "REAL r2",
+    ]
+
+
+def test_sanitize_preserves_codex_carrier_while_repairing_result_run():
+    """Codex replay metadata survives when moved behind its owning tool run."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    carrier = {
+        "role": "assistant",
+        "content": "",
+        "finish_reason": "incomplete",
+        "codex_reasoning_items": [{"type": "reasoning", "id": "rs_1"}],
+    }
+    messages = [
+        {"role": "user", "content": "run both"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "one", "arguments": "{}"}},
+            {"id": "c2", "type": "function",
+             "function": {"name": "two", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "REAL r1"},
+        carrier,
+        {"role": "tool", "tool_call_id": "c2", "content": "REAL r2"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    assert [m["role"] for m in out] == [
+        "user", "assistant", "tool", "tool", "assistant",
+    ]
+    assert out[-1] is carrier
+    assert out[-1]["codex_reasoning_items"] == [
+        {"type": "reasoning", "id": "rs_1"},
+    ]
+    assert [m["content"] for m in out if m.get("role") == "tool"] == [
+        "REAL r1", "REAL r2",
+    ]
+
+
+def test_sanitize_assigns_partial_dedup_results_to_owning_round():
+    """A later partial replay must not split an earlier call from its result."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    def tc(call_id: str) -> dict:
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": call_id, "arguments": "{}"},
+        }
+
+    messages = [
+        {"role": "user", "content": "run"},
+        {"role": "assistant", "content": "", "tool_calls": [tc("c1"), tc("c2")]},
+        {"role": "tool", "tool_call_id": "c1", "content": "REAL r1"},
+        {"role": "assistant", "content": "next", "tool_calls": [tc("c2"), tc("c3")]},
+        {"role": "tool", "tool_call_id": "c2", "content": "REAL r2"},
+        {"role": "tool", "tool_call_id": "c3", "content": "REAL r3"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    assert [m["role"] for m in out] == [
+        "user", "assistant", "tool", "tool", "assistant", "tool",
+    ]
+    assert [m["content"] for m in out if m.get("role") == "tool"] == [
+        "REAL r1", "REAL r2", "REAL r3",
+    ]
+    assert [tc["id"] for tc in out[4]["tool_calls"]] == ["c3"]
+
+
+def test_sanitize_dedup_drops_newly_empty_duplicate_assistant():
+    """Dedup must not create an empty non-final assistant turn.
+
+    The empty-message healer runs before duplicate-call cleanup. If dedup strips
+    the only tool call from an otherwise-empty replay, the newly-empty turn must
+    be removed rather than sent between a completed stubbed call and a user
+    message — strict providers reject that shape.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "step 1"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_A",
+            "type": "function",
+            "function": {"name": "foo", "arguments": "{}"},
+        }]},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_A",
+            "type": "function",
+            "function": {"name": "foo", "arguments": "{}"},
+        }]},
+        {"role": "user", "content": "continue"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    assert not any(
+        msg.get("role") == "assistant"
+        and not msg.get("content")
+        and not msg.get("tool_calls")
+        for msg in out
+    )
+
+
+def test_sanitize_dedup_runs_before_positional_stub_injection():
+    """A stub must not re-arm a duplicate call id before dedup runs."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    tool_call = {
+        "id": "call_A",
+        "type": "function",
+        "function": {"name": "foo", "arguments": "{}"},
+    }
+    messages = [
+        {"role": "user", "content": "step 1"},
+        {"role": "assistant", "content": "running", "tool_calls": [tool_call]},
+        {"role": "assistant", "content": "retrying", "tool_calls": [dict(tool_call)]},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    calls = [
+        tc["id"]
+        for msg in out
+        for tc in msg.get("tool_calls") or []
+    ]
+    results = [
+        msg["tool_call_id"]
+        for msg in out
+        if msg.get("role") == "tool"
+    ]
+    assert calls == ["call_A"]
+    assert results == ["call_A"]
 
 
 def test_full_pipeline_closes_replayed_call_with_only_historical_result():
@@ -773,6 +936,10 @@ def test_full_pipeline_closes_replayed_call_with_only_historical_result():
     old result is not in the contiguous tool-result run after the declaration.
     """
     from agent.agent_runtime_helpers import sanitize_api_messages
+    from agent.message_sanitization import (
+        tool_call_id_variants,
+        tool_result_id_variants,
+    )
 
     def call(call_id: str, content: str = "") -> dict:
         return {
@@ -800,26 +967,33 @@ def test_full_pipeline_closes_replayed_call_with_only_historical_result():
     AIAgent._repair_message_sequence(agent, messages)
     out = sanitize_api_messages(messages)
 
+    assert [message["role"] for message in out] == [
+        "user", "assistant", "tool", "user", "assistant", "tool", "tool",
+    ]
+    assert [
+        message["content"] for message in out if message.get("role") == "tool"
+    ] == [
+        "old result",
+        "new result",
+        "[Result unavailable — see context summary above]",
+    ]
+
     for index, message in enumerate(out):
         calls = message.get("tool_calls") or []
         if message.get("role") != "assistant" or not calls:
             continue
-        declared = {
-            tc.get("call_id") or tc.get("id")
-            for tc in calls
-            if tc.get("call_id") or tc.get("id")
-        }
-        answered = set()
+        declared_groups = [tool_call_id_variants(tc) for tc in calls]
+        answered_groups = []
         cursor = index + 1
         while cursor < len(out) and out[cursor].get("role") == "tool":
-            tool_call_id = out[cursor].get("tool_call_id")
-            if tool_call_id:
-                answered.add(tool_call_id)
+            answered_groups.append(
+                tool_result_id_variants(out[cursor].get("tool_call_id"))
+            )
             cursor += 1
-        assert declared <= answered, (
-            f"assistant at index {index} has positionally unanswered calls: "
-            f"{sorted(declared - answered)}"
-        )
+        assert all(
+            any(declared & answered for answered in answered_groups)
+            for declared in declared_groups
+        ), f"assistant at index {index} has a positionally unanswered call"
 
 
 def test_repair_drops_duplicate_tool_result_keyed_on_sibling_id():
