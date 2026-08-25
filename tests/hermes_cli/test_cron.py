@@ -383,3 +383,113 @@ class TestCronRunBackgroundDispatch:
         assert rc == 0
         assert "Running in background (delegation del-xyz)." in out
         assert "failed" not in out.lower()
+
+
+class TestCronRunNotifyOnCompleteLinger:
+    """`hermes cron run` is a one-shot CLI process (#90879 class, same as
+    `hermes chat -q/-Q` and `-z`): it exits as soon as this command returns,
+    so a job whose agent turn spawns a
+    terminal(background=true, notify_on_complete=true) job (a Bot Mode
+    handoff reply, or any bounded background command) would have that
+    delivery destroyed a few seconds later unless the parent lingers for it
+    first, exactly like the other two one-shot exit paths.
+    """
+
+    def _run_cmd(self, capsys):
+        rc = cron_command(Namespace(cron_command="run", job_id="job-1"))
+        return rc, capsys.readouterr().out
+
+    def test_run_action_lingers_for_pending_completions(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cron_cli,
+            "_cron_api",
+            lambda **kwargs: {
+                "success": True,
+                "job": {
+                    "id": "job-1", "name": "Watchdog",
+                    "executed": True, "execution_success": True,
+                },
+            },
+        )
+        calls = []
+        monkeypatch.setattr(
+            "tools.process_registry.process_registry.wait_for_pending_completions",
+            lambda task_id: calls.append(task_id) or {"waited": [], "completed": [], "timed_out": []},
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 0
+        assert calls == [None], (
+            "hermes cron run must linger on the whole registry (task_id=None), "
+            "the same as cli.py's one-shot exit path"
+        )
+
+    def test_run_action_lingers_even_on_a_synchronous_failure(self, monkeypatch, capsys):
+        """A job whose turn dispatches a background reply and THEN fails must
+        still linger — the background work was already spawned."""
+        monkeypatch.setattr(
+            cron_cli,
+            "_cron_api",
+            lambda **kwargs: {
+                "success": True,
+                "job": {
+                    "id": "job-1", "name": "Watchdog",
+                    "executed": True, "execution_success": False,
+                },
+            },
+        )
+        calls = []
+        monkeypatch.setattr(
+            "tools.process_registry.process_registry.wait_for_pending_completions",
+            lambda task_id: calls.append(task_id) or {"waited": [], "completed": [], "timed_out": []},
+        )
+
+        self._run_cmd(capsys)
+
+        assert calls == [None]
+
+    def test_non_run_action_does_not_linger(self, monkeypatch, capsys):
+        """Only 'run' actually executes an agent turn; pause/resume/etc. must
+        not pay for a registry wait they have no need for."""
+        monkeypatch.setattr(
+            cron_cli,
+            "_cron_api",
+            lambda **kwargs: {"success": True, "job": {"id": "job-1", "name": "Watchdog"}},
+        )
+        calls = []
+        monkeypatch.setattr(
+            "tools.process_registry.process_registry.wait_for_pending_completions",
+            lambda task_id: calls.append(task_id) or {"waited": [], "completed": [], "timed_out": []},
+        )
+
+        cron_command(Namespace(cron_command="pause", job_id="job-1"))
+
+        assert calls == []
+
+    def test_linger_failure_does_not_break_the_run_report(self, monkeypatch, capsys):
+        """The linger is best-effort: a raising registry must not turn a
+        successful run report into a crash."""
+        monkeypatch.setattr(
+            cron_cli,
+            "_cron_api",
+            lambda **kwargs: {
+                "success": True,
+                "job": {
+                    "id": "job-1", "name": "Watchdog",
+                    "executed": True, "execution_success": True,
+                },
+            },
+        )
+
+        def _boom(_task_id):
+            raise RuntimeError("registry unavailable")
+
+        monkeypatch.setattr(
+            "tools.process_registry.process_registry.wait_for_pending_completions", _boom
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 0
+        assert "Ran now: succeeded." in out
