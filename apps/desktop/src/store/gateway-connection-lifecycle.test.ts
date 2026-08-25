@@ -428,3 +428,40 @@ describe('reconnect fail-stop on a removed connection', () => {
     expect((result as unknown as { connectionState: string }).connectionState).toBe('open')
   })
 })
+
+describe('ensureGatewayForProfile shared-primary activation', () => {
+  it('refuses a stale shared-primary activation superseded by a newer one (#92333)', async () => {
+    // A shared-primary activation awaits the descriptor lookup (IPC) before
+    // publishing; while that await is parked, a newer activation can advance
+    // the epoch. applyActive() then refuses the stale epoch, and the caller
+    // must be told the route did NOT move — an unconditional `true` here
+    // would let profile.ts publish the target profile/connection onto a
+    // socket route that stayed on the newer backend (the #89206 split-brain).
+    let releaseLookup: (() => void) | undefined
+    const lookupGate = new Promise<void>(resolve => {
+      releaseLookup = resolve
+    })
+
+    const getConnection = vi.fn(async (profile: string) => {
+      if (profile === 'selena') {
+        await lookupGate // deferred shared-primary descriptor lookup
+      }
+
+      return { ...descriptorFor('legacy-local', profile), sharedPrimary: true }
+    })
+
+    installDesktop({ getConnection })
+
+    const stale = ensureGatewayForProfile('selena')
+    expect(getConnection).toHaveBeenCalledWith('selena')
+
+    // A newer activation lands and moves the route while the first lookup
+    // is still in flight.
+    await expect(ensureGatewayForProfile('work')).resolves.toBe(true)
+
+    releaseLookup?.()
+
+    // The superseded activation must report false, not "success".
+    await expect(stale).resolves.toBe(false)
+  })
+})

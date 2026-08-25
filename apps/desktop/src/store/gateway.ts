@@ -963,9 +963,7 @@ export async function ensureGatewayForProfile(profile: string): Promise<boolean>
   const activationEpoch = beginGatewayActivation()
 
   if (key === g.primaryProfile) {
-    applyActive(key, activationEpoch)
-
-    return true
+    return applyActive(key, activationEpoch)
   }
 
   // Global-remote share (routing case 3): one remote host serves every
@@ -974,9 +972,7 @@ export async function ensureGatewayForProfile(profile: string): Promise<boolean>
   // descriptor — $activeGatewayProfile still moves to `key`, so request
   // scoping and profile-aware surfaces behave identically.
   if (await sharedPrimaryRoute(key)) {
-    applyActive(g.primaryProfile, activationEpoch)
-
-    return true
+    return applyActive(g.primaryProfile, activationEpoch)
   }
 
   let entry = g.secondaries.get(key)
