@@ -202,6 +202,7 @@ import {
   tightenSecretFileMode,
   writeSecretFileAtomic
 } from './hardening'
+import { petSessionViewFocusGuard, recordHermesPetSessionView } from './hermes-pet-session-view'
 import { cursorPointInWindow } from './hud-cursor'
 import { startHudGameOverlayWatch } from './hud-game-overlay'
 import { applyHudResetBounds, defaultHudBounds } from './hud-geometry'
@@ -777,6 +778,10 @@ const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backe
 // ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
 // no --profile flag, so the backend honors active_profile / default.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
+// Content-free evidence consumed read-only by Hermes Pet. Electron's
+// userData path is `~/Library/Application Support/Hermes` on macOS (the app's
+// product name), and remains overrideable for hermetic Desktop tests.
+const HERMES_PET_SESSION_VIEW_PATH = path.join(app.getPath('userData'), 'hermes-pet-session-views-v1.json')
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
@@ -12619,6 +12624,24 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   touchPoolBackend(profile)
 
   return { ok: true }
+})
+ipcMain.handle('hermes:pet:session-viewed', (event, payload) => {
+  // Frontmost-window status belongs to Electron, not the renderer. A missing,
+  // destroyed, or unfocused sender window must neither mint foreground
+  // evidence nor clear/overwrite the existing marker.
+  if (petSessionViewFocusGuard(BrowserWindow.fromWebContents(event.sender))) {
+    return { ok: false, error: 'not-focused' }
+  }
+
+  try {
+    return recordHermesPetSessionView(HERMES_PET_SESSION_VIEW_PATH, payload, {
+      producerPID: process.pid
+    })
+  } catch (error) {
+    rememberLog(`[hermes-pet] session view marker failed: ${error instanceof Error ? error.message : String(error)}`)
+
+    return { ok: false, error: 'write-failed' }
+  }
 })
 ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
   return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile))

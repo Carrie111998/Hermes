@@ -253,6 +253,14 @@ export function useDesktopIntegrations({
         return
       }
 
+      // hermes://session/<stored-id> — Hermes Pet's session tab/link. Navigate
+      // straight to that stored session's route.
+      if (payload.kind === 'session' && payload.name) {
+        navigate(sessionRoute(payload.name))
+
+        return
+      }
+
       const action = resolveDeepLinkAction(payload)
 
       if (action.type === 'composer-blueprint') {

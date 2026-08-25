@@ -46,6 +46,12 @@ declare global {
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
+      // Content-free marker consumed read-only by Hermes Pet. It carries only
+      // the selected stored session identity and normalized owning profile.
+      recordPetSessionViewed?: (payload: {
+        sessionID: null | string
+        profile?: null | string
+      }) => Promise<{ ok: boolean; error?: string }>
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
