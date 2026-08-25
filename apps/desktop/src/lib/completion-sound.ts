@@ -1,7 +1,7 @@
 // Completion sound bank for agent turn-end cues.
 // Fourteen curated presets for A/B in Settings → Appearance. Default is variant 1.
 
-import { getAudioContext } from '@/lib/audio-context'
+import { getRunningAudioContext } from '@/lib/audio-context'
 import { ownsAmbientCue } from '@/store/ambient'
 import { $completionSoundVariantId, resolveCompletionSoundVariantId } from '@/store/completion-sound'
 import { $hapticsMuted } from '@/store/haptics'
@@ -380,65 +380,79 @@ export const COMPLETION_SOUND_VARIANTS: readonly CompletionSoundVariant[] = [
   }
 ] as const
 
-function playVariant(variantId: number) {
+function renderVariant(ac: AudioContext, variantId: number): void {
   const variant = COMPLETION_SOUND_VARIANTS.find(v => v.id === variantId)
 
   if (!variant) {
     return
   }
 
-  const ac = getAudioContext()
+  try {
+    // Signal path: voices → master → low-pass → (dry + reverb send) → out.
+    const master = ac.createGain()
+    const tone = ac.createBiquadFilter()
+    tone.type = 'lowpass'
+    tone.frequency.setValueAtTime(3800, ac.currentTime)
+    tone.Q.setValueAtTime(0.32, ac.currentTime)
+    master.gain.setValueAtTime(1.15, ac.currentTime)
+    master.connect(tone)
 
-  if (!ac) {
-    return
+    const dry = ac.createGain()
+    dry.gain.setValueAtTime(0.88, ac.currentTime)
+    tone.connect(dry)
+    dry.connect(ac.destination)
+
+    const reverb = makeReverb(ac)
+    const wet = ac.createGain()
+    wet.gain.setValueAtTime(0.34, ac.currentTime)
+    tone.connect(reverb)
+    reverb.connect(wet)
+    wet.connect(ac.destination)
+
+    variant.play(ac, master, ac.currentTime + 0.01)
+  } catch {
+    // The context can close between the awaited resume and node creation.
   }
+}
 
-  // Signal path: voices → master → low-pass → (dry + reverb send) → out.
-  const master = ac.createGain()
-  const tone = ac.createBiquadFilter()
-  tone.type = 'lowpass'
-  tone.frequency.setValueAtTime(3800, ac.currentTime)
-  tone.Q.setValueAtTime(0.32, ac.currentTime)
-  master.gain.setValueAtTime(0.48, ac.currentTime)
-  master.connect(tone)
+async function playVariant(variantId: number): Promise<void> {
+  const ac = await getRunningAudioContext()
 
-  const dry = ac.createGain()
-  dry.gain.setValueAtTime(0.88, ac.currentTime)
-  tone.connect(dry)
-  dry.connect(ac.destination)
-
-  const reverb = makeReverb(ac)
-  const wet = ac.createGain()
-  wet.gain.setValueAtTime(0.34, ac.currentTime)
-  tone.connect(reverb)
-  reverb.connect(wet)
-  wet.connect(ac.destination)
-
-  variant.play(ac, master, ac.currentTime + 0.01)
+  if (ac) {
+    renderVariant(ac, variantId)
+  }
 }
 
 // Audition the selected variant from settings. Bypasses the haptics mute toggle so
 // sound design can be compared even when turn-end cues are silenced.
 export function previewCompletionSound(variantId?: number) {
-  playVariant(resolveCompletionSoundVariantId(variantId ?? $completionSoundVariantId.get()))
+  return playVariant(resolveCompletionSoundVariantId(variantId ?? $completionSoundVariantId.get()))
 }
 
 // Plays the selected completion cue on any `message.complete`. Pass a dedupeKey
 // (the session id) so only one window beeps when several are open — the mute
 // check runs first, so a muted window never claims the cue out from under an
 // audible peer.
-export function playCompletionSound(dedupeKey?: string) {
+export async function playCompletionSound(dedupeKey?: string): Promise<void> {
   if ($hapticsMuted.get()) {
     return
   }
 
-  const play = () => playVariant($completionSoundVariantId.get())
+  const ac = await getRunningAudioContext()
 
-  if (!dedupeKey) {
-    return play()
+  if (!ac || $hapticsMuted.get()) {
+    return
   }
 
-  void ownsAmbientCue(`sound:${dedupeKey}`).then(owns => owns && play())
+  if (dedupeKey && !(await ownsAmbientCue(`sound:${dedupeKey}`))) {
+    return
+  }
+
+  if ($hapticsMuted.get()) {
+    return
+  }
+
+  renderVariant(ac, $completionSoundVariantId.get())
 }
 
 interface AirPuffSpec {

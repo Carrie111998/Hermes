@@ -257,6 +257,13 @@ function SidebarSessionRowImpl({
   // whenever any session's status changes, but a row only repaints on its own.
   const dotState = useStoreSelector($sessionDotStateById, states => states[session.id] ?? 'idle')
   const liveTurn = hasLiveTurn(dotState)
+  const needsInput = dotState === 'needs-input'
+
+  const needsInputBadge = needsInput ? (
+    <span className="shrink-0 rounded-[3px] bg-amber-500/18 px-1.5 py-0.5 text-[0.625rem] font-semibold leading-none text-amber-700 dark:text-amber-300">
+      {r.needsInput}
+    </span>
+  ) : null
 
   // Card header line: the workspace this belongs to — the project when it
   // resolves (same function the session color reads, so name and tint agree;
@@ -362,6 +369,7 @@ function SidebarSessionRowImpl({
           // token rather than row opacity — dimming the whole row would take
           // the title and the status dot down with it.
           openUnfocused && 'bg-(--ui-row-open-background)',
+          needsInput && 'bg-amber-500/10 ring-1 ring-inset ring-amber-500/45',
           liveTurn && 'text-foreground',
           // Opaque surface while lifted so the dragged row erases what's under
           // it (translucency let the rows below bleed through). data-glass-opaque
@@ -370,6 +378,7 @@ function SidebarSessionRowImpl({
           className
         )}
         data-glass-opaque={dragging ? '' : undefined}
+        data-needs-input={needsInput ? 'true' : undefined}
         data-working={liveTurn ? 'true' : undefined}
         // The row runs BOTH drags off one press, and each declines outside its
         // own region — so no timing/arbitration rule is needed and neither can
@@ -492,6 +501,7 @@ function SidebarSessionRowImpl({
                 <>
                   {leadNode}
                   {handoffBadge}
+                  {needsInputBadge}
                   <span className="min-w-0 flex-1 self-center">
                     <OverflowTip label={title}>
                       <SidebarRowLabel
@@ -539,6 +549,7 @@ function SidebarSessionRowImpl({
                     entire width — nothing truncates against the kebab. */}
                 <div className="flex min-w-0 items-center gap-1.5">
                   {leadNode}
+                  {needsInputBadge}
                   <span
                     className={cn(
                       'min-w-0 flex-1 truncate text-[0.6875rem] text-(--ui-text-tertiary)',

@@ -13,14 +13,14 @@ export function getAudioContext(): AudioContext | null {
   }
 
   try {
-    if (!ctx) {
-      const Ctor =
-        window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+    const Ctor =
+      window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
 
-      if (!Ctor) {
-        return null
-      }
+    if (!Ctor) {
+      return null
+    }
 
+    if (!ctx || ctx.state === 'closed' || !(ctx instanceof Ctor)) {
       ctx = new Ctor()
     }
 
@@ -34,4 +34,26 @@ export function getAudioContext(): AudioContext | null {
   } catch {
     return null
   }
+}
+
+/** Wait until the shared context can actually schedule audible work. The
+ * synchronous getter initiates resume for legacy callers; attention/completion
+ * cues await the same transition so tones are not scheduled into a context
+ * that never left `suspended`. */
+export async function getRunningAudioContext(): Promise<AudioContext | null> {
+  const ac = getAudioContext()
+
+  if (!ac) {
+    return null
+  }
+
+  if (ac.state === 'suspended') {
+    try {
+      await ac.resume()
+    } catch {
+      return null
+    }
+  }
+
+  return ac.state === 'running' ? ac : null
 }

@@ -331,7 +331,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     flushQueuedDeltas(sessionId)
 
     // Keyed by session so only one window beeps when several are open.
-    playCompletionSound(sessionId)
+    void playCompletionSound(sessionId)
 
     const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
 

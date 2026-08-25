@@ -1,6 +1,10 @@
+import { registryBackendScopeKey } from '@hermes/shared'
+
 import { pendingClarifyToolPayload } from '@/app/session/hooks/use-session-actions/restore-pending-clarify'
 import { translateNow } from '@/i18n'
+import { playApprovalSound } from '@/lib/approval-sound'
 import { restorePendingClarifyToolCall, settlePendingClarifyToolCall } from '@/lib/chat-messages'
+import { sessionTitle } from '@/lib/chat-runtime'
 import {
   $clarifyRequests,
   clearClarifyRequest,
@@ -13,6 +17,7 @@ import { $gateway } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import { $sessions, sessionMatchesStoredId } from '@/store/session'
 import { requestScrollToBottom } from '@/store/thread-scroll'
 
 import type { GatewayEventContext } from './types'
@@ -22,7 +27,7 @@ import type { GatewayEventContext } from './types'
  *  each of these must be parked per-session and surfaced. */
 export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, occurredAt } = ctx
-  const { activeSessionIdRef, sessionInterrupted, updateSessionState, upsertToolCall } = deps
+  const { activeSessionIdRef, sessionInterrupted, sessionStateByRuntimeIdRef, updateSessionState, upsertToolCall } = deps
 
   if (event.type === 'clarify.request') {
     // Surface the clarify tool's overlay. The Python side is blocked on
@@ -235,6 +240,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
     // surfaces once the user focuses that chat.
     const command = typeof payload?.command === 'string' ? payload.command : ''
     const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : undefined
 
     void receiveApprovalRequest($gateway.get(), {
       // false only when a tirith warning forbids it; backend omits the field otherwise.
@@ -244,7 +250,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         : undefined,
       command,
       description,
-      requestId: typeof payload?.request_id === 'string' ? payload.request_id : undefined,
+      requestId,
       sessionId: sessionId ?? null,
       smartDenied: payload?.smart_denied === true
     }).catch(() => undefined)
@@ -253,7 +259,26 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
       updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
     }
 
-    dispatchNativeNotification({
+    const storedSessionId = sessionId
+      ? (sessionStateByRuntimeIdRef.current.get(sessionId)?.storedSessionId ?? sessionId)
+      : null
+
+    const eventScope = registryBackendScopeKey(event.connectionId ?? null, event.profile ?? null)
+
+    const blockedSession = storedSessionId
+      ? $sessions
+          .get()
+          .find(
+            session =>
+              sessionMatchesStoredId(session, storedSessionId) &&
+              registryBackendScopeKey(session.connection_id ?? null, session.profile ?? null) === eventScope
+          )
+      : undefined
+
+    const approvalTitle = translateNow('notifications.native.approvalTitle')
+    const cueKey = [sessionId, requestId].filter(Boolean).join(':')
+
+    const notified = dispatchNativeNotification({
       actions: [
         { id: 'approve', text: translateNow('notifications.native.approveAction') },
         { id: 'reject', text: translateNow('notifications.native.rejectAction') }
@@ -261,8 +286,12 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
       body: command || description,
       kind: 'approval',
       sessionId,
-      title: translateNow('notifications.native.approvalTitle')
+      title: blockedSession ? `${approvalTitle} · ${sessionTitle(blockedSession)}` : approvalTitle
     })
+
+    if (notified) {
+      void playApprovalSound(cueKey || undefined)
+    }
 
     return true
   }

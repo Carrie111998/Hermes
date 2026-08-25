@@ -26,7 +26,8 @@ export const NATIVE_NOTIFICATION_KINDS: readonly NativeNotificationKind[] = [
   'plugin'
 ]
 
-// Blocking prompts — surface even while focused if they're for another session.
+// Blocking prompts always surface: a focused window can stay focused while the
+// user is physically away, so focus is not proof that the prompt was seen.
 const ATTENTION_KINDS = new Set<NativeNotificationKind>(['approval', 'input'])
 
 export interface NativeNotificationPrefs {
@@ -138,9 +139,9 @@ function shouldFire(kind: NativeNotificationKind, sessionId?: null | string, glo
     return isBackgrounded()
   }
 
-  // Attention kinds break through for an off-screen session even while focused.
+  // A blocking prompt must not confuse window focus with human presence.
   if (ATTENTION_KINDS.has(kind)) {
-    return isBackgrounded() || (Boolean(sessionId) && sessionId !== $activeSessionId.get())
+    return true
   }
 
   // Completion kinds: only the active session, only while away — so a busy

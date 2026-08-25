@@ -105,7 +105,6 @@ vi.mock('@/store/session-states', async importOriginal => {
 
   return {
     ...actual,
-    $attentionSessionIds: atom<string[]>([]),
     $stalledSessionIds: atom<string[]>([]),
     openSessionTile: vi.fn()
   }
@@ -178,7 +177,7 @@ const renderRow = (session: SessionInfo, extra?: { card?: boolean }) =>
 // the wiring rather than the predicate — the arc has gone missing before.
 describe('SidebarSessionRow running arc', () => {
   afterEach(() => {
-    clearAllSessionStates()
+    act(() => clearAllSessionStates())
   })
 
   const arc = (container: HTMLElement) => container.querySelector('.arc-row')
@@ -195,6 +194,17 @@ describe('SidebarSessionRow running arc', () => {
     const { container } = renderRow(makeSession({ title: 'Running' }))
 
     expect(arc(container)).toBeTruthy()
+  })
+
+  it('persistently highlights and labels the session that needs input', () => {
+    act(() => {
+      publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true, needsInput: true })
+    })
+
+    const { container } = renderRow(makeSession({ title: 'Blocked deployment' }))
+
+    expect(container.querySelector('[data-needs-input="true"]')).toBeTruthy()
+    expect(screen.getByText('Needs input')).toBeTruthy()
   })
 
   // The row owns its status subscription so a turn starting repaints that row
