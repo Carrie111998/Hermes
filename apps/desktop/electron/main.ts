@@ -346,6 +346,7 @@ import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstra
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
+import { installFullscreenPaintWatchdog } from './fullscreen-paint-watchdog'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {
@@ -12791,6 +12792,12 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
   win.on('enter-full-screen', () => sendWindowStateChanged(true))
   win.on('leave-full-screen', () => sendWindowStateChanged(false))
 
+  // #94865: Hyprland (native Wayland) fullscreen surfaces can stop receiving
+  // damage events after a few minutes and the page goes white. Arm a paint
+  // heartbeat that calls webContents.invalidate() while fullscreen so a stuck
+  // surface recovers automatically — no manual reload.
+  installFullscreenPaintWatchdog(win, { log: rememberLog })
+
   streamThrottle.register(win)
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
   attachRendererConsoleCapture(win, 'session-window', rememberLog)
@@ -13982,6 +13989,13 @@ function createWindow() {
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
+
+  // #94865: Hyprland (native Wayland) fullscreen surfaces can stop receiving
+  // damage events after a few minutes and the page goes white. Arm a paint
+  // heartbeat that calls webContents.invalidate() while fullscreen so a stuck
+  // surface recovers automatically — no manual reload.
+  installFullscreenPaintWatchdog(mainWindow, { log: rememberLog })
+
   mainWindow.on('minimize', () => sendWindowStateChanged())
   mainWindow.on('restore', () => sendWindowStateChanged())
   mainWindow.on('hide', () => sendWindowStateChanged())
