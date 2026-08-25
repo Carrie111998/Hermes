@@ -21,11 +21,25 @@ function makeFakeTree(opts = {}) {
   const wsBin = path.join(root, 'apps', 'desktop', 'node_modules', '.bin')
   fs.mkdirSync(rootBin, { recursive: true })
   fs.mkdirSync(wsBin, { recursive: true })
+  const shimName = `tsc${process.platform === 'win32' ? '.cmd' : ''}`
+  // Write a POSIX-shell shim body on Linux/macOS so the file is a real
+  // executable (resolve-bin.mjs probes X_OK first and only falls back to
+  // R_OK when running on Windows). Without chmod the Linux CI run sees
+  // the file as not executable and the BIN_NOT_FOUND branch fires
+  // spuriously -- regression-testing #94796 must work on Linux too.
+  const shimBody =
+    process.platform === 'win32'
+      ? '@echo off\r\necho tsc\r\n'
+      : '#!/bin/sh\necho tsc\n'
   if (opts.rootTsc) {
-    fs.writeFileSync(path.join(rootBin, `tsc${process.platform === 'win32' ? '.cmd' : ''}`), '@echo off\r\necho tsc\r\n')
+    const p = path.join(rootBin, shimName)
+    fs.writeFileSync(p, shimBody)
+    if (process.platform !== 'win32') fs.chmodSync(p, 0o755)
   }
   if (opts.workspaceTsc) {
-    fs.writeFileSync(path.join(wsBin, `tsc${process.platform === 'win32' ? '.cmd' : ''}`), '@echo off\r\necho tsc\r\n')
+    const p = path.join(wsBin, shimName)
+    fs.writeFileSync(p, shimBody)
+    if (process.platform !== 'win32') fs.chmodSync(p, 0o755)
   }
   return {
     root,
