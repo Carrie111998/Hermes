@@ -49,6 +49,7 @@ from agent.credential_pool import (
 )
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
+from tools.registry import registry
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -3544,6 +3545,18 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     for c in cands:
         if c and c in agent.valid_tool_names:
             return c
+
+    # Refuse to fuzzy-match a real tool that is merely unavailable this turn.
+    # check_fn-gated names (e.g. kanban_list hidden from kanban workers via
+    # _check_kanban_orchestrator_mode) are absent from valid_tool_names, so the
+    # fuzzy fallback would otherwise remap them onto the nearest available
+    # sibling (kanban_list -> kanban_link), silently turning a read into a
+    # different operation. If any normalized spelling of the requested name is
+    # a real registered tool, fall through to the normal "unknown tool" path so
+    # the model learns the name is unavailable here instead of getting a
+    # substituted sibling. (See #94506.)
+    if cands & set(registry.get_all_tool_names()):
+        return None
 
     # Fuzzy match as last resort.
     matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)

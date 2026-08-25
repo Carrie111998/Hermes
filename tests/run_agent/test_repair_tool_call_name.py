@@ -125,3 +125,46 @@ class TestVolcEngineXmlPollution:
         # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
         # recover the obvious target.
         assert repair('"terminal"') == "terminal"
+
+
+class TestGatedToolNotRemappedOntoSibling:
+    """Regression coverage for #94506.
+
+    A tool name the registry knows but ``check_fn`` withheld for this turn
+    (e.g. ``kanban_list`` hidden from dispatcher workers via
+    ``_check_kanban_orchestrator_mode``) is absent from ``valid_tool_names``.
+    Before the fix, the step-5 fuzzy fallback remapped it onto the nearest
+    available sibling (``kanban_list`` -> ``kanban_link``), silently turning a
+    read into a different operation. The fix refuses to substitute a sibling
+    for a real-but-gated name: it falls through to the normal "unknown tool"
+    path (returns None).
+    """
+
+    @pytest.fixture
+    def gated_repair(self):
+        """Bind _repair_tool_call on a stub whose valid_tool_names excludes the
+        orchestrator-only kanban tools, mimicking a dispatcher-spawned worker."""
+        from run_agent import AIAgent
+        from tools.registry import registry
+
+        all_names = set(registry.get_all_tool_names())
+        # A kanban worker's post-gating set omits the board-routing tools.
+        assert "kanban_list" in all_names, "kanban_list must be registered for this test"
+        assert "kanban_link" in all_names, "kanban_link must be registered for this test"
+        worker_valid = all_names - {"kanban_list", "kanban_unblock"}
+        stub = SimpleNamespace(valid_tool_names=worker_valid)
+        return AIAgent._repair_tool_call.__get__(stub, AIAgent)
+
+    def test_gated_exact_name_is_not_remapped_to_sibling(self, gated_repair):
+        # A real tool that is gated this turn must NOT become its sibling.
+        assert gated_repair("kanban_list") is None
+
+    def test_gated_camel_case_name_is_not_remapped(self, gated_repair):
+        # Normalized spellings of the gated name are caught too (not just the
+        # exact lowercase form), so CamelCase can't dodge the guard.
+        assert gated_repair("KanbanList") is None
+
+    def test_genuine_typo_of_available_tool_still_repairs(self, gated_repair):
+        # A typo of an *available* tool must still fuzzy-match — the guard only
+        # covers names that resolve to a real registered tool.
+        assert gated_repair("broswe_click") == "browser_click"
