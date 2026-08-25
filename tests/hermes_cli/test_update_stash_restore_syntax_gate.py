@@ -163,34 +163,81 @@ class TestImportProbeCatchesSyntaxError:
     """The post-update import probe must report SyntaxError as breakage, not
     swallow it as a benign non-import error (#94264)."""
 
+    def _run_probe_with_broken_module(self, tmp_path, module_name):
+        """Execute the EXACT production probe text in a subprocess with
+        ``module_name`` shadowed by a SyntaxError-broken file placed first on
+        sys.path. Deterministic: no dependence on cwd resolution, installed
+        packages, or interpreter flags."""
+        import subprocess
+        import sys
+
+        from hermes_cli.update_cmd import _build_import_probe
+
+        broken_dir = tmp_path / "broken"
+        parts = module_name.split(".")
+        pkg = broken_dir.joinpath(*parts[:-1])
+        pkg.mkdir(parents=True)
+        if parts[:-1]:
+            # Regular-package marker: without it the directory is only a
+            # NAMESPACE portion, and a regular package of the same name
+            # further down sys.path (the installed checkout) wins.
+            (pkg / "__init__.py").write_text("")
+        (pkg / (parts[-1] + ".py")).write_text(
+            "def broken(:\n    pass\n"  # invalid: orphan-paren SyntaxError
+        )
+
+        wrapper = (
+            f"import sys; sys.path.insert(0, {str(broken_dir)!r})\n"
+            + _build_import_probe()
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", wrapper],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result
+
     def test_probe_reports_syntax_error_module(self, tmp_path):
-        """The probe's generated source must treat SyntaxError as exit-3
-        breakage — before the fix it fell through to ``except Exception:
-        pass`` and reported the tree healthy."""
-        from hermes_cli.update_cmd import _UPDATE_CRITICAL_MODULES
+        """A first-party critical module that raises SyntaxError on import
+        must exit 3 with the error surfaced — before the fix the probe's
+        ``except Exception: pass`` swallowed it and reported healthy."""
+        # Shadow hermes_cli.main — the FIRST name the probe tries — so no
+        # earlier iteration can import the real module into sys.modules and
+        # cache-hit past the broken file.
+        result = self._run_probe_with_broken_module(tmp_path, "hermes_cli.main")
 
-        # Rebuild the probe body exactly as production assembles it, then
-        # execute its logic against a broken module on sys.path.
-        import hermes_cli.update_cmd as uc
-        import inspect
+        assert result.returncode == 3, (
+            f"expected exit 3, got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr[-400:]!r}"
+        )
+        first_line = (result.stdout or "").splitlines()[0]
+        assert first_line == "hermes_cli.main"
+        # The error detail is surfaced (exact wording varies by Python
+        # version/entrypoint: "invalid syntax", "SyntaxError: ...").
+        assert (result.stdout or "").split("\n", 1)[1].strip()
 
-        src = inspect.getsource(uc._validate_critical_modules_import)
-        assert "except SyntaxError" in src  # guard clause present in template
-        assert "raise SystemExit(3)" in src
+    def test_probe_ignores_unrelated_exception_module(self, tmp_path):
+        """Non-import failures at import time (config/env) are still benign:
+        a module raising RuntimeError must NOT trip exit 3."""
+        import subprocess
+        import sys
 
-        # Behavioral half: run the probe subprocess machinery against a root
-        # whose first-party module list forces run_agent resolution. We call
-        # the real function with a fake venv-less interpreter fallback.
-        broken = tmp_path / "run_agent.py"
-        broken.write_text("def broken(:\n    pass\n")  # SyntaxError on import
+        from hermes_cli.update_cmd import _build_import_probe
 
-        ok, module, error = hermes_main._validate_critical_modules_import(tmp_path)
-
-        # tmp_path isn't a project checkout: either run_agent fails to import
-        # (first-party ModuleNotFoundError → exit 3) or the probe can't even
-        # resolve it. What must NEVER happen is ok=True via a swallowed
-        # SyntaxError while a broken run_agent.py sits at the root.
-        if ok is True:
-            pytest.fail(
-                "probe reported healthy despite broken run_agent.py at root"
-            )
+        broken_dir = tmp_path / "broken2"
+        broken_dir.mkdir()
+        (broken_dir / "toolsets.py").write_text(
+            "raise RuntimeError('config env not set')\n"
+        )
+        wrapper = (
+            f"import sys; sys.path.insert(0, {str(broken_dir)!r})\n"
+            + _build_import_probe()
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", wrapper],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0

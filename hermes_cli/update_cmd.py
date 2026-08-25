@@ -423,34 +423,16 @@ _UPDATE_CRITICAL_MODULES = (
 )
 
 
-def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
-    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+def _build_import_probe() -> str:
+    """Assemble the source of the critical-module import probe.
 
-    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
-    cross-module breakage: a partially-updated tree where ``agent/`` is new but
-    ``tools/`` is old parses perfectly and still dies at startup with
-    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
-    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
-
-    That skew is reachable on the Windows ZIP-update path, whose copy loop
-    walks top-level entries in ``os.listdir`` order and replaces each one
-    independently — ``agent/`` lands long before ``tools/``, so a failure or
-    interruption between them leaves exactly that mismatch on disk.
-
-    Runs in a subprocess because importing these modules into the running
-    updater would pollute ``sys.modules`` and execute import-time side effects
-    against the half-updated tree. Costs ~0.4s.
-
-    Uses the project venv's interpreter when there is one (matching
-    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
-    different Python than the install's own, and probing the wrong
-    interpreter would test a tree the user never runs.
-
-    Returns ``(ok, failing_module, error_message)``.
+    Split from ``_validate_critical_modules_import`` so tests can execute the
+    exact probe text against a synthetic tree (#94264 CI follow-up) without
+    depending on how the host environment resolves first-party modules.
     """
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
 
-    probe = (
+    return (
         "import importlib, sys\n"
         "for name in %r:\n"
         "    try:\n"
@@ -479,6 +461,34 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
         "raise SystemExit(0)\n"
         % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
     )
+
+
+def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
+    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+
+    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
+    cross-module breakage: a partially-updated tree where ``agent/`` is new but
+    ``tools/`` is old parses perfectly and still dies at startup with
+    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
+    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
+
+    That skew is reachable on the Windows ZIP-update path, whose copy loop
+    walks top-level entries in ``os.listdir`` order and replaces each one
+    independently — ``agent/`` lands long before ``tools/``, so a failure or
+    interruption between them leaves exactly that mismatch on disk.
+
+    Runs in a subprocess because importing these modules into the running
+    updater would pollute ``sys.modules`` and execute import-time side effects
+    against the half-updated tree. Costs ~0.4s.
+
+    Uses the project venv's interpreter when there is one (matching
+    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
+    different Python than the install's own, and probing the wrong
+    interpreter would test a tree the user never runs.
+
+    Returns ``(ok, failing_module, error_message)``.
+    """
+    probe = _build_import_probe()
     try:
         interpreter = sys.executable
         try:
