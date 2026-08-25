@@ -1,52 +1,52 @@
 """Test TUI gateway stdin EINVAL handling (#92284)."""
 import errno
-import sys
+import io
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-
-def test_stdin_einval_exits_cleanly_not_crash(monkeypatch, tmp_path):
-    """Orca ADE PTY raises EINVAL on stdin read - should exit cleanly, not crash with code 1."""
-    # Mock the entry module's dependencies to isolate the loop
-    import tui_gateway.entry as entry
-
-    # Mock stdin to raise EINVAL
-    mock_stdin = MagicMock()
-    mock_stdin.readline.side_effect = OSError(errno.EINVAL, "Invalid argument")
-    
-    with patch.object(entry.sys, 'stdin', mock_stdin):
-        with patch.object(entry, '_log_exit') as mock_log:
-            with patch.object(entry, 'handle_spurious_eof'):
-                # Need to also mock the rest of main's setup to reach the loop
-                # We'll test the loop logic directly by invoking the relevant part
-                # Simplest: verify our fix handles the exception type correctly
-                try:
-                    raw = entry.sys.stdin.readline()
-                    assert False, "Should have raised"
-                except OSError as e:
-                    assert e.errno == errno.EINVAL
-                    # Our fix would catch this and break cleanly
-                    mock_log.assert_not_called()  # not yet
-                    # Simulate the fix's behavior
-                    mock_log(f"stdin read EINVAL (Orca PTY compat, no readable stdin): {e}")
-                    mock_log.assert_called_once()
+import tui_gateway.entry as entry
 
 
-def test_stdin_other_oserror_propagates():
-    """Non-EINVAL OSError should still propagate (not silently swallowed)."""
-    import tui_gateway.entry as entry
+class _FakeStdin:
+    def __init__(self, error=None, line=""):
+        self._error = error
+        self._line = line
 
-    mock_stdin = MagicMock()
-    mock_stdin.readline.side_effect = OSError(errno.EIO, "I/O error")
-    
-    with patch.object(entry.sys, 'stdin', mock_stdin):
+    def readline(self):
+        if self._error:
+            raise self._error
+        return self._line
+
+
+def test_einval_returns_none():
+    """EINVAL from a PTY-less launcher maps to clean EOF (None)."""
+    fake = _FakeStdin(error=OSError(errno.EINVAL, "Invalid argument"))
+    with patch.object(entry.sys, "stdin", fake):
+        result = entry._read_stdin_line()
+    assert result is None
+
+
+def test_eio_propagates():
+    """EIO (master-side close) should propagate, not be swallowed."""
+    fake = _FakeStdin(error=OSError(errno.EIO, "I/O error"))
+    with patch.object(entry.sys, "stdin", fake):
         with pytest.raises(OSError) as exc_info:
-            try:
-                raw = entry.sys.stdin.readline()
-            except OSError as e:
-                if e.errno == errno.EINVAL:
-                    pass  # would break
-                else:
-                    raise
-        assert exc_info.value.errno == errno.EIO
+            entry._read_stdin_line()
+    assert exc_info.value.errno == errno.EIO
+
+
+def test_normal_line_passthrough():
+    fake = _FakeStdin(line='{"jsonrpc": "2.0"}\n')
+    with patch.object(entry.sys, "stdin", fake):
+        result = entry._read_stdin_line()
+    assert result == '{"jsonrpc": "2.0"}\n'
+
+
+def test_eof_returns_empty_string():
+    """readline() returns '' at EOF — passthrough, not None."""
+    fake = _FakeStdin(line="")
+    with patch.object(entry.sys, "stdin", fake):
+        result = entry._read_stdin_line()
+    assert result == ""
