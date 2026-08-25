@@ -2396,3 +2396,72 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     )
 
     assert "".join(reasoning_streamed) == "Need to inspect files."
+
+
+def test_codex_commentary_stream_retry_with_item_id_delivered_once(monkeypatch):
+    """Commentary with an authoritative item_id must only be delivered once across stream retries (#94526)."""
+    agent = _build_agent(monkeypatch)
+    delivered = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: delivered.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    # First attempt delivers commentary with item_id "comm_item_1"
+    agent._fire_streamed_codex_commentary("Inspecting codebase first...", item_id="comm_item_1")
+    assert len(delivered) == 1
+    assert delivered[0]["text"] == "Inspecting codebase first..."
+    assert delivered[0]["already_streamed"] is False
+
+    # Second attempt (transport retry) attempts to deliver the same item_id
+    agent._fire_streamed_codex_commentary("Inspecting codebase first...", item_id="comm_item_1")
+    # Must be suppressed (strict deduplication)
+    assert len(delivered) == 1
+
+    # A different commentary item in the same turn can still deliver
+    agent._fire_streamed_codex_commentary("Now running tests...", item_id="comm_item_2")
+    assert len(delivered) == 2
+    assert delivered[1]["text"] == "Now running tests..."
+
+
+def test_emit_interim_assistant_message_is_noop_when_item_id_already_delivered(monkeypatch):
+    """Post-persist emission must be a strict no-op if the item was already streamed (#94526)."""
+    agent = _build_agent(monkeypatch)
+    delivered = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: delivered.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    # 1. Live stream delivered commentary
+    agent._fire_streamed_codex_commentary("Reading file tree...", item_id="comm_001")
+    assert len(delivered) == 1
+
+    # 2. Assistant message created with matching codex_message_items
+    assistant_msg = {
+        "role": "assistant",
+        "content": "Done.",
+        "codex_message_items": [
+            {
+                "type": "message",
+                "phase": "commentary",
+                "id": "comm_001",
+                "content": [{"type": "output_text", "text": "Reading file tree..."}],
+            }
+        ],
+    }
+
+    # 3. Post-persist sweep should be a strict no-op
+    agent._emit_interim_assistant_message(assistant_msg)
+    assert len(delivered) == 1
+
+
+def test_interim_commentary_synchronizes_with_streamed_assistant_text(monkeypatch):
+    """Live commentary must update the streamed text accumulator so _interim_content_was_streamed is True (#94526)."""
+    agent = _build_agent(monkeypatch)
+    agent.interim_assistant_callback = lambda text, **kw: None
+
+    text = "Executing tool plan..."
+    agent._fire_streamed_codex_commentary(text, item_id="comm_plan_1")
+
+    assert agent._interim_text_was_delivered(text, item_id="comm_plan_1") is True
+    assert agent._interim_content_was_streamed(text) is True
+

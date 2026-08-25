@@ -1306,7 +1306,10 @@ def _consume_codex_event_stream(
                             ).strip()
                     if commentary_text:
                         try:
-                            on_commentary_message(commentary_text)
+                            try:
+                                on_commentary_message(commentary_text, item_id=done_id)
+                            except TypeError:
+                                on_commentary_message(commentary_text)
                         except Exception:
                             logger.debug(
                                 "Codex stream on_commentary_message raised",
@@ -1592,11 +1595,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_streamed_text_parts.append(text)
         agent._fire_stream_delta(text)
 
+    delivered_commentary_ids: set[str] = set()
+
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
 
-    def _on_commentary_message(text: str) -> None:
-        agent._fire_streamed_codex_commentary(text)
+    def _on_commentary_message(text: str, item_id: str | None = None) -> None:
+        if item_id and item_id in delivered_commentary_ids:
+            return
+        agent._fire_streamed_codex_commentary(text, item_id=item_id)
+        if item_id:
+            delivered_commentary_ids.add(item_id)
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
