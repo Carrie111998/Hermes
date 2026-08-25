@@ -922,8 +922,16 @@ class TestExpiredCodexFallback:
             assert not isinstance(client, type(None)), "Should find a provider after expired Codex"
 
 
-    def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
-        """With expired Codex + OpenRouter key, OpenRouter should win (1st in chain)."""
+    def test_expired_codex_openrouter_key_no_longer_wins_auto(self, tmp_path, monkeypatch):
+        """An OPENROUTER_API_KEY alone must NOT win auto resolution.
+
+        OpenRouter left `_get_provider_chain()` on 2026-08-24, so setting the
+        env var is no longer sufficient to route auxiliary traffic there --
+        the pair has to be put back in the chain too. This test exists to
+        make that deliberate consequence visible rather than surprising:
+        with an expired Codex, no custom endpoint and no api-key provider,
+        auto now resolves to nothing instead of silently using OpenRouter.
+        """
         import base64
         import time as _time
 
@@ -960,9 +968,12 @@ class TestExpiredCodexFallback:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
             client, model = _resolve_auto()
-            assert client is not None
-            # OpenRouter is 1st in chain, should win
-            mock_openai.assert_called()
+            # OpenRouter is no longer a chain rung, so the key is not enough.
+            assert client is None
+            # Explicit selection still reaches it -- only AUTO changed.
+            from agent.auxiliary_client import _try_openrouter
+            explicit_client, _ = _try_openrouter()
+            assert explicit_client is not None
 
     def test_expired_codex_custom_endpoint_wins(self, tmp_path, monkeypatch):
         """With expired Codex + custom endpoint (Ollama), custom should win (3rd in chain)."""
@@ -1219,11 +1230,13 @@ class TestVisionClientFallback:
             _VISION_STRICT_BACKENDS,
             _VISION_AUTO_PROVIDER_ORDER,
         )
-        assert "nous" in _VISION_STRICT_BACKENDS
-        assert "nous" not in _VISION_AUTO_PROVIDER_ORDER
+        for dead in ("nous", "openrouter"):
+            assert dead in _VISION_STRICT_BACKENDS, dead
+            assert dead not in _VISION_AUTO_PROVIDER_ORDER, dead
         # AUTO must otherwise stay a faithful subset, in the same order.
         assert list(_VISION_AUTO_PROVIDER_ORDER) == [
-            p for p in _VISION_STRICT_BACKENDS if p != "nous"
+            p for p in _VISION_STRICT_BACKENDS
+            if p not in {"nous", "openrouter"}
         ]
 
     def test_vision_auto_includes_active_provider_when_configured(self, monkeypatch):
@@ -2000,16 +2013,18 @@ class TestIsRateLimitError:
 class TestGetProviderChain:
     """_get_provider_chain() resolves functions at call time (testable)."""
 
-    def test_returns_three_entries(self):
+    def test_returns_two_entries(self):
         chain = _get_provider_chain()
-        assert len(chain) == 3
+        assert len(chain) == 2
         labels = [label for label, _ in chain]
-        assert labels == ["openrouter", "local/custom", "api-key"]
-        # Nous is deliberately NOT in this chain - see _get_provider_chain
-        # docstring. No Nous credential exists in either auth store, so the
-        # hop only ever logged "no Nous authentication found" and then
-        # quarantined the label. Explicit `provider: nous` still resolves.
+        assert labels == ["local/custom", "api-key"]
+        # Nous (2026-08-23) and OpenRouter (2026-08-24) are deliberately NOT
+        # in this chain - see _get_provider_chain docstring. Neither has a
+        # credential in either auth store, so each hop only ever logged that
+        # it was unavailable and quarantined the label. Explicit
+        # `provider: nous` / `provider: openrouter` still resolve.
         assert "nous" not in labels
+        assert "openrouter" not in labels
         # Codex is deliberately NOT in this chain — see _get_provider_chain
         # docstring. ChatGPT-account Codex has a shifting model allow-list;
         # guessing a model to fall back on breaks more often than it helps.
@@ -2018,9 +2033,9 @@ class TestGetProviderChain:
     def test_picks_up_patched_functions(self):
         """Patches on _try_* functions must be visible in the chain."""
         sentinel = lambda: ("patched", "model")
-        with patch("agent.auxiliary_client._try_openrouter", sentinel):
+        with patch("agent.auxiliary_client._try_custom_endpoint", sentinel):
             chain = _get_provider_chain()
-        assert chain[0] == ("openrouter", sentinel)
+        assert chain[0] == ("local/custom", sentinel)
 
 
 class TestTryPaymentFallback:
@@ -2064,11 +2079,12 @@ class TestTryPaymentFallback:
     def test_codex_alias_maps_to_chain_label(self):
         """'codex' should map to 'openai-codex' in the skip set."""
         mock_client = MagicMock()
-        with patch("agent.auxiliary_client._try_openrouter", return_value=(mock_client, "or-model")), \
+        with patch("agent.auxiliary_client._try_custom_endpoint",
+                   return_value=(mock_client, "custom-model")), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openai-codex"):
             client, model, label = _try_payment_fallback("openai-codex", task="vision")
         assert client is mock_client
-        assert label == "openrouter"
+        assert label == "local/custom"
 
     def test_codex_not_in_fallback_chain(self):
         """Codex is deliberately NOT a fallback rung (shifting model allow-list).
@@ -4557,8 +4573,8 @@ class TestVisionAutoSkipsKimiCoding:
     on every request (#17076).
     """
 
-    def test_kimi_coding_skipped_falls_through_to_openrouter(self, monkeypatch):
-        """kimi-coding as main + vision auto → OpenRouter (not kimi)."""
+    def test_kimi_coding_skipped_falls_through_to_aggregator(self, monkeypatch):
+        """kimi-coding as main + vision auto → the aggregator chain, not kimi."""
         fake_or_client = MagicMock(name="openrouter_client")
 
         monkeypatch.setattr(
@@ -4578,21 +4594,23 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         def fake_strict(provider, model=None):
-            if provider == "openrouter":
+            # kimi-coding must never reach the strict backend; whichever
+            # aggregator AUTO still carries is the legitimate fall-through.
+            if provider == "kimi-coding":
+                raise AssertionError(
+                    "strict vision backend should not be called for "
+                    "kimi-coding when it is the main provider"
+                )
+            if provider == "deepinfra":
                 return fake_or_client, "google/gemini-3-flash-preview"
-            if provider == "nous":
-                return None, None
-            raise AssertionError(
-                f"strict vision backend should not be called for {provider!r} "
-                "when main provider is kimi-coding"
-            )
+            return None, None
         monkeypatch.setattr(
             "agent.auxiliary_client._resolve_strict_vision_backend",
             fake_strict,
         )
 
         provider, client, model = resolve_vision_provider_client()
-        assert provider == "openrouter"
+        assert provider == "deepinfra"
         assert client is fake_or_client
         assert model == "google/gemini-3-flash-preview"
 
@@ -4614,12 +4632,12 @@ class TestVisionAutoSkipsKimiCoding:
         monkeypatch.setattr(
             "agent.auxiliary_client._resolve_strict_vision_backend",
             lambda p, m=None: (fake_or_client, "gemini")
-            if p == "openrouter"
+            if p == "deepinfra"
             else (None, None),
         )
 
         provider, client, _ = resolve_vision_provider_client()
-        assert provider == "openrouter"
+        assert provider == "deepinfra"
         assert client is fake_or_client
 
     def test_explicit_override_to_kimi_coding_still_honored(self, monkeypatch):

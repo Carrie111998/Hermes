@@ -3070,17 +3070,21 @@ def _get_provider_chain() -> List[tuple]:
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
 
-    NOTE: ``nous`` is also NOT in this chain (removed 2026-08-23).  There
-    is no Nous credential in either auth store, so every auto-resolved
-    auxiliary call spent a hop on ``_try_nous`` only to log "no Nous
-    authentication found" and quarantine the label.  ``_try_nous`` is
-    still wired for EXPLICIT selection -- ``provider: nous`` in an
-    auxiliary config, and the vision path -- so this only drops the
-    automatic hop, not Nous support.  To restore it after running
-    ``hermes auth add nous``, put ``("nous", _try_nous),`` back below.
+    NOTE: ``nous`` and ``openrouter`` are also NOT in this chain (removed
+    2026-08-23/24).  Neither has a credential in either auth store: Nous has
+    had no provider entry since 2026-06-30, and OpenRouter's sole pool entry
+    was a dangling ``env:OPENROUTER_API_KEY`` pointer (request_count=0) that
+    was pruned, with ``OPENROUTER_API_KEY`` unset everywhere.  Every
+    auto-resolved auxiliary call spent a hop on each only to log that it was
+    unavailable and quarantine the label.
+
+    Both remain wired for EXPLICIT selection -- ``provider: openrouter`` /
+    ``provider: nous`` in an auxiliary config, and the vision paths -- so
+    this drops only the automatic hop, not support for either.  To restore
+    one after adding its credential, put its ``(label, fn)`` pair back
+    below; order in this list is the fallback order.
     """
     return [
-        ("openrouter", _try_openrouter),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
     ]
@@ -5666,19 +5670,29 @@ _VISION_STRICT_BACKENDS = (
     "deepinfra",
 )
 
-# The subset walked when vision is set to AUTO. ``nous`` is deliberately
-# excluded (2026-08-23): no Nous credential exists in either auth store, so
-# auto-probing it only ever logged "no Nous authentication found" and
-# quarantined the label. Because ``get_available_vision_backends()`` runs on
-# every vision AVAILABILITY check -- not just on a real vision call -- a dead
-# entry here is noisier than a dead entry in the text chain.
+# The subset walked when vision is set to AUTO. ``nous`` (2026-08-23) and
+# ``openrouter`` (2026-08-24) are deliberately excluded: neither has a
+# credential in either auth store, so auto-probing them only ever logged
+# that they were unavailable and quarantined the label. Because
+# ``get_available_vision_backends()`` runs on every vision AVAILABILITY
+# check -- not just on a real vision call -- a dead entry here is noisier
+# than a dead entry in the text chain.
 #
 # This is SEPARATE from _VISION_STRICT_BACKENDS on purpose: an explicit
-# ``auxiliary.vision.provider: nous`` must still route to the strict backend
-# and warn loudly that it cannot be served. Collapsing the two back into one
-# tuple silently changes explicit-override routing.
+# ``auxiliary.vision.provider: openrouter`` (or ``nous``) must still route
+# to the strict backend and warn loudly that it cannot be served.
+# Collapsing the two back into one tuple silently changes explicit-override
+# routing -- that regression was caught once already, by
+# ``test_explicit_provider_override_still_wins``.
+#
+# NB: this leaves ``deepinfra`` as the only auto aggregator, and it has no
+# credential either -- so in practice vision AUTO resolves the user's MAIN
+# provider (step 1 of ``get_available_vision_backends``) or nothing. That is
+# the pre-existing state, not a new gap: an empty list is handled (``hermes
+# setup`` reports vision unconfigured). Left in place because, unlike the two
+# above, nobody has decided deepinfra is dead weight.
 _VISION_AUTO_PROVIDER_ORDER = tuple(
-    p for p in _VISION_STRICT_BACKENDS if p != "nous"
+    p for p in _VISION_STRICT_BACKENDS if p not in {"nous", "openrouter"}
 )
 
 
