@@ -37,13 +37,31 @@ describe('resolvePosixInteractiveShell', () => {
 
   it('skips a non-executable PATH shell and uses an executable candidate', () => {
     const findOnPath = vi.fn((name: string) => {
-      if (name === 'zsh') return '/tmp/noexec/zsh'
-      if (name === 'bash') return '/usr/bin/bash'
+      if (name === 'zsh') {
+        return '/tmp/noexec/zsh'
+      }
+
+      if (name === 'bash') {
+        return '/usr/bin/bash'
+      }
+
       return null
     })
+
     const isExecutable = (candidate: string) => candidate === '/usr/bin/bash'
 
     expect(resolvePosixInteractiveShell(findOnPath, isExecutable)).toBe('/usr/bin/bash')
+  })
+
+  it('does not treat an executable directory as a shell', () => {
+    const findOnPath = vi.fn(() => null)
+    vi.spyOn(fs, 'statSync').mockImplementation(() => ({ isFile: () => false }) as any)
+
+    try {
+      expect(resolvePosixInteractiveShell(findOnPath)).toBe('/bin/sh')
+    } finally {
+      vi.restoreAllMocks()
+    }
   })
 
   it('returns bare /bin/sh as last resort when no candidate exists anywhere', () => {
