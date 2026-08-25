@@ -81,6 +81,12 @@ from hermes_cli.fallback_config import get_fallback_chain
 # (see gateway/agent_cache_pressure.py).
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+# Minimum idle time before the orphaned-session sweep will END a DB row that
+# the routing index can no longer reach. Deliberately far beyond any sane
+# reset window (the shipped default is 120 min idle / daily at 04:00), so the
+# sweep can only ever catch genuinely abandoned rows — never a session that is
+# merely slow. See _reconcile_orphaned_open_sessions.
+_ORPHAN_SWEEP_MIN_IDLE_S = 24 * 3600.0
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # Telegram cold polling now proves one real getUpdates round trip before connect
 # returns. Leave enough outer budget for initialize/deleteWebhook/start_polling
@@ -13868,6 +13874,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
 
+    async def _reconcile_orphaned_open_sessions(self) -> int:
+        """End open sessions the in-memory expiry path can never see.
+
+        ``_session_expiry_watcher`` iterates ``session_store._entries``, which
+        ``_ensure_loaded_locked`` builds from the ``gateway_routing`` table —
+        keyed by ``session_key``. A row that has no key, or whose key was
+        pruned or belongs to a previous gateway process, is not in that index,
+        so its reset policy is never evaluated and it stays open indefinitely.
+        Neither ``prune`` nor ``archive`` can reach it either: their selector
+        is pinned to ``ended_at IS NOT NULL`` precisely so a live session is
+        never picked, which excludes every never-closed row by construction.
+
+        Only rows idle beyond ``_ORPHAN_SWEEP_MIN_IDLE_S`` are touched — far
+        past any reset window, so a merely-slow session is never affected.
+        Anything still present in the routing index is skipped and left to the
+        in-memory path, which additionally runs the finalize hooks. Sessions
+        with live background processes are skipped via the same guard the
+        reset policy uses.
+
+        Rows are ENDED, never deleted: they hold real transcripts.
+        ``end_session`` is idempotent and first-reason-wins, so a concurrent
+        close is harmless.
+
+        Returns:
+            Number of sessions ended.
+        """
+        db = getattr(getattr(self, "_session_db", None), "_db", None)
+        lister = getattr(db, "list_orphaned_open_sessions", None)
+        if not callable(lister):
+            return 0
+        try:
+            rows = lister(older_than_seconds=_ORPHAN_SWEEP_MIN_IDLE_S)
+        except Exception as exc:
+            logger.debug("Orphaned-session listing failed: %s", exc)
+            return 0
+        if not rows:
+            return 0
+
+        live_keys = set(self.session_store._entries.keys())
+        closed = 0
+        for row in rows:
+            key = row.get("session_key")
+            # Still routable: the in-memory path owns it (and runs the
+            # finalize hooks this sweep deliberately does not).
+            if key and key in live_keys:
+                continue
+            if key:
+                try:
+                    if self.session_store._has_active_processes_safe(
+                        key, context="orphan-sweep"
+                    ):
+                        continue
+                except Exception:
+                    continue
+            try:
+                db.end_session(row["id"], "orphaned_expiry")
+                closed += 1
+            except Exception as exc:
+                logger.debug(
+                    "Could not end orphaned session %s: %s", row.get("id"), exc
+                )
+        return closed
+
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
 
@@ -14002,6 +14071,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.info(
                             "Session expiry done: %d finalized", _done,
                         )
+
+                # Close DB rows that no in-memory entry can ever reach.
+                # The loop above walks session_store._entries — the routing
+                # index, keyed by session_key — so a row with a NULL key, or
+                # one whose key was evicted or belongs to a previous gateway
+                # process, is never evaluated and stays open forever. See
+                # _reconcile_orphaned_open_sessions.
+                try:
+                    _orphans_closed = await self._reconcile_orphaned_open_sessions()
+                    if _orphans_closed:
+                        logger.info(
+                            "Session expiry: closed %d orphaned open session(s) "
+                            "unreachable from the routing index",
+                            _orphans_closed,
+                        )
+                except Exception as _e:
+                    logger.debug("Orphaned-session reconcile failed: %s", _e)
 
                 # Sweep agents that have been idle beyond the TTL regardless
                 # of session reset policy.  This catches sessions with very
