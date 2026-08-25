@@ -468,7 +468,10 @@ class ToolRegistry:
         # remains confined to the profile where its module was loaded.
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
+        # Built-in aliases stay process-global; dynamic MCP aliases follow the
+        # same per-profile overlay model as their tool registrations.
         self._toolset_aliases: Dict[str, str] = {}
+        self._scoped_toolset_aliases: Dict[str, Dict[str, str]] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -569,27 +572,48 @@ class ToolRegistry:
             if entry.toolset == toolset
         )
 
-    def register_toolset_alias(self, alias: str, toolset: str) -> None:
+    def register_toolset_alias(
+        self,
+        alias: str,
+        toolset: str,
+        *,
+        scope: Optional[str] = None,
+    ) -> None:
         """Register an explicit alias for a canonical toolset name."""
         with self._lock:
-            existing = self._toolset_aliases.get(alias)
+            target = (
+                self._toolset_aliases
+                if scope is None
+                else self._scoped_toolset_aliases.setdefault(scope, {})
+            )
+            existing = target.get(alias)
             if existing and existing != toolset:
                 logger.warning(
                     "Toolset alias collision: '%s' (%s) overwritten by %s",
                     alias, existing, toolset,
                 )
-            self._toolset_aliases[alias] = toolset
+            target[alias] = toolset
             self._generation += 1
 
-    def get_registered_toolset_aliases(self) -> Dict[str, str]:
+    def get_registered_toolset_aliases(
+        self, *, scope: Optional[str] = None
+    ) -> Dict[str, str]:
         """Return a snapshot of ``{alias: canonical_toolset}`` mappings."""
         with self._lock:
-            return dict(self._toolset_aliases)
+            active_scope = scope or self.current_scope_key()
+            aliases = dict(self._toolset_aliases)
+            aliases.update(self._scoped_toolset_aliases.get(active_scope, {}))
+            return aliases
 
-    def get_toolset_alias_target(self, alias: str) -> Optional[str]:
+    def get_toolset_alias_target(
+        self, alias: str, *, scope: Optional[str] = None
+    ) -> Optional[str]:
         """Return the canonical toolset name for an alias, or None."""
         with self._lock:
-            return self._toolset_aliases.get(alias)
+            active_scope = scope or self.current_scope_key()
+            return self._scoped_toolset_aliases.get(active_scope, {}).get(
+                alias, self._toolset_aliases.get(alias)
+            )
 
     # ------------------------------------------------------------------
     # Registration
@@ -974,11 +998,27 @@ class ToolRegistry:
             )
             if not toolset_still_exists:
                 self._toolset_checks.pop(entry.toolset, None)
-                self._toolset_aliases = {
-                    alias: target
-                    for alias, target in self._toolset_aliases.items()
-                    if target != entry.toolset
-                }
+                if caller_scope is None:
+                    self._toolset_aliases = {
+                        alias: target
+                        for alias, target in self._toolset_aliases.items()
+                        if target != entry.toolset
+                    }
+                else:
+                    scoped_aliases = self._scoped_toolset_aliases.get(
+                        caller_scope, {}
+                    )
+                    scoped_aliases = {
+                        alias: target
+                        for alias, target in scoped_aliases.items()
+                        if target != entry.toolset
+                    }
+                    if scoped_aliases:
+                        self._scoped_toolset_aliases[caller_scope] = (
+                            scoped_aliases
+                        )
+                    else:
+                        self._scoped_toolset_aliases.pop(caller_scope, None)
             self._generation += 1
         logger.debug("Deregistered tool: %s", name)
 
@@ -1035,16 +1075,30 @@ class ToolRegistry:
                         self._toolset_checks.pop(toolset, None)
                     else:
                         self._toolset_checks[toolset] = check_fn
-                if not surviving and not any(
-                    entry.toolset == toolset
-                    for entries in self._scoped_tools.values()
-                    for entry in entries.values()
-                ):
-                    self._toolset_aliases = {
-                        alias: target
-                        for alias, target in self._toolset_aliases.items()
-                        if target != toolset
-                    }
+                if not surviving:
+                    if scope is None and not any(
+                        entry.toolset == toolset
+                        for entries in self._scoped_tools.values()
+                        for entry in entries.values()
+                    ):
+                        self._toolset_aliases = {
+                            alias: target
+                            for alias, target in self._toolset_aliases.items()
+                            if target != toolset
+                        }
+                    elif scope is not None:
+                        scoped_aliases = self._scoped_toolset_aliases.get(
+                            scope, {}
+                        )
+                        scoped_aliases = {
+                            alias: target
+                            for alias, target in scoped_aliases.items()
+                            if target != toolset
+                        }
+                        if scoped_aliases:
+                            self._scoped_toolset_aliases[scope] = scoped_aliases
+                        else:
+                            self._scoped_toolset_aliases.pop(scope, None)
             self._generation += 1
         logger.debug("Restored tool registration: %s", name)
         return True

@@ -23606,7 +23606,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                _lock,
+                _servers,
+                discover_mcp_tools,
+                shutdown_current_profile_mcp_servers,
+            )
 
             # Capture old server names before shutdown
             with _lock:
@@ -23614,10 +23619,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            reload_context = copy_context()
+            await loop.run_in_executor(
+                None,
+                reload_context.run,
+                shutdown_current_profile_mcp_servers,
+            )
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await loop.run_in_executor(
+                None,
+                reload_context.run,
+                discover_mcp_tools,
+            )
 
             # Compute what changed
             with _lock:
