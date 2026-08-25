@@ -4,6 +4,11 @@ export function shouldCreateWindowsTray(platform: Platform): boolean {
   return platform === 'win32'
 }
 
+/** Windows does not emit app.before-quit for OS shutdown, restart, or logout. */
+export function shouldTreatSessionEndAsFinalQuit(platform: Platform): boolean {
+  return platform === 'win32'
+}
+
 export function shouldHideMainWindowOnClose({
   platform,
   isQuitting,

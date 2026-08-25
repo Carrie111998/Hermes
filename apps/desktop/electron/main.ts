@@ -378,7 +378,8 @@ import { installWindowsSystemCaTrust } from './windows-system-ca'
 import {
   shouldCreateWindowsTray,
   shouldHideMainWindowOnClose,
-  shouldStartMainWindowHidden
+  shouldStartMainWindowHidden,
+  shouldTreatSessionEndAsFinalQuit
 } from './windows-tray-lifecycle'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
@@ -12426,6 +12427,15 @@ function createWindow({ startHidden = false }: { startHidden?: boolean } = {}) {
   mainWindow.on('restore', () => sendWindowStateChanged())
   mainWindow.on('hide', () => sendWindowStateChanged())
   mainWindow.on('show', () => sendWindowStateChanged())
+
+  // Electron skips app.before-quit on Windows shutdown/restart/logout. Latch
+  // the native session-end request here so the following close event cannot be
+  // mistaken for a user clicking X and prevent the OS from ending the session.
+  if (shouldTreatSessionEndAsFinalQuit(process.platform)) {
+    mainWindow.on('query-session-end', () => {
+      isFinalQuitRequested = true
+    })
+  }
 
   // Reopen where the user left off. close is the backstop, flushed
   // synchronously before the window is gone.

@@ -5,12 +5,15 @@ import { test } from 'vitest'
 import {
   shouldCreateWindowsTray,
   shouldHideMainWindowOnClose,
-  shouldStartMainWindowHidden
+  shouldStartMainWindowHidden,
+  shouldTreatSessionEndAsFinalQuit
 } from './windows-tray-lifecycle'
 
 test('Windows close-to-tray lifecycle policy preserves explicit quit and non-Windows behavior', () => {
   assert.equal(shouldCreateWindowsTray('win32'), true)
   assert.equal(shouldCreateWindowsTray('darwin'), false)
+  assert.equal(shouldTreatSessionEndAsFinalQuit('win32'), true)
+  assert.equal(shouldTreatSessionEndAsFinalQuit('darwin'), false)
 
   assert.equal(shouldHideMainWindowOnClose({ platform: 'win32', isQuitting: false, trayAvailable: true }), true)
   assert.equal(shouldHideMainWindowOnClose({ platform: 'win32', isQuitting: false, trayAvailable: false }), false)
