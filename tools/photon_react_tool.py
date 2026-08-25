@@ -114,11 +114,14 @@ def _reactions_enabled() -> bool:
 def _photon_react_check() -> bool:
     """Availability check (runs at schema-assembly time).
 
-    Static gates only — no I/O — so startup never blocks on a dead
-    sidecar.  The adapter lookup itself happens in the handler, which
-    returns a clear error if the gateway went away mid-session.
+    Enforces the dual gate documented at module level: the operator flag
+    is on AND a live Photon adapter exists in this process.  The adapter
+    probe is the same in-process helper the handler uses — a runner-ref
+    lookup, no I/O — so startup never blocks on a dead sidecar.  The
+    handler still re-checks and returns a clear error if the gateway went
+    away mid-session.
     """
-    return _reactions_enabled()
+    return _reactions_enabled() and _live_photon_adapter() is not None
 
 
 async def _photon_react(args: Dict[str, Any], **kw) -> Dict[str, Any]:
@@ -136,8 +139,16 @@ async def _photon_react(args: Dict[str, Any], **kw) -> Dict[str, Any]:
 
     chat_id = str(args.get("chat_id") or "").strip()
     if not chat_id:
-        # Default to the home channel DM, which is the personal-texting case
-        # this tool exists for.
+        # Honor the promise in the schema: default to the chat of the
+        # message currently being answered (the gateway tracks this per
+        # conversation), falling back to the Photon home channel DM.
+        try:
+            from gateway.session_context import get_session_env
+
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        except Exception:
+            chat_id = ""
+    if not chat_id:
         try:
             from gateway.config import load_gateway_config
 
@@ -146,7 +157,8 @@ async def _photon_react(args: Dict[str, Any], **kw) -> Dict[str, Any]:
             chat_id = home.chat_id
         except Exception:
             return tool_error(
-                "No chat_id given and no Photon home channel configured."
+                "No chat_id given and no current-chat context or Photon "
+                "home channel available."
             )
 
     message_id: Optional[str] = str(args.get("message_id") or "").strip() or None
