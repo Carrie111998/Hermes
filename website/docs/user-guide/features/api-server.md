@@ -355,6 +355,17 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 
 Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
 
+When `session_id` identifies an existing Hermes session and no explicit
+`conversation_history` or `previous_response_id` is supplied, the run loads
+that session's active transcript. Session turn leases serialize concurrent
+writers and refresh the transcript after a contended wait.
+
+Clients may send an `Idempotency-Key` header when starting a run. Repeating
+the same request with the same key returns the original `run_id`; reusing the
+key with a different request returns `409 idempotency_conflict`. Keys and run
+statuses share the same process-local retention window, so durable workflows
+should still store the returned `run_id` or use an external task record.
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.
