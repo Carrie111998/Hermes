@@ -522,9 +522,21 @@ def _load_provider_from_dir(
     # discover_plugin_cli_commands() for relative-import support has no
     # __file__; only reuse modules that were actually loaded from disk.
     cached = sys.modules.get(module_name)
-    if cached is not None and getattr(cached, "__file__", None):
+    cached_file = getattr(cached, "__file__", None) if cached is not None else None
+    if cached_file and Path(cached_file).resolve() == init_file.resolve():
         mod = cached
     else:
+        if cached_file:
+            # User-installed providers are profile-scoped, so two profiles may
+            # install different implementations under the same provider name.
+            # Remove the prior package and its relative-import submodules before
+            # loading the implementation resolved for this profile.
+            for loaded_name in list(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(
+                    f"{module_name}."
+                ):
+                    sys.modules.pop(loaded_name, None)
+
         # Handle relative imports within the plugin
         # First ensure the parent packages are registered
         for parent in ("plugins", "plugins.memory"):

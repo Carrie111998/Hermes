@@ -404,3 +404,65 @@ def test_profile_clone_isolates_bad_manifests_and_failing_hooks(
     assert result == ["working-cloned"]
     assert "profile-clone manifest for memory provider 'malformed'" in caplog.text
     assert "Memory provider 'failing' failed to clone profile 'coder'" in caplog.text
+
+
+def test_profile_clone_reloads_same_named_provider_from_source_profile(
+    tmp_path, monkeypatch
+):
+    provider_name = "sameprofilemem"
+    marker_source = """\
+from agent.memory_provider import MemoryProvider
+
+
+class Provider(MemoryProvider):
+    @property
+    def name(self):
+        return "sameprofilemem"
+
+    def is_available(self):
+        return True
+
+    def initialize(self, *args, **kwargs):
+        pass
+
+    def get_tool_schemas(self):
+        return []
+
+    def clone_profile(self, profile_name, **kwargs):
+        (kwargs["profile_dir"] / "provider-origin.txt").write_text(ORIGIN)
+
+
+def register(ctx):
+    ctx.register_memory_provider(Provider())
+"""
+    ambient_dir = tmp_path / "ambient" / "plugins" / provider_name
+    source_dir = tmp_path / "source"
+    source_provider_dir = source_dir / "plugins" / provider_name
+    profile_dir = tmp_path / "profile"
+    ambient_dir.mkdir(parents=True)
+    source_provider_dir.mkdir(parents=True)
+    profile_dir.mkdir()
+    (ambient_dir / "__init__.py").write_text(
+        f'ORIGIN = "ambient"\n{marker_source}',
+        encoding="utf-8",
+    )
+    (source_provider_dir / "__init__.py").write_text(
+        f'ORIGIN = "source"\n{marker_source}',
+        encoding="utf-8",
+    )
+    (source_dir / "config.yaml").write_text(
+        f"memory:\n  provider: {provider_name}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", tmp_path / "bundled")
+
+    ambient_provider = memory_plugins._load_provider_from_dir(ambient_dir)
+    assert ambient_provider is not None
+
+    memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+    )
+
+    assert (profile_dir / "provider-origin.txt").read_text() == "source"
