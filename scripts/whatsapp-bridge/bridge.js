@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync, appendFileSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync, appendFileSync, statSync, renameSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -121,10 +121,28 @@ const INBOUND_LOG = path.join(path.dirname(SESSION_DIR), 'inbound.jsonl');
 const INBOUND_LOG_ENABLED = !['off', '0', 'false', 'no', ''].includes(
   String(process.env.WHATSAPP_INBOUND_LOG || 'on').toLowerCase()
 );
+// Rotate at a configurable size cap (default 10MB) so the file never grows
+// without bound: the current file is renamed to `.1` and a fresh one started.
+const INBOUND_LOG_MAX_BYTES = parseInt(
+  process.env.WHATSAPP_INBOUND_LOG_MAX_BYTES || String(10 * 1024 * 1024),
+  10
+);
+// Log the first append failure (full disk / bad permissions / bad path) so an
+// operator is alerted that the durable log is not being written, then stay
+// quiet on subsequent failures to avoid per-message noise.
+let inboundLogWarned = false;
 
 function appendInboundLog(event) {
   if (!INBOUND_LOG_ENABLED) return;
   try {
+    const stats = statSync(INBOUND_LOG, { throwIfNoEntry: false });
+    if (stats && stats.size >= INBOUND_LOG_MAX_BYTES) {
+      try {
+        renameSync(INBOUND_LOG, INBOUND_LOG + '.1');
+      } catch (e) {
+        console.warn('[whatsapp] inbound log rotation failed:', e.message);
+      }
+    }
     appendFileSync(INBOUND_LOG, JSON.stringify({
       ts: Date.now(),
       chatId: event.chatId || null,
@@ -136,7 +154,12 @@ function appendInboundLog(event) {
       mediaType: event.mediaType || null,
       messageId: event.messageId || null,
     }) + '\n', 'utf8');
-  } catch {}
+  } catch (e) {
+    if (!inboundLogWarned) {
+      inboundLogWarned = true;
+      console.warn('[whatsapp] failed to append inbound log:', e.message);
+    }
+  }
 }
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
