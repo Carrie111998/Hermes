@@ -31,7 +31,8 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
             "after the static checks. Makes real network calls."
         ),
     )
-    doctor_parser.add_argument(
+    output_mode = doctor_parser.add_mutually_exclusive_group()
+    output_mode.add_argument(
         "--ack",
         metavar="ADVISORY_ID",
         default=None,
@@ -40,5 +41,15 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
             "advisory will no longer trigger startup banners. Run `hermes "
             "doctor` first to see active advisories and their IDs."
         ),
+    )
+    output_mode.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the complete diagnostic report as JSON only",
+    )
+    output_mode.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show resolved route, fallback, and auxiliary-task diagnostics",
     )
     doctor_parser.set_defaults(func=cmd_doctor)
