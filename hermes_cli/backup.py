@@ -1963,7 +1963,14 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
             # Prune excluded directories in-place so os.walk doesn't descend
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+            # ``hermes-agent`` is only pruned at the root level; nested dirs
+            # with the same name (e.g. in skills/) must be preserved -- this
+            # walk must agree with ``_should_exclude`` and ``_run_backup_locked``.
+            is_root = dp == hermes_root
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root)
+            ]
 
             for fname in filenames:
                 fpath = dp / fname
