@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { mergeCompactProfileOrder, ProfileRail } from './profile-switcher'
+import { clampRailDragX, mergeCompactProfileOrder, ProfileRail } from './profile-switcher'
 
 // The rail's discoverability pills are navigation, not identity — assert the
 // multi-gateway entry point deep-links to Settings → Connections instead of
@@ -118,8 +118,14 @@ vi.mock('../../profiles/rename-profile-dialog', () => ({ RenameProfileDialog: ()
 const { $hasMultipleConnections } = await import('@/store/connections')
 const hasMultipleConnections = $hasMultipleConnections as ReturnType<typeof atom<boolean>>
 
-const { $activeGatewayProfile, $profileColors, $profileScope, $profiles, $profilesConnectionId } =
-  await import('@/store/profile')
+const {
+  $activeGatewayProfile,
+  $profileColors,
+  $profileScope,
+  $profiles,
+  $profilesConnectionId,
+  selectProfile
+} = await import('@/store/profile')
 
 const { $profileRemoteOverrides } = await import('@/store/profile-remote-override')
 const { $connection } = await import('@/store/session')
@@ -139,6 +145,7 @@ beforeEach(() => {
   sortableIds.length = 0
   requestGateway.mockReset()
   requestGateway.mockResolvedValue({ found: false })
+  vi.mocked(selectProfile).mockClear()
 })
 
 afterEach(() => {
@@ -154,6 +161,12 @@ afterEach(() => {
 })
 
 describe('ProfileRail multi-gateway entry point', () => {
+  it('preserves continuous drag movement across a variable-width active slot', () => {
+    expect(clampRailDragX(73, -40, 160)).toBe(73)
+    expect(clampRailDragX(-55, -40, 160)).toBe(-40)
+    expect(clampRailDragX(190, -40, 160)).toBe(160)
+  })
+
   it('reorders visible compact profiles without moving the hidden active profile', () => {
     expect(mergeCompactProfileOrder(['picasso', 'founder', 'writer'], ['picasso', 'writer'], 'writer', 'picasso')).toEqual([
       'writer',
@@ -222,6 +235,28 @@ describe('ProfileRail multi-gateway entry point', () => {
     expect(within(owner).getByText('C')).toBeTruthy()
     expect(within(owner).queryByText('Clyde')).toBeNull()
     expect(within(founder).getByText('F')).toBeTruthy()
+  })
+
+  it.each([
+    ['picasso', ['Clyde', 'Picasso', 'Founder']],
+    ['founder', ['Clyde', 'Picasso', 'Founder']]
+  ])('expands %s in its saved rail slot without reordering profiles', (activeName, expectedOrder) => {
+    activeGatewayProfile.set(activeName)
+    profileScope.set(activeName)
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { display_name: 'Picasso', is_default: false, name: 'picasso' },
+      { display_name: 'Founder', is_default: false, name: 'founder' }
+    ])
+    render(<ProfileRail />)
+
+    const rail = screen.getByRole('group', { name: 'Profiles' })
+
+    const profileLabels = Array.from(rail.querySelectorAll('button'))
+      .map(button => button.getAttribute('aria-label'))
+      .filter(label => label && expectedOrder.includes(label))
+
+    expect(profileLabels).toEqual(expectedOrder)
   })
 
   it('uses stable profile keys for sortable identity when display names differ', () => {
@@ -348,6 +383,10 @@ describe('ProfileRail multi-gateway entry point', () => {
 
     expect(allProfiles.querySelector('.codicon-layers')).toBeTruthy()
     expect(within(allProfiles).queryByText('Clyde')).toBeNull()
+
+    fireEvent.click(allProfiles)
+
+    expect(selectProfile).toHaveBeenCalledWith('default')
   })
 
   it('keeps thirteen profiles direct and condenses the fourteenth', () => {

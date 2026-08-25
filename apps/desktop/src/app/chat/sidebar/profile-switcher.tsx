@@ -90,34 +90,33 @@ import { ProfileRemoteOverrideDialog } from './profile-remote-override-dialog'
 import { useProfilePrewarm } from './use-profile-prewarm'
 import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
 
-const RAIL_GAP = 4 // px — matches gap-1 between squares.
-
 // Past this many profiles the strip of colored squares stops scaling (tiny
 // drag targets, endless horizontal scroll), so the rail collapses to a compact
 // menu. Drag-reorder and long-press-recolor live only on the squares path.
 const PROFILE_DROPDOWN_THRESHOLD = 13
 
-// Neighbors reflow on RAIL_TRANSITION; the dragged square glides between
-// snapped cells on the snappier DRAG_TRANSITION. Both come from the SHARED
-// reorder primitive (lib/reorder.ts) so every reorder strip feels identical.
+// Neighbors reflow on RAIL_TRANSITION; the dragged square follows the snappier
+// DRAG_TRANSITION while closestCenter resolves variable-width slots. Both
+// transitions come from the shared reorder primitive (lib/reorder.ts).
 const RAIL_TRANSITION = REORDER_RAIL_TRANSITION
 const DRAG_TRANSITION = REORDER_DRAG_TRANSITION_CSS
 
-// The rail is a single horizontal strip of fixed cells. Pin drags to the x-axis
-// (no cross-axis scrollbar), snap to whole cells so a square steps slot-to-slot
-// instead of gliding, and clamp to the occupied strip so it can't float past the
-// last profile onto the "+".
-const stepThroughCells: Modifier = ({ containerNodeRect, draggingNodeRect, transform }) => {
+// The active profile is wider than compact initials, so the rail no longer has a
+// uniform cell pitch. Keep drags continuous on the x-axis and let closestCenter
+// resolve the variable-width positions, while clamping to the occupied strip.
+export function clampRailDragX(x: number, minX: number, maxX: number): number {
+  return Math.min(maxX, Math.max(minX, x))
+}
+
+const clampToRail: Modifier = ({ containerNodeRect, draggingNodeRect, transform }) => {
   if (!draggingNodeRect || !containerNodeRect) {
     return { ...transform, y: 0 }
   }
 
-  const pitch = draggingNodeRect.width + RAIL_GAP
   const minX = containerNodeRect.left - draggingNodeRect.left
   const maxX = containerNodeRect.right - draggingNodeRect.right
-  const snapped = Math.round(transform.x / pitch) * pitch
 
-  return { ...transform, x: Math.min(maxX, Math.max(minX, snapped)), y: 0 }
+  return { ...transform, x: clampRailDragX(transform.x, minX, maxX), y: 0 }
 }
 
 export function mergeCompactProfileOrder(
@@ -130,6 +129,8 @@ export function mergeCompactProfileOrder(
   const to = compactIds.indexOf(overId)
 
   if (from < 0 || to < 0 || from === to) {
+    // Referential equality is the caller's no-op signal: no reorder haptic and
+    // no persistence write when the drag did not produce a valid move.
     return allIds
   }
 
@@ -292,17 +293,27 @@ export function ProfileRail() {
 
   return (
     <div aria-label={p.title} className="flex min-w-0 items-center gap-0.5" data-slot="profile-rail" role="group">
-      {multiProfile &&
-        (isAll ? (
-          <ProfilePill active glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
-        ) : activeProfile ? (
-          <ActiveProfilePill
-            color={resolveProfileColor(activeProfile.name, colors)}
-            label={profileLabel(activeProfile)}
-            onSelect={() => (activeProfile.is_default ? setShowAllProfiles(true) : selectProfile(activeProfile.name))}
-            profileName={activeProfile.name}
-          />
-        ) : null)}
+      {multiProfile && isAll && (
+        <ProfilePill
+          active
+          glyph="layers"
+          label={p.allProfiles}
+          onSelect={() =>
+            rosterCurrent && defaultProfile ? selectProfile(defaultProfile.name) : setShowAllProfiles(true)
+          }
+        />
+      )}
+
+      {/* Condensed rails cannot preserve individual slots, so keep the active
+          identity pinned beside the profile dropdown at that scale. */}
+      {multiProfile && condensed && !isAll && activeProfile && (
+        <ActiveProfilePill
+          color={resolveProfileColor(activeProfile.name, colors)}
+          label={profileLabel(activeProfile)}
+          onSelect={() => (activeProfile.is_default ? setShowAllProfiles(true) : selectProfile(activeProfile.name))}
+          profileName={activeProfile.name}
+        />
+      )}
 
       {/* Single-profile: the active default owner's identity next to create. */}
       {!multiProfile && activeProfile?.is_default && (
@@ -340,18 +351,26 @@ export function ProfileRail() {
           className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           ref={scrollRef}
         >
-          {multiProfile && rosterCurrent && defaultProfile && (isAll || !onDefault) && (
-            <OwnerProfileCompact
-              color={resolveProfileColor(defaultProfile.name, colors)}
-              label={defaultLabel}
-              onSelect={() => selectProfile(defaultProfile.name)}
-            />
-          )}
+          {multiProfile && rosterCurrent && defaultProfile &&
+            (onDefault ? (
+              <ActiveProfilePill
+                color={resolveProfileColor(defaultProfile.name, colors)}
+                label={defaultLabel}
+                onSelect={() => setShowAllProfiles(true)}
+                profileName={defaultProfile.name}
+              />
+            ) : (
+              <OwnerProfileCompact
+                color={resolveProfileColor(defaultProfile.name, colors)}
+                label={defaultLabel}
+                onSelect={() => selectProfile(defaultProfile.name)}
+              />
+            ))}
 
           {multiProfile && (
             <DndContext
               collisionDetection={closestCenter}
-              modifiers={[stepThroughCells]}
+              modifiers={[clampToRail]}
               onDragEnd={handleDragEnd}
               onDragOver={handleDragOver}
               onDragStart={handleDragStart}
@@ -361,22 +380,32 @@ export function ProfileRail() {
                 {/* relative → the strip is the dragged square's offsetParent, so the
                     clamp modifier bounds drags to the occupied cells (not the +). */}
                 <div className="relative flex items-center gap-1">
-                  {compactNamed.map(profile => (
-                    <ProfileSquare
-                      active={false}
-                      color={resolveProfileColor(profile.name, colors)}
-                      key={profile.name}
-                      label={profileLabel(profile)}
-                      onConnectRemote={() => openRemoteOverrideDialog(profile.name)}
-                      onDelete={() => setPendingDelete(profile)}
-                      onEditSoul={() => setPendingSoul(profile.name)}
-                      onRecolor={color => setProfileColor(profile.name, color)}
-                      onRename={() => setPendingRename(profile)}
-                      onSelect={() => selectProfile(profile.name)}
-                      profileName={profile.name}
-                      remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
-                    />
-                  ))}
+                  {named.map(profile =>
+                    !isAll && normalizeProfileKey(profile.name) === activeProfileKey ? (
+                      <ActiveProfilePill
+                        color={resolveProfileColor(profile.name, colors)}
+                        key={profile.name}
+                        label={profileLabel(profile)}
+                        onSelect={() => selectProfile(profile.name)}
+                        profileName={profile.name}
+                      />
+                    ) : (
+                      <ProfileSquare
+                        active={false}
+                        color={resolveProfileColor(profile.name, colors)}
+                        key={profile.name}
+                        label={profileLabel(profile)}
+                        onConnectRemote={() => openRemoteOverrideDialog(profile.name)}
+                        onDelete={() => setPendingDelete(profile)}
+                        onEditSoul={() => setPendingSoul(profile.name)}
+                        onRecolor={color => setProfileColor(profile.name, color)}
+                        onRename={() => setPendingRename(profile)}
+                        onSelect={() => selectProfile(profile.name)}
+                        profileName={profile.name}
+                        remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
+                      />
+                    )
+                  )}
                 </div>
               </SortableContext>
             </DndContext>
