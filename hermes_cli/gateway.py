@@ -33,12 +33,14 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
 from gateway.status import terminate_pid
 from gateway.restart import (
+    CRON_DRAIN_CLEANUP_RESERVE_S,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     is_gateway_supervisor_process,
+    parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
     resolve_restart_exit_wait_budget,
@@ -3527,8 +3529,18 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     # 60s minimum for installs that use the default immediate drain. Positive
     # drain values extend the deadline directly instead of inheriting a second
     # 60s floor, so a configured 45s drain yields 75s rather than 90s.
+    # The leash must cover the FULL stop budget: the shutdown drain may also
+    # hold for the cron floor — agent.cron_drain_timeout plus the cleanup
+    # reserve — on top of (as a max of) the restart drain, exactly as
+    # resolve_cron_drain_budget() sizes it at runtime. Sizing from the
+    # restart drain alone let TimeoutStopSec cut an in-flight cron drain
+    # mid-budget and turn every stop with active cron work into an unclean
+    # SIGKILL exit (#94759).
     _drain_timeout = int(_get_restart_drain_timeout() or 0)
-    restart_timeout = max(60, _drain_timeout + 30)
+    _cron_floor = int(
+        _get_cron_drain_timeout() + CRON_DRAIN_CLEANUP_RESERVE_S
+    )
+    restart_timeout = max(60, max(_drain_timeout, _cron_floor) + 30)
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
@@ -3947,6 +3959,21 @@ def _get_restart_drain_timeout() -> float:
             )
         )
     return parse_restart_drain_timeout(raw)
+
+
+def _get_cron_drain_timeout() -> float:
+    """Return the configured cron-only drain floor in seconds (#82161).
+
+    Mirrors the gateway runtime reader (env HERMES_CRON_DRAIN_TIMEOUT over
+    agent.cron_drain_timeout) so the generated systemd unit sizes
+    TimeoutStopSec against the same floor the live shutdown drain can wait.
+    """
+    raw = os.getenv("HERMES_CRON_DRAIN_TIMEOUT", "").strip()
+    if not raw:
+        cfg = read_raw_config()
+        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        raw = str(agent_cfg.get("cron_drain_timeout", ""))
+    return parse_cron_drain_timeout(raw if raw.strip() else None)
 
 
 def _get_restart_after_turn_timeout() -> float:
