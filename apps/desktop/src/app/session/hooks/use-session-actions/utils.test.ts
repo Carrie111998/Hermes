@@ -8,9 +8,12 @@ import { $activeGatewayProfile } from '@/store/profile'
 import {
   $currentBranch,
   $currentCwd,
+  $sessions,
+  setConnection,
   setCurrentBranch,
   setCurrentCwd,
   setSelectedStoredSessionId,
+  setSessions,
   workspaceCwdBelongsToSelectedSession
 } from '@/store/session'
 import type { SessionInfo, SessionResumeResponse } from '@/types/hermes'
@@ -33,8 +36,28 @@ import {
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
-  toBranchMessages
+  toBranchMessages,
+  upsertOptimisticSession
 } from './utils'
+
+describe('upsertOptimisticSession remote ownership', () => {
+  const initialSessions = $sessions.get()
+
+  afterEach(() => {
+    setConnection(null)
+    setSessions(initialSessions)
+  })
+
+  it('stamps a newly created row with the active remote gateway for its next turn', () => {
+    setConnection({ connectionId: 'prometheus', mode: 'remote', profile: 'default' } as never)
+    $activeGatewayProfile.set('default')
+    setSessions([])
+
+    upsertOptimisticSession({ session_id: 'runtime-new', stored_session_id: 'stored-new' } as never, 'stored-new')
+
+    expect($sessions.get()[0]).toMatchObject({ connection_id: 'prometheus', id: 'stored-new', profile: 'default' })
+  })
+})
 
 const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
   ({ id, role, parts: [{ type: 'text', text }], ...extra }) as ChatMessage

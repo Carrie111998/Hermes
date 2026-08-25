@@ -8,6 +8,7 @@ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
+  $connection,
   $cronSessions,
   $currentCwd,
   $messagingSessions,
@@ -1250,12 +1251,15 @@ export function upsertOptimisticSession(
   // profile) so the scoped sidebar shows the new row immediately instead of
   // filtering it out as "default" until the aggregator re-fetches.
   const profileKey = normalizeProfileKey($activeGatewayProfile.get())
+  const activeConnection = $connection.get()
+  const connectionId = activeConnection?.mode === 'remote' ? activeConnection.connectionId?.trim() : ''
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
     // lane immediately (the overlay groups by path); fall back to the workspace
     // the session was just started in when the create response omits it.
     cwd: created.info?.cwd ?? ($currentCwd.get().trim() || null),
+    ...(connectionId ? { connection_id: connectionId } : {}),
     ended_at: null,
     id,
     input_tokens: 0,

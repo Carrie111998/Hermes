@@ -10,7 +10,7 @@ import { persistBoolean, persistString, storedBoolean, storedString } from '@/li
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
-import type { SessionProfileRoute } from './session-request-router'
+import type { SessionOwnerScope, SessionProfileRoute } from './session-request-router'
 import { clearUnreadOnOpen } from './session-unread-remote'
 
 type Updater<T> = T | ((current: T) => T)
@@ -125,20 +125,34 @@ export function sessionBelongsToProfile(
  * (Bot Mode's canonical "Bot Chat") never appear in the row list, so the hint is
  * often the only sync source.
  */
-export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId: null | string): string | undefined {
+export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: null | string): SessionOwnerScope {
   if (!sessionId) {
     return undefined
   }
 
-  const owner = sessions.find(session => sessionMatchesStoredId(session, sessionId))?.profile?.trim()
+  const row = sessions.find(session => sessionMatchesStoredId(session, sessionId))
+  const connectionId = row?.connection_id?.trim()
+  const profile = row?.profile?.trim()
 
-  if (owner) {
+  if (connectionId) {
+    return { connectionId, profile: profile || 'default' }
+  }
+
+  if (profile) {
+    return profile
+  }
+
+  return getSessionOwnerHint(sessionId)
+}
+
+export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId: null | string): string | undefined {
+  const owner = knownSessionOwner(sessions, sessionId)
+
+  if (typeof owner === 'string') {
     return owner
   }
 
-  const hint = getSessionOwnerHint(sessionId)
-
-  return (hint?.targetProfile ?? hint?.profile)?.trim() || undefined
+  return owner ? (owner.targetProfile ?? owner.profile)?.trim() || undefined : undefined
 }
 
 /**

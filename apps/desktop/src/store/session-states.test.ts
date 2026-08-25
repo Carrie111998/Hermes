@@ -603,7 +603,13 @@ describe('knownOwnerForSession / requestForOwnedSession (#91684 client half)', (
     expect(knownOwnerForSession('stored-1')).toEqual({ connectionId: 'conn-a', profile: 'work' })
   })
 
-  it('falls back to the session row profile when no tile route exists', () => {
+  it('preserves a listed remote row connection when no tile route exists', () => {
+    setSessions([{ connection_id: 'prometheus', id: 'stored-2', profile: 'default' } as never])
+
+    expect(knownOwnerForSession('stored-2')).toEqual({ connectionId: 'prometheus', profile: 'default' })
+  })
+
+  it('falls back to the session row profile when no connection is recorded', () => {
     setSessions([{ id: 'stored-2', profile: 'loki' } as never])
 
     expect(knownOwnerForSession('stored-2')).toBe('loki')
