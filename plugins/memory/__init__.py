@@ -526,16 +526,16 @@ def _load_provider_from_dir(
     if cached_file and Path(cached_file).resolve() == init_file.resolve():
         mod = cached
     else:
-        if cached_file:
-            # User-installed providers are profile-scoped, so two profiles may
-            # install different implementations under the same provider name.
-            # Remove the prior package and its relative-import submodules before
-            # loading the implementation resolved for this profile.
-            for loaded_name in list(sys.modules):
-                if loaded_name == module_name or loaded_name.startswith(
-                    f"{module_name}."
-                ):
-                    sys.modules.pop(loaded_name, None)
+        # A synthetic package shell has no __file__, but CLI discovery may
+        # already have loaded descendants such as ``<provider>.cli`` from a
+        # different profile. Whenever the exact full package is not reusable,
+        # clear the package and every descendant before loading this profile's
+        # implementation.
+        for loaded_name in list(sys.modules):
+            if loaded_name == module_name or loaded_name.startswith(
+                f"{module_name}."
+            ):
+                sys.modules.pop(loaded_name, None)
 
         # Handle relative imports within the plugin
         # First ensure the parent packages are registered

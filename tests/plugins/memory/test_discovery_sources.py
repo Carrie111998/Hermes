@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.metadata
 import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -466,3 +467,58 @@ def register(ctx):
     )
 
     assert (profile_dir / "provider-origin.txt").read_text() == "source"
+
+
+def test_profile_clone_evicts_cli_discovery_package_descendants(
+    tmp_path, monkeypatch
+):
+    provider_name = "syntheticprofilemem"
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    provider_dir = source_dir / "plugins" / provider_name
+    provider_dir.mkdir(parents=True)
+    profile_dir.mkdir()
+    (source_dir / "config.yaml").write_text(
+        f"memory:\n  provider: {provider_name}\n",
+        encoding="utf-8",
+    )
+    (provider_dir / "helper.py").write_text(
+        'ORIGIN = "source"\n',
+        encoding="utf-8",
+    )
+    (provider_dir / "__init__.py").write_text(
+        "from agent.memory_provider import MemoryProvider\n"
+        "from .helper import ORIGIN\n\n"
+        "class Provider(MemoryProvider):\n"
+        "    @property\n"
+        "    def name(self):\n"
+        f"        return {provider_name!r}\n\n"
+        "    def is_available(self):\n"
+        "        return True\n\n"
+        "    def initialize(self, *args, **kwargs):\n"
+        "        pass\n\n"
+        "    def get_tool_schemas(self):\n"
+        "        return []\n\n"
+        "    def clone_profile(self, profile_name, **kwargs):\n"
+        "        (kwargs['profile_dir'] / 'synthetic-origin.txt').write_text(ORIGIN)\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_memory_provider(Provider())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", tmp_path / "bundled")
+
+    module_name = f"{memory_plugins._USER_NAMESPACE}.{provider_name}"
+    synthetic_package = types.ModuleType(module_name)
+    synthetic_package.__path__ = [str(tmp_path / "ambient" / provider_name)]
+    ambient_helper = types.ModuleType(f"{module_name}.helper")
+    ambient_helper.ORIGIN = "ambient"
+    monkeypatch.setitem(sys.modules, module_name, synthetic_package)
+    monkeypatch.setitem(sys.modules, f"{module_name}.helper", ambient_helper)
+
+    memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+    )
+
+    assert (profile_dir / "synthetic-origin.txt").read_text() == "source"
