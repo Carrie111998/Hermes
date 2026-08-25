@@ -98,6 +98,33 @@ class TestEndToEnd:
         assert "para 0 " in content
         assert "para 2999 " in content
 
+    def test_web_extract_normalizes_provider_error_envelopes(self, monkeypatch):
+        class FakeProvider:
+            name = "fake"
+            display_name = "Fake"
+
+            def supports_extract(self):
+                return True
+
+            async def extract(self, urls, **kwargs):
+                return [{
+                    "url": urls[0],
+                    "title": "",
+                    "content": "",
+                    "error": "upstream body with bearer-token-secret",
+                }]
+
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools._rescue_eligible", return_value=False), \
+             patch("tools.web_tools.async_is_safe_url", new=_AsyncTrue()), \
+             patch("agent.web_search_registry.get_provider", return_value=FakeProvider()):
+            result = json.loads(asyncio.new_event_loop().run_until_complete(
+                wt.web_extract_tool(["https://example.com/failure"])
+            ))
+
+        assert result["results"][0]["error"] == "Web extract provider 'fake' failed"
+
 
 def _make_awaitable(value):
     async def _coro(*a, **k):
