@@ -3,7 +3,7 @@ import crypto from 'node:crypto'
 import { assertBootstrapNotSuperseded, redactSecrets, SSH_ERROR } from './ssh-connection'
 
 const LOCKFILE_SCHEMA_VERSION = 2
-const PROTOCOL_VERSION = 1
+const PROTOCOL_VERSION = 2
 const READY_RE = /^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/gm
 const READY_POLL_INTERVAL_MS = 750
 

@@ -618,7 +618,10 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const capturedRoute = options?.route === undefined ? $newChatRoute.get() : options.route
-        const workspaceScope = options?.workspaceScope ?? { workspaceMode: 'sessions' }
+        const workspaceScope = options?.workspaceScope ?? {
+          workspaceMode: 'sessions' as const,
+          ...(capturedRoute ? { ownerRoute: capturedRoute } : {})
+        }
 
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()

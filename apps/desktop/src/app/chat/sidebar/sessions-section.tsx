@@ -31,7 +31,7 @@ import {
   SidebarWorkspaceGroup,
   type SidebarWorkspaceTree
 } from './projects'
-import { WorkspaceAddButton } from './projects/workspace-header'
+import { SourceAwareAddButton } from './new-session-source-picker'
 import { ReorderableList, useSortableBindings } from './reorderable-list'
 import { SidebarSessionSkeletons } from './section-states'
 import { SidebarSessionRow } from './session-row'
@@ -106,6 +106,7 @@ interface SidebarSessionsSectionProps {
   onTogglePin: (sessionId: string) => void
   onToggleUnread: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
+  onStartSessionOnSource?: (connectionId: string, path?: null | string) => void
   pinned: boolean
   rootClassName?: string
   contentClassName?: string
@@ -188,6 +189,7 @@ export function SidebarSessionsSection({
   onTogglePin,
   onToggleUnread,
   onNewSessionInWorkspace,
+  onStartSessionOnSource,
   pinned,
   rootClassName,
   contentClassName,
@@ -298,7 +300,11 @@ export function SidebarSessionsSection({
   // not a thing.
   const dividerAction =
     grouping === 'date' && onNewSessionInWorkspace ? (
-      <WorkspaceAddButton label={t.sidebar.nav['new-session']} onClick={() => onNewSessionInWorkspace(null)} />
+      <SourceAwareAddButton
+        label={t.sidebar.nav['new-session']}
+        onNewSession={() => onNewSessionInWorkspace(null)}
+        onPickSource={onStartSessionOnSource ? id => onStartSessionOnSource(id, null) : undefined}
+      />
     ) : null
 
   // A single flat/virtual/lane list row — either a divider or a session.
@@ -398,6 +404,7 @@ export function SidebarSessionsSection({
           <EnteredProjectContent
             liveSessions={liveSessions}
             onNewSession={onNewSessionInWorkspace}
+            onStartSessionOnSource={onStartSessionOnSource}
             project={projectContent}
             removedSessionIds={removedSessionIds}
             renderRows={renderRowsDated}
@@ -426,6 +433,7 @@ export function SidebarSessionsSection({
         key={project.id}
         onEnter={onEnterProject}
         onNewSession={onNewSessionInWorkspace}
+        onStartSessionOnSource={onStartSessionOnSource}
         previewSessions={projectOverviewPreviews?.[project.id]}
         project={project}
         renderRows={renderRows}
@@ -457,6 +465,7 @@ export function SidebarSessionsSection({
         group={group}
         key={group.id}
         onNewSession={onNewSessionInWorkspace}
+        onStartSessionOnSource={onStartSessionOnSource}
         renderRows={renderRows}
       />
     ))

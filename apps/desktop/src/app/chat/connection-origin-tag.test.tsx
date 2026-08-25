@@ -1,7 +1,9 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
-const { ConnectionOriginTag } = await import('./connection-origin-tag')
+import type { DesktopConnectionsRegistry, DesktopRegistryConnection } from '@/global'
+
+const { ConnectionOriginTag, sharedSessionsOrigin, visibleSessionOrigin } = await import('./connection-origin-tag')
 
 afterEach(cleanup)
 
@@ -11,7 +13,26 @@ const SSH = {
   id: 'mimir',
   kind: 'ssh',
   label: 'mimir'
-} as Parameters<typeof ConnectionOriginTag>[0]['connection']
+} as DesktopRegistryConnection
+
+const LOCAL = {
+  id: 'local',
+  kind: 'local',
+  label: 'This device'
+} as DesktopRegistryConnection
+
+const REMOTE = {
+  id: 'homelab',
+  kind: 'remote',
+  label: 'Homelab'
+} as DesktopRegistryConnection
+
+const registry = {
+  connections: [LOCAL, SSH, REMOTE],
+  primary: 'local',
+  secureTokenStorage: true,
+  version: 2
+} as DesktopConnectionsRegistry
 
 describe('ConnectionOriginTag', () => {
   it('labels a foreign gateway with kind icon + label', () => {
@@ -19,6 +40,8 @@ describe('ConnectionOriginTag', () => {
 
     const tag = screen.getByRole('img', { name: /mimir/ })
     expect(tag.textContent).toContain('mimir')
+    expect(tag.getAttribute('data-slot')).toBe('connection-origin-tag')
+    expect(tag.getAttribute('data-connection-kind')).toBe('ssh')
   })
 
   it('uses the gateway kind label in its accessible name', () => {
@@ -27,5 +50,33 @@ describe('ConnectionOriginTag', () => {
     const tag = screen.getByRole('img', { name: /mimir ·/ })
     // SSH is a remote gateway — never empty/blank.
     expect(tag?.getAttribute('aria-label')).toMatch(/·\s*\S+/)
+  })
+})
+
+describe('visibleSessionOrigin', () => {
+  it('hides the local default', () => {
+    expect(visibleSessionOrigin({}, registry, 'local')).toBeNull()
+  })
+
+  it('names a session pinned to a foreign gateway', () => {
+    expect(visibleSessionOrigin({ connection_id: 'mimir' }, registry, 'local')).toEqual(SSH)
+  })
+
+  it('prefers the section origin for a foreign list', () => {
+    expect(visibleSessionOrigin({}, registry, 'local', REMOTE)).toEqual(REMOTE)
+  })
+})
+
+describe('sharedSessionsOrigin', () => {
+  it('returns the shared foreign origin', () => {
+    expect(
+      sharedSessionsOrigin([{ connection_id: 'mimir' }, { connection_id: 'mimir' }], registry, 'local')
+    ).toEqual(SSH)
+  })
+
+  it('returns null when the group is mixed', () => {
+    expect(
+      sharedSessionsOrigin([{ connection_id: 'mimir' }, { connection_id: 'homelab' }], registry, 'local')
+    ).toBeNull()
   })
 })

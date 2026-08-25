@@ -19,10 +19,10 @@ import {
   SidebarRowShell
 } from '../chrome'
 
+import { SourceAwareAddButton } from '../new-session-source-picker'
 import { latestProjectSessions, PROJECT_PREVIEW_COUNT, useWorkspaceNodeOpen } from './model'
 import { ProjectContextMenu, ProjectMenu } from './project-menu'
 import type { SidebarProjectTree } from './workspace-groups'
-import { WorkspaceAddButton } from './workspace-header'
 
 // A bare color dot (no icon) or an icon glyph — tinted by `color` when set, else
 // the lead's default tertiary. The glyph wrapper centers + caps size either way.
@@ -64,6 +64,7 @@ interface ProjectOverviewRowProps {
   project: SidebarProjectTree
   onEnter?: (id: string) => void
   onNewSession?: (path: null | string) => void
+  onStartSessionOnSource?: (connectionId: string, path?: null | string) => void
   renderRows?: (sessions: SessionInfo[]) => React.ReactNode
   activeProjectId?: null | string
   previewSessions?: SessionInfo[]
@@ -78,6 +79,7 @@ export function ProjectOverviewRow({
   project,
   onEnter,
   onNewSession,
+  onStartSessionOnSource,
   renderRows,
   activeProjectId,
   previewSessions,
@@ -119,8 +121,12 @@ export function ProjectOverviewRow({
               folder" chat. New session sits outermost: it's the one you reach
               for. */}
           {!project.isNoProject && <ProjectMenu anchorRef={rowRef} isActive={isActive} project={project} />}
-          {onNewSession && (
-            <WorkspaceAddButton label={s.newSessionIn(project.label)} onClick={() => onNewSession(project.path)} />
+          {(onNewSession || onStartSessionOnSource) && (
+            <SourceAwareAddButton
+              label={s.newSessionIn(project.label)}
+              onNewSession={() => onNewSession?.(project.path)}
+              onPickSource={onStartSessionOnSource ? id => onStartSessionOnSource(id, project.path) : undefined}
+            />
           )}
         </>
       }

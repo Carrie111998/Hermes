@@ -571,6 +571,24 @@ describe('sessionTileOwnerRoute', () => {
     expect(sessionTileOwnerRoute('plain')).toBeUndefined()
   })
 
+  it('keeps ownerRoute on an ordinary sessions-mode tile', () => {
+    const ownerRoute = { connectionId: 'mimir', mode: 'remote' as const, profile: 'default' }
+
+    $selectedStoredSessionId.set(null)
+    openSessionTile('ssh-chat', 'right', undefined, undefined, { ownerRoute, workspaceMode: 'sessions' })
+
+    expect(sessionTileOwnerRoute('ssh-chat')).toEqual(ownerRoute)
+  })
+
+  it('does not drop ownerRoute when re-scoping a sessions-mode tile', () => {
+    const ownerRoute = { connectionId: 'mimir', mode: 'remote' as const, profile: 'default' }
+
+    $sessionTiles.set([{ ownerRoute, storedSessionId: 'ssh-chat', workspaceMode: 'sessions' }])
+    setSessionTileWorkspaceScope('ssh-chat', { workspaceMode: 'sessions' })
+
+    expect(sessionTileOwnerRoute('ssh-chat')).toEqual(ownerRoute)
+  })
+
   it('returns undefined when the session has no tile', () => {
     $sessionTiles.set([])
 

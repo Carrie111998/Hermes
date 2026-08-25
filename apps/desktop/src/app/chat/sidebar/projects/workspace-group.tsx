@@ -2,12 +2,14 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useState } from 'react'
 
+import { ConnectionOriginTag, sharedSessionsOrigin } from '@/app/chat/connection-origin-tag'
 import { Codicon } from '@/components/ui/codicon'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { displayPath } from '@/lib/display-path'
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { setWorkspaceNodeOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { newSessionInProfile, selectProfile } from '@/store/profile'
@@ -16,28 +18,30 @@ import { $sessionProfilesUsage } from '@/store/session'
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 
 import { SidebarGroupRow, SidebarRowLead, SidebarRowLink, SidebarRowStack } from '../chrome'
+import { SourceAwareAddButton } from '../new-session-source-picker'
 import { rankSessions } from '../order'
 
 import { PROJECT_PREVIEW_COUNT, SIDEBAR_GROUP_PAGE, useWorkspaceNodeOpen } from './model'
 import type { SidebarSessionGroup } from './workspace-groups'
-import {
-  WorkspaceAddButton,
-  WorkspaceContextMenu,
-  WorkspaceHeader,
-  WorkspaceMenu,
-  WorkspaceShowMoreButton
-} from './workspace-header'
+import { WorkspaceContextMenu, WorkspaceHeader, WorkspaceMenu, WorkspaceShowMoreButton } from './workspace-header'
 
 interface SidebarWorkspaceGroupProps {
   group: SidebarSessionGroup
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
+  onStartSessionOnSource?: (connectionId: string, path?: null | string) => void
   // When set (linked worktree rows), shows a remove affordance that runs a real
   // `git worktree remove`.
   onRemove?: () => void
 }
 
-export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemove }: SidebarWorkspaceGroupProps) {
+export function SidebarWorkspaceGroup({
+  group,
+  renderRows,
+  onNewSession,
+  onStartSessionOnSource,
+  onRemove
+}: SidebarWorkspaceGroupProps) {
   const { t } = useI18n()
   const s = t.sidebar
   const isProfileGroup = group.mode === 'profile'
@@ -45,6 +49,9 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   // that leaves this profile's spend unchanged doesn't repaint its header.
   const usage = useStoreSelector($sessionProfilesUsage, all => all[group.id])
   const rankIds = useStore($sidebarSessionRankIds)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
+  const groupOrigin = sharedSessionsOrigin(group.sessions, registry, activeConnectionId)
   // Empty worktree/branch lanes start collapsed — they only show a "No sessions
   // yet" placeholder, so defaulting them open just adds noise. Profile lanes and
   // lanes that already hold sessions default open.
@@ -71,7 +78,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
     />
   )
 
-  const handleNewSession = async () => {
+  const handleNewSession = async (connectionId?: string) => {
     // Reveal the lane the new session targets — an empty worktree/branch lane
     // starts collapsed, so without this the session lands in a folder the user
     // can't see. Stable across the lane's default flipping open once populated.
@@ -83,7 +90,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
       return
     }
 
-    if (!onNewSession) {
+    if (!onNewSession && !onStartSessionOnSource) {
       return
     }
 
@@ -100,14 +107,27 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
       }
     }
 
-    onNewSession(group.path)
+    if (connectionId && onStartSessionOnSource) {
+      onStartSessionOnSource(connectionId, group.path)
+
+      return
+    }
+
+    onNewSession?.(group.path)
   }
 
   // Profile groups start a fresh session in that profile but keep the
   // all-profiles browse view; workspace groups seed the new session's cwd.
-  // Main checkout lanes are branch-targeted.
-  const addButton = (onNewSession || isProfileGroup) && (
-    <WorkspaceAddButton label={s.newSessionIn(group.label)} onClick={() => void handleNewSession()} />
+  // Main checkout lanes are branch-targeted. Multi-gateway installs pick the
+  // source first (same picker as the sidebar "New session" row).
+  const addButton = (onNewSession || onStartSessionOnSource || isProfileGroup) && (
+    <SourceAwareAddButton
+      label={s.newSessionIn(group.label)}
+      onNewSession={() => void handleNewSession()}
+      onPickSource={
+        isProfileGroup || !onStartSessionOnSource ? undefined : id => void handleNewSession(id)
+      }
+    />
   )
 
   return (
@@ -149,7 +169,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
         <WorkspaceContextMenu onRemove={onRemove} path={group.path}>
           <WorkspaceHeader
             action={
-              (onNewSession || onRemove) && (
+              (onNewSession || onStartSessionOnSource || onRemove) && (
                 <div className="flex items-center">
                   {addButton}
                   {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
@@ -160,6 +180,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
             label={group.label}
             onToggle={toggleOpen}
             open={open}
+            origin={groupOrigin ? <ConnectionOriginTag connection={groupOrigin} /> : undefined}
             title={group.path ? displayPath(group.path) : undefined}
           />
         </WorkspaceContextMenu>

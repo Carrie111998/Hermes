@@ -419,6 +419,11 @@ def spawn_backend(payload: dict[str, Any]) -> dict[str, Any]:
     # VIRTUAL_ENV preserves venv identity; PYTHONPATH is deliberately NOT set (see above).
     env = dict(os.environ)
     env["VIRTUAL_ENV"] = os.path.dirname(venv_dir)
+    env["HERMES_DESKTOP"] = "1"
+    # Same as POSIX remote-lifecycle: a remote dashboard.public_url would
+    # engage the OAuth gate on this loopback isolated serve and reject the
+    # desktop session token on /api/ws.
+    env["HERMES_DASHBOARD_PUBLIC_URL"] = "http://127.0.0.1"
     env.pop("PYTHONPATH", None)
     _ensure_scope(ownership_id)
     creationflags = 0x00000008 | 0x00000200 | 0x01000000

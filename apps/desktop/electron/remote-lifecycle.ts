@@ -34,7 +34,12 @@ const LOCKFILE_SCHEMA_VERSION = 2
 // Bumped when the desktop<->dashboard reuse contract changes in a way that makes
 // an old running dashboard unsafe to reattach to (token handling, readiness/spawn
 // args, served-token reconciliation). A mismatch forces a clean respawn.
-const PROTOCOL_VERSION = 1
+const PROTOCOL_VERSION = 2
+// Isolated SSH serve inherits the remote config.yaml, including a public
+// dashboard.public_url. That turns on the OAuth gate even though we bind
+// 127.0.0.1, and the gate rejects ?token= on /api/ws. Override to loopback so
+// 0.20.x remotes stay in token mode without waiting for a server upgrade.
+const SPAWN_PUBLIC_URL = 'http://127.0.0.1'
 const READY_RE = /^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/m
 const REMOTE_LOCK_DIR = '~/.hermes/desktop-ssh'
 const SUPPORTED_REMOTE_OS = new Set(['Linux', 'Darwin'])
@@ -532,7 +537,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
 
   const dashCmd =
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
-    `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
+    `exec env HERMES_DESKTOP=1 HERMES_DASHBOARD_PUBLIC_URL=${SPAWN_PUBLIC_URL} ${hermes} ${profileArgs}${subCmd}`
 
   return (
     `mkdir -p "$(dirname ${logPath})" && ` +

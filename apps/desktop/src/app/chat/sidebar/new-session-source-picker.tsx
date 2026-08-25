@@ -1,5 +1,7 @@
+import { useStore } from '@nanostores/react'
 import { Fragment } from 'react'
 
+import { Codicon } from '@/components/ui/codicon'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -8,11 +10,15 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
+import { Tip } from '@/components/ui/tooltip'
 import type { DesktopRegistryConnection } from '@/global'
 import { useI18n } from '@/i18n'
 import { sortConnectionsForDisplay } from '@/lib/connection-display'
 import { Check, Cloud, Monitor, Network, Terminal } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { $activeConnectionId, $connectionsRegistry, $hasMultipleConnections } from '@/store/connections'
+
+import { WorkspaceAddButton } from './projects/workspace-header'
 
 const KIND_ICON: Record<DesktopRegistryConnection['kind'], typeof Monitor> = {
   local: Monitor,
@@ -53,7 +59,7 @@ export function NewSessionSourcePicker({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-64 p-1" side="right">
+      <DropdownMenuContent align="start" className="w-64 p-1" data-source-picker="" side="right">
         <DropdownMenuLabel className="px-2 py-1.5">
           {t.settings.connections.title}
         </DropdownMenuLabel>
@@ -109,4 +115,44 @@ export function NewSessionSourcePicker({
       </DropdownMenuContent>
     </DropdownMenu>
   )
+}
+
+const ADD_BTN_CLASS =
+  'grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100 data-[state=open]:opacity-100'
+
+/**
+ * Workspace/date "+" that opens the per-session source picker when more than
+ * one gateway is registered. Single-source installs keep the one-click add.
+ */
+export function SourceAwareAddButton({
+  label,
+  onNewSession,
+  onPickSource
+}: {
+  label: string
+  onNewSession: () => void
+  onPickSource?: (connectionId: string) => void
+}) {
+  const hasMultiple = useStore($hasMultipleConnections)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
+
+  if (hasMultiple && onPickSource) {
+    return (
+      <Tip label={label}>
+        <NewSessionSourcePicker
+          activeConnectionId={activeConnectionId}
+          connections={registry?.connections ?? []}
+          onPick={onPickSource}
+          trigger={
+            <button aria-label={label} className={ADD_BTN_CLASS} type="button">
+              <Codicon name="add" size="0.75rem" />
+            </button>
+          }
+        />
+      </Tip>
+    )
+  }
+
+  return <WorkspaceAddButton label={label} onClick={onNewSession} />
 }

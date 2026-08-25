@@ -4,8 +4,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DesktopRegistryConnection } from '@/global'
 
 import { Tip } from '@/components/ui/tooltip'
+import { $connection } from '@/store/session'
+import { $connectionsRegistry } from '@/store/connections'
 
-import { NewSessionSourcePicker } from './new-session-source-picker'
+import { NewSessionSourcePicker, SourceAwareAddButton } from './new-session-source-picker'
 
 // Radix menus use pointer capture; jsdom does not implement it.
 Element.prototype.hasPointerCapture ??= () => false
@@ -152,5 +154,46 @@ describe('NewSessionSourcePicker', () => {
     })
 
     await waitFor(() => expect(screen.getByText('Homelab')).toBeDefined())
+  })
+})
+
+describe('SourceAwareAddButton', () => {
+  afterEach(() => {
+    $connectionsRegistry.set(null)
+    $connection.set(null)
+  })
+
+  it('opens the source picker when more than one gateway is registered', async () => {
+    $connection.set({ connectionId: 'local', mode: 'local' } as never)
+    $connectionsRegistry.set({
+      connections: [
+        connection('local', 'This device', 'local'),
+        connection('homelab', 'Homelab', 'remote')
+      ],
+      lastUsed: 'local',
+      launchMode: 'primary',
+      primary: 'local',
+      secureTokenStorage: true,
+      version: 2
+    })
+
+    const onPickSource = vi.fn()
+
+    render(
+      <SourceAwareAddButton
+        label="New session in bragi"
+        onNewSession={vi.fn()}
+        onPickSource={onPickSource}
+      />
+    )
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'New session in bragi' }), {
+      button: 0,
+      pointerType: 'mouse'
+    })
+
+    await waitFor(() => expect(screen.getByText('Homelab')).toBeDefined())
+    fireEvent.click(screen.getByText('Homelab'))
+    await waitFor(() => expect(onPickSource).toHaveBeenCalledWith('homelab'))
   })
 })

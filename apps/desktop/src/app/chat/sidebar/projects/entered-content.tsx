@@ -13,6 +13,7 @@ import { notifyError } from '@/store/notifications'
 import { removeWorktreePath } from '@/store/projects'
 
 import { SidebarRowStack } from '../chrome'
+import { SourceAwareAddButton } from '../new-session-source-picker'
 
 import { useWorkspaceNodeOpen } from './model'
 import { SidebarWorkspaceGroup } from './workspace-group'
@@ -23,7 +24,7 @@ import {
   type SidebarSessionGroup,
   type SidebarWorkspaceTree
 } from './workspace-groups'
-import { WorkspaceAddButton, WorkspaceHeader } from './workspace-header'
+import { WorkspaceHeader } from './workspace-header'
 
 // The entered project's body. Main-checkout sessions render directly — no
 // redundant repo/branch header (the breadcrumb already names the project). Only
@@ -33,6 +34,7 @@ export function EnteredProjectContent({
   project,
   renderRows,
   onNewSession,
+  onStartSessionOnSource,
   repoWorktrees,
   liveSessions,
   removedSessionIds
@@ -40,6 +42,7 @@ export function EnteredProjectContent({
   project: SidebarProjectTree
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
+  onStartSessionOnSource?: (connectionId: string, path?: null | string) => void
   repoWorktrees?: Record<string, HermesGitWorktree[]>
   liveSessions?: SessionInfo[]
   removedSessionIds?: ReadonlySet<string>
@@ -64,6 +67,7 @@ export function EnteredProjectContent({
           key={repo.id}
           liveSessions={liveSessions}
           onNewSession={onNewSession}
+          onStartSessionOnSource={onStartSessionOnSource}
           removedSessionIds={removedSessionIds}
           renderRows={renderRows}
           repo={repo}
@@ -79,6 +83,7 @@ function RepoFlatSection({
   showHeader,
   renderRows,
   onNewSession,
+  onStartSessionOnSource,
   discoveredWorktrees,
   liveSessions,
   removedSessionIds
@@ -87,6 +92,7 @@ function RepoFlatSection({
   showHeader: boolean
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
+  onStartSessionOnSource?: (connectionId: string, path?: null | string) => void
   discoveredWorktrees?: HermesGitWorktree[]
   liveSessions?: SessionInfo[]
   removedSessionIds?: ReadonlySet<string>
@@ -166,6 +172,7 @@ function RepoFlatSection({
           // The kanban bucket is read-only: it aggregates many task worktrees, so
           // "new session here" and "remove worktree" have no single target.
           onNewSession={group.isKanban ? undefined : onNewSession}
+          onStartSessionOnSource={group.isKanban ? undefined : onStartSessionOnSource}
           onRemove={group.isMain || group.isKanban ? undefined : () => setRemoveTarget(group)}
           renderRows={renderRows}
         />
@@ -236,15 +243,21 @@ function RepoFlatSection({
     <SidebarRowStack>
       <WorkspaceHeader
         action={
-          onNewSession && (
-            <WorkspaceAddButton
+          (onNewSession || onStartSessionOnSource) && (
+            <SourceAwareAddButton
               label={s.newSessionIn(repo.label)}
-              onClick={() => {
-                // Reveal the repo the new session targets if the user had it
-                // collapsed — the session lands in one of its lanes.
+              onNewSession={() => {
                 setWorkspaceNodeOpen(repo.id, true)
-                onNewSession(repo.path)
+                onNewSession?.(repo.path)
               }}
+              onPickSource={
+                onStartSessionOnSource
+                  ? id => {
+                      setWorkspaceNodeOpen(repo.id, true)
+                      onStartSessionOnSource(id, repo.path)
+                    }
+                  : undefined
+              }
             />
           )
         }

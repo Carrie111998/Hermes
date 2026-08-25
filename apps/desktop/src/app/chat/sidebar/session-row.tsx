@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { memo } from 'react'
 import type * as React from 'react'
 
-import { ConnectionOriginTag } from '@/app/chat/connection-origin-tag'
+import { ConnectionOriginTag, visibleSessionOrigin } from '@/app/chat/connection-origin-tag'
 import { PrTag } from '@/app/chat/pr-tag'
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
@@ -26,6 +26,7 @@ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { $sidebarRowMeta } from '@/store/layout'
 import { normalizeProfileKey } from '@/store/profile'
 import { $projects } from '@/store/projects'
@@ -75,10 +76,9 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
    *  flat cross-profile lists — Pinned and search results in the All-profiles
    *  view — where no group header communicates ownership (#66003). */
   showProfile?: boolean
-  /** Tag the row with its owning CONNECTION (the gateway-origin chip). Passed
-   *  the active gateway when it is a remote/SSH/cloud source, so a session
-   *  list browsed on a foreign connection is clearly labelled as belonging to
-   *  that gateway instead of silently appearing in the local profile's view. */
+  /** Section-level origin (foreign-gateway lists). Rows also resolve from
+   *  `session.connection_id` when this is unset, so a mixed local list still
+   *  names the SSH/remote session. */
   connection?: DesktopRegistryConnection | null
   /** Inbox-style card: workspace header, title + last-message preview, and a
    *  model · size footer. The flat recents list opts in via the filter menu;
@@ -171,6 +171,9 @@ function SidebarSessionRowImpl({
   // rather than threaded as props: the subscription re-renders past the memo
   // below, and a toggle should repaint every row at once anyway.
   const rowMeta = useStore($sidebarRowMeta)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
+  const origin = visibleSessionOrigin(session, registry, activeConnectionId, connection)
   // Pinned metadata occupies the actions slot and swaps out for the kebab on
   // hover, so the row reserves the same width either way and never reflows.
   const pinnedAge = rowMeta.includes('updated')
@@ -208,11 +211,9 @@ function SidebarSessionRowImpl({
   // to the left of the kebab's own column: never flush right, never swapping.
   const trailing: { key: string; node: React.ReactNode }[] = []
 
-  // The gateway origin leads the chips: it names the connection the whole
-  // list belongs to (only set for remote/SSH/cloud sources), before the
-  // per-row profile ownership.
-  if (connection) {
-    trailing.push({ key: 'origin', node: <ConnectionOriginTag connection={connection} /> })
+  // Foreign-gateway mark leads the chips. Local "This device" stays unlabeled.
+  if (origin) {
+    trailing.push({ key: 'origin', node: <ConnectionOriginTag connection={origin} /> })
   }
 
   if ((showProfile || pinnedProfile) && hasProfileTag) {

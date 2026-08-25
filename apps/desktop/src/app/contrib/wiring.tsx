@@ -73,6 +73,7 @@ import {
   $selectedStoredSessionId,
   $sessionResumeRequest,
   $sessions,
+  getSessionOwnerHint,
   knownSessionProfile,
   sessionMatchesStoredId,
   sessionPinId,
@@ -359,6 +360,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       let owner: SessionOwnerScope =
         (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
+        (routingSessionId ? getSessionOwnerHint(routingSessionId) : undefined) ??
         knownSessionProfile($sessions.get(), routingSessionId)
 
       if (!owner && routingSessionId) {
@@ -1051,8 +1053,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onNavigate: selectSidebarItem,
     onNewSessionInWorkspace: path => startSessionInWorkspace(path, { openTab: true }),
     onNewSessionSplit: dir => void openNewSessionTile(dir),
-    onStartSessionOnSource: connectionId =>
-      startSessionOnSource(connectionId, startFreshSessionDraft).catch(error => {
+    onStartSessionOnSource: (connectionId, path) =>
+      startSessionOnSource(connectionId, () => {
+        if (path !== undefined) {
+          startSessionInWorkspace(path, { openTab: true })
+        } else {
+          startFreshSessionDraft()
+        }
+      }).catch(error => {
         const detail = error instanceof Error && error.message ? ` ${error.message}` : ''
         notify({ kind: 'error', message: t.settings.connections.startFailed + detail })
       }),

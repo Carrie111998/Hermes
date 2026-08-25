@@ -1,5 +1,5 @@
 import { Tip } from '@/components/ui/tooltip'
-import type { DesktopRegistryConnection } from '@/global'
+import type { DesktopConnectionsRegistry, DesktopRegistryConnection } from '@/global'
 import { useI18n } from '@/i18n'
 import { Cloud, Monitor, Network, Terminal } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -11,13 +11,57 @@ const KIND_ICON: Record<DesktopRegistryConnection['kind'], typeof Monitor> = {
   ssh: Terminal
 }
 
+const KIND_KEY = {
+  local: 'kindLocal',
+  remote: 'kindRemote',
+  cloud: 'kindCloud',
+  ssh: 'kindSsh'
+} as const
+
+/** The gateway a row/group should name, or null when it is the local default. */
+export function visibleSessionOrigin(
+  session: { connection_id?: string },
+  registry: DesktopConnectionsRegistry | null | undefined,
+  activeConnectionId: string | null,
+  section?: DesktopRegistryConnection | null
+): DesktopRegistryConnection | null {
+  const origin =
+    (section && section.kind !== 'local' ? section : null) ??
+    registry?.connections.find(connection => connection.id === (session.connection_id || activeConnectionId)) ??
+    null
+
+  return origin && origin.kind !== 'local' ? origin : null
+}
+
+/** Shared foreign origin when every session in a group runs on the same gateway. */
+export function sharedSessionsOrigin(
+  sessions: { connection_id?: string }[],
+  registry: DesktopConnectionsRegistry | null | undefined,
+  activeConnectionId: string | null
+): DesktopRegistryConnection | null {
+  if (sessions.length === 0) {
+    return null
+  }
+
+  const first = visibleSessionOrigin(sessions[0], registry, activeConnectionId)
+
+  if (!first) {
+    return null
+  }
+
+  for (const session of sessions) {
+    if (visibleSessionOrigin(session, registry, activeConnectionId)?.id !== first.id) {
+      return null
+    }
+  }
+
+  return first
+}
+
 /**
- * Gateway-origin chip: a session's owning connection as an icon + label. The
- * mirror of {@link ProfileTag} (#66003) but on the CONNECTION axis — a row
- * that runs on a remote/SSH/cloud gateway shows a small badge naming that
- * gateway, so browsing a foreign connection's sessions is explicit instead of
- * silent. Local "This device" sessions need no badge (the normal case) and
- * are gated out at the call site.
+ * Gateway-origin mark: icon + label naming the connection a session/group runs
+ * on. Quiet by design (Cursor's gray host suffix) so a mixed list stays
+ * scannable. Local "This device" is gated out at the call site.
  */
 export function ConnectionOriginTag({
   className,
@@ -28,30 +72,21 @@ export function ConnectionOriginTag({
 }) {
   const { t } = useI18n()
   const Icon = KIND_ICON[connection.kind]
-
-  const kindKey =
-    connection.kind === 'local'
-      ? 'kindLocal'
-      : connection.kind === 'remote'
-        ? 'kindRemote'
-        : connection.kind === 'cloud'
-          ? 'kindCloud'
-          : 'kindSsh'
-
-  const label = `${connection.label} · ${t.settings.connections[kindKey]}`
+  const label = `${connection.label} · ${t.settings.connections[KIND_KEY[connection.kind]]}`
 
   return (
     <Tip label={label}>
       <span
         aria-label={label}
         className={cn(
-          'inline-flex items-center gap-1 rounded-[4px] bg-(--ui-control-active-background)/50 px-1 py-0.5',
-          'text-[0.625rem] leading-none text-(--ui-text-secondary)',
+          'inline-flex min-w-0 items-center gap-0.5 text-[0.625rem] leading-none text-(--ui-text-quaternary)',
           className
         )}
+        data-connection-kind={connection.kind}
+        data-slot="connection-origin-tag"
         role="img"
       >
-        <Icon className="size-3 shrink-0 text-(--ui-text-tertiary)" />
+        <Icon className="size-3 shrink-0" />
         <span className="max-w-28 truncate">{connection.label}</span>
       </span>
     </Tip>

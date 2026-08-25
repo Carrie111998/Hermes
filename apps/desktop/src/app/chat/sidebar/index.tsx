@@ -301,8 +301,9 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onNavigate: (item: SidebarNavItem) => void
   /** Start a brand-new session on a specific registered source. Used by the
    *  new-session source picker; undefined on single-connection installs (where
-   *  the plain one-click new-session behavior is kept). */
-  onStartSessionOnSource?: (connectionId: string) => void
+   *  the plain one-click new-session behavior is kept). Optional `path` pins
+   *  the draft to a workspace/group cwd (null = no folder). */
+  onStartSessionOnSource?: (connectionId: string, path?: null | string) => void
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
   onResumeSession: (sessionId: string) => void
@@ -1922,6 +1923,7 @@ export function ChatSidebar({
                 // is a folder, and the new session lands in the active profile
                 // — the same one the composer would have started it in.
                 onNewSessionInWorkspace={onNewSessionInWorkspace}
+                onStartSessionOnSource={onStartSessionOnSource}
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
                 onResumeSession={onResumeSession}
