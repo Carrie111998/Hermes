@@ -442,6 +442,7 @@ def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch
         claim_expires=None,
         tenant=None,
         current_run_id=3,
+        branch_name="review/exact-branch",
         require_role_contract=True,
         expected_role_contract_sha256=hashlib.sha256(raw).hexdigest(),
     )
@@ -452,6 +453,7 @@ def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch
     assert captured["env"]["HERMES_ROLE_CONTRACT_SCHEMA"] == "hermes-role-contract/v2"
     assert len(captured["env"]["HERMES_ROLE_CONTRACT_SHA256"]) == 64
     assert len(captured["env"]["HERMES_ROLE_CONTRACT_RECEIPT_ID"]) == 64
+    assert task._role_contract_admission.branch_name == "review/exact-branch"
 
 
 def test_default_spawn_pins_prefixed_runtime_identity(board, monkeypatch, tmp_path):

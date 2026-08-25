@@ -13,6 +13,8 @@ The plugin router is attached to a bare FastAPI app — same approach as
 from __future__ import annotations
 
 import importlib.util
+import inspect
+import os
 import sys
 from pathlib import Path
 
@@ -138,6 +140,77 @@ def test_completion_artifact_ingestion_rejects_symlink(kanban_home):
         assert kb.list_attachments(conn, task_id) == []
     finally:
         conn.close()
+
+
+def test_completion_artifact_ingestion_rejects_same_inode_source_mutation(
+    kanban_home, monkeypatch
+):
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        workspace.mkdir(parents=True, exist_ok=True)
+        kb.set_workspace_path(conn, task_id, workspace)
+        source = workspace / "mutable.bin"
+        source.write_bytes(b"A" * 4096)
+        real_read = os.read
+        mutated = False
+
+        def mutating_read(fd, size):
+            nonlocal mutated
+            chunk = real_read(fd, size)
+            if chunk and not mutated:
+                mutated = True
+                source.write_bytes(b"B" * 4096)
+            return chunk
+
+        monkeypatch.setattr(kb.os, "read", mutating_read)
+        with pytest.raises(kb.ArtifactPreservationError, match="changed while being preserved"):
+            kb._persist_scratch_completion_artifacts(
+                conn, task_id, {"artifacts": [str(source)]}
+            )
+    finally:
+        conn.close()
+
+
+def test_completion_artifact_admission_rejects_destination_replacement(
+    kanban_home, monkeypatch
+):
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        workspace.mkdir(parents=True, exist_ok=True)
+        kb.set_workspace_path(conn, task_id, workspace)
+        source = workspace / "result.bin"
+        source.write_bytes(b"trusted")
+        original_insert = kb._insert_completion_attachment
+        replaced_paths = []
+
+        def replace_then_insert(*args, stored_path, **kwargs):
+            path = Path(stored_path)
+            replaced_paths.append(path)
+            replacement = path.with_name(path.name + ".replacement")
+            replacement.write_bytes(b"hostile")
+            replacement.replace(path)
+            return original_insert(*args, stored_path=stored_path, **kwargs)
+
+        monkeypatch.setattr(kb, "_insert_completion_attachment", replace_then_insert)
+        with pytest.raises(kb.ArtifactPreservationError, match="changed before hashing"):
+            kb.complete_task(conn, task_id, metadata={"artifacts": [str(source)]})
+        assert kb.list_attachments(conn, task_id) == []
+        assert replaced_paths and all(not path.exists() for path in replaced_paths)
+    finally:
+        conn.close()
+
+
+def test_completion_artifact_ingestion_has_no_procfs_dependency():
+    source = inspect.getsource(kb._persist_scratch_completion_artifacts)
+    assert "/proc/self/fd" not in source
 
 
 def test_attachments_root_is_per_board(kanban_home, monkeypatch):

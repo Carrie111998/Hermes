@@ -65,6 +65,90 @@ def test_intake_rejects_unsafe_implementation_contract(tmp_path):
     assert exc.value.code == "IMPLEMENTATION_PROFILE_AUTHORITY_WIDENED"
 
 
+def test_intake_rejects_forged_narrow_authority_for_wider_hash_bound_contract(
+    tmp_path, monkeypatch
+):
+    supplied = {
+        **FROZEN,
+        "02-builder": {
+            "schema": "hermes-role-contract/v2",
+            "version": "1.0.0",
+            "sha256": "c" * 64,
+            "allowed_toolsets": ["file", "kanban"],
+            "allowed_tools": ["read_file"],
+            "workspace_only": True,
+        },
+    }
+    monkeypatch.setattr(
+        controller,
+        "_installed_implementation_contract",
+        lambda _profile: {
+            "schema": "hermes-role-contract/v2",
+            "version": "1.0.0",
+            "sha256": "c" * 64,
+            "allowed_toolsets": ["file", "kanban", "terminal"],
+            "allowed_tools": ["read_file", "terminal"],
+            "workspace_only": False,
+        },
+    )
+    with pytest.raises(controller.PipelineControlError) as exc:
+        controller.register_intake(
+            specification_id="forged-narrow-contract",
+            revision=1,
+            artifact_bytes=ARTIFACT,
+            frozen_profiles=supplied,
+            authority_ceiling=["plan"],
+            db_path=tmp_path / "control.db",
+        )
+    assert exc.value.code == "IMPLEMENTATION_PROFILE_RECEIPT_MISMATCH"
+
+
+def test_intake_derives_authority_from_exact_installed_contract(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "02-builder"
+    profile.mkdir(parents=True)
+    raw = b"""---
+schema: hermes-role-contract/v2
+profile: 02-builder
+version: 1.0.0
+allowed_toolsets:
+  - file
+  - kanban
+allowed_tools:
+  - read_file
+  - kanban_show
+workspace_only: true
+---
+# Exact Builder contract
+Only the exact admitted file and Kanban tools are available.
+"""
+    profile.joinpath("ROLE_CONTRACT.md").write_bytes(raw)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    frozen = {
+        **FROZEN,
+        "02-builder": {
+            "schema": "hermes-role-contract/v2",
+            "version": "1.0.0",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "allowed_toolsets": ["file", "kanban"],
+            "allowed_tools": ["kanban_show", "read_file"],
+            "workspace_only": True,
+        },
+    }
+    intake = controller.register_intake(
+        specification_id="exact-installed-contract",
+        revision=1,
+        artifact_bytes=ARTIFACT,
+        frozen_profiles=frozen,
+        authority_ceiling=["plan"],
+        db_path=tmp_path / "control.db",
+    )
+    assert intake["frozen_profiles"]["02-builder"] == frozen["02-builder"]
+
+
 def _decide(control_db, intake, *, action="approve", request_id="request-1", feedback=None):
     return controller.record_decision(
         run_id=intake["run_id"],

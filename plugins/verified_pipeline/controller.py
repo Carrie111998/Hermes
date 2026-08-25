@@ -27,6 +27,8 @@ import stat
 import time
 from typing import Any, Callable, Iterator, Mapping, Optional
 
+from hermes_cli.profiles import get_profile_dir
+from hermes_cli.role_contract import RoleContractError, load_role_contract
 from plugins.plugin_storage import plugin_data_dir
 
 
@@ -97,6 +99,30 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _installed_implementation_contract(profile: str) -> dict[str, Any]:
+    """Derive authority from the exact installed, hash-bound contract bytes."""
+    try:
+        contract = load_role_contract(get_profile_dir(profile), profile, required=True)
+    except (FileNotFoundError, RoleContractError, ValueError) as exc:
+        raise PipelineControlError(
+            "IMPLEMENTATION_PROFILE_UNVERIFIABLE",
+            f"{profile} installed role contract could not be verified",
+        ) from exc
+    if contract is None:  # pragma: no cover - required=True is fail-closed
+        raise PipelineControlError(
+            "IMPLEMENTATION_PROFILE_UNVERIFIABLE",
+            f"{profile} installed role contract is missing",
+        )
+    return {
+        "schema": contract.schema,
+        "version": contract.version,
+        "sha256": contract.sha256,
+        "allowed_toolsets": list(contract.allowed_toolsets),
+        "allowed_tools": list(contract.allowed_tools),
+        "workspace_only": contract.workspace_only,
+    }
 
 
 def _default_db_path() -> Path:
@@ -296,6 +322,11 @@ def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
                     "workspace_only": True,
                 }
             )
+            if normalized_receipt != _installed_implementation_contract(name):
+                raise PipelineControlError(
+                    "IMPLEMENTATION_PROFILE_RECEIPT_MISMATCH",
+                    f"{name} frozen authority does not match its exact installed contract bytes",
+                )
         normalized[name] = normalized_receipt
     for required in (PLANNER_PROFILE,):
         if required not in normalized:

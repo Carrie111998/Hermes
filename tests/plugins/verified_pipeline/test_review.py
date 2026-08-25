@@ -72,6 +72,16 @@ os.environ[release.AUTHORITY_POLICY_PIN_ENV] = hashlib.sha256(
 release = importlib.reload(release)
 
 
+@pytest.fixture(autouse=True)
+def _bind_installed_contract_inventory_to_frozen_fixture(monkeypatch):
+    """Synthetic review tests use FROZEN as their exact installed inventory."""
+    monkeypatch.setattr(
+        controller,
+        "_installed_implementation_contract",
+        lambda profile: dict(FROZEN[profile]),
+    )
+
+
 def _setup(tmp_path: Path, *, frozen=FROZEN, authority=None):
     control_db = tmp_path / "control.db"
     kanban_db_path = tmp_path / "kanban.db"
@@ -157,15 +167,20 @@ def _admit_fixture_run(conn, task_id: str) -> tuple[object, int]:
     assert task is not None
     run_id = int(task.current_run_id)
     workspace = str(Path(task.workspace_path).resolve()) if task.workspace_path else None
+    frozen_contract = FROZEN.get(task.assignee, {})
+    implementation_role = task.assignee in controller.IMPLEMENTATION_PROFILES
+    allowed_toolsets = frozen_contract.get("allowed_toolsets", []) if implementation_role else []
+    allowed_tools = frozen_contract.get("allowed_tools", []) if implementation_role else []
+    workspace_only = frozen_contract.get("workspace_only", False) if implementation_role else False
     basis = {
         "schema": "hermes-role-contract/v2",
         "profile": task.assignee,
         "version": "1.0.0",
         "contract_sha256": task.expected_role_contract_sha256,
         "configured_toolsets": [],
-        "allowed_toolsets": [],
-        "allowed_tools": [],
-        "workspace_only": False,
+        "allowed_toolsets": list(allowed_toolsets),
+        "allowed_tools": list(allowed_tools),
+        "workspace_only": workspace_only,
         "mandatory_toolsets": ["kanban"],
         "effective_toolsets": ["kanban"],
         "task_id": task.id,
@@ -1967,6 +1982,60 @@ def test_execution_completion_rejects_terminal_profile_drift(tmp_path):
             db_path=control_db, kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_STAGE_RUN_MISMATCH"
+
+
+def test_execution_completion_rejects_self_consistent_narrow_authority_forgery(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    verify_id = projected["task_map"]["verify"]
+    _complete(kanban_path, verify_id)
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        row = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? AND status = 'done'",
+            (verify_id,),
+        ).fetchone()
+        metadata = json.loads(row["metadata"])
+        forged = metadata["role_contract_admission"]
+        forged["allowed_tools"] = ["read_file"]
+        basis_keys = (
+            "schema", "profile", "version", "contract_sha256", "configured_toolsets",
+            "allowed_toolsets", "allowed_tools", "workspace_only", "mandatory_toolsets",
+            "effective_toolsets", "task_id", "run_id", "workspace_path", "branch_name",
+        )
+        forged["receipt_id"] = hashlib.sha256(
+            json.dumps(
+                {key: forged[key] for key in basis_keys},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, sort_keys=True), row["id"]),
+            )
+            event = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? "
+                "AND kind = 'role_contract_admitted' ORDER BY id DESC LIMIT 1",
+                (verify_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(forged, sort_keys=True), event["id"]),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_STAGE_RECEIPT_MISMATCH"
 
 
 def test_execution_rejects_tampered_arm_receipts_on_replay_and_completion(tmp_path):

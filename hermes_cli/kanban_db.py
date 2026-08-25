@@ -5568,16 +5568,27 @@ def complete_task(
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
-                _insert_completion_attachment(
-                    conn,
-                    task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
-                    created_at=now,
-                )
+            staged_receipts = metadata.pop("_staged_artifact_receipts", [])
+            try:
+                for receipt in staged_receipts:
+                    _insert_completion_attachment(
+                        conn,
+                        task_id,
+                        filename=Path(receipt["stored_path"]).name,
+                        stored_path=receipt["stored_path"],
+                        size=receipt["size"],
+                        expected_sha256=receipt["sha256"],
+                        expected_device=receipt["device"],
+                        expected_inode=receipt["inode"],
+                        created_at=now,
+                    )
+            except Exception:
+                for receipt in staged_receipts:
+                    try:
+                        Path(receipt["stored_path"]).unlink(missing_ok=True)
+                    except (KeyError, OSError, TypeError):
+                        pass
+                raise
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -5779,6 +5790,7 @@ def _persist_scratch_completion_artifacts(
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
+    staged_receipts: list[dict[str, Any]] = []
     used_destinations: set[Path] = set()
     changed = False
     aggregate_size = 0
@@ -5813,11 +5825,20 @@ def _persist_scratch_completion_artifacts(
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             )
             source_stat = os.fstat(source_fd)
-            descriptor_path = Path(f"/proc/self/fd/{source_fd}").resolve()
+            source_path_stat = os.stat(lexical_src, follow_symlinks=False)
+            relative_parts = lexical_src.relative_to(workspace_root).parts
+            current = workspace_root
+            has_symlink_component = False
+            for part in relative_parts:
+                current /= part
+                if stat.S_ISLNK(os.lstat(current).st_mode):
+                    has_symlink_component = True
+                    break
             if (
                 not stat.S_ISREG(source_stat.st_mode)
-                or not descriptor_path.is_relative_to(workspace_root)
-                or descriptor_path != lexical_src
+                or has_symlink_component
+                or source_path_stat.st_dev != source_stat.st_dev
+                or source_path_stat.st_ino != source_stat.st_ino
             ):
                 raise ArtifactPreservationError(
                     f"declared artifact is not a confined regular file: {artifact}"
@@ -5836,16 +5857,18 @@ def _persist_scratch_completion_artifacts(
             dest = _unique_attachment_path(attachment_dir, lexical_src.name, used_destinations)
             destination_fd = os.open(
                 dest,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
             copied = 0
+            source_digest = hashlib.sha256()
             while chunk := os.read(source_fd, 1024 * 1024):
                 copied += len(chunk)
                 if copied > source_stat.st_size or copied > KANBAN_ATTACHMENT_MAX_BYTES:
                     raise ArtifactPreservationError(
                         f"declared scratch artifact grew beyond the size limit: {artifact}"
                     )
+                source_digest.update(chunk)
                 view = memoryview(chunk)
                 while view:
                     written = os.write(destination_fd, view)
@@ -5858,12 +5881,40 @@ def _persist_scratch_completion_artifacts(
             if (
                 after.st_dev != source_stat.st_dev
                 or after.st_ino != source_stat.st_ino
+                or after.st_size != source_stat.st_size
+                or after.st_mtime_ns != source_stat.st_mtime_ns
+                or after.st_ctime_ns != source_stat.st_ctime_ns
                 or not stat.S_ISREG(after.st_mode)
             ):
                 raise ArtifactPreservationError(
                     f"declared scratch artifact identity changed while being preserved: {artifact}"
                 )
             os.fsync(destination_fd)
+            destination_stat = os.fstat(destination_fd)
+            os.lseek(destination_fd, 0, os.SEEK_SET)
+            destination_digest = hashlib.sha256()
+            destination_size = 0
+            while chunk := os.read(destination_fd, 1024 * 1024):
+                destination_size += len(chunk)
+                destination_digest.update(chunk)
+            if (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or destination_size != copied
+                or destination_stat.st_size != copied
+                or destination_digest.digest() != source_digest.digest()
+            ):
+                raise ArtifactPreservationError(
+                    f"preserved artifact snapshot did not match its source descriptor: {artifact}"
+                )
+            staged_receipts.append(
+                {
+                    "stored_path": str(dest.absolute()),
+                    "size": copied,
+                    "sha256": destination_digest.hexdigest(),
+                    "device": destination_stat.st_dev,
+                    "inode": destination_stat.st_ino,
+                }
+            )
         except Exception as exc:
             if dest is not None:
                 try:
@@ -5888,9 +5939,7 @@ def _persist_scratch_completion_artifacts(
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        metadata["_staged_artifact_receipts"] = staged_receipts
 
 
 def _insert_completion_attachment(
@@ -5900,6 +5949,9 @@ def _insert_completion_attachment(
     filename: str,
     stored_path: str,
     size: int,
+    expected_sha256: str,
+    expected_device: int,
+    expected_inode: int,
     created_at: int,
 ) -> None:
     """Record a worker-produced artifact with a completion-time digest."""
@@ -5913,7 +5965,12 @@ def _insert_completion_attachment(
         ) from exc
     try:
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size != size:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != size
+            or opened.st_dev != expected_device
+            or opened.st_ino != expected_inode
+        ):
             raise ArtifactPreservationError(
                 f"preserved completion artifact changed before hashing: {stored_path}"
             )
@@ -5928,6 +5985,10 @@ def _insert_completion_attachment(
     finally:
         os.close(fd)
     artifact_sha256 = digest.hexdigest()
+    if artifact_sha256 != expected_sha256:
+        raise ArtifactPreservationError(
+            f"preserved completion artifact digest changed before admission: {stored_path}"
+        )
     conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, sha256, uploaded_by, created_at) "
@@ -11176,6 +11237,7 @@ def _default_spawn(
             workspace_path=(
                 str(Path(workspace).expanduser().resolve()) if workspace else None
             ),
+            branch_name=task.branch_name,
             required=bool(task.require_role_contract),
         )
         setattr(task, "_role_contract_admission", admission)

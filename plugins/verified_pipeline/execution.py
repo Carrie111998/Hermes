@@ -1075,6 +1075,16 @@ def _implementation_stage_receipt(
         or admission.get("schema") != expected_contract.get("schema")
         or admission.get("version") != expected_contract.get("version")
         or admission.get("contract_sha256") != expected_contract.get("sha256")
+        or (
+            expected_profile in controller.IMPLEMENTATION_PROFILES
+            and (
+                sorted(admission.get("allowed_toolsets") or [])
+                != sorted(expected_contract.get("allowed_toolsets") or [])
+                or sorted(admission.get("allowed_tools") or [])
+                != sorted(expected_contract.get("allowed_tools") or [])
+                or admission.get("workspace_only") is not expected_contract.get("workspace_only")
+            )
+        )
     ):
         raise ExecutionError(
             "EXECUTION_STAGE_RECEIPT_MISMATCH",
