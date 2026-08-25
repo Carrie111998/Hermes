@@ -142,7 +142,12 @@ class TestReadJournalMode:
             holder.close()
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(
+        # POSIX-only, and skipif conditions run at collection time — see the
+        # note on test_unreadable_file_is_reported_as_permission_denied.
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores file permissions",
+    )
     def test_read_only_directory_is_still_readable(self, tmp_path):
         db = tmp_path / "state.db"
         _make_db(db, journal_mode="WAL")
@@ -278,9 +283,18 @@ class TestLiveConnectionSafety:
 
 class TestUnreadableReason:
     def test_missing_file_keeps_the_os_error_text(self, tmp_path):
-        reason = doctor._unreadable_reason(tmp_path / "gone.db")
+        missing = tmp_path / "gone.db"
+        # The OS wording differs by platform ("No such file or directory" on
+        # POSIX, "The system cannot find the file specified" on Windows). Take
+        # it from the same call doctor makes instead of pinning one platform.
+        with pytest.raises(OSError) as excinfo:
+            missing.stat()
+        expected = excinfo.value.strerror
+        assert expected, "a blank strerror would make the check below vacuous"
 
-        assert "No such file or directory" in reason
+        reason = doctor._unreadable_reason(missing)
+
+        assert expected in reason
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
     @pytest.mark.skipif(
@@ -363,7 +377,10 @@ class TestReportDatabaseJournalModes:
         assert "state.db is in WAL mode" in out
         assert "projects.db: rollback journal mode" in out
         assert "kanban.db: rollback journal mode" in out
-        assert "kanban/boards/myboard/kanban.db is in WAL mode" in out
+        # doctor renders the relative path with the platform's own separator,
+        # so build the expected label the same way rather than assuming POSIX.
+        board_label = os.path.join("kanban", "boards", "myboard", "kanban.db")
+        assert f"{board_label} is in WAL mode" in out
 
     def test_missing_databases_are_skipped(self, tmp_path, capsys):
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
@@ -387,7 +404,12 @@ class TestReportDatabaseJournalModes:
         assert "state.db: rollback journal mode" in out
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(
+        # POSIX-only, and skipif conditions run at collection time — see the
+        # note on test_unreadable_file_is_reported_as_permission_denied.
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores file permissions",
+    )
     def test_unreadable_database_does_not_crash(self, tmp_path, capsys):
         db = tmp_path / "state.db"
         _make_db(db)
