@@ -5739,6 +5739,46 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     return bool(supports)
 
 
+# Reasons the user's MAIN provider cannot serve a vision task. These are the
+# exact strings logged by the auto-detect fall-through, kept as constants so
+# the two callers below can branch on the decision without re-deriving it.
+_VISION_BLOCK_NO_SUPPORT = "no vision support"
+_VISION_BLOCK_NO_CAPABILITY = "reports no vision capability"
+
+
+def _main_provider_vision_block(
+    provider: str,
+    vision_model: Optional[str],
+) -> Optional[str]:
+    """Return why ``provider``/``vision_model`` cannot serve vision, else None.
+
+    **This is the single main-provider vision capability test.** It exists
+    because there are two entry points that must agree on the answer --
+    :func:`resolve_vision_provider_client`, which ACTS on it, and
+    :func:`get_available_vision_backends`, which REPORTS on it -- and they
+    did not agree until 2026-08-25.
+
+    The bug: ``get_available_vision_backends`` step 1 called
+    ``resolve_provider_client(main_provider, _read_main_model())`` and
+    appended the provider whenever any client came back, applying neither
+    guard. So on a deepseek main provider it returned ``['deepseek']`` while
+    ``resolve_vision_provider_client()`` returned ``(None, None, None)``,
+    and ``hermes setup`` printed "Vision (image analysis)" as configured for
+    a runtime that could not serve a single image. That asymmetry was
+    harmless only while an aggregator was left in
+    :data:`_VISION_AUTO_PROVIDER_ORDER` to absorb it; emptying that tuple
+    (5babbc569c) made this guard the ONLY thing separating the two answers.
+
+    Do not inline these checks back into either caller. Any new main-provider
+    vision precondition belongs here so both paths inherit it.
+    """
+    if provider in _PROVIDERS_WITHOUT_VISION:
+        return _VISION_BLOCK_NO_SUPPORT
+    if not _main_model_supports_vision(provider, vision_model):
+        return _VISION_BLOCK_NO_CAPABILITY
+    return None
+
+
 def _normalize_vision_provider(provider: Optional[str]) -> str:
     return _normalize_aux_provider(provider)
 
@@ -5788,9 +5828,21 @@ def _strict_vision_backend_available(provider: str) -> bool:
 def get_available_vision_backends() -> List[str]:
     """Return the currently available vision backends in auto-selection order.
 
-    Order: active provider → ``_VISION_AUTO_PROVIDER_ORDER`` → stop.  This
-    is the single source of truth for setup, tool gating, and runtime
-    auto-routing of vision tasks.
+    Order: active provider → ``_VISION_AUTO_PROVIDER_ORDER`` → stop.
+
+    This REPORTS on vision availability; :func:`resolve_vision_provider_client`
+    ACTS on it. The two must never disagree, so both take their main-provider
+    verdict from :func:`_main_provider_vision_block` and probe the same
+    (vision, not chat) model -- see that helper for the 2026-08-25 bug where
+    they did disagree and ``hermes setup`` advertised vision the runtime
+    returned nothing for.
+
+    The sole production caller is ``hermes_cli/setup.py`` (the "Tool
+    Availability Summary" line). This is NOT a tool gate today: the vision
+    tools themselves call ``resolve_vision_provider_client`` directly. An
+    earlier version of this docstring claimed "setup, tool gating, and
+    runtime auto-routing"; only the first is real, and the claim is what made
+    the disagreement look harmless.
 
     That aggregator tuple is currently EMPTY (see its definition), so this
     returns either ``[main_provider]`` or ``[]``. An empty result is a
@@ -5804,9 +5856,22 @@ def get_available_vision_backends() -> List[str]:
             if _strict_vision_backend_available(main_provider):
                 available.append(main_provider)
         else:
-            client, _ = resolve_provider_client(main_provider, _read_main_model())
-            if client is not None:
-                available.append(main_provider)
+            # Mirror resolve_vision_provider_client()'s auto path exactly:
+            # the provider's dedicated vision model (not its chat model)
+            # wins, the shared capability guard decides, and the probe is
+            # flagged is_vision. Reporting on a different question than the
+            # runtime answers is what made this function advertise vision
+            # that no vision call could serve.
+            vision_model = (
+                _resolve_provider_vision_default(main_provider)
+                or _read_main_model()
+            )
+            if not _main_provider_vision_block(main_provider, vision_model):
+                client, _ = resolve_provider_client(
+                    main_provider, vision_model, is_vision=True
+                )
+                if client is not None:
+                    available.append(main_provider)
     # 2. Aggregator fallbacks — skip any already covered by the main
     #    provider. This tuple is empty today, so the loop is a no-op; it
     #    stays so that restoring an aggregator is a one-line change.
@@ -5893,6 +5958,15 @@ def resolve_vision_provider_client(
             # trusted to catch that. Only fall back to the chat model when no
             # provider default is available (catalog unreachable).
             vision_model = _resolve_provider_vision_default(main_provider) or main_model
+            # One capability verdict, shared with get_available_vision_backends()
+            # so availability reporting can never contradict what happens here.
+            # Skipped for nous: its branch below takes precedence and never
+            # consults this, so computing it would only buy a wasted config
+            # load and capability lookup on every nous vision resolution.
+            vision_block = (
+                None if main_provider == "nous"
+                else _main_provider_vision_block(main_provider, vision_model)
+            )
             if main_provider == "nous":
                 sync_client, default_model = _resolve_strict_vision_backend(
                     main_provider, vision_model
@@ -5903,7 +5977,7 @@ def resolve_vision_provider_client(
                         main_provider, default_model or resolved_model or main_model,
                     )
                     return _finalize(main_provider, sync_client, default_model)
-            elif main_provider in _PROVIDERS_WITHOUT_VISION:
+            elif vision_block == _VISION_BLOCK_NO_SUPPORT:
                 # Kimi Coding Plan's /coding endpoint (Anthropic Messages wire)
                 # does not accept image input — Kimi's own docs say "Current
                 # model does not support image input, switch to a model with
@@ -5916,7 +5990,7 @@ def resolve_vision_provider_client(
                     "vision support) — falling through to aggregator chain",
                     main_provider,
                 )
-            elif not _main_model_supports_vision(main_provider, vision_model):
+            elif vision_block:
                 # The main model is known to be text-only (e.g. DeepSeek V4,
                 # gpt-oss-120b without vision). Building a client and sending
                 # an image would produce a cryptic provider-side error like

@@ -4571,6 +4571,168 @@ class TestCodexAdapterGithubResponsesMessageIdDrop:
         assert message_item["id"] == "msg_short_but_connection_scoped"
 
 
+class TestVisionAvailabilityMatchesResolution:
+    """``get_available_vision_backends`` must never advertise vision that
+    ``resolve_vision_provider_client`` cannot serve.
+
+    One REPORTS, the other ACTS. Until 2026-08-25 they disagreed: the
+    reporter called ``resolve_provider_client(main, chat_model)`` and
+    appended the provider whenever any client came back, applying neither
+    the ``_PROVIDERS_WITHOUT_VISION`` membership check nor
+    ``_main_model_supports_vision``, and probing the CHAT model rather than
+    the provider's vision model. On a deepseek main provider that produced
+    ``['deepseek']`` from one entry point and ``(None, None, None)`` from
+    the other, so ``hermes setup`` printed "Vision (image analysis)" as
+    configured for a runtime that returned nothing.
+
+    Every test here pins ``_VISION_AUTO_PROVIDER_ORDER`` to a SENTINEL
+    rather than reading the live roster -- the same lesson these vision
+    tests learned three times over: coupling to the live provider list
+    makes them break on every roster edit, and with the roster empty the
+    fall-through assertions go VACUOUS instead of failing.
+    """
+
+    def _both(self, monkeypatch, provider, model, *, supports, aggregators=()):
+        """Run both entry points against one fixture; return (available, client)."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._VISION_AUTO_PROVIDER_ORDER", aggregators,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: provider,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: model,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._main_model_supports_vision",
+            lambda p, m: supports,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client",
+            lambda p, m=None, **kw: (MagicMock(name="client"), m),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_strict_vision_backend",
+            lambda p, m=None: (None, None),
+        )
+        available = get_available_vision_backends()
+        _, client, _ = resolve_vision_provider_client()
+        return available, client
+
+    def test_text_only_main_provider_is_reported_unavailable(self, monkeypatch):
+        """The regression: a text-only main provider must satisfy BOTH.
+
+        A client IS available for the provider -- ``resolve_provider_client``
+        is stubbed to always succeed -- so the only thing that can keep it
+        out of the list is the capability guard.
+        """
+        available, client = self._both(
+            monkeypatch, "deepseek", "deepseek-v4-pro", supports=False,
+        )
+        assert available == []
+        assert client is None
+        assert bool(available) == (client is not None)
+
+    def test_vision_capable_main_provider_is_reported_available(self, monkeypatch):
+        """Positive control -- the guard must not reject everything.
+
+        Without this, ``return []`` would pass the test above and the
+        symmetry assertion would be satisfied by a function that reports
+        vision as never configured.
+        """
+        available, client = self._both(
+            monkeypatch, "anthropic", "claude-sonnet-4", supports=True,
+        )
+        assert available == ["anthropic"]
+        assert client is not None
+        assert bool(available) == (client is not None)
+
+    @pytest.mark.parametrize("provider", ["kimi-coding", "kimi-coding-cn"])
+    def test_no_vision_endpoint_provider_is_reported_unavailable(
+        self, monkeypatch, provider,
+    ):
+        """``_PROVIDERS_WITHOUT_VISION`` was the SECOND missing guard.
+
+        It is applied at exactly one site in the module (the resolver), so
+        the reporter counted Kimi Coding as a vision backend even though a
+        vision call there 404s. ``supports=True`` isolates this from the
+        capability guard: only the membership check can reject it.
+        """
+        available, client = self._both(
+            monkeypatch, provider, "kimi-code", supports=True,
+        )
+        assert available == []
+        assert client is None
+
+    def test_availability_probes_the_vision_model_not_the_chat_model(
+        self, monkeypatch,
+    ):
+        """THIRD divergence: the two probed different models.
+
+        The resolver uses ``_resolve_provider_vision_default(provider) or
+        chat_model``; the reporter used the chat model raw. For xiaomi/zai
+        -- whose vision model is a different id from their chat model --
+        that meant availability was decided about a model the runtime would
+        never send an image to.
+        """
+        seen = []
+        monkeypatch.setattr(
+            "agent.auxiliary_client._VISION_AUTO_PROVIDER_ORDER", (),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "zai",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: "glm-5-chat",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._main_model_supports_vision",
+            lambda p, m: (seen.append(m), True)[1],
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client",
+            lambda p, m=None, **kw: (MagicMock(), m),
+        )
+        get_available_vision_backends()
+        assert seen == ["glm-5v-turbo"], (
+            "availability must be decided about the provider's VISION model, "
+            f"not its chat model; saw {seen}"
+        )
+
+    def test_guard_lives_in_one_helper_both_paths_call(self, monkeypatch):
+        """Pin the single-source-of-truth structure, not just the behaviour.
+
+        If someone re-inlines the checks into either caller, this fails --
+        which is the actual regression to prevent, since the behavioural
+        tests above can be satisfied by two copies that agree today and
+        drift tomorrow.
+        """
+        calls = []
+        monkeypatch.setattr(
+            "agent.auxiliary_client._VISION_AUTO_PROVIDER_ORDER", (),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "deepseek",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: "deepseek-v4-pro",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._main_provider_vision_block",
+            lambda p, m: (calls.append(p), "no vision support")[1],
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client",
+            lambda p, m=None, **kw: (MagicMock(), m),
+        )
+        assert get_available_vision_backends() == []
+        assert resolve_vision_provider_client()[1] is None
+        assert calls == ["deepseek", "deepseek"], (
+            "both entry points must route their main-provider verdict "
+            f"through _main_provider_vision_block; saw {calls}"
+        )
+
+
 class TestVisionAutoSkipsKimiCoding:
     """_resolve_auto vision branch skips providers that have no vision on
     their main endpoint (e.g. Kimi Coding Plan /coding) and falls through
