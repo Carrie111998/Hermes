@@ -2137,7 +2137,8 @@ KANBAN_CREATE_SCHEMA = {
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. New tasks "
+        "must carry Execution checklist and Closeout criteria sections."
     ),
     "parameters": {
         "type": "object",
@@ -2160,7 +2161,9 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Opening post: full spec, acceptance criteria, "
                     "links. The assigned worker reads this as part of "
-                    "its context."
+                    "its context. Use '- [ ] text' or '- [x] text' items "
+                    "under both required checklist sections; omitted bodies "
+                    "receive unchecked defaults."
                 ),
             },
             "parents": {

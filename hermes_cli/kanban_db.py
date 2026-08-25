@@ -134,6 +134,90 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# New cards carry these two sections. Keep syntax narrow so every lifecycle
+# surface (CLI, dashboard, tools, imports) has one contract.
+CHECKLIST_SECTIONS = ("Execution checklist", "Closeout criteria")
+_CHECKLIST_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s+(Execution checklist|Closeout criteria)\s*$",
+    re.IGNORECASE,
+)
+_CHECKLIST_ITEM_RE = re.compile(r"^\s*-\s+\[([ xX])\]\s+(.+?)\s*$")
+
+
+class ChecklistContractError(ValueError):
+    """Raised when a task body cannot satisfy the Kanban checklist contract."""
+
+
+def _checklist_contract(body: Optional[str], *, supply_defaults: bool = False) -> str:
+    """Validate required sections and checkbox syntax."""
+    text = (body or "").strip()
+    if not text and supply_defaults:
+        return (
+            "## Execution checklist\n"
+            "- [ ] Define the concrete work and verification steps.\n\n"
+            "## Closeout criteria\n"
+            "- [ ] Provide evidence for each completed execution step."
+        )
+    if not text:
+        raise ChecklistContractError(
+            "body must include ## Execution checklist and ## Closeout criteria"
+        )
+    sections: dict[str, list[str]] = {}
+    current = ""
+    for line_no, line in enumerate(text.splitlines(), 1):
+        heading = _CHECKLIST_HEADING_RE.match(line)
+        if heading:
+            current = heading.group(1).casefold()
+            if current in sections:
+                raise ChecklistContractError(f"duplicate checklist section at line {line_no}")
+            sections[current] = []
+            continue
+        if not current or not line.strip():
+            continue
+        item = _CHECKLIST_ITEM_RE.match(line)
+        if not item:
+            raise ChecklistContractError(
+                f"malformed checklist item at line {line_no}; use '- [ ] text' or '- [x] text'"
+            )
+        sections[current].append(item.group(1))
+    missing = [name for name in CHECKLIST_SECTIONS if name.casefold() not in sections]
+    if missing:
+        raise ChecklistContractError("missing required checklist section(s): " + ", ".join(missing))
+    empty = [name for name in CHECKLIST_SECTIONS if not sections[name.casefold()]]
+    if empty:
+        raise ChecklistContractError("checklist section(s) must contain at least one checkbox: " + ", ".join(empty))
+    return text
+
+
+def _require_checklist_evidence(body: Optional[str], metadata: Optional[dict]) -> None:
+    """Reject completion until every checklist item is checked and evidenced."""
+    text = _checklist_contract(body)
+    evidence = metadata.get("checklist_evidence") if isinstance(metadata, dict) else None
+    if not isinstance(evidence, dict):
+        raise ChecklistContractError(
+            "completion requires metadata.checklist_evidence with execution and closeout lists"
+        )
+    for section, key in (("Execution checklist", "execution"), ("Closeout criteria", "closeout")):
+        values = evidence.get(key, evidence.get(section))
+        statuses: list[str] = []
+        current = None
+        for line in text.splitlines():
+            match = _CHECKLIST_HEADING_RE.match(line)
+            if match:
+                current = match.group(1).casefold()
+                continue
+            if current == section.casefold():
+                item = _CHECKLIST_ITEM_RE.match(line)
+                if item:
+                    statuses.append(item.group(1))
+        if any(status.lower() != "x" for status in statuses):
+            raise ChecklistContractError(f"{section} has unchecked criteria")
+        if (not isinstance(values, list) or len(values) != len(statuses)
+                or any(not isinstance(v, str) or not v.strip() for v in values)):
+            raise ChecklistContractError(
+                f"checklist_evidence.{key} must contain non-empty evidence for every item"
+            )
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -3229,6 +3313,7 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    body = _checklist_contract(body, supply_defaults=True)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -5392,6 +5477,10 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    task_for_contract = get_task(conn, task_id)
+    if task_for_contract is None:
+        return False
+    _require_checklist_evidence(task_for_contract.body, metadata)
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -7228,6 +7317,8 @@ def specify_triage_task(
             sets.append("title = ?")
             params.append(title.strip())
             changed_fields.append("title")
+        if body is not None:
+            body = _checklist_contract(body)
         if body is not None and (body or "") != (existing["body"] or ""):
             sets.append("body = ?")
             params.append(body)
