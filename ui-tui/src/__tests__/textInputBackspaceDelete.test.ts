@@ -14,6 +14,27 @@ const KO_KAI = '\u0e01' // ก  Thai base consonant
 const SARA_I = '\u0e34' // ◌ิ  Thai combining vowel
 const MAI_THO = '\u0e49' // ◌้  Thai combining tone
 
+// Mirror of the source's graphemeStops (Intl.Segmenter, granularity grapheme,
+// always including 0 and s.length). Used to verify the snapPos no-op invariant.
+const graphemeStops = (s: string): number[] => {
+  const stops = [0]
+
+  for (const { index } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s)) {
+    if (index > 0) {
+      stops.push(index)
+    }
+  }
+
+  if (stops.at(-1) !== s.length) {
+    stops.push(s.length)
+  }
+
+  return stops
+}
+
+const atGraphemeBoundary = (s: string, p: number): boolean => graphemeStops(s).includes(p)
+
+
 describe('backspaceDelete', () => {
   it('deletes one combining mark at a time at end-of-input (Thai กิ → ก)', () => {
     const thai = KO_KAI + SARA_I // กิ
@@ -66,6 +87,17 @@ describe('backspaceDelete', () => {
     expect(backspaceDelete(value, 2)).toEqual({ cursor: 0, value: 'x' })
   })
 
+  it('mid-text Backspace between two Thai combining clusters deletes the whole preceding cluster', () => {
+    // กิกิ, cursor at 2 = between the two syllables (after ก◌ิ, before ก). Not
+    // end-of-input, so the grapheme-cluster model holds even though the
+    // preceding code point IS a combining mark — the sharpest mid-text case the
+    // AI review asked to pin: same Backspace semantics everywhere unless the
+    // cursor is at the very end of the input.
+    const two = KO_KAI + SARA_I + KO_KAI + SARA_I // กิกิ
+
+    expect(backspaceDelete(two, 2)).toEqual({ cursor: 0, value: KO_KAI + SARA_I })
+  })
+
   it('is a no-op at cursor 0', () => {
     expect(backspaceDelete(KO_KAI + SARA_I, 0)).toEqual({ cursor: 0, value: KO_KAI + SARA_I })
   })
@@ -80,5 +112,42 @@ describe('backspaceDelete ↔ fast-echo path consistency (#94512)', () => {
     const thai = KO_KAI + SARA_I
 
     expect(canFastBackspaceShape(thai, thai.length)).toBe(false)
+  })
+})
+
+describe('backspaceDelete → snapPos no-op invariant (#94512 AI review)', () => {
+  // The keydown handler runs the result of backspaceDelete straight into
+  // commit (textInput.tsx:1606 → commit at 1746), and commit snaps every
+  // cursor with `const c = snapPos(next, nextCur)` (textInput.tsx:1156).
+  // snapPos clamps to the largest grapheme stop ≤ p, so for the returned
+  // cursor to survive unchanged — and for the per-codepoint delete to actually
+  // land where backspaceDelete says — every branch must return a position on a
+  // grapheme boundary of the NEW value. These tests pin that contract.
+  it('end-of-input combining delete lands the cursor on a grapheme boundary', () => {
+    const r = backspaceDelete(KO_KAI + SARA_I, 2) // กิ → ก
+
+    expect(atGraphemeBoundary(r.value, r.cursor)).toBe(true)
+    expect(r.cursor).toBe(r.value.length) // end of string is always a boundary
+  })
+
+  it('mid-text grapheme delete also lands on a grapheme boundary', () => {
+    const two = KO_KAI + SARA_I + KO_KAI + SARA_I // กิกิ
+    const r = backspaceDelete(two, 2)
+
+    expect(atGraphemeBoundary(r.value, r.cursor)).toBe(true)
+  })
+
+  it('ASCII, emoji, ZWJ and no-op cases all land on grapheme boundaries', () => {
+    const cases = [
+      backspaceDelete('ab', 2), // → a
+      backspaceDelete('a😀', 3), // → a
+      backspaceDelete('😀', 2), // → ''
+      backspaceDelete('👨\u200d👩\u200d👧', '👨\u200d👩\u200d👧'.length), // → ''
+      backspaceDelete(KO_KAI + SARA_I, 0), // no-op
+    ]
+
+    for (const r of cases) {
+      expect(atGraphemeBoundary(r.value, r.cursor)).toBe(true)
+    }
   })
 })
