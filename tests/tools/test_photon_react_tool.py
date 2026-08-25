@@ -40,10 +40,7 @@ def _home_channel(monkeypatch):
         def get_home_channel(_platform):
             return _Home()
 
-    monkeypatch.setattr(
-        prt, "_load_gateway_config", lambda: _Config, raising=False
-    )
-    # The handler imports load_gateway_config lazily; patch that path too.
+    # The handler imports load_gateway_config lazily; patch that path.
     import gateway.config as gw_config
 
     monkeypatch.setattr(gw_config, "load_gateway_config", lambda: _Config)
@@ -51,11 +48,19 @@ def _home_channel(monkeypatch):
 
 def test_check_fn_requires_env_flag(monkeypatch) -> None:
     monkeypatch.delenv("PHOTON_REACTIONS", raising=False)
+    monkeypatch.setattr(prt, "_live_photon_adapter", lambda: _FakeAdapter())
+    assert prt._photon_react_check() is False
+
+
+def test_check_fn_requires_live_adapter(monkeypatch) -> None:
+    monkeypatch.setenv("PHOTON_REACTIONS", "true")
+    monkeypatch.setattr(prt, "_live_photon_adapter", lambda: None)
     assert prt._photon_react_check() is False
 
 
 def test_check_fn_passes_when_enabled(monkeypatch) -> None:
     monkeypatch.setenv("PHOTON_REACTIONS", "true")
+    monkeypatch.setattr(prt, "_live_photon_adapter", lambda: _FakeAdapter())
     assert prt._photon_react_check() is True
 
 
@@ -71,6 +76,19 @@ def test_handler_adds_reaction_with_default_chat(monkeypatch) -> None:
     result = asyncio.run(prt._photon_react({"emoji": "🔥"}))
     assert result["success"] is True
     assert fake.calls == [("add", "any;-;+16265551234", "🔥", None)]
+
+
+def test_handler_default_prefers_current_chat_over_home_channel(
+    monkeypatch,
+) -> None:
+    """Omitting chat_id reacts in the conversation being answered, not the
+    home DM — the contract the schema promises (review fix)."""
+    fake = _FakeAdapter()
+    monkeypatch.setattr(prt, "_live_photon_adapter", lambda: fake)
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "any;-;+15559999999")
+    result = asyncio.run(prt._photon_react({"emoji": "👍"}))
+    assert result["success"] is True
+    assert fake.calls == [("add", "any;-;+15559999999", "👍", None)]
 
 
 def test_handler_targets_specific_message(monkeypatch) -> None:
