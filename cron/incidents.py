@@ -42,7 +42,6 @@ _FAILURE_TYPE_ORDER = (
     ("agent", ("agent", "model", "provider", "inference")),
 )
 MAX_ERROR_CHARS = 500
-_MAX_SIGNATURE_ERROR_CHARS = 200
 
 _lock = threading.RLock()
 
@@ -143,8 +142,17 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _normalize_error(error)[:_MAX_SIGNATURE_ERROR_CHARS]
+    """Dedup key: stable for same job + same FULL normalized error.
+
+    The entire normalized error is signed (no length truncation): truncating
+    the input before hashing would collapse errors that differ only past the
+    cutoff into the same signature, masking a genuinely different failure as
+    a recurrence of an acknowledged one. The *stored* ``error`` field remains
+    bounded for display via ``_redact_error`` (``MAX_ERROR_CHARS``), but the
+    signature is computed over the full normalized text so any change in the
+    error text mints a distinct incident.
+    """
+    normalized = _normalize_error(error)
     digest = hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()
     return digest[:12]
 

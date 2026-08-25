@@ -117,6 +117,29 @@ def test_error_change_mints_new_incident(monkeypatch, tmp_path):
     assert inc.count_incidents() == 2
 
 
+def test_errors_differing_beyond_old_200_char_cutoff_mint_distinct_incidents(
+    monkeypatch, tmp_path
+):
+    """The signature must be computed over the FULL normalized error.
+
+    A long error whose only difference lands past the former 200-char
+    truncation boundary must NOT collide with the shared prefix: that would
+    mask a genuinely different failure as a recurrence of an acked one.
+    """
+    inc = _point_db(monkeypatch, tmp_path)
+    shared_prefix = ("x" * 200) + " prefix-before-the-difference"
+    error_a = shared_prefix + "AAA genuinely different failure"
+    error_b = shared_prefix + "BBB another distinct failure"
+
+    id_a, new_a = inc.upsert_incident("job-1", error_a)
+    id_b, new_b = inc.upsert_incident("job-1", error_b)
+
+    assert id_a != id_b, "errors differing only past the old cutoff must dedup separately"
+    assert new_a is True
+    assert new_b is True
+    assert inc.count_incidents() == 2
+
+
 # ── Redaction / classification ─────────────────────────────────────────────
 
 
