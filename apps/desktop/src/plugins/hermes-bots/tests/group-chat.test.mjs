@@ -8,7 +8,7 @@ const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
  *  text (or throws to simulate a failed turn). */
-function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false } = {}) {
+function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, terminalErrorByProfile, conflictOnce = false, deferredTimers = false, timerAdvanceMs = 0 } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => {
@@ -30,6 +30,12 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
   const sharedUiMeta = {}
   const uiMetaRevisions = {}
   let sessionSequence = 0
+  let fakeNow = 0
+  class TestDate extends Date {
+    static now() {
+      return timerAdvanceMs ? fakeNow : Date.now()
+    }
+  }
   // busyUntilResumeCall[profile] = N: this profile's session.resume reports
   // inflight/running for its first N calls, then flips to done — simulating
   // a turn that is genuinely still running when harvested, without an
@@ -44,7 +50,11 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
   }
   const context = {
     atom,
-    setTimeout: fn => {
+    Date: TestDate,
+    setTimeout: (fn, delay = 0) => {
+      if (Number(delay) >= 2000) {
+        fakeNow += timerAdvanceMs
+      }
       if (deferredTimers) {
         setImmediate(fn)
         return 1
@@ -158,8 +168,8 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             session_key: session.stored,
             message_count: session.messages.length,
             messages: [...session.messages],
-            inflight: busy,
-            running: busy,
+            inflight: session.inflightSnapshot || session.terminalError || busy,
+            running: session.runningSnapshot ?? busy,
             ...(pendingClarify ? { pending_clarify: pendingClarify } : {}),
             ...(pendingApproval ? { pending_approval: pendingApproval } : {})
           }
@@ -177,6 +187,16 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             stored: session.stored,
             title: session.title
           })
+          const retainedError = terminalErrorByProfile && terminalErrorByProfile[session.profile]
+          if (retainedError) {
+            session.terminalError = {
+              status: 'error',
+              streaming: false,
+              error: retainedError,
+              user: params.text
+            }
+            return {}
+          }
           const reply = turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
           return {}
@@ -204,7 +224,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, currentGroupActivity, $botAttention, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -212,7 +232,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
     register: () => undefined
   })
-  return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, requests, sessions, storageWrites, sharedUiMeta, uiMetaRevisions }
+  return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, requests, resumeCallCounts, sessions, storageWrites, sharedUiMeta, uiMetaRevisions }
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
@@ -319,6 +339,48 @@ test('failed member turn is a pass, not a room error', async () => {
 
   const log = roomLog(gc, 'Flaky')
   assert.equal(log.length, 1) // just the user message; no error entries
+})
+
+test('retained terminal inflight error fails immediately instead of consuming the hard cap', async () => {
+  const gc = load(() => '(pass)', {
+    deferredTimers: true,
+    terminalErrorByProfile: { research: 'provider quota exhausted' },
+    timerAdvanceMs: 1000
+  })
+
+  gc.sendToGroupChat('Terminal Error', [{ name: 'research', title: '' }], 'run expensive task')
+  for (let i = 0; i < 100 && (gc.$groupChats.get()['Terminal Error'] || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  const room = gc.$groupChats.get()['Terminal Error']
+  assert.equal(room.running, false)
+  assert.equal(Object.keys(room.stranded || {}).length, 0, 'terminal failure is not stranded as live work')
+  assert.ok(gc.resumeCallCounts.get('research') <= 2, 'preflight plus one terminal poll only')
+  assert.equal(gc.$botAttention.get().research?.reason, 'provider_quota_limit')
+  assert.equal(gc.$botAttention.get().research?.message, 'provider quota exhausted')
+  assert.equal(
+    gc.currentGroupActivity('Terminal Error').some(event => event.kind === 'failed' && event.member === 'research'),
+    true,
+    'the terminal error reaches the existing failed-turn activity path'
+  )
+})
+
+test('retained error snapshot does not abort while the gateway still reports the turn running', async () => {
+  const gc = load(() => '(pass)', {
+    busyUntilResumeCall: { research: 2 },
+    deferredTimers: true,
+    terminalErrorByProfile: { research: 'provider retry still settling' },
+    timerAdvanceMs: 1000
+  })
+
+  gc.sendToGroupChat('Live Error', [{ name: 'research', title: '' }], 'run task')
+  for (let i = 0; i < 100 && (gc.$groupChats.get()['Live Error'] || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  assert.ok(gc.resumeCallCounts.get('research') >= 3, 'poll continues until running flips false')
+  assert.equal(Object.keys(gc.$groupChats.get()['Live Error'].stranded || {}).length, 0)
 })
 
 test('delta injection: a second user send only feeds members the NEW messages', async () => {
@@ -1525,6 +1587,92 @@ test('stranded harvest: a timed-out turn whose reply landed late posts into the 
   assert.equal(log[0].from.name, 'research')
   assert.match(log[0].text, /delivered late/)
   assert.equal(gc.$groupChats.get().Late.stranded.research, undefined, 'marker consumed')
+})
+
+test('stranded harvest consumes a retained terminal inflight error instead of waiting forever', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+  gc.sessions.set('sid-terminal', {
+    stored: 'sid-terminal',
+    runtime: 'rt-terminal',
+    profile: 'research',
+    title: 'Group: Terminal Harvest',
+    messages: [{ role: 'user', content: 'expensive task' }],
+    terminalError: {
+      status: 'error',
+      streaming: false,
+      error: 'provider quota exhausted',
+      user: 'expensive task'
+    }
+  })
+  gc.updateGroupChat('Terminal Harvest', room => {
+    room.sessions = { research: 'sid-terminal' }
+    room.stranded = { research: { before: 1, thread: 'legacy' } }
+    return room
+  })
+
+  await gc.harvestStrandedGroupReply('Terminal Harvest', member)
+
+  assert.equal(gc.$groupChats.get()['Terminal Harvest'].stranded.research, undefined)
+  assert.equal(roomLog(gc, 'Terminal Harvest').filter(entry => entry.from.kind === 'member').length, 0)
+})
+
+test('stranded harvest keeps a non-error inflight snapshot even when it is temporarily non-streaming', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+  gc.sessions.set('sid-tool-gap', {
+    stored: 'sid-tool-gap',
+    runtime: 'rt-tool-gap',
+    profile: 'research',
+    title: 'Group: Active Snapshot',
+    messages: [{ role: 'user', content: 'long tool task' }],
+    inflightSnapshot: { status: 'running', streaming: false, user: 'long tool task' }
+  })
+  gc.updateGroupChat('Active Snapshot', room => {
+    room.sessions = { research: 'sid-tool-gap' }
+    room.stranded = { research: { before: 1, thread: 'legacy' } }
+    return room
+  })
+
+  await gc.harvestStrandedGroupReply('Active Snapshot', member)
+
+  assert.ok(gc.$groupChats.get()['Active Snapshot'].stranded.research, 'non-error inflight work remains harvestable')
+})
+
+test('stranded harvest preserves every live compatibility shape', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+  const cases = [
+    { name: 'Truthy Running', runningSnapshot: 1 },
+    { name: 'Streaming Error', inflightSnapshot: { status: 'error', streaming: true, error: 'partial retry' } },
+    { name: 'Nonterminal Error Field', inflightSnapshot: { status: 'running', streaming: false, error: 'retry note' } },
+    { name: 'Legacy Inflight', inflightSnapshot: 'legacy-busy' }
+  ]
+
+  for (const [index, fixture] of cases.entries()) {
+    const sessionId = `sid-live-${index}`
+    gc.sessions.set(sessionId, {
+      stored: sessionId,
+      runtime: `rt-live-${index}`,
+      profile: 'research',
+      title: `Group: ${fixture.name}`,
+      messages: [{ role: 'user', content: 'still running' }],
+      ...(fixture.runningSnapshot !== undefined ? { runningSnapshot: fixture.runningSnapshot } : {}),
+      ...(fixture.inflightSnapshot !== undefined ? { inflightSnapshot: fixture.inflightSnapshot } : {})
+    })
+    gc.updateGroupChat(fixture.name, room => {
+      room.sessions = { research: sessionId }
+      room.stranded = { research: { before: 1, thread: 'legacy' } }
+      return room
+    })
+
+    await gc.harvestStrandedGroupReply(fixture.name, member)
+
+    assert.ok(
+      gc.$groupChats.get()[fixture.name].stranded.research,
+      `${fixture.name} must remain active`
+    )
+  }
 })
 
 test('stranded + still busy: the round loop never re-submits into a member whose harvest just confirmed they are still running', async () => {
