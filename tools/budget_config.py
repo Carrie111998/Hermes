@@ -63,6 +63,39 @@ def _configured_mcp_result_size() -> int:
     return DEFAULT_MCP_RESULT_SIZE_CHARS
 
 
+def _configured_tool_overrides() -> Dict[str, int]:
+    """Read positive per-tool spill thresholds from ``tool_budget``.
+
+    Tool handlers and providers do not always keep their documented result
+    shape bounded. A named override lets an operator spill a known-chatty tool
+    before the generic 100K threshold without shrinking every tool or the
+    model's context window. Invalid entries are ignored fail-closed.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly()
+        block = data.get("tool_budget") if isinstance(data, dict) else None
+        raw = block.get("tool_overrides") if isinstance(block, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        overrides: Dict[str, int] = {}
+        for name, threshold in raw.items():
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if isinstance(threshold, bool):
+                continue
+            try:
+                value = int(threshold)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                overrides[name.strip()] = value
+        return overrides
+    except Exception:
+        return {}
+
+
 @dataclass(frozen=True)
 class BudgetConfig:
     """Immutable budget constants for the 3-layer tool result persistence system.
@@ -151,11 +184,18 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     always survives.
     """
     mcp_result_size = _configured_mcp_result_size()
+    tool_overrides = _configured_tool_overrides()
 
     if not context_length or context_length <= 0:
-        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS:
+        if (
+            mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS
+            and not tool_overrides
+        ):
             return DEFAULT_BUDGET
-        return BudgetConfig(mcp_result_size=mcp_result_size)
+        return BudgetConfig(
+            mcp_result_size=mcp_result_size,
+            tool_overrides=tool_overrides,
+        )
 
     window_chars = context_length * _CHARS_PER_TOKEN
     per_result = int(window_chars * _PER_RESULT_WINDOW_FRACTION)
@@ -171,4 +211,8 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
         mcp_result_size=mcp_result_size,
+        tool_overrides={
+            name: min(threshold, per_result)
+            for name, threshold in tool_overrides.items()
+        },
     )
