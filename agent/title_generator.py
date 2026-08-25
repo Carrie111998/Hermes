@@ -736,6 +736,56 @@ def _is_real_user_turn(message: Any) -> bool:
     )
 
 
+def _condense_history(history: Any, turns_window: int = 10) -> str:
+    """Flatten the last ``turns_window`` user+assistant exchanges into text.
+
+    Produces the compact retitle-input blob handed to the auxiliary title
+    model: recent user turns and non-empty assistant replies, in order, each
+    prefixed with a role label. Machine-authored user turns (compaction
+    handoffs, model-switch markers) are skipped via :func:`_is_real_user_turn`
+    so a session isn't titled after Hermes' own scaffolding. Tool messages are
+    excluded — the titler cares about intent, not tool-call plumbing.
+
+    Individual message bodies are clipped at 200 characters so a pasted log
+    can't dominate the blob, and the final result is tail-clipped at
+    :data:`MAX_TITLE_INPUT_CHARS` because recent context matters more than
+    old.
+    """
+    if not history:
+        return ""
+
+    slice_size = turns_window * 2
+    recent = history[-slice_size:]
+
+    lines = []
+    for message in recent:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "user":
+            if not _is_real_user_turn(message):
+                continue
+            text = content if isinstance(content, str) else flatten_message_text(content)
+            text = " ".join((text or "").split())
+            if not text:
+                continue
+            lines.append("User: " + text[:200])
+        elif role == "assistant":
+            text = content if isinstance(content, str) else flatten_message_text(content)
+            text = " ".join((text or "").split())
+            if not text:
+                continue
+            lines.append("Assistant: " + text[:200])
+        # skip tool, system, everything else
+
+    joined = "\n".join(lines)
+    if len(joined) > MAX_TITLE_INPUT_CHARS:
+        joined = joined[-MAX_TITLE_INPUT_CHARS:]
+    return joined
+
+
 def _session_is_untitled(session_db, session_id: str) -> bool:
     """Whether the session still carries no title of any provenance.
 

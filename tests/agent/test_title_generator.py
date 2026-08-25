@@ -11,6 +11,8 @@ from agent.title_generator import (
     _title_language,
     _retitle_config,
     _retitle_enabled,
+    _condense_history,
+    MAX_TITLE_INPUT_CHARS,
 )
 from hermes_state import SessionDB
 
@@ -685,3 +687,111 @@ class TestRetitleConfig:
              patch("hermes_cli.config.load_config_readonly",
                    side_effect=RuntimeError("bad config")):
             assert _retitle_enabled() is True
+
+
+class TestCondenseHistory:
+    """Unit tests for _condense_history()."""
+
+    def test_returns_empty_for_none_history(self):
+        assert _condense_history(None) == ""
+
+    def test_returns_empty_for_empty_history(self):
+        assert _condense_history([]) == ""
+
+    def test_includes_recent_user_and_assistant_turns_with_labels(self):
+        history = [
+            {"role": "user", "content": "How do I center a div?"},
+            {"role": "assistant", "content": "Use flexbox with justify-content."},
+        ]
+        result = _condense_history(history)
+        assert "User: How do I center a div?" in result
+        assert "Assistant: Use flexbox with justify-content." in result
+
+    def test_skips_tool_messages(self):
+        history = [
+            {"role": "user", "content": "Run the tests"},
+            {"role": "tool", "content": "pytest output goes here"},
+            {"role": "assistant", "content": "Tests passed."},
+        ]
+        result = _condense_history(history)
+        assert "pytest output" not in result
+        assert "User: Run the tests" in result
+        assert "Assistant: Tests passed." in result
+
+    def test_skips_machine_authored_user_turns(self):
+        history = [
+            {"role": "user", "content": "[System note: session resumed]"},
+            {"role": "user", "content": "What's the weather like?"},
+            {"role": "assistant", "content": "I can't check weather directly."},
+        ]
+        result = _condense_history(history)
+        assert "[System note:" not in result
+        assert "User: What's the weather like?" in result
+
+    def test_skips_empty_assistant_content(self):
+        history = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "   "},
+            {"role": "assistant", "content": "Hello!"},
+        ]
+        result = _condense_history(history)
+        lines = result.split("\n")
+        assistant_lines = [ln for ln in lines if ln.startswith("Assistant:")]
+        assert len(assistant_lines) == 1
+        assert "Assistant: Hello!" in result
+
+    def test_truncates_individual_message_bodies_to_200_chars(self):
+        long_body = "a" * 500
+        history = [
+            {"role": "user", "content": long_body},
+            {"role": "assistant", "content": long_body},
+        ]
+        result = _condense_history(history)
+        for line in result.split("\n"):
+            # strip label prefix
+            if line.startswith("User: "):
+                body = line[len("User: "):]
+            elif line.startswith("Assistant: "):
+                body = line[len("Assistant: "):]
+            else:
+                continue
+            assert len(body) <= 200
+
+    def test_returns_only_last_turns_window_pairs(self):
+        history = []
+        for i in range(20):
+            history.append({"role": "user", "content": f"user-msg-{i}"})
+            history.append({"role": "assistant", "content": f"assistant-msg-{i}"})
+        result = _condense_history(history, turns_window=5)
+        # window=5 => last 10 messages: user-msg-15..19, assistant-msg-15..19
+        assert "user-msg-0" not in result
+        assert "user-msg-14" not in result
+        assert "user-msg-15" in result
+        assert "user-msg-19" in result
+        assert "assistant-msg-19" in result
+
+    def test_final_output_capped_at_max_title_input_chars(self):
+        history = []
+        chunk = "word " * 40  # ~200 chars → truncated to 200 per body
+        for i in range(200):
+            history.append({"role": "user", "content": chunk})
+            history.append({"role": "assistant", "content": chunk})
+        result = _condense_history(history, turns_window=100)
+        assert len(result) <= MAX_TITLE_INPUT_CHARS
+
+    def test_multimodal_user_content_flattens_to_text(self):
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here's a screenshot,"},
+                    {"type": "image_url", "image_url": {"url": "data:..."}},
+                    {"type": "text", "text": "fix the login."},
+                ],
+            },
+            {"role": "assistant", "content": "Sure, checking now."},
+        ]
+        result = _condense_history(history)
+        assert "User:" in result
+        assert "Here's a screenshot," in result
+        assert "fix the login." in result
