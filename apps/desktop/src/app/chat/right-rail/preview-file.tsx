@@ -26,7 +26,7 @@ import {
   desktopFsCacheKey,
   desktopGitRoot,
   readDesktopFileDataUrl,
-  readDesktopFileText,
+  readDesktopFileTextLocalFirst,
   writeDesktopFileText
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
@@ -267,7 +267,7 @@ function dataUrlToBlob(dataUrl: string) {
 
 async function readTextPreview(filePath: string) {
   try {
-    return await readDesktopFileText(filePath)
+    return await readDesktopFileTextLocalFirst(filePath)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
 

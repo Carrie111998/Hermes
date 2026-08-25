@@ -87,6 +87,29 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
   return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path))
 }
 
+/**
+ * Read a composer text file local-shell first, even when the active agent is
+ * remote. Picker, clipboard, and OS-drop paths belong to this machine; in-app
+ * project-tree paths may belong only to the gateway and fall back there.
+ */
+export async function readDesktopFileTextLocalFirst(path: string): Promise<HermesReadFileTextResult> {
+  try {
+    const local = await window.hermesDesktop?.readFileText?.(path)
+
+    if (local) {
+      return local
+    }
+  } catch (error) {
+    if (!isDesktopFsRemoteMode()) {
+      throw error
+    }
+
+    // Not on this machine (or unreadable locally) — try the active gateway.
+  }
+
+  return readDesktopFileText(path)
+}
+
 // Save UTF-8 text back to a file. Local writes go through the hardened Electron
 // IPC; remote writes hit the dashboard's POST /api/fs/write-text (same path
 // hardening, parent-must-exist, size cap) so the editor behaves identically in
