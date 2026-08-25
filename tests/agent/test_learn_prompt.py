@@ -139,11 +139,16 @@ class TestDurableFactPersistence:
         prompt = build_learn_prompt(
             "remember that our prod deploy key lives in ~/.config/deploy.env"
         )
+        # Slice past the interpolated request block first: `.index()` returns
+        # the FIRST match, so a multi-line user request containing its own
+        # numbered lines ("…\n2. bar") would otherwise shadow the step
+        # headers and falsely fail the ordering assertion.
+        body = prompt[prompt.index("Do this:\n"):]
         assert (
-            prompt.index("\n1b.")
-            < prompt.index("\n1c.")
-            < prompt.index("\n2.")
-            < prompt.index("\n2b.")
+            body.index("\n1b.")
+            < body.index("\n1c.")
+            < body.index("\n2.")
+            < body.index("\n2b.")
         )
         # Memory persistence names its explicit tool parameters; dropping
         # them loses the add/replace semantics the guidance depends on.
