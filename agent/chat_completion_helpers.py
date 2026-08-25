@@ -5118,6 +5118,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _close_request_client_once(
                 "stream_request_complete"
                 if result["response"] is not None
+                and not _stream_attempt_was_cancelled(stream_attempt_id)
                 else "stream_error_cleanup"
             )
 
