@@ -140,10 +140,12 @@ def resolve_cron_drain_budget(
 
     The configured floor is clamped to what this process can actually honour.
     The shutdown watchdog hard-exits at ``watchdog_delay`` and the service
-    manager's ``TimeoutStopSec`` is sized from the same drain timeout, so
-    waiting past that leash (minus ``cleanup_reserve_s`` for the teardown that
-    follows the drain) would swap a cleanly-interrupted job for a SIGKILL that
-    leaves it wedged mid-run — strictly worse than the bug being fixed.
+    manager's ``TimeoutStopSec`` is sized from the full stop budget (the max
+    of the restart drain and this floor, plus cleanup reserve — see
+    ``generate_systemd_unit``), so waiting past that leash (minus
+    ``cleanup_reserve_s`` for the teardown that follows the drain) would swap
+    a cleanly-interrupted job for a SIGKILL that leaves it wedged mid-run —
+    strictly worse than the bug being fixed.
 
     Never returns less than ``drain_timeout``: the cron floor only ever
     extends the wait, so an operator who deliberately configured a long

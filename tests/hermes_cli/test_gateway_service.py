@@ -185,12 +185,6 @@ class TestRequireServiceInstalled:
 
 
 class TestGeneratedSystemdUnits:
-    def _expected_timeout_stop_sec(self) -> str:
-        timeout = int(max(60, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30))
-        return f"TimeoutStopSec={timeout}"
-
-
-
     def test_user_unit_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):
         # Regression for the multi-profile gateway restart-loop flap (#48700):
         # ~/.local/bin/node is often a symlink into a *specific* profile's node
@@ -2343,8 +2337,11 @@ class TestTimeoutStopSecCoversCronFloor:
             monkeypatch,
             "agent:\n  restart_drain_timeout: 60\n",
         )
-        # Default cron floor (30 + 10 = 40) < 60: unchanged from the old
-        # formula — no regression for restart-drain-dominated installs.
+        # An explicit restart drain above the default cron floor (30+10=40)
+        # keeps the old formula's result — no regression for
+        # restart-drain-dominated installs. (Default installs differ from
+        # main: restart_drain_timeout defaults to 0, so the cron floor 40+30
+        # raises the leash from 60 to 70 — see the PR description.)
         assert "TimeoutStopSec=90" in unit
 
     def test_env_override_extends_the_leash(self, tmp_path, monkeypatch):
