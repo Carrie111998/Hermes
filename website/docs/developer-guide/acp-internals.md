@@ -17,13 +17,13 @@ Key implementation files:
 - `acp_adapter/permissions.py`
 - `acp_adapter/tools.py`
 - `acp_adapter/auth.py`
-- `acp_registry/agent.json`
 
 ## Boot flow
 
 ```text
 hermes acp / hermes-acp / python -m acp_adapter
   -> acp_adapter.entry.main()
+  -> parse --version / --check / --setup before server startup
   -> load ~/.hermes/.env
   -> configure stderr logging
   -> construct HermesACPAgent
@@ -76,9 +76,8 @@ The manager is thread-safe and supports:
 Bridged callbacks:
 
 - `tool_progress_callback`
-- `thinking_callback`
+- `thinking_callback` (currently set to `None` in the ACP bridge — reasoning is forwarded through `step_callback` instead)
 - `step_callback`
-- `message_callback`
 
 Because `AIAgent` runs in a worker thread while ACP I/O lives on the main event loop, the bridge uses:
 
@@ -147,7 +146,7 @@ Instead it reuses Hermes' runtime resolver:
 - `acp_adapter/auth.py`
 - `hermes_cli/runtime_provider.py`
 
-So ACP advertises and uses the currently configured Hermes provider/credentials.
+So ACP advertises and uses the currently configured Hermes provider/credentials. It also always advertises a terminal setup auth method (`hermes-setup`, args `--setup`) so first-run ACP clients can open Hermes' interactive model/provider configuration before starting a normal ACP session.
 
 ## Working directory binding
 

@@ -16,7 +16,7 @@ Hermes has a shared provider runtime resolver used across:
 
 Primary implementation:
 
-- `hermes_cli/runtime_provider.py` — credential resolution, `_resolve_custom_runtime()`
+- `hermes_cli/runtime_provider.py` — credential resolution, custom-endpoint runtime resolution
 - `hermes_cli/auth.py` — provider registry, `resolve_provider()`
 - `hermes_cli/model_switch.py` — shared `/model` switch pipeline (CLI + gateway)
 - `agent/auxiliary_client.py` — auxiliary model routing
@@ -40,7 +40,7 @@ That ordering matters because Hermes treats the saved model/provider choice as t
 
 ## Providers
 
-Current provider families include:
+Current provider families include (see `plugins/model-providers/` for the complete bundled set):
 
 - AI Gateway (Vercel)
 - OpenRouter
@@ -48,18 +48,29 @@ Current provider families include:
 - OpenAI Codex
 - Copilot / Copilot ACP
 - Anthropic (native)
-- Google / Gemini
-- Alibaba / DashScope
+- Google / Gemini (`gemini`)
+- Alibaba / DashScope (`alibaba`, `alibaba-coding-plan`)
 - DeepSeek
 - Z.AI
-- Kimi / Moonshot
-- MiniMax
-- MiniMax China
+- Kimi / Moonshot (`kimi-coding`, `kimi-coding-cn`)
+- MiniMax (`minimax`, `minimax-cn`, `minimax-oauth`)
 - Kilo Code
 - Hugging Face
 - OpenCode Zen / OpenCode Go
+- AWS Bedrock
+- Azure Foundry
+- NVIDIA NIM
+- xAI (Grok)
+- Arcee
+- GMI Cloud
+- StepFun
+- Qwen OAuth
+- Xiaomi
+- Ollama Cloud
+- LM Studio
+- Tencent TokenHub
 - Custom (`provider: custom`) — first-class provider for any OpenAI-compatible endpoint
-- Named custom providers (`custom_providers` list in config.yaml)
+- Named custom providers (`providers:` dict in config.yaml; the legacy `custom_providers` list is still read for backward compatibility)
 
 ## Output of runtime resolution
 
@@ -139,7 +150,6 @@ Auxiliary tasks such as:
 - vision
 - web extraction summarization
 - context compression summaries
-- session search summarization
 - skills hub operations
 - MCP helper operations
 - memory flushes
@@ -154,7 +164,7 @@ When an auxiliary task is configured with provider `main`, Hermes resolves that 
 
 ## Fallback models
 
-Hermes supports a configured fallback model/provider pair, allowing runtime failover when the primary model encounters errors.
+Hermes supports a configured fallback provider chain — a list of `(provider, model)` entries tried in order when the primary model encounters errors. The legacy single-pair `fallback_model` dict is still accepted for back-compat (and migrated on first write).
 
 ### How it works internally
 
@@ -176,7 +186,7 @@ Hermes supports a configured fallback model/provider pair, allowing runtime fail
    - Resets retry count to 0 and continues the loop
 
 4. **Config flow**:
-   - CLI: `cli.py` reads `CLI_CONFIG["fallback_model"]` → passes to `AIAgent(fallback_model=...)`
+   - CLI: reads the fallback chain via `hermes_cli/fallback_config.get_fallback_chain()` → passes to `AIAgent(fallback_model=...)`
    - Gateway: `gateway/run.py._load_fallback_model()` reads `config.yaml` → passes to `AIAgent`
    - Validation: both `provider` and `model` keys must be non-empty, or fallback is disabled
 
@@ -189,7 +199,11 @@ Cron jobs **do** support fallback: `run_job()` reads `fallback_providers` (or le
 
 ### Test coverage
 
-See `tests/test_fallback_model.py` for comprehensive tests covering all supported providers, one-shot semantics, and edge cases.
+Fallback behavior is exercised across several suites:
+
+- `tests/run_agent/test_fallback_credential_isolation.py` — credential isolation between primary and fallback
+- `tests/hermes_cli/test_fallback_cmd.py` — the `/fallback` CLI command
+- `tests/gateway/test_fallback_eviction.py` — gateway eviction of failed providers
 
 ## Related docs
 

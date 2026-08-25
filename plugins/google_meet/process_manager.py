@@ -70,14 +70,11 @@ def _clear_active() -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Process exists but we can't signal it — treat as alive.
-        return True
-    return True
+    # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — it
+    # routes through GenerateConsoleCtrlEvent and can kill the target.
+    # Use the cross-platform existence check.
+    from gateway.status import _pid_exists
+    return _pid_exists(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +152,22 @@ def start(
         env["HERMES_MEET_REALTIME_VOICE"] = realtime_voice
     if realtime_instructions:
         env["HERMES_MEET_REALTIME_INSTRUCTIONS"] = realtime_instructions
+    # Resolve the realtime key at SPAWN time, in the parent, where the
+    # profile secret scope (a contextvar) is still installed. The detached
+    # child inherits the process environment — NOT the scope — so under a
+    # multiplexed gateway an in-child os.environ read would see another
+    # profile's OPENAI_API_KEY (or nothing). Pass it explicitly instead;
+    # meet_bot checks HERMES_MEET_REALTIME_KEY before OPENAI_API_KEY.
+    if not realtime_api_key:
+        try:
+            from agent.secret_scope import get_secret
+
+            realtime_api_key = (
+                get_secret("HERMES_MEET_REALTIME_KEY")
+                or get_secret("OPENAI_API_KEY")
+            )
+        except ImportError:  # pragma: no cover — secret_scope is in-repo
+            pass
     if realtime_api_key:
         env["HERMES_MEET_REALTIME_KEY"] = realtime_api_key
 
@@ -313,7 +326,7 @@ def stop(*, reason: str = "requested") -> Dict[str, Any]:
             time.sleep(0.5)
         if _pid_alive(pid):
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only plugin (google_meet registers no-op on Windows; see __init__.py)
             except ProcessLookupError:
                 pass
 

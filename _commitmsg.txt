@@ -1,0 +1,22 @@
+merge: integrate upstream main into security/p9c-credential-file-read
+
+Resolve the 16-file conflict surface (17,705-commit upstream drift) semantically:
+
+- Keep upstream architecture where it superseded branch work: transcript
+  layer (SQLite-only; JSONL mirror removed upstream), cron scheduler
+  (run_one_job + durable claims), api_server cron CRUD, telegram platform
+  (migrated to plugins/), test_api_server_jobs.
+- Re-integrate branch Phase 9 credential security: credential read
+  boundary (file_safety split + read-chokepoint chaining), redact_object
+  (session-JSON + request-dump redaction), dispatch-result scrub,
+  request-body projection, 0600 dumps.
+- Re-integrate P1a: save_jobs caller= attribution merged into upstream
+  save_jobs (with removed_ids), transform_cron_reply hook fired from
+  upstream run_one_job.
+- Keep upstream terminal-output redaction, kanban/plugin hooks, denylist
+  expansion (env/oauth/bws/gcloud) alongside branch credential sets.
+- Drop obsolete: JSONL-mirror redaction (no JSONL upstream), send_message
+  re-addition (upstream removed agent-callable messaging), telegram
+  table-classification tests (telegram platform moved).
+- Fix branch latent import (get_safe_write_root singular) and point the
+  precedence harness at plugins.platforms.telegram.adapter.

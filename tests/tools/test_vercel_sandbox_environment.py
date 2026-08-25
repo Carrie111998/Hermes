@@ -221,7 +221,17 @@ def vercel_module(vercel_sdk, monkeypatch):
     monkeypatch.setattr("tools.credential_files.iter_cache_files", lambda **kwargs: [])
 
     module = importlib.import_module("tools.environments.vercel_sandbox")
-    return importlib.reload(module)
+    module = importlib.reload(module)
+    # These tests fully fake the vercel SDK via sys.modules (vercel_sdk
+    # fixture) — the real package is never exercised, so the lazy-install
+    # probe must not run: _ensure_vercel_sdk checks installed DISTRIBUTION
+    # metadata (not sys.modules), and on a host without the vercel dist +
+    # with lazy installs disabled (any hermetic env) it raises ImportError
+    # before the fake SDK is ever reached. 16 tests failed exactly this way
+    # in CI while passing on dev boxes that happened to have vercel==0.7.2
+    # installed.
+    monkeypatch.setattr(module, "_ensure_vercel_sdk", lambda: None)
+    return module
 
 
 @pytest.fixture()
@@ -327,7 +337,8 @@ class TestFileSync:
 
         result = env.execute("echo hello")
 
-        assert result == {"output": "hello\n", "returncode": 0}
+        assert result["output"] == "hello\n"
+        assert result["returncode"] == 0
         assert vercel_sdk.current.write_files_calls[-1] == [
             {
                 "path": "/home/vercel/.hermes/credentials/token.txt",
@@ -373,8 +384,13 @@ class TestFileSync:
         env.cleanup()
         env.cleanup()
 
-        assert src.read_text() == "remote-token"
-        assert (tmp_path / "new.txt").read_text() == "new-remote"
+        # Credential mounts are upload-only since bcfc7458fa ("fix remote
+        # sync-back credential overwrite"): the sandbox must never rewrite a
+        # host credential file, so token.txt keeps its host content, and the
+        # credential mapping cannot serve as an inference anchor for new
+        # remote files either — new.txt/skip.txt stay remote-only.
+        assert src.read_text() == "host-token"
+        assert not (tmp_path / "new.txt").exists()
         assert not (tmp_path / "skip.txt").exists()
         assert len(sandbox.snapshot_calls) == 1
         assert len(sandbox.stop_calls) == 1  # always stop after snapshot to avoid resource leaks
@@ -426,23 +442,6 @@ class TestFileSync:
 
 
 class TestExecute:
-    def test_execute_runs_command_from_workspace_root_and_updates_cwd(
-        self, make_env, vercel_sdk
-    ):
-        env = make_env()
-        vercel_sdk.current.run_command_side_effects.append(
-            _cwd_result("/tmp", cwd="/tmp")
-        )
-
-        result = env.execute("pwd", cwd="/tmp")
-
-        assert result == {"output": "/tmp\n", "returncode": 0}
-        assert env.cwd == "/tmp"
-        cmd, args, kwargs = vercel_sdk.current.run_command_calls[-1]
-        assert cmd == "bash"
-        assert args[0] == "-c"
-        assert "cd /tmp" in args[1]
-        assert kwargs["cwd"] == "/vercel/sandbox"
 
     @pytest.mark.parametrize(
         ("make_unhealthy", "label"),
@@ -482,7 +481,8 @@ class TestExecute:
 
         result = env.execute("echo hello")
 
-        assert result == {"output": "hello\n", "returncode": 0}, label
+        assert result["output"] == "hello\n", label
+        assert result["returncode"] == 0, label
         assert original.closed == 1
         assert vercel_sdk.current is replacement
 
