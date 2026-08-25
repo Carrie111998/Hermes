@@ -1053,6 +1053,8 @@ def list_profiles() -> List[ProfileInfo]:
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
                 continue
+            if is_profile_deletion_marked(name):
+                continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
             if alias_name:

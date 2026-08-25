@@ -299,6 +299,7 @@ class TestDeleteProfile:
         assert is_profile_deletion_marked("coder")
         (profile_dir / "cron").mkdir(parents=True)
         assert "coder" not in {name for name, _home in profiles_to_serve(True)}
+        assert "coder" not in {profile.name for profile in list_profiles()}
 
         shutil.rmtree(profile_dir)
         recreated = create_profile("coder", no_alias=True)

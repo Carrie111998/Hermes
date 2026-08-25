@@ -816,3 +816,53 @@ def test_multiplex_heartbeat_excludes_profile_not_ticked_in_cycle(tmp_path):
     assert successful_heartbeats == [default_home.resolve()]
 
 
+def test_multiplex_heartbeat_does_not_recreate_home_deleted_after_snapshot(tmp_path):
+    """Heartbeat persistence cannot recreate a home deleted after refresh."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / "default"
+    deleted_home = tmp_path / "profiles" / "deleted"
+    for home in (default_home, deleted_home):
+        home.mkdir(parents=True)
+
+    membership_calls = 0
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    stop = threading.Event()
+
+    class PausedSnapshot:
+        def __iter__(self):
+            yield ("default", default_home)
+            yield ("deleted", deleted_home)
+            snapshot_ready.set()
+            assert release_snapshot.wait(timeout=5)
+
+    def profile_homes():
+        nonlocal membership_calls
+        membership_calls += 1
+        if membership_calls == 3:
+            return PausedSnapshot()
+        return [("default", default_home), ("deleted", deleted_home)]
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", return_value=0):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={"interval": 30, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        thread.start()
+        assert snapshot_ready.wait(timeout=5)
+        shutil.rmtree(deleted_home)
+        release_snapshot.set()
+        assert _wait_until(
+            lambda: (default_home / "cron" / "ticker_heartbeat").is_file()
+        )
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert not deleted_home.exists()
+
+

@@ -123,6 +123,7 @@ class _CronStorePaths:
     cron_dir: Path
     jobs_file: Path
     output_dir: Path
+    require_existing_home: bool = False
 
 
 _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
@@ -170,14 +171,22 @@ def _current_cron_store() -> _CronStorePaths:
 
 
 @contextlib.contextmanager
-def use_cron_store(home: Union[str, Path]):
-    """Route cron storage to ``home`` without mutating process globals."""
+def use_cron_store(
+    home: Union[str, Path], *, require_existing_home: bool = False
+):
+    """Route cron storage to ``home`` without mutating process globals.
+
+    ``require_existing_home`` is for long-lived multiplex schedulers whose
+    membership can race profile deletion. In that mode cron may create its
+    children, but must never recreate a profile root that disappeared.
+    """
     cron_dir = Path(home).expanduser().resolve() / "cron"
     token = _cron_store_override.set(
         _CronStorePaths(
             cron_dir=cron_dir,
             jobs_file=cron_dir / "jobs.json",
             output_dir=cron_dir / "output",
+            require_existing_home=require_existing_home,
         )
     )
     try:
@@ -698,8 +707,14 @@ def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> No
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
-    store.cron_dir.mkdir(parents=True, exist_ok=True)
-    store.output_dir.mkdir(parents=True, exist_ok=True)
+    store.cron_dir.mkdir(
+        parents=not store.require_existing_home,
+        exist_ok=True,
+    )
+    store.output_dir.mkdir(
+        parents=not store.require_existing_home,
+        exist_ok=True,
+    )
     _secure_dir(store.cron_dir)
     _secure_dir(store.output_dir)
 

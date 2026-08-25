@@ -669,10 +669,14 @@ class InProcessCronScheduler(CronScheduler):
 
         # Recovery + initial heartbeat for every profile.
         for entry in initial_profile_homes:
+            profile_name = entry[0] if isinstance(entry, tuple) else None
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
-                with use_cron_store(home):
+                with use_cron_store(
+                    home,
+                    require_existing_home=profile_name != "default",
+                ):
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(
@@ -694,14 +698,18 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in current_profile_homes():
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
                         # Record the identity before entering tick(): a failed
                         # tick still needs a liveness/error heartbeat, but only
                         # if this home remains in authoritative membership.
-                        ticked_homes[Path(home).resolve()] = home
+                        ticked_homes[Path(home).resolve()] = entry
                         home_token = set_hermes_home_override(str(home))
                         try:
-                            with use_cron_store(home):
+                            with use_cron_store(
+                                home,
+                                require_existing_home=profile_name != "default",
+                            ):
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,
@@ -728,7 +736,7 @@ class InProcessCronScheduler(CronScheduler):
                 try:
                     refreshed_homes = {
                         Path(entry[1] if isinstance(entry, tuple) else entry).resolve():
-                        entry[1] if isinstance(entry, tuple) else entry
+                        entry
                         for entry in current_profile_homes()
                     }
                 except BaseException as e:
@@ -746,10 +754,15 @@ class InProcessCronScheduler(CronScheduler):
                         for identity in ticked_homes
                         if identity in refreshed_homes
                     ]
-            for home in heartbeat_homes:
+            for entry in heartbeat_homes:
+                profile_name = entry[0] if isinstance(entry, tuple) else None
+                home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
                 try:
-                    with use_cron_store(home):
+                    with use_cron_store(
+                        home,
+                        require_existing_home=profile_name != "default",
+                    ):
                         record_ticker_heartbeat(success=ok)
                         # Surface the failure reason (or clear it) per profile
                         # so `hermes cron status` can show WHY ticks fail
