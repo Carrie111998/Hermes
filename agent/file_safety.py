@@ -486,23 +486,23 @@ def classify_cross_profile_target(path: str) -> Optional[dict]:
 
     # For a symlink-overlay home the env-derived root is the overlay itself,
     # while write targets resolve through the symlinks into the BACKING root
-    # (#93862). Classify against the backing root when one is known so
-    # profile-scoped writes are not silently unclassifiable.
-    active_profile = "default"
-    try:
-        from hermes_constants import profile_identity_for_home
+    # (#93862). The identity probe walks the overlay's symlinks, so it is
+    # computed lazily — only when classification actually needs it (target
+    # outside the env-derived root, or a scoped-area hit) — keeping the
+    # common bail-out paths free of the walk.
+    _identity: list = []
 
-        active_profile, backing_root = profile_identity_for_home(_hermes_home_path())
-        if backing_root is not None:
-            backing_real = backing_root.resolve()
+    def _profile_identity() -> tuple:
+        if not _identity:
+            resolved = ("default", None)
             try:
-                target.relative_to(root_real)
-            except ValueError:
-                # Target not under the env-derived root — fall back to the
-                # backing root the active profile actually lives under.
-                root_real = backing_real
-    except Exception:
-        pass
+                from hermes_constants import profile_identity_for_home
+
+                resolved = profile_identity_for_home(_hermes_home_path())
+            except Exception:
+                pass
+            _identity.append(resolved)
+        return _identity[0]
 
     target_profile: Optional[str] = None
     area: Optional[str] = None
@@ -510,7 +510,15 @@ def classify_cross_profile_target(path: str) -> Optional[dict]:
     try:
         rel = target.relative_to(root_real)
     except ValueError:
-        return None
+        # Target not under the env-derived root — fall back to the backing
+        # root the active profile actually lives under, when one is known.
+        _, backing_root = _profile_identity()
+        if backing_root is None:
+            return None
+        try:
+            rel = target.relative_to(backing_root.resolve())
+        except (OSError, RuntimeError, ValueError):
+            return None
 
     parts = rel.parts
     if not parts:
@@ -531,6 +539,7 @@ def classify_cross_profile_target(path: str) -> Optional[dict]:
     else:
         return None
 
+    active_profile = _profile_identity()[0]
     if target_profile == active_profile:
         # In-profile write — not a cross-profile event.
         return None

@@ -24,7 +24,12 @@ import sys
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
+# Symlink creation requires elevated privileges on Windows, so tests that
+# build symlink fixtures skip there. Tests that exercise the non-symlink
+# resolution paths (direct profile dir, copied files, root home, slug
+# validation) run on every platform, keeping the import path and the
+# non-overlay contract exercised on win32 CI.
+requires_symlinks = pytest.mark.skipif(
     sys.platform == "win32",
     reason="symlink creation requires elevated privileges on Windows",
 )
@@ -74,6 +79,7 @@ def test_direct_profile_dir_resolves(tmp_path, monkeypatch):
     assert profile_name_for_home(profile) == "milo"
 
 
+@requires_symlinks
 def test_overlay_home_recovers_profile_from_symlinks(profile_farm):
     from hermes_constants import profile_name_for_home
 
@@ -107,6 +113,7 @@ def test_root_home_stays_default(tmp_path, monkeypatch):
     assert profile_name_for_home(root) == "default"
 
 
+@requires_symlinks
 def test_symlinked_home_itself_still_resolves(tmp_path, monkeypatch):
     """A HERMES_HOME that is itself a symlink TO a profile dir resolves via
     path resolution (pre-existing behavior, must not regress)."""
@@ -124,6 +131,7 @@ def test_symlinked_home_itself_still_resolves(tmp_path, monkeypatch):
     assert profile_name_for_home(link) == "milo"
 
 
+@requires_symlinks
 def test_system_prompt_and_file_safety_agree_on_overlay(profile_farm, monkeypatch):
     """Both consumers of profile resolution must report the same name for an
     overlay home: the prompt hint (#93862's symptom) and the cross-profile
@@ -140,6 +148,7 @@ def test_system_prompt_and_file_safety_agree_on_overlay(profile_farm, monkeypatc
     assert fs._resolve_active_profile_name() == "workflow_evaluator"
 
 
+@requires_symlinks
 def test_disagreeing_symlinks_stay_default(profile_farm, tmp_path):
     """If overlay members point into DIFFERENT profiles, the overlay is
     ambiguous (or crafted) and the conservative answer is default — a single
@@ -154,6 +163,7 @@ def test_disagreeing_symlinks_stay_default(profile_farm, tmp_path):
     assert profile_name_for_home(overlay) == "default"
 
 
+@requires_symlinks
 def test_broken_symlink_identifies_nothing(tmp_path, monkeypatch):
     """A dangling symlink must not supply a profile name (resolve must be
     strict)."""
@@ -171,6 +181,7 @@ def test_broken_symlink_identifies_nothing(tmp_path, monkeypatch):
     assert profile_name_for_home(overlay) == "default"
 
 
+@requires_symlinks
 def test_nested_profiles_dir_in_path_identifies_nothing(tmp_path, monkeypatch):
     """Only the exact tail ``profiles/<name>/<member>`` identifies a profile.
     A ``profiles`` directory elsewhere in the target path must not — e.g.
@@ -191,6 +202,7 @@ def test_nested_profiles_dir_in_path_identifies_nothing(tmp_path, monkeypatch):
     assert profile_name_for_home(overlay) == "default"
 
 
+@requires_symlinks
 class TestOverlayCrossProfileGuardEndToEnd:
     """The guard itself, not just name agreement: an overlay session must be
     able to write its OWN backing profile unwarned, while writes into other
@@ -231,6 +243,7 @@ class TestOverlayCrossProfileGuardEndToEnd:
         assert guard.classify_cross_profile_target(str(tmp_path / "code" / "a.py")) is None
 
 
+@requires_symlinks
 class TestMixedOverlayPinnedBehavior:
     """Pin the intended semantics for imperfect overlays: NOISE (dangling or
     malformed links) is ignored when the valid links are unanimous — overlay
@@ -270,3 +283,85 @@ class TestMixedOverlayPinnedBehavior:
         (overlay / "skills").symlink_to(other / "skills")
         (overlay / "memories").symlink_to(root / "nowhere")  # dangling noise
         assert profile_name_for_home(overlay) == "default"
+
+
+class TestProfileNameShapeValidation:
+    """Names that could not have been created as profiles (per the
+    creation-time id shape ``[a-z0-9][a-z0-9_-]{0,63}``) must not be
+    *recovered* as profiles either — neither by the parent-name check (1b)
+    nor by overlay recovery (2), both of which are not anchored to the
+    configured root and would otherwise accept any directory literally
+    named ``profiles``."""
+
+    @requires_symlinks
+    def test_symlinked_home_to_invalid_slug_dir_stays_default(
+        self, tmp_path, monkeypatch
+    ):
+        """``/srv/app/profiles/Cache.d`` is not a profile — a HERMES_HOME
+        symlinked to it must not resolve to profile \"Cache.d\"."""
+        import hermes_constants
+        from hermes_constants import profile_name_for_home
+
+        not_a_profile = tmp_path / "srv" / "app" / "profiles" / "Cache.d"
+        not_a_profile.mkdir(parents=True)
+        link = tmp_path / "home-link"
+        link.symlink_to(not_a_profile)
+        monkeypatch.setenv("HERMES_HOME", str(link))
+        monkeypatch.setattr(
+            hermes_constants, "_default_hermes_root_memo", None, raising=False
+        )
+
+        assert profile_name_for_home(link) == "default"
+
+    @requires_symlinks
+    def test_overlay_link_into_invalid_slug_name_identifies_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """An overlay member whose target tail is ``profiles/<bad>/<member>``
+        with an invalid profile id identifies nothing."""
+        import hermes_constants
+        from hermes_constants import profile_name_for_home
+
+        bad = tmp_path / "root" / "profiles" / "Not A Profile" / "plugins"
+        bad.mkdir(parents=True)
+        overlay = tmp_path / "overlay-home"
+        overlay.mkdir()
+        (overlay / "plugins").symlink_to(bad)
+        monkeypatch.setenv("HERMES_HOME", str(overlay))
+        monkeypatch.setattr(
+            hermes_constants, "_default_hermes_root_memo", None, raising=False
+        )
+
+        assert profile_name_for_home(overlay) == "default"
+
+    @requires_symlinks
+    def test_invalid_slug_link_is_noise_beside_unanimous_valid_links(
+        self, profile_farm, tmp_path
+    ):
+        """A link into an invalid-id \"profile\" is noise, not a conflict —
+        unanimous valid links still resolve."""
+        from hermes_constants import profile_name_for_home
+
+        root, _profile, overlay = profile_farm
+        bad = root / "profiles" / "UPPER" / "skills"
+        bad.mkdir(parents=True)
+        (overlay / "skills").symlink_to(bad)
+
+        assert profile_name_for_home(overlay) == "workflow_evaluator"
+
+
+def test_profile_name_for_home_smoke_no_symlinks(tmp_path, monkeypatch):
+    """Cross-platform (incl. win32) smoke: the helper imports and resolves a
+    plain directory without touching any symlink machinery."""
+    import hermes_constants
+    from hermes_constants import profile_identity_for_home, profile_name_for_home
+
+    plain = tmp_path / "plain-home"
+    plain.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(plain))
+    monkeypatch.setattr(
+        hermes_constants, "_default_hermes_root_memo", None, raising=False
+    )
+
+    assert profile_name_for_home(plain) == "default"
+    assert profile_identity_for_home(plain) == ("default", None)

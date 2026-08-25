@@ -5,6 +5,7 @@ without risk of circular imports.
 """
 
 import os
+import re
 import shutil
 import stat
 import sys
@@ -240,6 +241,13 @@ _PROFILE_OVERLAY_MEMBERS = (
     "sessions",
 )
 
+# The on-disk profile id shape enforced at profile-creation time
+# (hermes_cli.profiles._PROFILE_ID_RE). Kept as a literal here because this
+# module must stay stdlib-only and import-safe; a name that could not have
+# been created as a profile must not be *recovered* as one either — every
+# recovery path below is anchored on it.
+_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
 
 def profile_identity_for_home(
     home: Path | str | None = None,
@@ -266,6 +274,13 @@ def profile_identity_for_home(
        symlinks into a shared named profile (#93862).
     3. Anything else -> ``(\"default\", None)``.
 
+    Windows note: overlay recovery (step 2) keys off ``Path.is_symlink()``,
+    which is False for NTFS junctions — junction-based overlays are
+    currently unsupported and resolve to ``default`` (steps 1/1b, which use
+    full path resolution, are unaffected). Widening the check to any
+    reparse-point divergence is possible but needs validation on a real
+    win32 host before it can gate the write guard's active side.
+
     Import-safe, never raises; falls back to ``(\"default\", None)``.
     """
     try:
@@ -288,8 +303,16 @@ def profile_identity_for_home(
         # 1b. The resolved home IS a profile dir under some OTHER root
         # (e.g. HERMES_HOME is a symlink to <custom-root>/profiles/<name>,
         # where root derivation from the unresolved env path picked the
-        # wrong root). The layout convention is unambiguous either way.
-        if home_real.parent.name == "profiles" and home_real.name:
+        # wrong root). Unlike step 1 this is not anchored to the configured
+        # root, so any directory literally named "profiles" would qualify —
+        # require the child to also pass the profile-id shape enforced at
+        # creation time (e.g. ``/srv/app/profiles/Cache.d`` is not a
+        # profile, but ``/srv/app/profiles/cache`` we accept: bounded risk,
+        # it misnames as a *named* profile rather than crossing a boundary).
+        if (
+            home_real.parent.name == "profiles"
+            and _PROFILE_NAME_RE.match(home_real.name)
+        ):
             return home_real.name, home_real.parent.parent
 
         # 2. Symlink-overlay recovery. Only inspect members that are
@@ -313,11 +336,13 @@ def profile_identity_for_home(
                 target = candidate.resolve(strict=True)
             except OSError:
                 continue
-            # Exact tail: target == <root>/profiles/<name>/<member>
+            # Exact tail: target == <root>/profiles/<name>/<member>, with
+            # <name> passing the creation-time profile-id shape (same
+            # reasoning as step 1b — this path is not root-anchored).
             if (
                 target.name == member
                 and target.parent.parent.name == "profiles"
-                and target.parent.name
+                and _PROFILE_NAME_RE.match(target.parent.name)
             ):
                 recovered.add((target.parent.name, target.parent.parent.parent))
         if len(recovered) == 1:
