@@ -30,7 +30,8 @@ vi.mock('@/i18n', () => ({
           kindLocal: 'Local',
           kindRemote: 'Remote gateway',
           kindSsh: 'SSH',
-          title: 'Registered gateways'
+          title: 'Registered gateways',
+          emptySources: 'No gateways available'
         }
       }
     }
@@ -55,7 +56,7 @@ const connection = (
 })
 
 describe('NewSessionSourcePicker', () => {
-  it('lists every registered source with its kind and surface nothing when empty', async () => {
+  it('lists every registered source with its kind', async () => {
     render(
       <NewSessionSourcePicker
         activeConnectionId="local"
@@ -103,5 +104,26 @@ describe('NewSessionSourcePicker', () => {
     fireEvent.click(screen.getByText('Homelab'))
 
     await waitFor(() => expect(onPick).toHaveBeenCalledWith('homelab'))
+  })
+
+  it('surfaces an explicit empty state instead of a bare label when no gateways are registered', async () => {
+    render(
+      <NewSessionSourcePicker
+        activeConnectionId="local"
+        connections={[]}
+        onPick={vi.fn()}
+        trigger={<button>New session</button>}
+      />
+    )
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'New session' }), {
+      button: 0,
+      pointerType: 'mouse'
+    })
+
+    await waitFor(() => expect(screen.getByText('No gateways available')).toBeDefined())
+    // No connection rows render — not even the active source.
+    expect(screen.queryByText('This device')).toBeNull()
+    expect(screen.getByRole('menuitem', { name: 'No gateways available' })).toBeDefined()
   })
 })

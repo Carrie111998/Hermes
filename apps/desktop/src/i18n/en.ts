@@ -789,6 +789,8 @@ export const en: Translations = {
       kindRemoteDesc: 'A Hermes gateway reachable over HTTP(S) — LAN, Tailscale, or the internet.',
       kindCloudDesc: 'A hosted instance discovered through your Hermes Cloud account.',
       kindSshDesc: 'A Hermes install reached over SSH.',
+      emptySources: 'No gateways available',
+      startFailed: 'Could not start a new session on the chosen gateway.',
       labelTitle: 'Name',
       labelDesc: 'Required. Shown everywhere this instance appears; must be unique (e.g. “Homelab”, “Work laptop”).',
       labelPlaceholder: 'Homelab',

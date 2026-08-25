@@ -35,6 +35,7 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -746,6 +747,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Clear a failed turn's red error banner. Errors are renderer-local (never
   // persisted): a bare error placeholder is dropped entirely; a partial-output
   // failure keeps its content and sheds the error. Both the runtime cache AND
+  const { t } = useI18n()
+
   // the live $messages view must be updated — preserveLocalAssistantErrors
   // re-grafts any still-errored view message on the next session.info flush.
   const dismissError = useCallback(
@@ -1048,7 +1051,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onNavigate: selectSidebarItem,
     onNewSessionInWorkspace: path => startSessionInWorkspace(path, { openTab: true }),
     onNewSessionSplit: dir => void openNewSessionTile(dir),
-    onStartSessionOnSource: connectionId => void startSessionOnSource(connectionId, startFreshSessionDraft),
+    onStartSessionOnSource: connectionId =>
+      startSessionOnSource(connectionId, startFreshSessionDraft).catch(error => {
+        const detail = error instanceof Error && error.message ? ` ${error.message}` : ''
+        notify({ kind: 'error', message: t.settings.connections.startFailed + detail })
+      }),
     onPasteClipboardImage: opts => composer.pasteClipboardImage(opts),
     onPickFiles: () => void composer.pickContextPaths('file'),
     onPickFolders: () => void composer.pickContextPaths('folder'),

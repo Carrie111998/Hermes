@@ -40,6 +40,14 @@ export function NewSessionSourcePicker({
   onPick: (connectionId: string) => void
 }) {
   const { t } = useI18n()
+
+  const KIND_LABEL: Record<DesktopRegistryConnection['kind'], string> = {
+    local: t.settings.connections.kindLocal,
+    remote: t.settings.connections.kindRemote,
+    cloud: t.settings.connections.kindCloud,
+    ssh: t.settings.connections.kindSsh
+  }
+
   const sorted = sortConnectionsForDisplay(connections)
 
   return (
@@ -53,15 +61,7 @@ export function NewSessionSourcePicker({
         {sorted.map((connection, index) => {
           const Icon = KIND_ICON[connection.kind]
           const isActive = connection.id === activeConnectionId
-
-          const kindLabel =
-            connection.kind === 'local'
-              ? t.settings.connections.kindLocal
-              : connection.kind === 'remote'
-                ? t.settings.connections.kindRemote
-                : connection.kind === 'cloud'
-                  ? t.settings.connections.kindCloud
-                  : t.settings.connections.kindSsh
+          const kindLabel = KIND_LABEL[connection.kind]
 
           return (
             <Fragment key={connection.id}>
@@ -98,6 +98,14 @@ export function NewSessionSourcePicker({
             </Fragment>
           )
         })}
+        {sorted.length === 0 && (
+          <DropdownMenuItem
+            className="cursor-default px-2 py-1.5 text-[0.8125rem] text-(--ui-text-tertiary)"
+            disabled
+          >
+            {t.settings.connections.emptySources}
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )

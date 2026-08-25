@@ -333,4 +333,18 @@ describe('startSessionOnSource', () => {
     expect(openDraft).not.toHaveBeenCalled()
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
   })
+
+  it('rejects AND does NOT open a draft when the dial fails to bring the target active', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    // Dial resolves but the target never becomes the active source.
+    ensureGatewayAgent.mockImplementationOnce(async () => undefined)
+    const openDraft = vi.fn()
+
+    await expect(startSessionOnSource('homelab', openDraft)).rejects.toThrow(/did not become active/)
+
+    // The draft must not start on the ORIGINAL source on a failed switch.
+    expect(openDraft).not.toHaveBeenCalled()
+    expect($connection.get()?.connectionId).toBe('local')
+  })
 })
