@@ -90,7 +90,8 @@ import {
   $focusedSessionState,
   $focusedStoredSessionId,
   $sessionStates,
-  $sessionTiles
+  $sessionTiles,
+  dropTilesForProfile
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { PaginatedSessions, UsageStats } from '@/types/hermes'
@@ -711,6 +712,17 @@ export const host = {
         : ambientRemoteConnectionId
           ? { connectionId: ambientRemoteConnectionId, profile: name }
           : undefined
+    )
+
+    // The profile is gone. Drop its persisted tiles NOW: a leftover Bot Mode
+    // tile restores on relaunch and dials the deleted profile's backend, whose
+    // ensure_hermes_home() re-creates the profile directory the delete just
+    // removed (hermes-agent#94235).
+    dropTilesForProfile(
+      route ? route.profile : name,
+      route
+        ? { connectionId: route.connectionId, profile: route.profile, targetProfile: route.targetProfile }
+        : undefined
     )
 
     // The profile rail paints from the shared $profiles cache; without a
