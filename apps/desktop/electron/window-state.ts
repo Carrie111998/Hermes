@@ -118,7 +118,7 @@ function staleFullscreenWorkArea(state, displays) {
 // width/height, capped to the largest current display so a size saved on a
 // since-disconnected bigger monitor can't exceed any screen the user now has.
 // Sets x/y only when still on-screen; otherwise Electron centers the window.
-function computeWindowOptions(state, displays): WindowOptions {
+function computeWindowOptions(state, displays, platform = process.platform): WindowOptions {
   const opts: WindowOptions = {
     width: finite(state?.width) ? state.width : DEFAULT_WIDTH,
     height: finite(state?.height) ? state.height : DEFAULT_HEIGHT
@@ -137,7 +137,11 @@ function computeWindowOptions(state, displays): WindowOptions {
     opts.height = clamp(opts.height, MIN_HEIGHT, cap.height)
   }
 
-  const staleWorkArea = staleFullscreenWorkArea(state, displays)
+  // The motivating restore-down failure is Windows-specific. Keeping the
+  // geometry heuristic there avoids rewriting deliberate near-fullscreen
+  // layouts from tiling WMs or user placement on macOS/Linux. This early return
+  // intentionally omits stale x/y so Electron centers the recovered window.
+  const staleWorkArea = platform === 'win32' ? staleFullscreenWorkArea(state, displays) : null
   if (staleWorkArea) {
     opts.width = clamp(Math.round(staleWorkArea.width * RECOVERED_WINDOW_RATIO), MIN_WIDTH, staleWorkArea.width)
     opts.height = clamp(Math.round(staleWorkArea.height * RECOVERED_WINDOW_RATIO), MIN_HEIGHT, staleWorkArea.height)
