@@ -1019,13 +1019,8 @@ export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number 
 }
 
 export const workspaceCwdForNewSession = (): string => {
-  // Both remote and local connections check the remembered workspace cwd,
-  // which is now scoped per-profile (see workspaceCwdKey above). This
-  // prevents a profile switch from inheriting the previous profile's
-  // working directory (#81492).
-  const remembered = getRememberedWorkspaceCwd()
-  if (remembered) {
-    return remembered
+  if ($connection.get()?.mode === 'remote') {
+    return getRememberedWorkspaceCwd()
   }
 
   // A bare new chat starts DETACHED — no inherited cwd, so the composer's coding
