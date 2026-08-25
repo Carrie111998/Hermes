@@ -89,15 +89,42 @@ _IMAGE_PATH_RE = re.compile(
     r"((?:[A-Za-z]:[\\/]|/)[^\s\"']+?\.(?:png|jpe?g|webp))", re.IGNORECASE
 )
 
-# http(s) URL literals in exec code checked against browser_navigate's policy
-_URL_RE = re.compile(r"https?://[^\s'\"\\)]+", re.IGNORECASE)
+# http(s) URL literals in exec code checked against browser_navigate's policy.
+# Backslashes are INCLUDED in the candidate: regex-escaped literals like
+# r"https://go\.solupay\.com/payment" are ordinary code content, and cutting
+# at the first backslash truncated them to a bare "https://go" whose DNS
+# failure was then misreported as a private-address block (#95027).
+_URL_RE = re.compile(r"https?://[^\s'\")]+", re.IGNORECASE)
+
+# Regex engines escape URL punctuation with backslashes; a browser never sees
+# them. Unescape before safety evaluation so the host is checked as written
+# (go\.solupay\.com -> go.solupay.com), and treat a candidate whose authority
+# still carries regex syntax after unescaping ((?:…), […], quantifiers) as a
+# search pattern rather than a concrete navigation target — resolving it only
+# yields a misleading DNS-failure block (#95027).
+_URL_ESCAPE_RE = re.compile(r"\\(.)")
+_URL_AUTHORITY_RE = re.compile(r"https?://([^/?#]+)", re.IGNORECASE)
+_REGEX_SYNTAX_CHARS = frozenset("(?*+[]|^$")
+
+
+def _normalize_url_candidate(url: str) -> Optional[str]:
+    """Normalize a regex-escaped URL literal; None marks a non-concrete pattern."""
+    candidate = _URL_ESCAPE_RE.sub(r"\1", url)
+    m = _URL_AUTHORITY_RE.match(candidate)
+    authority = m.group(1) if m else candidate
+    if any(ch in _REGEX_SYNTAX_CHARS for ch in authority):
+        return None  # regex pattern, not something a browser can navigate
+    return candidate
 
 
 def _blocked_url_in_code(code: str) -> Optional[str]:
     """Return an error if a URL literal fails the built-in navigation checks."""
     from tools.browser_tool import evaluate_url_safety
 
-    for url in _URL_RE.findall(code or ""):
+    for raw in _URL_RE.findall(code or ""):
+        url = _normalize_url_candidate(raw)
+        if url is None:
+            continue
         err = evaluate_url_safety(url)
         if err:
             return err.get("error", "Blocked: unsafe URL")
