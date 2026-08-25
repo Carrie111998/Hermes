@@ -352,4 +352,17 @@ describe('openMediaFileExternally', () => {
     await expect(openMediaFileExternally('/srv/out/a.png')).rejects.toThrow('gateway read failed')
     expect(openExternal).not.toHaveBeenCalled()
   })
+
+  // Gating the remote branch on the bridge's presence would drop a remote path
+  // into the local `file://` branch when the bridge is absent entirely, and
+  // `?.` then resolves to undefined — the exact silent no-op this fix removes.
+  // A remote open with no bridge must be a loud failure, not a quiet success.
+  it('rejects rather than silently resolving for a remote path with no bridge', async () => {
+    vi.stubGlobal('window', {})
+    $connection.set({ authMode: 'oauth', mode: 'remote', token: null } as never)
+
+    await expect(openMediaFileExternally('/srv/out/a.png')).rejects.toThrow(
+      'Desktop file download bridge is unavailable'
+    )
+  })
 })

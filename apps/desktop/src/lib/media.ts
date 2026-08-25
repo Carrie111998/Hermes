@@ -243,12 +243,19 @@ export async function openMediaFileExternally(path: string): Promise<void> {
     return
   }
 
-  if (window.hermesDesktop && isRemoteGateway()) {
+  // Gate on the connection alone, NOT on the bridge being present. Requiring
+  // `window.hermesDesktop` here would send a remote path down the local branch
+  // whenever the bridge is missing — reinstating the dead `file://` open this
+  // function exists to remove. `downloadGatewayMediaFile()` raises an explicit
+  // "bridge is unavailable" error instead, which the caller surfaces.
+  if (isRemoteGateway()) {
     await downloadGatewayMediaFile(path)
 
     return
   }
 
+  // Local mode only: the file really is on this machine, so `mediaExternalUrl()`
+  // resolves to a `file://` the shell can open.
   await window.hermesDesktop?.openExternal(mediaExternalUrl(path))
 }
 
