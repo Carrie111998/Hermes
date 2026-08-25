@@ -6,6 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.context_breakdown import (
+    compute_context_details,
+    compute_session_context_breakdown,
+)
 from agent.prompt_builder import drain_context_file_notices
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
@@ -399,12 +403,15 @@ def test_lazy_context_uses_frozen_agent_profile_scan_policy(monkeypatch, tmp_pat
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
     ):
-        build_system_prompt_parts(agent)
+        build_system_prompt(agent)
 
-    # A later config edit must not change the policy frozen with the prompt.
+    # Later config edits and read-only prompt projections must not change the
+    # policy frozen with the authoritative cached-prompt build.
     (agent_home / "config.yaml").write_text(
         'security:\n  context_file_scanning: "off"\n', encoding="utf-8"
     )
+    compute_session_context_breakdown(agent, [])
+    compute_context_details(agent)
     drain_context_file_notices()
     result = tracker.check_tool_call(
         "read_file", {"path": str(package / "module.py")}

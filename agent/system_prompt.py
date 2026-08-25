@@ -338,7 +338,12 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+def build_system_prompt_parts(
+    agent: Any,
+    system_message: Optional[str] = None,
+    *,
+    install_runtime_state: bool = False,
+) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
     Returns a dict with three keys:
@@ -352,7 +357,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     Joined into a single string by :func:`build_system_prompt` and
     cached on ``agent._cached_system_prompt`` for the lifetime of the
-    AIAgent.  Hermes never re-renders parts of this string mid-
+    AIAgent. ``install_runtime_state`` is reserved for that authoritative
+    cached-prompt build; read-only projections must leave session state alone.
+    Hermes never re-renders parts of this string mid-
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
@@ -380,7 +387,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         home_override=agent_home
     )
     subdirectory_hints = getattr(agent, "_subdirectory_hints", None)
-    if subdirectory_hints is not None:
+    if install_runtime_state and subdirectory_hints is not None:
         subdirectory_hints.set_scan_policy(_context_scan_policy)
 
     # ── Stable tier ────────────────────────────────────────────────
@@ -951,7 +958,11 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     rebuilt (on compaction/restore) the unchanged stable scaffold ahead of
     the change stays in the reused prefix.
     """
-    parts = build_system_prompt_parts(agent, system_message=system_message)
+    parts = build_system_prompt_parts(
+        agent,
+        system_message=system_message,
+        install_runtime_state=True,
+    )
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
 
