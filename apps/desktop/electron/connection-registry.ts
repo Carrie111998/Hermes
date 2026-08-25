@@ -415,7 +415,7 @@ export interface ConnectionAgents {
   profiles: null | string[]
   /** Present when profiles is null: why enumeration was skipped. */
   error?: string
-  /** Profile display names (`hermes profile rename`), keyed by profile name. */
+  /** Profile display names (`hermes profile rename`), keyed by trimmed profile name. */
   displayNames?: Record<string, string>
   /** Stable backend identity from the connection's /api/status (`install_id`).
    * Two connections reporting the same id are the SAME physical install

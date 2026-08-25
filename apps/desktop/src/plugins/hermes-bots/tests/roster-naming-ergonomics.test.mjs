@@ -96,11 +96,12 @@ test('display: without a display_name the remote default still reads as its conn
   assert.equal(displayName(bare, undefined), 'Laptop')
 })
 
-test('completion filter is substring: "scout" matches handle default-laptop', () => {
-  // The provider closure is not extractable; assert the shipped predicate shape.
+test('completion filter is substring with prefix-first ranking', () => {
+  // The provider closure is not extractable; assert the shipped predicate shape:
+  // membership by includes, ranking by startsWith.
   const provider = source.slice(source.indexOf("id: 'mention-completions'"))
-  assert.match(provider.slice(0, 2000), /includes\(q\)/)
-  assert.doesNotMatch(provider.slice(0, 2000), /startsWith\(q\)/)
+  assert.match(provider.slice(0, 2200), /field\.includes\(q\)/)
+  assert.match(provider.slice(0, 2200), /field\.startsWith\(q\)/)
 })
 
 test('warmUnionRoster: no-op without a queryClient, never throws', () => {

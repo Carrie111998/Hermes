@@ -4722,6 +4722,9 @@ function warmUnionRoster() {
 
   warmingRosterFor.add(connectionId)
 
+  // A hung fetch must not block warms for this connection forever.
+  const evict = setTimeout(() => warmingRosterFor.delete(connectionId), 15000)
+
   fetchRoster(connectionId)
     .then(roster => {
       if (Array.isArray(roster?.profiles)) {
@@ -4730,6 +4733,7 @@ function warmUnionRoster() {
     })
     .catch(() => undefined)
     .finally(() => {
+      clearTimeout(evict)
       warmingRosterFor.delete(connectionId)
     })
 }
@@ -14892,7 +14896,8 @@ export default {
 
           const active = focusedMentionProfile()
           const q = (query || '').toLowerCase()
-          const items = []
+          const prefixed = []
+          const rest = []
           const live = {
             name: active,
             connectionId: String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
@@ -14908,27 +14913,25 @@ export default {
             // Renamed bots complete on their friendly name — the tag is the
             // renamed slug when one exists, the profile handle otherwise.
             const tag = botMentionTag(profile)
+            const fields = [tag.toLowerCase(), handle.toLowerCase(), display.toLowerCase()]
 
             // Substring, not prefix: "@scout" must find "default-scout".
-            if (
-              q &&
-              !tag.toLowerCase().includes(q) &&
-              !handle.toLowerCase().includes(q) &&
-              !display.toLowerCase().includes(q)
-            ) {
+            // Prefix hits rank first so broad matches can't crowd them out.
+            if (q && !fields.some(field => field.includes(q))) {
               continue
             }
 
             const source = profile.connectionLabel ? ` · ${profile.connectionLabel}` : ''
+            const bucket = !q || fields.some(field => field.startsWith(q)) ? prefixed : rest
 
-            items.push({
+            bucket.push({
               insert: `@${tag}`,
               display: `@${tag}`,
               meta: `Bot · ${display}${source}`
             })
           }
 
-          return items.slice(0, 8)
+          return [...prefixed, ...rest].slice(0, 8)
         }
       }
     })
