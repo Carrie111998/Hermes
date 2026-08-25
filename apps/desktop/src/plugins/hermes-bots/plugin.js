@@ -5879,12 +5879,6 @@ async function openRosterBot(bot) {
 }
 
 function displayName(bot, meta) {
-  // Defensive: callers have historically passed {name: <object>} here (e.g.
-  // wrapping a roster owner object instead of its .name); a non-string name
-  // must degrade to '' rather than TypeError mid-render.
-  if (bot && typeof bot.name !== 'string') {
-    bot = { ...bot, name: typeof bot.name === 'object' && bot.name !== null ? String(bot.name?.name ?? '') : '' }
-  }
   // A configured alias route claiming this row overrides source-derived
   // identity: the friendly alias name must survive hosted-session
   // activation and Cloud-only rosters (#89131).
@@ -11097,6 +11091,12 @@ function defaultScheduleState() {
   return { freq: 'daily', time: '9:0', weekday: '1', monthday: '1', intervalN: '2', intervalUnit: 'h', onceN: '30', onceUnit: 'm', repeatN: '', raw: '' }
 }
 
+function routineDialogBotLabel(bot, metaByName) {
+  const owner = typeof bot === 'string' ? { name: bot } : bot
+
+  return displayName(owner, botRosterMeta(owner, metaByName))
+}
+
 function CreateRoutineDialog({ bot, open, onClose }) {
   const [name, setName] = useState('')
   const [instruction, setInstruction] = useState('')
@@ -11110,7 +11110,9 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const activeProfile = useValue(host.state.profile)
+  const allMeta = useValue($botMeta)
   const profile = typeof bot === 'string' ? bot : bot?.name
+  const botLabel = routineDialogBotLabel(bot, allMeta)
   const schedule = composeSchedule(sched)
 
   const reset = () => {
@@ -11183,7 +11185,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
           children: [
             jsx(DialogTitle, { children: 'New Cronjob' }),
             jsx(DialogDescription, {
-              children: `A recurring task ${displayName(typeof bot === 'string' ? { name: bot } : bot, botRosterMeta(bot, $botMeta.get()))} runs on a schedule. Runs land in its own chat history.`
+              children: `A recurring task ${botLabel} runs on a schedule. Runs land in its own chat history.`
             })
           ]
         }),
@@ -11213,7 +11215,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               'Send results to',
               pickerSelect(target, setTarget, [
                 { id: 'history', label: 'Run history only' },
-                { id: 'bot-chat', label: `${displayName(typeof bot === 'string' ? { name: bot } : bot, botRosterMeta(bot, $botMeta.get()))}\u2019s chat (bot responds)` }
+                { id: 'bot-chat', label: `${botLabel}\u2019s chat (bot responds)` }
               ])
             ),
             jsxs('label', {
