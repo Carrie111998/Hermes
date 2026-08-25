@@ -703,12 +703,12 @@ def _apply_tool_selection(
       - Either way, point the user at ``hermes mcp configure <name>``.
     """
     print()
-    print(color(f"  Probing '{entry.name}' for available tools...", Colors.CYAN))
 
     # Exclude-mode manifests short-circuit the checklist entirely: the curated
     # exclude list (names or glob patterns) is written as-is, everything else
     # stays enabled — including tools the server adds later. A reinstall with
     # a prior include selection still honours the user's own choice below.
+    # (No probe announcement here — this path deliberately never probes.)
     if entry.tools.default_excluded and prior_selection is None:
         _write_tools_exclude(entry.name, entry.tools.default_excluded)
         print(color(
@@ -721,6 +721,7 @@ def _apply_tool_selection(
         ))
         return
 
+    print(color(f"  Probing '{entry.name}' for available tools...", Colors.CYAN))
     probed = _probe_tools(entry.name)
 
     # Probe failure path
