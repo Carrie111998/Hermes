@@ -5,6 +5,7 @@ import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
+import { ModelPickerDialog } from '@/components/model-picker'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
@@ -704,6 +705,22 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
               onOpenSession={onOpenSession}
               onPauseResume={() => void handlePauseResume(selectedJob)}
               onTrigger={() => void handleTrigger(selectedJob)}
+              onModelChange={async (provider, model) => {
+                const { refreshError, stale } = await mutateAndRefreshCronJobs(profile, () =>
+                  updateCronJob(selectedJob.id, {
+                    model: model || null,
+                    provider: provider || null
+                  })
+                )
+
+                if (stale) {
+                  return
+                }
+
+                if (refreshError) {
+                  notifyError(refreshError, c.failedLoad)
+                }
+              }}
             />
           ) : query.trim() ? (
             // A search with no selected job: search-flavored copy is right.
@@ -783,7 +800,8 @@ function CronJobDetail({
   job,
   onOpenSession,
   onPauseResume,
-  onTrigger
+  onTrigger,
+  onModelChange
 }: {
   busy: boolean
   c: Translations['cron']
@@ -791,12 +809,16 @@ function CronJobDetail({
   onOpenSession?: (sessionId: string) => void
   onPauseResume: () => void
   onTrigger: () => void
+  onModelChange?: (provider: string, model: string) => Promise<void>
 }) {
   const state = jobState(job)
   const isPaused = state === 'paused'
   const deliver = jobDeliver(job)
   const prompt = jobPrompt(job)
   const modelOverride = jobModel(job)
+  const providerOverride = jobProvider(job)
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  const [modelBusy, setModelBusy] = useState(false)
 
   return (
     <PanelDetail>
@@ -813,6 +835,11 @@ function CronJobDetail({
             <PanelAction disabled={busy} icon="zap" onClick={onTrigger} primary>
               {c.triggerNow}
             </PanelAction>
+            {onModelChange && !jobIsScriptOnly(job) && (
+              <PanelAction disabled={busy || modelBusy} icon="settings" onClick={() => setModelPickerOpen(true)}>
+                {modelOverride || c.modelSwitcher}
+              </PanelAction>
+            )}
           </div>
         </div>
 
@@ -842,6 +869,27 @@ function CronJobDetail({
       ) : null}
 
       <CronJobRuns c={c} jobId={job.id} onOpenSession={onOpenSession} />
+
+      {onModelChange && !jobIsScriptOnly(job) && (
+        <ModelPickerDialog
+          contentClassName="z-[100]"
+          currentModel={modelOverride}
+          currentProvider={providerOverride}
+          onOpenChange={setModelPickerOpen}
+          onSelect={async ({ provider, model }) => {
+            setModelBusy(true)
+            try {
+              await onModelChange(provider, model)
+              notify({ kind: 'success', title: c.modelUpdated, message: truncate(jobTitle(job), 60) })
+            } catch {
+              notifyError(new Error(c.failedUpdate), c.failedUpdate)
+            } finally {
+              setModelBusy(false)
+            }
+          }}
+          open={modelPickerOpen}
+        />
+      )}
     </PanelDetail>
   )
 }
