@@ -100,6 +100,17 @@ class TestOpenRouterParity:
         )
         assert kw["extra_body"]["provider"] == prefs
 
+    def test_preset_keeps_server_side_provider_policy(self, transport):
+        kw = transport.build_kwargs(
+            model="@preset/hermes-primary",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("openrouter"),
+            provider_preferences={"data_collection": "deny"},
+        )
+
+        assert "provider" not in kw.get("extra_body", {})
+
 
 
 
