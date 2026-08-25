@@ -22,7 +22,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
-import { openGatewayForAgent, openGatewayForProfile, requestGatewayForAgent } from '@/store/gateway'
+import { openGatewayForAgent, openGatewayForProfile, requestGatewayForAgent, activeGatewayConnectionId } from '@/store/gateway'
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -58,6 +58,7 @@ import {
   $sessions,
   $yoloActive,
   getSessionOwnerHint,
+  setSessionOwnerHint,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
   sessionPinId,
@@ -513,6 +514,25 @@ export function useSessionActions({
 
         if (stored) {
           createdThisRun.add(stored)
+          const ownerRoute =
+            capturedRoute ||
+            (() => {
+              const connectionId = activeGatewayConnectionId()
+
+              if (!connectionId) {
+                return null
+              }
+
+              return {
+                connectionId,
+                profile: $activeGatewayProfile.get() || 'default',
+                mode: 'remote' as const
+              }
+            })()
+
+          if (ownerRoute) {
+            setSessionOwnerHint(stored, ownerRoute)
+          }
           // Seed the sidebar preview with the user's first message so the row
           // reads meaningfully while the turn is in flight, instead of flashing
           // "Untitled session" until the turn persists and auto-title runs. The
@@ -797,7 +817,25 @@ export function useSessionActions({
 
       // A row spliced from a CONNECTED registry gateway (#88880) carries its
       // owning connection — activate THAT gateway, not a same-named local
-      // profile. Rows without the tag keep the legacy profile path.
+      // profile. Rows without the tag keep the legacy profile path, EXCEPT
+      // when the live socket is already a remote connection: two homes both
+      // expose `default`, so a name-only owner resumes the remote session on
+      // This device (toast on first click) while a later send uses the hint
+      // we stamp below and works.
+      const liveOwnerRoute = (() => {
+        const connectionId = activeGatewayConnectionId()
+
+        if (!connectionId) {
+          return null
+        }
+
+        return {
+          connectionId,
+          mode: 'remote' as const,
+          profile: sessionProfile || $activeGatewayProfile.get() || 'default'
+        }
+      })()
+
       const sessionOwner: SessionOwnerScope =
         ownerRoute ||
         (storedForProfile?.connection_id
@@ -805,23 +843,29 @@ export function useSessionActions({
               connectionId: storedForProfile.connection_id,
               profile: sessionProfile || 'default'
             }
-          : sessionProfile)
+          : null) ||
+        liveOwnerRoute ||
+        sessionProfile
+
+      if (sessionOwner && typeof sessionOwner === 'object' && sessionOwner.connectionId) {
+        setSessionOwnerHint(storedSessionId, sessionOwner)
+      }
 
       // All-profiles / plugin navigation must not steal chrome API-home:
       // dial the owning backend without moving $activeGatewayProfile.
       if ($showAllProfiles.get()) {
-        if (ownerRoute?.connectionId || storedForProfile?.connection_id) {
+        if (ownerRoute?.connectionId || storedForProfile?.connection_id || liveOwnerRoute?.connectionId) {
           await openGatewayForAgent(
-            ownerRoute?.connectionId || storedForProfile?.connection_id || null,
-            ownerRoute?.profile || sessionProfile || 'default'
+            ownerRoute?.connectionId || storedForProfile?.connection_id || liveOwnerRoute?.connectionId || null,
+            ownerRoute?.profile || sessionProfile || liveOwnerRoute?.profile || 'default'
           )
         } else if (sessionProfile) {
           await openGatewayForProfile(normalizeProfileKey(sessionProfile))
         }
-      } else if (ownerRoute?.connectionId || storedForProfile?.connection_id) {
+      } else if (ownerRoute?.connectionId || storedForProfile?.connection_id || liveOwnerRoute?.connectionId) {
         await ensureGatewayAgent(
-          ownerRoute?.connectionId || storedForProfile?.connection_id || null,
-          ownerRoute?.profile || sessionProfile || 'default'
+          ownerRoute?.connectionId || storedForProfile?.connection_id || liveOwnerRoute?.connectionId || null,
+          ownerRoute?.profile || sessionProfile || liveOwnerRoute?.profile || 'default'
         )
       } else {
         await ensureGatewayProfile(sessionProfile)
@@ -842,12 +886,13 @@ export function useSessionActions({
       const requestForSession = <T>(method: string, params: Record<string, unknown> = {}): Promise<T> =>
         requestForSessionProfile<T>(sessionOwner, requestGateway, method, params)
 
-      const sessionRestScope = ownerRoute
-        ? {
-            connectionId: ownerRoute.connectionId,
-            profile: ownerRoute.targetProfile || ownerRoute.profile
-          }
-        : sessionProfile
+      const sessionRestScope =
+        sessionOwner && typeof sessionOwner === 'object' && sessionOwner.connectionId
+          ? {
+              connectionId: sessionOwner.connectionId,
+              profile: sessionOwner.targetProfile || sessionOwner.profile
+            }
+          : sessionProfile
 
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and

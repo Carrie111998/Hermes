@@ -120,10 +120,15 @@ export async function resumeStoredRuntimeSession(
   // runtime — every loser is an orphan for the reaper. Sharing one in-flight
   // promise makes concurrent recoveries converge on ONE runtime.
   const resumed = await singleFlightSessionResume(storedSessionId, async () => {
+    const [{ resolveSessionOwner }, { requestForSessionProfile }] = await Promise.all([
+      import('../use-session-actions/utils'),
+      import('@/store/session-request-router')
+    ])
+    const owner = await resolveSessionOwner(storedSessionId)
     const resolveProfile = deps.resolveProfile ?? defaultResolveProfile
     const profile = await resolveProfile(storedSessionId)
 
-    return deps.requestGateway<{ session_id: string }>('session.resume', {
+    return requestForSessionProfile<{ session_id: string }>(owner, deps.requestGateway, 'session.resume', {
       session_id: storedSessionId,
       source: 'desktop',
       omit_messages: true,

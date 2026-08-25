@@ -34,7 +34,6 @@ import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
-import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import { finalizeInterruptedMessages } from './rewind'
 import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
@@ -590,9 +589,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           const resumed = cachedRuntimeId
             ? { session_id: cachedRuntimeId }
             : await singleFlightSessionResume(targetStoredSessionId, async () => {
+                const [{ resolveSessionProfile, resolveSessionOwner }, { requestForSessionProfile }] = await Promise.all([
+                  import('../use-session-actions/utils'),
+                  import('@/store/session-request-router')
+                ])
                 const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
+                const owner = await resolveSessionOwner(targetStoredSessionId)
 
-                return requestGateway<{ session_id: string }>('session.resume', {
+                return requestForSessionProfile<{ session_id: string }>(owner, requestGateway, 'session.resume', {
                   session_id: targetStoredSessionId,
                   source: 'desktop',
                   omit_messages: true,
@@ -761,16 +765,23 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         try {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
+          const [{ resolveSessionOwner }, { requestForSessionProfile }] = await Promise.all([
+            import('../use-session-actions/utils'),
+            import('@/store/session-request-router')
+          ])
+          const owner = await resolveSessionOwner(recoverStoredSessionId)
+          const requestForOwner: GatewayRequest = (method, params, timeoutMs) =>
+            requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
 
           await withSessionNotFoundResume(
             sessionId,
             recoverStoredSessionId,
             liveId =>
               withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestForOwner('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               ),
             {
-              requestGateway,
+              requestGateway: requestForOwner,
               driftReason: sessionDriftReason,
               onRecovered: recoveredId => {
                 if (onRuntimeRecovered) {

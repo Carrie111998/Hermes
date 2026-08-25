@@ -12,6 +12,7 @@ import {
   $currentCwd,
   $messagingSessions,
   $sessions,
+  getSessionOwnerHint,
   commitWorkspaceCwdForSelectedSession,
   releaseWorkspaceCwdOwner,
   sessionMatchesStoredId,
@@ -28,7 +29,7 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
-import type { SessionProfileRoute } from '@/store/session-request-router'
+import type { SessionOwnerScope, SessionProfileRoute } from '@/store/session-request-router'
 
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
@@ -1422,6 +1423,44 @@ export async function resolveSessionProfile(storedSessionId: null | string): Pro
   const profile = (await resolveStoredSession(storedSessionId))?.profile?.trim()
 
   return profile || undefined
+}
+
+/**
+ * Owning (connection, profile) for a stored session when we already know the
+ * registry connection. A profile name alone is not enough: two gateways both
+ * expose `default`, and routing by name sends a remote follow-up to This device.
+ *
+ * Cache + hint only — never REST-probe. `resolveStoredSession` can hang tests
+ * and send-path recovery on a dead lookup; create/click stamp the hint instead.
+ */
+export async function resolveSessionOwner(storedSessionId: null | string): Promise<SessionOwnerScope> {
+  if (!storedSessionId) {
+    return undefined
+  }
+
+  try {
+    const hinted = getSessionOwnerHint(storedSessionId)
+
+    if (hinted?.connectionId?.trim()) {
+      return hinted
+    }
+
+    const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
+      sessionMatchesStoredId(session, storedSessionId)
+    )
+    const connectionId = cached?.connection_id?.trim()
+
+    if (connectionId) {
+      return {
+        connectionId,
+        profile: normalizeProfileKey(cached?.profile || 'default')
+      }
+    }
+  } catch {
+    // Fail open to the ambient socket rather than aborting the send.
+  }
+
+  return undefined
 }
 
 type SessionRuntimeStatePatch = Partial<

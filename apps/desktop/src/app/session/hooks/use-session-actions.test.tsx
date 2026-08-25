@@ -18,7 +18,7 @@ import {
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
-import { requestGatewayForAgent } from '@/store/gateway'
+import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
@@ -80,6 +80,7 @@ vi.mock('@/store/profile', async importOriginal => ({
 
 vi.mock('@/store/gateway', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
+  activeGatewayConnectionId: vi.fn(() => null),
   requestGatewayForAgent: vi.fn()
 }))
 
@@ -3261,5 +3262,60 @@ describe('selectSidebarItem', () => {
     expect(navigate).toHaveBeenCalledWith('/skills', undefined)
     expect(noteActiveTreeGroup).toHaveBeenCalledWith(null)
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
+  })
+})
+
+describe('resumeSession live remote owner', () => {
+  afterEach(() => {
+    cleanup()
+    setSessions([])
+    setResumeFailedSessionId(null)
+    setMessages([])
+    vi.mocked(activeGatewayConnectionId).mockReturnValue(null)
+    vi.mocked(getSession).mockReset()
+    vi.mocked(getLatestSessionMessages).mockReset().mockResolvedValue({ messages: [] } as never)
+    vi.mocked(requestGatewayForAgent).mockReset()
+  })
+
+  it('resumes an untagged default session on the live remote connection, not This device', async () => {
+    vi.mocked(activeGatewayConnectionId).mockReturnValue('remote-a')
+    setSessions([storedSession({ id: 'stored-remote', message_count: 0, profile: 'default' })])
+    vi.mocked(getSession).mockResolvedValue(
+      storedSession({ id: 'stored-remote', message_count: 0, profile: 'default' })
+    )
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [{ id: 'u1', role: 'user' }],
+      session_id: 'stored-remote'
+    } as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          messages: [],
+          session_id: 'rt-remote'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const ambientRequest = vi.fn(async () => {
+      throw new Error('session not found')
+    })
+
+    let resume: null | ((storedSessionId: string) => Promise<unknown>) = null
+    render(<ResumeHarness onReady={ready => (resume = ready)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    await resume!('stored-remote')
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'remote-a',
+      'default',
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-remote' })
+    )
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.resume', expect.anything())
+    expect($resumeFailedSessionId.get()).toBeNull()
   })
 })
