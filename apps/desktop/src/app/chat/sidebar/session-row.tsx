@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { memo } from 'react'
 import type * as React from 'react'
 
+import { ConnectionOriginTag } from '@/app/chat/connection-origin-tag'
 import { PrTag } from '@/app/chat/pr-tag'
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
@@ -11,6 +12,7 @@ import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timesta
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { OverflowTip, Tip } from '@/components/ui/tooltip'
+import type { DesktopRegistryConnection } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
@@ -73,6 +75,11 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
    *  flat cross-profile lists — Pinned and search results in the All-profiles
    *  view — where no group header communicates ownership (#66003). */
   showProfile?: boolean
+  /** Tag the row with its owning CONNECTION (the gateway-origin chip). Passed
+   *  the active gateway when it is a remote/SSH/cloud source, so a session
+   *  list browsed on a foreign connection is clearly labelled as belonging to
+   *  that gateway instead of silently appearing in the local profile's view. */
+  connection?: DesktopRegistryConnection | null
   /** Inbox-style card: workspace header, title + last-message preview, and a
    *  model · size footer. The flat recents list opts in via the filter menu;
    *  dense tree surfaces (projects, messaging, pins) keep the one-line row. */
@@ -136,6 +143,7 @@ function SidebarSessionRowImpl({
   dragging = false,
   dragHandleProps,
   showProfile = false,
+  connection = null,
   card = false,
   className,
   style,
@@ -199,6 +207,13 @@ function SidebarSessionRowImpl({
   // thing. Chips used to render in the body instead, which left them stranded
   // to the left of the kebab's own column: never flush right, never swapping.
   const trailing: { key: string; node: React.ReactNode }[] = []
+
+  // The gateway origin leads the chips: it names the connection the whole
+  // list belongs to (only set for remote/SSH/cloud sources), before the
+  // per-row profile ownership.
+  if (connection) {
+    trailing.push({ key: 'origin', node: <ConnectionOriginTag connection={connection} /> })
+  }
 
   if ((showProfile || pinnedProfile) && hasProfileTag) {
     trailing.push({ key: 'profile', node: <ProfileTag profile={session.profile} /> })

@@ -6,7 +6,7 @@ import { useCallback, useMemo } from 'react'
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
-import type { HermesGitWorktree } from '@/global'
+import type { DesktopRegistryConnection, HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
@@ -158,6 +158,10 @@ interface SidebarSessionsSectionProps {
   // lists (Pinned / search results) in the All-profiles view, where no group
   // header communicates ownership (#66003).
   showProfileTags?: boolean
+  // Tag every row with its owning CONNECTION — the gateway-origin chip. Set
+  // when the active source is a remote/SSH/cloud gateway, so a session list
+  // browsed on a foreign connection is clearly labelled as such.
+  connection?: DesktopRegistryConnection | null
   // Which dividers to fold into the flat list: `date` gives the chronological
   // "Yesterday" / "Last week" separators (flat recents + entered-project lanes),
   // `status` splits into WORKING / DONE under the same separators. `none` for
@@ -211,6 +215,7 @@ export function SidebarSessionsSection({
   projectBackRow,
   dndSensors,
   showProfileTags = false,
+  connection = null,
   grouping = 'none',
   card = false
 }: SidebarSessionsSectionProps) {
@@ -252,6 +257,7 @@ export function SidebarSessionsSection({
       const rowProps = {
         branchStem,
         card,
+        connection,
         isPinned: pinned,
         isSelected: session.id === activeSessionId,
         onArchive: () => onArchiveSession(session.id),
@@ -275,6 +281,7 @@ export function SidebarSessionsSection({
     [
       activeSessionId,
       card,
+      connection,
       onArchiveSession,
       onBranchSession,
       onDeleteSession,
@@ -459,6 +466,7 @@ export function SidebarSessionsSection({
         activeSessionId={activeSessionId}
         card={card}
         className={contentClassName}
+        connection={connection}
         dividerAction={dividerAction}
         onArchiveSession={onArchiveSession}
         onBranchSession={onBranchSession}

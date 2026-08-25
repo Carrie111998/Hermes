@@ -402,6 +402,16 @@ export function ChatSidebar({
   const profileScope = useStore($profileScope)
   const activeConnectionId = useStore($activeConnectionId)
 
+  // The active gateway's registry row, surfaced as a per-row origin chip on
+  // the session lists when it is a foreign (remote/SSH/cloud) source. Local
+  // "This device" stays unlabelled (the normal case).
+  const activeConnectionOrigin =
+    connectionsRegistry && activeConnectionId
+      ? (connectionsRegistry.connections.find(connection => connection.id === activeConnectionId) ?? null)
+      : null
+
+  const sessionConnectionOrigin = activeConnectionOrigin && activeConnectionOrigin.kind !== 'local' ? activeConnectionOrigin : null
+
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
   // become the truth (optimistic update + rollback in markSessionUnread).
@@ -1621,6 +1631,7 @@ export function ChatSidebar({
             {trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
+                connection={sessionConnectionOrigin}
                 contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
                 emptyState={
                   searchPending ? (
@@ -1650,6 +1661,7 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
+                connection={sessionConnectionOrigin}
                 contentClassName="flex flex-col gap-px rounded-lg pb-2 pt-1"
                 dndSensors={dndSensors}
                 emptyState={<SidebarPinnedEmptyState />}
@@ -1680,6 +1692,7 @@ export function ChatSidebar({
                 // the overview previews all render the same card.
                 card={cardRows}
                 collapsible={!inProject}
+                connection={sessionConnectionOrigin}
                 contentClassName={cn(
                   'flex min-h-0 flex-1 flex-col gap-px pb-1.75',
                   // The section is the ONE authority on whether the virtual
@@ -1800,6 +1813,7 @@ export function ChatSidebar({
                                     className={HEADER_ACTION_BTN}
                                     onClick={event => {
                                       event.stopPropagation()
+
                                       // The source picker owns the click; return so
                                       // the DropdownMenu trigger opens instead of
                                       // creating a session on the active source.
