@@ -1209,6 +1209,11 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_reasoning_items TEXT,
     codex_message_items TEXT,
     platform_message_id TEXT,
+    -- External-harness event identity: native_event_id||':'||ordinal, set by
+    -- the session-bridge ingest. Backs the partial UNIQUE index that makes a
+    -- re-ingest unable to append a second copy of an already-stored event.
+    -- NULL for every non-ingested row, which the partial index excludes.
+    native_event_key TEXT,
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
@@ -4125,6 +4130,25 @@ class SessionDB:
             )
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+
+        # Makes a re-ingest structurally unable to append a second copy of an
+        # event this session already stores. Partial, so the ~5% of rows with
+        # no external identity (and every non-ingested row) are exempt rather
+        # than colliding on NULL. IntegrityError is caught as well as
+        # OperationalError: a DB still carrying duplicates must keep opening
+        # read-only rather than fail startup -- the index simply stays absent
+        # until the duplicates are cleared.
+        try:
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_native_event_key "
+                "ON messages(session_id, native_event_key) "
+                "WHERE native_event_key IS NOT NULL"
+            )
+        except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+            logger.warning(
+                "idx_messages_native_event_key not created (%s) -- duplicate "
+                "external events may exist in this database.", exc
+            )
 
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
@@ -7107,8 +7131,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content,
+                   native_event_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -7129,6 +7154,7 @@ class SessionDB:
                     1 if msg.get("observed") else 0,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    msg.get("native_event_key"),
                 ),
             )
             inserted_ids.append(cursor.lastrowid)
