@@ -108,6 +108,48 @@ class TestBuildLearnPrompt:
         assert 'action="create"' in prompt
 
 
+class TestDurableFactPersistence:
+    def test_persists_durable_facts_via_memory_tool(self):
+        # Issue #94456: /learn routed everything to skill authoring, so
+        # "/learn remember our deploy key lives in ~/.config/deploy.env"
+        # produced a useless one-off skill instead of a durable memory entry.
+        prompt = build_learn_prompt(
+            "remember that our prod deploy key lives in ~/.config/deploy.env"
+        )
+        low = prompt.lower()
+        assert "memory" in low
+        assert "skill_manage" in low
+        assert "not paste source content wholesale into memory" in low
+
+    def test_fact_only_requests_may_skip_skill_authoring(self):
+        # The issue's literal patch still mandated ONE SKILL.md even when the
+        # request contains no procedure at all — reproducing the exact failure
+        # it describes. The prompt must let pure-fact requests skip step 2.
+        prompt = build_learn_prompt(
+            "remember that our prod deploy key lives in ~/.config/deploy.env"
+        )
+        low = prompt.lower()
+        assert "no procedure" in low
+        assert "skip steps 2 and 2b" in low
+        assert "do not author a skill" in low
+
+    def test_structural_invariants_ordering_and_memory_params(self):
+        # Substring presence alone can't catch reordering: 1c must sit
+        # between 1b and 2, and 2 before 2b (issue #94456 specifies the slot).
+        prompt = build_learn_prompt(
+            "remember that our prod deploy key lives in ~/.config/deploy.env"
+        )
+        assert (
+            prompt.index("\n1b.")
+            < prompt.index("\n1c.")
+            < prompt.index("\n2.")
+            < prompt.index("\n2b.")
+        )
+        # Memory persistence names its explicit tool parameters; dropping
+        # them loses the add/replace semantics the guidance depends on.
+        assert 'action="add"' in prompt
+
+
 class TestLearnRegistryWiring:
     def test_learn_is_registered_and_resolves(self):
         from hermes_cli.commands import resolve_command
