@@ -872,6 +872,23 @@ Key tables in `state.db`:
 - After a prune that actually removed rows, `state.db` is `VACUUM`ed to reclaim disk space when at least `sessions.min_vacuum_interval_days` (default 30) have elapsed since the last successful `VACUUM` (SQLite does not shrink the file on plain DELETE)
 - Pruning runs at most once per `sessions.min_interval_hours` (default 24); the last-run timestamp is tracked inside `state.db` itself so it's shared across every Hermes process in the same `HERMES_HOME`
 
+Completed **temporary child** sessions (explicit `delegate_task` children) stay in `state.db` by default after their result is delivered. Installations that want disposable workers gone after integration can set:
+
+```yaml
+delegation:
+  completed_session_retention: delete   # keep | archive | delete
+```
+
+Only sessions marked at creation as temporary (`model_config._delegate_from` or `_ephemeral`) are eligible. `--source tool` remains a list-visibility marker and is never treated as proof that deletion is safe. Running, user-created, shared, pinned, and unknown-after-crash rows are retained. Desktop pickers refresh via the existing `sessions.changed` broadcast when `state.db` is written.
+
+External one-shot workers can opt in per run:
+
+```bash
+hermes chat -q "do the job" --ephemeral
+```
+
+That marks ownership at creation and deletes **that** session only after a successful terminal finalization.
+
 Default is **off** — session history is valuable for `session_search` recall, and silently deleting it could surprise users. Enable in `~/.hermes/config.yaml`:
 
 ```yaml

@@ -563,6 +563,16 @@ def build_top_level_parser():
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
     )
+    chat_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        default=False,
+        help=(
+            "Mark this one-shot run as a disposable worker session and delete "
+            "it after successful terminal finalization. Does not treat --source "
+            "tool as proof that deletion is safe."
+        ),
+    )
     _inherited_flag(
         chat_parser,
         "--tui",

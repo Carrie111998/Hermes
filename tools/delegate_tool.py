@@ -46,6 +46,19 @@ from tools.terminal_tool import set_approval_callback as _set_subagent_approval_
 from utils import base_url_hostname, is_truthy_value
 
 
+def _accept_child_sessions_after_parent_result(parent_agent, result) -> None:
+    """Stamp durable parent acceptance, then apply completed-session retention."""
+    try:
+        from agent.session_retention import accept_from_delegation_result
+
+        session_db = getattr(parent_agent, "_session_db", None)
+        if session_db is None:
+            return
+        accept_from_delegation_result(session_db, result)
+    except Exception:
+        logger.debug("temporary child session retention failed", exc_info=True)
+
+
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
@@ -2935,6 +2948,7 @@ def _run_single_child(
                     else None
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
+                "child_session_id": str(getattr(child, "session_id", "") or ""),
                 "diagnostic_path": diagnostic_path,
             }
             if _late_pending_steer:
@@ -3131,6 +3145,7 @@ def _run_single_child(
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
             },
+            "child_session_id": str(getattr(child, "session_id", "") or ""),
             "tool_trace": tool_trace,
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
@@ -3309,6 +3324,7 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
+            "child_session_id": str(getattr(child, "session_id", "") or ""),
             "_child_role": getattr(child, "_delegate_role", None),
         }
         if _late_pending_steer:
@@ -4166,6 +4182,7 @@ def delegate_task(
                 "runtime; running the batch synchronously instead."
             )
             _sync_result = _execute_and_aggregate()
+            _accept_child_sessions_after_parent_result(parent_agent, _sync_result)
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "
@@ -4352,6 +4369,7 @@ def delegate_task(
             dispatch.get("error", "rejected"),
         )
         _cap_result = _execute_and_aggregate()
+        _accept_child_sessions_after_parent_result(parent_agent, _cap_result)
         if isinstance(_cap_result, dict):
             _cap_result["note"] = (
                 "The background delegation pool was at capacity "
@@ -4363,7 +4381,9 @@ def delegate_task(
         return json.dumps(_cap_result, ensure_ascii=False)
 
     # ----- Synchronous path -----
-    return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+    _sync_final = _execute_and_aggregate()
+    _accept_child_sessions_after_parent_result(parent_agent, _sync_final)
+    return json.dumps(_sync_final, ensure_ascii=False)
 
 
 def _resolve_child_credential_pool(

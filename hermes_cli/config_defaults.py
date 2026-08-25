@@ -2047,6 +2047,12 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Lifecycle for agent-created temporary child sessions after the
+        # parent has durably accepted the child's terminal result.
+        # keep (default) leaves the row; archive soft-hides it; delete
+        # removes the session and ownership metadata. Never inferred from
+        # source tags — only explicit _delegate_from / _ephemeral ownership.
+        "completed_session_retention": "keep",
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

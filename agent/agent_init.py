@@ -1777,6 +1777,14 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    # Explicit ownership for `hermes chat --ephemeral`. Source tags such as
+    # `--source tool` stay visibility-only and never authorize deletion.
+    if str(os.environ.get("HERMES_EPHEMERAL_SESSION") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        agent._session_init_model_config["_ephemeral"] = True
     # Persist a process-scoped --yolo launch into the session row so a later
     # `hermes --resume <id>` can restore the bypass (CLI resume paths read
     # model_config.yolo_mode back via SessionDB.session_yolo_enabled).

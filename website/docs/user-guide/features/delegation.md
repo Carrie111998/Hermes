@@ -478,6 +478,10 @@ error.
 # In ~/.hermes/config.yaml
 delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
+  # completed_session_retention: keep       # keep | archive | delete (default: keep).
+                                            # Opt-in cleanup of explicitly owned temporary
+                                            # children after the parent accepts their
+                                            # terminal result. Never inferred from source tags.
   # max_concurrent_children: 3              # Parallel children per batch (default: 3)
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
