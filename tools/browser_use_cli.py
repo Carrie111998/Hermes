@@ -687,6 +687,38 @@ def browser_exec(
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
+    # Issue #94946: under the default Browser Use CLI backend, browser daemons
+    # were never reaped — the cleanup thread never started (it lives in
+    # tools/browser_tool.py and is only kicked off from the legacy
+    # agent-browser path) and the orphan reaper's socket-dir glob never
+    # matched harness runtime dirs.  Register lifecycle hooks here so
+    # ``browser.inactivity_timeout`` actually fires and the orphan reaper
+    # has a session to reason about.  Safe to call on every invocation —
+    # _start_browser_cleanup_thread is idempotent, _update_session_activity
+    # is a dict write under a short-lived lock.
+    try:
+        from tools.browser_tool import (
+            _register_browser_use_session,
+            _start_browser_cleanup_thread,
+            _update_session_activity,
+        )
+        _start_browser_cleanup_thread()
+        # Pick the right cache key: named sessions get their own harness
+        # daemon (BU_NAME), unnamed calls share a per-task daemon.  Either
+        # way, the activity-tracking key matches _get_session_info's key
+        # for the provider path so the cleanup thread sees consistent
+        # activity regardless of how the session was bootstrapped.
+        lifecycle_key = (
+            f"bu-named-{session}" if session
+            else (task_id or "browser-exec-default")
+        )
+        _register_browser_use_session(lifecycle_key, session_name=session)
+        _update_session_activity(lifecycle_key)
+    except Exception as e:
+        # Lifecycle hooks are best-effort: never block the user's tool
+        # call because bookkeeping failed.  Log and continue.
+        logger.debug("browser_use_cli lifecycle hooks failed: %s", e)
+
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)

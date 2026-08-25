@@ -1916,6 +1916,35 @@ def _socket_safe_tmpdir() -> str:
     return tempfile.gettempdir()
 
 
+def _harness_runtime_dir() -> str:
+    """Per-user runtime directory used by the Browser Use ``browser_harness``
+    CLI backend (``python -m browser_harness.daemon``).
+
+    The harness is the default browser backend since #83402 / #81958, but it
+    does NOT drop session sockets under ``/tmp/agent-browser-*`` the way the
+    legacy ``agent-browser`` Node binary does — it keeps its PID/socket state
+    in this XDG-style dir instead.  Consequence: the orphan reaper, which
+    globs ``agent-browser-*`` under ``_socket_safe_tmpdir()``, is a no-op
+    under the default backend and harness daemons accumulate for the
+    lifetime of the process.  Issue #94946.
+
+    Path mirrors ``browser_harness.paths::runtime_dir`` (the harness package
+    is not vendored into Hermes, so we resolve the location ourselves).  On
+    Windows ``XDG_CONFIG_HOME`` is unset, so we fall back to ``%APPDATA%``.
+    A missing directory is fine — callers handle the "no session yet" case.
+    """
+    import os as _os
+    xdg = _os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg and _os.path.isabs(xdg):
+        return _os.path.join(xdg, "browser-harness", "runtime")
+    if sys.platform == "win32":
+        appdata = _os.environ.get("APPDATA", "").strip()
+        if appdata:
+            return _os.path.join(appdata, "browser-harness", "runtime")
+    home = _os.path.expanduser("~")
+    return _os.path.join(home, ".config", "browser-harness", "runtime")
+
+
 # Track active sessions per "session key".
 #
 # A "session key" is either the bare task_id (cloud/default path) OR a composite
@@ -2179,11 +2208,27 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
             daemon_pid, session_name, exc)
         return False
 
-    looks_like_browser = "agent-browser" in name or "agent-browser" in cmdline
+    # Identity check.  Two acceptable process identities:
+    #   - the legacy ``agent-browser`` Node binary (``name`` or ``cmdline``
+    #     contains "agent-browser"), AND
+    #   - the default Browser Use ``browser_harness`` Python daemon (its
+    #     cmdline is ``python -m browser_harness.daemon``).  The harness is
+    #     the default backend since #83402 / #81958; without this branch the
+    #     reaper refuses to reap harness daemons even when every other
+    #     safety check would pass — see issue #94946.
+    name_l = (name or "").lower()
+    cmdline_l = cmdline or ""
+    looks_like_browser = (
+        "agent-browser" in name_l
+        or "agent-browser" in cmdline_l
+        or "browser_harness" in name_l
+        or "browser_harness" in cmdline_l
+    )
     if not looks_like_browser:
         logger.warning(
             "Refusing to reap PID %d (session %s): not an agent-browser "
-            "process (name=%r)", daemon_pid, session_name, name)
+            "or browser_harness process (name=%r)",
+            daemon_pid, session_name, name)
         return False
 
     # Binding check: the live process must reference *this* socket dir.
@@ -2247,17 +2292,23 @@ def _socket_dir_idle_seconds(socket_dir: str) -> Optional[float]:
 
 
 def _reap_orphaned_browser_sessions():
-    """Scan for orphaned agent-browser daemon processes from previous runs.
+    """Scan for orphaned browser daemons from previous runs.
 
     When the Python process that created a browser session exits uncleanly
     (SIGKILL, crash, gateway restart), the in-memory ``_active_sessions``
-    tracking is lost but the node + Chromium processes keep running.
+    tracking is lost but the browser daemons keep running.
 
-    This function scans the tmp directory for ``agent-browser-*`` socket dirs
-    left behind by previous runs, reads the daemon PID files, and kills any
-    daemons whose owning hermes process is no longer alive.
+    Two socket-dir layouts are scanned, each tied to a different backend:
 
-    Ownership detection priority:
+    * Legacy ``agent-browser`` (Node binary) — drops a ``<tmp>/agent-browser-*
+      `` socket dir per session.
+    * Default ``browser_harness`` (Python ``browser-use`` CLI) — keeps its
+      session state under ``_harness_runtime_dir()`` (``~/.config/browser-harness/runtime``
+      on POSIX, ``%APPDATA%/browser-harness/runtime`` on Windows).  Issue
+      #94946: the reaper used to ignore this dir, so harness daemons leaked
+      for the lifetime of the process.
+
+    Per-session ownership detection priority:
       1. ``<session>.owner_pid`` file (written by current code) — if the
          referenced hermes PID is alive, leave the daemon alone regardless
          of whether it's in *this* process's ``_active_sessions``.  This is
@@ -2272,12 +2323,25 @@ def _reap_orphaned_browser_sessions():
     import glob
 
     tmpdir = _socket_safe_tmpdir()
-    pattern = os.path.join(tmpdir, "agent-browser-h_*")
-    socket_dirs = glob.glob(pattern)
-    # Also pick up CDP sessions
+    socket_dirs = []
+    # Legacy ``agent-browser`` Node binary — h_/cdp_/hermes_ per-session dirs.
+    socket_dirs += glob.glob(os.path.join(tmpdir, "agent-browser-h_*"))
     socket_dirs += glob.glob(os.path.join(tmpdir, "agent-browser-cdp_*"))
-    # Also pick up cloud-provider sessions (browser-use/browserbase/firecrawl)
     socket_dirs += glob.glob(os.path.join(tmpdir, "agent-browser-hermes_*"))
+
+    # Default Browser Use ``browser_harness`` backend (#94946).  Each
+    # harness daemon keeps its session state in a directory whose basename
+    # is the session_name — so we glob one level deep under runtime_dir.
+    harness_dir = _harness_runtime_dir()
+    if os.path.isdir(harness_dir):
+        try:
+            for entry in os.listdir(harness_dir):
+                full = os.path.join(harness_dir, entry)
+                if os.path.isdir(full):
+                    socket_dirs.append(full)
+        except OSError:
+            # harness_dir unreadable — ignore, the rest still runs.
+            pass
 
     if not socket_dirs:
         return
@@ -2293,106 +2357,124 @@ def _reap_orphaned_browser_sessions():
     reaped = 0
     for socket_dir in socket_dirs:
         dir_name = os.path.basename(socket_dir)
-        # dir_name is "agent-browser-{session_name}"
-        session_name = dir_name.removeprefix("agent-browser-")
+        # Strip the legacy ``agent-browser-`` prefix if present; harness
+        # runtime dirs use the bare session_name as the basename.
+        if dir_name.startswith("agent-browser-"):
+            session_name = dir_name[len("agent-browser-"):]
+        else:
+            session_name = dir_name
         if not session_name:
             continue
-
-        # Ownership check: prefer owner_pid file (cross-process safe).
-        owner_pid_file = os.path.join(socket_dir, f"{session_name}.owner_pid")
-        owner_pid: Optional[int] = None
-        owner_alive: Optional[bool] = None  # None = owner_pid missing/unreadable
-        if os.path.isfile(owner_pid_file):
-            try:
-                owner_pid = int(Path(owner_pid_file).read_text(encoding="utf-8").strip())
-                # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484).
-                # Use the cross-platform existence check.
-                from gateway.status import _pid_exists
-                owner_alive = _pid_exists(owner_pid)
-            except (ValueError, OSError):
-                owner_pid = None
-                owner_alive = None  # corrupt file — fall through
-
-        if owner_alive is True:
-            # Owner is alive.  Normally that means the session belongs to a
-            # live hermes process and must not be touched — but "owner alive"
-            # alone made leaked daemons immortal: if the owner lost its
-            # in-memory tracking (any exception path between spawn and
-            # registration), nothing would ever reap the daemon, and the
-            # daemon-side AGENT_BROWSER_IDLE_TIMEOUT_MS does not fire when the
-            # daemon itself is wedged (e.g. Chrome's framework was swapped out
-            # from under it by an auto-update).
-            #
-            # So: still trust live tracking, but fall back to idle age.
-            if session_name in tracked_names:
-                continue
-
-            idle_s = _socket_dir_idle_seconds(socket_dir)
-            if idle_s is None or idle_s < BROWSER_ORPHAN_GRACE_SECONDS:
-                # Unknown age, or still within the grace window — fail safe.
-                continue
-
-            logger.warning(
-                "Browser session %s has a live owner (PID %s) but is untracked "
-                "and idle for %ds (grace %ds) — treating as leaked and reaping",
-                session_name, owner_pid, int(idle_s),
-                BROWSER_ORPHAN_GRACE_SECONDS)
-            # fall through to the reap path below
-
-        if owner_alive is None:
-            # No owner_pid file (legacy daemon).  Fall back to in-process
-            # tracking: if this process knows about the session, leave alone.
-            if session_name in tracked_names:
-                continue
-
-        # owner_alive is False (dead owner) OR legacy daemon not tracked here.
-        pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-        if not os.path.isfile(pid_file):
-            # No daemon PID file — just a stale dir, remove it
-            shutil.rmtree(socket_dir, ignore_errors=True)
-            continue
-
-        try:
-            daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            shutil.rmtree(socket_dir, ignore_errors=True)
-            continue
-
-        # Check if the daemon is still alive. ``os.kill(pid, 0)`` on Windows
-        # is NOT a no-op — use the handle-based existence check.
-        from gateway.status import _pid_exists
-        if not _pid_exists(daemon_pid):
-            shutil.rmtree(socket_dir, ignore_errors=True)
-            continue
-
-        # The PID is live — but the .pid file lives in a world-writable,
-        # predictably-named temp dir we don't write ourselves, and PIDs get
-        # recycled after the real daemon exits.  Verify the process really is
-        # *this* session's agent-browser daemon before tree-killing it; refuse
-        # otherwise (don't touch the process, leave the socket dir for a later
-        # sweep once the imposter PID is gone).  Fixes the arbitrary same-user
-        # process DoS in issue #14073.
-        if not _verify_reapable_browser_daemon(
-                daemon_pid, socket_dir, session_name):
-            continue
-
-        # Daemon is alive and its owner is dead (or legacy + untracked).  Reap.
-        # Use the process-tree termination helper so Chromium children
-        # (renderer, GPU, etc.) are cleaned up, not just the daemon parent.
-        try:
-            from tools.process_registry import ProcessRegistry
-            ProcessRegistry._terminate_host_pid(daemon_pid)
-            logger.info("Reaped orphaned browser daemon PID %d (session %s)",
-                        daemon_pid, session_name)
+        if _reap_one_browser_socket_dir(socket_dir, session_name, tracked_names):
             reaped += 1
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-
-        # Clean up the socket directory
-        shutil.rmtree(socket_dir, ignore_errors=True)
 
     if reaped:
         logger.info("Reaped %d orphaned browser session(s) from previous run(s)", reaped)
+
+
+def _reap_one_browser_socket_dir(
+    socket_dir: str, session_name: str, tracked_names: set
+) -> bool:
+    """Process a single socket/runtime dir for the orphan reaper.
+
+    Returns True iff a daemon was reaped from this dir.  Factored out of
+    ``_reap_orphaned_browser_sessions`` so the two socket-dir layouts
+    (``/tmp/agent-browser-*`` and ``~/.config/browser-harness/runtime/<name>``)
+    share the same ownership / binding / verification logic — and so the
+    per-dir work is independently testable.  Issue #94946.
+    """
+    # Ownership check: prefer owner_pid file (cross-process safe).
+    owner_pid_file = os.path.join(socket_dir, f"{session_name}.owner_pid")
+    owner_pid: Optional[int] = None
+    owner_alive: Optional[bool] = None  # None = owner_pid missing/unreadable
+    if os.path.isfile(owner_pid_file):
+        try:
+            owner_pid = int(Path(owner_pid_file).read_text(encoding="utf-8").strip())
+            # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484).
+            # Use the cross-platform existence check.
+            from gateway.status import _pid_exists
+            owner_alive = _pid_exists(owner_pid)
+        except (ValueError, OSError):
+            owner_pid = None
+            owner_alive = None  # corrupt file — fall through
+
+    if owner_alive is True:
+        # Owner is alive.  Normally that means the session belongs to a
+        # live hermes process and must not be touched — but "owner alive"
+        # alone made leaked daemons immortal: if the owner lost its
+        # in-memory tracking (any exception path between spawn and
+        # registration), nothing would ever reap the daemon, and the
+        # daemon-side AGENT_BROWSER_IDLE_TIMEOUT_MS does not fire when the
+        # daemon itself is wedged (e.g. Chrome's framework was swapped out
+        # from under it by an auto-update).
+        #
+        # So: still trust live tracking, but fall back to idle age.
+        if session_name in tracked_names:
+            return False
+
+        idle_s = _socket_dir_idle_seconds(socket_dir)
+        if idle_s is None or idle_s < BROWSER_ORPHAN_GRACE_SECONDS:
+            # Unknown age, or still within the grace window — fail safe.
+            return False
+
+        logger.warning(
+            "Browser session %s has a live owner (PID %s) but is untracked "
+            "and idle for %ds (grace %ds) — treating as leaked and reaping",
+            session_name, owner_pid, int(idle_s),
+            BROWSER_ORPHAN_GRACE_SECONDS)
+        # fall through to the reap path below
+
+    if owner_alive is None:
+        # No owner_pid file (legacy daemon).  Fall back to in-process
+        # tracking: if this process knows about the session, leave alone.
+        if session_name in tracked_names:
+            return False
+
+    # owner_alive is False (dead owner) OR legacy daemon not tracked here.
+    pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+    if not os.path.isfile(pid_file):
+        # No daemon PID file — just a stale dir, remove it
+        shutil.rmtree(socket_dir, ignore_errors=True)
+        return False
+
+    try:
+        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        shutil.rmtree(socket_dir, ignore_errors=True)
+        return False
+
+    # Check if the daemon is still alive. ``os.kill(pid, 0)`` on Windows
+    # is NOT a no-op — use the handle-based existence check.
+    from gateway.status import _pid_exists
+    if not _pid_exists(daemon_pid):
+        shutil.rmtree(socket_dir, ignore_errors=True)
+        return False
+
+    # The PID is live — but the .pid file lives in a world-writable,
+    # predictably-named temp dir we don't write ourselves, and PIDs get
+    # recycled after the real daemon exits.  Verify the process really is
+    # *this* session's browser daemon (agent-browser Node binary or
+    # browser_harness Python daemon — #94946) before tree-killing it;
+    # refuse otherwise.  Fixes the arbitrary same-user process DoS in
+    # issue #14073.
+    if not _verify_reapable_browser_daemon(
+            daemon_pid, socket_dir, session_name):
+        return False
+
+    # Daemon is alive and its owner is dead (or legacy + untracked).  Reap.
+    # Use the process-tree termination helper so Chromium children
+    # (renderer, GPU, etc.) are cleaned up, not just the daemon parent.
+    try:
+        from tools.process_registry import ProcessRegistry
+        ProcessRegistry._terminate_host_pid(daemon_pid)
+        logger.info("Reaped orphaned browser daemon PID %d (session %s)",
+                    daemon_pid, session_name)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    # Clean up the socket directory
+    shutil.rmtree(socket_dir, ignore_errors=True)
+    return True
 
 
 def _browser_cleanup_thread_worker():
@@ -2461,6 +2543,80 @@ def _update_session_activity(task_id: str):
     """Update the last activity timestamp for a session."""
     with _cleanup_lock:
         _session_last_activity[task_id] = time.time()
+
+
+def _register_browser_use_session(task_id: str, session_name: str = "") -> None:
+    """Track a Browser Use CLI / browser_harness session in ``_active_sessions``.
+
+    Under the default backend (issue #94946) the harness daemon is launched
+    by ``browser_exec`` in a subprocess — the parent hermes process never
+    goes through ``_get_session_info`` (that path is reserved for the
+    built-in ``agent-browser`` backend and for the provider-backed Browser
+    Use path that goes through ``_resolve_backend_cdp``).  Without an
+    entry here, the cleanup thread would see no activity for the task and
+    reap it on the next cycle, AND the orphan reaper would have no
+    cross-process owner reference to honor.
+
+    The entry is intentionally minimal — we record only what the cleanup
+    thread and the reaper actually read (``session_name`` for the
+    ``tracked_names`` set, ``backend`` so the verifier knows the session
+    is a harness session, ``owner_pid`` for cross-process safety).  The
+    harness itself owns session lifecycle, so we do NOT call any close /
+    cleanup hooks here.
+
+    Idempotent: re-registering the same task_id just updates the entry.
+    """
+    with _cleanup_lock:
+        existing = _active_sessions.get(task_id)
+        session_info = dict(existing) if existing else {}
+        if session_name:
+            session_info["session_name"] = session_name
+        session_info["backend"] = "browser_harness"
+        session_info["owner_task_id"] = task_id
+        session_info.setdefault("session_key", task_id)
+        _active_sessions[task_id] = session_info
+
+
+def _shutdown_browser_harness_for_task(task_id: str) -> None:
+    """Best-effort: ask the browser_harness daemon for ``task_id`` to exit.
+
+    The harness (Python ``browser-use`` CLI backend) is a separate long-
+    running process whose own lifecycle Hermes does not own — but Hermes
+    *is* the only thing that knows when a session is no longer needed.
+    On an inactivity reap or process exit we therefore send the harness a
+    graceful ``shutdown`` IPC so it can clean up its own runtime dir,
+    release its CDP socket, and exit with code 0.  Falls through silently
+    if the harness package is not installed (the legacy agent-browser
+    backend is then in use and the close below handles it).
+
+    The function never raises — callers wrap it in try/except as
+    belt-and-suspenders.  Issue #94946.
+    """
+    try:
+        from browser_harness import _ipc as _bipc  # type: ignore
+    except Exception:
+        return  # harness not installed — nothing to do
+
+    # The harness keys its named-session IPC by BU_NAME / the bare session
+    # name.  When ``browser_exec`` runs with a ``session=...`` argument it
+    # passes that name to BU_NAME; when it runs without one the harness
+    # uses the default session.  Resolve to a name the harness accepts:
+    # if ``task_id`` starts with the ``bu-named-`` prefix we registered,
+    # the BU_NAME was the suffix; otherwise use ``task_id`` verbatim and
+    # also try the bare default name.
+    candidates: list = []
+    if task_id.startswith("bu-named-"):
+        candidates.append(task_id[len("bu-named-"):])
+    elif task_id and task_id != "browser-exec-default":
+        candidates.append(task_id)
+    candidates.append("default")
+
+    for name in candidates:
+        try:
+            _bipc.shutdown(name)
+            return
+        except Exception:
+            continue
 
 
 # Register cleanup thread stop on exit
@@ -5307,6 +5463,18 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     logger.debug("cleanup_browser called for task_id: %s", task_id)
     logger.debug("Active sessions: %s", list(_active_sessions.keys()))
 
+    # Issue #94946: Browser Use CLI / browser_harness sessions need an explicit
+    # IPC ``shutdown`` (NOT a signal — the harness is a long-running Python
+    # process whose socket/PID state we want the harness to clean up itself).
+    # Try this BEFORE the agent-browser close path below, because harness
+    # sessions may or may not appear in ``_active_sessions`` depending on
+    # whether the cleanup is invoked by the inactivity reaper, atexit, or
+    # an explicit user cleanup call.
+    try:
+        _shutdown_browser_harness_for_task(task_id)
+    except Exception as e:
+        logger.debug("browser_harness shutdown for %s: %s", task_id, e)
+
     # Check if session exists (under lock), but don't remove yet -
     # _run_browser_command needs it to build the close command.
     with _cleanup_lock:
@@ -5319,10 +5487,18 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
 
-        # An expired cloud CDP URL cannot accept an agent-browser close command.
-        # Avoid feeding it back through _get_session_info(), which would try to
-        # renew the session recursively while cleanup is still in progress.
-        if _session_has_expired(session_info):
+        # Issue #94946: browser_harness sessions are tracked here only for
+        # lifecycle bookkeeping (cleanup-thread activity + reaper cross-process
+        # safety).  Their actual daemon is launched and torn down by
+        # ``browser_exec`` subprocess plumbing — there is no agent-browser
+        # close command to send.  Skip the legacy close path so we don't
+        # shell out to a binary that does not apply to this session.
+        if session_info.get("backend") == "browser_harness":
+            logger.debug(
+                "Skipping agent-browser close for browser_harness session %s — "
+                "the harness owns its own IPC shutdown", task_id,
+            )
+        elif _session_has_expired(session_info):
             logger.debug(
                 "Skipping agent-browser close for expired session %s",
                 task_id,
