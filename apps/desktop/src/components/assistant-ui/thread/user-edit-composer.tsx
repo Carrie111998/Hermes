@@ -83,6 +83,8 @@ interface UserEditComposerProps {
   sessionId: string | null
 }
 
+export const EDIT_SUBMIT_COOLDOWN_MS = 200
+
 export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sessionId }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
@@ -609,7 +611,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     submitCooldownTimerRef.current = window.setTimeout(() => {
       submitCooldownTimerRef.current = null
       setSubmitting(false)
-    }, 200)
+    }, EDIT_SUBMIT_COOLDOWN_MS)
 
     try {
       aui.composer().send()

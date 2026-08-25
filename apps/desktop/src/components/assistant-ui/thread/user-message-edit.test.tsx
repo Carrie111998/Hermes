@@ -15,6 +15,8 @@ import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-s
 
 import { assistantMessage, stubThreadEnvironment, stubThreadViewportSize, userMessage } from '../test-utils'
 
+import { EDIT_SUBMIT_COOLDOWN_MS } from './user-edit-composer'
+
 import { Thread } from '.'
 stubThreadEnvironment()
 
@@ -220,7 +222,7 @@ describe('Enter submission and latch behavior', () => {
       expect(onEdit).toHaveBeenCalledTimes(1)
     })
 
-    const cooldownIndex = setTimeoutSpy.mock.calls.findIndex(([, delay]) => delay === 200)
+    const cooldownIndex = setTimeoutSpy.mock.calls.findIndex(([, delay]) => delay === EDIT_SUBMIT_COOLDOWN_MS)
     expect(cooldownIndex).toBeGreaterThanOrEqual(0)
     const cooldownTimer = setTimeoutSpy.mock.results[cooldownIndex]?.value
 

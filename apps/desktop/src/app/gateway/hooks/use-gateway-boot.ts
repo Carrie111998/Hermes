@@ -53,6 +53,7 @@ import {
 } from '@/store/session'
 import {
   $attentionSessionIds,
+  $sessionTiles,
   $workingSessionIds,
   foregroundSessionScopes,
   liveSessionScopes,
@@ -744,6 +745,8 @@ export function useGatewayBoot({
 
     const offWorking = $workingSessionIds.subscribe(() => recomputeKeptGateways())
     const offAttention = $attentionSessionIds.subscribe(() => recomputeKeptGateways())
+    const offActiveSession = $activeSessionId.subscribe(() => recomputeKeptGateways())
+    const offSessionTiles = $sessionTiles.subscribe(() => recomputeKeptGateways())
     const offActiveProfile = $activeGatewayProfile.subscribe(() => recomputeKeptGateways())
 
     const offWindowState = desktop.onWindowStateChanged?.(payload => {
@@ -935,6 +938,8 @@ export function useGatewayBoot({
       clearInterval(keepaliveTimer)
       offWorking()
       offAttention()
+      offActiveSession()
+      offSessionTiles()
       offActiveProfile()
       window.removeEventListener('online', onOnline)
       document.removeEventListener('visibilitychange', onVisible)
