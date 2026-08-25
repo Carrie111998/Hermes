@@ -17555,12 +17555,16 @@ async def api_auth_spawn_ticket(request: Request):
     this endpoint exists for. The constant-time token compare below IS the
     auth, in every mode.
     """
-    presented = (
-        request.headers.get(_SESSION_HEADER_NAME, "")
-        or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    )
-    if not presented or not hmac.compare_digest(
-        presented.encode(), _SESSION_TOKEN.encode()
+    presented = request.headers.get(_SESSION_HEADER_NAME, "")
+    if not presented:
+        # RFC 9110 §11.6.2: the auth-scheme token is case-insensitive.
+        raw_auth = request.headers.get("authorization", "")
+        if raw_auth[:7].lower() == "bearer ":
+            presented = raw_auth[7:].strip()
+    if (
+        not isinstance(_SESSION_TOKEN, str)
+        or not presented
+        or not hmac.compare_digest(presented.encode(), _SESSION_TOKEN.encode())
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
     from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log

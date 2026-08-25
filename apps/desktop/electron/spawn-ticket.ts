@@ -9,6 +9,12 @@
  * POST /api/auth/spawn-ticket: token-guarded (X-Hermes-Session-Token),
  * listed public to bypass the cookie gate, and minting a normal
  * single-use ticket.
+ *
+ * Ticket burn rate: every gated-profile spawn probe consumes exactly one
+ * single-use ticket per attempt (the readiness probe IS the consumer), so a
+ * crash-looping backend burns one ticket per spawn cycle. The store is
+ * TTL-GC'd (30s) and uncapped, so this churn is bounded by spawn frequency,
+ * not by any store limit.
  */
 
 const SPAWN_TICKET_TIMEOUT_MS = 8_000

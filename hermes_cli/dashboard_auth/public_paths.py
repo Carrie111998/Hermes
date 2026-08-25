@@ -62,6 +62,7 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # BYPASSES the cookie/session gate - its own constant-time
     # X-Hermes-Session-Token check IS the security boundary (same pattern as
     # /api/cron/fire's self-carried JWT).
+
     "/api/auth/spawn-ticket",
     # Chronos managed-cron fire webhook (NAS -> agent). See the entry above:
     # NOT cookie-gated; the NAS-minted JWT it carries is the security

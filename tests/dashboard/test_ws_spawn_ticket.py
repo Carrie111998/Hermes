@@ -15,6 +15,10 @@ The contract pinned here:
   * The pinned invariant stands: gated mode rejects legacy ``?token=``,
     even from a loopback peer holding the in-process token value.
   * ``/api/auth/spawn-ticket`` requires the session token; without it → 401.
+    A non-string ``_SESSION_TOKEN`` (misconfigured env injection) and a
+    case-variant ``bearer`` scheme are also rejected cleanly here: the
+    handler 401s instead of raising (no 500s from the auth path) while
+    still accepting any RFC 9110 scheme casing.
   * With the token, it mints a ticket that ``_ws_auth_ok`` accepts exactly
     once (single-use).
 """
@@ -101,5 +105,26 @@ def test_wrong_spawn_token_rejected(gated_client):
         "/api/auth/spawn-ticket",
         headers={"X-Hermes-Session-Token": "not-the-token"},
     )
+
+    assert resp.status_code == 401
+
+
+@pytest.mark.usefixtures("gated_client")
+def test_spawn_ticket_accepts_case_variant_bearer_scheme(gated_client):
+    """RFC 9110: the auth-scheme token is case-insensitive."""
+    resp = gated_client.post(
+        "/api/auth/spawn-ticket",
+        headers={"Authorization": f"bearer {web_server._SESSION_TOKEN}"},
+    )
+
+    assert resp.status_code == 200
+
+
+@pytest.mark.usefixtures("gated_client")
+def test_non_string_session_token_401s_instead_of_raising(gated_client, monkeypatch):
+    """A misconfigured env injection must not turn the auth check into a 500."""
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", None)
+
+    resp = gated_client.post("/api/auth/spawn-ticket")
 
     assert resp.status_code == 401

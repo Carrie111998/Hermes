@@ -10629,6 +10629,11 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     if (spawnTicket) {
       wsUrl = `ws://127.0.0.1:${port}/api/ws?ticket=${encodeURIComponent(spawnTicket)}`
       wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+      if (wsProbe.ok) {
+        rememberLog(
+          `Hermes backend for profile "${profile}" WS probe ok via spawn ticket (gated mode rejected ?token=)`
+        )
+      }
     }
   }
 
@@ -11065,6 +11070,9 @@ async function startHermes() {
       if (spawnTicket) {
         wsUrl = `ws://127.0.0.1:${port}/api/ws?ticket=${encodeURIComponent(spawnTicket)}`
         wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+        if (wsProbe.ok) {
+          rememberLog('Local backend WS probe ok via spawn ticket (gated mode rejected ?token=)')
+        }
       }
     }
 
