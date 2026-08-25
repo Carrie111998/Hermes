@@ -394,7 +394,24 @@ launch_app() { # attempted BEFORE the terminal event (launch acceptance is
     # immediate exec failure (ENOENT, ELF mismatch, dead sandbox) dies
     # within the window and downgrades to manual instead of lying.
     (cd "${RELAUNCH_CWD:-/}" 2>/dev/null || cd /
-     setsid "$RELAUNCH_TARGET" ${RELAUNCH_ARGS[@]+"${RELAUNCH_ARGS[@]}"} >/dev/null 2>&1 &
+     RELAUNCH_SETSID="$(command -v setsid 2>/dev/null || true)"
+     if [ -n "$RELAUNCH_SETSID" ]; then
+       "$RELAUNCH_SETSID" "$RELAUNCH_TARGET" ${RELAUNCH_ARGS[@]+"${RELAUNCH_ARGS[@]}"} >/dev/null 2>&1 &
+     else
+       RELAUNCH_NOHUP="$(command -v nohup 2>/dev/null || true)"
+       RELAUNCH_PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+       if [ -z "$RELAUNCH_NOHUP" ] || [ -z "$RELAUNCH_PYTHON" ]; then
+         log "WARNING: relaunch requires setsid or nohup plus python3 (or python) on PATH"
+         exit 127
+       fi
+       "$RELAUNCH_NOHUP" "$RELAUNCH_PYTHON" -c '
+import os, sys
+
+target = sys.argv[1]
+os.setsid()
+os.execve(target, [target, *sys.argv[2:]], os.environ.copy())
+' "$RELAUNCH_TARGET" ${RELAUNCH_ARGS[@]+"${RELAUNCH_ARGS[@]}"} >/dev/null 2>&1 &
+     fi
      echo $! > "$STATUS.launchpid") || { log "WARNING: relaunch spawn failed"; return 1; }
     local lp
     lp="$(cat "$STATUS.launchpid" 2>/dev/null)"; rm -f "$STATUS.launchpid" 2>/dev/null
