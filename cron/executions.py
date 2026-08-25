@@ -28,8 +28,17 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
-    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if EXECUTIONS_FILE is not None:
+        path = EXECUTIONS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        # Share cron.jobs' context-local store contract. Multiplex schedulers
+        # require an existing profile home so a stale membership snapshot
+        # cannot recreate a deleted profile while recovering this ledger.
+        from cron.jobs import ensure_cron_dir
+
+        cron_dir = get_hermes_home().resolve() / "cron"
+        path = ensure_cron_dir(cron_dir) / "executions.db"
     return sqlite3.connect(path, timeout=5)
 
 

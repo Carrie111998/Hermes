@@ -866,3 +866,58 @@ def test_multiplex_heartbeat_does_not_recreate_home_deleted_after_snapshot(tmp_p
     assert not deleted_home.exists()
 
 
+def test_multiplex_recovery_does_not_recreate_home_deleted_after_snapshot(tmp_path):
+    """Execution-ledger recovery must honor deletion after startup discovery."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / "default"
+    deleted_home = tmp_path / "profiles" / "deleted"
+    for home in (default_home, deleted_home):
+        home.mkdir(parents=True)
+
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    default_ticked = threading.Event()
+    stop = threading.Event()
+    membership_calls = 0
+
+    class PausedInitialSnapshot:
+        def __iter__(self):
+            yield ("default", default_home)
+            yield ("deleted", deleted_home)
+            snapshot_ready.set()
+            assert release_snapshot.wait(timeout=5)
+
+    def profile_homes():
+        nonlocal membership_calls
+        membership_calls += 1
+        if membership_calls == 1:
+            return PausedInitialSnapshot()
+        return [("default", default_home)]
+
+    def tracking_tick(*_args, **_kwargs):
+        default_ticked.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=tracking_tick):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={"interval": 0.01, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        thread.start()
+        assert snapshot_ready.wait(timeout=5)
+        shutil.rmtree(deleted_home)
+        release_snapshot.set()
+        assert default_ticked.wait(timeout=5)
+        assert thread.is_alive()
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert not deleted_home.exists()
+    assert not (deleted_home / "cron" / "executions.db").exists()
+
+

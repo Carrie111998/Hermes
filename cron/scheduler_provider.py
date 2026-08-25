@@ -685,6 +685,13 @@ class InProcessCronScheduler(CronScheduler):
                             home,
                         )
                     record_ticker_heartbeat()
+            except FileNotFoundError:
+                if profile_name == "default" or Path(home).is_dir():
+                    raise
+                logger.info(
+                    "Skipping cron recovery for deleted profile at %s",
+                    home,
+                )
             finally:
                 reset_hermes_home_override(home_token)
 

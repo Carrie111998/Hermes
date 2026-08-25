@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
@@ -55,6 +57,22 @@ def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path
     assert executions.list_executions() == [default_row]
     assert (tmp_path / "default" / "cron" / "executions.db").is_file()
     assert (tmp_path / "worker" / "cron" / "executions.db").is_file()
+
+
+def test_execution_ledger_does_not_recreate_missing_scoped_profile(monkeypatch, tmp_path):
+    import cron.executions as executions
+    from cron.jobs import use_cron_store
+
+    profile_home = tmp_path / "profiles" / "deleted"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
+
+    with use_cron_store(profile_home, require_existing_home=True):
+        profile_home.rmdir()
+        with pytest.raises(FileNotFoundError):
+            executions.recover_interrupted_executions()
+
+    assert not profile_home.exists()
 
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):

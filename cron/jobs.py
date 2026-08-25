@@ -200,6 +200,23 @@ def get_cron_output_dir() -> Path:
     return _current_cron_store().output_dir
 
 
+def ensure_cron_dir(cron_dir: Optional[Path] = None) -> Path:
+    """Create and return the active cron directory without reviving its home."""
+    store = _current_cron_store()
+    # A guarded scope is authoritative: callers cannot accidentally bypass
+    # its profile-home boundary by supplying a path resolved elsewhere.
+    target = (
+        store.cron_dir
+        if store.require_existing_home
+        else (cron_dir or store.cron_dir)
+    )
+    target.mkdir(
+        parents=not store.require_existing_home,
+        exist_ok=True,
+    )
+    return target
+
+
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
 # the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
 # in which case no finite run bound exists to derive from. Also acts as the
@@ -707,10 +724,7 @@ def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> No
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
-    store.cron_dir.mkdir(
-        parents=not store.require_existing_home,
-        exist_ok=True,
-    )
+    ensure_cron_dir()
     store.output_dir.mkdir(
         parents=not store.require_existing_home,
         exist_ok=True,
