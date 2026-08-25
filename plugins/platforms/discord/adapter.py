@@ -3505,8 +3505,11 @@ class DiscordAdapter(BasePlatformAdapter):
             # "👍🏻" match an entry typed as plain "👍". Folding is
             # matching-only: the event text below keeps the unfolded emoji.
             if allowlist is not None and fold_emoji_variants(emoji) not in {
-                fold_emoji_variants(normalize_reaction_emoji(name))
+                # Drop entries folding to '': modifier/selector-only config
+                # entries must match nothing, not every empty payload.
+                f
                 for name in allowlist
+                if (f := fold_emoji_variants(normalize_reaction_emoji(name)))
             }:
                 return
             # Hydration map contract: "" means known-but-empty (captionless

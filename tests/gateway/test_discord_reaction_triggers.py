@@ -703,7 +703,6 @@ async def test_remove_unknown_target_falls_back_to_fetch_text(monkeypatch):
 # applies to BOTH sides of the comparison ONLY — event text and hook payloads
 # stay faithful to what the human tapped.
 # ===========================================================================
-from plugins.platforms.discord.adapter import fold_emoji_variants
 
 _THUMB = "\U0001F44D"                      # 👍
 _VS15, _VS16 = "\uFE0E", "\uFE0F"
@@ -718,6 +717,8 @@ _WOMAN_TECH_TONE = (
 
 
 def test_fold_strips_vs_selectors_and_skin_tones():
+    from plugins.platforms.discord.adapter import fold_emoji_variants
+
     assert fold_emoji_variants(_THUMB + _VS16) == _THUMB
     assert fold_emoji_variants(_THUMB + _VS15) == _THUMB
     for tone in _SKIN_TONES:
@@ -729,6 +730,8 @@ def test_fold_strips_vs_selectors_and_skin_tones():
 
 
 def test_fold_inside_zwj_sequence_keeps_base_structure():
+    from plugins.platforms.discord.adapter import fold_emoji_variants
+
     # Modifiers WITHIN a ZWJ sequence are stripped wherever they appear;
     # the base sequence structure survives.
     assert fold_emoji_variants(_WOMAN_TECH_TONE) == (
@@ -738,10 +741,17 @@ def test_fold_inside_zwj_sequence_keeps_base_structure():
 
 
 def test_allowlist_folding_composes_after_custom_emoji_normalization():
-    # Folding composes AFTER normalize_reaction_emoji: a custom-emoji name
-    # containing selector codepoints would be folded post-reduction too.
-    assert fold_emoji_variants("paw") == "paw"
-    assert fold_emoji_variants(_THUMB) == _THUMB
+    # REAL reduction->fold composition (the Gate 5 per-entry pipeline): a
+    # hand-typed tag whose NAME carries VS16 reduces to 'thumbs<VS16>', then
+    # folding strips it — proving fold runs AFTER normalize, not before.
+    from plugins.platforms.discord.adapter import (
+        fold_emoji_variants,
+        normalize_reaction_emoji,
+    )
+
+    composed = fold_emoji_variants(
+        normalize_reaction_emoji("<:thumbs\uFE0F:42>"))
+    assert composed == "thumbs"
 
 
 @pytest.mark.asyncio
@@ -774,6 +784,31 @@ async def test_allowlist_skin_tone_entry_matches_plain_emoji(monkeypatch):
         await adapter._handle_reaction_payload(
             _reaction_payload(emoji=_FakeEmoji(form)), added=True)
     assert len(dispatched) == 3
+
+
+@pytest.mark.asyncio
+async def test_allowlist_modifier_only_entry_admits_nothing(monkeypatch):
+    # Empty-fold guard: an entry that is ONLY strippable modifiers folds to
+    # '' and is dropped from the comparison set — it must NOT sit there and
+    # match an all-strippable incoming payload (the '' ∈ {''} trap).
+    adapter = _make_adapter()
+    dispatched, hooks = _patch_common(monkeypatch, adapter)
+    monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
+                        lambda self: (True, {_SKIN_TONES[0]}),
+                        raising=False)
+    await adapter._handle_reaction_payload(
+        _reaction_payload(emoji=_FakeEmoji(_VS16)), added=True)
+    assert len(dispatched) == 0   # folds to '' vs emptied set -> rejected
+    assert len(hooks) == 1        # reached Gate 5; died THERE, not earlier
+
+    # Mixed allowlist: junk modifier-only entry next to a real one leaves
+    # normal entries fully functional.
+    monkeypatch.setattr(type(adapter), "_reaction_trigger_config",
+                        lambda self: (True, {_SKIN_TONES[0], _THUMB}),
+                        raising=False)
+    await adapter._handle_reaction_payload(
+        _reaction_payload(emoji=_FakeEmoji(_THUMB + _VS16)), added=True)
+    assert len(dispatched) == 1
 
 
 @pytest.mark.asyncio
