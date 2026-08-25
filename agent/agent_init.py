@@ -1476,11 +1476,22 @@ def init_agent(
                 if _routed_headers:
                     client_kwargs["default_headers"] = dict(_routed_headers)
             else:
-                # When the user explicitly chose a non-OpenRouter provider
-                # but no credentials were found, fail fast with a clear
-                # message instead of silently routing through OpenRouter.
+                # When the user explicitly named a concrete provider but no
+                # credentials were found, try fallback_model and otherwise fail
+                # fast naming the exact key that is missing.
+                #
+                # The set below is provider SELECTORS, not providers: "auto"
+                # and "custom" name no specific credential, so there is no env
+                # var to point at and no fallback decision to make here.
+                # "openrouter" was in this set back when it was the universal
+                # catch-all router and this branch existed to stop other
+                # providers silently rerouting through it.  Once openrouter
+                # became an ordinary named provider that can lose its
+                # credential like any other, its presence here meant a profile
+                # pinned to it skipped its own fallback_model and aborted with
+                # the generic "No LLM provider configured" instead.
                 _explicit = (agent.provider or "").strip().lower()
-                if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+                if _explicit and _explicit not in {"auto", "custom"}:
                     # Look up the actual env var name from the provider
                     # config — some providers use non-standard names
                     # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
