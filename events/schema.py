@@ -116,6 +116,12 @@ class EventType(Enum):
     # where reason is one of:
     #   concurrent_fire_blocked      (prior is healthy, still running)
     #   prior_fire_exceeded_timeout  (prior is wedged-but-tracked)
+    #   cross_process_fire_blocked   (Guard #5, 2026-08-25: the prior fire is
+    #                                 live in ANOTHER process, proved via the
+    #                                 execution ledger rather than _in_flight;
+    #                                 prior_cron_started_event_id is always
+    #                                 None here — that id only exists in the
+    #                                 owning process's memory)
     CRON_SKIPPED_DUPLICATE = ("cron_skipped_duplicate", Priority.LOW, "⏭️")
     # Cron min-interval-since-last-fire guard (Guard #4) -- added
     # 2026-04-30 to close the SEQUENTIAL-burst gap left by Guard #3

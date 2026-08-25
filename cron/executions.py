@@ -338,6 +338,77 @@ def nonterminal_execution_census() -> List[Dict[str, Any]]:
     return _nonterminal_execution_census_path(EXECUTIONS_FILE, create=True)
 
 
+#: Hard cap on how many non-terminal rows one admission check will probe.
+#:
+#: Measured 2026-08-24, warm, against a copy of the real 10,000-row
+#: profiles/main ledger (median / max of 30):
+#:   no open row  ->   8.6ms / 72.7ms   (every admission check pays this)
+#:   one live row ->  72.1ms / 185.8ms  (one psutil liveness probe on top)
+#: The floor is connection setup — ``_connect`` opens a fresh handle and runs
+#: three ``CREATE ... IF NOT EXISTS`` statements per call — not the indexed
+#: query. The caller runs inside ``cron.jobs._jobs_lock()``, a CROSS-PROCESS
+#: advisory lock documented as "field updates only", so the cost is worth
+#: stating: it is tolerable only because this path is rare (manual and
+#: external-provider fires; the built-in ticker never calls it).
+#:
+#: In practice a job has at most one non-terminal row (measured the same day:
+#: exactly 1 across 10,001 rows), so the cap only bounds a pathological
+#: pile-up left behind by repeated hard kills.
+_MAX_ADMISSION_LIVENESS_PROBES = 8
+
+
+def live_execution_for_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Return a non-terminal execution of ``job_id`` in ANOTHER process whose
+    owner is PROVABLY alive.
+
+    ``None`` means "no proof of a live run elsewhere", which deliberately lumps
+    together "the owner is dead" and "liveness could not be determined". A
+    caller gating admission must treat only a non-None result as grounds to
+    refuse: refusing on an unprovable probe would leave the job unfireable with
+    no recovery path, reintroducing the exact wedge the fire-claim TTL exists
+    to prevent.
+
+    That is the opposite of :func:`_owner_is_live`'s fail-safe-to-True, and the
+    asymmetry is intentional. On the recovery path "assume still owned" is
+    cheap and self-correcting — the next restart re-probes. As an admission
+    gate it is neither.
+
+    **Rows owned by THIS process are excluded, and that exclusion is load
+    bearing.** Their pid is alive by definition, so a stale one — a row whose
+    ``finish_execution`` never landed, e.g. an abandoned soft-deadline run —
+    would read as a live run forever. Nothing cleans it either:
+    :func:`recover_interrupted_execution_records` skips rows whose
+    ``process_id`` is ``_PROCESS_ID``, precisely because it cannot distinguish
+    them from its own in-flight work. In a long-lived gateway that combination
+    would wedge the job permanently. The in-process case is already owned by
+    ``cron.scheduler``'s ``_in_flight`` registry (Guard #3), which is exact
+    rather than inferred, so this function answers the strictly cross-process
+    question and the two compose without overlap.
+
+    Rows are probed newest-first and the scan stops at the first live owner, so
+    the blocking case normally costs exactly one probe. The sqlite read is
+    finished (and both locks released) before any probing begins, so a slow
+    ``psutil`` call never holds the ledger lock.
+    """
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM executions
+               WHERE job_id=? AND status IN ('claimed','running')
+                 AND process_id<>?
+               ORDER BY claimed_at DESC, id DESC
+               LIMIT ?""",
+            (job_id, _PROCESS_ID, _MAX_ADMISSION_LIVENESS_PROBES),
+        ).fetchall()
+
+    for row in rows:
+        # One row at a time: _classify_nonterminal_rows probes every row it is
+        # given, and the point here is to stop at the first proven-live owner.
+        classified = _classify_nonterminal_rows([row])[0]
+        if classified["owner_liveness"] == "live":
+            return classified
+    return None
+
+
 def _cross_profile_execution_ledgers() -> tuple:
     root = _canonical_hermes_root().resolve()
     candidates = [root / "cron" / "executions.db"]

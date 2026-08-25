@@ -335,6 +335,58 @@ def _job_running_in_this_process(job_id: str) -> bool:
         return True
 
 
+def _job_has_live_execution(job_id: str) -> bool:
+    """True only when the execution ledger PROVES another run of ``job_id`` is alive.
+
+    Layer 2 of the fire-claim admission gate. The claim TTL alone cannot tell a
+    run that is legitimately slow from a tick that died mid-run: on 2026-08-24 a
+    second fire of ``jobflow-matcher`` was admitted 1810.63s into a run whose
+    ledger row was still non-terminal, purely because 1810 > 300. This is the
+    cross-process, PID-recycle-safe signal that answers the question the clock
+    cannot — the same ledger ``recover_interrupted_executions`` already trusts.
+
+    Deliberately NOT ``cron.scheduler``'s ``_in_flight`` registry: that is a
+    plain dict under a ``threading.Lock``, so it is blind to a sibling process,
+    and the duplicate it failed to catch was two separate ``hermes cron run``
+    invocations.
+
+    Never raises, and never blocks on doubt: any failure — and any owner whose
+    liveness cannot be established — answers False (admit). Degrading to the
+    old clock-only behaviour is acceptable; wedging a job forever is not, and a
+    raise on this path would cost the gateway its scheduler.
+
+    Imported lazily for the same reason as ``_job_running_in_this_process``:
+    ``cron.scheduler`` imports this module at load, so a module-level cron
+    import here risks a cycle.
+    """
+    try:
+        from cron.executions import live_execution_for_job
+
+        live = live_execution_for_job(job_id)
+        if live is None:
+            return False
+        # Name the blocker. A bare False here is indistinguishable from the
+        # paused/disabled/missing refusals at the call site, and this is the
+        # one refusal an operator will want to explain after the fact. Logged
+        # rather than emitted: an event-bus write is a transaction against
+        # another file and this runs under the cross-process _jobs_lock, the
+        # same reason _emit_recovery_fire_triggers defers its emits.
+        logger.warning(
+            "Cron job %r: refusing a duplicate fire — execution %s is still "
+            "running under live pid %s (claimed %s)",
+            job_id, live.get("id"), live.get("pid"), live.get("claimed_at"),
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "Cron execution-ledger liveness check failed for job %r; admitting "
+            "the fire on the claim TTL alone",
+            job_id,
+            exc_info=True,
+        )
+        return False
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
     return _current_cron_store().cron_dir / ".jobs.lock"
@@ -2493,9 +2545,24 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
     ``mark_job_run`` clears the claim on completion so a re-armed recurring job
     is claimable again next fire.
 
+    Admission is layered, and the two layers answer different questions:
+
+    1. A claim younger than ``claim_ttl_seconds`` loses outright. This is the
+       cross-process CAS, and it is what closes the window between winning a
+       claim and writing the durable execution row (both call sites claim
+       first), so the TTL can never be zero.
+    2. Past the TTL the clock says "go", but a run of this job may simply be
+       long. ``_job_has_live_execution`` asks the execution ledger, which is
+       cross-process and PID-recycle-safe, and the fire loses if another run is
+       PROVABLY still alive.
+
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
-    reclaim it.
+    reclaim it. Layer 2 preserves that property rather than weakening it: it
+    refuses only on positive proof of life, so a dead owner (or an owner whose
+    liveness cannot be determined) still yields the job. Before layer 2 existed
+    a run legitimately outliving the TTL was read as a crash and fired again —
+    the 2026-08-24 ``jobflow-matcher`` duplicate, admitted 1810.63s in.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -2520,6 +2587,34 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
+
+            # Layer 2 (2026-08-24): the claim is stale or absent, so the clock says
+            # "go". Before overwriting it, ask the durable ledger whether a run
+            # of this job is STILL ALIVE — a 20-40 minute run is otherwise
+            # indistinguishable from a tick that died at minute 5.
+            #
+            # Order matters both ways. The fresh-claim check above must stay
+            # FIRST for correctness: both call sites claim before
+            # create_execution, so a winner holds a claim for a moment with no
+            # ledger row yet, and layer 1 is what closes that window (which is
+            # why the TTL can never go to zero). It must also stay first for
+            # cost: measured warm against the real 10k-row ledger this check is
+            # ~8.6ms median with nothing running and ~72ms when it does probe a
+            # live owner, all of it under the cross-process _jobs_lock. That is
+            # affordable only because this path is rare — manual and
+            # external-provider fires; the built-in ticker never comes here —
+            # and because a fresh claim short-circuits before reaching it.
+            #
+            # Known, accepted false-refusal window: _run_one_job_admitted calls
+            # mark_job_run (clears the claim) immediately before
+            # finish_execution (closes the row), so a fire landing between those
+            # two statements is refused. It is one statement wide and costs a
+            # missed run, not a duplicate. Swapping them would trade it for the
+            # 2026-07-27 defect where a crash in between loses the jobs.json
+            # write-back entirely.
+            if _job_has_live_execution(job_id):
+                return False
+
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
