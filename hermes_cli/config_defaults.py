@@ -4167,6 +4167,21 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "MELIOUS_API_KEY": {
+        "description": "Melious API key — open-weight models on European infrastructure (GDPR/TTDSG)",
+        "prompt": "Melious API Key",
+        "url": "https://melious.ai/account/api/keys",
+        "password": True,
+        "category": "provider",
+    },
+    "MELIOUS_BASE_URL": {
+        "description": "Melious base URL override (default: https://api.melious.ai/v1)",
+        "prompt": "Melious base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
     "AWS_REGION": {
         "description": "AWS region for Bedrock API calls (e.g. us-east-1, eu-central-1)",
         "prompt": "AWS Region",

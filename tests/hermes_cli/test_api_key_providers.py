@@ -43,6 +43,9 @@ class TestProviderRegistry:
         ("ai-gateway", "Vercel AI Gateway", "api_key"),
         ("kilocode", "Kilo Code", "api_key"),
         ("gmi", "GMI Cloud", "api_key"),
+        # Plugin-profile only — no hand-written PROVIDER_REGISTRY row, so this
+        # row also covers the profile auto-extension path.
+        ("melious", "Melious", "api_key"),
     ])
     def test_provider_registered(self, provider_id, name, auth_type):
         assert provider_id in PROVIDER_REGISTRY
@@ -115,6 +118,7 @@ class TestProviderRegistry:
         assert PROVIDER_REGISTRY["kilocode"].inference_base_url == "https://api.kilo.ai/api/gateway"
         assert PROVIDER_REGISTRY["gmi"].inference_base_url == "https://api.gmi-serving.com/v1"
         assert PROVIDER_REGISTRY["huggingface"].inference_base_url == "https://router.huggingface.co/v1"
+        assert PROVIDER_REGISTRY["melious"].inference_base_url == "https://api.melious.ai/v1"
 
     def test_oauth_providers_unchanged(self):
         """Ensure we didn't break the existing OAuth providers."""

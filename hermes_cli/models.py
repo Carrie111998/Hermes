@@ -1443,6 +1443,7 @@ _PROVIDER_ALIASES = {
     "huggingface-hub": "huggingface",
     "novita-ai": "novita",
     "novitaai": "novita",
+    "melious-ai": "melious",
     "mimo": "xiaomi",
     "xiaomi-mimo": "xiaomi",
     "tencent": "tencent-tokenhub",
