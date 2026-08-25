@@ -21,6 +21,7 @@ import type {
   ApprovalReq,
   ClarifyReq,
   ConfirmReq,
+  CostWindowConfig,
   DetailsMode,
   Msg,
   PanelSection,
@@ -322,6 +323,7 @@ export interface UiState {
   busy: boolean
   busyInputMode: BusyInputMode
   compact: boolean
+  costWindow: CostWindowConfig | null
   destructiveSlashConfirm: boolean
   detailsMode: DetailsMode
   detailsModeCommandOverride: boolean

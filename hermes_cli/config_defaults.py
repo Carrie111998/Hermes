@@ -1433,6 +1433,22 @@ DEFAULT_CONFIG = {
         # Show a color-coded battery read-out as the first status-bar element in
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,
+        # Opt-in TUI status-bar "cost/peak window" segment. When configured
+        # (null/absent = hidden), the TUI renders a self-ticking PEAK/OFF-PEAK
+        # pill in the status bar, colored by the named theme tone, flipping
+        # whenever the current UTC time enters/exits any of `windows_utc`.
+        # Windows are provider-agnostic and purely config-driven:
+        #   peak_windows:
+        #     label_active: "PEAK"
+        #     label_idle: "OFF-PEAK"
+        #     color: "error"              # any theme color tone, e.g. warn/accent
+        #     windows_utc:
+        #       - { days: "1-5", from: "01:00", to: "04:00" }   # cron-style days
+        #       - { days: "1-5", from: "06:00", to: "10:00" }
+        # `days` is cron-style ("0"/"7" = Sunday … "6" = Saturday), comma lists
+        # and ranges ("0,6", "1-5,7") supported. `from`/`to` are "HH:MM" UTC and
+        # must be within the same day (no overnight wraparound in v1).
+        "peak_windows": None,
         # Focus view (/focus): display-only reduced-output mode. When true the
         # CLI/TUI pins tool_progress to "off" (reusing the existing suppression
         # path), reports a per-turn hidden-line count with a recovery hint, and

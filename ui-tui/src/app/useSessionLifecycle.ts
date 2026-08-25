@@ -18,7 +18,7 @@ import type {
   SetupStatusResponse
 } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
-import type { Msg, PanelSection, SessionInfo, Usage } from '../types.js'
+import type { CostWindowConfig, Msg, PanelSection, SessionInfo, Usage } from '../types.js'
 
 import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
 import { patchOverlayState } from './overlayStore.js'
@@ -30,6 +30,8 @@ import { getUiState, patchUiState } from './uiStore.js'
 export { refreshSessionView, scheduleResumeScrollToBottom } from './sessionResumeView.js'
 
 const usageFrom = (info: null | SessionInfo): Usage => (info?.usage ? { ...ZERO, ...info.usage } : ZERO)
+
+const costWindowFrom = (info: null | SessionInfo): CostWindowConfig | null => info?.cost_window ?? null
 
 const statusFromLiveSession = (status?: string, running = false) => {
   if (status === 'waiting') {
@@ -148,7 +150,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     turnController.fullReset()
     setVoiceRecording(false)
     setVoiceProcessing(false)
-    patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
+    patchUiState({ bgTasks: new Set(), info: null, costWindow: null, sid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
     setStickyPrompt('')
@@ -178,7 +180,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       setLastUserMsg('')
       composerActions.setComposerTokens([])
       patchTurnState({ activity: [] })
-      patchUiState({ info, usage: usageFrom(info) })
+      patchUiState({ info, costWindow: costWindowFrom(info), usage: usageFrom(info) })
     },
     [composerActions, setHistoryItems, setLastUserMsg, setStickyPrompt]
   )
@@ -219,6 +221,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         info,
         sid: r.session_id,
         status: info?.version ? 'ready' : 'starting agent…',
+        costWindow: costWindowFrom(info),
         usage: usageFrom(info)
       })
 
@@ -312,6 +315,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             info,
             sid: r.session_id,
             status: statusFromLiveSession(r.status, running),
+            costWindow: costWindowFrom(info),
             usage: usageFrom(info)
           })
           hydrateLiveSessionInflight(r.inflight)
@@ -366,6 +370,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               info,
               sid: r.session_id,
               status: statusFromLiveSession(r.status, running),
+              costWindow: costWindowFrom(info),
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)

@@ -489,6 +489,104 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         server._sessions.pop("iso-sid", None)
 
 
+def test_load_peak_windows_parses_configured_block(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "display": {
+                "peak_windows": {
+                    "label_active": "PEAK",
+                    "label_idle": "OFF-PEAK",
+                    "color": "error",
+                    "windows_utc": [
+                        {"days": "1-5", "from": "01:00", "to": "04:00"},
+                        {"days": "1-5", "from": "06:00", "to": "10:00"},
+                    ],
+                }
+            }
+        },
+    )
+
+    assert server._load_peak_windows() == {
+        "label_active": "PEAK",
+        "label_idle": "OFF-PEAK",
+        "color": "error",
+        "windows_utc": [
+            {"days": "1-5", "from": "01:00", "to": "04:00"},
+            {"days": "1-5", "from": "06:00", "to": "10:00"},
+        ],
+    }
+
+
+def test_load_peak_windows_none_when_unconfigured_or_malformed(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    assert server._load_peak_windows() is None
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {}})
+    assert server._load_peak_windows() is None
+
+    # Malformed: missing label, empty window list, or non-dict block all opt out.
+    malformed = {
+        "display": {
+            "peak_windows": {
+                "label_active": "",
+                "label_idle": "OFF-PEAK",
+                "color": "error",
+                "windows_utc": [{"days": "1-5", "from": "01:00", "to": "04:00"}],
+            }
+        }
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: malformed)
+    assert server._load_peak_windows() is None
+
+    empty = {
+        "display": {
+            "peak_windows": {
+                "label_active": "PEAK",
+                "label_idle": "OFF-PEAK",
+                "color": "error",
+                "windows_utc": [],
+            }
+        }
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: empty)
+    assert server._load_peak_windows() is None
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {"peak_windows": "not-a-dict"}})
+    assert server._load_peak_windows() is None
+
+
+def test_session_info_pushes_cost_window_when_configured_and_none_otherwise(monkeypatch):
+    import hermes_cli.banner as _banner
+
+    monkeypatch.setattr(_banner, "get_update_result", lambda timeout=0.5: None)
+
+    configured = {
+        "display": {
+            "peak_windows": {
+                "label_active": "PEAK",
+                "label_idle": "OFF-PEAK",
+                "color": "warn",
+                "windows_utc": [{"days": "0,6", "from": "01:00", "to": "04:00"}],
+            }
+        }
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: configured)
+    info = server._session_info(None, _session())
+    assert info["cost_window"] == {
+        "label_active": "PEAK",
+        "label_idle": "OFF-PEAK",
+        "color": "warn",
+        "windows_utc": [{"days": "0,6", "from": "01:00", "to": "04:00"}],
+    }
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    info = server._session_info(None, _session())
+    assert info["cost_window"] is None
+
+
+
 def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):
