@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import threading
 import time
 from collections import defaultdict
@@ -91,6 +92,26 @@ class CampaignAlreadyRunning(RuntimeError):
 
 
 ACTIONABLE_VERDICTS = frozenset({"strong_fit", "review"})
+
+logger = logging.getLogger("interfaze.lead_research")
+
+# Everything a run event may carry, by name. An allow-list rather than a
+# redaction pass, because the input is a shared candidate corpus built from a
+# customer's contact list: a blocklist has to anticipate every field somebody
+# later adds to a metrics dict, and one miss publishes a person's email into a
+# log file nobody scopes by tenant. Identifiers, ISO codes, counts, statuses,
+# versions and error categories only.
+RUN_EVENT_FIELDS = frozenset({
+    "campaign_id", "profile_version_id", "scoring_profile_id", "source_ids",
+    "failed_source_ids", "target_countries", "country", "research_limit",
+    "supplied", "passed_cheap_gate", "duplicates_collapsed", "indexed_candidates",
+    "raw_records", "named_candidates", "resolved_organizations",
+    "eligible_companies", "strong_fit_pool", "qualified_leads",
+    "review_candidates", "outside_result_limit", "countries_represented",
+    "result_target_min", "result_limit", "result_shortfall",
+    "provider_requests", "processing_errors", "reused_bundles", "status",
+    "error_categories", "zero_result_explanation",
+})
 
 
 class ResearchRefreshService:
@@ -380,6 +401,29 @@ class LeadResearchService:
                 self.db, runs=self._agent_runs, facts=self._facts,
             )
         return self._agentic
+
+    def _run_event(self, run_id: str, company_id: str, kind: str, data: dict) -> None:
+        """Record one durable, count-only step of a run. Never fatal.
+
+        A trail is diagnostic: a campaign that qualified fifteen companies must
+        not be turned into a failure because the progress table was unavailable.
+        Logged first so the line survives even when the insert does not.
+        """
+        safe = {key: value for key, value in data.items() if key in RUN_EVENT_FIELDS}
+        logger.info(
+            "lead_research %s",
+            json_dump({
+                "run_id": run_id, "company_id": company_id, "kind": kind, **safe,
+            }),
+        )
+        try:
+            self.db.execute(
+                "INSERT INTO run_events(run_id,company_id,ts,kind,message,data) "
+                "VALUES(?,?,?,?,?,?)",
+                (run_id, company_id, now(), kind, "", json_dump(safe)),
+            )
+        except Exception:
+            logger.exception("lead research run event could not be persisted")
 
     def _checkpoint_candidate(
         self,
@@ -1678,6 +1722,14 @@ class LeadResearchService:
             ),
         )
 
+        self._run_event(run_id, company_id, "lead_research_started", {
+            "campaign_id": campaign_id,
+            "profile_version_id": frozen_profile.id if frozen_profile is not None else None,
+            "scoring_profile_id": config.scoring.profile_id,
+            "source_ids": sorted(config.enabled_source_ids),
+            "target_countries": list(config.target_countries),
+        })
+
         verify_pool = (
             ThreadPoolExecutor(
                 max_workers=self.verify_workers, thread_name_prefix="lead-verify",
@@ -1817,6 +1869,15 @@ class LeadResearchService:
                     supply.counts.get("cheap_verification_requests", 0)
                     + supply.counts.get("candidate_discovery_requests", 0)
                 )
+                self._run_event(run_id, company_id, "lead_research_market_supplied", {
+                    "campaign_id": campaign_id,
+                    "country": country,
+                    "research_limit": research_limit,
+                    "indexed_candidates": supply.counts.get("indexed_candidates", 0),
+                    "supplied": supply.counts.get("supplied", 0),
+                    "passed_cheap_gate": supply.counts.get("passed_cheap_gate", 0),
+                    "duplicates_collapsed": supply.counts.get("duplicates_collapsed", 0),
+                })
                 if not candidates:
                     # A market that selected nothing is indistinguishable from a
                     # market with no buyers in it unless the run says which it
@@ -2503,6 +2564,17 @@ class LeadResearchService:
         metrics["result_shortfall"] = max(
             0, RESULT_TARGET_MIN - metrics["qualified_leads"]
         )
+        self._run_event(run_id, company_id, "lead_research_ranked", {
+            "campaign_id": campaign_id,
+            "strong_fit_pool": metrics["strong_fit_pool"],
+            "qualified_leads": metrics["qualified_leads"],
+            "review_candidates": metrics["review_candidates"],
+            "outside_result_limit": metrics["outside_result_limit"],
+            "countries_represented": metrics["countries_represented"],
+            "result_target_min": RESULT_TARGET_MIN,
+            "result_limit": RESULT_LIMIT,
+            "result_shortfall": metrics["result_shortfall"],
+        })
 
         # Outside FUNNEL_KEYS with excluded_closed:
         # enrichment adds evidence to records already counted, it never moves
@@ -2521,6 +2593,7 @@ class LeadResearchService:
 
         partition_statuses: list[str] = []
         failed_sources: set[str] = set()
+        error_categories: set[str] = set()
         for (source_id, _country), partition in partitions.items():
             if not partition["available"]:
                 status = "skipped"
@@ -2546,6 +2619,8 @@ class LeadResearchService:
                 status = "succeeded"
                 error_category = None
             partition_statuses.append(status)
+            if error_category:
+                error_categories.add(error_category)
             partition_metrics = {
                 "selected_candidates": partition["selected"],
                 "verified_candidates": partition["verified"],
@@ -2607,6 +2682,26 @@ class LeadResearchService:
             unmapped_markets=unmapped_markets,
         )
         metrics["zero_result_explanation"] = explanation
+        self._run_event(run_id, company_id, "lead_research_completed", {
+            "campaign_id": campaign_id,
+            "status": final_status,
+            "failed_source_ids": sorted(failed_sources),
+            # Categories, not messages: an upstream's own text is the one place
+            # a company name or an address reliably shows up.
+            "error_categories": sorted(error_categories),
+            "strong_fit_pool": metrics["strong_fit_pool"],
+            "qualified_leads": metrics["qualified_leads"],
+            "review_candidates": metrics["review_candidates"],
+            "outside_result_limit": metrics["outside_result_limit"],
+            "eligible_companies": metrics["eligible_companies"],
+            "named_candidates": metrics["named_candidates"],
+            "resolved_organizations": metrics["resolved_organizations"],
+            "provider_requests": provider_requests,
+            "processing_errors": processing_errors,
+            "reused_bundles": reused_bundles,
+            "result_shortfall": metrics["result_shortfall"],
+            "zero_result_explanation": explanation,
+        })
         CampaignMetricsRecorder(self.db, company_id, campaign_id).save(metrics, now())
         output = {
             "campaign_id": campaign_id,
