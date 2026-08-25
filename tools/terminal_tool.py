@@ -1550,7 +1550,10 @@ def _resolve_override_host_cwd(task_id: Optional[str]) -> Optional[str]:
     if not os.path.isdir(candidate):
         return None
     if candidate.startswith(("/workspace", "/root")):
-        # Already an in-container path, not a host workspace.
+        # Already an in-container path, not a host workspace. Prefix check,
+        # not segment-exact, so it also rejects unrelated host dirs sharing
+        # the prefix (e.g. /workspacefiles, /rootfs-data) — acceptable for
+        # now since real host paths rarely collide with these prefixes.
         return None
     return candidate
 
