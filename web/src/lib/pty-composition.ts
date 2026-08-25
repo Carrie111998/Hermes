@@ -9,6 +9,7 @@ export function createPtyCompositionForwarder(send: (data: string) => void) {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let matchedTerminalPrefix = "";
   let sawUnrelatedTerminalData = false;
+  let compositionActive = false;
 
   const clearPending = () => {
     pending = null;
@@ -21,7 +22,12 @@ export function createPtyCompositionForwarder(send: (data: string) => void) {
   };
 
   return {
+    onCompositionStart() {
+      compositionActive = true;
+    },
     onCompositionEnd(data: string | null) {
+      if (!compositionActive) return;
+      compositionActive = false;
       if (!data) return;
       // Preserve rapid consecutive commits instead of discarding the first.
       const previous = pending;
@@ -49,6 +55,9 @@ export function createPtyCompositionForwarder(send: (data: string) => void) {
         sawUnrelatedTerminalData = true;
       }
     },
-    dispose: clearPending,
+    dispose() {
+      compositionActive = false;
+      clearPending();
+    },
   };
 }
