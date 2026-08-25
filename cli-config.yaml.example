@@ -1227,6 +1227,11 @@ platform_toolsets:
 #   auto_thread: true                # Auto-create thread on @mention (default: true)
 #   free_response_channels: ""       # Channel IDs where no mention is needed
 #   reactions: true                  # Show processing reactions (default: true)
+#   # When set, emoji reactions ON THE BOT'S OWN MESSAGES are delivered to the
+#   # agent as `reaction:added:<emoji>` / `reaction:removed:<emoji>` messages
+#   # (steer-style during busy sessions). true = all emoji; list = allowlist.
+#   # This is DIFFERENT from `reactions:` above (that's the bot's own 👀/✅ acks).
+#   reaction_triggers: false
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
 

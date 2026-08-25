@@ -421,6 +421,37 @@ Controls whether the bot adds emoji reactions to messages as visual feedback:
 
 Disable this if you find the reactions distracting or if the bot's role doesn't have the **Add Reactions** permission.
 
+#### `discord.reaction_triggers`
+
+**Type:** boolean or list — **Default:** `false`
+
+By default, emoji reactions on the bot's messages are acknowledged and dropped — a 👍 on a bot message does nothing. Set `discord.reaction_triggers` to route reactions into the agent loop:
+
+```yaml
+discord:
+  # Opt-in. false/absent (default) = reactions are acked and dropped.
+  # true = any emoji reaction ON THE BOT'S OWN MESSAGES routes to the agent.
+  reaction_triggers: true
+  # Or an explicit emoji allowlist — only these emoji route:
+  # reaction_triggers: ["👍", "✅"]
+```
+
+Behavior:
+
+- When triggered, the agent receives a normal message with text
+  `reaction:added:👍` / `reaction:removed:👍`, with reply context showing
+  which of the bot's own messages was reacted to.
+- Reactions are processed like normal messages: they steer a busy session or
+  start an idle-turn reply, so user authorization and channel policy
+  (`allowed_users`, `allowed_channels`, `ignored_channels`) apply exactly as
+  for typed messages.
+- Reactions on **other people's messages** never reach the agent (unlike the
+  Slack allowlist mode, which can target any message).
+
+This is independent of [`reactions`](#discordreactions) above, which controls the bot's own 👀/✅/❌ processing acks — those never feed back into the agent either way.
+
+Also independent of this opt-in, every human reaction fires the `reaction:added`/`reaction:removed` [gateway hooks](../features/hooks.md#available-events) for observers that don't need agent turns.
+
 #### `discord.ignored_channels`
 
 **Type:** string or list — **Default:** `[]`
