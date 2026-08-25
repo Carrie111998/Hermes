@@ -33,12 +33,20 @@ from tests.server.test_api_mvp import make_client
 
 
 def _weights(product: int, buyer: int) -> dict[str, int]:
+    """A campaign that weights what its configured sources can actually reach.
+
+    `market_coverage` and `commercial_scale` stay non-zero — the gap pass has to
+    have something to go and look for — but small, because no source here can
+    corroborate them and 30 points of weight on evidence nobody can strengthen
+    held every candidate below the strong-fit floor on arithmetic rather than on
+    anything about the company. `product + buyer` must total 90.
+    """
     return {
         "product_sector_fit": product,
         "buyer_channel_fit": buyer,
         "buying_intent": 0,
-        "market_coverage": 15,
-        "commercial_scale": 15,
+        "market_coverage": 5,
+        "commercial_scale": 5,
         "trade_activity": 0,
         "contactability": 0,
     }
@@ -209,7 +217,7 @@ def test_lead_research_contract_end_to_end(contract_app):
         client,
         a,
         product_terms=["industrial valve"],
-        weights=_weights(50, 20),
+        weights=_weights(60, 30),
     )
     issues = [
         {**dict(row), "data": json_load(row["data"], {})}
@@ -295,7 +303,7 @@ def test_two_tenants_reuse_public_fact_but_keep_decisions_private(contract_app):
         client,
         a,
         product_terms=["industrial valve"],
-        weights=_weights(50, 20),
+        weights=_weights(60, 30),
     )
     first_results = wait_for_results(app, client, a, first["id"])
     first_public = _public_result(first_results)
@@ -307,7 +315,7 @@ def test_two_tenants_reuse_public_fact_but_keep_decisions_private(contract_app):
         client,
         b,
         product_terms=["industrial valve"],
-        weights=_weights(20, 50),
+        weights=_weights(30, 60),
     )
     second_results = wait_for_results(app, client, b, second["id"])
     second_public = _public_result(second_results)

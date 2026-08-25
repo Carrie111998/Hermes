@@ -111,3 +111,41 @@ def test_customer_result_and_claim_payload_explains_uncertainty_and_exact_eviden
     assert citation["criteria"]
     assert all(set(criterion) == {"dimension", "weight"} for criterion in citation["criteria"])
     assert "shared_fact_id" not in citation and "hidden_labels" not in citation
+
+
+# ── the selection is recorded everywhere the score is ────────────────────────
+
+def test_a_displayed_lead_says_the_same_rank_in_every_record():
+    """Three places store this decision, and a disagreement is unauditable.
+
+    The result row's `data`, the result's frozen `snapshot_json`, and the
+    append-only score snapshot all have to name the same rank, because the
+    customer reads the first and an audit reads the last.
+    """
+    app, client, headers, company_id = make_research_client()
+    campaign = _run(app, client, headers, "Ranked decision")
+
+    rows = app.state.db.all(
+        "SELECT id,verdict,lead_id,data,snapshot_json FROM research_results "
+        "WHERE company_id=? AND campaign_id=?",
+        (company_id, campaign["id"]),
+    )
+    assert rows
+    for row in rows:
+        selection = json.loads(row["data"])["selection"]
+        assert selection["displayed"] is True
+        assert selection["display_rank"] >= 1
+        assert selection["country_round"] >= 1
+        assert row["lead_id"]
+        assert json.loads(row["snapshot_json"])["selection"] == selection
+        latest = app.state.db.one(
+            "SELECT snapshot_json FROM research_score_snapshots "
+            "WHERE company_id=? AND result_id=? ORDER BY created_at DESC",
+            (company_id, row["id"]),
+        )
+        assert json.loads(latest["snapshot_json"])["selection"] == selection
+
+    ranks = sorted(
+        json.loads(row["data"])["selection"]["display_rank"] for row in rows
+    )
+    assert ranks == list(range(1, len(rows) + 1))

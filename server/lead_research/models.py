@@ -826,6 +826,9 @@ class ResearchResultData(ApiModel):
     fact_ids: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     verdict_snapshot: dict[str, Any] = Field(default_factory=dict)
+    # Whether this strong fit is in the customer's primary list, and where.
+    # Absent on reviews and rejects, which are never displayed as leads.
+    selection: dict[str, Any] = Field(default_factory=dict)
 
 
 class CampaignContext(ApiModel):

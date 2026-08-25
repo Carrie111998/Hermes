@@ -12,6 +12,8 @@ in one place — `scoring.py` — and only the relative order is a contract.
 """
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from server.lead_research.models import Claim, ScoringProfile, VerificationBundle
@@ -213,11 +215,15 @@ def test_fit_and_confidence_remain_separate_signals():
 
 
 class TieredEvidenceVerifier:
-    """Rich evidence for one candidate, thin for the others.
+    """Richer evidence for one candidate than for the others.
 
     The lead list has to be ordered by fit, and a fixture that gives every
     company identical evidence cannot show that: any order is sorted when every
     score is equal.
+
+    Both tiers still clear the strong-fit floor — the list being ordered is only
+    observable among leads that are in it — so the difference is breadth of
+    observed buyer role, which is exactly what `buyer_channel_fit` measures.
     """
 
     RICH = "buyer-de-1"
@@ -233,20 +239,11 @@ class TieredEvidenceVerifier:
         return self.provider.health()
 
     def verify(self, query, candidate):
-        bundle = self.provider.verify(query, candidate)
         if candidate.source_record_id == self.RICH:
-            return bundle
-        # Thin: one independent source, one term, no domain.
-        independent = bundle.sources[1]
-        return VerificationBundle(
-            candidate_source_record_id=candidate.source_record_id,
-            sources=[independent.model_copy(update={"facts": {
-                "company_name": [candidate.company_name],
-                "buyer_role": ["distributor"],
-                "product_term": ["household-appliances"],
-            }})],
-            independent_source_count=1,
-        )
+            candidate = dataclasses.replace(candidate, data={
+                **candidate.data, "buyer_types": ["distributor", "importer"],
+            })
+        return self.provider.verify(query, candidate)
 
 
 def test_the_customer_lead_list_is_ordered_by_fit(tmp_path):

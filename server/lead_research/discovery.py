@@ -18,6 +18,12 @@ from .models import CandidateSupply, DiscoveryQuery
 from .providers.base import CandidateSource
 
 
+# How much wider than the shortlist to acquire before pre-ranking. Three, for
+# the same reason the shortlist is three times the list: candidates drop out at
+# the cheap gate, at eligibility and at the floor, and a selection with nothing
+# to reject is not a selection.
+_ACQUISITION_BAND = 3
+
 GateReason = Literal[
     "shared_relevance",
     "corpus_term",
@@ -106,6 +112,50 @@ def _domain(value: str | None) -> str | None:
     return (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.") or None
 
 
+def candidate_pre_rank(candidate: CandidateRecord, scope: ResearchScope) -> tuple:
+    """Which candidates are worth the research budget, before spending any of it.
+
+    Ordering key, best first. Every component is a property of the candidate
+    row and the campaign's own scope. Deliberately absent: dataset id, provider
+    id, access tier, and the order sources happen to be listed in — if any of
+    those could move a candidate up, reordering `enabled_source_ids` would
+    change the customer's lead list, which is the bug this exists to prevent.
+    """
+    terms = set(scope.all_terms)
+    row_terms = {
+        searchable_term(value)
+        for value in candidate.data.get("categories", [])
+        if str(value).strip()
+    }
+    exact = len(row_terms & terms)
+    overlapping = sum(
+        1
+        for row_term in row_terms - terms
+        for term in terms
+        if matches_term(term, row_term) or matches_term(row_term, term)
+    )
+    roles = [
+        str(value) for value in candidate.data.get("buyer_types", []) if str(value).strip()
+    ]
+    manifest = candidate.assertion_manifest
+    asserted = len(manifest.asserted_fields) if manifest else 0
+    curated_at = manifest.curated_at if manifest and manifest.curated_at else 0.0
+    contactable = bool(candidate.domain) or bool(candidate.data.get("contact_channel"))
+    return (
+        # An eligibility fact already known: this row's own product range rules
+        # it out of scope, whatever else it looks like.
+        int(explicit_range_exclusion(candidate, scope)),
+        -exact,
+        -overlapping,
+        -len(roles),
+        -asserted,
+        -int(contactable),
+        -curated_at,
+        candidate.normalized_name,
+        candidate.source_record_id,
+    )
+
+
 def _identity(candidate: CandidateRecord) -> tuple[str, str, str]:
     if candidate.domain:
         return ("domain", candidate.domain, "")
@@ -138,6 +188,12 @@ class CandidateDiscoveryService:
             sector_ids=query.sector_ids,
             hs_codes=query.hs_codes,
         )
+        # Ask every source for a wider band than the shortlist keeps, so the
+        # pre-rank actually chooses. The repository can only order by a column;
+        # asking it for exactly `limit` meant a corpus of 20 near-misses and one
+        # good match handed over the 20, because `source_record_id` order is
+        # arbitrary with respect to how well a row fits the campaign.
+        acquisition_limit = limit * _ACQUISITION_BAND
         candidate_repository = repository or self.repository
         # Alternate repositories used for bounded refresh/import views may
         # implement the long-standing select() boundary only. They are already
@@ -150,11 +206,9 @@ class CandidateDiscoveryService:
             company_id=company_id,
             countries=query.target_countries,
             product_terms=scope.all_terms,
-            limit=limit,
+            limit=acquisition_limit,
             exclude=exclude,
         )
-        candidates: list[CandidateRecord] = []
-        seen: set[tuple[str, str, str]] = set()
         counts: dict[str, int] = {
             "indexed_candidates": len(indexed),
             "duplicates_collapsed": 0,
@@ -163,22 +217,31 @@ class CandidateDiscoveryService:
             "cheap_verification_requests": 0,
             "candidate_discovery_requests": 0,
         }
+        # Acquisition and selection are separate passes on purpose. Gating as
+        # candidates arrived meant the first source to fill the limit ended the
+        # search, so a second source never got asked and reordering
+        # `enabled_source_ids` changed which companies a campaign researched.
+        # Every source is offered the same ceiling; the trim happens once, by
+        # `candidate_pre_rank`, after the whole union is known.
+        collected: dict[tuple[str, str, str], CandidateRecord] = {}
 
-        def add(candidate: CandidateRecord) -> bool:
+        def offer(candidate: CandidateRecord) -> bool:
             key = _identity(candidate)
-            if key in seen:
-                counts["duplicates_collapsed"] += 1
-                return False
-            seen.add(key)
-            counts["supplied"] += 1
-            decision = self.gate.evaluate(company_id, candidate, scope)
-            count_cheap_gate(counts, decision)
-            if decision.passed:
-                candidates.append(candidate)
-            return True
+            existing = collected.get(key)
+            if existing is None:
+                collected[key] = candidate
+                return True
+            counts["duplicates_collapsed"] += 1
+            # Same company from two sources: keep the richer row, decided by the
+            # same provider-neutral key that orders everything else. Keeping
+            # whichever arrived first would be keeping whichever source was
+            # listed first.
+            if candidate_pre_rank(candidate, scope) < candidate_pre_rank(existing, scope):
+                collected[key] = candidate
+            return False
 
         for candidate in indexed:
-            add(candidate)
+            offer(candidate)
 
         enabled = {
             row["source_id"]
@@ -189,8 +252,6 @@ class CandidateDiscoveryService:
             )
         }
         for source_id in sorted(enabled):
-            if len(candidates) >= limit:
-                break
             provider = self.registry.get(source_id)
             if not isinstance(provider, CandidateSource):
                 continue
@@ -198,7 +259,11 @@ class CandidateDiscoveryService:
             if health.status not in {"active", "degraded"}:
                 continue
             page = provider.discover_candidates(
-                query.model_copy(update={"max_records": limit - len(candidates)}),
+                # The same ceiling the indexed corpus got. Equal opportunity is
+                # the point: an earlier source filling the shortlist used to end
+                # the search, so source order changed which companies a campaign
+                # even looked at.
+                query.model_copy(update={"max_records": acquisition_limit}),
                 cursor=None,
             )
             counts["candidate_discovery_requests"] += page.requests
@@ -214,7 +279,7 @@ class CandidateDiscoveryService:
                 country = str(payload.get("country") or "").strip().upper()
                 if not name or country not in ISO_ALPHA_2:
                     continue
-                unique = add(CandidateRecord(
+                unique = offer(CandidateRecord(
                     dataset_id=f"source:{source_id}",
                     version=page.snapshot.snapshot_id,
                     source_record_id=record.source_record_id,
@@ -234,7 +299,20 @@ class CandidateDiscoveryService:
                 ))
                 if unique:
                     supplied += 1
-                if len(candidates) >= limit:
-                    break
             counts[f"{source_id}_discovered"] = supplied
-        return CandidateSupply(candidates=candidates[:limit], counts=counts)
+
+        counts["supplied"] = len(collected)
+        candidates: list[CandidateRecord] = []
+        for candidate in sorted(
+            collected.values(), key=lambda item: candidate_pre_rank(item, scope)
+        ):
+            if len(candidates) >= limit:
+                # Already in pre-rank order, so stopping here selects the same
+                # set a full pass would — without paying the cheap verifier for
+                # candidates that could not have been reached anyway.
+                break
+            decision = self.gate.evaluate(company_id, candidate, scope)
+            count_cheap_gate(counts, decision)
+            if decision.passed:
+                candidates.append(candidate)
+        return CandidateSupply(candidates=candidates, counts=counts)

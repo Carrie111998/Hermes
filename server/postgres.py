@@ -149,7 +149,8 @@ class PostgresDatabase:
                            "014_research_translations", "015_shared_research_facts",
                            "016_research_search_attempts", "017_research_result_contract",
                            "018_research_labels_corrections", "019_contact_verification_tiers",
-                           "020_lead_research_contract_backfill")
+                           "020_lead_research_contract_backfill",
+                           "021_balanced_lead_results")
 
     def _assert_migrations_applied(self) -> None:
         try:

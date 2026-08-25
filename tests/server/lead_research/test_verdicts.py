@@ -272,7 +272,14 @@ def test_reject_is_persisted_without_creating_a_lead(tmp_path):
     assert db.one("SELECT COUNT(*) AS n FROM leads WHERE company_id=?", (company_id,))["n"] == 0
 
 
-def test_review_is_persisted_and_creates_a_lead(tmp_path):
+def test_review_is_persisted_without_creating_a_lead(tmp_path):
+    """A review is a record of a candidate, not a lead.
+
+    It used to be materialized with `status='review'`, which put it in the same
+    `leads` table the customer's primary list reads from — so a run reported 91
+    "leads" of which almost none had cleared the floor. The record stays
+    visible, auditable and refreshable; it just is not a lead.
+    """
     db, company_id, campaign_id, result = _run_campaign(tmp_path, ReviewingVerifier)
 
     assert result["status"] == "succeeded"
@@ -280,10 +287,11 @@ def test_review_is_persisted_and_creates_a_lead(tmp_path):
         "SELECT verdict,lead_id FROM research_results WHERE company_id=? AND campaign_id=?",
         (company_id, campaign_id),
     )
-    assert research_result["verdict"] == "review"
-    assert research_result["lead_id"]
-    lead = db.one("SELECT status FROM leads WHERE id=?", (research_result["lead_id"],))
-    assert lead["status"] == "review"
+    assert dict(research_result) == {"verdict": "review", "lead_id": None}
+    assert db.one("SELECT COUNT(*) AS n FROM leads WHERE company_id=?", (company_id,))["n"] == 0
+    assert result["metrics"]["review_candidates"] == result["metrics"]["review_leads"] == 1
+    assert result["metrics"]["qualified_leads"] == 0
+    assert result["metrics"]["result_shortfall"] == 5
 
 
 class AbstainingVerifier(RejectingVerifier):
@@ -331,8 +339,12 @@ def test_a_rerun_with_a_domainless_verifier_does_not_duplicate_the_identity(tmp_
     `ReviewingVerifier` names the company and states nothing that links it — no
     domain, no registry id — which is the ordinary shape of a TED notice or a
     search snippet. Resolution could only match on an identifier, so every run
-    created another organization for the same company, and every organization
-    carried its own lead.
+    created another organization for the same company.
+
+    A review no longer becomes a lead, so `leads` staying empty is part of the
+    contract here too: rerunning a campaign that qualified nobody must not
+    accumulate rows anywhere. Lead reuse across reruns is pinned in
+    test_query_shape.py, on a fixture that actually qualifies.
     """
     db = Database(tmp_path / "verdicts.db")
     company_id, campaign_id = "company_one", "campaign_one"
@@ -384,14 +396,14 @@ def test_a_rerun_with_a_domainless_verifier_does_not_duplicate_the_identity(tmp_
     assert db.one(
         "SELECT COUNT(*) AS n FROM organizations WHERE company_id=?", (company_id,)
     )["n"] == 1
-    assert db.one("SELECT COUNT(*) AS n FROM leads WHERE company_id=?", (company_id,))["n"] == 1
+    assert db.one("SELECT COUNT(*) AS n FROM leads WHERE company_id=?", (company_id,))["n"] == 0
 
 
 def test_strong_evidence_still_earns_a_strong_fit_end_to_end(tmp_path):
     """The canary for the top band.
 
-    The shared fixture states one term and one role, which is corroborated but
-    narrow, and now correctly lands on `review`. Without this test nothing would
+    `ReviewingVerifier` states one term and one role, which is corroborated but
+    narrow, and correctly lands on `review`. Without this test nothing would
     prove the pipeline can still produce a `strong_fit` at all.
     """
     db, company_id, campaign_id, result = _run_campaign(tmp_path, StrongEvidenceVerifier)

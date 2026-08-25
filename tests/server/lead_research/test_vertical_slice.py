@@ -116,20 +116,21 @@ def test_research_campaign_vertical_slice_and_tenant_scope():
         (campaign["company_id"], campaign["id"]),
     )
     assert results
-    # `review`, not `strong_fit`: this fixture states one product term and one
-    # role across two sources, which is corroborated but narrow, and fit is
-    # scored by degree now rather than by presence. What strong evidence earns
-    # is pinned in test_fit_scoring.py.
-    assert {row["verdict"] for row in results} == {"review"}
+    # This fixture states three product ranges and a website across two
+    # corroborating pages, which clears the absolute floor. What thin evidence
+    # earns instead is pinned in test_fit_scoring.py and test_verdicts.py.
+    assert {row["verdict"] for row in results} == {"strong_fit"}
     assert all(row["lead_id"] for row in results)
 
     metrics = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/metrics", headers=headers,
     ).json()[0]
-    assert metrics["qualified_leads"] == 0
-    assert metrics["review_leads"] == len(results)
-    assert metrics["raw_records"] >= metrics["named_candidates"] >= metrics["review_leads"] > 0
-    assert metrics["resolved_organizations"] >= metrics["eligible_companies"] >= metrics["review_leads"]
+    assert metrics["review_leads"] == 0
+    assert metrics["qualified_leads"] == len(results)
+    assert metrics["strong_fit_pool"] == metrics["qualified_leads"]
+    assert metrics["outside_result_limit"] == 0
+    assert metrics["raw_records"] >= metrics["named_candidates"] >= metrics["qualified_leads"] > 0
+    assert metrics["resolved_organizations"] >= metrics["eligible_companies"] >= metrics["qualified_leads"]
 
     leads = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/leads", headers=headers,
@@ -348,20 +349,25 @@ def test_partition_failures_preserve_candidate_diagnostics(
 
 
 @pytest.mark.parametrize(
-    ("stage", "expected_results"),
+    ("stage", "expected_results", "expected_status"),
     [
-        ("identity", 0),
-        ("evidence", 0),
-        ("claims", 0),
-        ("eligibility", 0),
-        ("scoring", 0),
-        ("verdict", 0),
-        ("result", 0),
-        ("lead", 2),
+        ("identity", 0, "failed"),
+        ("evidence", 0, "failed"),
+        ("claims", 0, "failed"),
+        ("eligibility", 0, "failed"),
+        ("scoring", 0, "failed"),
+        ("verdict", 0, "failed"),
+        ("result", 0, "failed"),
+        # Lead materialization happens after every candidate is researched and
+        # ranked, so its research genuinely did complete: the partition reports
+        # `partial` — work done, work errored — not `failed`. The results are
+        # persisted with a null lead, which is the state the customer's list
+        # reads from and therefore the state that has to be right.
+        ("lead", 2, "partial"),
     ],
 )
 def test_downstream_candidate_failures_are_bounded_and_terminal(
-    monkeypatch, stage, expected_results,
+    monkeypatch, stage, expected_results, expected_status,
 ):
     app, client, headers, _ = make_research_client()
 
@@ -390,18 +396,21 @@ def test_downstream_candidate_failures_are_bounded_and_terminal(
 
     _, settled = start_and_settle(app, client, headers, campaign["id"])
 
-    assert settled["status"] == "failed"
+    assert settled["status"] == expected_status
     persisted_campaign = app.state.db.one(
         "SELECT status,run_id FROM research_campaigns WHERE id=?", (campaign["id"],)
     )
-    assert persisted_campaign["status"] == "failed"
+    assert persisted_campaign["status"] == expected_status
+    # `agent_runs` has no partial state: a run that produced work and reported
+    # its errors is a completed run, and the partition rows are where the
+    # failure lives.
     assert app.state.db.one(
         "SELECT status FROM agent_runs WHERE id=?", (persisted_campaign["run_id"],)
-    )["status"] == "failed"
+    )["status"] == ("failed" if expected_status == "failed" else "succeeded")
     source_run = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/source-runs", headers=headers,
     ).json()[0]
-    assert source_run["status"] == "failed"
+    assert source_run["status"] == expected_status
     assert {
         (error["candidate_source_record_id"], error["stage"])
         for error in source_run["metrics"]["errors"]

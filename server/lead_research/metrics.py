@@ -1,7 +1,10 @@
 """Defensible pre-run estimates and actual ordered funnel metrics."""
 from __future__ import annotations
 
+import math
+
 from .models import CampaignConfig, CampaignEstimate, DiscoveryQuery
+from .ranking import RESULT_LIMIT
 
 
 FUNNEL_KEYS = (
@@ -19,6 +22,25 @@ CHEAP_GATE_REASONS = (
     "excluded_by_range",
     "cheap_verification_no_scope_signal",
 )
+
+
+def research_limit_per_country(country_count: int) -> int:
+    """How many candidates one market is worth researching this pass.
+
+    The old figure was `max_qualified_leads_per_country * 3`, which with the
+    shipped default meant 150 candidates *per market* — 750 for a five-market
+    campaign, each one costing verification requests, to fill a list of 15. The
+    ceiling now follows the list: three times a market's share of the global
+    limit, so a five-market campaign researches about 45 candidates in total
+    rather than 750.
+
+    Three times, not one: candidates drop out at eligibility, at the floor, and
+    at identity resolution, so a shortlist the exact size of the list would
+    under-fill it. Never below three, because a market with two candidates is
+    still a market.
+    """
+    represented = max(1, int(country_count))
+    return max(3, math.ceil(RESULT_LIMIT / represented) * 3)
 
 
 def zero_result_explanation(

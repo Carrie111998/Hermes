@@ -62,6 +62,10 @@ def fixture_definition() -> DatasetDefinition:
         access_tier="public",
         entity_levels=["named_company", "opportunity"],
         capabilities=["organizations", "company_signals", "buying_requests"],
+        # What this fake can actually speak to. Declared so completeness is
+        # measured against reachable dimensions rather than all seven — an
+        # undeclared source made every fixture lead look half-evidenced.
+        emits=["company_name", "country", "domain", "buyer_role", "product_term"],
         freshness_days=30,
         adapter_mode="fixture",
         default_enabled=True,
@@ -141,26 +145,34 @@ class DeterministicProvider:
         # corpus row that said otherwise — and eligibility reads observed roles.
         roles = [str(value) for value in candidate.data.get("buyer_types") or []] or ["distributor"]
         role_phrase = " and ".join(roles)
+        # Three product ranges and a website on both pages: what a directory
+        # entry for a real distributor looks like, and what it takes to clear
+        # the strong-fit floor. A single term on a single page is a mention, and
+        # the scoring model is built to say so.
+        terms = ["household-appliances", "built-in ovens", "white goods"]
+        term_phrase = ", ".join(terms)
         official_markdown = (
-            f"{candidate.company_name} is a {role_phrase} of household-appliances "
+            f"{candidate.company_name} is a {role_phrase} of {term_phrase} "
             f"in {candidate.country}. Website: {candidate.domain}."
         )
         independent_markdown = (
-            f"Registry profile for {candidate.company_name}, a household-appliances {role_phrase}."
+            f"Registry profile for {candidate.company_name}, a {term_phrase} "
+            f"{role_phrase}. Website: {candidate.domain}."
         )
         official_facts = {
             "company_name": [candidate.company_name],
             "country": [candidate.country],
             "buyer_role": roles,
-            "product_term": ["household-appliances"],
+            "product_term": terms,
         }
-        if candidate.domain:
-            official_facts["domain"] = [candidate.domain]
         independent_facts = {
             "company_name": [candidate.company_name],
             "buyer_role": roles,
-            "product_term": ["household-appliances"],
+            "product_term": terms,
         }
+        if candidate.domain:
+            official_facts["domain"] = [candidate.domain]
+            independent_facts["domain"] = [candidate.domain]
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
             sources=[

@@ -24,7 +24,14 @@ from .metrics import (
     FUNNEL_KEYS,
     count_candidate_stage,
     estimate_campaign,
+    research_limit_per_country,
     zero_result_explanation,
+)
+from .ranking import (
+    RESULT_LIMIT,
+    RESULT_TARGET_MIN,
+    RankableResult,
+    select_displayed_strong_fits,
 )
 from .models import (
     CampaignConfig, CampaignContext, Claim, DiscoveryQuery, LeadCandidate, LeadScore,
@@ -143,6 +150,7 @@ def result_snapshot(
     score: LeadScore,
     fact_ids: list[str],
     verdict,
+    selection: dict | None = None,
 ) -> dict:
     evidence_ids = list(dict.fromkeys(
         evidence_id
@@ -166,6 +174,9 @@ def result_snapshot(
             "missing_evidence": verdict.missing_evidence,
             "conflicting_claims": verdict.conflicting_claims,
         },
+        # The display decision this score belongs to, so the snapshot, the
+        # result row and the API all say the same thing about one lead.
+        "selection": dict(selection or {}),
     }
 
 
@@ -277,7 +288,21 @@ class LeadResearchService:
             product_terms=canonical,
             market_terms=market_terms.by_language if market_terms else {},
             buyer_types=snapshot.get("buyer_types", config.buyer_types),
-            max_records=config.max_qualified_leads_per_country * 3,
+            max_records=self._research_limit(config),
+        )
+
+    @staticmethod
+    def _research_limit(config: CampaignConfig) -> int:
+        """How many candidates one market is worth researching this pass.
+
+        The legacy per-country qualified-lead ceiling stays as an upper safety
+        bound so a campaign stored with a deliberately small value keeps it; the
+        list-derived ceiling is what actually applies, because the old default
+        meant 150 candidates per market to fill a list of 15.
+        """
+        return min(
+            max(1, config.max_qualified_leads_per_country) * 3,
+            research_limit_per_country(len(config.target_countries)),
         )
 
     def start(self, company_id: str, campaign_id: str) -> dict:
@@ -533,7 +558,7 @@ class LeadResearchService:
             company_id=company_id,
             countries=config.target_countries,
             product_terms=search_terms,
-            limit=config.max_qualified_leads_per_country * max(1, len(config.target_countries)) * 3,
+            limit=self._research_limit(config) * max(1, len(config.target_countries)),
         )
         return estimate.model_copy(update={
             "corpus_candidates": len(selected),
@@ -1317,8 +1342,9 @@ class LeadResearchService:
         score: LeadScore,
         verdict,
         fact_ids: list[str],
+        selection: dict | None = None,
     ) -> tuple[str, dict]:
-        snapshot = result_snapshot(context, organization, score, fact_ids, verdict)
+        snapshot = result_snapshot(context, organization, score, fact_ids, verdict, selection)
         snapshot_id = new_id("score")
         self.db.execute(
             "INSERT INTO research_score_snapshots("
@@ -1365,7 +1391,10 @@ class LeadResearchService:
             data=snapshot,
         )
         lead_id = None
-        if verdict.kind in ACTIONABLE_VERDICTS:
+        # Only a strong fit becomes an operational lead. A review is a record of
+        # a candidate that did not clear the floor, and giving it a lead row put
+        # it in the same list as the qualified ones.
+        if verdict.kind == "strong_fit":
             existing = self.db.one(
                 "SELECT id FROM leads WHERE company_id=? AND resolved_organization_id=?",
                 (context.company_id, organization.organization_id),
@@ -1658,11 +1687,23 @@ class LeadResearchService:
         repo = EvidenceRepository(self.db, company_id)
         resolver = IdentityResolver(self.db, company_id)
         eligibility = EligibilityService()
+        research_limit = self._research_limit(config)
         metrics = {key: 0 for key in FUNNEL_KEYS}
-        # Review candidates stay visible and may become operational leads, but
-        # they have not earned the strong-fit verdict represented by the
-        # qualified funnel stage.
+        # Review candidates stay visible and auditable, but they are never
+        # materialized as leads and are never promoted to fill the list.
+        # `review_leads` is the legacy name kept for stored dashboards.
+        metrics["review_candidates"] = 0
         metrics["review_leads"] = 0
+        # Every candidate that cleared the strong-fit floor, before the global
+        # cap and country balance choose which of them are shown.
+        metrics["strong_fit_pool"] = 0
+        metrics["research_limit_per_country"] = research_limit
+        # Strong fits are held here until the whole run is known: a lead's place
+        # in the list depends on the other markets' candidates, so nothing can
+        # be materialized while candidates are still arriving.
+        pending_strong_fits: list[dict] = []
+        reject_reasons: dict[str, int] = {}
+        processing_errors = 0
         partitions: dict[tuple[str, str], dict] = {}
         processing_error: dict | None = None
         # Bound before the try so a campaign that fails early still reports
@@ -1742,7 +1783,7 @@ class LeadResearchService:
                     product_terms=product_terms,
                     market_terms=market_terms.by_language if market_terms else {},
                     buyer_types=config.buyer_types,
-                    max_records=config.max_qualified_leads_per_country * 3,
+                    max_records=research_limit,
                 )
             # Evidence already paid for, still fresh enough to stand. Read once
             # for the whole run, accepting the exact per-market query shapes.
@@ -1763,7 +1804,7 @@ class LeadResearchService:
                 supply = self.discovery.supply(
                     company_id,
                     query,
-                    config.max_qualified_leads_per_country * 3,
+                    research_limit,
                     exclude=settled,
                     repository=self.candidates,
                 )
@@ -2267,38 +2308,54 @@ class LeadResearchService:
                                 data=result_data,
                                 **result_identity,
                             )
-                            if evaluated_verdict.kind in ACTIONABLE_VERDICTS:
-                                stage = "lead"
-                                lead_id = self._upsert_lead(
-                                    company_id, campaign_id, organization_id, config,
-                                    score, gate, evaluated_verdict, source_ids,
-                                    sorted(official_domains | independent_domains), claims,
-                                    lead_ids,
-                                )
-                                if evaluated_verdict.kind == "strong_fit":
-                                    metrics["qualified_leads"] += 1
-                                else:
+                            if evaluated_verdict.kind == "strong_fit":
+                                # Held, not materialized. Whether this company
+                                # is in the customer's list depends on what the
+                                # other markets turn up, so the lead row and its
+                                # score snapshot wait for the ranking pass.
+                                metrics["strong_fit_pool"] += 1
+                                pending_strong_fits.append({
+                                    "result_id": result_id,
+                                    "organization_id": organization_id,
+                                    "country": country,
+                                    "candidate_name": candidate.company_name,
+                                    "score": score,
+                                    "gate": gate,
+                                    "verdict": evaluated_verdict,
+                                    "source_ids": source_ids,
+                                    "evidence_domains": sorted(
+                                        official_domains | independent_domains
+                                    ),
+                                    "claims": claims,
+                                    "result_data": result_data,
+                                    "result_identity": result_identity,
+                                    "candidate_source_record_id": candidate.source_record_id,
+                                    "partition_keys": [
+                                        (bundle_source_id, country)
+                                        for bundle_source_id, _ in bundles
+                                    ],
+                                    "fact_ids": fact_ids,
+                                    "resolved_identity": resolved_identity,
+                                    "snapshot_context": snapshot_context,
+                                })
+                            else:
+                                if evaluated_verdict.kind == "review":
+                                    metrics["review_candidates"] += 1
                                     metrics["review_leads"] += 1
-                                stage = "result"
-                                result_id = repo.upsert_result(
-                                    campaign_id=campaign_id,
-                                    organization_id=organization_id,
-                                    lead_id=lead_id,
-                                    verdict=evaluated_verdict.kind,
-                                    fit_score=score.fit_score,
-                                    evidence_confidence=score.evidence_confidence,
-                                    data=result_data,
-                                    **result_identity,
-                                )
-                            if snapshot_context is not None:
-                                self._append_score_snapshot(
-                                    snapshot_context,
-                                    resolved_identity,
-                                    result_id,
-                                    score,
-                                    evaluated_verdict,
-                                    fact_ids,
-                                )
+                                else:
+                                    for reason in evaluated_verdict.reasons or ["rejected"]:
+                                        reject_reasons[reason] = (
+                                            reject_reasons.get(reason, 0) + 1
+                                        )
+                                if snapshot_context is not None:
+                                    self._append_score_snapshot(
+                                        snapshot_context,
+                                        resolved_identity,
+                                        result_id,
+                                        score,
+                                        evaluated_verdict,
+                                        fact_ids,
+                                    )
                             self._checkpoint_candidate(
                                 company_id, campaign_id, primary_partition,
                                 candidate.source_record_id, "materialized",
@@ -2307,6 +2364,7 @@ class LeadResearchService:
                             for source_id, _ in bundles:
                                 partitions[(source_id, country)]["completed"] += 1
                         except Exception as exc:
+                            processing_errors += 1
                             diagnostic = {
                                 "candidate_source_record_id": candidate.source_record_id,
                                 "stage": stage,
@@ -2339,6 +2397,112 @@ class LeadResearchService:
             # cancellation: a leaked pool holds threads for the process's life.
             if verify_pool is not None:
                 verify_pool.shutdown(wait=True)
+
+        # One ranking pass over everything that cleared the floor. Outside the
+        # try/finally on purpose: a partial run must still publish an honest,
+        # balanced list of whatever it managed to qualify.
+        organizations = {
+            row["id"]: row
+            for row in self.db.all(
+                "SELECT id,display_name,country FROM organizations WHERE company_id=?",
+                (company_id,),
+            )
+        }
+        rankable = [
+            RankableResult(
+                result_id=item["result_id"],
+                organization_id=item["organization_id"],
+                company_name=(
+                    (organizations.get(item["organization_id"]) or {})["display_name"]
+                    if item["organization_id"] in organizations
+                    else item["candidate_name"]
+                ),
+                # The market the evidence places the company in, not the
+                # partition it was researched under.
+                country=(
+                    (organizations.get(item["organization_id"]) or {})["country"]
+                    or item["country"]
+                ).upper(),
+                fit_score=item["score"].fit_score,
+                evidence_confidence=item["score"].evidence_confidence,
+                known_weight=item["score"].known_weight,
+                freshness=float(item["score"].confidence_factors.get("freshness", 0.0)),
+            )
+            for item in pending_strong_fits
+        ]
+        decisions = select_displayed_strong_fits(
+            rankable, list(config.target_countries), limit=RESULT_LIMIT,
+        )
+        by_result = {item.result_id: item for item in rankable}
+        leads_by_country: dict[str, int] = {}
+        for item in pending_strong_fits:
+            decision = decisions[item["result_id"]]
+            selection = {
+                "displayed": decision.displayed,
+                "display_rank": decision.display_rank,
+                "country_round": decision.country_round,
+                "reason": decision.reason,
+            }
+            lead_id = None
+            if decision.displayed:
+                try:
+                    lead_id = self._upsert_lead(
+                        company_id, campaign_id, item["organization_id"], config,
+                        item["score"], item["gate"], item["verdict"], item["source_ids"],
+                        item["evidence_domains"], item["claims"], lead_ids,
+                    )
+                except Exception as exc:
+                    # Same shape as a per-candidate failure, so a lead that
+                    # could not be written is legible in the partition it came
+                    # from rather than only in the log.
+                    processing_errors += 1
+                    diagnostic = {
+                        "candidate_source_record_id": item["candidate_source_record_id"],
+                        "stage": "lead",
+                        "message": str(exc)[:240],
+                        "evaluated_verdict": "strong_fit",
+                    }
+                    for key in item["partition_keys"]:
+                        if key in partitions:
+                            partitions[key]["errors"].append(diagnostic)
+                    self._try_save_processing_issue(
+                        company_id, campaign_id, item["organization_id"],
+                        "candidate_processing_failed", diagnostic,
+                    )
+                if lead_id is not None:
+                    metrics["qualified_leads"] += 1
+                    country = by_result[item["result_id"]].country
+                    leads_by_country[country] = leads_by_country.get(country, 0) + 1
+            repo.upsert_result(
+                campaign_id=campaign_id,
+                organization_id=item["organization_id"],
+                lead_id=lead_id,
+                verdict="strong_fit",
+                fit_score=item["score"].fit_score,
+                evidence_confidence=item["score"].evidence_confidence,
+                data={**item["result_data"], "selection": selection},
+                **item["result_identity"],
+            )
+            if item["snapshot_context"] is not None:
+                self._append_score_snapshot(
+                    item["snapshot_context"],
+                    item["resolved_identity"],
+                    item["result_id"],
+                    item["score"],
+                    item["verdict"],
+                    item["fact_ids"],
+                    selection,
+                )
+        metrics["leads_by_country"] = dict(sorted(leads_by_country.items()))
+        metrics["countries_represented"] = len(leads_by_country)
+        metrics["outside_result_limit"] = (
+            metrics["strong_fit_pool"] - metrics["qualified_leads"]
+        )
+        metrics["result_target_min"] = RESULT_TARGET_MIN
+        metrics["result_limit"] = RESULT_LIMIT
+        metrics["result_shortfall"] = max(
+            0, RESULT_TARGET_MIN - metrics["qualified_leads"]
+        )
 
         # Outside FUNNEL_KEYS with excluded_closed:
         # enrichment adds evidence to records already counted, it never moves
@@ -2425,6 +2589,17 @@ class LeadResearchService:
             final_status = "partial"
         else:
             final_status = "failed"
+        # Why the list is short, counted from what was actually persisted. These
+        # are explanations, never adjustments: nothing here changes a verdict or
+        # promotes a candidate.
+        metrics["shortfall_reasons"] = {
+            "review_candidates": metrics["review_candidates"],
+            "outside_result_limit": metrics["outside_result_limit"],
+            "ineligible_or_rejected": sum(reject_reasons.values()),
+            "processing_errors": processing_errors,
+            "failed_sources": len(failed_sources),
+        }
+        metrics["reject_reasons"] = dict(sorted(reject_reasons.items()))
         explanation = zero_result_explanation(
             status=final_status,
             metrics=metrics,

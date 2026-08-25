@@ -21,6 +21,7 @@ from server.lead_research.candidates import CandidateRepository
 from server.lead_research.models import (
     CampaignConfig,
     DatasetDefinition,
+    DiscoveryQuery,
     ProviderHealth,
     VerificationBundle,
     VerificationSource,
@@ -60,26 +61,47 @@ class CountingDatabase:
 
 
 class SimpleVerifier:
+    """Two corroborating pages per candidate, enough to clear the strong-fit floor.
+
+    These tests are about the shape of the queries a run makes while it is
+    building leads, so the fixture has to actually produce leads: one thin page
+    is band C, and a review is never materialized.
+    """
+
     def __init__(self, definition):
         self.definition = definition
 
     def health(self):
         return ProviderHealth(status="active")
 
+    def facts(self, candidate):
+        return {
+            "company_name": [candidate.company_name],
+            "country": [candidate.country],
+            "buyer_role": ["distributor"],
+            "product_term": ["household-appliances", "built-in ovens", "white goods"],
+            "locations": [candidate.country],
+        }
+
     def verify(self, query, candidate):
         del query
+        facts = self.facts(candidate)
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
-            sources=[cited_source(
-                provenance_url=f"https://registry.example/{candidate.source_record_id}",
-                classification="independent",
-                retrieved_via="https://search.example",
-                facts={
-                    "company_name": [candidate.company_name],
-                    "country": [candidate.country],
-                    "buyer_role": ["distributor"],
-                },
-            )],
+            sources=[
+                cited_source(
+                    provenance_url=f"https://buyer.example/{candidate.source_record_id}",
+                    classification="official",
+                    retrieved_via=f"https://buyer.example/{candidate.source_record_id}",
+                    facts=facts,
+                ),
+                cited_source(
+                    provenance_url=f"https://registry.example/{candidate.source_record_id}",
+                    classification="independent",
+                    retrieved_via="https://search.example",
+                    facts=facts,
+                ),
+            ],
             independent_source_count=1,
             requests=1,
         )
@@ -93,7 +115,7 @@ def _definition() -> DatasetDefinition:
         access_tier="public",
         entity_levels=["named_company"],
         capabilities=["candidate_verification"],
-        emits=["company_name", "country", "buyer_role"],
+        emits=["company_name", "country", "buyer_role", "product_term", "locations"],
         adapter_mode="live",
         default_enabled=True,
     )
@@ -151,14 +173,14 @@ def _run(db, *, campaign_id="camp_1", verify_workers=1, reuse=False):
 def test_the_lead_table_is_read_once_per_run_not_once_per_candidate(harness):
     """The regression this file exists for.
 
-    Six candidates all reach the review lead list here. Every one of them used
-    to trigger its own full read of the lead table.
+    Six candidates all reach the lead list here. Every one of them used to
+    trigger its own full read of the lead table.
     """
     counting = CountingDatabase(harness)
 
     result = _run(counting)
 
-    assert result["metrics"]["review_leads"] == 6
+    assert result["metrics"]["qualified_leads"] == 6
     assert counting.matching("FROM leads WHERE company_id=?") == 1
 
 
@@ -173,25 +195,8 @@ def test_two_candidates_resolving_to_one_company_still_share_a_lead(harness):
     class OneCompany(SimpleVerifier):
         """Every candidate turns out to be the same company."""
 
-        def verify(self, query, candidate):
-                bundle = super().verify(query, candidate)
-                source = bundle.sources[0]
-                facts = {
-                    "company_name": ["One Company GmbH"],
-                    "country": ["DE"],
-                    "buyer_role": ["distributor"],
-                }
-                return VerificationBundle(
-                    candidate_source_record_id=candidate.source_record_id,
-                    sources=[cited_source(
-                        provenance_url=source.provenance_url,
-                        classification=source.classification,
-                        retrieved_via=source.retrieved_via,
-                        facts=facts,
-                    )],
-                independent_source_count=1,
-                requests=1,
-            )
+        def facts(self, candidate):
+            return {**super().facts(candidate), "company_name": ["One Company GmbH"]}
 
     config = CampaignConfig(
         name="One company", target_countries=["DE"],
@@ -301,3 +306,83 @@ def test_evidence_reuse_reads_once_per_run_on_an_index(harness):
         )
     ]
     assert any("ix_research_evidence_reuse" in str(detail) for detail in plan), plan
+
+
+# ── the research shortlist follows the list, not the corpus ──────────────────
+
+def test_the_research_shortlist_is_sized_by_the_result_limit():
+    """The cost bug behind this.
+
+    `max_qualified_leads_per_country * 3` with the shipped default meant 150
+    candidates per market — 750 verifications for a five-market campaign, to
+    fill a list of 15.
+    """
+    from server.lead_research.metrics import research_limit_per_country
+
+    assert research_limit_per_country(1) == 45
+    assert research_limit_per_country(5) == 9
+    assert research_limit_per_country(15) == 3
+    assert sum(research_limit_per_country(5) for _ in range(5)) == 45
+    assert research_limit_per_country(0) >= 3
+
+
+def test_a_small_campaign_ceiling_still_bounds_the_shortlist():
+    """The legacy per-country value stays an upper safety bound."""
+    from server.lead_research.service import LeadResearchService
+
+    config = CampaignConfig(
+        name="Tiny", target_countries=["DE"], sector_ids=["household-appliances"],
+        buyer_types=["distributor"], enabled_source_ids=["simple-source"],
+        max_qualified_leads_per_country=1,
+    )
+    assert LeadResearchService._research_limit(config) == 3
+
+
+def test_every_source_is_offered_the_same_ceiling_before_any_trim(harness):
+    """Equal opportunity, from the acquisition call itself.
+
+    The loop used to stop asking sources once the shortlist was full, so which
+    companies a campaign even looked at depended on how `enabled_source_ids`
+    happened to be ordered.
+    """
+    from server.lead_research.discovery import CandidateDiscoveryService
+    from server.lead_research.models import RawPage, SnapshotRef
+
+
+    class RecordingSource:
+        def __init__(self, definition):
+            self.definition = definition
+            self.asked: list[int] = []
+
+        def health(self):
+            return ProviderHealth(status="active")
+
+        def discover_candidates(self, query, cursor=None):
+            del cursor
+            self.asked.append(query.max_records)
+            return RawPage(
+                snapshot=SnapshotRef(
+                    snapshot_id="snap_x", source_id=self.definition.source_id,
+                ),
+                records=[], source_reported_total=0, next_cursor=None,
+            )
+
+    definitions, providers, sources = [], {}, []
+    for source_id in ("source-a", "source-b"):
+        definition = _definition().model_copy(update={"source_id": source_id})
+        recording = RecordingSource(definition)
+        definitions.append(definition)
+        providers[source_id] = recording
+        sources.append(recording)
+    registry = ProviderRegistry(definitions, providers)
+    service = CandidateDiscoveryService(harness, registry)
+    query = DiscoveryQuery(
+        campaign_id="camp_1", seller_countries=["TR"], target_countries=["DE"],
+        sector_ids=["household-appliances"], buyer_types=["distributor"],
+        max_records=9,
+    )
+
+    supply = service.supply("cmp_1", query, 9)
+
+    assert [source.asked for source in sources] == [[27], [27]]
+    assert len(supply.candidates) <= 9

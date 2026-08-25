@@ -105,7 +105,11 @@ def test_provisioning_refuses_to_delete_a_preexisting_research_result(db):
         (campaign_id, result["company_id"], "Existing campaign", "succeeded", 1, "{}", None, None, stamp, stamp),
     )
     db.execute(
-        "INSERT INTO research_results VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        # Named columns, not positional: the table has gained columns since and
+        # a bare VALUES list breaks every time it does.
+        "INSERT INTO research_results("
+        "id,company_id,campaign_id,organization_id,lead_id,verdict,fit_score,"
+        "evidence_confidence,data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("result_existing", result["company_id"], campaign_id, "org_existing", None, "reject", 0, 0.0, "{}", stamp, stamp),
     )
 
