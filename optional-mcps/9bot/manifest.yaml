@@ -1,3 +1,5 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
 manifest_version: 1
 
 name: 9bot
@@ -8,6 +10,10 @@ description: >-
 
 source: https://github.com/9-bot/mcp
 
+# Official vendor-hosted remote MCP (URL-only — Hermes never spawns a local
+# process for this entry). OAuth + Dynamic Client Registration;
+# Hermes's MCP client + mcp_oauth_manager handle discovery, PKCE, token
+# exchange, and refresh.
 transport:
   type: http
   url: https://mcp.9bot.com.br/mcp
