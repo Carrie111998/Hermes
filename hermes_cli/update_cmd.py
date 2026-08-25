@@ -6416,6 +6416,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # commit_count == 0 branch, which returns immediately after: an update
         # that pulled hundreds of upstream commits printed "Already up to
         # date!" and verified nothing).
+        # Set when the fork-sync stage already advanced HEAD. Read by the
+        # post-pull movement guard below: once the sync has performed the
+        # update, the subsequent merge is legitimately a zero-move.
+        head_moved_before_pull = False
         if commit_count == 0 and is_fork and branch == "main":
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
@@ -6430,6 +6434,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # HEAD moving is itself proof of an update. Keep the update
                 # path active even if the informational count cannot be read.
                 commit_count = max(1, synced_count)
+                # The sync just performed the update; the merge below will
+                # legitimately not move HEAD. Record that so the #79678
+                # movement guard does not mistake the completed update for
+                # a stuck no-op and abort before dependency sync, skills
+                # sync, and gateway restart run.
+                head_moved_before_pull = True
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -6773,18 +6783,63 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         if pre_pull_sha and post_pull_sha == pre_pull_sha:
-            print()
-            print("✗ Code did not move — update was a no-op.")
-            print(
-                f"  HEAD is pinned to {pre_pull_sha[:10]} (detached checkout); "
-                f"origin/{branch} advanced but the working tree stayed put."
-            )
-            print(
-                "  Reattach to the branch and retry: "
-                f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
-            )
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-            sys.exit(1)
+            if head_moved_before_pull:
+                # The fork-sync stage already advanced HEAD to the target
+                # commit, so the merge itself is a legitimate zero-move.
+                # This is an update that happened one stage earlier — not a
+                # stuck checkout. Fall through and let the dependency sync,
+                # skills sync, and gateway restart run for the pulled code.
+                print("  ✓ Code updated by the upstream fork sync.")
+            else:
+                branch_now = subprocess.run(
+                    git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                ).stdout.strip()
+                target_probe = subprocess.run(
+                    git_cmd + ["rev-parse", f"origin/{branch}"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                target_sha = target_probe.stdout.strip()
+                # Benign only when the working tree demonstrably holds the
+                # updated code: either the fork-sync stage moved it there
+                # (head_moved_before_pull), HEAD is attached to the target
+                # branch (a successful ff-merge on an attached branch always
+                # moves the ref, so pre == post means it was already there),
+                # or HEAD sits exactly at origin/<branch>. A checkout pinned
+                # to a STALE raw SHA reports "HEAD" here and misses every
+                # condition — the original #79678 stuck-update case still
+                # fails loudly below.
+                if (
+                    head_moved_before_pull
+                    or branch_now == branch
+                    or (target_sha and post_pull_sha == target_sha)
+                ):
+                    print(
+                        f"  ℹ Code is already at origin/{branch} "
+                        f"({(target_sha or post_pull_sha)[:10]}) — nothing to pull."
+                    )
+                else:
+                    print()
+                    print("✗ Code did not move — update was a no-op.")
+                    print(
+                        f"  Checkout is pinned to {pre_pull_sha[:10]} "
+                        f"(detached from '{branch}'); "
+                        f"origin/{branch} advanced but the working tree stayed put."
+                    )
+                    print(
+                        "  Reattach to the branch and retry: "
+                        f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
+                    )
+                    _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+                    sys.exit(1)
 
         # And verify HEAD actually sits on the target branch. The parked-
         # branch guard above should make this unreachable, but if any path
