@@ -556,6 +556,13 @@ def _run_tool(server, name, args=None):
     return json.loads(text) if text else result
 
 
+def _call_tool_raw(server, name, args=None):
+    """Call a tool through the server without unwrapping its result."""
+    return asyncio.get_event_loop().run_until_complete(
+        server.call_tool(name, args or {})
+    )
+
+
 @pytest.fixture
 def _event_loop():
     """Ensure an event loop exists for sync tests calling async tools."""
@@ -563,6 +570,37 @@ def _event_loop():
     asyncio.set_event_loop(loop)
     yield loop
     loop.close()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "field"),
+    [
+        ("conversations_list", {"platform": []}, "platform"),
+        ("conversations_list", {"search": {}}, "search"),
+        ("conversation_get", {"session_key": []}, "session_key"),
+        ("messages_read", {"session_key": {}}, "session_key"),
+        (
+            "attachments_fetch",
+            {"session_key": "agent:main:telegram:dm:123456", "message_id": []},
+            "message_id",
+        ),
+        ("events_poll", {"session_key": []}, "session_key"),
+        ("events_wait", {"session_key": {}}, "session_key"),
+        ("messages_send", {"target": [], "message": "hello"}, "target"),
+        ("permissions_respond", {"id": [], "decision": "deny"}, "id"),
+    ],
+)
+def test_rejects_non_string_arguments_at_mcp_boundary(
+    mcp_server_e2e, _event_loop, tool, arguments, field
+):
+    server, _ = mcp_server_e2e
+
+    with pytest.raises(Exception) as exc_info:
+        _call_tool_raw(server, tool, arguments)
+
+    error_text = str(exc_info.value).lower()
+    assert field in error_text
+    assert "string" in error_text
 
 
 class TestE2EConversationsList:
