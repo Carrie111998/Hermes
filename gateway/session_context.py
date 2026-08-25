@@ -166,6 +166,44 @@ _VAR_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Per-run environment (API server POST /v1/runs)
+# ---------------------------------------------------------------------------
+# Task-local like the session vars above: each asyncio task / worker thread sees
+# only its own run env, so concurrent /v1/runs never share values and no
+# process-global os.environ is mutated.
+_RUN_ENV: ContextVar = ContextVar("HERMES_RUN_ENV", default=_UNSET)
+
+
+def set_run_env(env: dict) -> Any:
+    """Bind a per-run environment (str->str) for the current task/thread.
+
+    Marks the process engaged so the subprocess bridge treats ContextVars as
+    authoritative. Returns a token; pass it to ``reset_run_env`` in a finally.
+    """
+    global _session_context_engaged
+    _session_context_engaged = True
+    clean = {str(k): str(v) for k, v in dict(env).items()}
+    return _RUN_ENV.set(clean)
+
+
+def reset_run_env(token: Any) -> None:
+    """Clear the per-run environment. Call on every terminal path (finally)."""
+    try:
+        _RUN_ENV.reset(token)
+    except Exception:
+        try:
+            _RUN_ENV.set(_UNSET)
+        except Exception:
+            pass
+
+
+def get_run_env() -> dict:
+    """Return the current task's per-run env (copy), or {} if none bound."""
+    value = _RUN_ENV.get()
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def set_current_session_id(session_id: str) -> None:
     """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
 
