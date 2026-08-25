@@ -11230,6 +11230,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.api_mode = result.api_mode
 
         if self.agent is not None:
+            # Snapshot the context estimate BEFORE switch_model() — that call
+            # zeroes compressor.last_prompt_tokens and clears the cached
+            # system prompt, so estimating afterwards under-reports (P0, PR
+            # #94753 review).
+            try:
+                from hermes_cli.cache_switch_notice import snapshot_pre_switch_state
+
+                _pre_switch_tokens = snapshot_pre_switch_state(self.agent)
+            except Exception:
+                _pre_switch_tokens = 0
             try:
                 self.agent.switch_model(
                     new_model=result.new_model,
@@ -11266,15 +11276,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"    Provider: {provider_label}")
 
         # Mid-session cache-rebuild notice (display.cache_switch_notice).
-        # Informational only — never blocks the switch. Silent when the
-        # estimated context is below the noise threshold or the toggle is off.
+        # Uses the PRE-switch token snapshot — switch_model() already zeroed
+        # the live counters above. Informational only, never blocks.
         try:
             from hermes_cli.cache_switch_notice import cache_switch_notice_for_agent
 
             _cache_notice = cache_switch_notice_for_agent(
-                agent=self.agent,
                 old_model_display=_display_old,
                 new_model_display=_display_new,
+                est_context_tokens=_pre_switch_tokens,
+                old_provider=self.provider if self.provider == result.target_provider else "",
+                new_provider=result.target_provider,
             )
             if _cache_notice:
                 for _line in _cache_notice.splitlines():
@@ -11637,6 +11649,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Apply to running agent (in-place swap)
         if self.agent is not None:
+            # Snapshot the context estimate BEFORE switch_model() — that call
+            # zeroes compressor.last_prompt_tokens and clears the cached
+            # system prompt, so estimating afterwards under-reports (P0, PR
+            # #94753 review).
+            try:
+                from hermes_cli.cache_switch_notice import snapshot_pre_switch_state
+
+                _pre_switch_tokens = snapshot_pre_switch_state(self.agent)
+            except Exception:
+                _pre_switch_tokens = 0
             try:
                 self.agent.switch_model(
                     new_model=result.new_model,
@@ -11686,9 +11708,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from hermes_cli.cache_switch_notice import cache_switch_notice_for_agent
 
             _cache_notice = cache_switch_notice_for_agent(
-                agent=self.agent,
                 old_model_display=_display_old,
                 new_model_display=_display_new,
+                est_context_tokens=_pre_switch_tokens,
+                old_provider=self.provider if self.provider == result.target_provider else "",
+                new_provider=result.target_provider,
+                include_revert_hint=not one_turn,
             )
             if _cache_notice:
                 for _line in _cache_notice.splitlines():

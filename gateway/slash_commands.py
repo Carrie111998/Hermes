@@ -1756,29 +1756,29 @@ class GatewaySlashCommandsMixin:
         old_model_display: str,
         new_model_display: str,
         agent=None,
+        est_context_tokens: Optional[int] = None,
+        old_provider: str = "",
+        new_provider: str = "",
+        include_revert_hint: bool = True,
     ) -> None:
         """Append the mid-session cache-rebuild notice if it applies.
 
-        Prefer a live agent when one is handed in (or found in the agent
-        cache); fall back to a silent no-op when neither is available so a
-        cold gateway still switches cleanly without a noisy estimate of 0.
+        ``est_context_tokens`` must come from ``snapshot_pre_switch_state()``
+        called BEFORE the in-place switch — afterwards the counters are zeroed
+        (P0, PR #94753 review). Falls back to estimating from ``agent`` only
+        when no snapshot was provided.
         """
         try:
             from hermes_cli.cache_switch_notice import cache_switch_notice_for_agent
 
-            live_agent = agent
-            if live_agent is None:
-                _cache_lock = getattr(self, "_agent_cache_lock", None)
-                _cache = getattr(self, "_agent_cache", None)
-                if _cache_lock is not None and _cache is not None:
-                    with _cache_lock:
-                        _entry = _cache.get(session_key)
-                    if _entry and _entry[0] is not None:
-                        live_agent = _entry[0]
             notice = cache_switch_notice_for_agent(
-                agent=live_agent,
+                agent=agent,
                 old_model_display=old_model_display,
                 new_model_display=new_model_display,
+                est_context_tokens=est_context_tokens,
+                old_provider=old_provider,
+                new_provider=new_provider,
+                include_revert_hint=include_revert_hint,
             )
             if notice:
                 lines.extend(notice.splitlines())
@@ -1975,12 +1975,25 @@ class GatewaySlashCommandsMixin:
                         # Update cached agent in-place
                         cached_entry = None
                         _switched_agent = None
+                        _pre_switch_tokens = 0
                         _cache_lock = getattr(_self, "_agent_cache_lock", None)
                         _cache = getattr(_self, "_agent_cache", None)
                         if _cache_lock and _cache is not None:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
                         if cached_entry and cached_entry[0] is not None:
+                            # Snapshot the context estimate BEFORE switch_model()
+                            # — that call zeroes the live counters (P0 review).
+                            try:
+                                from hermes_cli.cache_switch_notice import (
+                                    snapshot_pre_switch_state,
+                                )
+
+                                _pre_switch_tokens = snapshot_pre_switch_state(
+                                    cached_entry[0]
+                                )
+                            except Exception:
+                                _pre_switch_tokens = 0
                             try:
                                 cached_entry[0].switch_model(
                                     new_model=result.new_model,
@@ -2173,14 +2186,18 @@ class GatewaySlashCommandsMixin:
                                 lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         # Mid-session cache-rebuild notice (display.cache_switch_notice).
-                        # Uses the agent we switched in-place above — the cache
-                        # has already been evicted by this point.
+                        # Uses the PRE-switch token snapshot — the in-place
+                        # switch above already zeroed the live counters, and
+                        # the agent cache has been evicted by this point.
                         _self._append_cache_switch_notice(
                             lines,
                             session_key=_session_key,
                             old_model_display=_display_cur,
                             new_model_display=_display_new,
                             agent=_switched_agent,
+                            est_context_tokens=_pre_switch_tokens,
+                            old_provider=_cur_provider,
+                            new_provider=result.target_provider,
                         )
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
@@ -2301,6 +2318,7 @@ class GatewaySlashCommandsMixin:
             # If there's a cached agent, update it in-place
             cached_entry = None
             _switched_agent = None
+            _pre_switch_tokens = 0
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
             if _cache_lock and _cache is not None:
@@ -2308,6 +2326,16 @@ class GatewaySlashCommandsMixin:
                     cached_entry = _cache.get(session_key)
 
             if cached_entry and cached_entry[0] is not None:
+                # Snapshot the context estimate BEFORE switch_model() — that
+                # call zeroes compressor.last_prompt_tokens and clears the
+                # cached system prompt, so estimating afterwards under-reports
+                # (P0, PR #94753 review).
+                try:
+                    from hermes_cli.cache_switch_notice import snapshot_pre_switch_state
+
+                    _pre_switch_tokens = snapshot_pre_switch_state(cached_entry[0])
+                except Exception:
+                    _pre_switch_tokens = 0
                 try:
                     cached_entry[0].switch_model(
                         new_model=result.new_model,
@@ -2523,15 +2551,19 @@ class GatewaySlashCommandsMixin:
                 lines.append(t("gateway.model.prompt_caching_enabled"))
 
             # Mid-session cache-rebuild notice (display.cache_switch_notice).
-            # Informational only — never blocks. Silent below the noise threshold.
-            # Pass the agent we switched in-place above — the cache has already
-            # been evicted by this point so a cache lookup would miss.
+            # Uses the PRE-switch token snapshot — the in-place switch above
+            # already zeroed the live counters, and the agent cache has been
+            # evicted by this point.
             self._append_cache_switch_notice(
                 lines,
                 session_key=session_key,
                 old_model_display=format_model_for_display(current_model),
                 new_model_display=format_model_for_display(result.new_model),
                 agent=_switched_agent,
+                est_context_tokens=_pre_switch_tokens,
+                old_provider=current_provider,
+                new_provider=result.target_provider,
+                include_revert_hint=not one_turn,
             )
 
             if result.warning_message:

@@ -1806,6 +1806,7 @@ display:
   compact: false          # Compact output mode (less whitespace)
   cli_multiline_shortcuts: true  # CLI: Ctrl+J, \ + Enter, and supported Shift+Enter insert newlines (false = legacy c-j submit fallback)
   resume_display: full    # full (show previous messages on resume) | minimal (one-liner only)
+  cache_switch_notice: true  # Show one-time uncached re-read cost after a mid-session /model switch (silent below ~30k context tokens)
   bell_on_complete: false # Play terminal bell when agent finishes (great for long tasks)
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)

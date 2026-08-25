@@ -37,7 +37,7 @@ gateway:
     capabilities_label:     "Fähigkeiten: {capabilities}"
     prompt_caching_enabled: "Prompt-Caching: aktiviert"
     cache_switch_notice:    "⚡ Mitten in der Session zu `{model}` gewechselt — die nächste Antwort liest ~{tokens} Kontext uncached neu (einmalig)"
-    cache_switch_revert_hint: "  ↩ `/model {model}` tippen, um zurückzuwechseln — gleiche Unterhaltung, kein erneutes Einlesen"
+    cache_switch_revert_hint: "↩ `/model {model}` tippen, um zurückzuwechseln — gleiche Unterhaltung, kein erneutes Einlesen"
     warning_prefix:         "Warnung: {warning}"
     saved_global:           "In config.yaml gespeichert (`--global`)"
     session_only_hint:      "_(nur für diese Sitzung — `--global` ergänzen, um zu speichern)_"
