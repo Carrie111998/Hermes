@@ -70,6 +70,12 @@ class TestPageScriptShape:
         assert "tail -c 1" in script
         assert "tail_ran=1" in script
         assert "set -o pipefail" in script
+        # Missing mktemp used to `exit 1`. Must degrade instead.
+        assert "then exit 1; fi" not in script
+        assert "hermes-read.$$" in script
+        assert "page=$(" not in script
+        assert "trap " in script
+        assert script.count("sed -n") == 2
 
     def test_probe_script_does_not_head_not_regular_paths(self, ops):
         script = ops._probe_regular_file_cmd(
@@ -157,6 +163,70 @@ class TestProbeStatusIsolation:
         assert result.hint != "File is empty (0 bytes)."
 
 
+class TestPageFailureReporting:
+    def test_empty_page_failure_includes_exit_code(self):
+        from unittest.mock import MagicMock
+        import re
+
+        from tools.file_operations import ShellFileOperations
+
+        env = MagicMock()
+        env.cwd = "/tmp"
+
+        def execute(command, **kwargs):
+            match = re.search(r"__HERMES_READ_[0-9a-f]+__", command)
+            sentinel = match.group(0) if match else "x"
+            if command.startswith("if [ -f "):
+                import base64 as b64
+                return {
+                    "output": (
+                        f"size=5\nsize_rc=0\nsample_rc=0\n{sentinel}\n"
+                        f"{b64.b64encode(b'hello').decode()}"
+                    ),
+                    "returncode": 0,
+                }
+            if "sed -n" in command:
+                return {"output": "", "returncode": 1}
+            return {"output": "", "returncode": 0}
+
+        env.execute.side_effect = execute
+        result = ShellFileOperations(env).read_file("/tmp/notes.txt")
+        assert result.error
+        assert result.error == "Failed to read file: exit 1"
+        assert not result.error.endswith(": ")
+
+    def test_missing_sentinel_names_the_reason(self):
+        from unittest.mock import MagicMock
+        import re
+
+        from tools.file_operations import ShellFileOperations
+
+        env = MagicMock()
+        env.cwd = "/tmp"
+
+        def execute(command, **kwargs):
+            match = re.search(r"__HERMES_READ_[0-9a-f]+__", command)
+            sentinel = match.group(0) if match else "x"
+            if command.startswith("if [ -f "):
+                import base64 as b64
+                return {
+                    "output": (
+                        f"size=5\nsize_rc=0\nsample_rc=0\n{sentinel}\n"
+                        f"{b64.b64encode(b'hello').decode()}"
+                    ),
+                    "returncode": 0,
+                }
+            if "sed -n" in command:
+                return {"output": "no fence here", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        env.execute.side_effect = execute
+        result = ShellFileOperations(env).read_file("/tmp/notes.txt")
+        assert result.error
+        assert "missing page sentinel" in result.error
+        assert "exit 0" in result.error
+
+
 class TestLiveCoalescedRead:
     def test_text_path_uses_two_execs(self, tmp_path, ops, monkeypatch):
         target = tmp_path / "notes.txt"
@@ -237,6 +307,76 @@ class TestLiveCoalescedRead:
         assert "not a regular file" in result.error
         assert len(calls) == 1
         assert "sed -n" not in calls[0]
+
+    def test_text_path_still_reads_when_mktemp_missing(self, tmp_path, ops, monkeypatch):
+        target = tmp_path / "notes.txt"
+        target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        original = ops._exec
+
+        def without_mktemp(command, *args, **kwargs):
+            if "sed -n" in command:
+                command = "mktemp() { return 127; }; " + command
+            return original(command, *args, **kwargs)
+
+        monkeypatch.setattr(ops, "_exec", without_mktemp)
+        result = ops.read_file(str(target))
+        assert result.error is None
+        assert "1|alpha" in result.content
+        assert "3|gamma" in result.content
+
+    def test_text_path_still_reads_without_any_temp_file(self, tmp_path, ops, monkeypatch):
+        target = tmp_path / "notes.txt"
+        target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        original = ops._exec
+
+        def without_temp(command, *args, **kwargs):
+            if "sed -n" in command:
+                command = (
+                    "mktemp() { return 127; }; "
+                    "TMPDIR=/this-dir-does-not-exist-hermes-read-test; "
+                    + command
+                )
+            return original(command, *args, **kwargs)
+
+        monkeypatch.setattr(ops, "_exec", without_temp)
+        result = ops.read_file(str(target))
+        assert result.error is None
+        assert "1|alpha" in result.content
+        assert "3|gamma" in result.content
+
+    def test_trailing_blank_line_without_any_temp_file(self, tmp_path, ops, monkeypatch):
+        target = tmp_path / "blank.txt"
+        target.write_text("a\n\n", encoding="utf-8")
+        original = ops._exec
+
+        def without_temp(command, *args, **kwargs):
+            if "sed -n" in command:
+                command = (
+                    "mktemp() { return 127; }; "
+                    "TMPDIR=/this-dir-does-not-exist-hermes-read-test; "
+                    + command
+                )
+            return original(command, *args, **kwargs)
+
+        monkeypatch.setattr(ops, "_exec", without_temp)
+        result = ops.read_file(str(target))
+        assert result.error is None
+        assert result.content == "1|a\n2|\n3|"
+
+    def test_no_trailing_newline_without_mktemp(self, tmp_path, ops, monkeypatch):
+        target = tmp_path / "nonl.txt"
+        target.write_text("a\nb", encoding="utf-8")
+        original = ops._exec
+
+        def without_mktemp(command, *args, **kwargs):
+            if "sed -n" in command:
+                command = "mktemp() { return 127; }; " + command
+            return original(command, *args, **kwargs)
+
+        monkeypatch.setattr(ops, "_exec", without_mktemp)
+        result = ops.read_file(str(target))
+        assert result.error is None
+        assert result.content == "1|a\n2|b"
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this host")
     def test_fifo_errors_without_blocking(self, tmp_path, ops):

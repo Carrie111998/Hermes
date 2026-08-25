@@ -1405,6 +1405,10 @@ class ShellFileOperations(FileOperations):
         Missing and not-regular paths short-circuit *before* ``head``, so a
         FIFO / socket / device is never opened. Image / binary / UTF-16
         decisions stay in Python after this returns.
+
+        ``[ -f ]`` then ``wc -c <`` is a TOCTOU window: a replacement
+        between the test and the redirect is accepted and reported via
+        ``size_rc``, not retried.
         """
         arg = self._escape_shell_arg(path)
         # Regular-file arm always exits 0 so a failed ``head|base64`` cannot
@@ -1442,16 +1446,38 @@ class ShellFileOperations(FileOperations):
         only when the page is the last one *and* it ends in a newline —
         the same skip the previous sequential path used.
 
-        ``mktemp`` assignment succeeds even when mktemp is missing (empty
-        tmp); refuse that so we never redirect onto a file named ``$tmp``.
+        Prefers ``mktemp`` so the page lives on disk (header before body,
+        sentinel cannot appear in the payload until after it). When mktemp
+        is missing, fall back to a PID-stamped file under ``$TMPDIR`` —
+        the same degradation ``write_file`` already uses — so a busybox
+        without mktemp still reads. Only if that create fails too do we
+        stream ``sed|cut`` after the header (the last-page ``tail -c 1``
+        of the page itself is skipped; the file's last byte is still
+        probed). Streaming, not ``page=$(...)``: command substitution
+        strips trailing newlines and would drop a blank last line.
+        A missing mktemp must not fail the read.
         """
         arg = self._escape_shell_arg(path)
-        return (
-            f"tmp=$(mktemp -t hermes-read.XXXXXX 2>/dev/null || mktemp); "
-            f"if [ -z \"$tmp\" ] || [ ! -f \"$tmp\" ]; then exit 1; fi; "
-            f"set -o pipefail; "
+        page_pipe = (
             f"sed -n '{offset},{end_line}p' {arg} "
-            f"| cut -b1-{line_clamp_bytes} > \"$tmp\"; "
+            f"| cut -b1-{line_clamp_bytes}"
+        )
+        header_printf = (
+            "printf 'sed_rc=%s\\nwc_rc=%s\\ntotal=%s\\ntail_ran=%s\\ntail_nl=%s\\n' "
+            "\"$sed_rc\" \"$wc_rc\" \"$total\" \"$tail_ran\" \"$tail_nl\"; "
+            f"echo {sentinel}; "
+        )
+        return (
+            f"tmp=$(mktemp -t hermes-read.XXXXXX 2>/dev/null "
+            f"|| mktemp 2>/dev/null || true); "
+            f"if [ -z \"$tmp\" ] || [ ! -f \"$tmp\" ]; then "
+            f"tmp=\"${{TMPDIR:-/tmp}}/hermes-read.$$\"; "
+            f": > \"$tmp\" 2>/dev/null || tmp=; "
+            f"fi; "
+            f"set -o pipefail; "
+            f"if [ -n \"$tmp\" ] && [ -f \"$tmp\" ]; then "
+            f"trap 'rm -f \"$tmp\"' EXIT; "
+            f"{page_pipe} > \"$tmp\"; "
             f"sed_rc=$?; "
             f"set +o pipefail; "
             f"total=$(wc -l < {arg}); wc_rc=$?; "
@@ -1460,10 +1486,20 @@ class ShellFileOperations(FileOperations):
             f"&& [ \"$(tail -c 1 \"$tmp\" | wc -l)\" -eq 1 ]; then "
             f"tail_nl=$(tail -c 1 {arg} | wc -l); tail_ran=1; "
             f"fi; "
-            f"printf 'sed_rc=%s\\nwc_rc=%s\\ntotal=%s\\ntail_ran=%s\\ntail_nl=%s\\n' "
-            f"\"$sed_rc\" \"$wc_rc\" \"$total\" \"$tail_ran\" \"$tail_nl\"; "
-            f"echo {sentinel}; "
-            f"cat \"$tmp\"; rm -f \"$tmp\""
+            f"{header_printf}"
+            f"cat \"$tmp\"; rm -f \"$tmp\"; "
+            f"else "
+            f"set +o pipefail; "
+            f"total=$(wc -l < {arg}); wc_rc=$?; "
+            f"sed_rc=0; tail_ran=0; tail_nl=1; "
+            f"if [ \"$wc_rc\" -eq 0 ] && [ \"${{total:-0}}\" -le {end_line} ]; then "
+            f"tail_nl=$(tail -c 1 {arg} | wc -l); tail_ran=1; "
+            f"fi; "
+            f"{header_printf}"
+            f"set -o pipefail; "
+            f"{page_pipe}; "
+            f"exit $?; "
+            f"fi"
         )
 
     @staticmethod
@@ -1475,6 +1511,25 @@ class ShellFileOperations(FileOperations):
                 "socket, or device). Reading it could block indefinitely."
             )
         )
+
+    @staticmethod
+    def _read_failed(result: ExecuteResult, *, why: str = "") -> ReadResult:
+        """Page/read failure with exit status. Never ``Failed to read file: ``.
+
+        ``_exec`` folds stderr into stdout (``stderr=subprocess.STDOUT``),
+        so there is no separate stderr field. Empty stdout is the case
+        this exists for — a dangling colon with no reason.
+        """
+        bits: list[str] = []
+        if why:
+            bits.append(why)
+        stdout = (result.stdout or "").strip()
+        if stdout:
+            if len(stdout) > 400:
+                stdout = stdout[:400] + "..."
+            bits.append(stdout)
+        bits.append(f"exit {result.exit_code}")
+        return ReadResult(error="Failed to read file: " + "; ".join(bits))
 
     # UTF-16 rescue constants (ported from MoonshotAI/kimi-code#2647,
     # detection derived from VS Code's encoding sniffer): sample the leading
@@ -1734,10 +1789,10 @@ class ShellFileOperations(FileOperations):
             )
         )
         if page_result.exit_code != 0:
-            return ReadResult(error=f"Failed to read file: {page_result.stdout}")
+            return self._read_failed(page_result)
         page_parts = _split_sentinel_payload(page_result.stdout, page_sentinel)
         if page_parts is None:
-            return ReadResult(error=f"Failed to read file: {page_result.stdout}")
+            return self._read_failed(page_result, why="missing page sentinel")
         page_header, read_output = page_parts
         fields = _parse_page_header(page_header)
         try:
@@ -1745,7 +1800,7 @@ class ShellFileOperations(FileOperations):
         except ValueError:
             sed_rc = 1
         if sed_rc != 0:
-            return ReadResult(error=f"Failed to read file: {read_output}")
+            return self._read_failed(page_result, why=f"sed_rc={sed_rc}")
         try:
             total_lines = int(fields.get("total", "0"))
         except ValueError:
