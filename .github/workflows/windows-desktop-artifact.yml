@@ -1,0 +1,55 @@
+name: Windows Desktop Artifact
+
+on:
+  push:
+    branches:
+      - fix/clarify-cards-current-20260825
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-artifact-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 installer
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install npm 12
+        shell: bash
+        run: npm install --global npm@12
+
+      - name: Install dependencies
+        shell: bash
+        run: npm ci
+
+      - name: Build desktop application
+        working-directory: apps/desktop
+        shell: bash
+        run: npm run build
+
+      - name: Package Windows x64 NSIS installer
+        working-directory: apps/desktop
+        shell: bash
+        run: npm run builder -- --win nsis --x64 --publish never
+
+      - name: Upload installable artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Hermes-clarify-fix-Windows-x64
+          path: |
+            apps/desktop/release/Hermes-*-win-x64.exe
+            apps/desktop/release/latest.yml
+          if-no-files-found: error
+          retention-days: 14
