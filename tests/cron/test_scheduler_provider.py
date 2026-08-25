@@ -155,14 +155,19 @@ def test_desktop_ticker_gate_opens_when_gateway_dies():
     calls = []
     stop = threading.Event()
     gateway_up = {"value": True}
+    gate_consults = {"n": 0}
 
     def fake_tick(*args, **kwargs):
         calls.append(kwargs)
         return 0
 
+    def fake_gateway_running():
+        gate_consults["n"] += 1
+        return gateway_up["value"]
+
     with patch("cron.scheduler.tick", side_effect=fake_tick), patch(
         "hermes_cli.web_server._gateway_process_running",
-        side_effect=lambda: gateway_up["value"],
+        side_effect=fake_gateway_running,
     ):
         t = threading.Thread(
             target=_start_desktop_cron_ticker,
@@ -171,9 +176,13 @@ def test_desktop_ticker_gate_opens_when_gateway_dies():
             daemon=True,
         )
         t.start()
-        # While the gateway is up the loop runs but never dispatches; give it
-        # a moment to prove the negative, then kill the "gateway".
-        time.sleep(0.3)
+        # While the gateway is up the loop runs but never dispatches. Prove
+        # the negative via event sync, not a fixed sleep: wait until the gate
+        # has been consulted several times, THEN assert nothing dispatched
+        # (repo flake policy — no bare negative-timing asserts).
+        assert _wait_until(lambda: gate_consults["n"] >= 3), (
+            "ticker never consulted the gateway gate"
+        )
         assert calls == [], "tick dispatched while gateway was up"
         gateway_up["value"] = False  # gateway dies
         assert _wait_until(lambda: len(calls) >= 1), (

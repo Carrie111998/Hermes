@@ -1568,6 +1568,11 @@ def _foreign_lock_record_is_stale(existing: dict[str, Any]) -> bool:
     # Check if process is stopped (Ctrl+Z / SIGTSTP) — stopped
     # processes still appear alive to _pid_exists but are not
     # actually running. Treat them as stale so --replace works.
+    # Linux-only: reads /proc/{pid}/status for State: T/t. On macOS and
+    # Windows /proc does not exist, the Path.exists() guard fails, and a
+    # stopped holder is simply NOT detected as stale (the lease stays
+    # held until the process resumes or exits). Accepted scope: the other
+    # staleness oracles (liveness, start_time, cmdline) are cross-platform.
     if not stale:
         try:
             _proc_status = Path(f"/proc/{pid}/status")
@@ -1729,6 +1734,14 @@ def acquire_crypto_lease(
     (False, existing_record) when another live process holds the lease.
     Fail-closed: if the lock file is corrupted or the PID record is stale,
     reclaim it; if acquisition cannot be confirmed, return False.
+
+    A live-but-wedged holder keeps the lease indefinitely — that is the
+    intended fail-closed tradeoff (two OlmMachines on one store is worse
+    than a refused connect). Manual recovery: confirm no gateway/adapter
+    still runs for this store (``hermes status``), then delete the
+    ``matrix-crypto-*.lock`` file under the gateway lock dir
+    (``$XDG_STATE_HOME/hermes/locks`` by default, or
+    ``$HERMES_GATEWAY_LOCK_DIR``); the next connect re-acquires cleanly.
 
     ``store_path`` is the caller's resolved crypto DB path, stamped into the
     lease record for diagnostics.  ``identity`` should encode ``store_path`` +
