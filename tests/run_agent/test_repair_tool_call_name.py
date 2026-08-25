@@ -164,6 +164,19 @@ class TestGatedToolNotRemappedOntoSibling:
         # exact lowercase form), so CamelCase can't dodge the guard.
         assert gated_repair("KanbanList") is None
 
+    def test_typo_of_gated_unblock_is_not_remapped_to_block(self, gated_repair):
+        # A misspelling of a gated tool (kanban_unblock) must NOT be fuzzy-
+        # remapped onto its available opposite sibling (kanban_block) — that
+        # would invert an unblock into a block. Intent is resolved against the
+        # full registry; a gated canonical target fails closed.
+        assert gated_repair("kanban_unblok") is None
+        assert gated_repair("kanban_unblck") is None
+        assert gated_repair("kanban_unblockk") is None
+
+    def test_typo_of_gated_list_is_not_remapped_to_sibling(self, gated_repair):
+        # Misspelling kanban_list must not land on any available kanban_* sibling.
+        assert gated_repair("kanban_lsit") is None
+
     def test_genuine_typo_of_available_tool_still_repairs(self, gated_repair):
         # A typo of an *available* tool must still fuzzy-match — the guard only
         # covers names that resolve to a real registered tool.

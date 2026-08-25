@@ -3558,8 +3558,29 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     if cands & set(registry.get_all_tool_names()):
         return None
 
-    # Fuzzy match as last resort.
-    matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
+    # Resolve fuzzy intent against the FULL registered surface, not the
+    # post-gating set. A typo of a gated tool (kanban_unblok) is not an exact
+    # registry name, so the guard above can't catch it — but fuzzy-matching
+    # only against valid_tool_names would remap it onto the nearest AVAILABLE
+    # sibling (kanban_block), inverting the intended operation. Match intent
+    # against every registered name, then fail closed if the intended
+    # canonical is unavailable this turn. (See #94506.)
+    reg_matches = get_close_matches(
+        lowered, sorted(registry.get_all_tool_names()), n=1, cutoff=0.7
+    )
+    if reg_matches:
+        target = reg_matches[0]
+        if target in agent.valid_tool_names:
+            return target
+        # intended tool is gated this turn — refuse to substitute a sibling
+        return None
+
+    # No registered tool resembles the request (e.g. dynamic MCP tools absent
+    # from the static registry) — fall back to the post-gating set, which is
+    # authority-safe because any match there is available this turn.
+    matches = get_close_matches(
+        lowered, sorted(agent.valid_tool_names), n=1, cutoff=0.7
+    )
     if matches:
         return matches[0]
 
