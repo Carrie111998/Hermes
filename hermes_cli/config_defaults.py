@@ -1163,6 +1163,7 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
+            "prompt": "",  # custom titling system prompt; empty = built-in template
         },
         "memory_query_rewrite": {
             "provider": "auto",
