@@ -556,6 +556,15 @@ SEARCH_SCHEMA = {
                 "description": "Viking URI prefix to scope search (e.g. 'viking://resources/docs/').",
             },
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
+            "threshold": {
+                "type": "number",
+                "description": (
+                    "Minimum semantic score for a result (0-1). Default 0 "
+                    "returns everything the index matched, including "
+                    "memories in subdirectories; raise it to keep only "
+                    "strong matches."
+                ),
+            },
         },
         "required": ["query"],
     },
@@ -5051,7 +5060,22 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not query:
             return tool_error("query is required")
 
-        payload: Dict[str, Any] = {"query": query}
+        # score_threshold=0 matches the automatic recall path
+        # (_post_prefetch_search): without it the search/find endpoint
+        # applies its own narrow default recall, which returns only
+        # top-level memory files and silently drops subdirectory memories
+        # (entities/, events/, preferences/) even when they are vector-
+        # indexed and score highly (#94596).
+        score_threshold = 0.0
+        if args.get("threshold") is not None:
+            try:
+                score_threshold = float(args["threshold"])
+            except (TypeError, ValueError):
+                return tool_error("threshold must be a number")
+        payload: Dict[str, Any] = {
+            "query": query,
+            "score_threshold": score_threshold,
+        }
         mode = args.get("mode", "auto")
         if args.get("scope"):
             payload["target_uri"] = args["scope"]

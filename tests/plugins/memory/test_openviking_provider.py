@@ -708,6 +708,46 @@ def test_tool_search_sorts_by_raw_score_across_buckets():
     assert result["total"] == 3
 
 
+def test_tool_search_sends_score_threshold_zero_by_default():
+    """#94596: without an explicit score_threshold the search/find endpoint
+    applies its own narrow default recall, which returns only top-level
+    memory files and silently drops subdirectory memories (entities/,
+    events/, preferences/) even when they are vector-indexed and score
+    highly. The tool must send 0 like the automatic recall path
+    (_post_prefetch_search) does, so tool callers see the same recall
+    surface as automatic recall."""
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {"result": {"memories": [], "total": 0}}
+
+    provider._tool_search({"query": "fishingdrill"})
+
+    endpoint, payload = provider._client.post.call_args[0]
+    assert endpoint == "/api/v1/search/find"
+    assert payload["score_threshold"] == 0
+
+
+def test_tool_search_threshold_argument_overrides_default():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {"result": {"memories": [], "total": 0}}
+
+    provider._tool_search({"query": "fishingdrill", "threshold": 0.75})
+
+    _, payload = provider._client.post.call_args[0]
+    assert payload["score_threshold"] == 0.75
+
+
+def test_tool_search_rejects_non_numeric_threshold():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    result = provider._tool_search({"query": "fishingdrill", "threshold": "high"})
+
+    assert "threshold must be a number" in result
+    provider._client.post.assert_not_called()
+
+
 def test_tool_add_resource_rejects_hermes_credential_file_upload(tmp_path, monkeypatch):
     import agent.file_safety as fs
 
