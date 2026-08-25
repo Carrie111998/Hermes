@@ -23,6 +23,8 @@ def _make_stub(**overrides):
     stub.base_url = "https://openrouter.ai/api/v1"
     stub.api_key = "ambient-key"
     stub.api_mode = ""
+    stub.responses_transport = "sse"
+    stub._session_responses_transport_override = None
     stub.agent = None
     stub._console_print = lambda s: None
     for key, value in overrides.items():
@@ -52,9 +54,17 @@ def test_session_gateway_runtime_prefers_nested_key():
 
 def test_session_gateway_runtime_falls_back_to_top_level_keys():
     # The TUI gateway's _runtime_model_config writes top-level keys only.
-    meta = _row(model_config={"provider": "nous", "api_mode": "chat_completions"})
+    meta = _row(model_config={
+        "provider": "nous",
+        "api_mode": "chat_completions",
+        "responses_transport": "websocket-cached",
+    })
     runtime = SessionDB.session_gateway_runtime(meta)
-    assert runtime == {"provider": "nous", "api_mode": "chat_completions"}
+    assert runtime == {
+        "provider": "nous",
+        "api_mode": "chat_completions",
+        "responses_transport": "websocket-cached",
+    }
 
 
 def test_session_gateway_runtime_tolerates_garbage():
@@ -114,8 +124,42 @@ def test_restore_session_model_swaps_running_agent_in_place():
             calls.update(kwargs)
 
     stub = _make_stub(agent=_Agent())
-    stub._restore_session_model(_row())
+    stub._restore_session_model(_row(model_config={
+        "gateway_runtime": {
+            "provider": "openai-codex",
+            "responses_transport": "websocket-cached",
+        },
+    }))
     assert calls["new_model"] == "glm-4.7"
+    assert calls["responses_transport"] == "websocket-cached"
+    assert stub.responses_transport == "websocket-cached"
+    assert (
+        stub._session_responses_transport_override == "websocket-cached"
+    )
+
+
+def test_restore_session_model_applies_transport_when_model_route_matches():
+    calls = {}
+
+    class _Agent:
+        def switch_model(self, **kwargs):
+            calls.update(kwargs)
+
+    stub = _make_stub(
+        model="glm-4.7",
+        provider="openai-codex",
+        requested_provider="openai-codex",
+        agent=_Agent(),
+    )
+    stub._restore_session_model(_row(model_config={
+        "gateway_runtime": {
+            "provider": "openai-codex",
+            "responses_transport": "websocket-cached",
+        },
+    }))
+
+    assert stub.responses_transport == "websocket-cached"
+    assert calls["responses_transport"] == "websocket-cached"
 
 
 # ── _persist_model_switch_to_session ────────────────────────────────
@@ -126,6 +170,7 @@ class _Result:
     target_provider = "custom:opencode-zen"
     base_url = "https://oz/v1"
     api_mode = ""
+    responses_transport = "websocket-cached"
 
 
 def test_persist_model_switch_writes_model_and_both_route_shapes():
@@ -147,6 +192,11 @@ def test_persist_model_switch_writes_model_and_both_route_shapes():
     # ...and top-level for the TUI gateway's _stored_session_runtime_overrides.
     assert patch["provider"] == "custom:opencode-zen"
     assert patch["base_url"] == "https://oz/v1"
+    assert patch["responses_transport"] == "websocket-cached"
+    assert (
+        patch["gateway_runtime"]["responses_transport"]
+        == "websocket-cached"
+    )
     # Both shapes use or-None so stale keys are deleted (not merely omitted)
     # in BOTH gateway_runtime and top-level — the asymmetry that caused the
     # original stale-key bug.
@@ -278,6 +328,39 @@ def test_round_trip_persist_then_restore(tmp_path, monkeypatch):
     assert restored.model == "deepseek-v4-flash-free"
     assert restored.provider == "custom:opencode-zen"
     assert restored.base_url == "https://oz/v1"
+    assert restored.responses_transport == "websocket-cached"
+    assert (
+        restored._session_responses_transport_override == "websocket-cached"
+    )
+
+
+def test_model_runtime_snapshot_restores_transport_and_session_override():
+    calls = []
+
+    class _Agent:
+        _primary_runtime = None
+
+        def switch_model(self, **kwargs):
+            calls.append(kwargs)
+
+    stub = _make_stub(
+        agent=_Agent(),
+        responses_transport="websocket-cached",
+        _session_responses_transport_override="websocket-cached",
+        _explicit_api_key="ambient-key",
+        _explicit_base_url="https://openrouter.ai/api/v1",
+    )
+    snapshot = stub._snapshot_model_runtime()
+    stub.responses_transport = "sse"
+    stub._session_responses_transport_override = "sse"
+
+    stub._restore_model_runtime_snapshot(snapshot)
+
+    assert stub.responses_transport == "websocket-cached"
+    assert (
+        stub._session_responses_transport_override == "websocket-cached"
+    )
+    assert calls[-1]["responses_transport"] == "websocket-cached"
 
 
 # ── update_session_model provider persistence (#79536) ──────────────

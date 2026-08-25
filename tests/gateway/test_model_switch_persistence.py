@@ -12,6 +12,7 @@ Tests exercise the real ``_apply_session_model_override()`` and
 """
 
 from datetime import datetime
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -94,6 +95,7 @@ class TestApplySessionModelOverride:
             "api_key": "or-key-123",
             "base_url": "https://openrouter.ai/api/v1",
             "api_mode": "chat_completions",
+            "responses_transport": "websocket-cached",
         }
 
         model, rt = runner._apply_session_model_override(
@@ -107,6 +109,7 @@ class TestApplySessionModelOverride:
         assert rt["api_key"] == "or-key-123"
         assert rt["base_url"] == "https://openrouter.ai/api/v1"
         assert rt["api_mode"] == "chat_completions"
+        assert rt["responses_transport"] == "websocket-cached"
 
     def test_no_override_returns_originals(self):
         runner = _make_runner()
@@ -119,6 +122,44 @@ class TestApplySessionModelOverride:
 
         assert model == orig_model
         assert rt == orig_rt
+
+
+class TestSyncSessionModelFromAgent:
+    def test_persists_responses_transport_in_gateway_runtime(self):
+        runner = _make_runner()
+        written = {}
+
+        class _DB:
+            def get_session(self, session_id):
+                return {
+                    "id": session_id,
+                    "model": "gpt-5-codex",
+                    "model_config": "{}",
+                }
+
+            def update_session_meta(self, session_id, model_config, *, model):
+                written["session_id"] = session_id
+                written["model"] = model
+                written["model_config"] = json.loads(model_config)
+
+        runner._session_db = SimpleNamespace(_db=_DB())
+        agent = SimpleNamespace(
+            model="gpt-5-codex",
+            requested_provider="openai-codex",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+            responses_transport="websocket-cached",
+            _fallback_activated=False,
+        )
+
+        runner._sync_session_model_from_agent("sess-1", agent)
+
+        runtime = written["model_config"]["gateway_runtime"]
+        assert runtime["requested_provider"] == "openai-codex"
+        assert runtime["provider"] == "openai-codex"
+        assert runtime["api_mode"] == "codex_responses"
+        assert runtime["responses_transport"] == "websocket-cached"
 
 
 # ---------------------------------------------------------------------------
@@ -256,4 +297,3 @@ class TestOneTurnNeverPersisted:
         assert sk in runner._pending_one_turn_model_restores
         # ...but NEVER written through to the persistent session store.
         runner.async_session_store.set_model_override.assert_not_awaited()
-

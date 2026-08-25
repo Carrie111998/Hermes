@@ -980,6 +980,7 @@ _TERMINAL_EVENT_TYPES = frozenset({
     "response.completed",
     "response.incomplete",
     "response.failed",
+    "response.cancelled",
 })
 
 
@@ -1058,7 +1059,7 @@ def _consume_codex_event_stream(
       if no message item was emitted directly.
     * ``output_text``: assembled text from ``response.output_text.delta`` deltas.
     * ``usage``: copied from the terminal event's ``response.usage`` (when present).
-    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or ``completed`` if
+    * ``status``: ``completed`` / ``incomplete`` / ``failed`` / ``cancelled`` (or ``completed`` if
       the stream ended without a terminal frame but produced content).
     * ``id``: ``response.id`` when present.
     * ``incomplete_details``: passed through for ``response.incomplete`` frames.
@@ -1317,6 +1318,12 @@ def _consume_codex_event_stream(
 
         if event_type in _TERMINAL_EVENT_TYPES:
             saw_terminal = True
+            terminal_status = {
+                "response.completed": "completed",
+                "response.incomplete": "incomplete",
+                "response.failed": "failed",
+                "response.cancelled": "cancelled",
+            }[event_type]
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
                 terminal_usage = getattr(resp_obj, "usage", None)
@@ -1330,7 +1337,7 @@ def _consume_codex_event_stream(
                 if rstatus is None and isinstance(resp_obj, dict):
                     rstatus = resp_obj.get("status")
                 if isinstance(rstatus, str):
-                    terminal_status = rstatus
+                    terminal_status = rstatus.strip().lower() or terminal_status
                 if event_type == "response.incomplete":
                     terminal_incomplete_details = getattr(resp_obj, "incomplete_details", None)
                     if terminal_incomplete_details is None and isinstance(resp_obj, dict):
@@ -1346,6 +1353,12 @@ def _consume_codex_event_stream(
                 terminal_status = terminal_status or "incomplete"
             elif event_type == "response.failed":
                 terminal_status = terminal_status or "failed"
+            elif event_type == "response.cancelled":
+                terminal_status = terminal_status or "cancelled"
+                if resp_obj is not None:
+                    terminal_error = getattr(resp_obj, "error", None)
+                    if terminal_error is None and isinstance(resp_obj, dict):
+                        terminal_error = resp_obj.get("error")
             # Stop on terminal event.
             break
 
@@ -1603,6 +1616,186 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
+    def _claim_stream_interrupt_check():
+        """Claim the shared delta sink and fence this attempt if superseded."""
+        writer_token = claim_stream_writer(agent)
+
+        def _interrupt_or_superseded() -> bool:
+            if agent._interrupt_requested:
+                return True
+            if not stream_writer_is_current(agent, writer_token):
+                logger.warning(
+                    "Codex streaming attempt superseded by a newer stream; "
+                    "stopping consumption to preserve the single-writer "
+                    "invariant (model=%s).",
+                    api_kwargs.get("model", "unknown"),
+                )
+                return True
+            return False
+
+        return _interrupt_or_superseded
+
+    transport = getattr(agent, "responses_transport", "sse") or "sse"
+    websocket_runtime_identity = (
+        getattr(agent, "session_id", None),
+        str(getattr(agent, "provider", "") or "").strip().lower(),
+        str(getattr(agent, "base_url", "") or "").rstrip("/").lower(),
+        str(getattr(agent, "model", "") or ""),
+    )
+    relay_managed_execution = False
+    if transport != "sse":
+        try:
+            from agent import relay_runtime
+
+            relay_host, relay_session, _relay_parent = (
+                relay_runtime.resolve_execution_context(
+                    str(getattr(agent, "session_id", "") or "")
+                )
+            )
+            relay_managed_execution = bool(
+                relay_host is not None
+                and relay_session is not None
+                and relay_host.managed_execution_enabled()
+            )
+        except Exception:
+            logger.debug(
+                "Could not inspect Relay execution state for Codex WebSocket",
+                exc_info=True,
+            )
+    auto_websocket_disabled = (
+        transport == "auto"
+        and (
+            getattr(agent, "_codex_websocket_auto_disabled_for", None)
+            == websocket_runtime_identity
+            or relay_managed_execution
+        )
+    )
+    if transport == "auto" and relay_managed_execution:
+        # Relay's stream pipeline owns chunk interception, policy transforms,
+        # and pre-delivery redaction. The synchronous Responses WebSocket
+        # adapter currently consumes events inside its callback, so auto mode
+        # must keep SSE while managed execution is active.
+        logger.debug(
+            "Codex WebSocket auto mode selected SSE because Relay managed "
+            "stream execution is active"
+        )
+    if transport != "sse" and not auto_websocket_disabled:
+        from agent.codex_websocket_transport import (
+            WebSocketNotStartedError,
+            run_codex_websocket_stream,
+        )
+
+        if relay_managed_execution:
+            raise WebSocketNotStartedError(
+                "Codex WebSocket transport cannot preserve Relay managed "
+                "stream interception yet. Use responses_transport=auto or sse "
+                "while Relay plugins are active.",
+                retryable=False,
+            )
+
+        def _register_connection_abort(abort):
+            return agent._register_codex_websocket_abort(active_client, abort)
+
+        codex_turn_id = getattr(agent, "_current_turn_id", None)
+        turn_state = (
+            getattr(agent, "_codex_turn_state", None)
+            if getattr(agent, "_codex_turn_state_turn_id", None) == codex_turn_id
+            else None
+        )
+
+        def _record_turn_state(value: str) -> None:
+            # A previous interrupted worker may unwind after a new turn starts.
+            # Keep its late metadata from contaminating the new turn's routing.
+            if (
+                getattr(agent, "_current_turn_id", None) == codex_turn_id
+                and getattr(agent, "_codex_turn_state_turn_id", None) == codex_turn_id
+                and not getattr(agent, "_codex_turn_state", None)
+            ):
+                agent._codex_turn_state = value
+
+        for websocket_attempt in range(2):
+            interrupt_check = _claim_stream_interrupt_check()
+
+            attempt_turn_state = (
+                getattr(agent, "_codex_turn_state", None)
+                if getattr(agent, "_codex_turn_state_turn_id", None)
+                == codex_turn_id
+                else turn_state
+            )
+
+            def _execute_websocket(next_api_kwargs: dict[str, Any]):
+                # Relay middleware may rewrite the request, so consumer-Codex
+                # wire sanitization belongs inside the physical callback just
+                # like the SSE path below.
+                websocket_api_kwargs = _sanitize_consumer_codex_request(
+                    agent,
+                    next_api_kwargs,
+                )
+                timeout = websocket_api_kwargs.get("timeout")
+                timeout = (
+                    float(timeout)
+                    if isinstance(timeout, (int, float)) and timeout > 0
+                    else None
+                )
+
+                def _consume_websocket_events(events, _get_final_response=None):
+                    return _consume_codex_event_stream(
+                        events,
+                        model=websocket_api_kwargs.get("model"),
+                        on_text_delta=_on_text_delta,
+                        on_reasoning_delta=_on_reasoning_delta,
+                        on_commentary_message=(
+                            _on_commentary_message
+                            if (
+                                getattr(agent, "interim_assistant_callback", None)
+                                is not None
+                                and getattr(agent, "show_commentary", True)
+                            )
+                            else None
+                        ),
+                        on_first_delta=on_first_delta,
+                        on_event=_on_event,
+                        interrupt_check=interrupt_check,
+                    )
+
+                return run_codex_websocket_stream(
+                    api_kwargs=websocket_api_kwargs,
+                    client=active_client,
+                    provider=agent.provider,
+                    base_url=agent.base_url,
+                    session_id=agent.session_id,
+                    transport=transport,
+                    collect_events=_consume_websocket_events,
+                    interrupted=interrupt_check,
+                    timeout=timeout,
+                    register_connection_abort=_register_connection_abort,
+                    turn_state=attempt_turn_state,
+                    record_turn_state=_record_turn_state,
+                )
+
+            try:
+                return _execute_websocket(dict(api_kwargs))
+            except WebSocketNotStartedError as exc:
+                if websocket_attempt == 0 and getattr(exc, "retryable", False):
+                    logger.debug(
+                        "Codex WebSocket failed before request start; reconnecting once: %s",
+                        exc,
+                    )
+                    continue
+                if transport != "auto":
+                    raise
+                logger.debug(
+                    "Codex WebSocket auto mode fell back to SSE before request start: %s",
+                    exc,
+                )
+                # Match current Codex behavior: once auto mode exhausts its
+                # WebSocket attempt budget, keep this Hermes session/runtime on
+                # SSE instead of paying another failed handshake every tool loop.
+                agent._codex_websocket_auto_disabled_for = (
+                    websocket_runtime_identity
+                )
+                break
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -1787,7 +1980,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._client_log_context(), exc,
                     )
 
-            if final.status in {"incomplete", "failed"}:
+            if final.status in {"incomplete", "failed", "cancelled"}:
                 logger.warning(
                     "Codex Responses stream terminal status=%s "
                     "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",

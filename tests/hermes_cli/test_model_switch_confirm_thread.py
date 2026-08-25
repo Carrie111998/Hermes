@@ -25,11 +25,13 @@ class _FakeAgent:
         self.calls = []
         self.model = "old/model"
         self.provider = "openrouter"
+        self.applied = threading.Event()
 
     def switch_model(self, **kwargs):
         self.calls.append(kwargs)
         self.model = kwargs["new_model"]
         self.provider = kwargs["new_provider"]
+        self.applied.set()
 
 
 class _StubCLI:
@@ -127,6 +129,7 @@ def test_confirm_runs_off_main_thread_when_tui_present(monkeypatch):
     # The worker thread performs the confirm and completes the apply.
     assert ready.wait(timeout=10)
     assert called_on["is_main"] is False
+    assert stub.agent.applied.wait(timeout=10)
 
     # Apply still lands on CLI + agent state.
     assert stub.model == "claude-sonnet-4.6"

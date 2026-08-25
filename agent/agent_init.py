@@ -589,6 +589,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    responses_transport: str = "sse",
 ):
     """
     Initialize the AI Agent.
@@ -599,6 +600,8 @@ def init_agent(
         provider (str): Provider identifier (optional; used for telemetry/routing hints)
         requested_provider (str): Original provider identity before runtime canonicalization
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
+        responses_transport (str): Codex Responses transport: "sse", "websocket",
+            "websocket-cached", or "auto".
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
@@ -677,6 +680,17 @@ def init_agent(
     # flag is the explicit single-switch off for both review paths.
     agent.skip_background_review = bool(skip_background_review)
     agent.pass_session_id = pass_session_id
+    from agent.codex_websocket_transport import normalize_codex_responses_transport
+
+    agent.responses_transport = normalize_codex_responses_transport(responses_transport)
+    agent._active_codex_websocket_aborts = {}
+    # Legacy single-hook slot retained for compatibility with older callers
+    # and lightweight test doubles. Production registrations use the
+    # request-client keyed registry above.
+    agent._active_codex_websocket_abort = None
+    agent._codex_websocket_auto_disabled_for = None
+    agent._codex_turn_state = None
+    agent._codex_turn_state_turn_id = None
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -1402,8 +1416,49 @@ def init_agent(
                             )
                             continue
                         if _fb_client is not None:
-                            agent.provider = _fb["provider"]
+                            _fb_provider = str(_fb["provider"]).strip().lower()
+                            _fb_base_url = str(_fb_client.base_url)
+                            _fb_api_mode = str(_fb.get("api_mode") or "").strip()
+                            if not _fb_api_mode:
+                                from hermes_cli.providers import determine_api_mode
+
+                                _fb_api_mode = determine_api_mode(
+                                    _fb_provider,
+                                    _fb_base_url,
+                                    _fb_model or _fb["model"],
+                                )
+                            _fb_responses_transport = _fb.get(
+                                "responses_transport"
+                            )
+                            if (
+                                _fb_responses_transport is None
+                                and _fb_provider == "openai-codex"
+                            ):
+                                try:
+                                    from hermes_cli.config import load_config
+
+                                    _fb_model_cfg = load_config().get("model") or {}
+                                    if isinstance(_fb_model_cfg, dict):
+                                        _fb_responses_transport = _fb_model_cfg.get(
+                                            "responses_transport",
+                                            "sse",
+                                        )
+                                except Exception:
+                                    _fb_responses_transport = "sse"
+
+                            agent.provider = _fb_provider
+                            agent.requested_provider = _fb_provider
                             agent.model = _fb_model or _fb["model"]
+                            agent.base_url = _fb_base_url
+                            agent.api_mode = _fb_api_mode
+                            from agent.codex_websocket_transport import (
+                                set_agent_codex_responses_transport,
+                            )
+
+                            set_agent_codex_responses_transport(
+                                agent,
+                                _fb_responses_transport or "sse",
+                            )
                             agent._fallback_activated = True
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,
@@ -3043,6 +3098,7 @@ def init_agent(
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "responses_transport": getattr(agent, "responses_transport", "sse"),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

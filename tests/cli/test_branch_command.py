@@ -12,6 +12,7 @@ Verifies that:
 
 import os
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -145,6 +146,61 @@ class TestBranchCommandCLI:
         assert kwargs["parent_session_id"] == original_id
         assert kwargs["reset"] is False
         assert kwargs["reason"] == "branch"
+
+    def test_branch_runtime_survives_ambient_provider_change(
+        self, cli_instance, session_db, monkeypatch
+    ):
+        from cli import HermesCLI
+
+        agent = MagicMock()
+        agent.model = "gpt-5.4"
+        agent.requested_provider = "openai-codex"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent.api_mode = "codex_responses"
+        agent.responses_transport = "websocket-cached"
+        cli_instance.agent = agent
+        cli_instance.model = "gpt-5.4"
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        row = session_db.get_session(cli_instance.session_id)
+        config = __import__("json").loads(row["model_config"])
+        assert config["_branched_from"] == "20260403_120000_abc123"
+        assert config["requested_provider"] == "openai-codex"
+        assert config["provider"] == "openai-codex"
+        assert config["responses_transport"] == "websocket-cached"
+        assert config["gateway_runtime"]["api_mode"] == "codex_responses"
+        assert config["gateway_runtime"]["responses_transport"] == "websocket-cached"
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_key": "fresh-codex-secret",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+                "responses_transport": "websocket-cached",
+            },
+        )
+        resumed = SimpleNamespace(
+            model="ambient-model",
+            provider="openrouter",
+            requested_provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            responses_transport="sse",
+            api_key="ambient-secret",
+            agent=None,
+            _explicit_model_override=False,
+        )
+
+        HermesCLI._restore_session_model(resumed, row, quiet=True)
+
+        assert resumed.model == "gpt-5.4"
+        assert resumed.provider == "openai-codex"
+        assert resumed.requested_provider == "openai-codex"
+        assert resumed.responses_transport == "websocket-cached"
 
 
 

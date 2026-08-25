@@ -3684,7 +3684,17 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    try:
+                        from agent.codex_websocket_transport import (
+                            cleanup_codex_websocket_session,
+                        )
+
+                        cleanup_codex_websocket_session(old_session_id)
+                    except Exception:
+                        pass
                     agent.session_id = new_session_id
+                    # Ordering contract: the agent thread updates the contextvar here;
+                    # the gateway propagates to SessionEntry after run_in_executor returns.
                     try:
                         from gateway.session_context import set_current_session_id
 

@@ -41,6 +41,7 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_cli.session_runtime import copy_non_secret_session_runtime
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -1950,6 +1951,7 @@ class GatewaySlashCommandsMixin:
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
+                                    responses_transport=result.responses_transport,
                                 )
                             except Exception as exc:
                                 # The in-place swap rolled the agent back to the
@@ -2005,10 +2007,12 @@ class GatewaySlashCommandsMixin:
                         )
                         _self._session_model_overrides[_session_key] = {
                             "model": result.new_model,
+                            "requested_provider": result.target_provider,
                             "provider": result.target_provider,
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
+                            "responses_transport": result.responses_transport,
                         }
 
                         # Write-through the non-secret parts to the session
@@ -2263,6 +2267,7 @@ class GatewaySlashCommandsMixin:
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
+                        responses_transport=result.responses_transport,
                     )
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
@@ -2317,10 +2322,12 @@ class GatewaySlashCommandsMixin:
             # Store session override so next agent creation uses the new model
             self._session_model_overrides[session_key] = {
                 "model": result.new_model,
+                "requested_provider": result.target_provider,
                 "provider": result.target_provider,
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
+                "responses_transport": result.responses_transport,
             }
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
@@ -2331,10 +2338,9 @@ class GatewaySlashCommandsMixin:
             elif hasattr(self, "_pending_one_turn_model_restores"):
                 self._pending_one_turn_model_restores.pop(session_key, None)
 
-            # Write-through the non-secret parts (model/provider/base_url) to
-            # the session store so the override survives a gateway restart.
-            # api_key/api_mode are never persisted — they are re-resolved via
-            # runtime provider resolution on rehydration.
+            # Write through model/requested-provider/provider/base-url/api-mode/
+            # transport so the override survives a gateway restart.  api_key is
+            # re-resolved through runtime provider resolution on rehydration.
             #
             # /model --once is intentionally EXCLUDED from the write-through:
             # a one-turn override must never survive a restart. The persisted
@@ -5142,6 +5148,59 @@ class GatewaySlashCommandsMixin:
 
         parent_session_id = current_entry.session_id
 
+        # A branch owns a copy of the parent's conversation, so it must also
+        # own the same non-secret runtime route. Prefer the live override (it
+        # may be newer than the row), while carrying persisted reasoning and
+        # service-tier metadata forward with the lineage marker.
+        try:
+            _parent_row = await self._session_db.get_session(parent_session_id) or {}
+        except Exception:
+            _parent_row = {}
+        _parent_model_config = {}
+        _raw_parent_config = _parent_row.get("model_config")
+        if isinstance(_raw_parent_config, dict):
+            _parent_model_config = dict(_raw_parent_config)
+        elif isinstance(_raw_parent_config, str) and _raw_parent_config.strip():
+            try:
+                import json as _json
+
+                _parsed_parent_config = _json.loads(_raw_parent_config)
+                if isinstance(_parsed_parent_config, dict):
+                    _parent_model_config = _parsed_parent_config
+            except Exception:
+                logger.debug("Failed to parse parent branch runtime", exc_info=True)
+        _branch_model_config = {
+            key: _parent_model_config[key]
+            for key in ("reasoning_config", "service_tier", "max_iterations")
+            if key in _parent_model_config
+        }
+        _branch_model_config["_branched_from"] = parent_session_id
+        _branch_model_config = copy_non_secret_session_runtime(
+            _parent_row,
+            _branch_model_config,
+        )
+        _live_override = (
+            (getattr(self, "_session_model_overrides", {}) or {}).get(session_key)
+            or current_entry.model_override
+        )
+        if _live_override:
+            _branch_model_config = copy_non_secret_session_runtime(
+                _live_override,
+                _branch_model_config,
+            )
+        _branch_override = copy_non_secret_session_runtime(_branch_model_config)
+        _branch_model_config["gateway_runtime"] = {
+            key: _branch_override[key]
+            for key in (
+                "requested_provider",
+                "provider",
+                "base_url",
+                "api_mode",
+                "responses_transport",
+            )
+            if _branch_override.get(key)
+        }
+
         # Serialize the parent's full origin (same shape as the reset path's
         # db_create_kwargs in gateway/session.py, #82633) so the branch row
         # carries complete identity from birth. Prefer the live entry's origin
@@ -5165,8 +5224,15 @@ class GatewaySlashCommandsMixin:
             await self._session_db.create_session(
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
-                model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
-                model_config={"_branched_from": parent_session_id},
+                model=(
+                    _branch_override.get("model")
+                    or (
+                        (self.config.get("model", {}) or {}).get("default")
+                        if isinstance(self.config, dict)
+                        else None
+                    )
+                ),
+                model_config=_branch_model_config,
                 parent_session_id=parent_session_id,
                 # Gateway routing columns — forward ALL of them at CREATE time,
                 # same fix as the compression-rotation bug in
@@ -5239,7 +5305,11 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Switch the session store entry to the new session
-        new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
+        new_entry = await self.async_session_store.switch_session(
+            session_key,
+            new_session_id,
+            model_override=_branch_override,
+        )
         if not new_entry:
             return t("gateway.branch.switch_failed")
         self._clear_session_boundary_security_state(session_key)

@@ -3163,6 +3163,10 @@ def _(rid, params: dict) -> dict:
         new_key = _new_session_key()
         new_sid = uuid.uuid4().hex[:8]
         source = _session_source(session)
+        branch_runtime = _runtime_model_config(
+            session["agent"],
+            {"_branched_from": old_key},
+        )
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         branch_name = params.get("name", "")
         try:
@@ -3178,13 +3182,13 @@ def _(rid, params: dict) -> dict:
             db.create_session(
                 new_key,
                 source=source,
-                model=_resolve_model(),
+                model=branch_runtime.get("model") or _resolve_model(),
                 # Stable _branched_from marker so list_sessions_rich() keeps the
                 # branch visible in /resume and /sessions. The TUI branch leaves
                 # the parent live (no end_reason='branched'), so the legacy
                 # end_reason heuristic never matches it — the marker is the only
                 # thing that surfaces TUI branches. See issue #20856.
-                model_config={"_branched_from": old_key},
+                model_config=branch_runtime,
                 parent_session_id=old_key,
                 cwd=_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not
@@ -3272,6 +3276,9 @@ def _(rid, params: dict) -> dict:
                     new_key,
                     session_id=new_key,
                     session_db=branch_db,
+                    model_override=branch_runtime,
+                    reasoning_config_override=branch_runtime.get("reasoning_config"),
+                    service_tier_override=branch_runtime.get("service_tier"),
                     platform_override=source,
                 )
             finally:
@@ -3286,6 +3293,7 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                model_override=branch_runtime,
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is

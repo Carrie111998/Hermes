@@ -83,6 +83,97 @@ async def test_capabilities_advertises_session_control_surface(adapter):
 
 
 @pytest.mark.asyncio
+async def test_fork_session_inherits_parent_runtime_route_and_api_metadata(
+    adapter,
+    session_db,
+):
+    import json
+
+    parent_id = session_db.create_session(
+        "fork-runtime-parent",
+        "api_server",
+        model="gpt-5.4",
+        model_config={
+            # Simulate ambient defaults that differ from the route which owns
+            # the parent transcript. The nested runtime is authoritative.
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+            "responses_transport": "sse",
+            "api_key": "must-not-persist",
+            "reasoning_config": {"effort": "high"},
+            "model_options": {"reasoning": {"effort": "high"}},
+            "browser_model_lock": {
+                "provider": "openai-codex",
+                "model": "gpt-5.4",
+                "model_options": {"reasoning": {"effort": "high"}},
+                "route_source": "raw_request",
+                "confirmed": True,
+            },
+            "gateway_runtime": {
+                "requested_provider": "openai-codex",
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+                "responses_transport": "websocket-cached",
+            },
+        },
+        system_prompt="Keep the parent's system prompt",
+    )
+    session_db.replace_messages(
+        parent_id,
+        [{"role": "user", "content": "parent context"}],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{parent_id}/fork",
+            json={"id": "fork-runtime-child"},
+        )
+        assert response.status == 201, await response.text()
+
+    child = session_db.get_session("fork-runtime-child")
+    assert child["model"] == "gpt-5.4"
+    assert child["system_prompt"] == "Keep the parent's system prompt"
+    assert child["parent_session_id"] == parent_id
+
+    config = child["model_config"]
+    if isinstance(config, str):
+        config = json.loads(config)
+    assert config["_branched_from"] == parent_id
+    assert config["model"] == "gpt-5.4"
+    assert config["requested_provider"] == "openai-codex"
+    assert config["provider"] == "openai-codex"
+    assert config["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert config["api_mode"] == "codex_responses"
+    assert config["responses_transport"] == "websocket-cached"
+    assert config["model_options"] == {"reasoning": {"effort": "high"}}
+    assert "api_key" not in config
+    assert config["gateway_runtime"] == {
+        "requested_provider": "openai-codex",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+        "responses_transport": "websocket-cached",
+    }
+    assert config["reasoning_config"] == {"effort": "high"}
+    assert config["browser_model_lock"]["confirmed"] is True
+    assert "api_key" not in config["gateway_runtime"]
+
+    runtime_request = adapter._effective_session_runtime_request(
+        session=child,
+        body={},
+    )
+    assert runtime_request["persisted_lock"] is True
+    assert runtime_request["requested"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.4",
+        "raw_model": "gpt-5.4",
+    }
+
+
+@pytest.mark.asyncio
 async def test_session_messages_default_to_latest_bounded_page(adapter, session_db):
     session_id = session_db.create_session("bounded-messages", "api_server")
     session_db.replace_messages(

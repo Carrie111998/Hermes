@@ -2,8 +2,9 @@
 
 ``GatewayRunner._session_model_overrides`` is in-memory, so before persistence
 a gateway restart silently reverted every session to the global default model.
-The non-secret parts (model/provider/base_url) are now written through to the
-session store (``SessionEntry.model_override`` in sessions.json) and lazily
+The non-secret parts (model/requested-provider/provider/base-url/api-mode/
+responses-transport) are written through to the session store
+(``SessionEntry.model_override`` in sessions.json) and lazily
 rehydrated on first use after a restart, with credentials re-resolved through
 the normal runtime provider resolution.
 
@@ -29,10 +30,12 @@ from gateway.session import (
 
 OVERRIDE = {
     "model": "gpt-5o",
+    "requested_provider": "openai",
     "provider": "openai",
     "api_key": "sk-SUPER-SECRET-do-not-persist",
     "base_url": "https://api.openai.example/v1",
     "api_mode": "responses",
+    "responses_transport": "websocket-cached",
 }
 
 
@@ -81,8 +84,11 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
     persisted = store2.get_model_override(session_key)
     assert persisted == {
         "model": "gpt-5o",
+        "requested_provider": "openai",
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
+        "api_mode": "responses",
+        "responses_transport": "websocket-cached",
     }
 
 
@@ -108,28 +114,55 @@ def test_runner_rehydrates_override_after_restart(store_factory):
         "gateway.run._resolve_runtime_agent_kwargs_for_provider",
         return_value={
             "api_key": "sk-fresh-from-keychain",
-            "api_mode": "responses",
+            "api_mode": "chat_completions",
             "base_url": "https://api.openai.example/v1",
             "provider": "openai",
+            "responses_transport": "sse",
         },
     ):
         runner._rehydrate_session_model_override(session_key)
 
     override = runner._session_model_overrides[session_key]
     assert override["model"] == "gpt-5o"
+    assert override["requested_provider"] == "openai"
     assert override["provider"] == "openai"
     assert override["base_url"] == "https://api.openai.example/v1"
     # Credentials come from live resolution, never from disk.
     assert override["api_key"] == "sk-fresh-from-keychain"
     assert override["api_mode"] == "responses"
+    assert override["responses_transport"] == "websocket-cached"
+
+    _, applied = runner._apply_session_model_override(
+        session_key,
+        "ambient-model",
+        {"provider": "openrouter", "responses_transport": "sse"},
+    )
+    assert applied["requested_provider"] == "openai"
+    assert applied["provider"] == "openai"
+    assert applied["api_mode"] == "responses"
+    assert applied["responses_transport"] == "websocket-cached"
 
 
 def test_sanitize_model_override():
     assert sanitize_model_override(None) is None
     assert sanitize_model_override({}) is None
-    assert sanitize_model_override({"api_key": "sk-x", "api_mode": "chat"}) is None
+    assert sanitize_model_override({"api_key": "sk-x", "api_mode": "chat"}) == {
+        "api_mode": "chat"
+    }
     assert sanitize_model_override(OVERRIDE) == {
         "model": "gpt-5o",
+        "requested_provider": "openai",
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
+        "api_mode": "responses",
+        "responses_transport": "websocket-cached",
+    }
+    assert sanitize_model_override(
+        {
+            "requested_provider": "named-codex-route",
+            "provider": "openai-codex",
+        }
+    ) == {
+        "requested_provider": "named-codex-route",
+        "provider": "openai-codex",
     }

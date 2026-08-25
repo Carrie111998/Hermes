@@ -523,6 +523,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        responses_transport: str = "sse",
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -613,6 +614,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            responses_transport=responses_transport,
         )
 
     def _get_session_db_for_recall(self):
@@ -894,10 +896,26 @@ class AIAgent:
             return_load_result=True,
         )
 
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    def switch_model(
+        self,
+        new_model,
+        new_provider,
+        api_key='',
+        base_url='',
+        api_mode='',
+        responses_transport=None,
+    ):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
-        return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
+        return switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key,
+            base_url,
+            api_mode,
+            responses_transport,
+        )
 
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
@@ -1367,6 +1385,7 @@ class AIAgent:
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
+            "responses_transport": getattr(self, "responses_transport", "sse") or "sse",
         }
 
     def _check_compression_model_feasibility(self) -> None:
@@ -4586,6 +4605,13 @@ class AIAgent:
                 self.client = None
         except Exception:
             pass
+        if getattr(self, "responses_transport", "sse") != "sse":
+            try:
+                from agent.codex_websocket_transport import cleanup_codex_websocket_session
+
+                cleanup_codex_websocket_session(getattr(self, "session_id", None))
+            except Exception:
+                pass
 
         # Also drop the cached per-request wire client (reused across
         # sequential LLM calls) — same socket/memory rationale as above.
@@ -4669,7 +4695,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Close the OpenAI/httpx client
+        # 6. Close LLM transport sockets
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -4677,6 +4703,13 @@ class AIAgent:
                 self.client = None
         except Exception:
             pass
+        if getattr(self, "responses_transport", "sse") != "sse":
+            try:
+                from agent.codex_websocket_transport import cleanup_codex_websocket_session
+
+                cleanup_codex_websocket_session(getattr(self, "session_id", None))
+            except Exception:
+                pass
 
         # 6b. Close the cached per-request wire client (reused across
         # sequential LLM calls; see _create_request_openai_client).
@@ -5561,6 +5594,51 @@ class AIAgent:
             return
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _register_codex_websocket_abort(self, client: Any, abort: Any):
+        """Register a WebSocket abort hook for one physical request client."""
+        key = id(client)
+        with self._openai_client_lock():
+            registry = getattr(self, "_active_codex_websocket_aborts", None)
+            if not isinstance(registry, dict):
+                registry = {}
+                self._active_codex_websocket_aborts = registry
+            registry[key] = (client, abort)
+
+        def unregister() -> None:
+            with self._openai_client_lock():
+                registry = getattr(
+                    self,
+                    "_active_codex_websocket_aborts",
+                    None,
+                )
+                if not isinstance(registry, dict):
+                    return
+                current = registry.get(key)
+                if (
+                    isinstance(current, tuple)
+                    and len(current) == 2
+                    and current[0] is client
+                    and current[1] is abort
+                ):
+                    registry.pop(key, None)
+
+        return unregister
+
+    def _codex_websocket_abort_for_client(self, client: Any):
+        """Return the abort hook owned by ``client``, if it is still active."""
+        with self._openai_client_lock():
+            registry = getattr(self, "_active_codex_websocket_aborts", None)
+            if isinstance(registry, dict):
+                current = registry.get(id(client))
+                if (
+                    isinstance(current, tuple)
+                    and len(current) == 2
+                    and current[0] is client
+                    and callable(current[1])
+                ):
+                    return current[1]
+        return None
+
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
         """Cross-thread abort: shut sockets down without releasing FDs.
 
@@ -5575,6 +5653,16 @@ class AIAgent:
         ``EPIPE`` so it can unwind and close ``client`` from its own context
         — which is where the FD release belongs.
         """
+        websocket_abort = self._codex_websocket_abort_for_client(client)
+        if websocket_abort is None:
+            # Compatibility for extensions and old test doubles that still
+            # register the pre-registry global hook directly.
+            websocket_abort = getattr(self, "_active_codex_websocket_abort", None)
+        if callable(websocket_abort):
+            try:
+                websocket_abort()
+            except Exception:
+                logger.debug("Codex WebSocket abort failed (%s)", reason, exc_info=True)
         if client is None:
             return
         # A pool whose sockets were shut down from a stranger thread must

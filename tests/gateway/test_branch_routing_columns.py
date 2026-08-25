@@ -70,6 +70,7 @@ def _make_branch_runner(store: SessionStore):
     runner._busy_ack_ts = {}
     runner._pending_approvals = {}
     runner._update_prompt_pending = {}
+    runner._session_model_overrides = {}
     runner._agent_cache_lock = None
     runner.session_store = store
     runner._session_db = AsyncSessionDB(store._db)
@@ -101,7 +102,7 @@ class TestBranchRoutingColumns:
         captured_new_session_id = {}
         real_switch_session = store.switch_session
 
-        def _crash_before_switch(session_key, target_session_id):
+        def _crash_before_switch(session_key, target_session_id, **_kwargs):
             # Simulate the process dying right here — before routing gets
             # backfilled — by capturing the id and raising instead of
             # forwarding to the real switch_session().
@@ -153,3 +154,68 @@ class TestBranchRoutingColumns:
 
         _ = real_switch_session  # silence unused
 
+    @pytest.mark.asyncio
+    async def test_branch_runtime_survives_first_build_and_store_reload(
+        self, store, tmp_path
+    ):
+        import json
+
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+        store._db.append_message(
+            parent_entry.session_id, role="user", content="private context"
+        )
+        store._db.append_message(
+            parent_entry.session_id, role="assistant", content="ack"
+        )
+        store._db.update_session_model(parent_entry.session_id, "gpt-5.4")
+        store._db.patch_session_model_config(
+            parent_entry.session_id,
+            {"reasoning_config": {"enabled": True, "effort": "high"}},
+        )
+        runtime = {
+            "model": "gpt-5.4",
+            "requested_provider": "openai-codex",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+            "responses_transport": "websocket-cached",
+            "api_key": "must-not-persist",
+        }
+        store.set_model_override(parent_entry.session_key, runtime)
+
+        runner = _make_branch_runner(store)
+        runner.config = {"model": {"default": "ambient-openrouter-model"}}
+        runner._session_model_overrides[parent_entry.session_key] = dict(runtime)
+        runner._clear_session_boundary_security_state = lambda _key: None
+        runner._evict_cached_agent = lambda _key: None
+
+        result = await runner._handle_branch_command(_make_event("/branch"))
+
+        assert result
+        child_entry = store._entries[parent_entry.session_key]
+        assert child_entry.session_id != parent_entry.session_id
+        assert child_entry.model_override == {
+            key: value for key, value in runtime.items() if key != "api_key"
+        }
+        # The live map feeds the next agent build and keeps its in-memory
+        # credential, while the persisted entry remains strictly non-secret.
+        assert runner._session_model_overrides[parent_entry.session_key][
+            "responses_transport"
+        ] == "websocket-cached"
+
+        row = store._db.get_session(child_entry.session_id)
+        config = json.loads(row["model_config"])
+        assert row["model"] == "gpt-5.4"
+        assert config["_branched_from"] == parent_entry.session_id
+        assert config["reasoning_config"] == {"enabled": True, "effort": "high"}
+        assert config["gateway_runtime"]["requested_provider"] == "openai-codex"
+        assert config["gateway_runtime"]["api_mode"] == "codex_responses"
+        assert config["gateway_runtime"]["responses_transport"] == "websocket-cached"
+        assert "api_key" not in config
+        assert "api_key" not in config["gateway_runtime"]
+
+        reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        assert reloaded.get_model_override(parent_entry.session_key) == {
+            key: value for key, value in runtime.items() if key != "api_key"
+        }

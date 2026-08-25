@@ -89,6 +89,15 @@ class CLIAgentSetupMixin:
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
         resolved_api_mode = runtime.get("api_mode", self.api_mode)
+        resolved_responses_transport = runtime.get("responses_transport", "sse")
+        session_responses_transport = getattr(
+            self, "_session_responses_transport_override", None
+        )
+        if session_responses_transport is not None:
+            # Session resume and session-only /model switches own this field
+            # until their conversation boundary.  The rest of the runtime
+            # (credentials, endpoint, token pool) remains freshly resolved.
+            resolved_responses_transport = session_responses_transport
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
@@ -134,11 +143,13 @@ class CLIAgentSetupMixin:
         routing_changed = (
             resolved_provider != self.provider
             or resolved_api_mode != self.api_mode
+            or resolved_responses_transport != self.responses_transport
             or resolved_acp_command != self.acp_command
             or resolved_acp_args != self.acp_args
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
+        self.responses_transport = resolved_responses_transport
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
         self._credential_pool = resolved_credential_pool
@@ -306,6 +317,7 @@ class CLIAgentSetupMixin:
                 self, "requested_provider", self.provider
             ),
             "api_mode": self.api_mode,
+            "responses_transport": getattr(self, "responses_transport", "sse"),
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
@@ -319,6 +331,7 @@ class CLIAgentSetupMixin:
                 runtime["requested_provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["responses_transport"],
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -483,6 +496,7 @@ class CLIAgentSetupMixin:
                     self, "requested_provider", self.provider
                 ),
                 "api_mode": self.api_mode,
+                "responses_transport": self.responses_transport,
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
@@ -495,6 +509,7 @@ class CLIAgentSetupMixin:
                 provider=runtime.get("provider"),
                 requested_provider=runtime.get("requested_provider"),
                 api_mode=runtime.get("api_mode"),
+                responses_transport=runtime.get("responses_transport", "sse"),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
@@ -572,6 +587,7 @@ class CLIAgentSetupMixin:
                 runtime.get("requested_provider"),
                 runtime.get("base_url"),
                 runtime.get("api_mode"),
+                runtime.get("responses_transport", "sse"),
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
             )
