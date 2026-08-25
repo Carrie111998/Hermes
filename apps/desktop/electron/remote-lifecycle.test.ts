@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -22,6 +22,7 @@ import {
   openForward,
   ownershipDirectory,
   pidIsOurDashboard,
+  probeRemoteHermesInstallId,
   probeRemotePlatform,
   PROTOCOL_VERSION,
   readLockfile,
@@ -98,6 +99,31 @@ test('listRemoteHermesProfiles inventories Mini-style profile dirs without spawn
     ssh.calls.some(cmd => cmd.includes('serve') || cmd.includes('dashboard')),
     false
   )
+})
+
+test('probeRemoteHermesInstallId reads the stable identity without spawning a dashboard', async () => {
+  const ssh = fakeSsh([
+    [/HERMES_HOME/, '/Users/test/.hermes\n'],
+    [/install_id/, '0123456789abcdef0123456789abcdef\n']
+  ])
+
+  assert.equal(await probeRemoteHermesInstallId(ssh), '0123456789abcdef0123456789abcdef')
+  assert.ok(ssh.calls.some(call => call.includes('install_id')))
+  assert.ok(ssh.calls.every(call => !call.includes('serve') && !call.includes('dashboard')))
+})
+
+test('SSH roster wiring carries the probed install id into the public source row', async () => {
+  const main = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
+  const start = main.indexOf('async function probeSshProfileInventory')
+  const end = main.indexOf("ipcMain.handle('hermes:agents:roster'", start)
+  const roster = main.slice(start, end)
+
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  assert.match(roster, /probeRemoteHermesInstallId\(ssh\)/)
+  assert.match(roster, /rememberConnectionInstallId\(connection\.id, \{ install_id: installId \}\)/)
+  assert.match(roster, /raw = \{ connection, profiles: null, error: 'connect-on-demand', \.\.\.\(installId \? \{ installId \} : \{\}\) \}/)
+  assert.match(main, /sources: enumerations\.map\(\(\{ connection, error, installId, profiles \}\)/)
 })
 
 test('listRemoteHermesProfiles rejects a hostile HERMES_HOME', async () => {
