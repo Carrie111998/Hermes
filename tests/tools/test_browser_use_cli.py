@@ -14,6 +14,7 @@ Covers the three seams the integration relies on:
 import json
 import os
 import stat
+import subprocess
 import time
 
 import pytest
@@ -842,6 +843,23 @@ class TestSkillTextDescription:
 
 
 class TestBrowserExec:
+    @staticmethod
+    def _provider_owned_backend(monkeypatch):
+        def resolve(env, task_id, session_name=""):
+            env["BU_CDP_WS"] = "wss://managed.example/cdp/replacement"
+            env["_HERMES_BU_PRIVATE_BROWSER"] = "1"
+            env["_HERMES_BU_PROVIDER_BROWSER"] = "1"
+            return None
+
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", resolve)
+        monkeypatch.setattr(bu_cli, "_base_subprocess_env", lambda: {})
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["/fake/browser-use"])
+
+    @staticmethod
+    def _json_result(value):
+        assert isinstance(value, str)
+        return json.loads(value)
+
     def test_missing_cli_returns_install_hint(self, monkeypatch):
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         result = json.loads(bu_cli.browser_exec("print(page_info())"))
@@ -881,6 +899,152 @@ class TestBrowserExec:
         assert result["success"] is False
         assert result["exit_code"] == 3
         assert "boom" in result["stderr"]
+
+    def test_provider_daemon_failure_bootstraps_once_before_running_user_code(
+        self, monkeypatch
+    ):
+        self._provider_owned_backend(monkeypatch)
+        calls = []
+        ticks = iter((100.0, 105.0, 112.0))
+        monkeypatch.setattr(bu_cli.time, "monotonic", lambda: next(ticks))
+
+        def run(cmd, *, input, env, timeout, **kwargs):
+            calls.append({"input": input, "env": dict(env), "timeout": timeout})
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    "",
+                    "browser-harness: required daemon 'r7k2' is not running\n",
+                )
+            if len(calls) == 2:
+                return subprocess.CompletedProcess(cmd, 0, "BOOTSTRAPPED\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "USER_CODE_OK\n", "")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", run)
+
+        result = self._json_result(
+            bu_cli.browser_exec("print('payload')", session="r7k2", timeout_s=30)
+        )
+
+        assert result["success"] is True
+        assert result["output"] == "USER_CODE_OK\n"
+        assert len(calls) == 3
+        assert "HERMES_PROVIDER_DAEMON_PREFLIGHT" in calls[0]["input"]
+        assert calls[0]["env"]["BH_REQUIRE_EXISTING_DAEMON"] == "1"
+        assert "HERMES_PROVIDER_DAEMON_BOOTSTRAPPED" in calls[1]["input"]
+        assert "restart_daemon" not in calls[1]["input"]
+        assert "ensure_daemon()" not in calls[1]["input"]
+        assert "BH_REQUIRE_EXISTING_DAEMON" not in calls[1]["env"]
+        assert calls[2]["input"] == "print('payload')"
+        assert calls[2]["env"]["BH_REQUIRE_EXISTING_DAEMON"] == "1"
+        assert all("_HERMES_BU_PROVIDER_BROWSER" not in call["env"] for call in calls)
+        assert [call["timeout"] for call in calls] == [30, 25.0, 18.0]
+        assert sum(call["input"] == "print('payload')" for call in calls) == 1
+
+    def test_healthy_provider_daemon_runs_user_code_without_bootstrap(self, monkeypatch):
+        self._provider_owned_backend(monkeypatch)
+        calls = []
+
+        def run(cmd, *, input, env, timeout, **kwargs):
+            calls.append({"input": input, "env": dict(env)})
+            output = "PREFLIGHT_OK\n" if len(calls) == 1 else "OK\n"
+            return subprocess.CompletedProcess(cmd, 0, output, "")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", run)
+
+        result = self._json_result(
+            bu_cli.browser_exec("print('payload')", session="r7k2", timeout_s=30)
+        )
+
+        assert result["success"] is True
+        assert result["output"] == "OK\n"
+        assert len(calls) == 2
+        assert "HERMES_PROVIDER_DAEMON_PREFLIGHT" in calls[0]["input"]
+        assert calls[0]["env"]["BH_REQUIRE_EXISTING_DAEMON"] == "1"
+        assert calls[1]["input"] == "print('payload')"
+        assert calls[1]["env"]["BH_REQUIRE_EXISTING_DAEMON"] == "1"
+
+    def test_unrelated_provider_user_failure_is_not_retried(self, monkeypatch):
+        self._provider_owned_backend(monkeypatch)
+        calls = []
+
+        def run(cmd, *, input, env, timeout, **kwargs):
+            calls.append(input)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(cmd, 0, "PREFLIGHT_OK\n", "")
+            return subprocess.CompletedProcess(cmd, 3, "", "page script failed\n")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", run)
+
+        result = self._json_result(
+            bu_cli.browser_exec("print('payload')", session="r7k2", timeout_s=30)
+        )
+
+        assert result["success"] is False
+        assert result["exit_code"] == 3
+        assert len(calls) == 2
+        assert "HERMES_PROVIDER_DAEMON_PREFLIGHT" in calls[0]
+        assert calls[1] == "print('payload')"
+
+    def test_required_daemon_text_from_user_code_is_not_retried(
+        self, monkeypatch
+    ):
+        self._provider_owned_backend(monkeypatch)
+        calls = []
+
+        def run(cmd, *, input, env, timeout, **kwargs):
+            calls.append(input)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(cmd, 0, "PREFLIGHT_OK\n", "")
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                "SIDE_EFFECT_DONE\n",
+                "browser-harness: required daemon 'r7k2' is unhealthy: disconnected\n",
+            )
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", run)
+
+        result = self._json_result(
+            bu_cli.browser_exec("print('payload')", session="r7k2", timeout_s=30)
+        )
+
+        assert result["success"] is False
+        assert result["output"] == "SIDE_EFFECT_DONE\n"
+        assert len(calls) == 2
+        assert "HERMES_PROVIDER_DAEMON_PREFLIGHT" in calls[0]
+        assert calls[1] == "print('payload')"
+
+    def test_provider_daemon_bootstrap_failure_does_not_run_user_code(self, monkeypatch):
+        self._provider_owned_backend(monkeypatch)
+        calls = []
+
+        def run(cmd, *, input, env, timeout, **kwargs):
+            calls.append(input)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    "",
+                    "browser-harness: required daemon 'r7k2' is unhealthy: disconnected\n",
+                )
+            return subprocess.CompletedProcess(cmd, 9, "", "bootstrap failed\n")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", run)
+
+        result = self._json_result(
+            bu_cli.browser_exec("print('payload')", session="r7k2", timeout_s=30)
+        )
+
+        assert result["success"] is False
+        assert result["exit_code"] == 9
+        assert "bootstrap failed" in result["stderr"]
+        assert "HERMES_PROVIDER_DAEMON_PREFLIGHT" in calls[0]
+        assert "HERMES_PROVIDER_DAEMON_BOOTSTRAPPED" in calls[1]
+        assert "restart_daemon" not in calls[1]
+        assert "ensure_daemon()" not in calls[1]
+        assert all(call != "print('payload')" for call in calls)
 
     def test_timeout_returns_actionable_error(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, "cat > /dev/null\nsleep 30\n")
