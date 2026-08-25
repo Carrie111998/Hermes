@@ -450,6 +450,7 @@ export default function ConfigPage() {
 
   return (
     <div className="flex flex-col gap-4">
+      <PluginSlot name="config:top" />
       <Toast toast={toast} />
 
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">

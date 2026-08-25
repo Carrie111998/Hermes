@@ -63,6 +63,11 @@ describe("Config plugin sections", () => {
         optionCount: 4,
       },
     );
+    registerSlot(
+      "top-banner-plugin",
+      "config:top",
+      () => <div data-testid="config-top-plugin">Top plugin content</div>,
+    );
     container = document.createElement("div");
     headerContainer = document.createElement("div");
     document.body.append(container);
@@ -76,6 +81,7 @@ describe("Config plugin sections", () => {
     await act(async () => root.unmount());
     await act(async () => headerRoot.unmount());
     unregisterPluginSlots("buzz-platform");
+    unregisterPluginSlots("top-banner-plugin");
     container.remove();
     headerContainer.remove();
     vi.clearAllMocks();
@@ -101,6 +107,19 @@ describe("Config plugin sections", () => {
 
     expect(container.querySelector('[data-testid="buzz-policy-panel"]')?.textContent).toBe(
       "Buzz policy panel",
+    );
+  });
+
+  it("renders the documented config:top plugin slot", async () => {
+    await act(async () => root.render(<I18nProvider><ConfigPage /></I18nProvider>));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-testid="config-top-plugin"]')?.textContent).toBe(
+      "Top plugin content",
     );
   });
 
