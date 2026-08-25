@@ -1895,9 +1895,62 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert mock_pool.submit.call_count == 2
 
 
+class TestCronCrossChannelThreadWarning:
+    """DAN-3044: Cron scheduler warns 'delivery target lost thread_id' only on same-channel delivery."""
+
+    def test_cross_channel_delivery_logs_debug_not_warning(self, caplog):
+        from gateway.config import Platform
+        job = {
+            "id": "health-check-job",
+            "deliver": "slack:C0B9H0H1YJZ",
+            "origin": {
+                "platform": "slack",
+                "chat_id": "C0BD8QBUSJF",
+                "thread_id": "1720000000.123456",
+            },
+        }
+        mock_cfg = MagicMock()
+        mock_cfg.get_platform_config.return_value = {"token": "xoxb-test"}
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
+            _deliver_result(job, "Infra healthy")
+
+        # No warning emitted for cross-channel delivery
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "lost it" in r.message]
+        assert not warning_records, f"Unexpected warning logged: {warning_records}"
+
+        # Debug logged for cross-channel thread non-inheritance
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG and "does not inherit origin thread_id" in r.message]
+        assert len(debug_records) == 1
+
+    def test_same_channel_lost_thread_logs_warning(self, caplog):
+        job = {
+            "id": "same-channel-job",
+            "deliver": "telegram:12345",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "12345",
+                "thread_id": "42",
+            },
+        }
+        mock_cfg = MagicMock()
+        mock_cfg.get_platform_config.return_value = {"bot_token": "1234:ABC"}
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
+            _deliver_result(job, "Same channel update")
+
+        # Warning IS emitted when the target is the same chat but lost the thread_id
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "lost it" in r.message]
+        assert len(warning_records) == 1
+        assert "origin has thread_id=42 but delivery target lost it" in warning_records[0].message
+
+
 class TestSetCronSessionTitle:
     """Robust cron session titling: #50535/#50536/#50537."""
-
 
     def test_dedupes_on_duplicate_title(self):
         # First write collides (ValueError); helper falls back to lineage #N.
@@ -1908,5 +1961,7 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
+
+
 
 
