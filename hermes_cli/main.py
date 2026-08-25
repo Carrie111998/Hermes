@@ -7842,8 +7842,21 @@ def _register_linux_desktop_entry() -> None:
         print(f"⚠ Could not install the desktop launcher entry: {exc}")
 
 
+def _desktop_source_dir_or_exit() -> Path:
+    """Return the Desktop source directory or fail with an actionable error."""
+    desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+    if not (desktop_dir / "package.json").exists():
+        print(f"Desktop GUI source not found at: {desktop_dir}")
+        sys.exit(1)
+    return desktop_dir
+
+
 def cmd_gui(args: argparse.Namespace):
     """Serialize the mutable Desktop preflight, then build and launch it."""
+    # Validate before constructing the external lock so a broken checkout does
+    # not create lock state or obscure the source-specific diagnostic.
+    _desktop_source_dir_or_exit()
+
     from hermes_cli.desktop_build_lock import DesktopBuildLock
 
     build_lock = DesktopBuildLock(PROJECT_ROOT)
@@ -7867,10 +7880,7 @@ def cmd_gui(args: argparse.Namespace):
 
 def _cmd_gui_impl(args: argparse.Namespace, *, build_lock=None):
     """Build and launch Desktop under ``build_lock`` when a build is allowed."""
-    desktop_dir = PROJECT_ROOT / "apps" / "desktop"
-    if not (desktop_dir / "package.json").exists():
-        print(f"Desktop GUI source not found at: {desktop_dir}")
-        sys.exit(1)
+    desktop_dir = _desktop_source_dir_or_exit()
 
     try:
         from hermes_logging import setup_logging as _setup_logging_gui

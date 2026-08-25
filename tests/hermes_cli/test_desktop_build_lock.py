@@ -61,12 +61,30 @@ def test_desktop_build_lock_releases_after_exception(tmp_path):
     successor.release()
 
 
+def test_gui_reports_missing_source_before_constructing_build_lock(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "broken-hermes-agent"
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    args = argparse.Namespace()
+
+    with patch(
+        "hermes_cli.desktop_build_lock.DesktopBuildLock",
+        side_effect=AssertionError("build lock constructed before source validation"),
+    ), pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(args)
+
+    assert exc.value.code == 1
+    assert capsys.readouterr().out.strip() == (
+        f"Desktop GUI source not found at: {root / 'apps' / 'desktop'}"
+    )
+
+
 def test_gui_refuses_contended_build_before_checking_freshness(tmp_path, monkeypatch):
     root = tmp_path / "hermes-agent"
     desktop_dir = root / "apps" / "desktop"
     desktop_dir.mkdir(parents=True)
     (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    # Keep this lock-order test out of the unrelated Linux keyring bootstrap.
     monkeypatch.setenv("GNOME_KEYRING_CONTROL", "/run/user/1000/keyring")
 
     holder = DesktopBuildLock(root)
