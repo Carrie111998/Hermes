@@ -193,12 +193,12 @@ class TestClarifyDigitShortcut:
     def test_digit_within_range_is_typed_when_a_draft_exists(self):
         cli = _make_cli_stub(["staging", "prod"])
         state = cli._clarify_state
-        buffer = _FakeBuffer("keep v")
+        buffer = _FakeBuffer("  keep v ")
         handler = cli._make_clarify_number_handler(1, "2")
 
         handler(_make_event(buffer))
 
-        assert buffer.text == "keep v2"
+        assert buffer.text == "  keep v 2"
         assert state["response_queue"].empty()
         assert cli._clarify_state is state
 
@@ -230,6 +230,16 @@ class TestClarifyDigitShortcut:
         handler = cli._make_clarify_number_handler(1, "2")
 
         handler(_make_event(_FakeBuffer("")))
+
+        assert _drain(state) == "prod"
+        assert cli._clarify_state is None
+
+    def test_whitespace_only_draft_still_quick_selects(self):
+        cli = _make_cli_stub(["staging", "prod"])
+        state = cli._clarify_state
+        handler = cli._make_clarify_number_handler(1, "2")
+
+        handler(_make_event(_FakeBuffer(" \t ")))
 
         assert _drain(state) == "prod"
         assert cli._clarify_state is None

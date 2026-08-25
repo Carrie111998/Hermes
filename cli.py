@@ -15916,7 +15916,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             state = self._clarify_state
             if not state or self._clarify_freetext:
                 return
-            if event.app.current_buffer.text:
+            if event.app.current_buffer.text.strip():
                 event.app.current_buffer.insert_text(char)
                 return
 
