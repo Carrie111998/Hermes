@@ -116,6 +116,12 @@ def _purge_stale_hermes_modules() -> None:
         import importlib
 
         importlib.invalidate_caches()
+        receipt_module = _m().sys.modules.get("hermes_cli.update_receipt")
+        active_receipt = (
+            getattr(receipt_module, "_current", None)
+            if receipt_module is not None
+            else None
+        )
         purged = []
         for name in list(_m().sys.modules):
             if name in _STALE_PURGE_PROTECTED:
@@ -133,6 +139,18 @@ def _purge_stale_hermes_modules() -> None:
             logger.debug(
                 "Purged %d stale Hermes module(s) after checkout update", len(purged)
             )
+        if active_receipt is not None:
+            try:
+                fresh_receipt_module = importlib.import_module(
+                    "hermes_cli.update_receipt"
+                )
+                setattr(fresh_receipt_module, "_current", active_receipt)
+            except Exception:
+                # Preserve the original recorder rather than silently losing the
+                # only receipt if the freshly pulled module cannot be imported.
+                if receipt_module is not None:
+                    _m().sys.modules["hermes_cli.update_receipt"] = receipt_module
+                raise
     except Exception as exc:
         logger.debug("Could not purge stale Hermes modules: %s", exc)
 

@@ -16,6 +16,8 @@ module graph from the updated checkout.
 
 from __future__ import annotations
 
+import importlib
+import json
 import sys
 import types
 
@@ -23,23 +25,40 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
+from hermes_cli import update_receipt
 
 
 @pytest.fixture(autouse=True)
 def _restore_sys_modules():
-    """Snapshot & restore sys.modules around each test.
-
-    The purge under test evicts real Hermes modules from the cache; later
-    tests in the same process may hold references to the evicted module
-    objects (e.g. `patch.object` targets), so put the originals back.
-    """
+    """Restore module-cache entries and parent-package bindings after purge."""
     snapshot = dict(sys.modules)
+    missing = object()
+    parent_attrs = []
+    for name in snapshot:
+        parent_name, separator, child_name = name.rpartition(".")
+        if not separator or not name.startswith(
+            ("hermes_cli.", "gateway.", "tools.", "tui_gateway.", "agent.")
+        ):
+            continue
+        parent = snapshot.get(parent_name)
+        if parent is not None:
+            parent_attrs.append(
+                (parent, child_name, getattr(parent, child_name, missing))
+            )
+
     yield
+
     for name, mod in snapshot.items():
         sys.modules[name] = mod
     for name in list(sys.modules):
         if name not in snapshot:
             del sys.modules[name]
+    for parent, child_name, original in parent_attrs:
+        if original is missing:
+            if hasattr(parent, child_name):
+                delattr(parent, child_name)
+        else:
+            setattr(parent, child_name, original)
 
 
 def _fake_module(name: str) -> types.ModuleType:
@@ -80,6 +99,35 @@ def test_purge_protects_executing_modules():
     assert sys.modules.get("hermes_cli.update_cmd") is update_cmd
     assert sys.modules.get("hermes_cli.main") is cli_main
     assert "hermes_cli" in sys.modules
+
+
+def test_purge_preserves_active_update_receipt(tmp_path, monkeypatch):
+    """A code-changing update must still publish the receipt it started."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    update_receipt._current = None
+    update_receipt.begin_update_receipt()
+    update_receipt.record_step("git_pull", True, "updated checkout")
+
+    try:
+        update_cmd._purge_stale_hermes_modules()
+        refreshed_receipt = importlib.import_module("hermes_cli.update_receipt")
+        assert refreshed_receipt is not update_receipt
+        path = refreshed_receipt.finalize_update_receipt("success")
+
+        assert path is not None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert len(payload["steps"]) == 1
+        step = payload["steps"][0]
+        assert {key: step[key] for key in ("name", "ok", "detail")} == {
+            "name": "git_pull",
+            "ok": True,
+            "detail": "updated checkout",
+        }
+    finally:
+        update_receipt._current = None
+        refreshed = sys.modules.get("hermes_cli.update_receipt")
+        if refreshed is not None:
+            setattr(refreshed, "_current", None)
 
 
 def test_purge_leaves_prefix_lookalikes_alone():
