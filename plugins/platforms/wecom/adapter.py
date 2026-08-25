@@ -1692,14 +1692,24 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] thinking bubble failed: %s", self.name, e)
 
-    def _abort_thinking(self, chat_id: str, notice_key: str) -> None:
+    def _abort_thinking(self, chat_id: str, notice_key: str, *,
+                        opened_before: float | None = None) -> None:
         """Close an open bubble with a localized notice (abort/timeout path).
 
         Mirrors wecom-bridge: when a turn is aborted or times out, the bubble
         must still land somewhere — replace it with the catalog notice text
         instead of leaving the placeholder to rot into "无结果".
+
+        ``opened_before``: monotonic fence. When given, only a bubble opened
+        BEFORE that moment is closed — prevents an old turn's late finally
+        from killing a NEWER turn's bubble in the same chat (interrupt mode:
+        new turn opens its own bubble while the old one is still unwinding).
         """
-        st = self._thinking_streams.pop(chat_id, None)
+        st = self._thinking_streams.get(chat_id)
+        if st is not None and opened_before is not None \
+                and st["opened_at"] >= opened_before:
+            return  # bubble belongs to a newer turn — leave it alone
+        self._thinking_streams.pop(chat_id, None)
         ka = self._thinking_keepalives.pop(chat_id, None)
         if ka:
             ka.cancel()

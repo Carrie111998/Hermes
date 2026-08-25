@@ -28315,6 +28315,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Monotonic fence for the WeCom thinking-bubble abort net: this turn
+        # may only close bubbles opened BEFORE it started — an interrupting
+        # message can spawn a newer turn whose bubble must survive.
+        _run_turn_opened_at = time.monotonic()
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -29859,7 +29863,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # placeholder to rot into WeCom's "无结果" state. Best-effort —
             # mirrors wecom-bridge's turn_end finally block. When the turn DID
             # deliver, the bubble was already finished in-place by send() and
-            # this is a no-op.
+            # this is a no-op. opened_before fences against killing a NEWER
+            # turn's bubble when this turn was interrupted and a replacement
+            # run has already opened its own.
             try:
                 _rh = result_holder[0] if result_holder[0] else {}
                 _delivered = bool(_rh.get("final_response"))
@@ -29869,7 +29875,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if callable(_abort):
                         _notice = "aborted" if _rh.get("interrupted") else "timeout"
                         await asyncio.get_running_loop().run_in_executor(
-                            None, _abort, source.chat_id, _notice,
+                            None, lambda: _abort(
+                                source.chat_id, _notice,
+                                opened_before=_run_turn_opened_at),
                         )
             except Exception:
                 pass
