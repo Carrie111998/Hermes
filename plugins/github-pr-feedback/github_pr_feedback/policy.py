@@ -16,6 +16,9 @@ _FEEDBACK_KINDS = frozenset(
 )
 MAX_ASSIGNEE_RULES = 32
 MAX_MATCH_TERMS_PER_RULE = 32
+MAX_COMMAND_ARGUMENTS = 32
+MAX_COMMAND_ARGUMENT_LENGTH = 4096
+_SHELL_COMMANDS = frozenset({"bash", "dash", "fish", "sh", "zsh"})
 
 
 def _nonempty_string(value: object, field: str) -> str:
@@ -154,6 +157,31 @@ class LocalCIAuditPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class PostMergePolicy:
+    """A fixed, local-only deployment action after a confirmed merge."""
+
+    deployment_path: Path
+    protected_runtime_entry: str
+    package_argv: tuple[str, ...]
+    bundle_path: str
+    bundle_identifier: str
+    relaunch_argv: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MergeMaintainerPolicy:
+    """Strict scope and freshness limits for the deterministic merge owner."""
+
+    assignee: str
+    repository: str
+    author_login: str
+    base_branch: str
+    receipt_max_age_seconds: int
+    report_only: bool
+    post_merge: PostMergePolicy | None
+
+
+@dataclass(frozen=True, slots=True)
 class PluginPolicy:
     enabled: bool
     targets: Mapping[str, RepositoryTarget]
@@ -167,6 +195,7 @@ class PluginPolicy:
     board: str | None
     assignee_rules: tuple[AssigneeRule, ...] = ()
     local_ci_audit: LocalCIAuditPolicy | None = None
+    merge_maintainer: MergeMaintainerPolicy | None = None
 
     def assignee_for(self, body: str) -> str:
         """Choose the unique highest-scoring specialist, otherwise the fallback."""
@@ -295,6 +324,129 @@ def _parse_local_ci_audit(raw: object) -> LocalCIAuditPolicy | None:
     return LocalCIAuditPolicy(assignee=assignee, post_results=post_results)
 
 
+def _relative_path(value: object, field: str) -> str:
+    text = _nonempty_string(value, field)
+    path = Path(text)
+    if path.is_absolute() or "\x00" in text or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"{field} must be a normalized relative path")
+    return text
+
+
+def _command_argv(value: object, field: str) -> tuple[str, ...]:
+    argv = _string_list(value, field)
+    if len(argv) > MAX_COMMAND_ARGUMENTS:
+        raise ValueError(f"{field} exceeds its bounded limit")
+    if any(
+        len(argument) > MAX_COMMAND_ARGUMENT_LENGTH
+        or "\x00" in argument
+        or "\n" in argument
+        or "\r" in argument
+        for argument in argv
+    ):
+        raise ValueError(f"{field} contains an invalid argument")
+    if Path(argv[0]).name.casefold() in _SHELL_COMMANDS:
+        raise ValueError(f"{field} must not invoke a command shell")
+    return argv
+
+
+def _parse_post_merge(raw: object, *, target: RepositoryTarget) -> PostMergePolicy | None:
+    if not isinstance(raw, Mapping):
+        raise ValueError("post_merge must be a mapping")
+    enabled = raw.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("post_merge enabled must be a boolean")
+    if not enabled:
+        if set(raw) != {"enabled"}:
+            raise ValueError("disabled post_merge has unknown fields")
+        return None
+    expected = {
+        "enabled",
+        "deployment_path",
+        "protected_runtime_entry",
+        "package_argv",
+        "bundle_path",
+        "bundle_identifier",
+        "relaunch_argv",
+    }
+    if set(raw) != expected:
+        raise ValueError("post_merge has missing or unknown fields")
+    deployment_path = Path(_nonempty_string(raw["deployment_path"], "deployment_path"))
+    if (
+        not deployment_path.is_absolute()
+        or not deployment_path.is_dir()
+        or not _is_git_worktree(deployment_path)
+    ):
+        raise ValueError("deployment_path must be an existing Git worktree")
+    deployment_path = deployment_path.resolve()
+    if deployment_path == target.local_path:
+        raise ValueError("deployment_path must be distinct from the audit worktree")
+    return PostMergePolicy(
+        deployment_path=deployment_path,
+        protected_runtime_entry=_relative_path(
+            raw["protected_runtime_entry"], "protected_runtime_entry"
+        ),
+        package_argv=_command_argv(raw["package_argv"], "package_argv"),
+        bundle_path=_relative_path(raw["bundle_path"], "bundle_path"),
+        bundle_identifier=_nonempty_string(raw["bundle_identifier"], "bundle_identifier"),
+        relaunch_argv=_command_argv(raw["relaunch_argv"], "relaunch_argv"),
+    )
+
+
+def _parse_merge_maintainer(
+    raw: object, *, targets: Mapping[str, RepositoryTarget]
+) -> MergeMaintainerPolicy | None:
+    if not isinstance(raw, Mapping):
+        raise ValueError("merge_maintainer must be a mapping")
+    enabled = raw.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("merge_maintainer enabled must be a boolean")
+    if not enabled:
+        if set(raw) != {"enabled"}:
+            raise ValueError("disabled merge_maintainer has unknown fields")
+        return None
+    expected = {
+        "enabled",
+        "assignee",
+        "repository",
+        "author_login",
+        "base_branch",
+        "receipt_max_age_seconds",
+        "report_only",
+        "post_merge",
+    }
+    if set(raw) != expected:
+        raise ValueError("merge_maintainer has missing or unknown fields")
+    repository = _repository(raw["repository"], "merge_maintainer repository")
+    target = targets.get(repository)
+    if target is None or target.head_repository != repository:
+        raise ValueError("merge_maintainer repository must be an exact same-repository target")
+    author_login = _nonempty_string(raw["author_login"], "merge_maintainer author_login")
+    if author_login.casefold() != target.owner_login.casefold():
+        raise ValueError("merge_maintainer author_login must match the target owner")
+    base_branch = _nonempty_string(raw["base_branch"], "merge_maintainer base_branch")
+    if base_branch.startswith("refs/") or any(character.isspace() for character in base_branch):
+        raise ValueError("merge_maintainer base_branch must be a literal branch name")
+    receipt_max_age_seconds = raw["receipt_max_age_seconds"]
+    if (
+        not isinstance(receipt_max_age_seconds, int)
+        or isinstance(receipt_max_age_seconds, bool)
+        or receipt_max_age_seconds < 1
+    ):
+        raise ValueError("receipt_max_age_seconds must be a positive integer")
+    report_only = raw["report_only"]
+    if not isinstance(report_only, bool):
+        raise ValueError("report_only must be a boolean")
+    return MergeMaintainerPolicy(
+        assignee=_nonempty_string(raw["assignee"], "merge_maintainer assignee"),
+        repository=repository,
+        author_login=author_login,
+        base_branch=base_branch,
+        receipt_max_age_seconds=receipt_max_age_seconds,
+        report_only=report_only,
+        post_merge=_parse_post_merge(raw["post_merge"], target=target),
+    )
+
+
 def load_policy(raw: object) -> PluginPolicy:
     """Parse plugin configuration, retaining no enabled behavior on any omission."""
 
@@ -320,6 +472,7 @@ def load_policy(raw: object) -> PluginPolicy:
         "auto_dispatch",
         "assignee_rules",
         "local_ci_audit",
+        "merge_maintainer",
     }
     if not required.issubset(raw) or set(raw) - required - optional:
         raise ValueError("enabled configuration has missing or unknown fields")
@@ -356,16 +509,27 @@ def load_policy(raw: object) -> PluginPolicy:
     if not reviewer_logins and not reviewer_associations:
         raise ValueError("at least one reviewer login or association is required")
     return PluginPolicy(
-        True,
-        targets,
-        reviewer_logins,
-        reviewer_associations,
-        include_self_feedback,
-        include_bot_feedback,
-        auto_dispatch,
-        _not_before(raw["not_before"]),
-        _nonempty_string(raw["assignee"], "assignee"),
-        _nonempty_string(raw["board"], "board"),
-        _parse_assignee_rules(raw["assignee_rules"]) if "assignee_rules" in raw else (),
-        _parse_local_ci_audit(raw["local_ci_audit"]) if "local_ci_audit" in raw else None,
+        enabled=True,
+        targets=targets,
+        reviewer_logins=reviewer_logins,
+        reviewer_associations=reviewer_associations,
+        include_self_feedback=include_self_feedback,
+        include_bot_feedback=include_bot_feedback,
+        auto_dispatch=auto_dispatch,
+        not_before=_not_before(raw["not_before"]),
+        assignee=_nonempty_string(raw["assignee"], "assignee"),
+        board=_nonempty_string(raw["board"], "board"),
+        assignee_rules=(
+            _parse_assignee_rules(raw["assignee_rules"]) if "assignee_rules" in raw else ()
+        ),
+        local_ci_audit=(
+            _parse_local_ci_audit(raw["local_ci_audit"])
+            if "local_ci_audit" in raw
+            else None
+        ),
+        merge_maintainer=(
+            _parse_merge_maintainer(raw["merge_maintainer"], targets=targets)
+            if "merge_maintainer" in raw
+            else None
+        ),
     )

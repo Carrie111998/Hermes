@@ -11,6 +11,8 @@ import pytest
 from github_pr_feedback.ledger import ClaimLease, FeedbackLedger
 from github_pr_feedback.policy import (
     FeedbackReceipt,
+    MergeMaintainerPolicy,
+    PostMergePolicy,
     PullRequest,
     Reviewer,
     load_policy,
@@ -63,6 +65,120 @@ def enabled_raw_config(local_path: Path) -> dict[str, object]:
         "assignee": "repair-agent",
         "board": "repairs",
     }
+
+
+def enabled_merge_config(repository_path: Path, deployment_path: Path) -> dict[str, object]:
+    raw = enabled_raw_config(repository_path)
+    raw["merge_maintainer"] = {
+        "enabled": True,
+        "assignee": "pr-merge-maintainer",
+        "repository": "acme/widgets",
+        "author_login": "owner",
+        "base_branch": "stable",
+        "receipt_max_age_seconds": 21600,
+        "report_only": False,
+        "post_merge": {
+            "enabled": True,
+            "deployment_path": str(deployment_path),
+            "protected_runtime_entry": "main.py",
+            "package_argv": [
+                "python3",
+                "tools/tb.py",
+                "gui-package-macos",
+                "--replace",
+                "--json",
+            ],
+            "bundle_path": "desktop/macos/Example/build/Example.app",
+            "bundle_identifier": "com.example.local.operator",
+            "relaunch_argv": ["/usr/bin/open", "-n"],
+        },
+    }
+    return raw
+
+
+def test_merge_maintainer_is_disabled_by_default(tmp_path: Path) -> None:
+    repository_path = tmp_path / "widgets"
+    initialize_git_worktree(repository_path)
+
+    policy = load_policy(enabled_raw_config(repository_path))
+
+    assert policy.merge_maintainer is None
+
+
+def test_enabled_policy_parses_strict_merge_and_post_merge_settings(tmp_path: Path) -> None:
+    repository_path = tmp_path / "widgets"
+    deployment_path = tmp_path / "deployment"
+    initialize_git_worktree(repository_path)
+    initialize_git_worktree(deployment_path)
+
+    policy = load_policy(enabled_merge_config(repository_path, deployment_path))
+
+    assert policy.merge_maintainer == MergeMaintainerPolicy(
+        assignee="pr-merge-maintainer",
+        repository="acme/widgets",
+        author_login="owner",
+        base_branch="stable",
+        receipt_max_age_seconds=21600,
+        report_only=False,
+        post_merge=PostMergePolicy(
+            deployment_path=deployment_path.resolve(),
+            protected_runtime_entry="main.py",
+            package_argv=(
+                "python3",
+                "tools/tb.py",
+                "gui-package-macos",
+                "--replace",
+                "--json",
+            ),
+            bundle_path="desktop/macos/Example/build/Example.app",
+            bundle_identifier="com.example.local.operator",
+            relaunch_argv=("/usr/bin/open", "-n"),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda merge: merge.update({"unknown": True}),
+        lambda merge: merge.update({"repository": "other/widgets"}),
+        lambda merge: merge.update({"author_login": "someone-else"}),
+        lambda merge: merge.update({"receipt_max_age_seconds": 0}),
+        lambda merge: merge.update({"merge_method": "merge"}),
+        lambda merge: merge.update({"post_merge": {"deployment_path": "/tmp"}}),
+        lambda merge: merge["post_merge"].update({"unknown": True}),
+        lambda merge: merge["post_merge"].update({"protected_runtime_entry": "/main.py"}),
+        lambda merge: merge["post_merge"].update({"bundle_path": "../Example.app"}),
+        lambda merge: merge["post_merge"].update({"package_argv": "python3 tools/tb.py"}),
+        lambda merge: merge["post_merge"].update({"relaunch_argv": []}),
+    ],
+)
+def test_enabled_policy_rejects_unsafe_merge_maintainer_settings(
+    tmp_path: Path, mutation
+) -> None:
+    repository_path = tmp_path / "widgets"
+    deployment_path = tmp_path / "deployment"
+    initialize_git_worktree(repository_path)
+    initialize_git_worktree(deployment_path)
+    raw = enabled_merge_config(repository_path, deployment_path)
+    mutation(raw["merge_maintainer"])
+
+    with pytest.raises(ValueError):
+        load_policy(raw)
+
+
+def test_disabled_post_merge_hook_requires_only_explicit_enabled_flag(tmp_path: Path) -> None:
+    repository_path = tmp_path / "widgets"
+    deployment_path = tmp_path / "deployment"
+    initialize_git_worktree(repository_path)
+    initialize_git_worktree(deployment_path)
+    raw = enabled_merge_config(repository_path, deployment_path)
+    raw["merge_maintainer"]["post_merge"] = {"enabled": False}
+
+    policy = load_policy(raw)
+
+    assert policy.merge_maintainer is not None
+    assert policy.merge_maintainer.post_merge is None
 
 
 def test_policy_can_explicitly_admit_owner_and_bot_feedback_without_widening_human_reviewers(
