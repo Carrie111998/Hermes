@@ -129,6 +129,14 @@ let watermarksSeeded = false
  *  unread badge already carries the signal. Persisted via ctx.storage. */
 const $activityToasts = atom(false)
 
+/** Roster navigation-group state (see the nav-groups section below for the
+ *  pure helpers; the atoms live here with the other roster atoms so the
+ *  soul-helper test slice never executes `atom()` without the SDK). */
+const $navGroups = atom({})
+const $navGroupOrder = atom([])
+const $navGroupColors = atom({})
+const $navGroupAliases = atom({})
+
 /** Flip the activity-toast pref and persist it. */
 function setActivityToasts(enabled) {
   $activityToasts.set(enabled)
@@ -5165,6 +5173,224 @@ function resolveRosterMentions(text, roster, active = {}) {
   return mentioned
 }
 
+// ── roster navigation groups ──────────────────────────────────────────────
+// A "nav group" is a user-organization folder over the Bots roster — bots AND
+// group chats — orthogonal to group-chat membership (botGroups above). It is a
+// pure front-end preference persisted via ctx.storage (never bot meta or
+// profile.yaml). Flexibility contract: an item may sit in a group or ungrouped;
+// it has ONE home group (moveItemToGroup moves it, folder-to-folder); it may
+// additionally be ALIASED into other groups (setItemAlias) as a shortcut that
+// does not change its home. Every helper is pure over plain data so it is
+// testable without the SDK or React.
+
+const NAV_GROUPS_KEY = 'nav-groups'
+const NAV_GROUP_ORDER_KEY = 'nav-group-order'
+const NAV_GROUP_COLORS_KEY = 'nav-group-colors'
+const NAV_GROUP_ALIASES_KEY = 'nav-group-aliases'
+
+/** Roster-wide stable key for a bot — reuses the roster's own keying so a
+ *  group survives connection switches and profile renames. */
+function botNavKey(bot) {
+  return botRosterKey(bot)
+}
+
+/** Stable key for a group-chat row (namespaced to avoid colliding with bots). */
+function groupNavKey(name) {
+  return `group:${String(name || '').trim()}`
+}
+
+/** Trim a group name; empty/blank becomes null (ungrouped sentinel). */
+function normalizeGroupName(name) {
+  const trimmed = String(name || '').trim()
+  return trimmed || null
+}
+
+/** Whether any item actually carries a group — the opt-in gate. */
+function hasAnyNavGroups(groups) {
+  return Object.values(groups || {}).some(name => Boolean(normalizeGroupName(name)))
+}
+
+/** Split items into (ordered) group sections plus an ungrouped list. `items`
+ *  carry at least a `key`; extra fields ride through. Aliased keys appear in
+ *  their target group as `alias: true` copies while the home is unchanged. */
+function bucketByGroup(items, groups, groupOrder, aliases) {
+  const map = new Map()
+  const ungrouped = []
+  const index = new Map((items || []).map(item => [item.key, item]))
+
+  for (const item of items || []) {
+    const name = normalizeGroupName(groups?.[item.key])
+    if (name) {
+      if (!map.has(name)) map.set(name, [])
+      map.get(name).push(item)
+    } else {
+      ungrouped.push(item)
+    }
+  }
+
+  for (const [rawName, keys] of Object.entries(aliases || {})) {
+    const target = normalizeGroupName(rawName)
+    if (!target) continue
+    for (const key of keys || []) {
+      const item = index.get(key)
+      if (!item) continue
+      if (!map.has(target)) map.set(target, [])
+      map.get(target).push({ ...item, alias: true })
+    }
+  }
+
+  const seen = new Set()
+  const ordered = []
+  for (const raw of groupOrder || []) {
+    const name = normalizeGroupName(raw)
+    if (name && map.has(name) && !seen.has(name)) {
+      seen.add(name)
+      ordered.push(name)
+    }
+  }
+  const rest = [...map.keys()]
+    .filter(name => !seen.has(name))
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+  for (const name of rest) {
+    seen.add(name)
+    ordered.push(name)
+  }
+
+  return { sections: ordered.map(name => ({ name, items: map.get(name) })), ungrouped }
+}
+
+/** Move an item into a group, or ungroup it (groupName null/blank). */
+function moveItemToGroup(groups, key, groupName) {
+  const next = { ...(groups || {}) }
+  const target = normalizeGroupName(groupName)
+  if (target) next[key] = target
+  else delete next[key]
+  return next
+}
+
+/** Add or remove an alias (shortcut) of `key` in `groupName`. */
+function setItemAlias(aliases, groupName, key, enabled) {
+  const next = {}
+  for (const [g, keys] of Object.entries(aliases || {})) {
+    next[g] = (keys || []).slice()
+  }
+  const target = normalizeGroupName(groupName)
+  if (!target) return next
+  if (enabled) {
+    if (!next[target]) next[target] = []
+    if (!next[target].includes(key)) next[target].push(key)
+  } else {
+    next[target] = (next[target] || []).filter(k => k !== key)
+    if (next[target].length === 0) delete next[target]
+  }
+  return next
+}
+
+/** Move a group to `toIndex` in the order list (drag reorder). */
+function reorderGroup(order, groupName, toIndex) {
+  const list = (order || []).slice()
+  const name = normalizeGroupName(groupName)
+  if (!name) return list
+  const from = list.indexOf(name)
+  if (from >= 0) list.splice(from, 1)
+  const idx = Math.max(0, Math.min(toIndex, list.length))
+  list.splice(idx, 0, name)
+  return list
+}
+
+/** Ensure a group exists in the order list (append if new). */
+function addGroup(order, groupName) {
+  const name = normalizeGroupName(groupName)
+  if (!name) return (order || []).slice()
+  const list = (order || []).slice()
+  if (!list.includes(name)) list.push(name)
+  return list
+}
+
+/** Rename a group; name collisions merge (items/aliases follow, dedupe, color
+ *  survives, order slot updates). */
+function renameGroup(groups, order, aliases, colors, oldName, newName) {
+  const from = normalizeGroupName(oldName)
+  const to = normalizeGroupName(newName)
+  if (!from || !to || from === to) return { groups, order, aliases, colors }
+
+  const nextGroups = {}
+  for (const [key, g] of Object.entries(groups || {})) {
+    nextGroups[key] = normalizeGroupName(g) === from ? to : g
+  }
+
+  const nextAliases = {}
+  for (const [g, keys] of Object.entries(aliases || {})) {
+    const target = normalizeGroupName(g) === from ? to : g
+    nextAliases[target] = [...(nextAliases[target] || []), ...(keys || [])]
+  }
+  for (const g of Object.keys(nextAliases)) {
+    nextAliases[g] = [...new Set(nextAliases[g])]
+  }
+
+  const nextOrder = [...new Set((order || []).map(name => (normalizeGroupName(name) === from ? to : name)))]
+
+  const nextColors = {}
+  for (const [g, c] of Object.entries(colors || {})) {
+    const target = normalizeGroupName(g) === from ? to : g
+    if (target && !(target in nextColors)) nextColors[target] = c
+  }
+
+  return { groups: nextGroups, order: nextOrder, aliases: nextAliases, colors: nextColors }
+}
+
+/** Delete a group: its items return to ungrouped; aliases/color/order drop. */
+function deleteGroup(groups, order, aliases, colors, groupName) {
+  const from = normalizeGroupName(groupName)
+  if (!from) return { groups, order, aliases, colors }
+
+  const nextGroups = {}
+  for (const [key, g] of Object.entries(groups || {})) {
+    if (normalizeGroupName(g) !== from) nextGroups[key] = g
+  }
+
+  const nextAliases = {}
+  for (const [g, keys] of Object.entries(aliases || {})) {
+    if (normalizeGroupName(g) !== from) nextAliases[g] = keys
+  }
+
+  const nextOrder = (order || []).filter(name => normalizeGroupName(name) !== from)
+
+  const nextColors = {}
+  for (const [g, c] of Object.entries(colors || {})) {
+    if (normalizeGroupName(g) !== from) nextColors[g] = c
+  }
+
+  return { groups: nextGroups, order: nextOrder, aliases: nextAliases, colors: nextColors }
+}
+
+/** Persist all four nav-group atoms to ctx.storage (best-effort). */
+function persistNavState(storage = pluginCtx?.storage) {
+  try {
+    Promise.resolve(storage?.set?.(NAV_GROUPS_KEY, $navGroups.get())).catch(() => undefined)
+    Promise.resolve(storage?.set?.(NAV_GROUP_ORDER_KEY, $navGroupOrder.get())).catch(() => undefined)
+    Promise.resolve(storage?.set?.(NAV_GROUP_COLORS_KEY, $navGroupColors.get())).catch(() => undefined)
+    Promise.resolve(storage?.set?.(NAV_GROUP_ALIASES_KEY, $navGroupAliases.get())).catch(() => undefined)
+  } catch {
+    /* storage unavailable — the grouping holds for this window only */
+  }
+}
+
+/** MIME type for nav-group drags. The payload is JSON { key, kind }. */
+const NAV_DRAG_MIME = 'application/x-hermes-nav-item'
+
+/** Read a nav-group drag payload off a drag/drop event (null if not ours). */
+function parseNavDragEvent(event) {
+  const raw = event?.dataTransfer?.getData?.(NAV_DRAG_MIME)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed.key === 'string' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 /** Source-qualified identity for a roster row — the React list key AND the
  *  cross-surface roster identity. Names alone are NOT unique in a
  *  multi-source roster (two connections can both expose 'default');
@@ -8992,7 +9218,7 @@ function botRowOwnsWorkspace(
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
-function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
+function BotRow({ bot, onDelete, onEdit, onGroup, onMoveNav, onCopyNav, showHandle }) {
   const activeProfile = useValue(host.state.profile)
   const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
   const selectedRosterKey = useValue($selectedRosterKey)
@@ -9112,6 +9338,11 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
 
   const row = jsxs('button', {
     type: 'button',
+    draggable: true,
+    onDragStart: event => {
+      event.dataTransfer.setData(NAV_DRAG_MIME, JSON.stringify({ key: botNavKey(bot), kind: 'bot' }))
+      event.dataTransfer.effectAllowed = 'copyMove'
+    },
     onPointerEnter: warm,
     onClick: open,
     className: cn(
@@ -9265,6 +9496,15 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
           jsx(ContextMenuItem, {
             onSelect: () => void ensureBotMetadata(bot).then(() => onGroup(bot)).catch(error => host.notifyError?.(error, 'Could not load bot groups')),
             children: groups.length ? `Groups: ${groups.join(', ')}…` : 'Manage groups…'
+          }),
+          jsx(ContextMenuSeparator, {}),
+          jsx(ContextMenuItem, {
+            onSelect: () => onMoveNav?.(bot),
+            children: 'Move to group…'
+          }),
+          jsx(ContextMenuItem, {
+            onSelect: () => onCopyNav?.(bot),
+            children: 'Copy to group…'
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
@@ -14726,7 +14966,7 @@ function openGroupChat(group) {
 /** One group chat as one quiet roster row. The room owns one visual identity;
  *  member details stay in its tooltip and workspace instead of competing
  *  with bot avatars in the narrow sidebar. */
-function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
+function GroupRow({ active, group, members, needsYou, onOpen, onDisband, onMoveNav, onCopyNav }) {
   const rooms = useValue($groupChats)
   const room = rooms[group] || { log: [] }
   const log = Array.isArray(room.log) ? room.log : []
@@ -14744,6 +14984,11 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
 
   const row = jsxs('button', {
     type: 'button',
+    draggable: true,
+    onDragStart: event => {
+      event.dataTransfer.setData(NAV_DRAG_MIME, JSON.stringify({ key: groupNavKey(group), kind: 'group' }))
+      event.dataTransfer.effectAllowed = 'copyMove'
+    },
     onClick: () => {
       haptic('tap')
       onOpen(group)
@@ -14835,6 +15080,15 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
+            onSelect: () => onMoveNav?.(group),
+            children: 'Move to group…'
+          }),
+          jsx(ContextMenuItem, {
+            onSelect: () => onCopyNav?.(group),
+            children: 'Copy to group…'
+          }),
+          jsx(ContextMenuSeparator, {}),
+          jsx(ContextMenuItem, {
             className: 'text-destructive focus:text-destructive',
             onSelect: () => onDisband({ name: group, members }),
             children: 'Delete Group'
@@ -14842,6 +15096,168 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
         ]
       })
     ]
+  })
+}
+
+/** Foldable heading for a roster navigation group — carries the group's accent
+ *  color and a right-click menu (new / rename / delete group). */
+function NavGroupHeader({ collapsed, count, color, name, onToggle, onCreateGroup, onRename, onDelete, onDropItem }) {
+  const button = jsxs('button', {
+    type: 'button',
+    'aria-expanded': !collapsed,
+    className:
+      'mt-1 flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)',
+    onClick: onToggle,
+    onDragOver: event => {
+      if (!parseNavDragEvent(event)) return
+      event.preventDefault()
+      event.dataTransfer.dropEffect = event.altKey ? 'copy' : 'move'
+    },
+    onDrop: event => {
+      const data = parseNavDragEvent(event)
+      if (!data) return
+      event.preventDefault()
+      onDropItem?.(data.key, event.altKey ? 'copy' : 'move')
+    },
+    children: [
+      jsx(Codicon, { name: collapsed ? 'chevron-right' : 'chevron-down', className: 'shrink-0' }),
+      jsx('span', { className: 'size-2 shrink-0 rounded-full', style: color ? { backgroundColor: color } : undefined }),
+      jsx('span', { className: 'min-w-0 flex-1 truncate', children: name }),
+      jsx('span', { className: 'shrink-0 font-normal tabular-nums text-(--ui-text-quaternary)', children: count })
+    ]
+  })
+
+  return jsxs(ContextMenu, {
+    children: [
+      jsx(ContextMenuTrigger, { asChild: true, children: button }),
+      jsxs(ContextMenuContent, {
+        children: [
+          jsx(ContextMenuItem, { onSelect: onCreateGroup, children: 'New group…' }),
+          jsx(ContextMenuItem, { onSelect: onRename, children: 'Rename group…' }),
+          jsx(ContextMenuSeparator, {}),
+          jsx(ContextMenuItem, {
+            className: 'text-destructive focus:text-destructive',
+            onSelect: onDelete,
+            children: 'Delete group'
+          })
+        ]
+      })
+    ]
+  })
+}
+
+/** Single-line group-name prompt used for "new group" and "rename group". */
+function NavGroupDialog({ open, title, initial, confirmLabel, onClose, onSubmit }) {
+  const [value, setValue] = useState(initial || '')
+
+  useEffect(() => {
+    if (open) setValue(initial || '')
+  }, [open, initial])
+
+  const commit = () => {
+    const name = String(value || '').trim()
+    if (!name) return
+    onSubmit(name)
+    onClose()
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: next => {
+      if (!next) onClose()
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm',
+      children: [
+        jsx(DialogHeader, { children: jsx(DialogTitle, { children: title }) }),
+        jsx('div', {
+          className: 'px-4 pb-2',
+          children: jsx(Input, {
+            value,
+            autoFocus: true,
+            placeholder: 'Group name',
+            onChange: event => setValue(event.target.value),
+            onKeyDown: event => {
+              if (event.key === 'Enter') commit()
+            }
+          })
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'ghost', onClick: onClose, children: 'Cancel' }),
+            jsx(Button, { disabled: !String(value || '').trim(), onClick: commit, children: confirmLabel || 'Save' })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+/** Choose a destination group for a bot/group-chat (move) or a shortcut (copy).
+ *  Lists every group plus "New group…"; move mode also offers "Remove from
+ *  group". `onSelect` receives the group name, '__new__' for the new-group
+ *  prompt, or null to ungroup. */
+function NavMoveDialog({ open, title, groups, currentGroup, mode, onClose, onSelect }) {
+  return jsx(Dialog, {
+    open,
+    onOpenChange: next => {
+      if (!next) onClose()
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm',
+      children: [
+        jsx(DialogHeader, { children: jsx(DialogTitle, { children: title }) }),
+        jsx('div', {
+          className: 'flex max-h-72 flex-col gap-0.5 overflow-y-auto px-2 pb-2',
+          children: [
+            ...groups.map(group =>
+              jsx('button', {
+                key: group,
+                type: 'button',
+                className:
+                  'flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-(--chrome-action-hover)',
+                onClick: () => {
+                  onSelect(group)
+                  onClose()
+                },
+                children: [
+                  jsx(Codicon, { name: 'folder', className: 'text-(--ui-text-tertiary)' }),
+                  jsx('span', { className: 'min-w-0 flex-1 truncate', children: group }),
+                  currentGroup === group
+                    ? jsx(Codicon, { name: 'check', className: 'shrink-0 text-(--ui-accent)' })
+                    : null
+                ]
+              })
+            ),
+            jsx('button', {
+              type: 'button',
+              className:
+                'flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-(--chrome-action-hover)',
+              onClick: () => {
+                onSelect('__new__')
+                onClose()
+              },
+              children: [jsx(Codicon, { name: 'add', className: 'text-(--ui-text-tertiary)' }), jsx('span', { children: 'New group…' })]
+            }),
+            mode === 'move' && currentGroup
+              ? jsx('button', {
+                  type: 'button',
+                  className:
+                    'flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-destructive transition-colors hover:bg-(--chrome-action-hover)',
+                  onClick: () => {
+                    onSelect(null)
+                    onClose()
+                  },
+                  children: [
+                    jsx(Codicon, { name: 'close', className: 'text-(--ui-text-tertiary)' }),
+                    jsx('span', { children: 'Remove from group' })
+                  ]
+                })
+              : null
+          ]
+        })
+      ]
+    })
   })
 }
 
@@ -14918,6 +15334,11 @@ function BotsPane() {
   const [activityFilter, setActivityFilter] = useState('all')
   const [gatewayFilter, setGatewayFilter] = useState('all')
   const [collapsedRosterSections, setCollapsedRosterSections] = useState(() => new Set())
+  const [navGroupCreateOpen, setNavGroupCreateOpen] = useState(false)
+  const [navGroupRenaming, setNavGroupRenaming] = useState(null)
+  const [navGroupDeleting, setNavGroupDeleting] = useState(null)
+  const [navMoving, setNavMoving] = useState(null)
+  const [navCreating, setNavCreating] = useState(null)
   const hiddenSectionRef = useRef(null)
   const activityToasts = useValue($activityToasts)
   const groupChatName = useValue($groupChatWorkspace)
@@ -14932,6 +15353,10 @@ function BotsPane() {
   const rosterHydrated = useValue($rosterHydrated)
   const selectionHydrated = useValue($selectedRosterHydrated)
   const selectedRosterKey = useValue($selectedRosterKey)
+  const navGroups = useValue($navGroups)
+  const navGroupOrder = useValue($navGroupOrder)
+  const navGroupColors = useValue($navGroupColors)
+  const navGroupAliases = useValue($navGroupAliases)
 
   // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
   // retry immediately instead of waiting out the poll interval.
@@ -15151,6 +15576,38 @@ function BotsPane() {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
   }
 
+  // ── roster navigation groups (opt-in folder organization) ──────────────
+  const grouped = hasAnyNavGroups(navGroups)
+  const allNavGroupNames = [
+    ...new Set([
+      ...navGroupOrder.map(normalizeGroupName).filter(Boolean),
+      ...Object.values(navGroups).map(normalizeGroupName).filter(Boolean)
+    ])
+  ]
+  const navItems = [
+    ...botRows.map(row => ({ key: botNavKey(row.bot), kind: 'bot', bot: row.bot })),
+    ...groupRows.map(row => ({ key: groupNavKey(row.name), kind: 'group', group: row }))
+  ]
+  const { sections: navSections, ungrouped: navUngrouped } = bucketByGroup(
+    navItems,
+    navGroups,
+    navGroupOrder,
+    navGroupAliases
+  )
+
+  const applyNavMove = (key, mode, groupName) => {
+    if (mode === 'copy') {
+      $navGroupAliases.set(setItemAlias($navGroupAliases.get(), groupName, key, true))
+    } else if (groupName) {
+      $navGroups.set(moveItemToGroup($navGroups.get(), key, groupName))
+    } else {
+      $navGroups.set(moveItemToGroup($navGroups.get(), key, null))
+    }
+    persistNavState()
+  }
+
+  const startNavMove = (key, mode) => setNavMoving({ key, mode })
+
   const renderBotRow = (bot, keyPrefix = '') =>
     jsx(
       BotRow,
@@ -15159,6 +15616,8 @@ function BotsPane() {
         onDelete: setDeleting,
         onEdit: setEditing,
         onGroup: setGrouping,
+        onMoveNav: () => startNavMove(botNavKey(bot), 'move'),
+        onCopyNav: () => startNavMove(botNavKey(bot), 'copy'),
         showHandle: botNeedsHandleLabel(bot, roster, allMeta)
       },
       `${keyPrefix}${botRosterKey(bot)}`
@@ -15173,10 +15632,86 @@ function BotsPane() {
         members: row.members,
         needsYou: Boolean(groupNeedsYou[row.name]),
         onOpen: openGroupChat,
-        onDisband: setDeletingGroup
+        onDisband: setDeletingGroup,
+        onMoveNav: () => startNavMove(groupNavKey(row.name), 'move'),
+        onCopyNav: () => startNavMove(groupNavKey(row.name), 'copy')
       },
       `group:${row.name}`
     )
+
+  const renderNavItem = item =>
+    item.kind === 'group' ? renderGroupRow(item.group) : renderBotRow(item.bot, item.alias ? 'alias:' : '')
+
+  const renderNavGroupSection = section => {
+    const sectionId = `nav-group:${section.name}`
+    const collapsed = rosterSectionCollapsed(sectionId)
+
+    return jsxs(
+      'div',
+      {
+        className: 'min-w-0',
+        children: [
+          jsx(NavGroupHeader, {
+            collapsed,
+            count: section.items.length,
+            color: navGroupColors[section.name],
+            name: section.name,
+            onToggle: () => toggleRosterSection(sectionId),
+            onCreateGroup: () => setNavGroupCreateOpen(true),
+            onRename: () => setNavGroupRenaming(section.name),
+            onDelete: () => setNavGroupDeleting(section.name),
+            onDropItem: (key, mode) => applyNavMove(key, mode, section.name)
+          }),
+          collapsed
+            ? null
+            : jsx('div', {
+                className: 'grid min-w-0 gap-0.5',
+                children: section.items.map(renderNavItem)
+              })
+        ]
+      },
+      sectionId
+    )
+  }
+
+  const renderNavUngroupedSection = () => {
+    const sectionId = 'nav-group:ungrouped'
+    const collapsed = rosterSectionCollapsed(sectionId)
+
+    return jsxs(
+      'div',
+      {
+        className: 'min-w-0',
+        onDragOver: event => {
+          if (!parseNavDragEvent(event)) return
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'move'
+        },
+        onDrop: event => {
+          const data = parseNavDragEvent(event)
+          if (!data) return
+          event.preventDefault()
+          applyNavMove(data.key, 'move', null)
+        },
+        children: [
+          jsx(RosterSectionHeader, {
+            collapsed,
+            count: navUngrouped.length,
+            icon: 'folder-opened',
+            label: 'Ungrouped',
+            onToggle: () => toggleRosterSection(sectionId)
+          }),
+          collapsed
+            ? null
+            : jsx('div', {
+                className: 'grid min-w-0 gap-0.5',
+                children: navUngrouped.map(renderNavItem)
+              })
+        ]
+      },
+      sectionId
+    )
+  }
 
   const renderGatewaySection = section => {
     const sectionId = `gateway:${section.id}`
@@ -15545,14 +16080,19 @@ function BotsPane() {
                     children: jsx('div', {
                       className: 'grid w-full min-w-0 gap-0.5 px-1.5 pb-2',
                       children: [
-                        ...(showGatewaySections
+                        ...(grouped
                           ? [
-                              sortedGroupRows.length ? renderGroupChatSection() : null,
-                              ...gatewaySections.sections.map(renderGatewaySection)
+                              ...navSections.map(renderNavGroupSection),
+                              navUngrouped.length ? renderNavUngroupedSection() : null
                             ].filter(Boolean)
-                          : rosterRows.map(row =>
-                              row.kind === 'group' ? renderGroupRow(row) : renderBotRow(row.bot)
-                            )),
+                          : showGatewaySections
+                            ? [
+                                sortedGroupRows.length ? renderGroupChatSection() : null,
+                                ...gatewaySections.sections.map(renderGatewaySection)
+                              ].filter(Boolean)
+                            : rosterRows.map(row =>
+                                row.kind === 'group' ? renderGroupRow(row) : renderBotRow(row.bot)
+                              )),
                         showHiddenSection
                           ? jsxs(
                               'div',
@@ -15631,6 +16171,94 @@ function BotsPane() {
         }
       }),
       grouping ? jsx(GroupDialog, { bot: grouping, onClose: () => setGrouping(null) }) : null,
+      jsx(NavGroupDialog, {
+        open: navGroupCreateOpen,
+        title: 'New group',
+        confirmLabel: 'Create',
+        onClose: () => setNavGroupCreateOpen(false),
+        onSubmit: name => {
+          $navGroupOrder.set(addGroup($navGroupOrder.get(), name))
+          persistNavState()
+        }
+      }),
+      navGroupRenaming
+        ? jsx(NavGroupDialog, {
+            open: true,
+            title: 'Rename group',
+            initial: navGroupRenaming,
+            confirmLabel: 'Rename',
+            onClose: () => setNavGroupRenaming(null),
+            onSubmit: name => {
+              const r = renameGroup(
+                $navGroups.get(),
+                $navGroupOrder.get(),
+                $navGroupAliases.get(),
+                $navGroupColors.get(),
+                navGroupRenaming,
+                name
+              )
+              $navGroups.set(r.groups)
+              $navGroupOrder.set(r.order)
+              $navGroupAliases.set(r.aliases)
+              $navGroupColors.set(r.colors)
+              persistNavState()
+            }
+          })
+        : null,
+      navMoving
+        ? jsx(NavMoveDialog, {
+            open: true,
+            title: navMoving.mode === 'copy' ? 'Copy to group' : 'Move to group',
+            groups: allNavGroupNames,
+            currentGroup: navGroups[navMoving.key] || null,
+            mode: navMoving.mode,
+            onClose: () => setNavMoving(null),
+            onSelect: groupName => {
+              if (groupName === '__new__') {
+                setNavMoving(null)
+                setNavCreating({ key: navMoving.key, mode: navMoving.mode })
+              } else {
+                applyNavMove(navMoving.key, navMoving.mode, groupName)
+              }
+            }
+          })
+        : null,
+      navCreating
+        ? jsx(NavGroupDialog, {
+            open: true,
+            title: 'New group',
+            confirmLabel: 'Create',
+            onClose: () => setNavCreating(null),
+            onSubmit: name => {
+              $navGroupOrder.set(addGroup($navGroupOrder.get(), name))
+              applyNavMove(navCreating.key, navCreating.mode, name)
+            }
+          })
+        : null,
+      jsx(ConfirmDialog, {
+        open: Boolean(navGroupDeleting),
+        title: 'Delete group?',
+        description: navGroupDeleting ? `Items in "${navGroupDeleting}" will return to the ungrouped list.` : null,
+        destructive: true,
+        confirmLabel: 'Delete',
+        onClose: () => setNavGroupDeleting(null),
+        onConfirm: () => {
+          if (!navGroupDeleting) return
+          const r = deleteGroup(
+            $navGroups.get(),
+            $navGroupOrder.get(),
+            $navGroupAliases.get(),
+            $navGroupColors.get(),
+            navGroupDeleting
+          )
+          $navGroups.set(r.groups)
+          $navGroupOrder.set(r.order)
+          $navGroupAliases.set(r.aliases)
+          $navGroupColors.set(r.colors)
+          persistNavState()
+          setNavGroupDeleting(null)
+        }
+      }),
       jsx(ConfirmDialog, {
         open: Boolean(deleting),
         title: 'Delete bot and profile?',
@@ -15810,6 +16438,41 @@ export default {
         .catch(() => undefined)
     } catch {
       /* no storage — default (silent) stays */
+    }
+
+    // Hydrate roster navigation groups (opt-in folder organization over bots
+    // AND group chats). Shape-guarded like every other storage read.
+    try {
+      Promise.resolve(ctx.storage?.get?.(NAV_GROUPS_KEY))
+        .then(value => {
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            $navGroups.set(value)
+          }
+        })
+        .catch(() => undefined)
+      Promise.resolve(ctx.storage?.get?.(NAV_GROUP_ORDER_KEY))
+        .then(value => {
+          if (Array.isArray(value)) {
+            $navGroupOrder.set(value.filter(name => typeof name === 'string' && name.trim()))
+          }
+        })
+        .catch(() => undefined)
+      Promise.resolve(ctx.storage?.get?.(NAV_GROUP_COLORS_KEY))
+        .then(value => {
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            $navGroupColors.set(value)
+          }
+        })
+        .catch(() => undefined)
+      Promise.resolve(ctx.storage?.get?.(NAV_GROUP_ALIASES_KEY))
+        .then(value => {
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            $navGroupAliases.set(value)
+          }
+        })
+        .catch(() => undefined)
+    } catch {
+      /* no storage — no groups this window */
     }
 
     // Hydrate persisted group-chat room logs (epoch/running are runtime-only
