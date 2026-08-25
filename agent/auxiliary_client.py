@@ -9077,6 +9077,13 @@ def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
     _url = str(base_url or "").lower()
     if not _url:
         return False
+    # Ollama Cloud reasoning models can leave non-streaming requests waiting
+    # until the client timeout (or return an empty structured payload), while
+    # the same request succeeds through the streamed main/compression path.
+    # Match the endpoint as well as the route label so an auto-routed client
+    # keeps the wire contract after provider resolution.
+    if provider == "ollama-cloud" or base_url_host_matches(_url, "ollama.com"):
+        return True
     # Tencent Copilot — "Non-stream chat request is currently not supported"
     if base_url_host_matches(_url, "copilot.tencent.com"):
         return True

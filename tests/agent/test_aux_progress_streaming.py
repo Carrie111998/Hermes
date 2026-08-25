@@ -236,6 +236,16 @@ class TestFenceProgress:
 
 class TestProviderRequiresStream:
 
+    def test_ollama_cloud_is_streamed_without_a_progress_hook(self):
+        assert _provider_requires_stream(
+            "ollama-cloud", "https://ollama.com/v1"
+        ) is True
+        # Auto-routed clients must retain the endpoint contract even when the
+        # provider label has not yet been narrowed to ollama-cloud.
+        assert _provider_requires_stream(
+            "auto", "https://ollama.com/v1"
+        ) is True
+
     def test_normal_endpoints_are_not(self):
         assert _provider_requires_stream(
             "openrouter", "https://openrouter.ai/api/v1"
