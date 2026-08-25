@@ -68,6 +68,15 @@ def _msgs(n=20):
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
 
 
+def _count_rows(rows, *, content: str | None = None, role: str | None = None):
+    return sum(
+        1
+        for row in rows
+        if (content is None or row.get("content") == content)
+        and (role is None or row.get("role") == role)
+    )
+
+
 def _bound_context_compressor(db: SessionDB, session_id: str) -> ContextCompressor:
     with patch(
         "agent.context_compressor.get_model_context_length",
@@ -195,6 +204,117 @@ class TestWorkspaceMetadataFollowsRotation:
         assert row["chat_id"] == "c1"
         assert row["chat_type"] == "private"
         assert row["user_id"] == "u1"
+
+
+class TestRotationChildFlushDedup:
+    def test_live_user_anchor_is_persisted_once_in_child(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ROT_LIVE_USER"
+        db.create_session(parent, source="cli")
+        db.append_message(parent, "user", "persisted question")
+        db.append_message(parent, "assistant", "persisted answer")
+
+        loaded = db.get_messages_as_conversation(parent)
+        messages = [*loaded, {"role": "user", "content": "live question"}]
+
+        agent = _build_agent_with_db(db, parent)
+        agent._persist_user_message_idx = len(messages) - 1
+        agent.context_compressor.compress.return_value = [
+            {"role": "assistant", "content": "s"},
+        ]
+
+        returned, _ = agent._compress_context(messages, "sys", approx_tokens=120_000)
+        agent._flush_messages_to_session_db(returned)
+
+        child_rows = db.get_messages_as_conversation(
+            agent.session_id, include_inactive=True
+        )
+        assert _count_rows(child_rows, content="live question", role="user") == 1
+
+    def test_mid_tool_loop_rows_do_not_duplicate_after_failed_parent_flush(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ROT_TOOL_LOOP"
+        db.create_session(parent, source="cli")
+        db.append_message(parent, "user", "persisted question")
+        db.append_message(parent, "assistant", "persisted answer")
+
+        loaded = db.get_messages_as_conversation(parent)
+        assistant_turn = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        }
+        tool_turn = {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "tool result",
+        }
+        messages = [
+            *loaded,
+            {"role": "user", "content": "live tool question"},
+            assistant_turn,
+            tool_turn,
+        ]
+
+        agent = _build_agent_with_db(db, parent)
+        agent._persist_user_message_idx = len(loaded)
+        agent.context_compressor.compress.return_value = [
+            assistant_turn,
+            tool_turn,
+        ]
+
+        with patch.object(
+            agent,
+            "_flush_messages_to_session_db",
+            return_value=False,
+        ):
+            returned, _ = agent._compress_context(
+                messages, "sys", approx_tokens=120_000
+            )
+
+        agent._flush_messages_to_session_db(returned)
+
+        child_rows = db.get_messages_as_conversation(
+            agent.session_id, include_inactive=True
+        )
+        assert _count_rows(
+            child_rows, content="live tool question", role="user"
+        ) == 1
+        assert _count_rows(child_rows, content="tool result", role="tool") == 1
+
+    def test_existing_handoff_user_turn_still_writes_live_child_user_once(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ROT_ALREADY_HAS_USER"
+        db.create_session(parent, source="cli")
+        db.append_message(parent, "user", "persisted question")
+        db.append_message(parent, "assistant", "persisted answer")
+
+        loaded = db.get_messages_as_conversation(parent)
+        messages = [*loaded, {"role": "user", "content": "live question"}]
+
+        agent = _build_agent_with_db(db, parent)
+        agent._persist_user_message_idx = len(messages) - 1
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "live question"},
+        ]
+
+        returned, _ = agent._compress_context(messages, "sys", approx_tokens=120_000)
+        agent._flush_messages_to_session_db(returned)
+
+        child_rows = db.get_messages_as_conversation(
+            agent.session_id, include_inactive=True
+        )
+        assert _count_rows(child_rows, content="live question", role="user") == 1
 
 
 class TestPlatformForwardedAtBoundary:

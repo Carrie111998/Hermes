@@ -64,7 +64,7 @@ import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
@@ -2149,8 +2149,17 @@ def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
         target.pop(flag, None)
 
 
-def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
+CompressedUserTurnOutcome = Literal[
+    "inserted",
+    "merged",
+    "already_present",
+    "placeholder_appended",
+]
+
+
+def _insert_real_user_anchor(messages: list, anchor: dict) -> CompressedUserTurnOutcome:
     """Insert the latest human turn without breaking role alternation."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
 
     def _role(msg: Any) -> Optional[str]:
         return msg.get("role") if isinstance(msg, dict) else None
@@ -2163,13 +2172,15 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
             continue
         previous_role = _role(messages[index - 1]) if index > 0 else None
         if previous_role != "user":
+            anchor[_DB_PERSISTED_MARKER] = True
             messages.insert(index, anchor)
-            return
+            return "inserted"
     # Every assistant is user-preceded (or there are none). Appending is
     # safe whenever the transcript does not already end with a user turn.
     if not messages or _role(messages[-1]) != "user":
+        anchor[_DB_PERSISTED_MARKER] = True
         messages.append(anchor)
-        return
+        return "inserted"
     # The transcript ends with a user-role message and no slot avoids
     # user/user adjacency.
     from agent.context_compressor import ContextCompressor
@@ -2183,17 +2194,22 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
         # the summary" — exactly what the handoff prefix instructs — and the
         # adjacent user turns are merged summary-first by
         # repair_message_sequence before the next API call.
+        anchor[_DB_PERSISTED_MARKER] = True
         messages.append(anchor)
-        return
+        return "inserted"
     # Trailing user-role scaffolding (e.g. the todo snapshot): merge instead
     # of inserting a consecutive same-role message (#55677 strict templates).
     _merge_anchor_into_user_message(messages[-1], anchor)
+    messages[-1][_DB_PERSISTED_MARKER] = True
+    return "merged"
 
 
-def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
+def _ensure_compressed_has_user_turn(
+    original_messages: list, compressed: list
+) -> CompressedUserTurnOutcome:
     """Preserve human intent, not merely a synthetic user-role placeholder."""
     if any(_is_real_user_message(message) for message in compressed):
-        return
+        return "already_present"
     from agent.context_compressor import (
         COMPRESSION_CONTINUATION_USER_CONTENT,
         _fresh_compaction_message_copy,
@@ -2201,11 +2217,10 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
 
     for message in reversed(original_messages):
         if _is_real_user_message(message):
-            _insert_real_user_anchor(
+            return _insert_real_user_anchor(
                 compressed,
                 _fresh_compaction_message_copy(message),
             )
-            return
     from agent.message_metadata import append_message
 
     append_message(
@@ -2215,6 +2230,7 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
             "content": COMPRESSION_CONTINUATION_USER_CONTENT,
         },
     )
+    return "placeholder_appended"
 
 
 _PENDING_CONTEXT_ENGINE_NOTIFICATION = (
@@ -3451,7 +3467,9 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        _ensure_compressed_has_user_turn(messages, compressed)
+        compressed_user_turn_outcome = _ensure_compressed_has_user_turn(
+            messages, compressed
+        )
 
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
@@ -3765,6 +3783,20 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
+                    from agent.context_compressor import _DB_PERSISTED_MARKER
+
+                    current_idx = getattr(agent, "_persist_user_message_idx", None)
+                    if (
+                        compressed_user_turn_outcome in {"inserted", "merged"}
+                        and isinstance(current_idx, int)
+                        and 0 <= current_idx < len(messages)
+                    ):
+                        _live_user_message = messages[current_idx]
+                        if (
+                            isinstance(_live_user_message, dict)
+                            and _live_user_message.get("role") == "user"
+                        ):
+                            _live_user_message[_DB_PERSISTED_MARKER] = True
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
@@ -3785,6 +3817,32 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    def _handoff_signature(message: Any) -> Any:
+                        if not isinstance(message, dict):
+                            return None
+                        return json.dumps(
+                            {
+                                key: value
+                                for key, value in message.items()
+                                if not str(key).startswith("_")
+                            },
+                            sort_keys=True,
+                            default=str,
+                            separators=(",", ":"),
+                        )
+
+                    _live_message_signatures = {
+                        _handoff_signature(_message)
+                        for _message in messages
+                        if isinstance(_message, dict)
+                    }
+                    for _handoff_message in compressed:
+                        if (
+                            isinstance(_handoff_message, dict)
+                            and _handoff_signature(_handoff_message)
+                            in _live_message_signatures
+                        ):
+                            _handoff_message[_DB_PERSISTED_MARKER] = True
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
@@ -3880,11 +3938,6 @@ def compress_context(
                 else:
                     agent._last_flushed_db_idx = len(compressed)
                     agent._flushed_db_message_session_id = agent.session_id
-                    agent._flushed_db_message_ids = {
-                        id(message)
-                        for message in compressed
-                        if isinstance(message, dict)
-                    }
                 _session_commit_succeeded = True
             except Exception as e:
                 if (
