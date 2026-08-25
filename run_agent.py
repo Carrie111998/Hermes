@@ -6767,22 +6767,23 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(
         self, text: str, item_id: str | None = None
-    ) -> None:
+    ) -> bool:
         """Deliver a completed live Codex commentary message immediately."""
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(text, str):
-            return
+            return False
         visible = self._strip_think_blocks(text).strip()
         if visible:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible, item_id=item_id):
-            return
+            return False
         try:
             cb(visible, already_streamed=False)
             self._record_delivered_interim_text(visible, item_id=item_id)
-            self._record_streamed_assistant_text(visible)
+            return True
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+            return False
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
