@@ -3037,7 +3037,7 @@ def _persist_target_text_receipts(
         except Exception:
             persisted = False
             key = None
-        if persisted and key is not None:
+        if persisted and key is not None and receipt.outcome == "delivered":
             observed.add(key)
         else:
             persisted_all = False
@@ -3852,6 +3852,8 @@ def _deliver_result(
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
+                _media_receipts = []
+                _media_errors = []
                 if adapter_ok and not timed_out and media_files:
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
@@ -3865,7 +3867,6 @@ def _deliver_result(
                     routed_media_metadata["_transport_receipt_requested_target"] = (
                         receipt_requested_target
                     )
-                    _media_receipts = []
                     _media_errors = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
@@ -3891,11 +3892,13 @@ def _deliver_result(
                     delivery_errors.append(msg)
 
                 media_receipts_persisted = bool(media_files) and _persist_target_text_receipts(
-                    tuple(_media_receipts) if adapter_ok and not timed_out else (),
+                    tuple(_media_receipts) if not timed_out else (),
                     receipt_attempts,
                     receipt_requested_target,
                     components={"media"},
                 )
+                if _media_errors:
+                    adapter_ok = False
                 if media_files and not media_receipts_persisted:
                     # Preserve any partial typed acknowledgements, but keep the
                     # target unknown unless every planned media component was

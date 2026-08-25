@@ -97,6 +97,43 @@ class _TypedMediaTelegramAdapter(_PlannedTelegramAdapter):
         )
 
 
+class _UnknownMediaTelegramAdapter(_PlannedTelegramAdapter):
+    async def send_document(
+        self, chat_id: str, file_path: str, metadata=None,
+    ) -> SendResult:
+        metadata = metadata or {}
+        requested_identity = metadata["_transport_receipt_requested_target"]
+        requested = TransportTarget(
+            str(requested_identity["platform"]),
+            str(requested_identity["chat_id"]),
+            (str(requested_identity["thread_id"]) if requested_identity.get("thread_id") else None),
+        )
+        ordinal = metadata["_transport_receipt_ordinal"]
+        return SendResult(
+            success=False,
+            error="media delivery outcome is unknown",
+            error_kind="unknown",
+            receipts=(TransportReceipt(
+                outcome="unknown",
+                requested_target=requested,
+                component="media",
+                ordinal=ordinal,
+            ),),
+        )
+
+
+class _FailedMediaWithDeliveredReceiptAdapter(_TypedMediaTelegramAdapter):
+    async def send_document(
+        self, chat_id: str, file_path: str, metadata=None,
+    ) -> SendResult:
+        delivered = await super().send_document(chat_id, file_path, metadata)
+        return SendResult(
+            success=False,
+            error="provider reported media failure",
+            receipts=delivered.receipts,
+        )
+
+
 def _gateway_config() -> GatewayConfig:
     return GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
@@ -190,6 +227,35 @@ def test_scheduler_rejects_hostile_adapter_plan_and_receipt_containers():
     assert _confirm_adapter_delivery(HostileResult()) is False
     assert _confirm_adapter_delivery(HostileFieldsDescriptor()) is False
     assert descriptor_calls == []
+
+
+def test_persisted_non_delivered_receipts_do_not_satisfy_component_plan():
+    from cron.scheduler import _persist_target_text_receipts
+
+    target = TransportTarget("telegram", "123")
+    attempts = {("telegram", "123", "", "media", 0): "attempt"}
+    requested = {"platform": "telegram", "chat_id": "123", "thread_id": ""}
+    receipts = (
+        TransportReceipt(
+            outcome="unknown",
+            requested_target=target,
+            component="media",
+            ordinal=0,
+        ),
+        TransportReceipt(
+            outcome="failed",
+            requested_target=target,
+            failure_kind="pre_dispatch",
+            component="media",
+            ordinal=0,
+        ),
+    )
+
+    for receipt in receipts:
+        with patch("cron.scheduler.record_transport_receipt", return_value=True):
+            assert _persist_target_text_receipts(
+                (receipt,), attempts, requested, components={"media"}
+            ) is False
 
 
 def test_standalone_telegram_caption_preregistration_omits_unsent_text_component():
@@ -443,6 +509,80 @@ def test_live_adapter_typed_media_ack_completes_planned_target(monkeypatch, tmp_
         "unknown": 0,
         "targets_delivered": 1,
     }
+
+
+def test_live_adapter_unknown_media_ack_stays_partial_without_session_side_effects(
+    monkeypatch, tmp_path
+):
+    import cron.executions as executions
+    import gateway.platforms.base as base
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    media = tmp_path / "unknown-receipt-report.pdf"
+    media.write_bytes(b"test-pdf")
+    monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
+    execution = executions.create_execution("receipt-e2e", source="direct")
+    adapter = _UnknownMediaTelegramAdapter(["text"])
+    job = _job()
+    job["attach_to_session"] = True
+
+    with (
+        patch("gateway.config.load_gateway_config", return_value=_gateway_config()),
+        patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+        patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coroutine_threadsafe),
+        patch("cron.scheduler._open_continuable_cron_thread", return_value="created-thread"),
+        patch("cron.scheduler._seed_cron_thread_session") as seed_thread,
+        patch("cron.scheduler._maybe_mirror_cron_delivery") as mirror_delivery,
+    ):
+        result = _deliver_result(
+            job, f"report\nMEDIA:{media}",
+            adapters={Platform.TELEGRAM: adapter}, loop=_running_loop(),
+            execution_id=execution["id"], fire_identity="fire-unknown-media",
+        )
+
+    assert result is not None
+    assert "media" in result
+    seed_thread.assert_not_called()
+    mirror_delivery.assert_not_called()
+    assert executions.receipt_summary(execution["id"]) == {
+        "delivered": 1,
+        "failed": 0,
+        "unknown": 1,
+        "targets_delivered": 0,
+    }
+
+
+def test_live_adapter_media_error_prevents_delivery_side_effects_even_with_delivered_receipt(
+    monkeypatch, tmp_path
+):
+    import cron.executions as executions
+    import gateway.platforms.base as base
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    media = tmp_path / "failed-media-report.pdf"
+    media.write_bytes(b"test-pdf")
+    monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
+    execution = executions.create_execution("receipt-e2e", source="direct")
+    adapter = _FailedMediaWithDeliveredReceiptAdapter(["text"])
+    job = _job()
+    job["attach_to_session"] = True
+
+    with (
+        patch("gateway.config.load_gateway_config", return_value=_gateway_config()),
+        patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+        patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coroutine_threadsafe),
+        patch("cron.scheduler._open_continuable_cron_thread", return_value=None),
+        patch("cron.scheduler._maybe_mirror_cron_delivery") as mirror_delivery,
+    ):
+        result = _deliver_result(
+            job, f"report\nMEDIA:{media}",
+            adapters={Platform.TELEGRAM: adapter}, loop=_running_loop(),
+            execution_id=execution["id"], fire_identity="fire-failed-media",
+        )
+
+    assert result is not None
+    assert "provider reported media failure" in result
+    mirror_delivery.assert_not_called()
 
 
 def test_new_continuation_thread_preserves_preregistered_requested_target(monkeypatch, tmp_path):
