@@ -118,7 +118,10 @@ def test_marker_roundtrip(tmp_path):
 
 
 def test_marker_survives_corrupt_sidecar(tmp_path):
-    path = tmp_path / "desktop" / "interrupted_turns.json"
+    # The per-session layout reads/writes ``<home>/desktop/interrupted_turns/<key>.json``.
+    # A corrupt per-session file must be treated as "no marker" so a single
+    # bad write can't wedge the next resume.
+    path = tmp_path / "desktop" / "interrupted_turns" / "abc.json"
     path.parent.mkdir(parents=True)
     path.write_text("{not json")
 
