@@ -408,6 +408,42 @@ def _parse_service_tier_config(raw: str) -> str | None:
     logger.warning("Unknown service_tier '%s', ignoring", raw)
     return None
 
+# Literal strings that STT pipelines have been observed to return in
+# place of an actual transcript when the upstream API errors without a
+# useful body.  Used by `_is_placeholder_transcript` to reject these
+# before they hit the chat surface (which would otherwise render the
+# user's next turn as `[Null]` / `[None]`).
+_STT_PLACEHOLDER_TRANSCRIPTS = frozenset({"null", "none", "undefined", "nan", ""})
+
+
+def _is_placeholder_transcript(transcript) -> bool:
+    """True when ``transcript`` is a non-content STT placeholder.
+
+    Some STT pipelines — particularly command-type providers that wrap a
+    ``curl | jq -r .text`` invocation — emit one of the literal strings
+    ``"null"``, ``"None"``, ``"undefined"``, ``"nan"``, or the empty
+    string when the upstream API returns an error envelope with no
+    ``.text`` field.  The runner sees a non-empty stdout, marks the run
+    successful, and hands the placeholder back to the CLI as a real
+    transcript.  Without this guard the chat surface renders ``[Null]``
+    and the model tries to act on an empty utterance.
+
+    Callers MUST handle the rejection (log + user-visible diagnostic).
+
+    Non-string inputs are coerced via ``str()`` — the helper is defensive
+    because some upstream STT shims hand back ints / bytes / lists when
+    an internal error short-circuits.  ``None`` collapses to ``""``.
+    """
+    if transcript is None:
+        return "" in _STT_PLACEHOLDER_TRANSCRIPTS
+    if not isinstance(transcript, str):
+        try:
+            transcript = transcript.decode() if isinstance(transcript, (bytes, bytearray)) else str(transcript)
+        except Exception:
+            return False
+    return transcript.strip().lower() in _STT_PLACEHOLDER_TRANSCRIPTS
+
+
 def load_cli_config() -> Dict[str, Any]:
     """
     Load CLI configuration from config files.
@@ -14332,7 +14368,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # upstream API returns an error envelope with no .text).
                 # Without this, the chat surface would render "[Null]" and
                 # the model would try to act on an empty utterance.
-                if transcript.lower() in {"null", "none", "undefined", "nan"}:
+                if _is_placeholder_transcript(transcript):
                     logger.warning(
                         "voice barge: STT returned non-content placeholder %r; "
                         "treating as transcription failure.",
@@ -14667,9 +14703,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # healthy. The wake engine is paused for the duration of capture
         # and resumes automatically when capture ends. Watchdog state is
         # left alone — there's nothing to resume because we never paused.
-        # Mark _voice_processing so the wake detector's callback-dispatch
-        # gating doesn't immediately re-fire on residual wake phonemes.
+        # Mark _voice_recording AND _voice_processing so concurrent mic
+        # openers (manual /voice, barge-in) gate correctly during the
+        # entire wake→capture→transcribe window. _voice_recording is
+        # the standard "mic is busy" flag and is what _voice_start_recording
+        # checks at entry — without it set here, a concurrent Ctrl+B or
+        # /voice call would race to open a second InputStream on the same
+        # device, reintroducing the exact two-stream contention this PR
+        # removes.
         with self._voice_lock:
+            self._voice_recording = True
             self._voice_processing = True
         try:
             from tools.wake_word import start_post_wake_capture
@@ -14683,6 +14726,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # callback dispatch (rare; usually a permission event).
                 logger.warning("wake word: post-wake capture arm failed — falling back to /voice on")
                 with self._voice_lock:
+                    self._voice_recording = False
                     self._voice_processing = False
                 self._voice_continuous = False
                 try:
@@ -14691,6 +14735,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"{_DIM}Wake capture failed: {e}{_RST}")
         except Exception as e:
             with self._voice_lock:
+                self._voice_recording = False
                 self._voice_processing = False
             logger.warning("wake word: post-wake capture arm error: %s", e)
 
@@ -14705,9 +14750,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             import wave
             import os
 
+            # HERMES_HOME-aware tmp dir — honors HERMES_HOME/profile
+            # overrides so capture WAVs land inside the managed tree on
+            # container / custom-install setups. Falls back to
+            # ~/.hermes/tmp if the config helper can't be imported for
+            # any reason.
+            try:
+                from hermes_cli.config import get_hermes_home
+                _tmp_dir = get_hermes_home() / "tmp"
+            except Exception:
+                _tmp_dir = os.path.expanduser("~/.hermes/tmp")
+
             # Mark processing up front so the watchdog won't try to do
             # anything weird while we're transcribing.
             with self._voice_lock:
+                self._voice_recording = True
                 self._voice_processing = True
 
             submitted = False
@@ -14726,10 +14783,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"{_DIM}Wake capture too short (%.2fs).{_RST}" % duration_sec)
                     return
 
-                os.makedirs(os.path.expanduser("~/.hermes/tmp"), exist_ok=True)
+                os.makedirs(_tmp_dir, exist_ok=True)
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 wav_path = os.path.join(
-                    os.path.expanduser("~/.hermes/tmp"),
+                    _tmp_dir,
                     f"wake_capture_{timestamp}.wav",
                 )
                 with wave.open(wav_path, "wb") as wf:
@@ -14750,14 +14807,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if result.get("success") and result.get("transcript", "").strip():
                     transcript = result["transcript"].strip()
 
-                    # Defensive: some STT pipelines (notably command-type
-                    # providers using jq) emit the literal string "null",
-                    # "None", or "undefined" when the upstream API returns
-                    # an error envelope with no .text field. Don't queue
-                    # those as user input — the chat surface would render
-                    # them as "[Null]" and the model would try to act on
-                    # an empty/nonsense utterance. Drop with a hint instead.
-                    if transcript.lower() in {"null", "none", "undefined", "nan", ""}:
+                    # Defensive: some STT pipelines (notably command-type providers using
+                    # jq) emit the literal string "null", "None", or
+                    # "undefined" when the upstream API returns an error
+                    # envelope with no .text field. Don't queue those as
+                    # user input — the chat surface would render them as
+                    # "[Null]" and the model would try to act on an
+                    # empty/nonsense utterance. Drop with a hint instead.
+                    if _is_placeholder_transcript(transcript):
                         logger.warning(
                             "wake word: STT returned non-content placeholder %r; "
                             "treating as transcription failure. Underlying API "
@@ -14794,6 +14851,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 transcription_failed = wav_path is not None
             finally:
                 with self._voice_lock:
+                    self._voice_recording = False
                     self._voice_processing = False
                 if hasattr(self, '_app') and self._app:
                     try:
@@ -14808,6 +14866,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception as e:
             logger.exception("post-wake callback outer error: %s", e)
             with self._voice_lock:
+                self._voice_recording = False
                 self._voice_processing = False
 
     def _start_wake_watchdog(self):
