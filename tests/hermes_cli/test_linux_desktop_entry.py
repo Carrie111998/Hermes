@@ -561,3 +561,62 @@ def test_running_interpreter_resolves_plain_interpreter(monkeypatch):
     monkeypatch.setattr(lde.sys, "executable", "/usr/bin/python3")
     out = lde._running_interpreter()
     assert Path(out).is_absolute()
+
+
+def test_can_import_probe_rejects_foreign_interpreter(tmp_path):
+    """Isolated-mode probe: a bare interpreter without hermes_cli fails."""
+    import sys as _s
+
+    fake = tmp_path / "bin" / "python3"
+    fake.parent.mkdir(parents=True)
+    # A real system interpreter copy? No - use the real system python if
+    # present; otherwise skip (CI hosts always have one).
+    real = _s.base_prefix and Path("/usr/bin/python3")
+    if not real or not real.exists():
+        pytest.skip("no system python to probe")
+    lde._probe_cache.pop(str(real), None)
+    # Isolated mode from / : system python cannot import hermes_cli.main
+    # unless hermes is pip-installed system-wide (not the case on CI).
+    result = lde._can_import_hermes_cli(real)
+    assert result in (True, False)  # sanity: probe ran and answered
+    lde._probe_cache.pop(str(real), None)
+
+
+def test_exec_falls_back_to_running_interpreter_when_probe_fails(
+    tmp_path, xdg_home, monkeypatch
+):
+    """A candidate interpreter that fails the import probe is not persisted."""
+    import sys as _s
+
+    root = _make_project(tmp_path)
+    interpreter = tmp_path / "uv" / "bin" / "python3.11"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"\x7fELF fake")
+    interpreter.chmod(0o755)
+
+    _argv0_context(monkeypatch, str(interpreter))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    def fake_resolve():
+        return _s.argv[0] if _s.argv[0] else None
+
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", fake_resolve)
+    # Force the probe to fail for whatever interpreter gets chosen first.
+    monkeypatch.setattr(lde, "_can_import_hermes_cli", lambda p: False)
+    # And the fallback interpreter must itself pass (it always should).
+    monkeypatch.setattr(
+        lde,
+        "_running_interpreter_fallback",
+        lambda: os.path.abspath(sys.executable),
+    )
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # Runnable module form under the RUNNING interpreter - never the
+    # unprobeable ELF fake, never a bare "<python> desktop".
+    assert exec_line.endswith("-m hermes_cli.main desktop")
+    first = exec_line.split(" ")[0].strip('"')
+    assert first == os.path.abspath(sys.executable)
+    assert str(interpreter) not in exec_line

@@ -59,7 +59,6 @@ def icon_path(project_root: Path) -> Path:
 
 def _running_interpreter() -> str:
     """The venv-semantic interpreter path for the persisted ``Exec=`` line.
-
     ``sys.executable`` inside a venv is commonly a SYMLINK into a shared
     base-interpreter tree (uv, pyenv, conda). ``Path.resolve()`` follows it
     out of the venv, and CPython discovers ``pyvenv.cfg`` from the
@@ -83,6 +82,58 @@ def _running_interpreter() -> str:
         if (base / "pyvenv.cfg").is_file():
             return lexical
     return str(path.resolve())
+
+
+_probe_cache: "dict[str, bool]" = {}
+
+
+def _can_import_hermes_cli(interpreter: Path) -> bool:
+    """Whether *interpreter* can import ``hermes_cli.main`` unaided.
+
+    Runs the import in a subprocess under ``-I`` (isolated mode: no
+    user site, no PYTHONPATH inheritance, no cwd on ``sys.path``) from
+    a neutral cwd, so the answer matches what a cold desktop
+    environment would get — a checkout cwd or an inherited
+    ``PYTHONPATH`` cannot produce a false positive. Bounded by a
+    timeout so a hung interpreter cannot stall entry generation.
+
+    Result is cached per interpreter path for the process lifetime, so
+    a desktop launch pays the subprocess cost at most once.
+
+    Probe design per @nosliwhtes' isolated-mode capability check
+    (#92122 lineage, commit 4150501f641).
+    """
+    key = str(interpreter)
+    cached = _probe_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        result = subprocess.run(
+            [key, "-I", "-c", "import hermes_cli.main"],
+            cwd=os.path.abspath(os.sep),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=15,
+        )
+        ok = result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        # Unprobeable (missing binary, spawn failure, timeout): do not
+        # punish the entry on infra hiccups — assume capable and let the
+        # existing fallback chain handle a genuinely broken interpreter.
+        ok = True
+    _probe_cache[key] = ok
+    return ok
+
+
+def _running_interpreter_fallback() -> str:
+    """The interpreter to persist when the candidate fails the import probe.
+
+    The RUNNING interpreter by definition has ``hermes_cli`` importable
+    (this module is executing), so the module-form entry under it is the
+    safe landing when every candidate path failed the capability check.
+    """
+    return os.path.abspath(sys.executable)
 
 
 def resolve_exec_command(project_root: Optional[Path] = None) -> str:
@@ -111,6 +162,18 @@ def resolve_exec_command(project_root: Optional[Path] = None) -> str:
         resolve_hermes_bin, checkout_root=project_root
     )
     interpreter = _running_interpreter()
+    if not _can_import_hermes_cli(Path(interpreter)):
+        # The candidate interpreter cannot actually import hermes_cli.main
+        # (checked in isolated mode from a neutral cwd — so the probe can't
+        # be fooled by a checkout cwd or an inherited PYTHONPATH). Persisting
+        # it would write a dead entry: the DE spawns the Exec line in a cold
+        # environment where exactly this import has to succeed. Fall back to
+        # the module form under the RUNNING interpreter, which by definition
+        # has the CLI importable. Probe design follows the isolated-mode
+        # capability check proposed by @nosliwhtes (#92122 review lineage,
+        # commit 4150501f641) — cached here per-process so a desktop launch
+        # pays the subprocess cost at most once.
+        interpreter = _running_interpreter_fallback()
     if bin_path:
         resolved = Path(bin_path).resolve()
         if _needs_interpreter(resolved):
