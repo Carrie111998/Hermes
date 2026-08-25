@@ -213,12 +213,15 @@ export function setRememberedRoute(path: null | string, profile: string): void {
 let configuredDefaultProjectDir = ''
 
 function workspaceCwdKey(connection: HermesConnection | null = $connection.get()): string {
+  const profile = encodeURIComponent(connection?.profile || 'default')
+
   if (connection?.mode !== 'remote') {
-    return WORKSPACE_CWD_KEY
+    // Scope per-profile for local connections too — previously all local
+    // profiles shared one key, leaking cwd across profile switches (#81492).
+    return `${WORKSPACE_CWD_KEY}.local.${profile}`
   }
 
   const base = encodeURIComponent(connection.baseUrl || 'remote')
-  const profile = encodeURIComponent(connection.profile || 'default')
 
   return `${WORKSPACE_CWD_KEY}.remote.${base}.${profile}`
 }
@@ -1230,8 +1233,13 @@ export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number 
 }
 
 export const workspaceCwdForNewSession = (): string => {
-  if ($connection.get()?.mode === 'remote') {
-    return getRememberedWorkspaceCwd()
+  // Both remote and local connections check the remembered workspace cwd,
+  // which is now scoped per-profile (see workspaceCwdKey above). This
+  // prevents a profile switch from inheriting the previous profile's
+  // working directory (#81492).
+  const remembered = getRememberedWorkspaceCwd()
+  if (remembered) {
+    return remembered
   }
 
   // A bare new chat starts DETACHED — no inherited cwd, so the composer's coding
