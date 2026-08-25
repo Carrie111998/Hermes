@@ -951,12 +951,23 @@ class GatewayKanbanWatchersMixin:
                             # (exactly the old behavior) rather than
                             # skipping the turn.
                             try:
+                                # Local import: gateway.run imports this
+                                # module — hoisting it would be a cycle.
                                 from gateway.run import _profile_runtime_scope
 
                                 _wake_ctx = _profile_runtime_scope(
                                     self._resolve_profile_home_for_source(_source)
                                 )
-                            except Exception:
+                            except Exception as exc:
+                                # Fail-open to the unscoped wake (the old
+                                # behavior) rather than skipping the turn —
+                                # but leave a trace so operators can tell
+                                # scoped from unscoped wakes in retrospect.
+                                logger.warning(
+                                    "kanban notifier: profile scope unavailable"
+                                    " for %s/%s (%s); delivering unscoped",
+                                    platform_str, sub["chat_id"], exc,
+                                )
                                 _wake_ctx = nullcontext()
                             with _wake_ctx:
                                 await deliver_wake(
