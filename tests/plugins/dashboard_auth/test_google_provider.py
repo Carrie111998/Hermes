@@ -303,6 +303,7 @@ class TestStartLogin:
         assert params["scope"] == "openid email profile"
         assert params["code_challenge_method"] == "S256"
         assert params["prompt"] == "select_account"
+        assert params["access_type"] == "offline"
         assert "state" in params
         assert "code_challenge" in params
 

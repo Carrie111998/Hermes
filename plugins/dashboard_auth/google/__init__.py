@@ -225,6 +225,13 @@ class GoogleDashboardAuthProvider(DashboardAuthProvider):
             # shared/kiosk browser doesn't silently reuse the wrong
             # identity.
             "prompt": "select_account",
+            # Google omits refresh_token from the token response for
+            # web-application clients unless the authorization request
+            # carries access_type=offline. Without this, refresh_session()
+            # never receives a refresh token to work with and every
+            # session silently falls back to full re-login once the ID
+            # token expires (~1h).
+            "access_type": "offline",
         }
         redirect_url = (
             f"{disco['authorization_endpoint']}?{urllib.parse.urlencode(params)}"
