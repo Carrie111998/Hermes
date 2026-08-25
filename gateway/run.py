@@ -8279,7 +8279,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
-            "request_overrides": dict(runtime_kwargs.get("request_overrides") or {}),
         }
         route = {
             "model": model,
