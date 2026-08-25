@@ -5841,6 +5841,113 @@ def test_cli_undo_keeps_history_when_post_rewind_reload_fails(
         server._sessions.pop("profile-undo-reload-fail-sid", None)
 
 
+def test_durable_lifecycle_selector_uses_profile_db_not_launch(monkeypatch, tmp_path):
+    """_session_owns_durable_lifecycle must consult the session's OWN profile
+    state.db (app-global remote mode), not the launch profile's shared handle —
+    the same wrong-database class the truncation/undo routing in this PR fixes.
+    A gateway-owned row that lives only in the profile DB must read as
+    gateway-owned, and the delegation selectors must drop the durable key."""
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "remote-profile"
+    profile_home.mkdir()
+    session_key = "profile-gateway-viewer-session"
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session(session_key, source="telegram")
+    finally:
+        db.close()
+
+    agent = types.SimpleNamespace(session_id=session_key)
+    sess = _session(agent=agent, session_key=session_key)
+    sess["profile_home"] = str(profile_home)
+    server._sessions["profile-gateway-viewer-sid"] = sess
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("must not consult the launch-profile DB"),
+    )
+
+    try:
+        assert server._session_owns_durable_lifecycle(sess, session_key) is False
+        own_sid, owned_key = server._session_async_delegation_selectors(
+            sess, sid_hint="profile-gateway-viewer-sid"
+        )
+        assert own_sid == "profile-gateway-viewer-sid"
+        assert owned_key == ""
+    finally:
+        server._sessions.pop("profile-gateway-viewer-sid", None)
+
+
+def test_durable_lifecycle_selector_owns_tui_rows_in_profile_db(monkeypatch, tmp_path):
+    """Counterpart: a TUI/desktop row in the profile DB stays TUI-owned —
+    routing through the profile DB must not over-restrict."""
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "remote-profile"
+    profile_home.mkdir()
+    session_key = "profile-tui-session"
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session(session_key, source="desktop")
+    finally:
+        db.close()
+
+    agent = types.SimpleNamespace(session_id=session_key)
+    sess = _session(agent=agent, session_key=session_key)
+    sess["profile_home"] = str(profile_home)
+    server._sessions["profile-tui-sid"] = sess
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("must not consult the launch-profile DB"),
+    )
+
+    try:
+        assert server._session_owns_durable_lifecycle(sess, session_key) is True
+        _, owned_key = server._session_async_delegation_selectors(
+            sess, sid_hint="profile-tui-sid"
+        )
+        assert owned_key == session_key
+    finally:
+        server._sessions.pop("profile-tui-sid", None)
+
+
+def test_durable_lifecycle_selector_fails_closed_when_db_unavailable(monkeypatch):
+    """No owning DB to consult → NOT TUI-owned (fail closed): a gateway-owned
+    session must never be misclassified as TUI-owned by absence of a row."""
+    sess = _session(session_key="no-db-session")
+    sess["profile_home"] = "/nonexistent-profile-home"
+
+    def _yield_none(session):
+        yield None
+
+    monkeypatch.setattr(
+        server, "_session_db", server.contextlib.contextmanager(_yield_none)
+    )
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("must not fall back to the launch-profile DB"),
+    )
+
+    assert server._session_owns_durable_lifecycle(sess, "no-db-session") is False
+
+
+def test_durable_lifecycle_selector_launch_session_gateway_row(monkeypatch):
+    """Launch-profile session (no profile_home): _session_db borrows the shared
+    _get_db() handle; gateway-owned sources still read as gateway-owned."""
+
+    class _FakeDB:
+        def get_session(self, target):
+            return {"source": "telegram"}
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    sess = _session(session_key="launch-gw-session")
+
+    assert server._session_owns_durable_lifecycle(sess, "launch-gw-session") is False
+
+
 def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
     """#82959: String row IDs in history match correctly against integer truncate_before_row_id."""
     replaced = []

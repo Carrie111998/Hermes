@@ -1051,21 +1051,32 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     return session.get("transport") is _detached_ws_transport
 
 
-def _session_owns_durable_lifecycle(session_id: str | None) -> bool:
-    """Whether this TUI/desktop session may end its durable DB row by key."""
+def _session_owns_durable_lifecycle(session: dict | None, session_id: str | None) -> bool:
+    """Whether this TUI/desktop session may end its durable DB row by key.
+
+    The row lives in the *session's* profile state.db (app-global remote
+    mode), not the launch profile's shared handle — the same wrong-database
+    class the truncation/undo routing in this PR fixes. Fail closed (False)
+    when the owning DB can't be consulted, so a gateway-owned session is
+    never misclassified as TUI-owned by absence of a row.
+    """
     if not session_id:
         return True
+    if session is None:
+        # No live session dict → no profile_home → cannot locate the owning
+        # DB. Fail closed rather than guessing via the launch handle.
+        return False
     try:
-        db = _get_db()
-        if db is None:
-            return True
-        # Don't end gateway-originated sessions — the gateway owns their
-        # lifecycle. The TUI is only a viewer there (#60609).
-        row = db.get_session(session_id)
+        with _session_db(session) as db:
+            if db is None:
+                return False
+            # Don't end gateway-originated sessions — the gateway owns their
+            # lifecycle. The TUI is only a viewer there (#60609).
+            row = db.get_session(session_id)
         source = (row or {}).get("source", "")
         return not _is_gateway_owned_source(source)
     except Exception:
-        return True
+        return False
 
 
 def _session_async_delegation_selectors(
@@ -1087,7 +1098,11 @@ def _session_async_delegation_selectors(
     agent = session.get("agent")
     session_key = str(session.get("session_key") or "")
     session_id = getattr(agent, "session_id", None) or session_key
-    owned_session_key = session_key if _session_owns_durable_lifecycle(session_id) else ""
+    owned_session_key = (
+        session_key
+        if _session_owns_durable_lifecycle(session, session_id)
+        else ""
+    )
     return own_sid, owned_session_key
 
 
