@@ -1473,6 +1473,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         guild_id,
                     )
 
+            # Raw reaction events: drive reaction triggers without needing the
+            # message cache (raw payloads arrive even for uncached messages).
+            # Gate chain + synthesis live in _handle_reaction_payload.
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                await adapter_self._handle_reaction_payload(payload, added=True)
+
+            @self._client.event
+            async def on_raw_reaction_remove(payload):
+                await adapter_self._handle_reaction_payload(payload, added=False)
+
             # Register slash commands
             if self._slash_commands:
                 self._register_slash_commands()
@@ -3412,6 +3423,243 @@ class DiscordAdapter(BasePlatformAdapter):
     def _lookup_outbound_snippet(self, message_id: Any) -> Optional[str]:
         targets = getattr(self, "_reaction_targets", None) or {}
         return targets.get(str(message_id))
+
+    async def _handle_reaction_payload(self, payload, *, added: bool) -> None:
+        """Raw-reaction gate chain -> optional synthesized MessageEvent.
+
+        Canonical gate order (single source of truth):
+
+          Gate 1  validity drop (empty emoji/message_id)
+          Gate 2  self-drop — ABSOLUTE FIRST behavioral gate: the bot must
+                  never echo its own emoji acks, neither as a dispatched
+                  event nor onto the hook surface
+          Gate 3  hook fan-out (awaited; fires for every human reaction
+                  regardless of opt-in, mirroring Slack)
+          Gate 4  opt-in off => hooks-only return
+          Gate 5  allowlist (normalized emoji vs normalized allowlist names)
+          Gate 6  target-authorship: 6a ``message_author_id`` fast path
+                  (REACTION_ADD); 6b single-fetch fallback — EVERY
+                  REACTION_REMOVE takes 6b because the remove payload lacks
+                  ``message_author_id``
+          Gate 7  channel policy — generic handle_message bypasses the
+                  on_message admission block, so allowed/ignored channels
+                  are mirrored here; DM payloads SKIP this gate exactly as
+                  ingress does; an unresolvable guild channel drops
+                  fail-closed
+          Gate 8  reactor authorization (_is_allowed_user, fails closed)
+          then synthesize a MessageEvent and dispatch via handle_message.
+        """
+        try:
+            client = getattr(self, "_client", None)
+            client_user = getattr(client, "user", None)
+            our_id = str(getattr(client_user, "id", "")) if client_user is not None else ""
+            reactor_id = str(getattr(payload, "user_id", "") or "")
+            emoji = normalize_reaction_emoji(getattr(payload, "emoji", None))
+            message_id = str(getattr(payload, "message_id", "") or "")
+            if not emoji or not message_id:
+                return                                     # Gate 1: validity drop
+            if our_id and reactor_id == our_id:
+                return                                     # Gate 2: self-drop (acks)
+            enabled, allowlist = self._reaction_trigger_config()
+            await self._emit_reaction_hook(payload, emoji, added, reactor_id)  # Gate 3
+            if not enabled:                                # Gate 4: hooks-only mode
+                return
+            # Gate 5: allowlist — normalize BOTH sides so a YAML entry written
+            # as "<:paw:123>" matches the normalized output "paw".
+            if allowlist is not None and emoji not in {
+                normalize_reaction_emoji(name) for name in allowlist
+            }:
+                return
+            # Hydration map contract: "" means known-but-empty (captionless
+            # attachment — a hit, do NOT replace it with a fetch); None means
+            # unknown. Gate 6a therefore keeps whatever the map returned.
+            target_text = self._lookup_outbound_snippet(message_id)
+            author_id = str(getattr(payload, "message_author_id", "") or "")
+            if author_id:                                  # Gate 6a: ADD fast path
+                if not our_id or author_id != our_id:
+                    return
+            else:                                          # Gate 6b: EVERY REMOVE
+                is_ours, fetched_text = await self._resolve_reaction_target(
+                    message_id, payload)
+                if not is_ours:
+                    return
+                target_text = target_text or fetched_text
+
+            # Gate 7: channel policy. Cheap and REST-free (channel cache first),
+            # placed BEFORE authorization exactly like the ingress ordering of
+            # channel gates ahead of user gates.
+            guild_id_raw = getattr(payload, "guild_id", None)
+            is_dm = guild_id_raw is None
+            channel_obj = None
+            parent_channel_id: Optional[str] = None
+            channel_ids: Optional[set] = None
+            if not is_dm:
+                raw_cid = getattr(payload, "channel_id", None)
+                resolver = getattr(client, "get_channel", None) if client else None
+                if callable(resolver) and raw_cid is not None:
+                    try:
+                        channel_obj = resolver(int(raw_cid))
+                    except (TypeError, ValueError):
+                        channel_obj = None
+                if channel_obj is None and client is not None and raw_cid is not None:
+                    fetcher = getattr(client, "fetch_channel", None)
+                    if callable(fetcher):
+                        try:
+                            channel_obj = await fetcher(int(raw_cid))
+                        except Exception:
+                            channel_obj = None
+                if channel_obj is None:
+                    logger.debug(
+                        "[%s] reaction trigger dropped: unresolvable guild channel %s",
+                        getattr(self, "name", "discord"),
+                        getattr(payload, "channel_id", "?"),
+                    )
+                    return                                 # fail closed
+                channel_keys = self._discord_channel_keys_from_channel(channel_obj)
+                allowed_channels = self._get_allowed_channels()
+                if allowed_channels:
+                    if "*" not in allowed_channels and not (channel_keys & allowed_channels):
+                        logger.debug(
+                            "[%s] Ignoring reaction in non-allowed channel: %s",
+                            self.name, channel_keys)
+                        return
+                ignored_channels = self._get_ignored_channels()
+                if "*" in ignored_channels or (channel_keys & ignored_channels):
+                    logger.debug(
+                        "[%s] Ignoring reaction in ignored channel: %s",
+                        self.name, channel_keys)
+                    return
+                raw_parent = getattr(channel_obj, "parent_id", None)
+                parent_channel_id = str(raw_parent) if raw_parent else None
+                cid_str = str(getattr(channel_obj, "id", "") or "")
+                channel_ids = {cid_str} if cid_str else set()
+                if parent_channel_id:
+                    channel_ids.add(parent_channel_id)
+
+            # Gate 8: reactor authorization. Identity prefers payload.member
+            # (REACTION_ADD in guilds); otherwise a guarded fetch_user.
+            reactor_obj = getattr(payload, "member", None)
+            if reactor_obj is None and client is not None:
+                dm_fetch = getattr(client, "fetch_user", None)
+                if callable(dm_fetch):
+                    try:
+                        reactor_obj = await dm_fetch(int(reactor_id))
+                    except Exception:
+                        reactor_obj = None
+            guild = getattr(channel_obj, "guild", None) if channel_obj is not None else None
+            if not self._is_allowed_user(
+                reactor_id,
+                reactor_obj,
+                guild=guild,
+                is_dm=is_dm,
+                channel_ids=channel_ids,
+            ):
+                return
+
+            # Source: DM payloads build chat_type="dm" directly (the shared
+            # helper hardcodes thread/group); guild payloads are thread-aware.
+            user_name = None
+            if reactor_obj is not None:
+                user_name = (
+                    getattr(reactor_obj, "display_name", None)
+                    or getattr(reactor_obj, "name", None)
+                )
+            if is_dm:
+                source = self.build_source(
+                    chat_id=str(getattr(payload, "channel_id", "") or ""),
+                    chat_type="dm",
+                    user_id=reactor_id,
+                    user_name=user_name,
+                    message_id=message_id,
+                )
+            else:
+                thread_id, chat_id = self._thread_id_and_chat_for_channel(channel_obj)
+                if not chat_id:
+                    chat_id = str(getattr(payload, "channel_id", "") or "")
+                chat_name = getattr(channel_obj, "name", None)
+                if guild is not None and chat_name:
+                    chat_name = f"{getattr(guild, 'name', '')} / #{chat_name}"
+                source = self.build_source(
+                    chat_id=str(chat_id),
+                    chat_name=chat_name,
+                    chat_type="thread" if thread_id else "group",
+                    user_id=reactor_id,
+                    user_name=user_name,
+                    thread_id=thread_id,
+                    guild_id=str(guild_id_raw) if guild_id_raw else None,
+                    parent_chat_id=parent_channel_id,
+                    message_id=message_id,
+                )
+
+            # MessageEvent/MessageType already imported module-top — no re-import.
+            event = MessageEvent(
+                text=f"reaction:{'added' if added else 'removed'}:{emoji}",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=message_id,
+                reply_to_message_id=message_id,
+                reply_to_text=target_text,
+                reply_to_is_own_message=True,
+                raw_message=payload,
+                timestamp=dt.datetime.now(dt.timezone.utc),
+            )
+            await self.handle_message(event)
+        except Exception:
+            logger.debug("[%s] reaction trigger handling failed",
+                         getattr(self, "name", "discord"), exc_info=True)
+
+    async def _resolve_reaction_target(self, message_id, payload) -> tuple[bool, Optional[str]]:
+        """Single-fetch authorship+hydration check for reactions lacking message_author_id.
+
+        Performs EXACTLY ONE REST call (channel.fetch_message). Returns
+        (True, snippet<=200 chars) when the fetched message is authored by our bot,
+        (False, None) otherwise or on ANY failure (fail-closed -> drop, logged debug).
+        """
+        try:
+            client = getattr(self, "_client", None)
+            channel = client.get_channel(int(getattr(payload, "channel_id"))) if client else None
+            if channel is None and client is not None:
+                channel = await client.fetch_channel(int(getattr(payload, "channel_id")))
+            if channel is None:
+                return False, None
+            msg = await channel.fetch_message(int(message_id))
+            client_user = getattr(client, "user", None)
+            our_id = str(getattr(client_user, "id", "")) if client_user else ""
+            msg_author = getattr(msg, "author", None)
+            author_id = (
+                str(getattr(msg_author, "id", "") or "")
+                if msg_author is not None else ""
+            )
+            if not our_id or author_id != our_id:
+                return False, None
+            snippet = (getattr(msg, "content", "") or "").strip()[:200]
+            return True, snippet or None
+        except Exception:
+            logger.debug("[%s] reaction target fetch failed (%s)",
+                         getattr(self, "name", "discord"), message_id, exc_info=True)
+            return False, None
+
+    async def _emit_reaction_hook(self, payload, emoji: str, added: bool, reactor_id: str) -> None:
+        """Fire the gateway reaction:* hook surface (parity with Slack/Photon)."""
+        handler = getattr(self, "_reaction_handler", None)
+        if handler is None:
+            return
+        try:
+            client_user = getattr(getattr(self, "_client", None), "user", None)
+            await handler({
+                "platform": "discord",
+                "event_name": f"reaction:{'added' if added else 'removed'}",
+                "reaction": emoji,
+                "user_id": reactor_id,
+                "item_user_id": str(getattr(client_user, "id", "")),
+                "channel_id": str(getattr(payload, "channel_id", "")),
+                "message_ts": str(getattr(payload, "message_id", "")),
+                "event_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "raw_event": payload,
+            })
+        except Exception:
+            logger.debug("[%s] reaction hook fan-out failed",
+                         getattr(self, "name", "discord"), exc_info=True)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
