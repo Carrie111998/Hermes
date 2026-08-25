@@ -35,7 +35,9 @@ def _parse(entry_text: str) -> dict:
     return values
 
 
-def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, monkeypatch):
+def test_install_writes_entry_with_absolute_exec_and_icon(
+    tmp_path, xdg_home, monkeypatch
+):
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
@@ -68,7 +70,9 @@ def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, mo
 
 def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes"
+    )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -79,6 +83,10 @@ def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
 def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
+    # Deterministic even on machines where ~/.local/bin/hermes is on PATH:
+    # this test pins the no-launcher-at-all fallback, so nothing may be
+    # found on PATH either.
+    monkeypatch.setattr(lde.shutil, "which", lambda name: None)
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -90,9 +98,13 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes"
+    )
     calls: list[Path] = []
-    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda d: calls.append(d) or [])
+    monkeypatch.setattr(
+        lde, "refresh_desktop_databases", lambda d: calls.append(d) or []
+    )
 
     lde.install_desktop_entry(root)
     assert len(calls) == 1
@@ -105,7 +117,9 @@ def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monke
 def test_install_without_source_icon_uses_themed_name(tmp_path, xdg_home, monkeypatch):
     root = tmp_path / "hermes-agent"
     root.mkdir()
-    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes"
+    )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
@@ -137,7 +151,9 @@ def test_install_is_a_noop_on_windows(tmp_path):
 def _stub_tools(monkeypatch, available: "set[str]") -> "list[list[str]]":
     ran: list[list[str]] = []
     monkeypatch.setattr(
-        lde.shutil, "which", lambda name: f"/usr/bin/{name}" if name in available else None
+        lde.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in available else None,
     )
     monkeypatch.setattr(lde, "_run_quiet", lambda cmd: ran.append(cmd) or True)
     return ran
@@ -203,3 +219,92 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line == f'"{spaced}" desktop'
+
+
+# ---------------------------------------------------------------------------
+# Raw checkout wrapper detection
+#
+# Regression coverage for the app-menu crash: $HERMES_HOME/hermes starts
+# with "#!/usr/bin/env python3" and dies outside a terminal with
+# ModuleNotFoundError: dotenv. resolve_exec_command() must never write
+# that file into Exec=, so its detector has to separate the raw wrapper
+# from every launcher that actually works.
+# ---------------------------------------------------------------------------
+
+
+def _write_launcher(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_raw_checkout_wrapper_is_detected(tmp_path):
+    raw = _write_launcher(
+        tmp_path / "checkout" / "hermes",
+        "#!/usr/bin/env python3\nfrom hermes_cli.main import main\nmain()\n",
+    )
+
+    assert lde._is_raw_checkout_wrapper(str(raw)) is True
+
+
+def test_installed_bash_launcher_is_not_raw(tmp_path):
+    # The launcher the installer writes to ~/.local/bin/hermes: a bash
+    # shim execing the venv interpreter. This is the good case the
+    # detector must let through.
+    installed = _write_launcher(
+        tmp_path / ".local" / "bin" / "hermes",
+        '#!/usr/bin/env bash\nexec /opt/hermes/venv/bin/python /opt/hermes/hermes "$@"\n',
+    )
+
+    assert lde._is_raw_checkout_wrapper(str(installed)) is False
+
+
+def test_shebang_below_a_leading_blank_line_is_not_raw(tmp_path):
+    # Detection reads the first bytes of the file. A shebang that is not
+    # at offset zero is not executable as one, so it must not match.
+    shifted = _write_launcher(
+        tmp_path / "hermes",
+        "\n#!/usr/bin/env python3\n",
+    )
+
+    assert lde._is_raw_checkout_wrapper(str(shifted)) is False
+
+
+def test_exact_shebang_without_a_body_is_still_raw(tmp_path):
+    bare = _write_launcher(tmp_path / "hermes", "#!/usr/bin/env python3")
+
+    assert lde._is_raw_checkout_wrapper(str(bare)) is True
+
+
+def test_missing_file_is_not_raw(tmp_path):
+    assert lde._is_raw_checkout_wrapper(str(tmp_path / "does-not-exist")) is False
+
+
+def test_directory_path_is_not_raw(tmp_path):
+    assert lde._is_raw_checkout_wrapper(str(tmp_path)) is False
+
+
+def test_exec_skips_raw_checkout_wrapper_and_falls_back_to_module(
+    tmp_path, xdg_home, monkeypatch
+):
+    # The reported failure end to end: argv[0] resolves to the raw
+    # checkout wrapper and nothing better exists on PATH. The entry must
+    # fall back to the current interpreter running the CLI module rather
+    # than record a command that fails silently on launch.
+    root = _make_project(tmp_path)
+    raw_wrapper = _write_launcher(
+        tmp_path / "hermes-agent" / "hermes",
+        "#!/usr/bin/env python3\n",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(raw_wrapper)
+    )
+    monkeypatch.setattr(lde.shutil, "which", lambda name: None)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    assert entry is not None
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.endswith("-m hermes_cli.main desktop")
+    assert str(raw_wrapper) not in exec_line
