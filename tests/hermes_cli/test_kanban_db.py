@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import pickle
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -166,9 +168,303 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_idempotency_unique_index_migration_rejects_active_duplicates_without_mutation(
+    tmp_path,
+):
+    db_path = tmp_path / "duplicate-idempotency.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                assignee TEXT,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+                idempotency_key TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO tasks
+                (id, title, status, created_at, workspace_kind, idempotency_key)
+            VALUES (?, ?, 'ready', ?, 'scratch', ?)
+            """,
+            [
+                ("t_duplicate_a", "first", 1, "period-2026-q3"),
+                ("t_duplicate_b", "second", 2, "period-2026-q3"),
+            ],
+        )
+        conn.commit()
+        columns_before = conn.execute("PRAGMA table_info(tasks)").fetchall()
+    finally:
+        conn.close()
+
+    with pytest.raises(ValueError) as exc_info:
+        kb.init_db(db_path)
+
+    message = str(exc_info.value)
+    assert "period-2026-q3" in message
+    assert "t_duplicate_a" in message
+    assert "t_duplicate_b" in message
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT id, idempotency_key, status FROM tasks ORDER BY id"
+        ).fetchall()
+        columns_after = conn.execute("PRAGMA table_info(tasks)").fetchall()
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+    finally:
+        conn.close()
+
+    assert rows == [
+        ("t_duplicate_a", "period-2026-q3", "ready"),
+        ("t_duplicate_b", "period-2026-q3", "ready"),
+    ]
+    assert columns_after == columns_before
+    assert "idx_tasks_idempotency_active_unique" not in indexes
+
+
+def test_database_enforces_one_active_task_per_idempotency_key(tmp_path):
+    db_path = tmp_path / "idempotency-constraint.db"
+    with kb.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks
+                (id, title, status, created_at, workspace_kind, idempotency_key)
+            VALUES ('t_first', 'first', 'ready', 1, 'scratch', 'shared-key')
+            """
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO tasks
+                    (id, title, status, created_at, workspace_kind, idempotency_key)
+                VALUES ('t_duplicate', 'duplicate', 'ready', 2, 'scratch', 'shared-key')
+                """
+            )
+
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = 't_first'")
+        conn.execute(
+            """
+            INSERT INTO tasks
+                (id, title, status, created_at, workspace_kind, idempotency_key)
+            VALUES ('t_reused', 'reused', 'ready', 3, 'scratch', 'shared-key')
+            """
+        )
+        conn.commit()
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = 'shared-key' "
+            "AND status != 'archived'"
+        ).fetchone()[0] == 1
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
+
+
+def test_idempotent_create_reports_created_then_reused(kanban_home, tmp_path):
+    workspace_path = str(tmp_path / "shared-workspace")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="periodic assessment",
+            assignee="ops",
+            workspace_kind="dir",
+            workspace_path=workspace_path,
+            skills=["audit"],
+            idempotency_key="assessment-2026-q3",
+        )
+        second = kb.create_task(
+            conn,
+            title="periodic assessment",
+            assignee="ops",
+            workspace_kind="dir",
+            workspace_path=workspace_path,
+            skills=["audit"],
+            idempotency_key="assessment-2026-q3",
+        )
+
+        assert first.task_id == second.task_id
+        assert first.created is True
+        assert first.existing is False
+        assert first.reused is False
+        assert second.created is False
+        assert second.existing is True
+        assert second.reused is True
+        assert str(first) == first.task_id
+        assert [event.kind for event in kb.list_events(conn, first)] == ["created"]
+
+
+def test_create_task_result_pickles_as_a_string_compatible_result():
+    original = kb.CreateTaskResult("t_pickle", created=False)
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert restored == "t_pickle"
+    assert isinstance(restored, kb.CreateTaskResult)
+    assert restored.created is False
+    assert restored.reused is True
+
+
+def test_empty_non_null_idempotency_key_is_reused(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="empty key contract",
+            assignee="ops",
+            idempotency_key="",
+        )
+        second = kb.create_task(
+            conn,
+            title="empty key contract",
+            assignee="ops",
+            idempotency_key="",
+        )
+
+        assert first.created is True
+        assert second.reused is True
+        assert first.task_id == second.task_id
+
+
+def test_archived_idempotency_key_may_be_reused(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="periodic assessment",
+            assignee="ops",
+            idempotency_key="assessment-2026-q2",
+        )
+        assert kb.archive_task(conn, first) is True
+
+        second = kb.create_task(
+            conn,
+            title="periodic assessment",
+            assignee="ops",
+            idempotency_key="assessment-2026-q2",
+        )
+
+        assert second.created is True
+        assert second.task_id != first.task_id
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ? ORDER BY id",
+            ("assessment-2026-q2",),
+        ).fetchall()
+        assert len(rows) == 2
+        assert sum(row["status"] != "archived" for row in rows) == 1
+        assert [event.kind for event in kb.list_events(conn, second)] == ["created"]
+
+
+def test_simultaneous_idempotent_creators_return_one_created_and_one_reused(
+    kanban_home,
+):
+    release_creators = threading.Barrier(2)
+    # On the regressed implementation the lookup ran before BEGIN IMMEDIATE;
+    # hold both legacy lookups at that exact boundary so the test is reliably
+    # RED there. The fixed path performs its lookup inside the write transaction,
+    # so this trace-only barrier intentionally remains dormant.
+    pre_transaction_lookups = threading.Barrier(2)
+
+    def create_from_independent_connection():
+        conn = kb.connect()
+        try:
+            def synchronize_legacy_lookup(sql):
+                if (
+                    "FROM TASKS WHERE IDEMPOTENCY_KEY" in sql.upper()
+                    and not conn.in_transaction
+                ):
+                    pre_transaction_lookups.wait(timeout=5)
+
+            conn.set_trace_callback(synchronize_legacy_lookup)
+            release_creators.wait(timeout=5)
+            return kb.create_task(
+                conn,
+                title="simultaneous assessment",
+                assignee="ops",
+                skills=["audit"],
+                idempotency_key="assessment-simultaneous-2026-q3",
+            )
+        finally:
+            conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(create_from_independent_connection) for _ in range(2)
+        ]
+        results = [future.result(timeout=10) for future in futures]
+
+    assert results[0].task_id == results[1].task_id
+    assert sorted(result.created for result in results) == [False, True]
+    assert sorted(result.reused for result in results) == [False, True]
+
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+            ("assessment-simultaneous-2026-q3",),
+        ).fetchall()
+        assert [row["id"] for row in rows] == [results[0].task_id]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'created'",
+            (results[0].task_id,),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("override", "field"),
+    [
+        ({"title": "different assessment"}, "title"),
+        ({"assignee": "alice"}, "assignee"),
+        ({"workspace_kind": "scratch"}, "workspace_kind"),
+        ({"workspace_path": "/different/workspace"}, "workspace_path"),
+        ({"skills": ["different-skill"]}, "skills"),
+    ],
+)
+def test_idempotent_create_rejects_semantic_mismatch_without_mutation(
+    kanban_home,
+    tmp_path,
+    override,
+    field,
+):
+    workspace_path = str(tmp_path / "shared-workspace")
+    contract = {
+        "title": "periodic assessment",
+        "assignee": "ops",
+        "workspace_kind": "dir",
+        "workspace_path": workspace_path,
+        "skills": ["audit"],
+        "idempotency_key": "assessment-2026-q4",
+    }
+    with kb.connect() as conn:
+        original = kb.create_task(conn, **contract)
+
+        with pytest.raises(ValueError, match=field):
+            kb.create_task(conn, **(contract | override))
+
+        task = kb.get_task(conn, original)
+        assert task is not None
+        assert task.title == contract["title"]
+        assert task.assignee == contract["assignee"]
+        assert task.workspace_kind == contract["workspace_kind"]
+        assert task.workspace_path == contract["workspace_path"]
+        assert task.skills == contract["skills"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+            (contract["idempotency_key"],),
+        ).fetchone()[0] == 1
+        assert [event.kind for event in kb.list_events(conn, original)] == ["created"]
 
 
 

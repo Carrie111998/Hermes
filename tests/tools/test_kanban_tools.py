@@ -416,6 +416,28 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_idempotency_result_is_explicit_and_task_id_stays_compatible(worker_env):
+    from tools import kanban_tools as kt
+
+    args = {
+        "title": "periodic child",
+        "assignee": "peer",
+        "workspace_kind": "scratch",
+        "skills": ["audit"],
+        "idempotency_key": "periodic-child-2026-q3",
+    }
+    first = json.loads(kt._handle_create(args))
+    second = json.loads(kt._handle_create(args))
+
+    assert first["task_id"] == second["task_id"]
+    assert first["created"] is True
+    assert first["existing"] is False
+    assert first["reused"] is False
+    assert second["created"] is False
+    assert second["existing"] is True
+    assert second["reused"] is True
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
