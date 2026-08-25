@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.metadata
 import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -219,3 +220,314 @@ def test_activation_is_not_gated_on_plugins_enabled(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     assert memory_plugins.load_memory_provider("gatedmem") is not None
+
+
+def test_profile_clone_resolves_provider_through_canonical_config_loader(
+    tmp_path, monkeypatch
+):
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    source_dir.mkdir()
+    profile_dir.mkdir()
+    (source_dir / "config.yaml").write_text(
+        "memory:\n  provider: ${CLONE_MEMORY_PROVIDER}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLONE_MEMORY_PROVIDER", "custommem")
+    monkeypatch.setattr(memory_plugins, "_iter_provider_dirs", lambda: [])
+
+    calls = []
+
+    class Provider:
+        def clone_profile(self, profile_name, **kwargs):
+            calls.append((profile_name, kwargs))
+            return "cloned"
+
+    monkeypatch.setattr(
+        memory_plugins,
+        "load_memory_provider",
+        lambda name, **kwargs: Provider() if name == "custommem" else None,
+    )
+
+    from hermes_constants import get_hermes_home
+
+    ambient_home = get_hermes_home()
+    result = memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+    )
+
+    assert result == ["cloned"]
+    assert calls == [(
+        "coder",
+        {
+            "source_dir": source_dir,
+            "profile_dir": profile_dir,
+            "clone_all": False,
+        },
+    )]
+    assert get_hermes_home() == ambient_home
+
+
+def test_profile_clone_runs_provider_declared_by_manifest(tmp_path, monkeypatch):
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    provider_dir = tmp_path / "legacy-memory"
+    source_dir.mkdir()
+    profile_dir.mkdir()
+    provider_dir.mkdir()
+    (provider_dir / "plugin.yaml").write_text(
+        "name: legacy-memory\nprofile_clone: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        memory_plugins,
+        "_iter_provider_dirs",
+        lambda: [("legacy-memory", provider_dir)],
+    )
+
+    calls = []
+
+    class Provider:
+        def clone_profile(self, profile_name, **kwargs):
+            calls.append((profile_name, kwargs))
+            return "legacy-cloned"
+
+    monkeypatch.setattr(
+        memory_plugins,
+        "load_memory_provider",
+        lambda name, **kwargs: Provider() if name == "legacy-memory" else None,
+    )
+
+    result = memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+        clone_all=True,
+    )
+
+    assert result == ["legacy-cloned"]
+    assert calls == [(
+        "coder",
+        {
+            "source_dir": source_dir,
+            "profile_dir": profile_dir,
+            "clone_all": True,
+        },
+    )]
+
+
+def test_profile_clone_loads_provider_from_explicit_source_profile(
+    tmp_path, monkeypatch
+):
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    source_dir.mkdir()
+    profile_dir.mkdir()
+    (source_dir / "config.yaml").write_text(
+        "memory:\n  provider: sourceclone\n",
+        encoding="utf-8",
+    )
+    provider_dir = source_dir / "plugins" / "sourceclone"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(
+        PROVIDER_SOURCE.format(name="sourceclone").replace(
+            "    def get_tool_schemas(self):\n        return []\n",
+            "    def get_tool_schemas(self):\n"
+            "        return []\n\n"
+            "    def clone_profile(self, profile_name, **kwargs):\n"
+            "        (kwargs['profile_dir'] / 'sourceclone.txt').write_text(profile_name)\n"
+            "        return 'source-cloned'\n",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", tmp_path / "bundled")
+
+    from hermes_constants import get_hermes_home
+
+    ambient_home = get_hermes_home()
+    result = memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+    )
+
+    assert result == ["source-cloned"]
+    assert (profile_dir / "sourceclone.txt").read_text() == "coder"
+    assert get_hermes_home() == ambient_home
+
+
+def test_profile_clone_isolates_bad_manifests_and_failing_hooks(
+    tmp_path, monkeypatch, caplog
+):
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    source_dir.mkdir()
+    profile_dir.mkdir()
+
+    provider_dirs = []
+    for name, manifest in (
+        ("malformed", "- not-a-mapping\n"),
+        ("failing", "profile_clone: true\n"),
+        ("working", "profile_clone: true\n"),
+    ):
+        provider_dir = tmp_path / name
+        provider_dir.mkdir()
+        (provider_dir / "plugin.yaml").write_text(manifest, encoding="utf-8")
+        provider_dirs.append((name, provider_dir))
+    monkeypatch.setattr(memory_plugins, "_iter_provider_dirs", lambda: provider_dirs)
+
+    class FailingProvider:
+        def clone_profile(self, profile_name, **kwargs):
+            raise RuntimeError("broken clone hook")
+
+    class WorkingProvider:
+        def clone_profile(self, profile_name, **kwargs):
+            return "working-cloned"
+
+    def load_provider(name, **kwargs):
+        if name == "failing":
+            return FailingProvider()
+        if name == "working":
+            return WorkingProvider()
+        return None
+
+    monkeypatch.setattr(memory_plugins, "load_memory_provider", load_provider)
+
+    with caplog.at_level("DEBUG", logger="plugins.memory"):
+        result = memory_plugins.clone_memory_provider_profile(
+            "coder",
+            source_dir=source_dir,
+            profile_dir=profile_dir,
+        )
+
+    assert result == ["working-cloned"]
+    assert "profile-clone manifest for memory provider 'malformed'" in caplog.text
+    assert "Memory provider 'failing' failed to clone profile 'coder'" in caplog.text
+
+
+def test_profile_clone_reloads_same_named_provider_from_source_profile(
+    tmp_path, monkeypatch
+):
+    provider_name = "sameprofilemem"
+    marker_source = """\
+from agent.memory_provider import MemoryProvider
+
+
+class Provider(MemoryProvider):
+    @property
+    def name(self):
+        return "sameprofilemem"
+
+    def is_available(self):
+        return True
+
+    def initialize(self, *args, **kwargs):
+        pass
+
+    def get_tool_schemas(self):
+        return []
+
+    def current_origin(self):
+        from .helper import ORIGIN
+        return ORIGIN
+
+    def clone_profile(self, profile_name, **kwargs):
+        (kwargs["profile_dir"] / "provider-origin.txt").write_text(
+            self.current_origin()
+        )
+
+
+def register(ctx):
+    ctx.register_memory_provider(Provider())
+"""
+    ambient_dir = tmp_path / "ambient" / "plugins" / provider_name
+    source_dir = tmp_path / "source"
+    source_provider_dir = source_dir / "plugins" / provider_name
+    profile_dir = tmp_path / "profile"
+    ambient_dir.mkdir(parents=True)
+    source_provider_dir.mkdir(parents=True)
+    profile_dir.mkdir()
+    (ambient_dir / "__init__.py").write_text(marker_source, encoding="utf-8")
+    (ambient_dir / "helper.py").write_text('ORIGIN = "ambient"\n', encoding="utf-8")
+    (source_provider_dir / "__init__.py").write_text(
+        marker_source,
+        encoding="utf-8",
+    )
+    (source_provider_dir / "helper.py").write_text(
+        'ORIGIN = "source"\n',
+        encoding="utf-8",
+    )
+    (source_dir / "config.yaml").write_text(
+        f"memory:\n  provider: {provider_name}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", tmp_path / "bundled")
+
+    ambient_provider = memory_plugins._load_provider_from_dir(ambient_dir)
+    assert ambient_provider is not None
+
+    memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+    )
+
+    assert (profile_dir / "provider-origin.txt").read_text() == "source"
+    assert ambient_provider.current_origin() == "ambient"
+
+
+def test_profile_clone_ignores_cli_discovery_package_descendants(
+    tmp_path, monkeypatch
+):
+    provider_name = "syntheticprofilemem"
+    source_dir = tmp_path / "source"
+    profile_dir = tmp_path / "profile"
+    provider_dir = source_dir / "plugins" / provider_name
+    provider_dir.mkdir(parents=True)
+    profile_dir.mkdir()
+    (source_dir / "config.yaml").write_text(
+        f"memory:\n  provider: {provider_name}\n",
+        encoding="utf-8",
+    )
+    (provider_dir / "helper.py").write_text(
+        'ORIGIN = "source"\n',
+        encoding="utf-8",
+    )
+    (provider_dir / "__init__.py").write_text(
+        "from agent.memory_provider import MemoryProvider\n"
+        "from .helper import ORIGIN\n\n"
+        "class Provider(MemoryProvider):\n"
+        "    @property\n"
+        "    def name(self):\n"
+        f"        return {provider_name!r}\n\n"
+        "    def is_available(self):\n"
+        "        return True\n\n"
+        "    def initialize(self, *args, **kwargs):\n"
+        "        pass\n\n"
+        "    def get_tool_schemas(self):\n"
+        "        return []\n\n"
+        "    def clone_profile(self, profile_name, **kwargs):\n"
+        "        (kwargs['profile_dir'] / 'synthetic-origin.txt').write_text(ORIGIN)\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_memory_provider(Provider())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", tmp_path / "bundled")
+
+    module_name = f"{memory_plugins._USER_NAMESPACE}.{provider_name}"
+    synthetic_package = types.ModuleType(module_name)
+    synthetic_package.__path__ = [str(tmp_path / "ambient" / provider_name)]
+    ambient_helper = types.ModuleType(f"{module_name}.helper")
+    ambient_helper.ORIGIN = "ambient"
+    monkeypatch.setitem(sys.modules, module_name, synthetic_package)
+    monkeypatch.setitem(sys.modules, f"{module_name}.helper", ambient_helper)
+
+    memory_plugins.clone_memory_provider_profile(
+        "coder",
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+    )
+
+    assert (profile_dir / "synthetic-origin.txt").read_text() == "source"

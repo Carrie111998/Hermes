@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.machinery
 import importlib.metadata
@@ -39,7 +40,8 @@ import logging
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, TYPE_CHECKING
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config_readonly
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 if TYPE_CHECKING:
     from agent.memory_provider import MemoryProvider
@@ -366,6 +368,86 @@ def load_memory_provider(
         return None
 
 
+def clone_memory_provider_profile(
+    profile_name: str,
+    *,
+    source_dir: Path,
+    profile_dir: Path,
+    clone_all: bool = False,
+) -> object | None:
+    """Run the cloned profile's configured memory-provider hook.
+
+    The active provider comes from the source config.yaml. Providers with
+    legacy out-of-band state may also declare ``profile_clone: true`` in
+    plugin.yaml so their hook can probe that state without coupling profile
+    creation to a provider-specific filename or resolver.
+    """
+    token = set_hermes_home_override(source_dir)
+    try:
+        provider_names: list[str] = []
+        config_path = source_dir / "config.yaml"
+        if config_path.exists():
+            try:
+                config = load_config_readonly()
+                configured = cfg_get(config, "memory", "provider") or None
+                if configured:
+                    provider_names.append(configured)
+            except Exception:
+                logger.debug(
+                    "Failed to read memory provider from clone source %s",
+                    source_dir,
+                    exc_info=True,
+                )
+
+        for candidate, provider_dir in _iter_provider_dirs():
+            manifest_path = provider_dir / "plugin.yaml"
+            if not manifest_path.exists():
+                continue
+            try:
+                import yaml
+
+                manifest = yaml.safe_load(
+                    manifest_path.read_text(encoding="utf-8-sig")
+                ) or {}
+                if not isinstance(manifest, dict):
+                    raise TypeError("plugin manifest must be a mapping")
+            except Exception:
+                logger.debug(
+                    "Failed to inspect profile-clone manifest for memory provider '%s'",
+                    candidate,
+                    exc_info=True,
+                )
+                continue
+            if manifest.get("profile_clone") is True and candidate not in provider_names:
+                provider_names.append(candidate)
+
+        results = []
+        for provider_name in provider_names:
+            provider = load_memory_provider(provider_name, register_skills=False)
+            if provider is None:
+                continue
+            try:
+                result = provider.clone_profile(
+                    profile_name,
+                    source_dir=source_dir,
+                    profile_dir=profile_dir,
+                    clone_all=clone_all,
+                )
+            except Exception:
+                logger.debug(
+                    "Memory provider '%s' failed to clone profile '%s'",
+                    provider_name,
+                    profile_name,
+                    exc_info=True,
+                )
+                continue
+            if result is not None:
+                results.append(result)
+        return results or None
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _load_provider_from_entry_point(
     entry_point,
     *,
@@ -431,7 +513,17 @@ def _load_provider_from_dir(
     # Use a separate namespace for user-installed plugins so they don't
     # collide with bundled providers in sys.modules.
     _is_bundled = _MEMORY_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _MEMORY_PLUGINS_DIR
-    module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
+    if _is_bundled:
+        module_name = f"plugins.memory.{name}"
+    else:
+        # The same provider name may be installed by multiple profiles in one
+        # long-lived process. Give each resolved directory its own package so
+        # retained provider instances and lazy relative imports cannot cross
+        # profile boundaries through sys.modules.
+        path_key = hashlib.sha256(
+            str(provider_dir.resolve()).encode("utf-8")
+        ).hexdigest()[:16]
+        module_name = f"{_USER_NAMESPACE}.{name}_{path_key}"
     init_file = provider_dir / "__init__.py"
 
     if not init_file.exists():
@@ -441,9 +533,18 @@ def _load_provider_from_dir(
     # discover_plugin_cli_commands() for relative-import support has no
     # __file__; only reuse modules that were actually loaded from disk.
     cached = sys.modules.get(module_name)
-    if cached is not None and getattr(cached, "__file__", None):
+    cached_file = getattr(cached, "__file__", None) if cached is not None else None
+    if cached_file and Path(cached_file).resolve() == init_file.resolve():
         mod = cached
     else:
+        # Clear an incomplete or mismatched package in this directory-specific
+        # namespace before retrying the load, including relative submodules.
+        for loaded_name in list(sys.modules):
+            if loaded_name == module_name or loaded_name.startswith(
+                f"{module_name}."
+            ):
+                sys.modules.pop(loaded_name, None)
+
         # Handle relative imports within the plugin
         # First ensure the parent packages are registered
         for parent in ("plugins", "plugins.memory"):

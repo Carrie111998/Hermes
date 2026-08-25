@@ -1313,6 +1313,26 @@ def create_profile(
     # unit-generation paths handle gateway lifecycle.
     _maybe_register_gateway_service(canon)
 
+    # Profile creation is shared by the CLI, REST/Desktop, and Bot Mode RPC.
+    # Let the selected memory provider apply its own clone-time identity state
+    # without coupling this core profile module to a specific plugin.
+    if source_dir is not None:
+        try:
+            from plugins.memory import clone_memory_provider_profile
+
+            clone_memory_provider_profile(
+                canon,
+                source_dir=source_dir,
+                profile_dir=profile_dir,
+                clone_all=clone_all,
+            )
+        except Exception:
+            logger.debug(
+                "Memory provider profile-clone integration failed for '%s'",
+                canon,
+                exc_info=True,
+            )
+
     return profile_dir
 
 
