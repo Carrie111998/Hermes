@@ -57,6 +57,34 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
+def _running_interpreter() -> str:
+    """The venv-semantic interpreter path for the persisted ``Exec=`` line.
+
+    ``sys.executable`` inside a venv is commonly a SYMLINK into a shared
+    base-interpreter tree (uv, pyenv, conda). ``Path.resolve()`` follows it
+    out of the venv, and CPython discovers ``pyvenv.cfg`` from the
+    *lexical* argv[0] — so a dereferenced path boots without the venv's
+    site-packages and dies on the first third-party import (#90292, one
+    level up; identified in #80547's review and confirmed on real Zorin/uv
+    hardware in this PR's review).
+
+    Keep the lexical path only when it actually is venv-semantic (a
+    ``pyvenv.cfg`` sits at or above it in the tree); otherwise the
+    dereferenced absolute path is the more durable form (survives the
+    symlink being re-pointed or its parent moving).
+
+    Idea credit: the lexical-preservation rule was independently proposed
+    in #92516/#94115/#94544 and by nosliwhtes' review of this PR; the
+    pyvenv.cfg-detection refinement here keeps both properties.
+    """
+    lexical = os.path.abspath(sys.executable)
+    path = Path(lexical)
+    for base in (path.parent, *path.parent.parents):
+        if (base / "pyvenv.cfg").is_file():
+            return lexical
+    return str(path.resolve())
+
+
 def resolve_exec_command(project_root: Optional[Path] = None) -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
@@ -82,6 +110,7 @@ def resolve_exec_command(project_root: Optional[Path] = None) -> str:
     bin_path = _resolve_hermes_bin_for_desktop_entry(
         resolve_hermes_bin, checkout_root=project_root
     )
+    interpreter = _running_interpreter()
     if bin_path:
         resolved = Path(bin_path).resolve()
         if _needs_interpreter(resolved):
@@ -92,17 +121,13 @@ def resolve_exec_command(project_root: Optional[Path] = None) -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly. Keep the LEXICAL path
-            # (abspath, not resolve()): on uv-managed venvs .venv/bin/python
-            # symlinks to a base interpreter outside the venv tree, and the
-            # dereferenced path is where pyvenv.cfg stops being adjacent —
-            # the exact failure #80547's review identified (#94443 case 2).
-            argv = [os.path.abspath(sys.executable), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly.
+            argv = [interpreter, str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
         argv = [
-            os.path.abspath(sys.executable),
+            interpreter,
             "-m",
             "hermes_cli.main",
             "desktop",
@@ -160,11 +185,21 @@ def _resolve_hermes_bin_for_desktop_entry(
         return False
 
     def _is_interpreter(candidate: Path) -> bool:
-        """A python interpreter binary (``bin/python*``), not a launcher."""
+        """A python interpreter binary (``bin/python*``), not a launcher.
+
+        Strict basename match — accepts ``python``, ``python3``,
+        ``python3.11``, ``python2.7``; rejects lookalikes such as
+        ``python3-config``, ``pythonw``, and anything else merely
+        *containing* "python". Regex approach proposed independently in
+        #94051; kept here with the parent-dir guard so a script named
+        ``python`` outside a bin/Scripts tree is not misclassified.
+        """
+        import re
+
         name = candidate.name.lower()
-        return candidate.parent.name in {"bin", "scripts"} and (
-            name == "python" or name.startswith("python")
-        )
+        if not re.fullmatch(r"python[23]?(\d+)?(\.\d+)?", name):
+            return False
+        return candidate.parent.name in {"bin", "scripts"}
 
     # Only reroute when argv[0] actually drove the resolution: re-run the
     # resolver with argv[0] hidden and compare. If PATH yields nothing,
@@ -349,7 +384,15 @@ def install_desktop_entry(project_root: Path) -> Optional[Path]:
         # churn the menu caches.
         if entry_path.is_file() and entry_path.read_text(encoding="utf-8") == contents:
             return entry_path
-        entry_path.write_text(contents, encoding="utf-8")
+        # Atomic replace: an interrupted plain write can leave a zero-byte
+        # entry, which permanently breaks the taskbar pin (nothing later
+        # rewrites a file that exists at the right path). The temp+rename
+        # dance in utils.atomic_write_text is the codebase's shared
+        # implementation — ported from #80547, which closed unmerged with
+        # this piece unlanded.
+        from utils import atomic_write_text
+
+        atomic_write_text(entry_path, contents, create_mode=0o755)
         # Some launchers (and older Plasma) offer the entry only when it
         # is executable.
         entry_path.chmod(0o755)
