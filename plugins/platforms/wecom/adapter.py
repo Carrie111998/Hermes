@@ -1629,15 +1629,26 @@ class WeComAdapter(BasePlatformAdapter):
         conversation turn, so any open/aging bubble from the prior turn is
         dropped and the next send_typing opens a brand-new bubble.
 
-        We cancel the keepalive and drop the entry WITHOUT writing a finish
-        frame — the old placeholder is abandoned and WeCom lets it expire
-        naturally. This is intentional: a redirect/follow-up means a new turn
-        starts, and the old bubble's lifetime is irrelevant now.
+        We cancel the keepalive, then send a finish=true frame to CLOSE the
+        old placeholder (WeCom does not auto-expire an open stream — leaving
+        it without a finish frame leaves a stuck "thinking" bubble on screen).
+        After that we drop the entry so the new turn opens its own bubble.
         """
         ka = self._thinking_keepalives.pop(chat_id, None)
         if ka:
             ka.cancel()
-        self._thinking_streams.pop(chat_id, None)
+        st = self._thinking_streams.pop(chat_id, None)
+        if st is not None and self._ws and not self._ws.closed:
+            try:
+                self._ws.send_json({
+                    "cmd": APP_CMD_RESPONSE,
+                    "headers": {"req_id": st["req"]},
+                    "body": {"msgtype": "stream",
+                             "stream": {"id": st["id"], "finish": True,
+                                        "content": ""}},
+                })
+            except Exception:
+                pass  # best-effort; worst case the old placeholder lingers
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Open the official WeCom "thinking" bubble for this chat.
