@@ -3290,6 +3290,16 @@ class DiscordAdapter(BasePlatformAdapter):
             current_existing_payload = self._existing_command_to_payload(current)
             current_payload = self._canonicalize_app_command_payload(current_existing_payload)
             desired_payload = self._canonicalize_app_command_payload(desired)
+            # discord.py serializes an unspecified install/context policy as
+            # null, while Discord may expand that omission in the fetched
+            # command (for example integration_types=[0, 1]).  Unspecified
+            # means "use the application's defaults", not "replace the live
+            # defaults on every startup".  Compare the fetched value when the
+            # desired tree left the field unspecified; explicit restrictions
+            # remain authoritative.
+            for defaulted_field in ("contexts", "integration_types"):
+                if desired.get(defaulted_field) is None:
+                    desired_payload[defaulted_field] = current_payload[defaulted_field]
             if current_payload == desired_payload:
                 unchanged += 1
                 continue
@@ -5806,7 +5816,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
         @tree.command(name="new", description="Start a new conversation")
         async def slash_new(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/reset", "New conversation started~")
+            # Dispatch the canonical command directly.  `/reset` remains a
+            # compatibility alias, but routing `/new` through the alias made
+            # the two native picker entries needlessly depend on different
+            # registration and alias-resolution paths.
+            await self._run_simple_slash(interaction, "/new", "New conversation started~")
 
         @tree.command(name="reset", description="Reset your Hermes session")
         async def slash_reset(interaction: discord.Interaction):

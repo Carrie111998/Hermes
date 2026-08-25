@@ -142,6 +142,20 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
+async def test_native_new_dispatches_canonical_new_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["new"]
+    interaction = SimpleNamespace()
+    await command(interaction)
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/new", "New conversation started~"
+    )
+
+
+@pytest.mark.asyncio
 async def test_registers_native_rename_slash_command(adapter):
     adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
