@@ -767,26 +767,40 @@ def _discover(
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
 
+    # Two-pass scan: interactive sources first, then top up with demoted
+    # (cron) ones. Post-hoc demotion alone (#19434) only reorders rows that
+    # made it into the scan window — a cron corpus with more than
+    # _DISCOVER_SCAN_LIMIT matching rows fills the window entirely and the
+    # user's own sessions never reach the demotion pass at all.
     try:
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES)
+            + list(_DEMOTED_SESSION_SOURCES),
             limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
-            # distinct sessions AND so interactive matches buried under a wall
-            # of cron rows are still in hand for the demotion pass below.
+            # distinct sessions among the interactive matches.
             offset=0,
             sort=sort,
             fields=_DISCOVER_SEARCH_FIELDS,
         )
+        remaining = _DISCOVER_SCAN_LIMIT - len(raw_results)
+        if remaining > 0:
+            raw_results += db.search_messages(
+                query=query,
+                role_filter=role_list,
+                source_filter=list(_DEMOTED_SESSION_SOURCES),
+                limit=remaining,
+                offset=0,
+                sort=sort,
+                fields=_DISCOVER_SEARCH_FIELDS,
+            )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
 
-    # Demote automation (cron) rows below interactive ones before dedup, so a
-    # high-volume cron corpus can't starve the user's own sessions out of the
-    # top `limit` results (#19434). Stable — preserves BM25/recency order
-    # within each class.
+    # Keep the post-hoc demotion pass: it still covers rows routed here from
+    # other paths and keeps ordering stable if the source lists ever drift.
     raw_results = _order_for_recall(raw_results)
 
     if not raw_results and not title_result:

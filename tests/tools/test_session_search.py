@@ -17,6 +17,7 @@ import pytest
 from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
+    _DISCOVER_SCAN_LIMIT,
     _format_timestamp,
     _is_compacted_message,
     _is_compression_ended,
@@ -578,6 +579,33 @@ class TestCronDemotion:
         assert result["results"][0]["source"] == "telegram"
         assert result["results"][0]["session_id"] == "s_user"
 
+    def test_interactive_match_survives_cron_flooding_the_scan_window(self, db):
+        """Post-hoc demotion is not enough when cron rows fill the entire
+        _DISCOVER_SCAN_LIMIT window — the interactive hit never even reaches
+        the demotion pass. The scan itself must fetch interactive sources
+        first and only top up with demoted ones.
+        """
+        now = int(time.time())
+        db.create_session("s_user", source="telegram")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?",
+                         (now - 90000, "s_user"))
+        db.append_message("s_user", role="user", content="review the venom slides please")
+        # More matching cron rows than the whole scan window holds.
+        overflow = _DISCOVER_SCAN_LIMIT + 20
+        db.create_session("cron_flood", source="cron")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?",
+                         (now - 1000, "cron_flood"))
+        for i in range(overflow):
+            db.append_message("cron_flood", role="assistant",
+                              content=f"venom slides nightly digest {i}")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="venom slides", limit=3, db=db))
+        assert result["success"] is True
+        sources = [r["source"] for r in result["results"]]
+        assert "telegram" in sources
+        assert result["results"][0]["session_id"] == "s_user"
+
     def test_cron_still_reachable_when_only_match(self, db):
         """Demotion must not exclude cron — when only cron matches, it still
         comes back."""
@@ -891,12 +919,18 @@ class TestRewindExclusion:
         ))
         assert result_compact["count"] >= 1
 
-        # Rewound content should NOT be discoverable
+        # Rewound content should NOT be discoverable. The OR-relaxation
+        # retry may legitimately surface OTHER messages sharing a term
+        # ("content" matches the compacted row), so assert on the rewound
+        # text itself rather than on an empty result set.
         result_rewind = json.loads(session_search(
             query="rewound content gamma", db=db,
             current_session_id="s_mixed",
         ))
-        assert result_rewind["count"] == 0
+        results_text = json.dumps(
+            result_rewind.get("results", []), ensure_ascii=False
+        )
+        assert "gamma" not in results_text
 
 
 class TestCompressionEndedHelper:

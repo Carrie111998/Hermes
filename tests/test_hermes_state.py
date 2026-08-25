@@ -879,6 +879,34 @@ class TestFTS5Search:
 
 
 
+    def test_multi_term_query_falls_back_to_or_when_and_finds_nothing(self, db):
+        # Terms spread across different messages: implicit-AND finds nothing,
+        # so the search retries the same terms OR-joined (BM25 still ranks).
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="A apresentação ficou pronta")
+        db.append_message("s1", role="assistant", content="Subi o deck em produção")
+
+        results = db.search_messages("apresentação deck horário")
+        assert len(results) == 2
+
+    def test_or_fallback_skips_single_term_and_explicit_operator_queries(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Só falamos de deck aqui")
+
+        # Single missing term: nothing to relax.
+        assert db.search_messages("horário") == []
+        # Explicit operators are user intent — never rewritten.
+        assert db.search_messages("deck AND horário") == []
+        assert db.search_messages('"deck horário"') == []
+
+    def test_or_fallback_ignores_unknown_terms(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="planilha de custo mensal")
+
+        results = db.search_messages("planilha custo inexistenteterm")
+        assert len(results) == 1
+        assert "planilha" in results[0]["snippet"]
+
     def test_long_search_query_is_capped_and_does_not_crash(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="bounded sanitizer target")

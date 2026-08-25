@@ -11596,15 +11596,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             # Two queries: anchor + before (DESC, take window+1), and after
             # (ASC, take window). Final order is id ASC.
+            #
+            # Rewound rows (active=0, compacted=0) are excluded — the user
+            # took those back, and search_messages already hides them from
+            # hits, so surfacing them through the surrounding window leaked
+            # exactly the content the rewind removed. Compaction-archived
+            # rows (compacted=1) stay visible, mirroring the search rule
+            # (#38763). The anchor itself is always kept so callers'
+            # anchor-in-window invariant holds even for an explicit scroll
+            # to a rewound id.
             before_rows = conn.execute(
                 "SELECT * FROM messages "
                 "WHERE session_id = ? AND id <= ? "
+                "AND (active = 1 OR compacted = 1 OR id = ?) "
                 "ORDER BY id DESC LIMIT ?",
-                (session_id, around_message_id, window + 1),
+                (session_id, around_message_id, around_message_id, window + 1),
             ).fetchall()
             after_rows = conn.execute(
                 "SELECT * FROM messages "
                 "WHERE session_id = ? AND id > ? "
+                "AND (active = 1 OR compacted = 1) "
                 "ORDER BY id ASC LIMIT ?",
                 (session_id, around_message_id, window),
             ).fetchall()

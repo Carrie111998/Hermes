@@ -1053,10 +1053,13 @@ class SessionSearchMixin:
                     role_clause = f" AND role IN ({role_placeholders})"
                     role_params = list(keep_roles)
 
+                # Rewound rows are excluded for the same reason as in
+                # get_messages_around: the user took them back.
                 bookend_start_rows = conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id < ?{role_clause} "
                     f"AND length(content) > 0 "
+                    f"AND (active = 1 OR compacted = 1) "
                     f"ORDER BY id ASC LIMIT ?",
                     (session_id, window_min_id, *role_params, bookend),
                 ).fetchall()
@@ -1065,6 +1068,7 @@ class SessionSearchMixin:
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id > ?{role_clause} "
                     f"AND length(content) > 0 "
+                    f"AND (active = 1 OR compacted = 1) "
                     f"ORDER BY id DESC LIMIT ?",
                     (session_id, window_max_id, *role_params, bookend),
                 ).fetchall()
@@ -1446,6 +1450,28 @@ class SessionSearchMixin:
                 include_inactive=include_inactive,
                 fields=fields,
             )
+            if not rows and offset == 0:
+                # Implicit-AND found nothing: natural multi-word queries
+                # ("apresentação deck horário") require every term in ONE
+                # message, which silently zeroes out whenever the words are
+                # spread across a conversation. Retry the same terms
+                # OR-joined — BM25 still ranks, so messages matching more
+                # terms surface first. Never rewrites queries that carry
+                # explicit intent (operators/phrases/prefixes) or CJK, which
+                # has its own routing.
+                relaxed = self._relaxed_or_query(query)
+                if relaxed:
+                    rows = self._search_messages_impl(
+                        relaxed,
+                        source_filter=source_filter,
+                        exclude_sources=exclude_sources,
+                        role_filter=role_filter,
+                        limit=limit,
+                        offset=offset,
+                        sort=sort,
+                        include_inactive=include_inactive,
+                        fields=fields,
+                    )
             return rows
         finally:
             try:
@@ -1485,6 +1511,38 @@ class SessionSearchMixin:
             return "like_scan"
         except Exception:
             return "unknown"
+
+    # Only queries relaxed past this many terms would OR-join into noise;
+    # keep the strongest (first) terms — natural questions front-load topic
+    # words ("planilha estimativa custo da reunião de ontem…").
+    _RELAX_MAX_TERMS = 8
+
+    def _relaxed_or_query(self, query: str) -> Optional[str]:
+        """OR-joined rewrite of a plain multi-word query, or None.
+
+        Returns None — meaning "do not retry" — for queries that carry
+        explicit FTS5 intent (phrases, prefix globs, boolean operators),
+        CJK queries (their routing owns fallback behavior), and single-term
+        queries (nothing to relax).
+        """
+        if not query:
+            return None
+        if '"' in query or "*" in query:
+            return None
+        raw_tokens = query.split()
+        if any(t in ("AND", "OR", "NOT") for t in raw_tokens):
+            return None
+        sanitized = self._sanitize_fts5_query(query)
+        if not sanitized or self._contains_cjk(sanitized):
+            return None
+        seen: dict = {}
+        for tok in sanitized.split():
+            if tok and tok not in seen:
+                seen[tok] = None
+        tokens = list(seen)[: self._RELAX_MAX_TERMS]
+        if len(tokens) < 2:
+            return None
+        return " OR ".join(tokens)
 
     @staticmethod
     def _compile_like_boolean_query(

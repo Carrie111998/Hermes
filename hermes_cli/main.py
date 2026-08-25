@@ -1641,6 +1641,29 @@ def _resolve_last_session(source: str = "cli") -> Optional[str]:
     return None
 
 
+def _resolve_platform_resume(resume_val: str) -> Optional[str]:
+    """Resolve ``--resume @<platform>`` to that platform's most recent session.
+
+    The reverse direction of ``/handoff``: a conversation started on a
+    gateway platform (telegram, whatsapp, …) continues in the terminal
+    without the user hunting for a session id. ``@claude`` / ``@codex`` are
+    NOT handled here — those import foreign-CLI sessions and are resolved
+    before this runs. Returns None when ``resume_val`` is not an ``@`` form;
+    exits with a hint when the platform has no sessions yet.
+    """
+    val = (resume_val or "").strip().lower()
+    if not val.startswith("@") or len(val) < 2:
+        return None
+    platform_source = val[1:]
+    session_id = _resolve_last_session(source=platform_source)
+    if session_id:
+        print(f"↪ resuming most recent {platform_source} session: {session_id}")
+        return session_id
+    print(f"No {platform_source} session found to resume.")
+    print("Use 'hermes sessions list' to see available sessions.")
+    sys.exit(1)
+
+
 def _probe_container(cmd: list, backend: str, via_sudo: bool = False):
     """Run a container inspect probe, returning the CompletedProcess.
 
@@ -3022,6 +3045,15 @@ def cmd_chat(args):
         print(f"✓ Imported as {_imported_id} — resuming it now.")
         print(f"  (later: hermes --resume {_imported_id})")
         args.resume = _imported_id
+
+    # --resume @telegram / @whatsapp / @<any-platform>: continue that
+    # platform's most recent session in the terminal — the reverse direction
+    # of /handoff. (@claude/@codex were consumed by the import block above.)
+    _resume_platform = getattr(args, "resume", None)
+    if isinstance(_resume_platform, str):
+        _platform_id = _resolve_platform_resume(_resume_platform)
+        if _platform_id:
+            args.resume = _platform_id
 
     # Resolve --resume by title if it's not a direct session ID
     resume_val = getattr(args, "resume", None)

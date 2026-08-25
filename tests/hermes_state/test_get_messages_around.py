@@ -104,3 +104,49 @@ class TestContentHydration:
         assert asst, "expected an assistant message"
         # tool_calls should be a list after hydration, not a string
         assert isinstance(asst[0].get("tool_calls"), list)
+
+
+class TestRewoundRowsHidden:
+    """Rewound rows (active=0, compacted=0) must not surface through the
+    window — search already hides them as hits, and the window otherwise
+    leaked exactly the content the user's rewind removed. Compaction-archived
+    rows (compacted=1) stay visible, mirroring search_messages (#38763)."""
+
+    def _rewind(self, db, mid):
+        db._conn.execute(
+            "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?", (mid,)
+        )
+        db._conn.commit()
+
+    def test_rewound_neighbor_is_excluded_from_window(self, db):
+        ids = _seed(db, n=6)
+        self._rewind(db, ids[3])
+        view = db.get_messages_around("s1", ids[2], window=2)
+        got = [m["id"] for m in view["window"]]
+        assert ids[3] not in got
+        # Window still fills from remaining live rows.
+        assert ids[2] in got
+
+    def test_rewound_anchor_itself_is_still_returned(self, db):
+        ids = _seed(db, n=4)
+        self._rewind(db, ids[1])
+        view = db.get_messages_around("s1", ids[1], window=1)
+        assert ids[1] in [m["id"] for m in view["window"]]
+
+    def test_compaction_archived_neighbor_stays_visible(self, db):
+        ids = _seed(db, n=4)
+        db._conn.execute(
+            "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?", (ids[1],)
+        )
+        db._conn.commit()
+        view = db.get_messages_around("s1", ids[2], window=2)
+        assert ids[1] in [m["id"] for m in view["window"]]
+
+    def test_rewound_rows_excluded_from_bookends(self, db):
+        ids = _seed(db, n=10)
+        self._rewind(db, ids[0])
+        self._rewind(db, ids[9])
+        view = db.get_anchored_view("s1", ids[5], window=1, bookend=2)
+        bookend_ids = [m["id"] for m in view["bookend_start"] + view["bookend_end"]]
+        assert ids[0] not in bookend_ids
+        assert ids[9] not in bookend_ids
