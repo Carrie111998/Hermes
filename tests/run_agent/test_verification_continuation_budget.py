@@ -150,14 +150,21 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
 def test_failed_mutation_gets_one_backstage_recovery_turn(agent, monkeypatch):
     agent.max_iterations = 2
     agent.iteration_budget.max_total = 2
+    model_calls = 0
     answers = iter([
         _response("Done — I changed the file."),
         _response(AIAgent._FILE_MUTATION_BLOCKED_MESSAGE),
     ])
-    agent._interruptible_api_call = lambda _kwargs: next(answers)
+
+    def model_call(_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
     agent._handle_max_iterations = MagicMock(return_value="replacement summary")
     agent._file_mutation_verifier_enabled = lambda: True
-    agent._unresolved_file_mutation_failures = lambda: {
+    agent._unresolved_file_mutation_failures = lambda **_kwargs: {
         "/tmp/private-source.py": {
             "tool": "patch",
             "error_preview": "old_string not found",
@@ -172,7 +179,8 @@ def test_failed_mutation_gets_one_backstage_recovery_turn(agent, monkeypatch):
 
     assert result["final_response"] == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
     assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
-    assert result["completed"] is True
+    assert result["completed"] is False
+    assert model_calls == 2
     assert emitted == []
     assert [message["role"] for message in result["messages"]] == [
         "user",
