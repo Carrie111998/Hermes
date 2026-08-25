@@ -1789,23 +1789,56 @@ export function ChatSidebar({
                       <>
                         {!showAllProfiles ? (
                           <Tip label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}>
-                            <Button
-                              aria-label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
-                              className={HEADER_ACTION_BTN}
-                              onClick={event => {
-                                event.stopPropagation()
+                            {!agentsGrouped && hasMultipleConnections ? (
+                              <NewSessionSourcePicker
+                                activeConnectionId={activeConnectionId}
+                                connections={connectionsRegistry?.connections ?? []}
+                                onPick={connectionId => onStartSessionOnSource?.(connectionId)}
+                                trigger={
+                                  <Button
+                                    aria-label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
+                                    className={HEADER_ACTION_BTN}
+                                    onClick={event => {
+                                      event.stopPropagation()
+                                      // The source picker owns the click; return so
+                                      // the DropdownMenu trigger opens instead of
+                                      // creating a session on the active source.
+                                      if (!agentsGrouped && hasMultipleConnections) {
+                                        return
+                                      }
 
-                                if (agentsGrouped) {
-                                  openProjectCreate()
-                                } else {
-                                  onNewSessionInWorkspace(null)
+                                      if (agentsGrouped) {
+                                        openProjectCreate()
+                                      } else {
+                                        onNewSessionInWorkspace(null)
+                                      }
+                                    }}
+                                    size="icon-xs"
+                                    variant="ghost"
+                                  >
+                                    <Codicon name="add" size="0.75rem" />
+                                  </Button>
                                 }
-                              }}
-                              size="icon-xs"
-                              variant="ghost"
-                            >
-                              <Codicon name="add" size="0.75rem" />
-                            </Button>
+                              />
+                            ) : (
+                              <Button
+                                aria-label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
+                                className={HEADER_ACTION_BTN}
+                                onClick={event => {
+                                  event.stopPropagation()
+
+                                  if (agentsGrouped) {
+                                    openProjectCreate()
+                                  } else {
+                                    onNewSessionInWorkspace(null)
+                                  }
+                                }}
+                                size="icon-xs"
+                                variant="ghost"
+                              >
+                                <Codicon name="add" size="0.75rem" />
+                              </Button>
+                            )}
                           </Tip>
                         ) : null}
                         <div className="grid size-6 place-items-center">
