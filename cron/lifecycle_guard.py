@@ -71,7 +71,14 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # matching via the `/hermes` tail, while every real command position
     # (start of text, whitespace, `;`/`&`/`|`, `$(`, backtick, even a
     # U+FFFD from binary-content decoding) still matches.
-    r"(?:(?<![/\w.\-])hermes\s+gateway\s+(?:restart|stop|uninstall)\b)"
+    # The optional suffix is what the CLI is actually spelled as on Windows:
+    # `hermes.exe gateway restart` is the same command as `hermes gateway
+    # restart`, and npm-style shims install `hermes.cmd` / `hermes.ps1`
+    # alongside it. Anchoring on the bare name let every one of those spellings
+    # walk past a guard that stops the unsuffixed form, and the guard is gated
+    # on PID-file ownership rather than platform, so the bypass is live wherever
+    # a supervised gateway runs on Windows.
+    r"(?:(?<![/\w.\-])hermes(?:\.(?:exe|cmd|bat|com|ps1))?\s+gateway\s+(?:restart|stop|uninstall)\b)"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -98,8 +105,15 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # token orders because real reproductions show both.
     # Leading \b ensures we match "pkill" or "kill" as whole words, not as
     # suffixes of other words (e.g. "skill" -> "kill").
-    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # `taskkill` and `Stop-Process` are the Windows spellings of the same
+    # operation — the same reasoning that put `bootout` next to `unload`
+    # (#80260). `\bp?kill\b` cannot reach inside `taskkill` (no word boundary
+    # between the two `k`s), so they need naming outright. Service-control
+    # forms (`net stop`, `sc stop`, `Stop-Service`) are deliberately not
+    # covered here: they presuppose a service install this guard has no
+    # evidence of, and guessing at one risks blocking unrelated services.
+    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bhermes\b[^\n]*\bgateway)"
+    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
 
 
