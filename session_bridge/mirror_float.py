@@ -124,6 +124,21 @@ def discover_ccd_registry_roots(
     return tuple(roots)
 
 
+def _atomic_write_record(path: Path, record: Mapping[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+    last_error: OSError | None = None
+    for _attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(temporary, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(_REPLACE_RETRY_SECONDS)
+    temporary.unlink(missing_ok=True)
+    raise last_error if last_error is not None else OSError("replace failed")
+
+
 class _MirrorFloatSkip(Exception):
     """Internal: this mirror cannot be floated safely; count it as skipped."""
 
@@ -347,20 +362,7 @@ class ClaudeMirrorFloatWorker:
         return registered, floated
 
     def _write_record(self, path: Path, record: Mapping[str, Any]) -> None:
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(
-            json.dumps(record, separators=(",", ":")), encoding="utf-8"
-        )
-        last_error: OSError | None = None
-        for _attempt in range(_REPLACE_ATTEMPTS):
-            try:
-                os.replace(temporary, path)
-                return
-            except OSError as exc:
-                last_error = exc
-                time.sleep(_REPLACE_RETRY_SECONDS)
-        temporary.unlink(missing_ok=True)
-        raise last_error if last_error is not None else OSError("replace failed")
+        _atomic_write_record(path, record)
 
     def _load_registry_index(self) -> dict[Path, dict[str, Path]]:
         indexes: dict[Path, dict[str, Path]] = {}
@@ -402,3 +404,192 @@ class ClaudeMirrorFloatWorker:
             if row.get("id") == source_session_id:
                 return row.get("last_active")
         return None
+
+
+# Mirror records ([Codex]/[Hermes]/[Bridge]) are owned by the recency rule
+# above and must never be re-archived here.
+_MIRROR_TAG_PATTERN = re.compile(r"^\[(codex|hermes|bridge)\]", re.IGNORECASE)
+# Chip briefs run in agent worktrees or Hermes profile workspaces.
+_AUTOMATION_CWD_PATTERN = re.compile(
+    r"([\\/]\.claude[\\/]worktrees[\\/]|[\\/]\.hermes[\\/]profiles[\\/])",
+    re.IGNORECASE,
+)
+# First words of chip titles (imperative briefs). Deliberately conservative:
+# a bypassPermissions session whose title starts outside this set is treated
+# as the user's unless its cwd is an automation workspace.
+_CHIP_TITLE_VERBS = frozenset(
+    """
+    add adjudicate archive audit backfill bound bump cap capture check clean
+    classify close compile confirm correct decide dedupe delete deploy
+    deregister detect diagnose disable dismiss document drain eliminate enable
+    enforce enrich establish evaluate expire extend falsify-check find finish
+    fix flush gate guard harden hunt identify implement improve inspect
+    integrate investigate isolate judge kill land limit lock measure merge
+    migrate monitor normalize observe patch pin plan probe protect prove prune
+    publish purge quarantine quiet raise re-arm reap rebuild recheck reconcile
+    record recover reduce refactor refresh register reindex relaunch release
+    remove rename repair replace requeue rerun rescan reschedule reset resolve
+    restart restore resume retire retry review rewrite rotate route run save
+    scan schedule scope seal search seed separate settle ship silence simplify
+    soak-verify stabilize stage standardize stop strip surface survey sweep
+    switch sync teach teardown test throttle tighten trace track triage tune
+    unarchive unblock unify unpin unstick unwedge update upgrade validate
+    verify watch wire wrap write
+    """.split()
+)
+
+
+class IdleChipArchiveWorker:
+    """Archive idle automation-chip records in the CCD desktop registries.
+
+    Every chip session started in the desktop app leaves an unarchived
+    ``local_*.json`` record that the sidebar shows forever (20-45/day on this
+    host), burying the user's own sessions. This worker archives a record only
+    when ALL of these hold:
+
+    - the record is unarchived and not a bridge mirror (``[Codex]``/
+      ``[Hermes]``/``[Bridge]`` titles belong to the mirror recency rule);
+    - it ran under ``bypassPermissions`` AND looks automation-shaped: an
+      imperative chip-verb title, or an agent-worktree / Hermes-profile cwd
+      (the user's own bypass sessions have conversational titles and live
+      cwds, so they are spared);
+    - the SESSION has been idle past ``idle_seconds`` across every harness
+      store copy. Liveness must span all roots read in the same pass: only
+      the current-account store updates live, and a union-synced copy's
+      stale ``lastActivityAt`` lies about a running session (that exact
+      mistake archived 16 live sessions during the 2026-08-24 one-off sweep
+      before its corrective pass).
+
+    The scan is bounded by file mtime (``lookback_seconds``): any record
+    still unarchived was written recently — by the app at activity or by
+    this worker's own edits — so old untouched files need never be read and
+    the per-cycle cost tracks recent activity, not store size. Archived
+    records are left byte-identical apart from ``isArchived``; nothing is
+    ever deleted, and ``run_min_interval_seconds`` throttles full passes.
+    """
+
+    def __init__(
+        self,
+        *,
+        registry_roots: Iterable[Path],
+        idle_seconds: float = 86_400.0,
+        lookback_seconds: float = 14 * 86_400.0,
+        run_min_interval_seconds: float = 3600.0,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+    ) -> None:
+        roots = tuple(registry_roots)
+        for root in roots:
+            if not isinstance(root, Path):
+                raise TypeError("registry_roots must contain Path entries")
+        idle = float(idle_seconds)
+        if not math.isfinite(idle) or idle <= 0:
+            raise ValueError("idle_seconds must be finite and positive")
+        lookback = float(lookback_seconds)
+        if not math.isfinite(lookback) or lookback <= 0:
+            raise ValueError("lookback_seconds must be finite and positive")
+        if lookback <= idle * 2:
+            raise ValueError(
+                "lookback_seconds must exceed twice idle_seconds; otherwise "
+                "records age past the scan window before they qualify"
+            )
+        run_interval = float(run_min_interval_seconds)
+        if not math.isfinite(run_interval) or run_interval < 0:
+            raise ValueError("run_min_interval_seconds must be finite and non-negative")
+        self._registry_roots = roots
+        self._idle_seconds = idle
+        self._lookback_seconds = lookback
+        self._run_min_interval_seconds = run_interval
+        self._monotonic = monotonic
+        self._wall_clock = wall_clock
+        self._last_run_at: float | None = None
+
+    def run_once(self) -> dict[str, int]:
+        now = self._monotonic()
+        if (
+            self._last_run_at is not None
+            and now - self._last_run_at < self._run_min_interval_seconds
+        ):
+            return {"examined": 0, "archived": 0, "skipped": 0, "throttled": 1}
+        self._last_run_at = now
+
+        wall_now = self._wall_clock()
+        mtime_floor = wall_now - self._lookback_seconds
+        examined = archived = skipped = 0
+
+        records: list[tuple[Path, dict[str, Any]]] = []
+        group_last_ms: dict[str, float] = {}
+        for root in self._registry_roots:
+            try:
+                entries = list(os.scandir(root))
+            except OSError:
+                continue
+            for entry in entries:
+                if not (
+                    entry.name.startswith("local_") and entry.name.endswith(".json")
+                ):
+                    continue
+                try:
+                    if entry.stat().st_mtime < mtime_floor:
+                        continue
+                    data = json.loads(
+                        Path(entry.path).read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    skipped += 1
+                    continue
+                if not isinstance(data, dict):
+                    skipped += 1
+                    continue
+                examined += 1
+                records.append((Path(entry.path), data))
+                key = data.get("cliSessionId") or data.get("sessionId") or entry.name
+                activity = data.get("lastActivityAt")
+                if isinstance(activity, (int, float)) and not isinstance(
+                    activity, bool
+                ):
+                    group_last_ms[key] = max(
+                        group_last_ms.get(key, 0.0), float(activity)
+                    )
+
+        idle_floor_ms = (wall_now - self._idle_seconds) * 1000
+        for path, data in records:
+            if data.get("isArchived"):
+                continue
+            if not self._is_chip(data):
+                continue
+            key = data.get("cliSessionId") or data.get("sessionId") or path.name
+            if group_last_ms.get(key, 0.0) >= idle_floor_ms:
+                continue
+            updated = dict(data)
+            updated["isArchived"] = True
+            try:
+                _atomic_write_record(path, updated)
+            except OSError:
+                skipped += 1
+                continue
+            archived += 1
+
+        return {
+            "examined": examined,
+            "archived": archived,
+            "skipped": skipped,
+            "throttled": 0,
+        }
+
+    @staticmethod
+    def _is_chip(data: Mapping[str, Any]) -> bool:
+        title = data.get("title")
+        title = title.strip() if isinstance(title, str) else ""
+        if _MIRROR_TAG_PATTERN.match(title):
+            return False
+        if data.get("permissionMode") != "bypassPermissions":
+            return False
+        first_word = title.split(" ", 1)[0].rstrip(":,.").lower() if title else ""
+        if first_word in _CHIP_TITLE_VERBS:
+            return True
+        for field in ("cwd", "originCwd"):
+            value = data.get(field)
+            if isinstance(value, str) and _AUTOMATION_CWD_PATTERN.search(value):
+                return True
+        return False

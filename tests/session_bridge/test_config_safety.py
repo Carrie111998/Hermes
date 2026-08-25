@@ -722,6 +722,8 @@ _CLAUDE_VISIBILITY_DEFAULTS = {
     "process_timeout_seconds": 120,
     "discovery_timeout_seconds": 30,
     "float_activity": False,
+    "archive_idle_chips": False,
+    "idle_chip_archive_seconds": 86_400,
 }
 
 
@@ -788,6 +790,8 @@ def test_claude_visibility_config_parses_every_valid_override(
         "process_timeout_seconds": 180,
         "discovery_timeout_seconds": 45,
         "float_activity": True,
+        "archive_idle_chips": True,
+        "idle_chip_archive_seconds": 43_200,
     }
 
     config = _load_with_claude_visibility(monkeypatch, configured)

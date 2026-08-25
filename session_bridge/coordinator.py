@@ -1049,6 +1049,7 @@ class SessionBridgeCoordinator:
         ),
         permission_preflight: Callable[[str], bool] | None = None,
         mirror_float: object | None = None,
+        idle_chip_archiver: object | None = None,
     ) -> None:
         if type(scan_batch_size) is not int or scan_batch_size <= 0:
             raise ValueError("scan_batch_size must be a positive integer")
@@ -1104,6 +1105,11 @@ class SessionBridgeCoordinator:
         ):
             raise TypeError("mirror_float must provide run_once() or be None")
         self._mirror_float = mirror_float
+        if idle_chip_archiver is not None and not callable(
+            getattr(idle_chip_archiver, "run_once", None)
+        ):
+            raise TypeError("idle_chip_archiver must provide run_once() or be None")
+        self._idle_chip_archiver = idle_chip_archiver
         self._sidebar_cancellation_recovery_timeout = float(
             sidebar_cancellation_recovery_timeout
         )
@@ -3652,6 +3658,13 @@ class SessionBridgeCoordinator:
         if self._mirror_float is not None:
             await self._run_post_scan_worker(
                 self._mirror_float, "mirror_float_failed"
+            )
+        # Same local-only reasoning as the float above: archiving idle chip
+        # records touches nothing but registry files, so it runs outside the
+        # provider-health gate and the Codex sidebar lane.
+        if self._idle_chip_archiver is not None:
+            await self._run_post_scan_worker(
+                self._idle_chip_archiver, "idle_chip_archive_failed"
             )
 
     def _any_configured_provider_unhealthy(self) -> bool:
