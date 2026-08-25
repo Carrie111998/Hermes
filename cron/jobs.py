@@ -3101,6 +3101,7 @@ def claim_job_for_fire(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    scheduled_at_utc: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -3110,6 +3111,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            scheduled_at_utc=scheduled_at_utc,
         )
 
 
@@ -3119,6 +3121,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    scheduled_at_utc: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -3139,6 +3142,10 @@ def _claim_job_for_fire_locked(
     ``mark_job_run`` clears the claim on completion so a re-armed recurring job
     is claimable again next fire.
 
+    ``scheduled_at_utc`` lets a delayed worker preserve the due time from the
+    scheduler's pre-advance snapshot. External providers normally omit it and
+    capture the record's current ``next_run_at`` under this same lock.
+
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
@@ -3158,6 +3165,11 @@ def _claim_job_for_fire_locked(
                 return False
             now = _hermes_now()
             existing = job.get("fire_claim")
+            claimed_scheduled_at = (
+                scheduled_at_utc
+                if isinstance(scheduled_at_utc, str) and scheduled_at_utc.strip()
+                else job.get("next_run_at")
+            )
             if existing:
                 try:
                     claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
@@ -3170,6 +3182,8 @@ def _claim_job_for_fire_locked(
                     _age = (now - claimed_at).total_seconds()
                     if 0 <= _age < claim_ttl_seconds:
                         return False  # someone holds a fresh claim
+                    if isinstance(existing.get("scheduled_at"), str) and existing["scheduled_at"].strip():
+                        claimed_scheduled_at = existing["scheduled_at"]
                 except Exception:
                     pass  # malformed claim → overwrite
             if force:
@@ -3181,7 +3195,11 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": owner,
+                "scheduled_at": claimed_scheduled_at,
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
