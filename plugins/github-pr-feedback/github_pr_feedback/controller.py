@@ -43,7 +43,13 @@ _CODEX_REVIEW_ENVELOPE_PREFIX = (
     "### 💡 codex review here are some automated review suggestions for this pull request."
 )
 _DEGRADED_REASONS = frozenset(
-    {"github_error", "admission_cap", "dispatch_failed", "exact_head_unavailable"}
+    {
+        "github_error",
+        "github_ci_state_unavailable",
+        "admission_cap",
+        "dispatch_failed",
+        "exact_head_unavailable",
+    }
 )
 
 
@@ -59,6 +65,8 @@ class GitHubReader(Protocol):
     def list_feedback(self, repository: str, number: int) -> tuple[Feedback, ...]: ...
 
     def get_pull_request(self, repository: str, number: int) -> PullRequest: ...
+
+    def actions_enabled(self, repository: str) -> bool: ...
 
 
 class LocalGit(Protocol):
@@ -118,6 +126,7 @@ class KanbanTask:
     branch: str
     idempotency_key: str
     evidence: Mapping[str, object]
+    evidence_heading: str = "Untrusted evidence (JSON)"
     initial_status: str = "blocked"
     max_retries: int = 1
 
@@ -270,6 +279,13 @@ class ScanController:
             return _scan_result(created, skipped)
         for repository in self._policy.targets:
             target = self._policy.targets[repository]
+            actions_enabled: bool | None = None
+            actions_state_unavailable = False
+            if self._policy.local_ci_audit is not None:
+                try:
+                    actions_enabled = self._github.actions_enabled(repository)
+                except Exception:  # noqa: BLE001 - an uncertain gate must fail closed.
+                    actions_state_unavailable = True
             try:
                 pull_requests = self._github.list_open_pull_requests(repository, target.owner_login)
             except Exception:  # noqa: BLE001 - an adapter failure must not admit work.
@@ -280,6 +296,20 @@ class ScanController:
                 if not pull_request_admission.admitted:
                     skipped[pull_request_admission.reason or "not_admitted"] += 1
                     continue
+                if self._policy.local_ci_audit is not None:
+                    if actions_state_unavailable:
+                        skipped["github_ci_state_unavailable"] += 1
+                    elif actions_enabled:
+                        skipped["github_ci_enabled"] += 1
+                    elif attempted >= MAX_ADMISSIONS_PER_SCAN:
+                        skipped["admission_cap"] += 1
+                    else:
+                        attempted += 1
+                        audit_error = self._dispatch_local_ci(pull_request)
+                        if audit_error is None:
+                            created += 1
+                        else:
+                            skipped[audit_error] += 1
                 try:
                     feedback_items = self._github.list_feedback(repository, pull_request.number)
                 except Exception:  # noqa: BLE001 - an adapter failure must not admit work.
@@ -355,6 +385,67 @@ class ScanController:
                         continue
                     created += 1
         return _scan_result(created, skipped)
+
+    def _dispatch_local_ci(self, listed: PullRequest) -> str | None:
+        audit_policy = self._policy.local_ci_audit
+        if audit_policy is None:
+            return "local_ci_disabled"
+        try:
+            current = self._github.get_pull_request(listed.base_repository, listed.number)
+        except Exception:  # noqa: BLE001 - canonical state is required.
+            return "github_error"
+        admission = self._policy.admit_pull_request(current)
+        if not admission.admitted or admission.target is None:
+            return admission.reason or "not_admitted"
+        if current.head_sha != listed.head_sha:
+            return "head_changed"
+        receipt = FeedbackReceipt(
+            repository=current.base_repository,
+            pr_number=current.number,
+            feedback_kind="pr_local_ci",
+            feedback_id="local-ci-audit-v1",
+            head_sha=current.head_sha,
+        )
+        claimed_at = self._clock()
+        lease = self._ledger.claim(
+            receipt,
+            owner=self._claim_owner,
+            claimed_at=claimed_at,
+            stale_before=claimed_at - self._claim_lease,
+        )
+        if lease is None:
+            return "duplicate"
+        self._ledger.record_expected_head(receipt, lease, receipt.head_sha)
+        try:
+            prepared = self._local_git.prepare_receipt_worktree(
+                admission.target.local_path, receipt
+            )
+            if prepared.expected_sha.casefold() != receipt.head_sha.casefold():
+                raise RuntimeError("prepared worktree expected SHA does not match receipt")
+            self._ledger.record_workspace(
+                receipt,
+                lease,
+                prepared.path,
+                prepared.expected_sha,
+            )
+            task_id = self._kanban.create_or_get_task(
+                _local_ci_task(
+                    self._policy,
+                    receipt,
+                    prepared,
+                    post_results=audit_policy.post_results,
+                )
+            )
+            self._ledger.finalize(receipt, task_id, lease)
+        except Exception as error:  # noqa: BLE001 - retain retryable dispatch failure.
+            try:
+                self._ledger.fail(receipt, str(error) or "task creation failed", lease)
+            except LedgerStateError:
+                pass
+            if isinstance(error, ExactHeadUnavailable):
+                return "exact_head_unavailable"
+            return "dispatch_failed"
+        return None
 
     def retry_failed(self, receipt: FeedbackReceipt) -> ScanResult:
         """Retry only a failed receipt after rereading and readmitting canonical state."""
@@ -553,6 +644,59 @@ def _task(
         # create_task resolves that to a ready card until a worker claims it.
         initial_status="running" if auto_dispatch else "blocked",
         max_retries=3 if auto_dispatch else 1,
+    )
+
+
+def _local_ci_task(
+    policy: PluginPolicy,
+    receipt: FeedbackReceipt,
+    prepared: PreparedWorktree,
+    *,
+    post_results: bool,
+) -> KanbanTask:
+    """Build a read-only, exact-head audit task for a PR without GitHub CI."""
+
+    comment_scope = (
+        "After re-reading the PR and confirming the head is still exact, post one factual audit "
+        "summary comment containing the tested SHA, commands, outcomes, durations, and evidence "
+        "classification. "
+        if post_results
+        else "Do not write to GitHub. "
+    )
+    instructions = (
+        "Audit this pull request read-only from the exact receipt worktree. Re-read the canonical "
+        "PR first and require its head to equal expected_head_sha; otherwise stop fail-closed. "
+        "Confirm repository GitHub Actions remain disabled before running. Do not edit source files. "
+        "Do not push, approve, or merge. Bootstrap only the worktree-local ignored environment if "
+        "needed. Run the repository-owned CI governance check, scripts/run_hygiene_lane.py, "
+        "scripts/run_static_lane.py with STATIC_BASE_REF set to the canonical PR base SHA, and every "
+        "required lane declared by tests/manifests/test_lanes.toml through scripts/run_test_lane.py. "
+        "If frontend files changed, also run its locked install, lint, tests, and production build. "
+        "Record exact commands and classify failures as logic regression, diagnostic-only, or "
+        "environment-blocked. Ensure the tracked worktree remains unchanged. "
+        + comment_scope
+        + "A failing audit may recommend a separate repair card, but this worker must not repair it."
+    )
+    evidence = {
+        "repository": receipt.repository,
+        "pr_number": receipt.pr_number,
+        "expected_head_sha": receipt.head_sha,
+        "github_actions_enabled": False,
+        "post_results": post_results,
+    }
+    return KanbanTask(
+        title=f"Local PR CI audit: {receipt.repository}#{receipt.pr_number}",
+        instructions=instructions,
+        board=policy.board or "",
+        assignee=policy.local_ci_audit.assignee if policy.local_ci_audit else "",
+        repository_path=prepared.path,
+        head_sha=receipt.head_sha,
+        branch=prepared.branch,
+        idempotency_key=_receipt_idempotency_key(receipt),
+        evidence=evidence,
+        evidence_heading="Canonical PR audit receipt (JSON)",
+        initial_status="running",
+        max_retries=3,
     )
 
 

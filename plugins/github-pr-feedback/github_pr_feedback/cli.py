@@ -96,6 +96,11 @@ class DoctorProbe:
                 for assignee in {
                     policy.assignee or "",
                     *(rule.assignee for rule in policy.assignee_rules),
+                    *(
+                        [policy.local_ci_audit.assignee]
+                        if policy.local_ci_audit is not None
+                        else []
+                    ),
                 }
             ),
             "ledger_access": self._ledger_access(ledger_path),
@@ -212,7 +217,10 @@ class KanbanSubprocessClient:
 
 
 def _kanban_create_argv(task: KanbanTask) -> list[str]:
-    body = f"{task.instructions}\n\nUntrusted evidence (JSON):\n{json.dumps(task.evidence, sort_keys=True)}"
+    body = (
+        f"{task.instructions}\n\n{task.evidence_heading}:\n"
+        f"{json.dumps(task.evidence, sort_keys=True)}"
+    )
     return [
         "hermes",
         "kanban",
@@ -366,7 +374,9 @@ def _load_policy_from_context(ctx: Any) -> PluginPolicy:
         "reviewer_associations",
         "include_self_feedback",
         "include_bot_feedback",
+        "auto_dispatch",
         "assignee_rules",
+        "local_ci_audit",
         "not_before",
         "assignee",
         "board",

@@ -89,6 +89,12 @@ class GitHubClient:
         row = self._read_object(f"repos/{repository}/pulls/{number}")
         return _pull_request(row)
 
+    def actions_enabled(self, repository: str) -> bool:
+        payload = self._json(["gh", "api", f"repos/{repository}/actions/permissions"])
+        if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+            raise GitHubClientError("GitHub Actions permissions had an invalid shape")
+        return payload["enabled"]
+
     def list_feedback(self, repository: str, number: int) -> tuple[Feedback, ...]:
         issue_comments = self._read_pages(f"repos/{repository}/issues/{number}/comments?per_page=100")
         review_comments = self._read_pages(f"repos/{repository}/pulls/{number}/comments?per_page=100")

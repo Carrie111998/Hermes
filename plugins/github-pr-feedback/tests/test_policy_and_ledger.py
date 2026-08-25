@@ -235,6 +235,49 @@ def test_enabled_policy_normalizes_not_before_to_utc(tmp_path: Path) -> None:
     assert policy.not_before == datetime(2026, 8, 24, tzinfo=UTC)
 
 
+def test_enabled_policy_parses_a_bounded_local_ci_audit_lane(tmp_path: Path) -> None:
+    repository_path = tmp_path / "widgets"
+    initialize_git_worktree(repository_path)
+    raw = enabled_raw_config(repository_path)
+    raw["local_ci_audit"] = {
+        "enabled": True,
+        "assignee": "pr-local-ci-auditor",
+        "post_results": True,
+    }
+
+    policy = load_policy(raw)
+
+    assert policy.local_ci_audit is not None
+    assert policy.local_ci_audit.assignee == "pr-local-ci-auditor"
+    assert policy.local_ci_audit.post_results is True
+
+
+@pytest.mark.parametrize(
+    "local_ci_audit",
+    [
+        True,
+        {},
+        {"enabled": True, "assignee": "pr-local-ci-auditor"},
+        {
+            "enabled": True,
+            "assignee": "pr-local-ci-auditor",
+            "post_results": True,
+            "unknown": True,
+        },
+    ],
+)
+def test_enabled_policy_rejects_incomplete_or_unknown_local_ci_audit_settings(
+    tmp_path: Path, local_ci_audit: object
+) -> None:
+    repository_path = tmp_path / "widgets"
+    initialize_git_worktree(repository_path)
+    raw = enabled_raw_config(repository_path)
+    raw["local_ci_audit"] = local_ci_audit
+
+    with pytest.raises(ValueError):
+        load_policy(raw)
+
+
 def test_enabled_policy_parses_bounded_assignee_rules_and_uses_fallback_on_a_tie(
     tmp_path: Path,
 ) -> None:

@@ -165,6 +165,24 @@ def test_github_client_gets_the_current_pull_request_with_fixed_argv() -> None:
     assert runner.calls == [argv]
 
 
+def test_github_client_reads_repository_actions_enabled_with_fixed_argv() -> None:
+    argv = ("gh", "api", "repos/acme/widgets/actions/permissions")
+    runner = RecordingRunner({argv: {"enabled": False, "sha_pinning_required": False}})
+
+    enabled = GitHubClient(runner).actions_enabled("acme/widgets")
+
+    assert enabled is False
+    assert runner.calls == [argv]
+
+
+@pytest.mark.parametrize("payload", [{}, {"enabled": "false"}, [], None])
+def test_github_client_fails_closed_on_invalid_actions_permission_shape(payload: object) -> None:
+    argv = ("gh", "api", "repos/acme/widgets/actions/permissions")
+
+    with pytest.raises(GitHubClientError, match="Actions permissions"):
+        GitHubClient(RecordingRunner({argv: payload})).actions_enabled("acme/widgets")
+
+
 def canonical_pull(number: int = 17, head_sha: str = "a" * 40) -> dict[str, object]:
     return {
         "number": number,

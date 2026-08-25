@@ -2,7 +2,9 @@
 
 `github-pr-feedback` is a disabled-by-default standalone Hermes plugin. It
 reads canonical GitHub pull-request feedback, applies a strict local policy,
-and creates one exact-head Kanban repair task per admitted receipt. It never
+and creates exact-head Kanban tasks for admitted feedback. An independent,
+explicitly configured lane can also schedule read-only local CI audits for PR
+heads when repository GitHub Actions are disabled. The scanner itself never
 pushes, replies, merges, changes GitHub settings, or handles credentials.
 
 ## Install and configure
@@ -42,6 +44,13 @@ plugins:
         include_self_feedback: false
         include_bot_feedback: false
         auto_dispatch: false
+        # Optional exact-head audit lane. It runs only when the canonical
+        # repository Actions permission is `enabled: false` and reruns once
+        # for each new PR head SHA.
+        local_ci_audit:
+          enabled: false
+          assignee: pr-local-ci-auditor
+          post_results: false
         not_before: "2026-01-01T00:00:00Z"
         # Fallback when no rule wins uniquely, including ambiguous ties.
         assignee: task-orchestrator
@@ -82,6 +91,17 @@ worktree `HEAD` differs, the scan fails degraded and never substitutes a local
 branch tip. Its body keeps the bounded GitHub text in an explicitly untrusted
 JSON evidence envelope.
 
+With `local_ci_audit.enabled: true`, the scan also reads the canonical
+`repos/{owner}/{repository}/actions/permissions` endpoint. It creates a ready,
+read-only audit card only when `enabled` is exactly `false`; an unavailable or
+malformed permission response is degraded and fails closed. The immutable
+audit identity includes the PR head SHA, so repeated scans deduplicate the same
+head and a later head automatically receives a fresh audit. The worker must
+re-read the canonical PR head, use the exact receipt worktree, keep tracked
+files unchanged, and run repository-owned governance, hygiene, static,
+required test-lane, and changed-frontend checks. It may post one factual result
+comment when `post_results: true`, but cannot edit, push, approve, or merge.
+
 In `auto_dispatch` mode, the worker must independently validate the finding,
 re-read the canonical PR immediately before any GitHub write, and require that
 the head still equals the receipt SHA. A confirmed bounded repair may be
@@ -98,7 +118,7 @@ card after a crash or lost response.
 
 `doctor` is read-only. For an enabled configuration it checks the `gh`
 executable and authentication, the Hermes executable, configured board and
-every fallback/routed assignee, ledger access, and each repository's
+every fallback/routed/audit assignee, ledger access, and each repository's
 linked-worktree capability.
 `scan` and `retry` return nonzero with `"status": "degraded"` when canonical
 coverage or dispatch is incomplete.
