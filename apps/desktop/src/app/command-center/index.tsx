@@ -602,6 +602,7 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
                 return (
                   <Tip
                     key={entry.day}
+                    delayDuration={0}
                     label={`${entry.day} · in ${compactNumber(entry.input_tokens)} · out ${compactNumber(entry.output_tokens)}`}
                   >
                     <div className="group relative flex h-24 min-w-0 flex-1 flex-col justify-end">
