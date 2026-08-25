@@ -174,6 +174,38 @@ class TestSingleWriterLoop:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_stale_terminal_marker_discards_buffered_text_callbacks(
+        self, _close, mock_create, monkeypatch
+    ):
+        """Buffered text stays in the result without stale UI callbacks."""
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.05")
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+        agent = _make_agent()
+        delivered = []
+        first_delta = []
+        agent.stream_delta_callback = delivered.append
+        agent._stream_callback = None
+
+        def stream_gen():
+            yield _chunk(content="data: buffered")
+            time.sleep(0.7)
+            yield _chunk(finish_reason="stop", model="m")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = stream_gen()
+        mock_create.return_value = mock_client
+
+        response = agent._interruptible_streaming_api_call(
+            {}, on_first_delta=lambda: first_delta.append("fired")
+        )
+
+        assert delivered == []
+        assert first_delta == []
+        assert response.choices[0].finish_reason == "stop"
+        assert response.choices[0].message.content == "data: buffered"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_stale_terminal_tool_call_skips_generation_callback(
         self, _close, mock_create
     ):

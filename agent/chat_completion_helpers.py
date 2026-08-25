@@ -3953,6 +3953,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         provider_finish_consumed = False
+        provider_terminal_crossed_fence = False
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -4091,11 +4092,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _set_request_stream_handle(stream)
         pending_text_parts: list[str] = []
 
-        def _flush_pending_stream_text():
+        def _flush_pending_stream_text(*, suppress_callbacks: bool = False):
             if not pending_text_parts:
                 return
             pending_parts = list(pending_text_parts)
             pending_text_parts.clear()
+            if suppress_callbacks:
+                return
             if not tool_calls_acc:
                 for text in pending_parts:
                     _fire_first_delta()
@@ -4262,7 +4265,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Accumulate tool call deltas — notify display on first name
             delta_tool_calls = getattr(delta, "tool_calls", None)
             if delta_tool_calls:
-                _flush_pending_stream_text()
+                _flush_pending_stream_text(
+                    suppress_callbacks=terminal_chunk_crossed_fence
+                )
                 for tc_delta in delta_tool_calls:
                     raw_index = getattr(tc_delta, "index", None)
                     raw_idx = raw_index if raw_index is not None else 0
@@ -4346,6 +4351,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             if chunk_finish_reason is not None:
                 provider_finish_consumed = True
+                provider_terminal_crossed_fence |= terminal_chunk_crossed_fence
                 finish_reason = chunk_finish_reason
 
             # Usage in the final chunk
@@ -4531,7 +4537,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         )
         if provider_stream_error is not None:
             raise provider_stream_error
-        _flush_pending_stream_text()
+        _flush_pending_stream_text(
+            suppress_callbacks=provider_terminal_crossed_fence
+        )
 
         full_reasoning = "".join(reasoning_parts) or None
         mock_message = SimpleNamespace(
