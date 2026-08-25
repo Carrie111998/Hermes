@@ -636,15 +636,16 @@ def _execute_job_now(
     """
     job_id = job["id"]
     admission = None
-    handed_off = False
     try:
         from cron.scheduler import run_one_job
-        from jobflow_dispatch.quarantine_control import default_control_store
-
-        admission = default_control_store().dispatch_section(
-            boundary="manual-immediate-fire"
+        from jobflow_dispatch.quarantine_control import (
+            default_control_store,
+            retain_dispatch_admission,
         )
-        admission.__enter__()
+
+        admission = retain_dispatch_admission(
+            default_control_store(), boundary="manual-immediate-fire"
+        )
         previous_next_run_at = job.get("next_run_at")
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
@@ -677,8 +678,10 @@ def _execute_job_now(
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and releases this retained admission only
-        # after its durable execution row is running.
-        handed_off = True
+        # after its durable execution row is running. The release below stays
+        # armed anyway: whichever frame gets there first performs it, so a call
+        # that fails to BIND (signature skew, a stub missing the kwarg) cannot
+        # leave the section held by nobody. See RetainedDispatchAdmission.
         processed = run_one_job(job, _dispatch_admission=admission)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
@@ -696,8 +699,8 @@ def _execute_job_now(
             pass
         return {"claimed": True, "success": False, "error": str(e)}
     finally:
-        if admission is not None and not handed_off:
-            admission.__exit__(None, None, None)
+        if admission is not None:
+            admission.release()
 
 
 def cronjob(

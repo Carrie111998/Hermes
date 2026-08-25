@@ -23,7 +23,10 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Any
 
-from jobflow_dispatch.quarantine_control import default_control_store
+from jobflow_dispatch.quarantine_control import (
+    default_control_store,
+    retain_dispatch_admission,
+)
 
 
 class CronScheduler(ABC):
@@ -282,12 +285,14 @@ class CronScheduler(ABC):
 
         # One retained section spans the store-level fire claim through the
         # durable running execution row. run_one_job releases this exact admission
-        # at that handoff rather than holding it through the model run.
-        admission = default_control_store().dispatch_section(
-            boundary="external-provider-fire"
+        # at that handoff rather than holding it through the model run -- but the
+        # release below stays armed regardless, so a call that fails to BIND
+        # (signature skew between a partially-deployed scheduler and this call
+        # site) cannot leave the section held by nobody. Both releases are the
+        # same idempotent one; see RetainedDispatchAdmission.
+        admission = retain_dispatch_admission(
+            default_control_store(), boundary="external-provider-fire"
         )
-        admission.__enter__()
-        handed_off = False
         try:
             if not claim_job_for_fire(job_id):
                 return False  # another machine already claimed this fire
@@ -295,7 +300,6 @@ class CronScheduler(ABC):
             if job is None:
                 return False  # job removed (e.g. repeat-N exhausted) between arm and fire
             job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-            handed_off = True
             return run_one_job(
                 job,
                 adapters=adapters,
@@ -303,8 +307,7 @@ class CronScheduler(ABC):
                 _dispatch_admission=admission,
             )
         finally:
-            if not handed_off:
-                admission.__exit__(None, None, None)
+            admission.release()
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

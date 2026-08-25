@@ -864,6 +864,66 @@ def default_control_store() -> QuarantineControlStore:
         return _DEFAULT_CONTROL_STORE
 
 
+class RetainedDispatchAdmission:
+    """A dispatch admission entered by one frame and released by another.
+
+    ``run_one_job`` accepts an already-entered admission from its caller and
+    releases it at the durable-running handoff, rather than holding it through
+    the model run. The caller therefore cannot release unconditionally -- but it
+    also cannot assume the callee took ownership. The *call itself* can fail
+    before the callee's body ever runs: an argument-binding ``TypeError`` when a
+    partially-deployed ``cron/scheduler.py`` and its call site disagree about
+    the signature, or a test double that does not accept the kwarg (observed for
+    real in ``tests/hermes_cli/test_console_engine.py``, fixed by d5722113ab).
+
+    Inferring ownership from control flow -- setting a ``handed_off`` flag on the
+    line *before* the call and skipping the caller's ``finally`` on it -- leaks
+    the admission on exactly that path, because the callee's own ``finally``
+    never armed either. A leaked admission is not benign: ``_DISPATCH_DEPTH``
+    keeps this store's entry pinned and the kernel lock stays held, so every
+    later ``dispatch_section`` on this thread is a re-entrant no-op that never
+    releases the underlying file lock.
+
+    Tracking the release on the admission object makes both frames correct
+    without coordinating: whoever gets there first performs the release, anyone
+    after is a no-op. Callers can then make their ``finally`` unconditional.
+    """
+
+    __slots__ = ("_section", "released")
+
+    def __init__(self, section: Any) -> None:
+        self._section = section
+        self.released = False
+
+    def __enter__(self) -> "RetainedDispatchAdmission":
+        self._section.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if self.released:
+            return False
+        # Marked before the call, not after: if the section's teardown raises,
+        # the section is still torn down and must not be re-entered on the way
+        # out of a second frame's ``finally``.
+        self.released = True
+        return bool(self._section.__exit__(exc_type, exc, tb))
+
+    def release(self) -> None:
+        """Release the section unless someone already did. Idempotent."""
+        self.__exit__(None, None, None)
+
+
+def retain_dispatch_admission(
+    store: Any, *, boundary: str
+) -> RetainedDispatchAdmission:
+    """Enter ``store``'s dispatch section as a releasable-by-either-frame handle.
+
+    ``store`` is passed in rather than resolved here so each call site keeps its
+    own ``default_control_store`` seam for tests.
+    """
+    return RetainedDispatchAdmission(store.dispatch_section(boundary=boundary)).__enter__()
+
+
 def request_wake(job_id: Any, *, caller: Any, reason: Any = None) -> bool:
     return default_control_store().request_wake(job_id, caller=caller, reason=reason)
 

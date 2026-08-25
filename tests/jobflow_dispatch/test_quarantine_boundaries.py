@@ -321,3 +321,180 @@ def test_dispatcher_section_spans_claim_through_wake(monkeypatch):
 
     assert calls.index(("enter", "jobflow-dispatcher")) < calls.index("claim")
     assert calls.index("wake") < calls.index(("exit", "jobflow-dispatcher"))
+
+
+# --- Retained-admission ownership handoff -----------------------------------
+#
+# ``_execute_job_now`` and ``fire_due`` enter an admission and hand it to
+# ``run_one_job``, which releases it at the durable-running handoff. Both used
+# to infer that handoff from control flow -- ``handed_off = True`` on the line
+# BEFORE the call, with the caller's ``finally`` skipped on it. That is correct
+# for every path that reaches ``run_one_job``'s body and wrong for the one that
+# does not: an argument-binding ``TypeError`` leaves the callee's ``finally``
+# unarmed and the caller's disarmed, so the section is held by nobody. Observed
+# for real via test doubles (five ``def _fake(job)`` stubs in
+# tests/hermes_cli/test_console_engine.py, d5722113ab); reachable in production
+# through signature skew between a partially-deployed scheduler and its callers.
+
+
+class _RetainingFenceStore(_FenceStore):
+    """A ``_FenceStore`` that keeps every section it hands out alive.
+
+    Without this, these tests cannot see the bug they exist for.
+    ``@contextmanager`` sections are cleaned up by CPython refcounting: drop the
+    last reference to an un-exited one and the generator is finalized,
+    ``GeneratorExit`` runs its ``finally``, and the section releases anyway.
+    That safety net is real but it is not the contract -- it fires at an
+    arbitrary later moment, and it does not fire at all while something still
+    holds the frame, which is precisely the leaking path (``fire_due`` lets the
+    TypeError propagate and its traceback pins the frame that owns the admission
+    for as long as the exception lives).
+
+    Retaining the sections removes the net so the ownership handoff itself is
+    what the assertions measure. Verified against the pre-fix code: with the net
+    left in place, these tests passed on the buggy version too.
+    """
+
+    def __init__(self, calls, *, refuse=False):
+        super().__init__(calls, refuse=refuse)
+        self.sections = []
+
+    def dispatch_section(self, *, boundary):
+        section = super().dispatch_section(boundary=boundary)
+        self.sections.append(section)
+        return section
+
+
+def _binding_mismatch_run_one_job(job, *, adapters=None, loop=None, verbose=False):
+    """``run_one_job``'s signature as it stood before 410c57ddc9 added the kwarg.
+
+    Passing ``_dispatch_admission=`` to it raises TypeError at BINDING -- no
+    frame of this function ever executes -- which is exactly the path that used
+    to leak the admission.
+    """
+    raise AssertionError("body must not run; the call cannot even bind")
+
+
+def test_manual_fire_releases_admission_when_run_one_job_cannot_bind(monkeypatch):
+    import cron.scheduler as scheduler
+    import jobflow_dispatch.quarantine_control as quarantine_control
+    import tools.cronjob_tools as cronjob_tools
+
+    calls = []
+    monkeypatch.setattr(
+        quarantine_control, "default_control_store", lambda: _RetainingFenceStore(calls)
+    )
+    monkeypatch.setattr(cronjob_tools, "claim_job_for_fire", lambda _jid: True)
+    monkeypatch.setattr(cronjob_tools, "get_job", lambda jid: {"id": jid, "name": "one"})
+    monkeypatch.setattr(cronjob_tools, "emit_cron_triggered_safe", lambda **_k: None)
+    monkeypatch.setattr(cronjob_tools, "mark_job_run", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "run_one_job", _binding_mismatch_run_one_job)
+
+    result = cronjob_tools._execute_job_now({"id": "job-1", "name": "one"})
+
+    assert result["success"] is False
+    assert "_dispatch_admission" in (result["error"] or "")
+    # The point of the test: the caller's finally still ran the release.
+    assert calls.count(("exit", "manual-immediate-fire")) == 1
+
+
+def test_provider_fire_releases_admission_when_run_one_job_cannot_bind(monkeypatch):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+    import cron.scheduler_provider as provider
+
+    calls = []
+    monkeypatch.setattr(
+        provider, "default_control_store", lambda: _RetainingFenceStore(calls)
+    )
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda _jid: True)
+    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "one"})
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_k: {"id": "exec-1"})
+    monkeypatch.setattr(scheduler, "run_one_job", _binding_mismatch_run_one_job)
+
+    # fire_due has no except-handler, so the binding failure propagates -- the
+    # release must happen on the way out rather than riding on the dead frame.
+    with pytest.raises(TypeError, match="_dispatch_admission"):
+        provider.InProcessCronScheduler().fire_due("job-1")
+
+    assert calls.count(("exit", "external-provider-fire")) == 1
+
+
+def test_manual_fire_does_not_double_release_the_handed_off_admission(monkeypatch):
+    """The normal path: the callee releases, the caller's finally is a no-op.
+
+    ``run_one_job`` releases on BOTH its success and BaseException paths, so a
+    caller that released again would exit the section twice -- and a second exit
+    must never land on whatever section a later frame had since entered.
+    """
+    import cron.scheduler as scheduler
+    import jobflow_dispatch.quarantine_control as quarantine_control
+    import tools.cronjob_tools as cronjob_tools
+
+    calls = []
+    monkeypatch.setattr(
+        quarantine_control, "default_control_store", lambda: _RetainingFenceStore(calls)
+    )
+    monkeypatch.setattr(cronjob_tools, "claim_job_for_fire", lambda _jid: True)
+    monkeypatch.setattr(
+        cronjob_tools,
+        "get_job",
+        lambda jid: {"id": jid, "name": "one", "last_status": "ok", "last_error": None},
+    )
+    monkeypatch.setattr(cronjob_tools, "emit_cron_triggered_safe", lambda **_k: None)
+    monkeypatch.setattr(cronjob_tools, "mark_job_run", lambda *_a, **_k: None)
+
+    def handoff(_job, *, _dispatch_admission=None, **_kwargs):
+        calls.append("handoff")
+        _dispatch_admission.__exit__(None, None, None)
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", handoff)
+
+    result = cronjob_tools._execute_job_now({"id": "job-1", "name": "one"})
+
+    assert result["success"] is True
+    assert calls.count(("exit", "manual-immediate-fire")) == 1
+    assert calls.index("handoff") < calls.index(("exit", "manual-immediate-fire"))
+
+
+def test_retained_admission_release_is_idempotent_across_frames():
+    from jobflow_dispatch.quarantine_control import retain_dispatch_admission
+
+    calls = []
+    admission = retain_dispatch_admission(_RetainingFenceStore(calls), boundary="unit")
+    assert admission.released is False
+
+    admission.__exit__(None, None, None)  # the callee's handoff release
+    assert admission.released is True
+    admission.release()  # the caller's finally
+    admission.release()  # and any number of frames after it
+
+    assert calls == [("enter", "unit"), ("exit", "unit")]
+
+
+def test_retained_admission_stays_released_when_teardown_raises():
+    """A section whose teardown raises is still torn down -- never re-entered."""
+
+    class _ExplodingSection:
+        def __init__(self):
+            self.exits = 0
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_exc):
+            self.exits += 1
+            raise RuntimeError("teardown failed")
+
+    from jobflow_dispatch.quarantine_control import RetainedDispatchAdmission
+
+    section = _ExplodingSection()
+    admission = RetainedDispatchAdmission(section).__enter__()
+
+    with pytest.raises(RuntimeError, match="teardown failed"):
+        admission.__exit__(None, None, None)
+
+    admission.release()  # the caller's finally must not retry it
+    assert section.exits == 1
