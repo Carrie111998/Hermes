@@ -6,6 +6,21 @@ import type { SidebarProjectTree } from './workspace-groups'
 
 afterEach(cleanup)
 
+// Steerable stand-in for the nanostores atom so individual tests can toggle
+// the unified "All profiles" sidebar view.
+const { showAllProfilesMock } = vi.hoisted(() => ({
+  showAllProfilesMock: {
+    value: false,
+    get: () => showAllProfilesMock.value,
+    listen: () => () => {},
+    subscribe: () => () => {},
+  } as { value: boolean; get: () => boolean; listen: () => () => void; subscribe: () => () => void }
+}))
+
+vi.mock('@/store/profile', () => ({
+  $showAllProfiles: showAllProfilesMock
+}))
+
 // jsdom doesn't implement ResizeObserver; Radix's PopoverContent/Arrow use it
 // (via @radix-ui/react-use-size) to measure the arrow once the popover is
 // actually mounted. The kebab-only test above never opens a Popover, so it
@@ -115,4 +130,28 @@ describe('ProjectMenu', () => {
     // chain rather than getting silently dropped on an intermediate wrapper.
     expect(await screen.findByRole('button', { name: 'No color' })).toBeTruthy()
   }, 15000)
+
+  it('keeps Delete enabled for explicit projects outside the all-profiles view', async () => {
+    showAllProfilesMock.value = false
+    render(<ProjectMenu isActive={false} project={project} />)
+
+    const trigger = screen.getByRole('button', { name: 'Actions' })
+    openTriggerMenu(trigger)
+
+    const deleteItem = await screen.findByRole('menuitem', { name: 'Delete…' })
+    expect(deleteItem.getAttribute('aria-disabled')).not.toBe('true')
+  })
+
+  it('disables Delete for explicit projects while viewing all profiles', async () => {
+    showAllProfilesMock.value = true
+    render(<ProjectMenu isActive={false} project={project} />)
+
+    const trigger = screen.getByRole('button', { name: 'Actions' })
+    openTriggerMenu(trigger)
+
+    const deleteItem = await screen.findByRole('menuitem', { name: 'Delete…' })
+    // Per-profile RPCs cannot be scoped with no active profile, so the
+    // destructive action must be disabled instead of failing silently.
+    expect(deleteItem.getAttribute('aria-disabled')).toBe('true')
+  })
 })
