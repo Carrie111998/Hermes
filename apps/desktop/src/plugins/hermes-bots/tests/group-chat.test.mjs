@@ -167,6 +167,15 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             ...(pendingApproval ? { pending_approval: pendingApproval } : {})
           }
         }
+        if (method === 'session.active_list') {
+          return {
+            sessions: [...sessions.values()].map(session => ({
+              id: session.runtime,
+              session_key: session.stored,
+              status: session.autoContinuing ? 'working' : 'idle'
+            }))
+          }
+        }
         if (method === 'prompt.submit') {
           const session = resolveSession(null, params.session_id)
           if (!session) {
@@ -434,6 +443,12 @@ test('a newer room request resets a crash auto-continuation before submitting', 
   const interruptIndex = gc.requests.findIndex(request => request.method === 'session.interrupt')
   const submitIndex = gc.requests.findIndex(request => request.method === 'prompt.submit')
   assert.ok(interruptIndex >= 0 && interruptIndex < submitIndex, 'stale recovery is interrupted before the new prompt')
+  const settlementMethods = gc.requests.slice(interruptIndex + 1, submitIndex).map(request => request.method)
+  assert.deepEqual(
+    settlementMethods,
+    ['session.active_list', 'session.resume'],
+    'settlement is polled read-only, then resumed once for the clean baseline'
+  )
 })
 
 test('ordinary busy member work is never reset as a stale continuation', async () => {

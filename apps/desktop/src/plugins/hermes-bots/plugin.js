@@ -7128,16 +7128,25 @@ async function resetAutoContinuedGroupTurn(member, runtime, stored, state) {
   await requestForBot(member, 'session.interrupt', { session_id: sessionId })
 
   const deadline = Date.now() + GROUP_AUTO_CONTINUE_RESET_TIMEOUT_MS
-  let latest = state
 
   while (Date.now() < deadline) {
-    latest = await requestForBot(member, 'session.resume', {
-      session_id: stored || sessionId,
+    // session.resume is not a read-only probe: a cold resume can mint a new
+    // runtime and synthesize crash recovery. Poll the existing live-session
+    // inventory instead, then resume exactly once below for the clean message
+    // baseline after the interrupted worker has actually settled.
+    const active = await requestForBot(member, 'session.active_list', {
+      current_session_id: sessionId,
       profile: member.name
     })
+    const live = (Array.isArray(active?.sessions) ? active.sessions : []).find(
+      row => row?.id === sessionId || (stored && row?.session_key === stored)
+    )
 
-    if (!latest?.auto_continuing && !latest?.auto_continue && !latest?.running && !latest?.inflight) {
-      return latest
+    if (!live || (live.status !== 'working' && live.status !== 'starting')) {
+      return requestForBot(member, 'session.resume', {
+        session_id: stored || sessionId,
+        profile: member.name
+      })
     }
 
     await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
@@ -7337,6 +7346,10 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
   }
 
   if (pre) {
+    // Fail closed on reset errors. Submitting after we identified an active
+    // crash continuation but could not prove it settled can queue behind, or
+    // be confused with, the stale turn. That is categorically different from
+    // the lazy-session resume miss above, where no competing turn was seen.
     pre = await resetAutoContinuedGroupTurn(member, runtime, stored, pre)
     before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
   }
