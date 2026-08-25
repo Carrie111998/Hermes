@@ -1,7 +1,7 @@
 import type { useSensors } from '@dnd-kit/core'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -89,6 +89,82 @@ function SidebarSectionHeader({
         <div className="flex w-fit min-w-0 items-center gap-1 leading-none">{labelBody}</div>
       )}
       {action}
+    </div>
+  )
+}
+
+export interface ProfileGroupSectionData {
+  name: null | string
+  groups: SidebarSessionGroup[]
+}
+
+// Bucket profile groups under their named parent group, ungrouped last. A pure
+// function so the all-profiles "group → profile → sessions" tree is testable.
+export function groupProfileGroupsByParent(groups: SidebarSessionGroup[]): ProfileGroupSectionData[] {
+  const buckets = new Map<null | string, SidebarSessionGroup[]>()
+
+  for (const group of groups) {
+    const key = group.parentGroup ?? null
+    const list = buckets.get(key) ?? []
+    list.push(group)
+    buckets.set(key, list)
+  }
+
+  const named = [...buckets.entries()].filter(([name]) => name != null)
+  const ungrouped = buckets.get(null) ?? []
+
+  return [
+    ...named.map(([name, list]) => ({ name, groups: list })),
+    ...(ungrouped.length ? [{ name: null, groups: ungrouped }] : [])
+  ]
+}
+
+// The outer rung of the all-profiles tree: one collapsible parent group per
+// user-defined grouping, holding that group's profile groups (which themselves
+// collapse to their sessions). Renders nothing special when there are no
+// groupings — callers fall back to the flat profile-group list.
+function ProfileGroupSection({
+  name,
+  groups,
+  renderRows,
+  onNewSession
+}: {
+  name: null | string
+  groups: SidebarSessionGroup[]
+  renderRows: (items: SessionInfo[]) => React.ReactNode
+  onNewSession?: (path: null | string) => void
+}) {
+  const { t } = useI18n()
+  const [open, setOpen] = useState(true)
+  const label = name ?? t.profiles.groupUngrouped
+
+  return (
+    <div className="flex flex-col">
+      <div className="group/section flex shrink-0 items-center justify-between gap-1 pb-1 pt-1.5">
+        <button
+          className="group/section-label flex w-fit min-w-0 items-center gap-1 bg-transparent text-left leading-none"
+          onClick={() => setOpen(!open)}
+          type="button"
+        >
+          <SidebarPanelLabel>{label}</SidebarPanelLabel>
+          <DisclosureCaret
+            className="text-(--ui-text-tertiary) opacity-0 transition group-hover/section-label:opacity-100"
+            open={open}
+          />
+        </button>
+      </div>
+      {open && (
+        <div className="flex flex-col">
+          {groups.map(group => (
+            <SidebarWorkspaceGroup
+              group={group}
+              key={group.id}
+              onNewSession={onNewSession}
+              renderRows={renderRows}
+            />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -447,15 +523,29 @@ export function SidebarSessionsSection({
       </>
     )
   } else if (groups?.length) {
-    // Profile/source groups never reorder; render them flat with static rows.
-    inner = groups.map(group => (
-      <SidebarWorkspaceGroup
-        group={group}
-        key={group.id}
-        onNewSession={onNewSessionInWorkspace}
-        renderRows={renderRows}
-      />
-    ))
+    // Profile/source groups never reorder. When any profile group names a
+    // parent grouping, nest them under collapsible parent-group sections
+    // ("group → profile → sessions"); otherwise render the flat list.
+    if (groups.some(group => group.parentGroup)) {
+      inner = groupProfileGroupsByParent(groups).map(section => (
+        <ProfileGroupSection
+          groups={section.groups}
+          key={section.name ?? '__ungrouped__'}
+          name={section.name}
+          onNewSession={onNewSessionInWorkspace}
+          renderRows={renderRows}
+        />
+      ))
+    } else {
+      inner = groups.map(group => (
+        <SidebarWorkspaceGroup
+          group={group}
+          key={group.id}
+          onNewSession={onNewSessionInWorkspace}
+          renderRows={renderRows}
+        />
+      ))
+    }
   } else if (flatVirtualized) {
     const virtual = (
       <VirtualSessionList

@@ -30,6 +30,10 @@ export interface SidebarSessionGroup {
   isKanban?: boolean
   mode?: 'profile' | 'source' | 'workspace'
   sourceId?: string
+  // For mode='profile': the user's named grouping (e.g. a project/fleet) this
+  // profile belongs to, or null when ungrouped. Drives the outer "group →
+  // profile → sessions" tree in the all-profiles sidebar.
+  parentGroup?: null | string
 }
 
 /** A repo node: holds its branch/worktree lanes (`repo -> lane -> sessions`). */

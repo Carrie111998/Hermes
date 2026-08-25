@@ -76,6 +76,8 @@ import { notifyError } from '@/store/notifications'
 import {
   $newChatProfile,
   $profileColors,
+  $profileGroupOrder,
+  $profileGroups,
   $profiles,
   $profileScope,
   ALL_PROFILES,
@@ -1247,6 +1249,8 @@ export function ChatSidebar({
   // Only reachable while the sidebar is showing every profile — scoped to one,
   // it would draw a single group around the whole list.
   const profileGrouped = showAllProfiles && grouping === 'profile'
+  const profileGroupNames = useStore($profileGroups)
+  const profileGroupOrder = useStore($profileGroupOrder)
 
   const profileGroups = useMemo<SidebarSessionGroup[] | undefined>(() => {
     if (!profileGrouped) {
@@ -1263,6 +1267,7 @@ export function ChatSidebar({
         id: key,
         label: key,
         mode: 'profile',
+        parentGroup: profileGroupNames[key] ?? null,
         path: null,
         sessions: []
       }
@@ -1272,11 +1277,28 @@ export function ChatSidebar({
       groups.set(key, group)
     }
 
-    // default (root) first, then the rest alphabetically.
-    return [...groups.values()].sort((a, b) =>
-      a.id === 'default' ? -1 : b.id === 'default' ? 1 : a.label.localeCompare(b.label)
-    )
-  }, [profileGrouped, agentSessions, profileColors])
+    // Order the outer tree by the user's group order (ungrouped last), then
+    // default profile first + alpha within each group. With no groupings the
+    // profileGroups carry a null parentGroup and fall back to the old flat
+    // order.
+    const groupRank = (name: null | string): number => {
+      if (name == null) {return Number.MAX_SAFE_INTEGER}
+      const index = profileGroupOrder.indexOf(name)
+
+      return index === -1 ? Number.MAX_SAFE_INTEGER - 1 : index
+    }
+
+    return [...groups.values()].sort((a, b) => {
+      const ra = groupRank(a.parentGroup ?? null)
+      const rb = groupRank(b.parentGroup ?? null)
+
+      if (ra !== rb) {
+        return ra - rb
+      }
+
+      return a.id === 'default' ? -1 : b.id === 'default' ? 1 : a.label.localeCompare(b.label)
+    })
+  }, [profileGrouped, agentSessions, profileColors, profileGroupNames, profileGroupOrder])
 
   // The flat Sessions list always shows ALL recent sessions; Projects is a
   // parallel grouped view, not a filter on this one — nothing is hidden here.
