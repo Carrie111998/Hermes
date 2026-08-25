@@ -989,3 +989,60 @@ describe('knownSessionProfile', () => {
     expect(knownSessionProfile([], null)).toBeUndefined()
   })
 })
+
+describe('knownSessionOwner reconciliation', () => {
+  it('reconciles a complete hint with same-profile profile-only evidence', () => {
+    const hint = {
+      connectionId: 'remote-source',
+      mode: 'remote' as const,
+      profile: 'default',
+      targetProfile: 'backend-default'
+    }
+
+    setSessionOwnerHint('partial-confirmation', hint)
+
+    expect(knownSessionOwner([session({ id: 'partial-confirmation', profile: 'default' })], 'partial-confirmation')).toEqual(
+      hint
+    )
+  })
+
+  it('reconciles a qualified row with a same-profile profile-only row', () => {
+    expect(
+      knownSessionOwner(
+        [
+          session({ connection_id: 'source-a', id: 'compatible-rows', profile: 'worker' }),
+          session({ connection_id: undefined, id: 'compatible-rows', profile: 'worker' })
+        ],
+        'compatible-rows'
+      )
+    ).toEqual({ connectionId: 'source-a', profile: 'worker' })
+  })
+
+  it('fails closed for contradictory connection-qualified owners', () => {
+    setSessionOwnerHint('contradictory-connections', { connectionId: 'source-a', profile: 'worker' })
+
+    expect(
+      knownSessionOwner(
+        [session({ connection_id: 'source-b', id: 'contradictory-connections', profile: 'worker' })],
+        'contradictory-connections'
+      )
+    ).toEqual({ ambiguous: true })
+  })
+
+  it('fails closed when profile-only evidence contradicts the qualified owner', () => {
+    setSessionOwnerHint('contradictory-profiles', { connectionId: 'source-a', profile: 'worker' })
+
+    expect(
+      knownSessionOwner([session({ id: 'contradictory-profiles', profile: 'reviewer' })], 'contradictory-profiles')
+    ).toEqual({ ambiguous: true })
+  })
+
+  it('ignores profileless rows instead of inventing default ownership', () => {
+    expect(
+      knownSessionOwner(
+        [session({ connection_id: 'source-profileless', id: 'profileless-row', profile: undefined })],
+        'profileless-row'
+      )
+    ).toBeUndefined()
+  })
+})

@@ -10,7 +10,7 @@ import { persistBoolean, persistString, storedBoolean, storedString } from '@/li
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
-import type { SessionProfileRoute } from './session-request-router'
+import type { SessionOwnerScope, SessionProfileRoute } from './session-request-router'
 import { clearUnreadOnOpen } from './session-unread-remote'
 
 type Updater<T> = T | ((current: T) => T)
@@ -146,33 +146,64 @@ export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId:
  * scoped row or open-time hint must stay a route object; reducing it to a bare
  * profile name sends same-named sessions to the primary connection.
  */
-export function knownSessionOwner(
-  sessions: readonly SessionInfo[],
-  sessionId: null | string
-): SessionProfileRoute | string | undefined {
+export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: null | string): SessionOwnerScope {
   if (!sessionId) {
     return undefined
   }
 
-  const row = sessions.find(session => sessionMatchesStoredId(session, sessionId))
-  const rowProfile = row?.profile?.trim()
-  const rowConnection = row?.connection_id?.trim()
+  const hints = getSessionOwnerHints(sessionId)
+  const qualifiedOwners = new Map<string, SessionProfileRoute>()
+  const profileOnlyOwners = new Set<string>()
 
-  if (rowConnection) {
-    return {
-      connectionId: rowConnection,
-      ...(row?.source === 'local' ? { mode: 'local' as const } : {}),
-      profile: rowProfile || 'default'
+  for (const hint of hints) {
+    qualifiedOwners.set(JSON.stringify([hint.connectionId, hint.profile]), hint)
+  }
+
+  for (const row of sessions.filter(session => sessionMatchesStoredId(session, sessionId))) {
+    const connectionId = row.connection_id?.trim()
+    const profile = row.profile?.trim()
+
+    // A connection without a profile is incomplete evidence. In particular,
+    // do not invent "default": that could turn an unrelated projection into
+    // a routable owner claim on the wrong backend.
+    if (!profile) {
+      continue
+    }
+
+    if (connectionId) {
+      const key = JSON.stringify([connectionId, profile])
+
+      if (!qualifiedOwners.has(key)) {
+        qualifiedOwners.set(key, {
+          connectionId,
+          ...(row.source === 'local' ? { mode: 'local' as const } : {}),
+          profile
+        })
+      }
+    } else {
+      profileOnlyOwners.add(profile)
     }
   }
 
-  const hint = getSessionOwnerHint(sessionId)
+  if (qualifiedOwners.size > 0) {
+    if (qualifiedOwners.size !== 1) {
+      return { ambiguous: true }
+    }
 
-  if (hint) {
-    return hint
+    const owner = qualifiedOwners.values().next().value
+
+    if (!owner || [...profileOnlyOwners].some(profile => profile !== owner.profile)) {
+      return { ambiguous: true }
+    }
+
+    return owner
   }
 
-  return rowProfile || undefined
+  if (profileOnlyOwners.size === 0) {
+    return undefined
+  }
+
+  return profileOnlyOwners.size === 1 ? [...profileOnlyOwners][0] : { ambiguous: true }
 }
 
 /**

@@ -809,7 +809,7 @@ export function storedSessionIdForRuntimeId(sessionId: string): null | string {
 export function setSessionTileWorkspaceScope(storedSessionId: string, scope: SessionTileWorkspaceScope): boolean {
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.ownerRoute
+  const ownerRoute = scope.ownerRoute ?? tile?.ownerRoute
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (
@@ -817,6 +817,7 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
     ((tile.workspaceMode ?? 'sessions') === scope.workspaceMode &&
       tile.workspaceOwnerKey === workspaceOwnerKey &&
       tile.ownerRoute?.connectionId === ownerRoute?.connectionId &&
+      tile.ownerRoute?.mode === ownerRoute?.mode &&
       tile.ownerRoute?.profile === ownerRoute?.profile &&
       tile.ownerRoute?.targetProfile === ownerRoute?.targetProfile &&
       tile.workspaceTabTitle === workspaceTabTitle)
@@ -1064,7 +1065,7 @@ export function openSessionTile(
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        ownerRoute: workspaceScope.ownerRoute,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,
@@ -1276,6 +1277,7 @@ export function reopenLastClosedTile(): void {
 
     if (!$sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
       openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before, {
+        ownerRoute: tile.ownerRoute,
         workspaceMode: tile.workspaceMode ?? 'sessions',
         workspaceOwnerKey: tile.workspaceOwnerKey
       })

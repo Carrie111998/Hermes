@@ -24,6 +24,7 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setSessionOwnerHint,
   setSessions,
   setWorkspaceCwdOwner,
   setYoloActive
@@ -1243,19 +1244,25 @@ export function upsertOptimisticSession(
   title: string | null = null,
   preview: string | null = null,
   parentSessionId: string | null = null,
-  lastActive?: number
+  lastActive?: number,
+  ownerRoute?: SessionProfileRoute | null
 ) {
   const now = lastActive ?? Date.now() / 1000
   // Stamp the profile the session was just created on (= the live gateway's
   // profile) so the scoped sidebar shows the new row immediately instead of
   // filtering it out as "default" until the aggregator re-fetches.
-  const profileKey = normalizeProfileKey($activeGatewayProfile.get())
+  const profileKey = normalizeProfileKey(ownerRoute?.profile ?? $activeGatewayProfile.get())
+
+  if (ownerRoute) {
+    setSessionOwnerHint(id, ownerRoute)
+  }
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
     // lane immediately (the overlay groups by path); fall back to the workspace
     // the session was just started in when the create response omits it.
     cwd: created.info?.cwd ?? ($currentCwd.get().trim() || null),
+    ...(ownerRoute ? { connection_id: ownerRoute.connectionId } : {}),
     ended_at: null,
     id,
     input_tokens: 0,
