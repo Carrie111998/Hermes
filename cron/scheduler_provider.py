@@ -650,14 +650,20 @@ class InProcessCronScheduler(CronScheduler):
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
         logger = logging.getLogger("cron.scheduler_provider")
+
+        def current_profile_homes():
+            entries = profile_homes() if callable(profile_homes) else profile_homes
+            return list(entries)
+
+        initial_profile_homes = current_profile_homes()
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s",
-            len(profile_homes),
-            [p[0] if isinstance(p, tuple) else p for p in profile_homes],
+            len(initial_profile_homes),
+            [p[0] if isinstance(p, tuple) else p for p in initial_profile_homes],
         )
 
         # Recovery + initial heartbeat for every profile.
-        for entry in profile_homes:
+        for entry in initial_profile_homes:
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
@@ -681,7 +687,7 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    for entry in profile_homes:
+                    for entry in current_profile_homes():
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
@@ -704,7 +710,10 @@ class InProcessCronScheduler(CronScheduler):
             else:
                 _tick_error = None
             # Record per-profile heartbeat after each tick cycle.
-            for entry in profile_homes:
+            # Resolve membership again here: profile deletion can happen while
+            # a tick is running, and touching its stale startup Path would make
+            # ensure_dirs() recreate the deleted profile as a cron-only ghost.
+            for entry in current_profile_homes():
                 home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
                 try:
