@@ -197,6 +197,89 @@ describe('session.info model-options invalidation gating', () => {
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ambientKey })
   })
 
+  it('keeps the exact runtime-bound alias authoritative after the stored id rotates', () => {
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+    const ownerRoute = {
+      connectionId: 'remote-owner',
+      mode: 'remote' as const,
+      profile: 'bot-alias',
+      targetProfile: 'backend-bot'
+    }
+
+    const targetKey = modelOptionsQueryKey(
+      { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile },
+      ACTIVE_SID
+    )
+
+    const socketKey = modelOptionsQueryKey(
+      { connectionId: ownerRoute.connectionId, profile: ownerRoute.profile },
+      ACTIVE_SID
+    )
+
+    $sessionTiles.set([{ ownerRoute, runtimeId: ACTIVE_SID, storedSessionId: 'stored-lineage-root' }])
+    sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
+    invalidate.mockClear()
+
+    act(() =>
+      stream.handleEvent({
+        connectionId: ownerRoute.connectionId,
+        payload: {
+          model: 'm2',
+          provider: 'p1',
+          running: true,
+          stored_session_id: 'stored-rotated-tip'
+        },
+        profile: ownerRoute.profile,
+        session_id: ACTIVE_SID,
+        type: 'session.info'
+      })
+    )
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: targetKey })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: socketKey })
+  })
+
+  it('rejects a stale alias tile when both runtime ids differ despite a matching stored id', () => {
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+    const ownerRoute = {
+      connectionId: 'remote-owner',
+      mode: 'remote' as const,
+      profile: 'bot-alias',
+      targetProfile: 'stale-backend-bot'
+    }
+
+    const socketKey = modelOptionsQueryKey(
+      { connectionId: ownerRoute.connectionId, profile: ownerRoute.profile },
+      ACTIVE_SID
+    )
+
+    const staleTargetKey = modelOptionsQueryKey(
+      { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile },
+      ACTIVE_SID
+    )
+
+    $sessionTiles.set([{ ownerRoute, runtimeId: 'stale-runtime', storedSessionId: 'stored-shared' }])
+    sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
+    invalidate.mockClear()
+
+    act(() =>
+      stream.handleEvent({
+        connectionId: ownerRoute.connectionId,
+        payload: { model: 'm2', provider: 'p1', running: true, stored_session_id: 'stored-shared' },
+        profile: ownerRoute.profile,
+        session_id: ACTIVE_SID,
+        type: 'session.info'
+      })
+    )
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: socketKey })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: staleTargetKey })
+  })
+
   it('fails closed instead of invalidating a guessed catalog when exact owner routes conflict', () => {
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')

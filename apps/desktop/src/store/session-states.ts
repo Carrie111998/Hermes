@@ -892,11 +892,21 @@ export function sessionEventOwnerRoute(
 
   const tileRoutes = $sessionTiles
     .get()
-    .filter(tile =>
-      storedId
-        ? tile.storedSessionId === storedId && (!runtimeId || !tile.runtimeId || tile.runtimeId === runtimeId)
-        : tile.runtimeId === runtimeId || tile.storedSessionId === runtimeId
-    )
+    .filter(tile => {
+      // A live runtime binding is the strongest identity. Compression can
+      // rotate the backend's stored id while the mounted tile intentionally
+      // retains the durable lineage id.
+      if (runtimeId && tile.runtimeId) {
+        return tile.runtimeId === runtimeId
+      }
+
+      // Fall back to durable identity only when the event has no runtime id or
+      // the tile has not acquired one. Never let a matching stored id override
+      // two explicit, differing runtime bindings.
+      const durableId = storedId || runtimeId
+
+      return Boolean(durableId && tile.storedSessionId === durableId)
+    })
     .map(tile => tile.ownerRoute)
     .filter((route): route is SessionProfileRoute => sourceMatches(route))
 
