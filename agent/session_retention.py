@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -314,3 +315,21 @@ def accept_from_delegation_result(
 def default_session_db():
     from hermes_state import SessionDB
     return SessionDB()
+
+
+@contextmanager
+def temporary_session_db() -> Iterator[Any]:
+    """Open a SessionDB for a short retention pass and always close it.
+
+    Ledger/delivery hooks must not leave SessionDB's writer connection (or
+    its WAL/SHM descriptors) open; those paths are covered by the
+    async-delegation connection-close contract.
+    """
+    db = default_session_db()
+    try:
+        yield db
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("temporary SessionDB close failed", exc_info=True)

@@ -442,9 +442,16 @@ def restore_undelivered_completions(target_queue) -> int:
             target_queue.put(evt)
             restored += 1
     try:
-        from agent.session_retention import default_session_db, sweep_accepted_temporary_sessions
+        from agent.session_retention import (
+            RETENTION_KEEP,
+            resolve_retention_policy,
+            sweep_accepted_temporary_sessions,
+            temporary_session_db,
+        )
 
-        sweep_accepted_temporary_sessions(default_session_db())
+        if resolve_retention_policy() != RETENTION_KEEP:
+            with temporary_session_db() as session_db:
+                sweep_accepted_temporary_sessions(session_db)
     except Exception:
         logger.debug("temporary session retention sweep failed", exc_info=True)
     return restored
@@ -465,9 +472,16 @@ def _release_child_sessions_after_delivery(delegation_id: str) -> None:
             raw = row[0] if not hasattr(row, "keys") else row["result_json"]
             if raw:
                 payload = json.loads(raw)
-        from agent.session_retention import accept_from_delegation_result, default_session_db
+        from agent.session_retention import (
+            accept_from_delegation_result,
+            child_session_ids_from_result,
+            temporary_session_db,
+        )
 
-        accept_from_delegation_result(default_session_db(), payload)
+        if not child_session_ids_from_result(payload):
+            return
+        with temporary_session_db() as session_db:
+            accept_from_delegation_result(session_db, payload)
     except Exception:
         logger.debug(
             "temporary child retention after delivery failed for %s",
