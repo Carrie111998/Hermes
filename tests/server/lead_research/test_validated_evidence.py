@@ -1,15 +1,19 @@
-"""Validated evidence anchors a score, and more evidence never lowers one.
+"""More evidence never lowers a score, and who published it never changes fit.
 
-Both halves of this file are the same regression. `derive_dimension_scores`
-averaged the claims in a dimension, so a corroborating fact *reduced* it — an
-official product term scored 77.9 alone and 54.1 once a web mention agreed with
-it. The system was penalised for looking harder, which is fatal to a design
-whose whole plan is a web-search fallback that produces more claims than the
-validated sources do.
+The first half is the original regression. `derive_dimension_scores` averaged
+the claims in a dimension, so a corroborating fact *reduced* it — an official
+product term scored 77.9 alone and 54.1 once a web mention agreed with it. The
+system was penalised for looking harder, which is fatal to a design whose whole
+plan is a web-search fallback that produces more claims than the validated
+sources do. Combining fixes the direction: every claim is either the anchor or
+bounded support, and neither role can subtract.
 
-Combining fixes the direction. Validated standing fixes the ordering: a fact
-the company's own page or an authoritative registry vouched for sets what a
-dimension is worth, and everything else can only add to it.
+The second half is the correction to the first fix. `validated` — a publisher
+with standing vouched for this fact — used to discount the anchor, which made
+fit a function of who filed the evidence rather than of the company. Fit is
+business fit. `validated` still decides what may be shared between customers,
+still carries provenance and corrections, and claim confidence still feeds
+evidence confidence; it is simply absent from the fit arithmetic.
 """
 from __future__ import annotations
 
@@ -71,37 +75,41 @@ def test_support_saturates_so_many_weak_mentions_cannot_reach_the_top():
     assert _fit_dimension(many) < 100
 
 
-# ── validated evidence sets the score ────────────────────────────────────────
+# ── the same fact scores the same whoever filed it ───────────────────────────
 
-def test_validated_evidence_outscores_the_same_fact_unvalidated():
+def test_the_same_fact_scores_the_same_validated_or_not():
     validated = [_claim("product_term", ["ovens"], validated=True, evidence=("ev_1", "ev_2"))]
     unvalidated = [_claim("product_term", ["ovens"], validated=False, evidence=("ev_1", "ev_2"))]
 
-    assert _fit_dimension(validated) > _fit_dimension(unvalidated)
+    assert _fit_dimension(validated) == _fit_dimension(unvalidated)
 
 
-def test_an_unvalidated_claim_never_becomes_the_anchor():
-    """A perfect web-search hit must not outrank a weaker official fact."""
+def test_the_strongest_claim_is_the_anchor_whoever_validated_it():
+    """A better-evidenced fact is a better fact, whatever published it.
+
+    What still separates a weak mention from a real one is the evidence behind
+    it — confidence, corroboration, breadth — all of which this measures.
+    """
     official_only = [
         _claim("product_term", ["ovens"], validated=True, confidence=.6, evidence=("ev_1",))
     ]
-    plus_perfect_web = official_only + [
-        _claim(
-            "hs_code", ["8516", "8514", "7321"], validated=False,
-            confidence=1.0, evidence=("ev_2", "ev_3"),
-        )
-    ]
-    web_alone = [
+    perfect_web = [
         _claim(
             "hs_code", ["8516", "8514", "7321"], validated=False,
             confidence=1.0, evidence=("ev_2", "ev_3"),
         )
     ]
 
-    # The web fact adds support to the official one...
-    assert _fit_dimension(plus_perfect_web) > _fit_dimension(official_only)
-    # ...but on its own it stays below what a validated fact is worth.
-    assert _fit_dimension(web_alone) < 100
+    # More evidence still only ever adds.
+    assert _fit_dimension(official_only + perfect_web) > _fit_dimension(official_only)
+    # And a corroborated, three-value claim outranks a single weak one.
+    assert _fit_dimension(perfect_web) > _fit_dimension(official_only)
+
+
+def test_a_thin_claim_still_scores_thin_however_it_was_published():
+    thin = [_claim("product_term", ["ovens"], validated=True, confidence=.4, evidence=("ev_1",))]
+
+    assert _fit_dimension(thin) < 50
 
 
 # ── freshness is measured, not assumed ───────────────────────────────────────

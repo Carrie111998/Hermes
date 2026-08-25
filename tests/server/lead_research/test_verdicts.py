@@ -45,21 +45,24 @@ def _claim(field: str, evidence_id: str) -> Claim:
     )
 
 
-def _score(band: str = "A") -> LeadScore:
-    return LeadScore(
-        fit_score=92,
-        evidence_confidence=.86,
-        priority_band=band,
-        dimensions={"product_sector_fit": 100.0},
-        confidence_factors={},
-    )
+def _score(band: str = "A", **overrides) -> LeadScore:
+    """A score that clears the absolute strong-fit floor unless a test lowers it."""
+    values = {
+        "fit_score": 92,
+        "evidence_confidence": .86,
+        "priority_band": band,
+        "known_weight": 60,
+        "dimensions": {"product_sector_fit": 100.0, "buyer_channel_fit": 90.0},
+        "confidence_factors": {},
+    }
+    return LeadScore(**{**values, **overrides})
 
 
 def _eligible() -> EligibilityResult:
     return EligibilityResult(True, {"resolved_identity": "pass"}, [])
 
 
-def test_strong_fit_requires_two_sources_and_one_official():
+def test_strong_fit_requires_both_scored_dimensions_above_the_floor():
     coverage = SourceCoverage(
         official_domains={"official.example"},
         independent_domains={"registry.example"},
@@ -84,11 +87,27 @@ def test_strong_fit_requires_two_sources_and_one_official():
         (SourceCoverage(official_domains={"official.example"}, independent_domains=set()), "independent_source"),
     ],
 )
-def test_a_score_without_required_source_coverage_is_review(coverage, missing):
-    verdict = evaluate_verdict(_candidate(), [_claim("product_sector_fit", "ev_1")], _score(), _eligible(), coverage)
+def test_a_source_gap_is_reported_without_deciding_the_verdict(coverage, missing):
+    """Coverage is a receipt, not a gate: it names what was never read."""
+    verdict = evaluate_verdict(
+        _candidate(),
+        [_claim("product_sector_fit", "ev_1"), _claim("buyer_channel_fit", "ev_2")],
+        _score(), _eligible(), coverage,
+    )
+
+    assert verdict.kind == "strong_fit"
+    assert missing in verdict.missing_evidence
+
+
+def test_a_lead_with_only_one_scored_dimension_is_review():
+    verdict = evaluate_verdict(
+        _candidate(), [_claim("product_sector_fit", "ev_1")],
+        _score(dimensions={"product_sector_fit": 100.0}), _eligible(),
+        SourceCoverage({"official.example"}, {"registry.example"}),
+    )
 
     assert verdict.kind == "review"
-    assert missing in verdict.missing_evidence
+    assert "buyer_channel_fit_required" in verdict.reasons
 
 
 def test_ineligible_candidate_is_rejected_even_with_a_score_and_source_coverage():

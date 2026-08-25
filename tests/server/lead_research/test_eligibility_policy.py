@@ -161,3 +161,21 @@ def test_a_switched_off_gate_stays_visible_in_the_record():
 
     assert gate.gates["buyer_role"] == "not_required"
     assert gate.gates["target_geography"] == "not_required"
+
+
+# A curated buyer list can state that a company buys in a sector, and that is a
+# channel role -- it is not a claim to manufacture or own a brand. Without the
+# mapping, every campaign asking for distributors rejected every curated buyer
+# for a reason that had nothing to do with the company.
+def test_sector_buyer_satisfies_a_wholesale_channel_request():
+    from server.lead_research.qualification import satisfies_buyer_role
+
+    assert satisfies_buyer_role({"sector_buyer"}, {"distributor", "importer"})
+    assert satisfies_buyer_role({"sector buyer"}, {"retailer"})
+
+
+def test_sector_buyer_does_not_claim_production_or_ownership():
+    from server.lead_research.qualification import satisfies_buyer_role
+
+    assert not satisfies_buyer_role({"sector_buyer"}, {"manufacturer"})
+    assert not satisfies_buyer_role({"sector_buyer"}, {"brand"})

@@ -390,3 +390,43 @@ def test_attainable_dimensions_are_derived_from_declared_fields():
     assert attainable_dimensions([]) == set()
     # lifecycle_status is real evidence but speaks to no scoring dimension.
     assert attainable_dimensions(["lifecycle_status"]) == set()
+
+
+# --- Fit reads facts, never publishers ------------------------------------
+#
+# `validated` says a publisher with standing vouched for a fact. That controls
+# what may be shared between customers and it feeds evidence confidence -- but
+# discounting fit by it made the same three dimension claims score differently
+# depending on who filed them, so a hand-checked customer list could never
+# reach band A however complete its evidence was. Fit is about the company.
+
+def _dimension_claims(**overrides) -> list[Claim]:
+    return [
+        _claim("product_sector_fit", 90, confidence=.85, **overrides),
+        _claim("buyer_channel_fit", 85, confidence=.85, **overrides),
+        _claim("market_coverage", 80, confidence=.85, **overrides),
+    ]
+
+
+def test_identical_fact_shapes_ignore_provider_authority():
+    official = _dimension_claims(validated=True)
+    curated = [claim.model_copy(update={"validated": False}) for claim in official]
+
+    assert derive_dimension_scores(official) == derive_dimension_scores(curated)
+    assert score_lead({}, official, ScoringProfile()).fit_score == 86
+    assert score_lead({}, curated, ScoringProfile()).fit_score == 86
+
+
+def test_the_strongest_claim_anchors_a_dimension_whoever_validated_it():
+    stronger_unvalidated = [
+        _claim("product_sector_fit", 60, evidence=("ev_a",), validated=True),
+        _claim("product_sector_fit", 90, evidence=("ev_b",), validated=False),
+    ]
+    assert derive_dimension_scores(stronger_unvalidated)["product_sector_fit"] >= 90
+
+
+def test_answered_weight_is_the_same_whoever_validated_it():
+    official = score_lead({}, _dimension_claims(validated=True), ScoringProfile())
+    curated = score_lead({}, _dimension_claims(validated=False), ScoringProfile())
+    assert official.fit_score == curated.fit_score
+    assert official.known_weight == curated.known_weight == 60

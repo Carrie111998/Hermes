@@ -58,7 +58,14 @@ class Bundle:
 class Source:
     def __init__(self, url, facts):
         self.provenance_url = url
+        self.source_reference = None
         self.facts = facts
+
+    @property
+    def locator(self):
+        """The identity a source is deduplicated by; a URL here, a
+        `dataset:` reference for internal evidence."""
+        return self.provenance_url or self.source_reference or ""
 
 
 class Provider:

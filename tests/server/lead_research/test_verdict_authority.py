@@ -1,20 +1,26 @@
-"""What standing a verdict needs, and what it must keep refusing.
+"""What a strong fit actually requires, and what it must keep refusing.
 
-`strong_fit` required a domain classified `official` — a page on the company's
-own site. That classification is only ever produced by fetching a domain the
-candidate row already carried, so a company whose website was not in the corpus
-had no path to it at all: 161 of the 201 TED-derived rows could never be a
-strong fit however much evidence they accumulated. The verdict was capped by
-corpus metadata rather than by evidence.
+`strong_fit` used to require an authoritative publisher plus a second one
+agreeing. That is a statement about publishers, and it made the verdict a
+function of who filed the evidence rather than of what the evidence says: a
+company whose website was not in the corpus, or whose facts came from a curated
+customer list with no public page at all, could never be a strong fit however
+complete and consistent its evidence was.
 
-An authoritative registry now satisfies that leg. It is declared per source in
-the provider catalog, because "the EU's Publications Office is authoritative"
-is a judgement about a publisher, not something to infer from a URL.
+What replaces it is an absolute quality floor on the evidence itself — enough
+answered scoring weight, enough evidence confidence, both scored dimensions
+present, no material conflict — applied after the terminal and eligibility
+checks that already reject. Authority is still computed and still reported in
+`missing_evidence`, because a strong fit that hides its own gaps stops being
+auditable; it just no longer decides the verdict.
 
-What this must *not* do is lower the bar. One publisher is still one source,
-and third-party mentions with no authority behind them are still `review`.
+What this must *not* do is pad the list. The floor is a floor: below it a
+candidate is `review`, and no review candidate is ever promoted to reach a
+target.
 """
 from __future__ import annotations
+
+import pytest
 
 from server.lead_research.models import Claim, LeadScore
 from server.lead_research.qualification import EligibilityResult
@@ -26,20 +32,30 @@ from tests.server.lead_research.fakes import cited_source
 TED = "ted.europa.eu"
 
 
+def _product_claim() -> Claim:
+    return Claim(field="product_sector_fit", value=95, status="observed", confidence=.9,
+                 method="observed", evidence_ids=["ev_1"])
+
+
 def _claims() -> list[Claim]:
     return [
-        Claim(field="product_sector_fit", value=95, status="observed", confidence=.9,
-              method="observed", evidence_ids=["ev_1"]),
+        _product_claim(),
         Claim(field="buyer_channel_fit", value=85, status="observed", confidence=.9,
               method="observed", evidence_ids=["ev_2"]),
     ]
 
 
-def _score(band: str = "A") -> LeadScore:
-    return LeadScore(
-        fit_score=88, evidence_confidence=.8, priority_band=band,
-        dimensions={"product_sector_fit": 95.0}, confidence_factors={},
-    )
+def _score(band: str = "A", **overrides) -> LeadScore:
+    """A band-A score that clears the floor, unless a test lowers one input."""
+    values = {
+        "fit_score": 88,
+        "evidence_confidence": .8,
+        "priority_band": band,
+        "known_weight": 60,
+        "dimensions": {"product_sector_fit": 95.0, "buyer_channel_fit": 85.0},
+        "confidence_factors": {},
+    }
+    return LeadScore(**{**values, **overrides})
 
 
 def _verdict(coverage: SourceCoverage, band: str = "A"):
@@ -50,13 +66,24 @@ def _verdict(coverage: SourceCoverage, band: str = "A"):
 
 # ── the block this lifts ──────────────────────────────────────────────────────
 
-def test_a_registry_notice_and_a_second_publisher_reach_a_strong_fit():
+def test_a_band_curated_evidence_can_be_strong_without_a_public_url():
     """The regression this file exists for.
 
-    A company with no website in the corpus: an EU award notice naming it, plus
-    two independent pages. Every path to `official` was closed to it, so this
-    used to be permanently `review`.
+    A curated buyer list states the dimensions and cites an internal dataset
+    reference. There is no domain of any kind, so every publisher-based route to
+    `strong_fit` was closed to it permanently.
     """
+    verdict = evaluate_verdict(
+        {}, _claims(), _score(), EligibilityResult(True, {}, []),
+        SourceCoverage(set(), set()),
+    )
+
+    assert verdict.kind == "strong_fit"
+    assert verdict.reasons == ["a_band_above_absolute_quality_floor"]
+    assert "official_source" in verdict.missing_evidence
+
+
+def test_a_registry_notice_and_a_second_publisher_reach_a_strong_fit():
     verdict = _verdict(SourceCoverage(
         official_domains=set(),
         independent_domains={TED, "trade-press.example", "registry.example"},
@@ -64,7 +91,7 @@ def test_a_registry_notice_and_a_second_publisher_reach_a_strong_fit():
     ))
 
     assert verdict.kind == "strong_fit"
-    assert verdict.reasons == ["a_band_with_registry_and_corroborating_evidence"]
+    assert verdict.reasons == ["a_band_above_absolute_quality_floor"]
 
 
 def test_a_strong_fit_still_reports_what_it_never_saw():
@@ -82,36 +109,21 @@ def test_a_strong_fit_still_reports_what_it_never_saw():
     assert "authoritative_source" not in verdict.missing_evidence
 
 
-def test_the_company_own_page_route_is_unchanged():
+def test_the_company_own_page_route_still_reaches_a_strong_fit():
     verdict = _verdict(SourceCoverage(
         official_domains={"buyer.example"},
         independent_domains={"registry.example"},
     ))
 
     assert verdict.kind == "strong_fit"
-    assert verdict.reasons == ["a_band_with_official_and_corroborating_evidence"]
     assert verdict.missing_evidence == []
 
 
-def test_an_official_page_and_a_registry_notice_corroborate_each_other():
-    """Two publishers, both with standing. Nothing further is required."""
-    verdict = _verdict(SourceCoverage(
-        official_domains={"buyer.example"},
-        independent_domains=set(),
-        registry_domains={TED},
-    ))
+def test_a_single_publisher_is_reported_but_no_longer_blocking():
+    """One publisher is still one source, and the record says so.
 
-    assert verdict.kind == "strong_fit"
-    assert "independent_source" in verdict.missing_evidence
-
-
-# ── the bar this must not lower ───────────────────────────────────────────────
-
-def test_a_registry_notice_alone_is_not_corroboration():
-    """One publisher is one source, whoever the publisher is.
-
-    This is the case the deployed tenant is actually in: TED, and a corpus whose
-    rows cite the same TED notice, are one domain between them.
+    It is the *floor* that decides now, so this is a strong fit with
+    `second_source` named as a gap rather than a review with no way forward.
     """
     verdict = _verdict(SourceCoverage(
         official_domains=set(),
@@ -119,31 +131,47 @@ def test_a_registry_notice_alone_is_not_corroboration():
         registry_domains={TED},
     ))
 
-    assert verdict.kind == "review"
+    assert verdict.kind == "strong_fit"
     assert "second_source" in verdict.missing_evidence
 
 
-def test_third_party_mentions_with_no_authority_stay_under_review():
-    """Two directory listings are not a strong fit."""
-    verdict = _verdict(SourceCoverage(
-        official_domains=set(),
-        independent_domains={"directory-a.example", "directory-b.example"},
-    ))
+# ── the bar this must not lower ───────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    ("score_update", "reason"),
+    [
+        ({"known_weight": 45}, "insufficient_answered_weight"),
+        ({"evidence_confidence": .59}, "insufficient_evidence_confidence"),
+    ],
+)
+def test_absolute_floor_never_pads_a_band(score_update, reason):
+    """A band-A fit computed from too little is still not a strong fit.
+
+    `fit_score` is a weighted mean over the dimensions a lead actually has, so
+    one dimension answered out of seven can read 95. Answered weight is what
+    stops that from being a lead.
+    """
+    verdict = evaluate_verdict(
+        {}, _claims(), _score(**score_update),
+        EligibilityResult(True, {}, []), SourceCoverage(set(), set()),
+    )
 
     assert verdict.kind == "review"
-    assert verdict.missing_evidence.count("authoritative_source") == 1
+    assert reason in verdict.reasons
 
 
-def test_nothing_at_all_is_still_review_with_every_gap_named():
-    verdict = _verdict(SourceCoverage(set(), set()))
+def test_missing_product_or_buyer_dimension_stays_review():
+    verdict = evaluate_verdict(
+        {}, [_product_claim()],
+        _score(dimensions={"product_sector_fit": 95.0}),
+        EligibilityResult(True, {}, []), SourceCoverage(set(), set()),
+    )
 
     assert verdict.kind == "review"
-    assert set(verdict.missing_evidence) == {
-        "authoritative_source", "official_source", "independent_source", "second_source",
-    }
+    assert "buyer_channel_fit_required" in verdict.reasons
 
 
-def test_a_lower_band_is_never_upgraded_by_authority():
+def test_a_lower_band_is_never_upgraded_by_a_cleared_floor():
     verdict = _verdict(
         SourceCoverage(set(), {TED, "press.example"}, {TED}), band="B",
     )
@@ -151,7 +179,19 @@ def test_a_lower_band_is_never_upgraded_by_authority():
     assert verdict.kind == "review"
 
 
-def test_a_conflicting_claim_still_blocks_a_strong_fit():
+def test_nothing_at_all_still_names_every_gap():
+    verdict = evaluate_verdict(
+        {}, _claims(), _score(known_weight=10),
+        EligibilityResult(True, {}, []), SourceCoverage(set(), set()),
+    )
+
+    assert verdict.kind == "review"
+    assert set(verdict.missing_evidence) == {
+        "authoritative_source", "official_source", "independent_source", "second_source",
+    }
+
+
+def test_a_material_conflict_still_blocks_a_strong_fit():
     conflicted = Claim(
         field="domain", value=["a.example", "b.example"], status="conflicted",
         confidence=.9, method="observed", evidence_ids=["ev_1"],
@@ -163,7 +203,43 @@ def test_a_conflicting_claim_still_blocks_a_strong_fit():
     )
 
     assert verdict.kind == "review"
+    assert "material_conflict" in verdict.reasons
     assert verdict.conflicting_claims == ["domain"]
+
+
+def test_an_immaterial_conflict_does_not_block_a_strong_fit():
+    """A disagreement about something the verdict does not rest on.
+
+    Blocking on any conflicted field at all made an argument about a phone
+    number as disqualifying as one about the company's country.
+    """
+    conflicted = Claim(
+        field="phone", value=["+1 1", "+1 2"], status="conflicted",
+        confidence=.9, method="observed", evidence_ids=["ev_1"],
+    )
+
+    verdict = evaluate_verdict(
+        {}, [*_claims(), conflicted], _score(), EligibilityResult(True, {}, []),
+        SourceCoverage({"buyer.example"}, {TED}, {TED}),
+    )
+
+    assert verdict.kind == "strong_fit"
+    assert verdict.conflicting_claims == ["phone"]
+
+
+def test_a_closed_company_is_still_rejected_however_well_it_scores():
+    closed = Claim(
+        field="lifecycle_status", value="dissolved", status="observed",
+        confidence=.9, method="observed", evidence_ids=["ev_1"],
+    )
+
+    verdict = evaluate_verdict(
+        {}, [*_claims(), closed], _score(), EligibilityResult(True, {}, []),
+        SourceCoverage({"buyer.example"}, {TED}, {TED}),
+    )
+
+    assert verdict.kind == "reject"
+    assert verdict.reasons == ["lifecycle_status_dissolved"]
 
 
 def test_an_ineligible_company_is_still_rejected_however_authoritative():
@@ -174,6 +250,13 @@ def test_an_ineligible_company_is_still_rejected_however_authoritative():
     )
 
     assert verdict.kind == "reject"
+
+
+def test_a_rejected_band_is_never_a_strong_fit():
+    verdict = _verdict(SourceCoverage({"buyer.example"}, {TED}, {TED}), band="Rejected")
+
+    assert verdict.kind == "reject"
+    assert verdict.reasons == ["below_scoring_threshold"]
 
 
 # ── the declaration itself ───────────────────────────────────────────────────
@@ -211,6 +294,11 @@ class _RegistryNotice:
         facts = {
             "company_name": [candidate.company_name],
             "country": [candidate.country],
+            # A notice naming where the contract was performed is presence in
+            # the requested market, which is a third answered dimension. Without
+            # it this fixture answers 45 of 100 weighted points and sits below
+            # the floor on arithmetic rather than on authority.
+            "locations": [candidate.country],
             "buyer_role": ["public procurement supplier", "distributor"],
             "product_term": ["white goods", "built-in ovens", "household-appliances"],
         }
@@ -242,6 +330,7 @@ class _WebMentions:
         facts = {
             "company_name": [candidate.company_name],
             "country": [candidate.country],
+            "locations": [candidate.country],
             "buyer_role": ["distributor", "wholesaler"],
             "product_term": ["white goods", "built-in ovens", "household-appliances"],
         }
@@ -276,7 +365,8 @@ def test_a_company_with_no_website_can_now_be_a_strong_fit_end_to_end(tmp_path):
 
     No domain on the candidate row, so nothing can ever be classified
     `official`, and this was permanently `review` at any evidence level. An EU
-    notice plus corroborating third-party pages now reaches it.
+    notice plus corroborating third-party pages now reaches it — on answered
+    weight and confidence, which is what the floor measures.
 
     The fixtures here declare what they emit, so `completeness` is measured
     against what these two sources could establish rather than against all seven

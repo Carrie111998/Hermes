@@ -30,8 +30,13 @@ CHANNEL_ROLES = frozenset({
 #   nothing more, so it answers a request for any role in CHANNEL_ROLES and
 #   deliberately not for "brand" or "manufacturer" — those claim ownership or
 #   production that winning a supply contract does not evidence.
+# - "sector buyer" is what a curated buyer list can state: the operator who
+#   supplied this dataset asserts this company buys in this sector. That is a
+#   channel role for every channel a seller sells through, and — for the same
+#   reason as above — deliberately not "brand" or "manufacturer".
 ROLE_EQUIVALENTS: dict[str, frozenset[str]] = {
     "public procurement supplier": CHANNEL_ROLES,
+    "sector buyer": CHANNEL_ROLES,
 }
 
 

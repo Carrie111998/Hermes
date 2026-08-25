@@ -46,6 +46,28 @@ def _domain(url: str | None) -> str:
     return (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.")
 
 
+def _independent_source_count(bundles) -> int:
+    """How many separate publishers vouched for this candidate.
+
+    Counted by domain for public pages, so two pages on one site are one
+    publisher — and by internal reference for a curated dataset, which has no
+    domain at all. Without the second half, an eligibility policy asking for
+    one independent source rejected every curated-corpus candidate for lack of
+    a domain it was never going to have.
+    """
+    domains = {
+        _domain(source.provenance_url)
+        for _, bundle in bundles for source in bundle.sources
+        if source.classification == "independent" and _domain(source.provenance_url)
+    }
+    references = {
+        source.source_reference
+        for _, bundle in bundles for source in bundle.sources
+        if source.classification == "independent" and source.source_reference
+    }
+    return len(domains) + len(references)
+
+
 def _claimed_values(claims, field: str) -> list[str]:
     """Observed values for one claim field. A claim value is a scalar or a list."""
     values: list[str] = []
@@ -1936,7 +1958,7 @@ class LeadResearchService:
                                 ])),
                                 "organization_id": organization_id,
                                 "official_domains": sorted(official_domains),
-                                "independent_domain_count": len(independent_domains),
+                                "independent_domain_count": _independent_source_count(bundles),
                                 "lifecycle_status": next(
                                     iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
                                 ),
@@ -2067,7 +2089,7 @@ class LeadResearchService:
                                     *_claimed_values(claims, "buyer_role"),
                                 ])),
                                 "official_domains": sorted(official_domains),
-                                "independent_domain_count": len(independent_domains),
+                                "independent_domain_count": _independent_source_count(bundles),
                                 "lifecycle_status": next(
                                     iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
                                 ),

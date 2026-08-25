@@ -90,6 +90,53 @@ class SourceCoverage:
         return bool(self.official_domains or self.registry_domains)
 
 
+# The absolute quality floor a band-A lead must clear to be a strong fit.
+#
+# It replaces "an authoritative publisher plus a second one agreeing", which
+# was a statement about publishers rather than about evidence. These four are
+# properties of what is known about the company:
+#
+#   confidence   how much the evidence behind the claims is worth
+#   known_weight how much of the scoring model was actually answered — `fit` is
+#                a weighted mean over the dimensions a lead *has*, so one
+#                dimension out of seven can read 95 and mean almost nothing
+#   dimensions   both scored dimensions any shipped verifier can reach must be
+#                present; a lead with no buyer evidence is not a buyer
+#   conflicts    a live disagreement about what the verdict rests on
+#
+# A floor, not a target. Nothing below it is promoted to fill a result list.
+STRONG_FIT_MIN_CONFIDENCE = .60
+STRONG_FIT_MIN_KNOWN_WEIGHT = 50
+STRONG_FIT_REQUIRED_DIMENSIONS = frozenset({
+    "product_sector_fit", "buyer_channel_fit",
+})
+# Which conflicts are material. A disagreement about a phone number is not the
+# same as one about the company's country: blocking on any conflicted field at
+# all made every argument equally disqualifying.
+MATERIAL_CONFLICT_FIELDS = frozenset({
+    "company_name", "country", "domain", "product_sector_fit",
+    "product_term", "buyer_channel_fit", "buyer_role",
+})
+
+
+def strong_fit_floor(score: LeadScore, claims: list[Claim]) -> list[str]:
+    """Named reasons this lead is below the strong-fit floor; empty means clear."""
+    reasons: list[str] = []
+    if score.evidence_confidence < STRONG_FIT_MIN_CONFIDENCE:
+        reasons.append("insufficient_evidence_confidence")
+    if score.known_weight < STRONG_FIT_MIN_KNOWN_WEIGHT:
+        reasons.append("insufficient_answered_weight")
+    for dimension in sorted(STRONG_FIT_REQUIRED_DIMENSIONS):
+        if score.dimensions.get(dimension) is None:
+            reasons.append(f"{dimension}_required")
+    if any(
+        claim.status == "conflicted" and claim.field in MATERIAL_CONFLICT_FIELDS
+        for claim in claims
+    ):
+        reasons.append("material_conflict")
+    return reasons
+
+
 def evaluate_verdict(
     candidate,
     claims: list[Claim],
@@ -117,9 +164,6 @@ def evaluate_verdict(
     if len(coverage.all_domains) < 2:
         missing.append("second_source")
     missing = sorted(set(missing))
-    # What actually disqualifies a strong verdict, as opposed to what is merely
-    # absent. One authoritative publisher, and a second publisher agreeing.
-    corroborated = coverage.has_authority and len(coverage.all_domains) >= 2
 
     # Before eligibility and before the score: nothing downstream can make a
     # company that no longer exists worth contacting.
@@ -145,18 +189,16 @@ def evaluate_verdict(
             missing_evidence=missing,
             conflicting_claims=conflicting,
         )
-    if score.priority_band == "A" and corroborated and not conflicting:
+    floor_reasons = strong_fit_floor(score, claims)
+    if score.priority_band == "A" and not floor_reasons:
         return Verdict(
             kind="strong_fit",
-            reasons=[
-                "a_band_with_official_and_corroborating_evidence"
-                if coverage.official_domains
-                else "a_band_with_registry_and_corroborating_evidence"
-            ],
+            reasons=["a_band_above_absolute_quality_floor"],
             missing_evidence=missing,
-            conflicting_claims=[],
+            conflicting_claims=conflicting,
         )
     reasons = [f"priority_band_{score.priority_band.lower()}"]
+    reasons.extend(floor_reasons)
     if conflicting:
         reasons.append("conflicting_claims")
     if missing:

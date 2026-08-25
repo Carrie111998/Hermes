@@ -60,13 +60,15 @@ _CORROBORATION_STRENGTH = .27
 _BREADTH_STRENGTH = .18
 _BREADTH_SATURATES_AT = 3
 
-# An unvalidated claim — an independent page, a web-search result — is real
-# evidence and scores, but it does not carry a validated fact's weight. The
-# discount is what makes "validated matters more" arithmetic rather than a
-# comment: an unvalidated claim can never outrank a validated one on the same
-# dimension, because it is never allowed to be the dimension's anchor while a
-# validated claim exists.
-_UNVALIDATED_WEIGHT = .75
+# `validated` — a publisher with standing vouched for the fact — deliberately
+# does not appear in this file's arithmetic. It decides what may be shared
+# between customers, it carries provenance and corrections, and claim
+# confidence still feeds evidence confidence. What it must not do is change
+# *fit*: fit answers "how well does this company match the campaign", and who
+# filed a fact is not a property of the company. Discounting it here meant one
+# curated buyer list and one registry page stating the same three dimensions
+# produced different bands, so a hand-checked customer list could not reach
+# band A however complete its evidence was.
 
 # A dimension is anchored by its strongest claim; every further claim is
 # support, worth a bounded share of the remaining headroom. Support saturates
@@ -161,22 +163,16 @@ def _claim_score(claim: Claim) -> float | None:
     return round(min(100.0, 100.0 * claim.confidence * _evidence_strength(claim)), 3)
 
 
-def _combine(scored: list[tuple[float, bool]]) -> float:
+def _combine(scored: list[float]) -> float:
     """One dimension score from its claims: anchor plus bounded support.
 
-    `scored` is (score, validated) per claim. The anchor is the strongest
-    validated claim when there is one, so an unvalidated claim can raise a
-    dimension but never define it — which is what "validated counts for more"
-    has to mean if it is to survive a web-search fallback that will always
-    produce more claims than the validated sources do.
+    The anchor is the strongest claim, whoever validated it. Every further
+    claim is support worth a bounded share of the remaining headroom.
 
     Monotonic by construction: every claim is either the anchor or a supporter,
     and neither role can reduce the result.
     """
-    validated = [score for score, is_validated in scored if is_validated]
-    anchor = max(validated) if validated else max(
-        score * _UNVALIDATED_WEIGHT for score, _ in scored
-    )
+    anchor = max(scored)
     supporters = len(scored) - 1
     support = min(1.0, supporters / _SUPPORT_SATURATES_AT)
     return round(min(100.0, anchor + (100.0 - anchor) * _SUPPORT_HEADROOM * support), 3)
@@ -194,7 +190,7 @@ def derive_dimension_scores(claims: Iterable[Claim]) -> dict[str, float | None]:
         for dimension, fields in DIMENSION_CLAIM_FIELDS.items()
         for field in fields
     }
-    values: dict[str, list[tuple[float, bool]]] = {key: [] for key in SCORE_DIMENSIONS}
+    values: dict[str, list[float]] = {key: [] for key in SCORE_DIMENSIONS}
     for claim in claims:
         dimension = field_dimensions.get(claim.field)
         if (
@@ -205,7 +201,7 @@ def derive_dimension_scores(claims: Iterable[Claim]) -> dict[str, float | None]:
             continue
         score = _claim_score(claim)
         if score is not None:
-            values[dimension].append((score, claim.validated))
+            values[dimension].append(score)
     return {
         key: _combine(scored) if scored else None
         for key, scored in values.items()
