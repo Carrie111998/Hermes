@@ -26,7 +26,7 @@ import {
   isInlineMediaSrc,
   isMarkdownDocumentPath,
   isRemoteGateway,
-  mediaExternalUrl,
+  mediaExternalLink,
   mediaKind,
   mediaName,
   mediaPathFromMarkdownHref,
@@ -111,7 +111,9 @@ function useOpenMediaFile(path: string) {
       setOpenFailed(false)
       void downloadGatewayMediaFile(path).catch(() => setOpenFailed(true))
     } else {
-      openExternalLink(mediaExternalUrl(path))
+      // Resolve a short-lived signed link so the session token never rides in
+      // the URL handed to the system browser.
+      void mediaExternalLink(path).then(openExternalLink)
     }
   }
 

@@ -12534,16 +12534,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
-                            # shell=True is intentional: quick_commands are user-defined
-                            # shell snippets from config.yaml — not agent/LLM controlled.
-                            # Sanitize env to prevent credential leakage —
-                            # quick commands run in the CLI process which
-                            # has all API keys in os.environ.
+                            # argv-first when the command has no shell syntax;
+                            # shell fallback for explicit shell operators (&&,
+                            # pipes, redirects, …). quick_commands are
+                            # user-defined snippets from config.yaml — a `;` or
+                            # `|` smuggled into an argument can't become a
+                            # second command. Sanitize env to prevent credential
+                            # leakage — quick commands run in the CLI process
+                            # which has all API keys in os.environ.
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
-                            from hermes_cli._subprocess_compat import windows_hide_flags
-                            result = subprocess.run(
-                                exec_cmd, shell=True, capture_output=True,
+                            from hermes_cli._subprocess_compat import (
+                                run_configured_command,
+                                windows_hide_flags,
+                            )
+                            result = run_configured_command(
+                                exec_cmd, capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=30, env=sanitized_env,
                                 # No console flash on Windows (#56747).
                                 creationflags=windows_hide_flags(),

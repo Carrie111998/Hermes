@@ -130,6 +130,78 @@ export function mediaExternalUrl(path: string): string {
   return /^file:/i.test(path) ? path : `file://${path}`
 }
 
+// Short-lived signed download link for gateway-local files opened outside the
+// app (system browser, OS shell, new tab). The legacy query-token URL put the
+// session token inside the URL — leaking it into browser history, proxy logs,
+// and the shell's argv. Instead, trade the header-authenticated token for a
+// path-bound, self-expiring link minted by the gateway
+// (POST /api/files/download-link), which contains no session material and
+// stops working after the server's link TTL. Falls back to the legacy URL
+// only if the gateway predates the signed-link endpoint (it still accepts
+// ``?token=`` during the deprecation window) or the round-trip fails.
+export async function mediaExternalLink(path: string): Promise<string> {
+  if (/^https?:/i.test(path)) {
+    // Already a URL. A legacy ``/api/files/download`` link still carries the
+    // session token in its query string — re-mint a signed link for the same
+    // file against the same gateway. Any other https URL opens as-is.
+    try {
+      const url = new URL(path)
+      const file = url.searchParams.get('path')
+
+      if (url.pathname.endsWith('/api/files/download') && file) {
+        const signed = await mintSignedLink(url.origin, file)
+
+        if (signed) {
+          return signed
+        }
+      }
+    } catch {
+      // not a parseable URL — treat as a plain path below
+    }
+
+    return path
+  }
+
+  const conn = isRemoteGateway() ? $connection.get() : null
+
+  if (conn?.baseUrl && conn.token) {
+    const signed = await mintSignedLink(conn.baseUrl, filePathFromMediaPath(path))
+
+    if (signed) {
+      return signed
+    }
+  }
+
+  return mediaExternalUrl(path)
+}
+
+async function mintSignedLink(baseUrl: string, file: string): Promise<string | null> {
+  const conn = $connection.get()
+
+  try {
+    const resp = await fetch(`${baseUrl}/api/files/download-link`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hermes-Session-Token': conn?.token ?? ''
+      },
+      body: JSON.stringify({ path: file })
+    })
+
+    if (resp.ok) {
+      const data = (await resp.json()) as { url?: string }
+
+      if (data.url) {
+        return data.url.startsWith('http') ? data.url : `${baseUrl}${data.url}`
+      }
+    }
+  } catch {
+    // fall through to the legacy URL
+  }
+
+  return null
+}
+
 // Remote gateway audio/video is proxied by the Electron main process. OAuth
 // connections intentionally expose no static token to the renderer, so a bare
 // HTTPS source cannot authenticate reliably. The custom protocol keeps secrets

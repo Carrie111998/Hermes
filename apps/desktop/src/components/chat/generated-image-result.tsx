@@ -7,7 +7,7 @@ import { ImageActionButton, ImageLightbox } from '@/components/chat/zoomable-ima
 import { useImageDownload } from '@/hooks/use-image-download'
 import { useI18n } from '@/i18n'
 import { generatedImageFromResult } from '@/lib/generated-images'
-import { filePathFromMediaPath, gatewayMediaDataUrl, isRemoteGateway, mediaExternalUrl, mediaName } from '@/lib/media'
+import { filePathFromMediaPath, gatewayMediaDataUrl, isRemoteGateway, mediaExternalLink, mediaExternalUrl, mediaName } from '@/lib/media'
 import { cn } from '@/lib/utils'
 
 // Aspect hint from the tool args sizes the frame *before* the image loads, so
@@ -100,7 +100,9 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
         href="#"
         onClick={event => {
           event.preventDefault()
-          void window.hermesDesktop?.openExternal(mediaExternalUrl(image))
+          // Resolve a short-lived signed link so the session token never rides
+          // in the URL handed to the system browser.
+          void mediaExternalLink(image).then(url => window.hermesDesktop?.openExternal(url))
         }}
       >
         {copy.openImage}: {mediaName(image)}

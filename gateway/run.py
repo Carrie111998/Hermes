@@ -17975,13 +17975,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
                             from tools.environments.local import build_subprocess_env
-                            sanitized_env = build_subprocess_env()
-                            proc = await asyncio.create_subprocess_shell(
-                                exec_cmd,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                                env=sanitized_env,
+                            from hermes_cli._subprocess_compat import (
+                                command_needs_shell,
+                                split_command_line,
                             )
+                            sanitized_env = build_subprocess_env()
+                            if command_needs_shell(exec_cmd):
+                                # Explicit shell syntax (&&, pipes, redirects,
+                                # …) — keep the shell as the operator wrote it.
+                                proc = await asyncio.create_subprocess_shell(
+                                    exec_cmd,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE,
+                                    env=sanitized_env,
+                                )
+                            else:
+                                # argv-first: a `;`/`|` smuggled into an
+                                # argument can't become a second command.
+                                proc = await asyncio.create_subprocess_exec(
+                                    *split_command_line(exec_cmd),
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE,
+                                    env=sanitized_env,
+                                )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                             output = (stdout or stderr).decode().strip()
                             # Redact any remaining sensitive patterns in output

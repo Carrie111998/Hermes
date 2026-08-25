@@ -502,15 +502,18 @@ def workspace_fingerprint(cwd: Optional[str] = None) -> str:
 def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
     """Run one gate command. Returns ``(passed, exit_code, output_tail)``.
 
-    The command runs through the shell in ``cwd`` (default: process cwd) with
-    a hard timeout; on timeout the process is killed and treated as failed
-    with exit code -1. Output is the combined stdout+stderr tail, bounded to
+    The command runs argv-first (no shell) when the configured command has no
+    shell syntax, and through the shell otherwise (``&&``, pipes, redirects,
+    globs, …). It runs in ``cwd`` (default: process cwd) with a hard timeout;
+    on timeout the process is killed and treated as failed with exit code -1.
+    Output is the combined stdout+stderr tail, bounded to
     ``_GATE_OUTPUT_TAIL_CHARS``.
     """
     try:
-        proc = subprocess.run(
+        from hermes_cli._subprocess_compat import run_configured_command
+
+        proc = run_configured_command(
             gate.command,
-            shell=True,
             capture_output=True,
             text=True,
             # A gate runs whatever the operator configured, so its output is

@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional  # noqa: F401
 from fastapi import APIRouter, HTTPException, Request  # noqa: F401
 from fastapi.responses import HTMLResponse  # noqa: F401
 
+from hermes_cli.dashboard_auth.csp import build_none_csp
 from hermes_cli.web_deps import late, LateState
 from hermes_cli.web_models import (
     MCPCatalogInstall,
@@ -357,8 +358,16 @@ async def mcp_oauth_callback(
         ),
         None,
     )
+    _status_headers = {
+        "Content-Security-Policy": build_none_csp(),
+        "X-Content-Type-Options": "nosniff",
+    }
     if flow is None:
-        return HTMLResponse("<h1>OAuth flow expired</h1><p>Return to Hermes and try again.</p>", status_code=404)
+        return HTMLResponse(
+            "<h1>OAuth flow expired</h1><p>Return to Hermes and try again.</p>",
+            status_code=404,
+            headers=_status_headers,
+        )
     try:
         flow.deliver_callback(code=code, state=state, error=error)
     except ValueError as exc:
@@ -368,10 +377,18 @@ async def mcp_oauth_callback(
             "<h1>OAuth callback rejected</h1>"
             "<p>The callback was invalid or already used.</p>",
             status_code=status_code,
+            headers=_status_headers,
         )
     if error:
-        return HTMLResponse("<h1>Authorization failed</h1><p>Return to Hermes for details.</p>", status_code=400)
-    return HTMLResponse("<h1>Authorization received</h1><p>You can close this tab and return to Hermes.</p>")
+        return HTMLResponse(
+            "<h1>Authorization failed</h1><p>Return to Hermes for details.</p>",
+            status_code=400,
+            headers=_status_headers,
+        )
+    return HTMLResponse(
+        "<h1>Authorization received</h1><p>You can close this tab and return to Hermes.</p>",
+        headers=_status_headers,
+    )
 
 
 @router.put("/api/mcp/servers/{name}/enabled")

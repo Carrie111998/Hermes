@@ -458,7 +458,22 @@ _PASSWORD_FORM_SCRIPT = """\
 """
 
 
-def render_login_html(*, next_path: str = "") -> str:
+def _apply_csp_nonce(html: str, nonce: str) -> str:
+    """Attach a CSP nonce to the inline <style>/<script> tags of a rendered page.
+
+    ``nonce`` comes from ``secrets.token_urlsafe`` (URL-safe base64 — safe
+    inside a double-quoted HTML attribute). The login page renders exactly one
+    ``<style>`` block and at most one ``<script>`` block, so a single bounded
+    replace per tag is safe.
+    """
+    if not nonce:
+        return html
+    html = html.replace("<style>", f'<style nonce="{nonce}">', 1)
+    html = html.replace("<script>", f'<script nonce="{nonce}">', 1)
+    return html
+
+
+def render_login_html(*, next_path: str = "", nonce: str = "") -> str:
     """Return the full HTML for ``GET /login``.
 
     ``next_path`` — when set, the post-login landing path the user
@@ -467,10 +482,15 @@ def render_login_html(*, next_path: str = "") -> str:
     end-to-end. The caller (``routes.login_page``) is responsible for
     validating ``next_path`` against the same-origin rules before we
     emit it; we still HTML-escape it as defence in depth.
+
+    ``nonce`` — per-response CSP nonce applied to the inline ``<style>`` and
+    the optional password-form ``<script>`` so the page can carry a strict
+    ``script-src`` policy. The caller must emit the matching
+    ``Content-Security-Policy`` header.
     """
     providers = list_session_providers()
     if not providers:
-        return _EMPTY_HTML
+        return _apply_csp_nonce(_EMPTY_HTML, nonce)
 
     if next_path:
         # URL-encode then HTML-escape. The URL-encode step matches the
@@ -495,9 +515,12 @@ def render_login_html(*, next_path: str = "") -> str:
                 f'Sign in with {html.escape(p.display_name)}</a>'
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
-    return _LOGIN_HTML_TEMPLATE.format(
-        provider_buttons="\n".join(buttons),
-        password_script=script,
+    return _apply_csp_nonce(
+        _LOGIN_HTML_TEMPLATE.format(
+            provider_buttons="\n".join(buttons),
+            password_script=script,
+        ),
+        nonce,
     )
 
 

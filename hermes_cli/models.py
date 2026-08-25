@@ -66,6 +66,16 @@ def _custom_provider_ssl_context(base_url: str):
         import ssl
 
         if tls.get("ssl_verify") is False:
+            # Same policy as the httpx chat client: never honor ssl_verify:false
+            # for publicly routable hosts — a self-signed cert there belongs to
+            # ``ssl_ca_cert``. Fall back to default verification so the probe
+            # keeps the process-wide TLS policy instead of silently probing
+            # without any checks.
+            from agent.ssl_verify import _is_local_host
+            from urllib.parse import urlparse
+
+            if not _is_local_host(urlparse(base_url).hostname or ""):
+                return None
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE

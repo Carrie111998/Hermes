@@ -76,6 +76,26 @@ def test_empty_provider_login_page_is_safe_through_real_route(
     assert next_value not in response.text
 
 
+def test_login_page_carries_strict_csp_with_nonce(gated_app):
+    clear_providers()
+    register_provider(StubAuthProvider())
+    try:
+        response = gated_app.get("/login")
+    finally:
+        clear_providers()
+
+    assert response.status_code == 200
+    csp = response.headers.get("content-security-policy")
+    assert csp is not None
+    assert "script-src 'self' 'nonce-" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert response.headers.get("x-content-type-options") == "nosniff"
+    # The inline <style> carries the same nonce the header advertises.
+    nonce = csp.split("'nonce-", 1)[1].split("'", 1)[0]
+    assert nonce
+    assert f'<style nonce="{nonce}">' in response.text
+
+
 def test_gated_status_is_public(gated_app):
     """``/api/status`` MUST be public under the OAuth gate.
 

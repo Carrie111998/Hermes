@@ -446,11 +446,17 @@ def _(rid, params: dict) -> dict:
             # has all API keys in os.environ.
             from tools.environments.local import build_subprocess_env
             sanitized_env = build_subprocess_env()
-            from hermes_cli._subprocess_compat import windows_hide_flags
+            from hermes_cli._subprocess_compat import (
+                run_configured_command,
+                windows_hide_flags,
+            )
 
-            r = subprocess.run(
+            # argv-first when the command has no shell syntax; shell fallback
+            # for explicit shell operators (&&, pipes, redirects, …). A quick
+            # command is a user-defined snippet from config.yaml, so a `;` or
+            # `|` smuggled into an argument can't become a second command.
+            r = run_configured_command(
                 qc.get("command", ""),
-                shell=True,
                 capture_output=True,
                 text=True,
                 # Force UTF-8 + lossy decode so non-UTF-8 child output can't

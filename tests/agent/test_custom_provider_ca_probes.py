@@ -94,12 +94,22 @@ class TestResolveRequestsVerifyProviderScoped:
         ):
             assert _resolve_requests_verify(_BASE) == bundle_file
 
-    def test_provider_ssl_verify_false_disables(self, clean_env):
+    def test_provider_ssl_verify_false_disables_for_local_host(self, clean_env):
+        local = "http://localhost:11434/v1"
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=_providers(local, ssl_verify=False),
+        ):
+            assert _resolve_requests_verify(local) is False
+
+    def test_provider_ssl_verify_false_refused_for_public_host(self, clean_env):
+        # Public host: ssl_verify:false is not honored — the probe falls back
+        # to default verification instead of probing without any checks.
         with patch(
             "hermes_cli.config.get_compatible_custom_providers",
             return_value=_providers(_BASE, ssl_verify=False),
         ):
-            assert _resolve_requests_verify(_BASE) is False
+            assert _resolve_requests_verify(_BASE) is True
 
     def test_no_base_url_does_not_consult_config(self, clean_env, bundle_file):
         """Existing callers pass no base_url — env-only behavior, no config read."""
@@ -153,15 +163,25 @@ class TestCustomProviderSSLContext:
         assert isinstance(ctx, ssl.SSLContext)
         assert ctx.verify_mode == ssl.CERT_REQUIRED
 
-    def test_ssl_verify_false_returns_unverified_context(self):
+    def test_ssl_verify_false_returns_unverified_context_for_local_host(self):
+        local = "http://localhost:11434/v1"
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=_providers(local, ssl_verify=False),
+        ):
+            ctx = _custom_provider_ssl_context(local)
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.check_hostname is False
+        assert ctx.verify_mode == ssl.CERT_NONE
+
+    def test_ssl_verify_false_refused_for_public_host(self):
+        # Public host: never probe with verification disabled — fall back to
+        # the default TLS policy (None keeps urllib's default behavior).
         with patch(
             "hermes_cli.config.get_compatible_custom_providers",
             return_value=_providers(_BASE, ssl_verify=False),
         ):
-            ctx = _custom_provider_ssl_context(_BASE)
-        assert isinstance(ctx, ssl.SSLContext)
-        assert ctx.check_hostname is False
-        assert ctx.verify_mode == ssl.CERT_NONE
+            assert _custom_provider_ssl_context(_BASE) is None
 
     def test_no_base_url_returns_none(self):
         assert _custom_provider_ssl_context("") is None

@@ -30,7 +30,7 @@ import {
   useLinkTitle
 } from '@/lib/external-link'
 import { FileImage, FileText, FolderOpen, Link2 } from '@/lib/icons'
-import { downloadGatewayMediaFile, isRemoteGateway } from '@/lib/media'
+import { downloadGatewayMediaFile, isRemoteGateway, mediaExternalLink } from '@/lib/media'
 import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
@@ -282,10 +282,15 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
           return
         }
 
+        // Resolve a short-lived signed link so the session token never rides
+        // in the URL handed to the system browser (legacy artifact hrefs
+        // carry it as ?token= on /api/files/download).
+        const url = await mediaExternalLink(href)
+
         if (window.hermesDesktop?.openExternal) {
-          await window.hermesDesktop.openExternal(href)
+          await window.hermesDesktop.openExternal(url)
         } else {
-          window.open(href, '_blank', 'noopener,noreferrer')
+          window.open(url, '_blank', 'noopener,noreferrer')
         }
       } catch (err) {
         notifyError(err, a.openFailed)

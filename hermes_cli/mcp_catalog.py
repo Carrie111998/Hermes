@@ -468,12 +468,15 @@ def _install_root() -> Path:
 def _run_bootstrap(cwd: Path, commands: List[str]) -> None:
     """Execute bootstrap commands in *cwd*. Raise CatalogError on first failure.
 
-    Each command runs through the shell (so `&&` etc. work). The output is
+    Each command runs argv-first when it contains no shell syntax, and through
+    the shell when it does (``&&``, pipes, redirects, …). The output is
     streamed to the user's terminal for visibility.
     """
+    from hermes_cli._subprocess_compat import run_configured_command
+
     for cmd in commands:
         print(color(f"  $ {cmd}", Colors.DIM))
-        proc = subprocess.run(cmd, cwd=str(cwd), shell=True)
+        proc = run_configured_command(cmd, cwd=str(cwd))
         if proc.returncode != 0:
             raise CatalogError(
                 f"bootstrap step failed (exit {proc.returncode}): {cmd}"
