@@ -228,12 +228,6 @@ class WeComAdapter(BasePlatformAdapter):
         # WeCom stream lifetime: server rejects updates after ~6 minutes
         # (errcode 846608). Keepalives do NOT extend it. Use 330s for margin.
         self.THINKING_STREAM_MAX_S = 330.0
-        # Per-chat active-turn flag: True while a turn is running and its
-        # thinking bubble is expected. send() marks it False on final
-        # delivery; inbound messages re-arm it. send_typing refuses to open
-        # a bubble when it's False — that's a progress-loop tail call after
-        # the turn ended, which would otherwise orphan a placeholder.
-        self._turn_active: Dict[str, bool] = {}
         # Opt-out switch: platforms.wecom.extra.thinking_bubble (default on).
         self._thinking_bubble_enabled = bool(extra.get("thinking_bubble", True))
 
@@ -1002,8 +996,10 @@ class WeComAdapter(BasePlatformAdapter):
         self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
             self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
-        # A genuinely new inbound message starts a fresh turn.
-        self._turn_active[normalized_chat_id] = True
+        # A genuinely new inbound message starts a FRESH turn — hard-reset
+        # any open/aging bubble from the prior turn so the new turn opens
+        # its own bubble cleanly.
+        self._reset_thinking(normalized_chat_id)
 
     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
         normalized = str(reply_to or "").strip()
@@ -1482,16 +1478,17 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
-        # Redirect ack: close the OLD bubble with the notice. We do NOT flip
-        # _turn_active — the redirected turn continues in the SAME chat and
-        # its next send_typing must open a FRESH bubble for the new answer
-        # (matching normal/timeout logic). Using _finish_thinking here would
-        # set _turn_active=False and the fence would suppress that new bubble.
+        # Redirect ack: the prior turn was interrupted by a follow-up. The
+        # inbound handler already hard-reset the old bubble (see
+        # _reset_thinking), so there is no open stream to close here. We just
+        # surface a standalone "adjusted" notice; the new turn opens its own
+        # bubble via send_typing with no fence in the way.
         if is_redirect_ack:
             from agent.i18n import t
-            await self._write_stream(
-                chat_id, t("gateway.busy_ack.redirect_short"), finish=True)
-            return SendResult(success=True)
+            return await self.send(
+                chat_id, t("gateway.busy_ack.redirect_short"),
+                reply_to=reply_to,
+                metadata={"_wecom_no_stream": True})
 
         # Live bubble open → write into it. Mid-turn: finish=false (draft /
         # live progress). Final: finish=true writes the ANSWER into the
@@ -1625,6 +1622,23 @@ class WeComAdapter(BasePlatformAdapter):
             reply_to=reply_to,
         )
 
+    def _reset_thinking(self, chat_id: str) -> None:
+        """Hard-reset this chat's thinking-bubble state.
+
+        Called on every inbound message: a follow-up message is a FRESH
+        conversation turn, so any open/aging bubble from the prior turn is
+        dropped and the next send_typing opens a brand-new bubble.
+
+        We cancel the keepalive and drop the entry WITHOUT writing a finish
+        frame — the old placeholder is abandoned and WeCom lets it expire
+        naturally. This is intentional: a redirect/follow-up means a new turn
+        starts, and the old bubble's lifetime is irrelevant now.
+        """
+        ka = self._thinking_keepalives.pop(chat_id, None)
+        if ka:
+            ka.cancel()
+        self._thinking_streams.pop(chat_id, None)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Open the official WeCom "thinking" bubble for this chat.
 
@@ -1646,17 +1660,10 @@ class WeComAdapter(BasePlatformAdapter):
         st = self._thinking_streams.get(chat_id)
         if st is not None:
             return  # already open; its keepalive task is running
-        # Turn-active fence: once the previous turn's final answer has been
-        # delivered (send() set _turn_active[chat]=False), a straggler
-        # send_typing from the progress loop must NOT open a fresh bubble —
-        # it would orphan a placeholder nobody closes. A new inbound message
-        # re-arms _turn_active=True, so a genuinely new turn opens normally.
-        if not self._turn_active.get(chat_id, True):
-            logger.debug(
-                "[%s] suppressing typing bubble: turn for %s already "
-                "delivered; no new inbound since", self.name, chat_id)
-            return
-
+        # No fence needed: every inbound message hard-resets this chat's
+        # bubble state (see _reset_thinking), so a straggler send_typing
+        # after a delivered turn can only arrive if no new message started a
+        # turn — in which case opening a bubble is harmless and self-closing.
         stream_id = f"stream_{uuid.uuid4().hex[:16]}"
 
         async def _keepalive() -> None:
@@ -1770,6 +1777,8 @@ class WeComAdapter(BasePlatformAdapter):
             self._finished_streams[chat_id] = {"id": st["id"], "req": st["req"]}
         except Exception:
             pass
+        # Turn ended (abort/timeout). The inbound handler hard-resets this
+        # chat's bubble state on the next message, so no flags to flip here.
 
     async def _write_stream(self, chat_id: str, content: str, *, finish: bool) -> bool:
         """Write text into the chat's open thinking stream.
@@ -1827,10 +1836,9 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _finish_thinking(self, chat_id: str, content: str) -> bool:
         """Close the open bubble with finish=true. Thin wrapper over
-        _write_stream(finish=True); shared by the normal-answer, redirect,
-        and abort paths. Marks the turn inactive so a progress-loop
-        straggler send_typing won't reopen an orphan placeholder."""
-        self._turn_active[chat_id] = False
+        _write_stream(finish=True); shared by the normal-answer and abort
+        paths. No turn-state flags: every inbound message hard-resets the
+        bubble state (see _reset_thinking), so no straggler fence needed."""
         return await self._write_stream(chat_id, content, finish=True)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
