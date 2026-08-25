@@ -31,27 +31,68 @@ _RATE_LIMITS_PATH = "/rest/rate-limits"
 _DEFAULT_MODELS = ["grok-4", "grok-4-heavy"]
 
 
-def _find_grok_target(http_url: str) -> Optional[str]:
-    """Return a webSocketDebuggerUrl for an existing grok.com tab, if any."""
+#: A frozen renderer answers the browser-level websocket handshake but never
+#: replies to Runtime.evaluate, so liveness has to be probed with a real
+#: evaluation and a short timeout rather than inferred from the connection.
+_LIVENESS_TIMEOUT = 3.0
+#: How long to wait for a tab WE opened to become evaluable. Polled, not slept:
+#: the fetch needs only the origin's cookies, not a fully painted app, so it is
+#: usually ready well before this.
+_NEW_TAB_SETTLE_SECONDS = 10
+
+
+def _find_grok_targets(http_url: str) -> list[tuple[str, str]]:
+    """Return ``(target_id, webSocketDebuggerUrl)`` for every grok.com page tab.
+
+    A LIST, not the first match: a long-backgrounded tab can be frozen while
+    another is fine, and picking blindly is what left the xai row unavailable
+    for 39h on 2026-08-25 (see ``_usable_grok_target``).
+    """
     import urllib.request
 
+    found: list[tuple[str, str]] = []
     try:
         with urllib.request.urlopen(f"{http_url}/json", timeout=3.0) as resp:
             targets = json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return None
+        return found
     for target in targets:
         if not isinstance(target, dict):
             continue
         url = str(target.get("url") or "")
         ws = str(target.get("webSocketDebuggerUrl") or "")
-        if url.startswith(_GROK_ORIGIN) and target.get("type") == "page" and ws:
-            return ws
-    return None
+        tid = str(target.get("id") or "")
+        if url.startswith(_GROK_ORIGIN) and target.get("type") == "page" and ws and tid:
+            found.append((tid, ws))
+    return found
 
 
-def _new_grok_target(http_url: str) -> Optional[str]:
-    """Open a background grok.com tab via /json/new and return its WS URL."""
+def _target_is_responsive(ws_url: str, *, timeout: float = _LIVENESS_TIMEOUT) -> bool:
+    """Whether the tab's renderer actually executes JavaScript right now.
+
+    Chrome freezes and discards background tabs. A frozen tab still appears in
+    ``/json/list`` with a valid webSocketDebuggerUrl, and the websocket still
+    connects -- only the evaluation never comes back. Nothing short of running
+    an expression distinguishes the two.
+    """
+    try:
+        _cdp_call(
+            ws_url,
+            "Runtime.evaluate",
+            {"expression": "1", "returnByValue": True},
+            timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _new_grok_target(http_url: str) -> Optional[tuple[str, str]]:
+    """Open a background grok.com tab; return ``(target_id, ws_url)``.
+
+    The id is returned so the caller can CLOSE what it opened -- a tab per
+    collection would otherwise accumulate 288 grok.com tabs a day.
+    """
     import urllib.request
 
     try:
@@ -63,8 +104,53 @@ def _new_grok_target(http_url: str) -> Optional[str]:
             target = json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
-    ws = str(target.get("webSocketDebuggerUrl") or "") if isinstance(target, dict) else ""
-    return ws or None
+    if not isinstance(target, dict):
+        return None
+    ws = str(target.get("webSocketDebuggerUrl") or "")
+    tid = str(target.get("id") or "")
+    return (tid, ws) if ws and tid else None
+
+
+def _close_target(http_url: str, target_id: str) -> None:
+    """Close a tab we opened. Best-effort: a leaked tab must not fail a fetch."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"{http_url}/json/close/{target_id}", timeout=5.0
+        ) as resp:
+            resp.read()
+    except Exception as exc:
+        logger.debug("grok_session: could not close target %s: %s", target_id, exc)
+
+
+def _usable_grok_target(http_url: str) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(target_id_we_opened_or_None, ws_url_or_None)``.
+
+    Prefers a RESPONSIVE tab the user already has open, so the ordinary case
+    costs nothing and touches nothing. Falls back to opening our own only when
+    every existing grok.com tab is frozen -- deliberately in preference to
+    reviving theirs, since the only ways to thaw a tab (bringToFront, reload)
+    either steal focus or discard an in-progress conversation.
+    """
+    for tid, ws in _find_grok_targets(http_url):
+        if _target_is_responsive(ws):
+            return None, ws
+        logger.debug("grok_session: grok.com tab %s is frozen; skipping", tid)
+
+    opened = _new_grok_target(http_url)
+    if opened is None:
+        return None, None
+    tid, ws = opened
+    import time
+
+    for _ in range(_NEW_TAB_SETTLE_SECONDS):
+        if _target_is_responsive(ws):
+            return tid, ws
+        time.sleep(1.0)
+    # Hand it back anyway -- the caller closes it either way, and the fetch is
+    # allowed one last try against its own longer timeout.
+    return tid, ws
 
 
 def _cdp_call(ws_url: str, method: str, params: dict, *, timeout: float) -> dict:
@@ -145,7 +231,7 @@ def fetch_grok_rate_limits(
     if not http_url:
         logger.debug("grok_session: no CDP browser on :%s", port)
         return None
-    ws_url = _find_grok_target(http_url) or _new_grok_target(http_url)
+    opened_id, ws_url = _usable_grok_target(http_url)
     if not ws_url:
         logger.debug("grok_session: no grok.com tab available")
         return None
@@ -163,6 +249,11 @@ def fetch_grok_rate_limits(
     except Exception as exc:
         logger.debug("grok_session: evaluate failed: %s", exc)
         return None
+    finally:
+        # Only ever closes a tab THIS call opened; the user's own tab is left
+        # exactly as found, open or frozen.
+        if opened_id:
+            _close_target(http_url, opened_id)
     if not entries:
         return None
 
