@@ -2,10 +2,12 @@ import { atom, computed } from 'nanostores'
 
 import type { DesktopConnectionsRegistry } from '@/global'
 import { persistStringRecord, storedStringRecord } from '@/lib/storage'
+import { openGatewayForAgent } from '@/store/gateway'
 import { wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
 import {
   $activeGatewayProfile,
   $newChatProfile,
+  $newChatRoute,
   $showAllProfiles,
   ensureGatewayAgent,
   normalizeProfileKey,
@@ -249,19 +251,18 @@ export async function selectConnection(connectionId: string): Promise<void> {
  * Start a brand-new session on a specific registered source (the per-session
  * "where does this session run?" affordance). Same source → just open a fresh
  * draft on the active profile (the historical one-click behavior). A different
- * source → dial that source so the session streams over it, WITHOUT the
- * destructive re-home `selectConnection` performs (no session-list wipe, no
- * profile jump, no double session create). The window's active socket moves to
- * the chosen source (one socket per window — Phase 2 introduces true
- * per-session routing), but the current profile and its list stay put. Throws
- * if the target source cannot become active, leaving the current session
- * untouched.
+ * source → pin `$newChatRoute` to that connection and warm its socket in the
+ * background. Chrome (`$connection` / `$activeGatewayProfile` / the profile
+ * rail) stays put: the session runs on the chosen gateway the way Cursor runs
+ * a chat on SSH without re-homing the window. Throws if the target cannot be
+ * dialed, leaving the current session untouched.
  */
 export async function startSessionOnSource(
   connectionId: string,
   startFreshSessionDraft: () => void
 ): Promise<void> {
   if (connectionId === $activeConnectionId.get()) {
+    $newChatRoute.set(null)
     startFreshSessionDraft()
 
     return
@@ -274,11 +275,18 @@ export async function startSessionOnSource(
     return
   }
 
-  await ensureGatewayAgent(connectionId, normalizeProfileKey($activeGatewayProfile.get()))
+  const profile = normalizeProfileKey(
+    $lastProfileByConnection.get()[connectionId] ?? targetConnection.remoteProfile ?? 'default'
+  )
 
-  if ($connection.get()?.connectionId !== connectionId) {
-    throw new Error(`Connection "${targetConnection.label}" did not become active.`)
-  }
+  // Warm the secondary socket. Must not call ensureGatewayAgent: that applyActive
+  // + setConnection re-homes the window (ConnectionSwitcher, session list, cwd).
+  await openGatewayForAgent(connectionId, profile)
 
   startFreshSessionDraft()
+  $newChatRoute.set({
+    connectionId,
+    profile,
+    mode: targetConnection.kind === 'local' ? 'local' : 'remote'
+  })
 }

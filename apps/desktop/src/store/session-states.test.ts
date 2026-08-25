@@ -4,7 +4,7 @@ import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $selectedStoredSessionId, setSessions } from '@/store/session'
+import { $selectedStoredSessionId, setSessionOwnerHint, setSessions } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
   $sessionStates,
@@ -607,6 +607,15 @@ describe('knownOwnerForSession / requestForOwnedSession (#91684 client half)', (
     setSessions([{ id: 'stored-2', profile: 'loki' } as never])
 
     expect(knownOwnerForSession('stored-2')).toBe('loki')
+  })
+
+  it('prefers a connection-qualified owner hint over the session row profile', () => {
+    setSessions([{ id: 'stored-hint', profile: 'loki' } as never])
+    setSessionOwnerHint('stored-hint', { connectionId: 'homelab', profile: 'default' })
+    setSessionOwnerHint('rt-hint', { connectionId: 'homelab', profile: 'default' })
+
+    expect(knownOwnerForSession('stored-hint')).toEqual({ connectionId: 'homelab', profile: 'default' })
+    expect(knownOwnerForSession('rt-hint')).toEqual({ connectionId: 'homelab', profile: 'default' })
   })
 
   it('returns undefined (ambient) when no owner is known, and for null ids', () => {

@@ -42,6 +42,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   clearReadBaseline,
+  getSessionOwnerHint,
   knownSessionProfile,
   lineageAliases,
   markSessionRead,
@@ -752,7 +753,12 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
 
   const storedSessionId = storedSessionIdForRuntimeId(sessionId) ?? sessionId
 
-  return sessionTileOwnerRoute(storedSessionId) ?? knownSessionProfile($sessions.get(), storedSessionId)
+  return (
+    sessionTileOwnerRoute(storedSessionId) ??
+    getSessionOwnerHint(storedSessionId) ??
+    getSessionOwnerHint(sessionId) ??
+    knownSessionProfile($sessions.get(), storedSessionId)
+  )
 }
 
 /**
