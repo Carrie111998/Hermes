@@ -19,7 +19,6 @@ import importlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any
 
@@ -33,6 +32,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db
+from hermes_cli.role_contract import admit_role_contract, load_role_contract
 from hermes_cli.dashboard_auth.base import Session
 from plugins.verified_pipeline import controller, execution, materializer, release, review, validators
 from plugins.verified_pipeline.dashboard.plugin_api import router
@@ -40,9 +40,8 @@ from plugins.verified_pipeline.dashboard.plugin_api import router
 
 SPECIFICATION = """# Deterministic verified-pipeline control-plane canary
 
-Exercise exact approval, review, materialization, dependency, completion, and
-read-only release-readiness custody using deterministic contract-compatible
-worker receipts. Do not claim a live worker-produced implementation artifact.
+Exercise exact approval, review, materialization, dependency, and generic graph
+completion custody using deterministic contract-compatible worker receipts. Do not claim a live worker-produced implementation artifact.
 No merge, deploy, installation, credential, production, or live-enablement
 authority is granted.
 """
@@ -65,6 +64,9 @@ def _write_contract(home: Path, profile: str) -> None:
                 "version: 1.0.0",
                 "allowed_toolsets:",
                 "  - kanban",
+                "allowed_tools:",
+                "  - kanban_show",
+                "workspace_only: true",
                 "---",
                 f"Disposable canary authority for {profile}.",
                 "",
@@ -117,29 +119,21 @@ def _complete(kanban_path: Path, task_id: str, result: str) -> None:
         assert task is not None
         run_id = int(task.current_run_id)
         workspace = Path(task.workspace_path).resolve()
-        basis = {
-            "schema": "hermes-role-contract/v2",
-            "profile": task.assignee,
-            "version": "1.0.0",
-            "contract_sha256": task.expected_role_contract_sha256,
-            "configured_toolsets": [],
-            "allowed_toolsets": ["kanban"],
-            "allowed_tools": [],
-            "workspace_only": False,
-            "mandatory_toolsets": ["kanban"],
-            "effective_toolsets": ["kanban"],
-            "task_id": task.id,
-            "run_id": run_id,
-            "workspace_path": str(workspace),
-        }
-        receipt = {
-            **basis,
-            "contract_size": 1,
-            "contract_path": f"/deterministic-canary/{task.assignee}/ROLE_CONTRACT.md",
-            "receipt_id": hashlib.sha256(
-                json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest(),
-        }
+        profile_home = Path(os.environ["HERMES_HOME"]) / "profiles" / task.assignee
+        contract = load_role_contract(profile_home, task.assignee, required=True)
+        assert contract is not None
+        admission = admit_role_contract(
+            profile_home,
+            task.assignee,
+            contract.allowed_toolsets,
+            task_id=task.id,
+            run_id=run_id,
+            workspace_path=str(workspace),
+            branch_name=task.branch_name,
+            required=True,
+        )
+        assert admission is not None
+        receipt = admission.receipt()
         with kanban_db.write_txn(conn):
             conn.execute(
                 "UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ?",
@@ -148,79 +142,9 @@ def _complete(kanban_path: Path, task_id: str, result: str) -> None:
             kanban_db._append_event(
                 conn, task.id, "role_contract_admitted", receipt, run_id=run_id
             )
-        parent_row = conn.execute(
-            "SELECT parent.workspace_path FROM task_links "
-            "JOIN tasks AS parent ON parent.id = task_links.parent_id "
-            "WHERE task_links.child_id = ? ORDER BY parent.id LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        parent_workspace = (
-            Path(parent_row["workspace_path"])
-            if parent_row is not None and parent_row["workspace_path"]
-            else None
-        )
-        remote_url = "https://github.com/jasonwu-ai/hermes-agent.git"
-        if task.workspace_kind == "worktree":
-            if parent_workspace is not None and (parent_workspace / ".git").exists():
-                subprocess.run(
-                    ["git", "clone", "-q", str(parent_workspace), str(workspace)], check=True
-                )
-            else:
-                subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
-            subprocess.run(
-                ["git", "config", "user.email", "pipeline-canary@example.invalid"],
-                cwd=workspace,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.name", "Pipeline Canary"],
-                cwd=workspace,
-                check=True,
-            )
-            has_remote = subprocess.run(
-                ["git", "config", "--get", "remote.origin.url"],
-                cwd=workspace,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            ).returncode == 0
-            remote_command = ["git", "remote", "set-url", "origin", remote_url]
-            if not has_remote:
-                remote_command = ["git", "remote", "add", "origin", remote_url]
-            subprocess.run(remote_command, cwd=workspace, check=True)
-
-        is_exact_test = (
-            task.workspace_kind == "worktree"
-            and execution._implementation_role(task.assignee) == "test"
-            and parent_workspace is not None
-        )
         artifact = workspace / f"{task.assignee}-canary-stage-receipt.txt"
         artifact.write_text(f"{result}\n", encoding="utf-8")
-        if task.workspace_kind == "worktree":
-            if not is_exact_test:
-                subprocess.run(["git", "add", artifact.name], cwd=workspace, check=True)
-                subprocess.run(
-                    ["git", "commit", "-q", "-m", f"canary stage {task_id}"],
-                    cwd=workspace,
-                    check=True,
-                )
-            commit_sha = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
-            ).strip()
-            branch_name = subprocess.check_output(
-                ["git", "branch", "--show-current"], cwd=workspace, text=True
-            ).strip()
-            completion_metadata = {
-                "artifacts": [str(artifact)],
-                "source_commit": {
-                    "schema": "git-source/v1",
-                    "repository": remote_url,
-                    "commit_sha": commit_sha,
-                    "branch": branch_name,
-                }
-            }
-        else:
-            completion_metadata = {"artifacts": [str(artifact)]}
+        completion_metadata = {"artifacts": [str(artifact)]}
         if not kanban_db.complete_task(
             conn,
             task_id,
@@ -244,7 +168,7 @@ def _plan(request: dict[str, Any]) -> dict[str, Any]:
             "dependencies": [],
             "deliverable": "A deterministic Builder-stage completion receipt.",
             "acceptance_criteria": ["Receipt is bound to the accepted canary specification."],
-            "workspace": "worktree",
+            "workspace": "scratch",
         },
         {
             "id": "test",
@@ -254,7 +178,7 @@ def _plan(request: dict[str, Any]) -> dict[str, Any]:
             "dependencies": ["build"],
             "deliverable": "A deterministic Test-stage completion receipt.",
             "acceptance_criteria": ["Test cannot advance before Builder completes."],
-            "workspace": "worktree",
+            "workspace": "scratch",
         },
         {
             "id": "integrate",
@@ -264,7 +188,7 @@ def _plan(request: dict[str, Any]) -> dict[str, Any]:
             "dependencies": ["test"],
             "deliverable": "A deterministic Integration-stage completion receipt.",
             "acceptance_criteria": ["Integration cannot advance before Test completes."],
-            "workspace": "worktree",
+            "workspace": "scratch",
         },
         {
             "id": "release",
@@ -641,34 +565,24 @@ def run(output_dir: Path) -> dict[str, Any]:
         kanban_db_path=kanban_path,
     )["replayed"]
     release.init_release_schema(control_db, authority_verifiers=authority_policy)
-    ready_authority = _persist_release_ready_authority(
-        control_db,
-        execution_intent["idempotency_key"],
-        completion,
-        signing_key,
-        verifier,
-    )
-    ready = release.record_release_ready(
-        execution_intent["idempotency_key"],
-        authority_key=ready_authority["authority_key"],
-        board=kanban_db.DEFAULT_BOARD,
-        db_path=control_db,
-        kanban_db_path=kanban_path,
-    )
-    release_ready_replay = release.record_release_ready(
-        execution_intent["idempotency_key"],
-        authority_key=ready_authority["authority_key"],
-        board=kanban_db.DEFAULT_BOARD,
-        db_path=control_db,
-        kanban_db_path=kanban_path,
-    )["replayed"]
+    if completion.get("source_candidate") is not None:
+        raise RuntimeError("artifact-only canary unexpectedly produced executable source custody")
+    executable_evidence_rejected = False
+    try:
+        execution._assert_source_evidence_supported("02-builder")
+    except execution.ExecutionError as exc:
+        executable_evidence_rejected = (
+            exc.code == "EXECUTION_EXECUTABLE_EVIDENCE_UNSUPPORTED"
+        )
+    if not executable_evidence_rejected:
+        raise RuntimeError("Builder executable evidence did not fail closed")
 
     replay = {
         "decision": decision_replay,
         "materialization": materialization_replay,
         "arming": arming_replay,
         "completion": completion_replay,
-        "release_ready": release_ready_replay,
+
     }
 
     conn = controller.connect(control_db)
@@ -696,7 +610,8 @@ def run(output_dir: Path) -> dict[str, Any]:
         "task_count": len(_rows(kanban_path)),
         "implementation_task_map": projected["task_map"],
         "execution_key": execution_intent["idempotency_key"],
-        "release_key": ready["release_key"],
+        "executable_evidence_rejected": executable_evidence_rejected,
+
         "replay": replay,
         "forbidden_authority_receipts": forbidden,
         "stages": [
@@ -707,11 +622,14 @@ def run(output_dir: Path) -> dict[str, Any]:
             {"stage": "Exactly-once inert DAG", "status": "PASS"},
             {"stage": "Signed exact-scope arming", "status": armed["status"]},
             {
-                "stage": "Native Builder → Test → Integration → Release gates (simulated completions)",
+                "stage": "Contract-admitted Builder → Test → Integration → Release artifact gates",
                 "status": "PASS",
             },
-            {"stage": "Immutable completion custody", "status": completion["status"]},
-            {"stage": "Read-only release readiness", "status": ready["status"]},
+            {"stage": "Immutable generic graph completion", "status": completion["status"]},
+            {
+                "stage": "Executable release readiness unavailable without sandbox proof",
+                "status": "PASS_FAIL_CLOSED",
+            },
         ],
         "boundary": {
             "merge": False,

@@ -27,7 +27,7 @@ from plugins.verified_pipeline import controller, materializer
 EXECUTION_CONTROLLER_ID = "verified-pipeline/bounded-execution-controller/v1"
 AUTHORIZATION_SCHEMA = "verified-pipeline/authenticated-execution-decision/v1"
 EXECUTION_DECISION = "AUTHORIZE_BOUNDED_EXECUTION"
-COMPLETION_STATUS = "IMPLEMENTATION_COMPLETE_PENDING_RELEASE_REVIEW"
+COMPLETION_STATUS = "TASK_GRAPH_COMPLETE_PENDING_RELEASE_REVIEW"
 ARMING_STATUS = "ARMING"
 ARMED_STATUS = "ARMED"
 AUTHORIZED_BOUNDARY = (
@@ -910,6 +910,41 @@ def arm_execution(
 
 MAX_IMPLEMENTATION_ARTIFACT_BYTES = 25 * 1024 * 1024
 
+_SAFE_GIT_CONFIG = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "credential.helper=",
+    "-c", "core.sshCommand=/bin/false",
+    "-c", "core.attributesFile=/dev/null",
+    "-c", "core.excludesFile=/dev/null",
+)
+
+
+def _safe_git(
+    workspace: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run non-network Git inspection without ambient credentials or executable hooks."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    return subprocess.run(
+        ["/usr/bin/git", *_SAFE_GIT_CONFIG, "-C", str(workspace), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+        check=check,
+        env=env,
+    )
+
 
 def _sha256_regular_file(path: Path) -> tuple[str, int]:
     try:
@@ -917,7 +952,9 @@ def _sha256_regular_file(path: Path) -> tuple[str, int]:
     except FileNotFoundError as exc:
         raise ExecutionError("EXECUTION_ARTIFACT_MISSING", "captured artifact is missing") from exc
     if not stat.S_ISREG(before.st_mode):
-        raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact is not a regular file")
+        raise ExecutionError(
+            "EXECUTION_ARTIFACT_UNSAFE", "captured artifact is not a regular file"
+        )
     if before.st_size > MAX_IMPLEMENTATION_ARTIFACT_BYTES:
         raise ExecutionError(
             "EXECUTION_ARTIFACT_TOO_LARGE",
@@ -1015,6 +1052,7 @@ def _implementation_stage_receipt(
                 "task_id",
                 "run_id",
                 "workspace_path",
+                "branch_name",
             )
         }
         computed_admission_id = hashlib.sha256(
@@ -1041,6 +1079,29 @@ def _implementation_stage_receipt(
         raise ExecutionError(
             "EXECUTION_STAGE_RECEIPT_MISMATCH",
             "implementation stage receipt does not match the frozen admitted run",
+        )
+
+    task_workspace = board_conn.execute(
+        "SELECT workspace_path, branch_name FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    admitted_workspace = str(admission.get("workspace_path") or "").strip()
+    current_workspace = str(task_workspace["workspace_path"] or "").strip() if task_workspace else ""
+    try:
+        same_workspace = (
+            bool(admitted_workspace)
+            and bool(current_workspace)
+            and Path(admitted_workspace).resolve() == Path(current_workspace).resolve()
+        )
+    except OSError:
+        same_workspace = False
+    if (
+        not same_workspace
+        or admission.get("branch_name") != (task_workspace["branch_name"] if task_workspace else None)
+    ):
+        raise ExecutionError(
+            "EXECUTION_STAGE_CUSTODY_DRIFT",
+            "task workspace or branch changed after role-contract admission",
         )
 
     # Ordinary Hermes attachments remain the durable evidence path for
@@ -1087,6 +1148,7 @@ def _implementation_stage_receipt(
 
     normalized_source_commit: Optional[dict[str, Any]] = None
     if source_commit is not None:
+        _assert_source_evidence_supported(expected_profile)
         if not isinstance(source_commit, dict):
             raise ExecutionError(
                 "EXECUTION_SOURCE_RECEIPT_INVALID",
@@ -1137,43 +1199,19 @@ def _implementation_stage_receipt(
                 "source commit receipt has no durable task worktree",
             )
         try:
-            subprocess.run(
-                ["git", "-C", str(workspace_path), "cat-file", "-e", f"{commit_sha}^{{commit}}"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            )
-            observed_tree = subprocess.check_output(
-                ["git", "-C", str(workspace_path), "show", "-s", "--format=%T", commit_sha],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            ).strip()
-            observed_head = subprocess.check_output(
-                ["git", "-C", str(workspace_path), "rev-parse", "HEAD"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            ).strip().lower()
-            observed_branch = subprocess.check_output(
-                ["git", "-C", str(workspace_path), "branch", "--show-current"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            ).strip()
-            tracked_status = subprocess.check_output(
-                ["git", "-C", str(workspace_path), "status", "--porcelain", "--untracked-files=no"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            ).strip()
-            remote = subprocess.run(
-                ["git", "-C", str(workspace_path), "config", "--get", "remote.origin.url"],
-                text=True,
-                capture_output=True,
-                timeout=15,
-                check=False,
+            _safe_git(workspace_path, "cat-file", "-e", f"{commit_sha}^{{commit}}")
+            observed_tree = _safe_git(
+                workspace_path, "show", "-s", "--format=%T", commit_sha
+            ).stdout.strip()
+            observed_head = _safe_git(workspace_path, "rev-parse", "HEAD").stdout.strip().lower()
+            observed_branch = _safe_git(
+                workspace_path, "branch", "--show-current"
+            ).stdout.strip()
+            tracked_status = _safe_git(
+                workspace_path, "status", "--porcelain", "--untracked-files=no"
+            ).stdout.strip()
+            remote = _safe_git(
+                workspace_path, "config", "--get", "remote.origin.url", check=False
             ).stdout.strip()
         except (OSError, subprocess.SubprocessError) as exc:
             raise ExecutionError(
@@ -1234,6 +1272,13 @@ def _implementation_stage_receipt(
 
 def _implementation_role(profile: str) -> str:
     return re.sub(r"^\d+-", "", profile).lower()
+
+
+def _assert_source_evidence_supported(profile: str) -> None:
+    raise ExecutionError(
+        "EXECUTION_EXECUTABLE_EVIDENCE_UNSUPPORTED",
+        "source-commit evidence requires a separately admitted sandboxed execution capability",
+    )
 
 
 def _canonical_repository_identity(value: str) -> str:
@@ -1314,14 +1359,12 @@ def _validate_source_lineage(
             )
         for parent_source in parent_sources:
             try:
-                result = subprocess.run(
-                    [
-                        "git", "-C", str(child_workspace), "merge-base", "--is-ancestor",
-                        parent_source["commit_sha"], child_source["commit_sha"],
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=15,
+                result = _safe_git(
+                    child_workspace,
+                    "merge-base",
+                    "--is-ancestor",
+                    parent_source["commit_sha"],
+                    child_source["commit_sha"],
                     check=False,
                 )
             except (OSError, subprocess.SubprocessError) as exc:

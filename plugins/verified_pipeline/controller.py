@@ -48,6 +48,17 @@ IMPLEMENTATION_PROFILES = (
     *MANDATORY_IMPLEMENTATION_PROFILES,
     *OPTIONAL_IMPLEMENTATION_PROFILES,
 )
+_KANBAN_STAGE_TOOLS = {
+    "kanban_show", "kanban_comment", "kanban_attach", "kanban_attachments",
+    "kanban_complete", "kanban_block", "kanban_heartbeat",
+}
+IMPLEMENTATION_ROLE_TOOL_CEILINGS = {
+    "02-builder": _KANBAN_STAGE_TOOLS | {"read_file", "search_files", "write_file", "patch"},
+    "09-test": _KANBAN_STAGE_TOOLS | {"read_file", "search_files", "write_file"},
+    "06-integration": _KANBAN_STAGE_TOOLS | {"read_file", "search_files", "write_file", "patch"},
+    "08-release": _KANBAN_STAGE_TOOLS | {"read_file", "search_files", "write_file"},
+    "10-validator": _KANBAN_STAGE_TOOLS | {"read_file", "search_files"},
+}
 VALID_ACTIONS = frozenset({"approve", "request_changes"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -248,7 +259,7 @@ def init_db(db_path: Optional[str | os.PathLike[str]] = None) -> Path:
 def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
     if not isinstance(value, Mapping) or not value:
         raise PipelineControlError("INVALID_PROFILE_INVENTORY", "frozen profile inventory is required")
-    normalized: dict[str, dict[str, str]] = {}
+    normalized: dict[str, dict[str, Any]] = {}
     for profile, receipt in value.items():
         name = str(profile).strip().lower()
         if not _ID_RE.fullmatch(name) or not isinstance(receipt, Mapping):
@@ -258,7 +269,34 @@ def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
         version = str(receipt.get("version") or "").strip()
         if not _SHA256_RE.fullmatch(digest) or not schema or not version:
             raise PipelineControlError("INVALID_PROFILE_INVENTORY", "profile receipt is incomplete")
-        normalized[name] = {"schema": schema, "version": version, "sha256": digest}
+        normalized_receipt: dict[str, Any] = {
+            "schema": schema,
+            "version": version,
+            "sha256": digest,
+        }
+        if name in IMPLEMENTATION_ROLE_TOOL_CEILINGS:
+            allowed_toolsets = sorted(
+                {str(item) for item in receipt.get("allowed_toolsets", [])}
+            )
+            allowed_tools = sorted({str(item) for item in receipt.get("allowed_tools", [])})
+            if (
+                not allowed_toolsets
+                or not set(allowed_toolsets).issubset({"file", "kanban"})
+                or not set(allowed_tools).issubset(IMPLEMENTATION_ROLE_TOOL_CEILINGS[name])
+                or receipt.get("workspace_only") is not True
+            ):
+                raise PipelineControlError(
+                    "IMPLEMENTATION_PROFILE_AUTHORITY_WIDENED",
+                    f"{name} exceeds the verified implementation-role authority ceiling",
+                )
+            normalized_receipt.update(
+                {
+                    "allowed_toolsets": allowed_toolsets,
+                    "allowed_tools": allowed_tools,
+                    "workspace_only": True,
+                }
+            )
+        normalized[name] = normalized_receipt
     for required in (PLANNER_PROFILE,):
         if required not in normalized:
             raise PipelineControlError(

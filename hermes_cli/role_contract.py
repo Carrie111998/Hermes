@@ -59,6 +59,7 @@ class RoleContractAdmission:
     task_id: str
     run_id: Optional[int]
     workspace_path: Optional[str]
+    branch_name: Optional[str]
     receipt_id: str
 
     def receipt(self) -> dict[str, Any]:
@@ -78,6 +79,7 @@ class RoleContractAdmission:
             "task_id": self.task_id,
             "run_id": self.run_id,
             "workspace_path": self.workspace_path,
+            "branch_name": self.branch_name,
             "receipt_id": self.receipt_id,
         }
 
@@ -270,6 +272,7 @@ def admit_role_contract(
     task_id: str,
     run_id: Optional[int],
     workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None,
     required: bool,
 ) -> Optional[RoleContractAdmission]:
     """Admit a profile contract and derive a non-widening toolset surface."""
@@ -301,6 +304,7 @@ def admit_role_contract(
         "task_id": task_id,
         "run_id": run_id,
         "workspace_path": workspace_path,
+        "branch_name": branch_name,
     }
     receipt_id = hashlib.sha256(
         json.dumps(receipt_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -313,6 +317,7 @@ def admit_role_contract(
         task_id=task_id,
         run_id=run_id,
         workspace_path=workspace_path,
+        branch_name=branch_name,
         receipt_id=receipt_id,
     )
 

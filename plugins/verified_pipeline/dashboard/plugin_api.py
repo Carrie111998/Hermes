@@ -83,8 +83,8 @@ def _authenticated_actor(request: Request) -> str:
     return f"dashboard-session:{provider}:{user_id}"
 
 
-def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
-    receipts: dict[str, dict[str, str]] = {}
+def _frozen_profile_inventory() -> dict[str, dict[str, Any]]:
+    receipts: dict[str, dict[str, Any]] = {}
     for profile in (
         controller.PLANNER_PROFILE,
         review.DA_PROFILE,
@@ -97,6 +97,9 @@ def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
             "schema": contract.schema,
             "version": contract.version,
             "sha256": contract.sha256,
+            "allowed_toolsets": list(contract.allowed_toolsets),
+            "allowed_tools": list(contract.allowed_tools),
+            "workspace_only": contract.workspace_only,
         }
     for profile in (
         controller.REVISION_PROFILE,
@@ -109,6 +112,9 @@ def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
             "schema": contract.schema,
             "version": contract.version,
             "sha256": contract.sha256,
+            "allowed_toolsets": list(contract.allowed_toolsets),
+            "allowed_tools": list(contract.allowed_tools),
+            "workspace_only": contract.workspace_only,
         }
     return receipts
 

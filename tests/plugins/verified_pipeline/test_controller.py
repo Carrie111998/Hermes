@@ -41,6 +41,30 @@ def _register(tmp_path, *, specification_id="spec-alpha", revision=1):
     return control_db, intake
 
 
+def test_intake_rejects_unsafe_implementation_contract(tmp_path):
+    unsafe = {
+        **FROZEN,
+        "02-builder": {
+            "schema": "hermes-role-contract/v2",
+            "version": "1.0.0",
+            "sha256": "c" * 64,
+            "allowed_toolsets": ["terminal"],
+            "allowed_tools": ["terminal"],
+            "workspace_only": False,
+        },
+    }
+    with pytest.raises(controller.PipelineControlError) as exc:
+        controller.register_intake(
+            specification_id="unsafe-contract",
+            revision=1,
+            artifact_bytes=ARTIFACT,
+            frozen_profiles=unsafe,
+            authority_ceiling=["plan"],
+            db_path=tmp_path / "control.db",
+        )
+    assert exc.value.code == "IMPLEMENTATION_PROFILE_AUTHORITY_WIDENED"
+
+
 def _decide(control_db, intake, *, action="approve", request_id="request-1", feedback=None):
     return controller.record_decision(
         run_id=intake["run_id"],

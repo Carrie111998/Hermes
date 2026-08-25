@@ -40,6 +40,13 @@ FROZEN = {
         ("09-test", "f"),
     )
 }
+FROZEN["09-test"].update(
+    {
+        "allowed_toolsets": ["file", "kanban"],
+        "allowed_tools": sorted(controller.IMPLEMENTATION_ROLE_TOOL_CEILINGS["09-test"]),
+        "workspace_only": True,
+    }
+)
 ARTIFACT = b"# Exact specification\n\nBuild one bounded, reviewed plan.\n"
 AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
 AUTHORITY_VERIFIER = {
@@ -163,7 +170,8 @@ def _admit_fixture_run(conn, task_id: str) -> tuple[object, int]:
         "effective_toolsets": ["kanban"],
         "task_id": task.id,
         "run_id": run_id,
-        "workspace_path": workspace,
+        "workspace_path": str(workspace),
+        "branch_name": task.branch_name,
     }
     receipt = {
         **basis,
@@ -188,7 +196,9 @@ def _admit_fixture_run(conn, task_id: str) -> tuple[object, int]:
     return task, run_id
 
 
-def _complete(kanban_path: Path, task_id: str) -> None:
+def _complete(
+    kanban_path: Path, task_id: str, *, include_source: bool = False
+) -> None:
     conn = kanban_db.connect(db_path=kanban_path)
     try:
         task_row, run_id = _admit_fixture_run(conn, task_id)
@@ -243,7 +253,7 @@ def _complete(kanban_path: Path, task_id: str) -> None:
         artifact_name = "test-evidence.txt" if is_exact_test else "stage-output.txt"
         artifact = workspace / artifact_name
         artifact.write_text(f"verified stage output for {task_id}\n", encoding="utf-8")
-        if task_row.workspace_kind == "worktree":
+        if task_row.workspace_kind == "worktree" and include_source:
             if not is_exact_test:
                 subprocess.run(["git", "add", artifact_name], cwd=workspace, check=True)
                 subprocess.run(
@@ -1737,6 +1747,50 @@ def test_execution_artifact_size_limit_fails_before_hashing(tmp_path):
     assert exc.value.code == "EXECUTION_ARTIFACT_TOO_LARGE"
 
 
+def test_execution_artifact_hash_rejects_symlink(tmp_path):
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"authoritative")
+    link = tmp_path / "artifact-link.bin"
+    link.symlink_to(target)
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution._sha256_regular_file(link)
+    assert exc.value.code == "EXECUTION_ARTIFACT_UNSAFE"
+
+
+def test_execution_completion_rejects_post_admission_branch_drift(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    _complete(kanban_path, projected["task_map"]["verify"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET branch_name = ? WHERE id = ?",
+                ("drifted/branch", projected["task_map"]["verify"]),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board,
+            authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_STAGE_CUSTODY_DRIFT"
+
+
+@pytest.mark.parametrize("profile", sorted(FROZEN))
+def test_source_evidence_is_unavailable_without_sandbox_capability(profile):
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution._assert_source_evidence_supported(profile)
+    assert exc.value.code == "EXECUTION_EXECUTABLE_EVIDENCE_UNSUPPORTED"
+
+
+@pytest.mark.skip(reason="source custody is dormant until sandbox capability exists")
 def test_execution_completion_rejects_source_commit_drift(tmp_path):
     control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
     execution.arm_execution(
@@ -1769,6 +1823,7 @@ def test_execution_completion_rejects_source_commit_drift(tmp_path):
     assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_DRIFT"
 
 
+@pytest.mark.skip(reason="source custody is dormant until sandbox capability exists")
 def test_execution_completion_rejects_non_head_source_commit(tmp_path):
     control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
     execution.arm_execution(
@@ -1794,6 +1849,7 @@ def test_execution_completion_rejects_non_head_source_commit(tmp_path):
     assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_DRIFT"
 
 
+@pytest.mark.skip(reason="source custody is dormant until sandbox capability exists")
 def test_execution_completion_rejects_source_branch_mismatch(tmp_path):
     control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
     execution.arm_execution(
@@ -1825,6 +1881,7 @@ def test_execution_completion_rejects_source_branch_mismatch(tmp_path):
     assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_MISMATCH"
 
 
+@pytest.mark.skip(reason="source custody is dormant until sandbox capability exists")
 def test_execution_completion_rejects_tracked_worktree_drift(tmp_path):
     control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
     execution.arm_execution(
@@ -1848,6 +1905,7 @@ def test_execution_completion_rejects_tracked_worktree_drift(tmp_path):
     assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_DIRTY"
 
 
+@pytest.mark.skip(reason="source custody is dormant until sandbox capability exists")
 def test_execution_completion_rejects_test_commit_divergence(tmp_path):
     control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
     execution.arm_execution(
@@ -2159,6 +2217,34 @@ def _persist_release_authority(
     return envelope
 
 
+def test_release_ready_is_unavailable_without_sandbox_source(tmp_path):
+    control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
+    assert completion["source_candidate"] is None
+    execution_key = intent["idempotency_key"]
+    authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.RELEASE_READY_DECISION,
+        schema=release.RELEASE_READY_AUTH_SCHEMA,
+        fields={
+            "completion_sha256": execution._digest(completion),
+            "repository": "jasonwu-ai/hermes-agent",
+            "base_ref": "main",
+            "head_sha": "1" * 40,
+            "evidence_sha256": "2" * 64,
+        },
+    )
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_release_ready(
+            execution_key,
+            authority_key=authority["authority_key"],
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "RELEASE_READY_EVIDENCE_INVALID"
+
+
 def _release_ready_authority(control_db: Path, execution_key: str, completion: dict):
     return _persist_release_authority(
         control_db,
@@ -2175,6 +2261,7 @@ def _release_ready_authority(control_db: Path, execution_key: str, completion: d
     )
 
 
+@pytest.mark.skip(reason="executable release custody is dormant until sandbox capability exists")
 def test_release_boundary_records_ordered_exact_authority_without_side_effects(tmp_path):
     control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
     execution_key = intent["idempotency_key"]
@@ -2321,6 +2408,7 @@ def test_release_boundary_records_ordered_exact_authority_without_side_effects(t
         conn.close()
 
 
+@pytest.mark.skip(reason="executable release custody is dormant until sandbox capability exists")
 def test_release_boundary_rejects_missing_predecessor_and_scope_drift(tmp_path):
     control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
     execution_key = intent["idempotency_key"]
@@ -2371,6 +2459,7 @@ def test_release_boundary_rejects_missing_predecessor_and_scope_drift(tmp_path):
     assert exc.value.code == "MERGE_AUTHORITY_SCOPE_INVALID"
 
 
+@pytest.mark.skip(reason="executable release custody is dormant until sandbox capability exists")
 def test_release_ready_rejects_head_not_bound_to_completion_source(tmp_path):
     control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
     execution_key = intent["idempotency_key"]
@@ -2398,6 +2487,7 @@ def test_release_ready_rejects_head_not_bound_to_completion_source(tmp_path):
     assert exc.value.code == "RELEASE_READY_EVIDENCE_INVALID"
 
 
+@pytest.mark.skip(reason="executable release custody is dormant until sandbox capability exists")
 def test_release_boundary_rejects_db_writer_self_signed_readiness(tmp_path):
     control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
     execution_key = intent["idempotency_key"]
@@ -2552,6 +2642,7 @@ def test_safe_file_rejects_inode_swap_between_lstat_and_open(tmp_path, monkeypat
     assert exc.value.code == "REVIEW_ARTIFACT_CUSTODY_MISMATCH"
 
 
+@pytest.mark.skip(reason="executable release custody is dormant until sandbox capability exists")
 def test_release_boundary_rejects_signed_wrong_completion_predecessor(tmp_path):
     control_db, kanban_path, _, board, intent, _ = _completed_execution(tmp_path)
     execution_key = intent["idempotency_key"]

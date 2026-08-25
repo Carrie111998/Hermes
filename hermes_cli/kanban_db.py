@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -160,6 +161,8 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+KANBAN_COMPLETION_MAX_ARTIFACTS = 16
+KANBAN_COMPLETION_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -5745,6 +5748,10 @@ def _persist_scratch_completion_artifacts(
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
+    if len(raw_artifacts) > KANBAN_COMPLETION_MAX_ARTIFACTS:
+        raise ArtifactPreservationError(
+            f"completion declares more than {KANBAN_COMPLETION_MAX_ARTIFACTS} artifacts"
+        )
 
     row = conn.execute(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
@@ -5774,6 +5781,7 @@ def _persist_scratch_completion_artifacts(
     persisted: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
+    aggregate_size = 0
 
     def _discard_copies() -> None:
         for copied in used_destinations:
@@ -5791,43 +5799,71 @@ def _persist_scratch_completion_artifacts(
         if not artifact:
             continue
         src = Path(artifact).expanduser()
-        try:
-            resolved_src = src.resolve()
-        except OSError:
+        lexical_src = Path(os.path.abspath(src))
+        if not lexical_src.is_relative_to(workspace_root):
             persisted.append(artifact)
             continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        if not src.is_file():
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
-            )
-
-        size = resolved_src.stat().st_size
-        if size > KANBAN_ATTACHMENT_MAX_BYTES:
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
 
         dest: Optional[Path] = None
+        source_fd: Optional[int] = None
+        destination_fd: Optional[int] = None
         try:
+            source_fd = os.open(
+                lexical_src,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            source_stat = os.fstat(source_fd)
+            descriptor_path = Path(f"/proc/self/fd/{source_fd}").resolve()
+            if (
+                not stat.S_ISREG(source_stat.st_mode)
+                or not descriptor_path.is_relative_to(workspace_root)
+                or descriptor_path != lexical_src
+            ):
+                raise ArtifactPreservationError(
+                    f"declared artifact is not a confined regular file: {artifact}"
+                )
+            if source_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact exceeds the "
+                    f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                )
+            aggregate_size += source_stat.st_size
+            if aggregate_size > KANBAN_COMPLETION_MAX_TOTAL_BYTES:
+                raise ArtifactPreservationError(
+                    "declared completion artifacts exceed the aggregate size limit"
+                )
             attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
+            dest = _unique_attachment_path(attachment_dir, lexical_src.name, used_destinations)
+            destination_fd = os.open(
+                dest,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            copied = 0
+            while chunk := os.read(source_fd, 1024 * 1024):
+                copied += len(chunk)
+                if copied > source_stat.st_size or copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                    raise ArtifactPreservationError(
+                        f"declared scratch artifact grew beyond the size limit: {artifact}"
+                    )
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    view = view[written:]
+            if copied != source_stat.st_size:
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact changed while being preserved: {artifact}"
+                )
+            after = os.stat(lexical_src, follow_symlinks=False)
+            if (
+                after.st_dev != source_stat.st_dev
+                or after.st_ino != source_stat.st_ino
+                or not stat.S_ISREG(after.st_mode)
+            ):
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact identity changed while being preserved: {artifact}"
+                )
+            os.fsync(destination_fd)
         except Exception as exc:
             if dest is not None:
                 try:
@@ -5840,6 +5876,11 @@ def _persist_scratch_completion_artifacts(
             raise ArtifactPreservationError(
                 f"could not preserve declared scratch artifact {artifact}: {exc}"
             ) from exc
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            if source_fd is not None:
+                os.close(source_fd)
 
         used_destinations.add(dest)
         persisted.append(str(dest.resolve()))
@@ -5863,9 +5904,29 @@ def _insert_completion_attachment(
 ) -> None:
     """Record a worker-produced artifact with a completion-time digest."""
     digest = hashlib.sha256()
-    with Path(stored_path).open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(stored_path, flags)
+    except OSError as exc:
+        raise ArtifactPreservationError(
+            f"could not open preserved completion artifact safely: {stored_path}"
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size != size:
+            raise ArtifactPreservationError(
+                f"preserved completion artifact changed before hashing: {stored_path}"
+            )
+        observed_size = 0
+        while chunk := os.read(fd, 1024 * 1024):
+            observed_size += len(chunk)
             digest.update(chunk)
+        if observed_size != opened.st_size:
+            raise ArtifactPreservationError(
+                f"preserved completion artifact changed while hashing: {stored_path}"
+            )
+    finally:
+        os.close(fd)
     artifact_sha256 = digest.hexdigest()
     conn.execute(
         "INSERT INTO task_attachments "
@@ -10855,6 +10916,7 @@ def _admit_worker_role_contract(
                 if task.workspace_path
                 else None
             ),
+            branch_name=task.branch_name,
             required=bool(task.require_role_contract),
         )
     except RoleContractError as exc:

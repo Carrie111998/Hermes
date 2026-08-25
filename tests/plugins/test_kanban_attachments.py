@@ -118,6 +118,28 @@ def test_delete_attachment_missing_returns_none(kanban_home):
         conn.close()
 
 
+def test_completion_artifact_ingestion_rejects_symlink(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        workspace.mkdir(parents=True, exist_ok=True)
+        kb.set_workspace_path(conn, task_id, workspace)
+        target = workspace / "authoritative.txt"
+        target.write_bytes(b"authoritative")
+        link = workspace / "artifact-link.txt"
+        link.symlink_to(target)
+        with pytest.raises(kb.ArtifactPreservationError, match="could not preserve"):
+            kb._persist_scratch_completion_artifacts(
+                conn, task_id, {"artifacts": [str(link)]}
+            )
+        assert kb.list_attachments(conn, task_id) == []
+    finally:
+        conn.close()
+
+
 def test_attachments_root_is_per_board(kanban_home, monkeypatch):
     # default board uses <root>/kanban/attachments
     default_root = kb.attachments_root(board="default")

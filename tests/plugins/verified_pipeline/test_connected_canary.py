@@ -6,7 +6,9 @@ import subprocess
 import sys
 
 
-def test_connected_canary_runs_to_read_only_release_ready(tmp_path: Path) -> None:
+def test_connected_canary_runs_to_generic_completion_with_release_fail_closed(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "connected-canary"
     result = subprocess.run(
         [

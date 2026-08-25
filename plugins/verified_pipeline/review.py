@@ -552,6 +552,10 @@ def _verify_terminal_run(
             "AND kind = 'role_contract_admitted' ORDER BY id",
             (task_id, run_id),
         ).fetchall()
+        task_custody = conn.execute(
+            "SELECT workspace_path, branch_name FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
     finally:
         conn.close()
     if (
@@ -583,6 +587,7 @@ def _verify_terminal_run(
             "task_id": receipt["task_id"],
             "run_id": receipt["run_id"],
             "workspace_path": receipt["workspace_path"],
+            "branch_name": receipt["branch_name"],
         }
         computed_receipt_id = hashlib.sha256(
             json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -601,6 +606,9 @@ def _verify_terminal_run(
         or receipt.get("run_id") != run_id
         or receipt.get("profile") != expected_assignee
         or receipt.get("workspace_path") != expected_workspace_text
+        or task_custody is None
+        or receipt.get("workspace_path") != task_custody["workspace_path"]
+        or receipt.get("branch_name") != task_custody["branch_name"]
         or receipt.get("schema") != expected_contract.get("schema")
         or receipt.get("version") != expected_contract.get("version")
         or receipt.get("contract_sha256") != expected_contract.get("sha256")
