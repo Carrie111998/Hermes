@@ -62,6 +62,36 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
+class TestStdioChildrenDead:
+    """Regression tests for the fast-fail liveness probe (#81995).
+
+    ``_stdio_children_dead`` must return True only when EVERY captured
+    stdio child pid has exited, so a live subprocess never gets an
+    in-flight tool call failed instantly with "has exited".
+    """
+
+    def test_returns_false_when_a_child_is_alive(self, monkeypatch):
+        server = _make_mock_server("jira")
+        server._stdio_child_pids = {12345}
+        monkeypatch.setattr(
+            "psutil.pid_exists", lambda pid: True,
+        )
+        assert server._stdio_children_dead() is False
+
+    def test_returns_true_when_all_children_exited(self, monkeypatch):
+        server = _make_mock_server("jira")
+        server._stdio_child_pids = {12345, 23456}
+        monkeypatch.setattr(
+            "psutil.pid_exists", lambda pid: False,
+        )
+        assert server._stdio_children_dead() is True
+
+    def test_returns_false_unknown_when_no_pids_captured(self):
+        server = _make_mock_server("jira")
+        server._stdio_child_pids = set()
+        assert server._stdio_children_dead() is False
+
+
 class TestFilterMCPChildren:
     def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
         """Non-MCP children start with an interpreter/binary, not the marker."""
