@@ -1,3 +1,4 @@
+import type * as DndKitSortable from '@dnd-kit/sortable'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -11,10 +12,31 @@ import { mergeCompactProfileOrder, ProfileRail } from './profile-switcher'
 
 const navigate = vi.fn()
 
-const { gatewayState, requestGateway } = vi.hoisted(() => ({
+const { gatewayState, requestGateway, sortableIds } = vi.hoisted(() => ({
   gatewayState: { current: { id: 'pc' } },
-  requestGateway: vi.fn()
+  requestGateway: vi.fn(),
+  sortableIds: [] as string[]
 }))
+
+vi.mock('@dnd-kit/sortable', async importOriginal => {
+  const actual = await importOriginal<typeof DndKitSortable>()
+
+  return {
+    ...actual,
+    useSortable: ({ id }: { id: string }) => {
+      sortableIds.push(id)
+
+      return {
+        attributes: {},
+        isDragging: false,
+        listeners: {},
+        setNodeRef: vi.fn(),
+        transform: null,
+        transition: null
+      }
+    }
+  }
+})
 
 vi.mock('react-router', () => ({
   useNavigate: () => navigate
@@ -95,7 +117,11 @@ vi.mock('../../profiles/rename-profile-dialog', () => ({ RenameProfileDialog: ()
 
 const { $hasMultipleConnections } = await import('@/store/connections')
 const hasMultipleConnections = $hasMultipleConnections as ReturnType<typeof atom<boolean>>
-const { $activeGatewayProfile, $profileScope, $profiles, $profilesConnectionId } = await import('@/store/profile')
+
+const { $activeGatewayProfile, $profileColors, $profileScope, $profiles, $profilesConnectionId } =
+  await import('@/store/profile')
+
+const { $profileRemoteOverrides } = await import('@/store/profile-remote-override')
 const { $connection } = await import('@/store/session')
 
 const profiles = $profiles as ReturnType<
@@ -103,12 +129,14 @@ const profiles = $profiles as ReturnType<
 >
 
 const profileScope = $profileScope as ReturnType<typeof atom<string>>
+const profileColors = $profileColors as ReturnType<typeof atom<Record<string, string>>>
 const activeGatewayProfile = $activeGatewayProfile as ReturnType<typeof atom<string>>
 const profilesConnectionId = $profilesConnectionId as ReturnType<typeof atom<null | string>>
 const connection = $connection as ReturnType<typeof atom<{ connectionId: string } | null>>
 
 beforeEach(() => {
   gatewayState.current = { id: 'pc' }
+  sortableIds.length = 0
   requestGateway.mockReset()
   requestGateway.mockResolvedValue({ found: false })
 })
@@ -119,6 +147,8 @@ afterEach(() => {
   profiles.set([{ is_default: true, name: 'default' }])
   profileScope.set('default')
   activeGatewayProfile.set('default')
+  profileColors.set({})
+  $profileRemoteOverrides.set({})
   profilesConnectionId.set('pc')
   connection.set({ connectionId: 'pc' })
 })
@@ -192,6 +222,51 @@ describe('ProfileRail multi-gateway entry point', () => {
     expect(within(owner).getByText('C')).toBeTruthy()
     expect(within(owner).queryByText('Clyde')).toBeNull()
     expect(within(founder).getByText('F')).toBeTruthy()
+  })
+
+  it('uses stable profile keys for sortable identity when display names differ', () => {
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { display_name: 'Visual Artist', is_default: false, name: 'picasso' },
+      { display_name: 'Company Founder', is_default: false, name: 'founder' }
+    ])
+    render(<ProfileRail />)
+
+    expect(sortableIds).toEqual(expect.arrayContaining(['picasso', 'founder']))
+    expect(sortableIds).not.toEqual(expect.arrayContaining(['Visual Artist', 'Company Founder']))
+  })
+
+  it('keeps remote-profile labels and tooltips name-only', () => {
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { display_name: 'Founder', is_default: false, name: 'founder' }
+    ])
+    $profileRemoteOverrides.set({ founder: { host: 'bigbox', url: 'https://bigbox.example' } })
+    render(<ProfileRail />)
+
+    expect(screen.getByRole('button', { name: 'Founder' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Runs on bigbox/ })).toBeNull()
+  })
+
+  it('resolves active and owner colors from profile keys instead of display names', () => {
+    profileColors.set({ default: '#123456', picasso: '#654321' })
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { display_name: 'Visual Artist', is_default: false, name: 'picasso' }
+    ])
+    const { unmount } = render(<ProfileRail />)
+
+    expect(within(screen.getByRole('button', { name: 'Clyde' })).getByText('C').style.color).toBe('')
+    unmount()
+
+    activeGatewayProfile.set('picasso')
+    profileScope.set('picasso')
+    render(<ProfileRail />)
+
+    expect(within(screen.getByRole('button', { name: 'Visual Artist' })).getByText('V').style.color).toBe(
+      'rgb(101, 67, 33)'
+    )
+    expect(screen.getByRole('button', { name: 'Clyde' }).style.color).toBe('var(--ui-text-quaternary)')
   })
 
   it('uses is_default to recognize a root-keyed machine owner', () => {

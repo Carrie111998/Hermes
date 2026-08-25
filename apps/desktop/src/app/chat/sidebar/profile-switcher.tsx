@@ -297,7 +297,7 @@ export function ProfileRail() {
           <ProfilePill active glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
         ) : activeProfile ? (
           <ActiveProfilePill
-            color={resolveProfileColor(profileLabel(activeProfile), colors)}
+            color={resolveProfileColor(activeProfile.name, colors)}
             label={profileLabel(activeProfile)}
             onSelect={() => (activeProfile.is_default ? setShowAllProfiles(true) : selectProfile(activeProfile.name))}
             profileName={activeProfile.name}
@@ -307,7 +307,7 @@ export function ProfileRail() {
       {/* Single-profile: the active default owner's identity next to create. */}
       {!multiProfile && activeProfile?.is_default && (
         <ActiveProfilePill
-          color={resolveProfileColor(profileLabel(activeProfile), colors)}
+          color={resolveProfileColor(activeProfile.name, colors)}
           label={profileLabel(activeProfile)}
           onSelect={() => selectProfile(activeProfile.name)}
           profileName={activeProfile.name}
@@ -321,7 +321,7 @@ export function ProfileRail() {
         <div className="flex min-w-0 flex-1 items-center gap-1">
           {rosterCurrent && defaultProfile && (isAll || !onDefault) && (
             <OwnerProfileCompact
-              color={resolveProfileColor(defaultLabel, colors)}
+              color={resolveProfileColor(defaultProfile.name, colors)}
               label={defaultLabel}
               onSelect={() => selectProfile(defaultProfile.name)}
             />
@@ -342,7 +342,7 @@ export function ProfileRail() {
         >
           {multiProfile && rosterCurrent && defaultProfile && (isAll || !onDefault) && (
             <OwnerProfileCompact
-              color={resolveProfileColor(defaultLabel, colors)}
+              color={resolveProfileColor(defaultProfile.name, colors)}
               label={defaultLabel}
               onSelect={() => selectProfile(defaultProfile.name)}
             />
@@ -373,6 +373,7 @@ export function ProfileRail() {
                       onRecolor={color => setProfileColor(profile.name, color)}
                       onRename={() => setPendingRename(profile)}
                       onSelect={() => selectProfile(profile.name)}
+                      profileName={profile.name}
                       remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
                     />
                   ))}
@@ -785,6 +786,7 @@ interface ProfileSquareProps {
   active: boolean
   color: null | string
   label: string
+  profileName: string
   onSelect: () => void
   onRecolor: (color: null | string) => void
   onRename: () => void
@@ -817,6 +819,7 @@ function ProfileSquare({
   onRecolor,
   onRename,
   onSelect,
+  profileName,
   remoteHost
 }: ProfileSquareProps) {
   const { t } = useI18n()
@@ -827,10 +830,10 @@ function ProfileSquare({
   const suppressClick = useRef(false)
   // Hovering a square telegraphs the switch — start that profile's backend
   // spawn now so a cold click doesn't pay the full boot.
-  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(label)
+  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(profileName)
 
   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
-    id: label,
+    id: profileName,
     transition: RAIL_TRANSITION
   })
 
@@ -887,7 +890,7 @@ function ProfileSquare({
                     type="button"
                     {...attributes}
                     {...listeners}
-                    aria-label={remoteHost ? `${label} — ${p.remoteOverride.badge(remoteHost)}` : label}
+                    aria-label={label}
                     aria-pressed={active}
                     // Hold-to-recolor rides alongside the dnd pointer listener (call
                     // it first so drag tracking still arms), then a timer opens the
@@ -941,7 +944,7 @@ function ProfileSquare({
                 </TooltipTrigger>
               </ContextMenuTrigger>
             </PopoverAnchor>
-            <TooltipContent>{remoteHost ? `${label} · ${p.remoteOverride.badge(remoteHost)}` : label}</TooltipContent>
+            <TooltipContent>{label}</TooltipContent>
           </Tooltip>
         </TooltipProvider>
 
