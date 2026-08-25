@@ -47,6 +47,202 @@ def test_is_session_expired_detects_session_not_found():
     assert _is_session_expired_error(RuntimeError("Unknown session: abc123")) is True
 
 
+def test_is_session_expired_detects_session_terminated():
+    """Remote Playwright MCP reports transport loss as ``Session terminated``."""
+    from tools.mcp_tool import _is_session_expired_error
+
+    assert _is_session_expired_error(RuntimeError("Session terminated")) is True
+
+
+def test_is_session_expired_detects_stale_pipe_and_closed_transport_variants():
+    """Stdio/AnyIO stale-pipe failures usually surface as closed-resource
+    or broken-pipe text, not an HTTP session-expired JSON-RPC error."""
+    from anyio import ClosedResourceError
+    from tools.mcp_tool import _is_session_expired_error
+    assert _is_session_expired_error(RuntimeError("ClosedResourceError")) is True
+    assert _is_session_expired_error(RuntimeError("closed resource in MCP child")) is True
+    assert _is_session_expired_error(RuntimeError("transport is closed")) is True
+    assert _is_session_expired_error(RuntimeError("Broken pipe while writing request")) is True
+    assert _is_session_expired_error(RuntimeError("End of file from MCP server")) is True
+    # AnyIO raises this with no message, so str(exc) is empty while repr(exc)
+    # still carries the transport-failure class name.
+    assert _is_session_expired_error(ClosedResourceError()) is True
+
+
+def test_is_session_expired_is_case_insensitive():
+    """Match uses lower-cased comparison so servers that emit the
+    message in different cases (SDK formatter quirks) still trigger."""
+    from tools.mcp_tool import _is_session_expired_error
+    assert _is_session_expired_error(RuntimeError("INVALID OR EXPIRED SESSION")) is True
+    assert _is_session_expired_error(RuntimeError("Session Expired")) is True
+
+
+def test_is_session_expired_rejects_unrelated_errors():
+    """Narrow scope: only the specific session-expired markers trigger.
+    A regular RuntimeError / ValueError does not."""
+    from tools.mcp_tool import _is_session_expired_error
+    assert _is_session_expired_error(RuntimeError("Tool failed to execute")) is False
+    assert _is_session_expired_error(ValueError("Missing parameter")) is False
+    assert _is_session_expired_error(Exception("Connection refused")) is False
+    # 401 is handled by the sibling _is_auth_error path, not here.
+    assert _is_session_expired_error(RuntimeError("401 Unauthorized")) is False
+
+
+def test_is_session_expired_rejects_interrupted_error():
+    """InterruptedError is the user-cancel signal — must never route
+    through the session-reconnect path."""
+    from tools.mcp_tool import _is_session_expired_error
+    assert _is_session_expired_error(InterruptedError()) is False
+    assert _is_session_expired_error(InterruptedError("Invalid or expired session")) is False
+
+
+def test_is_session_expired_detects_message_less_anyio_transport_failures():
+    """Recognized stream failures have no text for marker matching."""
+    from anyio import BrokenResourceError, EndOfStream
+    from tools.mcp_tool import _is_session_expired_error
+
+    assert _is_session_expired_error(BrokenResourceError()) is True
+    assert _is_session_expired_error(EndOfStream()) is True
+
+
+def test_is_session_expired_detects_wrapped_closed_resource():
+    """AnyIO task groups may wrap a message-less transport close."""
+    from anyio import ClosedResourceError
+    from tools.mcp_tool import _is_session_expired_error
+
+    exc = ExceptionGroup("MCP transport failed", [ClosedResourceError()])
+    assert _is_session_expired_error(exc) is True
+
+
+def test_is_session_expired_rejects_mixed_group_with_user_interruption():
+    """Cancellation anywhere in the tree takes precedence over transport loss."""
+    from anyio import ClosedResourceError
+    from tools.mcp_tool import _is_session_expired_error
+
+    exc = ExceptionGroup(
+        "cancelled MCP transport",
+        [InterruptedError("cancel"), ClosedResourceError()],
+    )
+    assert _is_session_expired_error(exc) is False
+
+
+def test_is_session_expired_finds_closed_resource_beyond_recursion_limit():
+    """The full classifier must handle arbitrarily deep transport wrappers."""
+    import sys
+
+    from anyio import ClosedResourceError
+    from tools.mcp_tool import _is_session_expired_error
+
+    class NestedException(Exception):
+        exceptions: tuple[BaseException, ...]
+
+    exc = ClosedResourceError()
+    for _ in range(sys.getrecursionlimit() + 100):
+        wrapper = NestedException("wrapped")
+        wrapper.exceptions = (exc,)
+        exc = wrapper
+
+    assert _is_session_expired_error(exc) is True
+
+
+def test_is_session_expired_handles_cyclic_graph_without_transport_error():
+    """A cyclic non-transport graph must terminate and classify false."""
+    from tools.mcp_tool import _is_session_expired_error
+
+    class CyclicException(Exception):
+        exceptions: tuple[BaseException, ...]
+
+    first = CyclicException("first")
+    second = CyclicException("second")
+    first.exceptions = (second,)
+    second.exceptions = (first,)
+
+    assert _is_session_expired_error(first) is False
+
+
+def test_is_session_expired_finds_transport_error_in_cyclic_graph():
+    """Cycle detection must not prevent scanning reachable transport errors."""
+    from anyio import ClosedResourceError
+    from tools.mcp_tool import _is_session_expired_error
+
+    class CyclicException(Exception):
+        exceptions: tuple[BaseException, ...]
+
+    first = CyclicException("first")
+    second = CyclicException("second")
+    first.exceptions = (second, ClosedResourceError())
+    second.exceptions = (first,)
+
+    assert _is_session_expired_error(first) is True
+
+
+def test_is_session_expired_rejects_empty_message():
+    """Bare exceptions with no message shouldn't match."""
+    from tools.mcp_tool import _is_session_expired_error
+    assert _is_session_expired_error(RuntimeError("")) is False
+    assert _is_session_expired_error(Exception()) is False
+
+
+def test_is_session_expired_follows_cause_chain():
+    """A transport close reachable only via ``__cause__`` must classify."""
+    from anyio import ClosedResourceError
+    from tools.mcp_tool import _is_session_expired_error
+
+    try:
+        try:
+            raise ClosedResourceError()
+        except ClosedResourceError as inner:
+            raise RuntimeError("MCP request failed") from inner
+    except RuntimeError as exc:
+        assert _is_session_expired_error(exc) is True
+
+
+def test_is_session_expired_follows_context_chain():
+    """Implicit ``__context__`` chaining must also be scanned."""
+    from anyio import BrokenResourceError
+    from tools.mcp_tool import _is_session_expired_error
+
+    try:
+        try:
+            raise BrokenResourceError()
+        except BrokenResourceError:
+            raise RuntimeError("while handling transport write")
+    except RuntimeError as exc:
+        assert _is_session_expired_error(exc) is True
+
+
+def test_is_session_expired_interruption_in_cause_chain_wins():
+    """User cancellation buried in the chain overrides transport signals."""
+    from anyio import ClosedResourceError
+    from tools.mcp_tool import _is_session_expired_error
+
+    root = InterruptedError("cancel")
+    mid = ClosedResourceError()
+    mid.__cause__ = root
+    top = RuntimeError("transport is closed")
+    top.__cause__ = mid
+    assert _is_session_expired_error(top) is False
+
+
+def test_is_session_expired_handles_cyclic_cause_context_chain():
+    """Cycles through __cause__/__context__ must terminate (visited set)."""
+    from tools.mcp_tool import _is_session_expired_error
+
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__context__ = a  # cycle back through the other link
+    assert _is_session_expired_error(a) is False
+
+    from anyio import ClosedResourceError
+
+    c = RuntimeError("c")
+    d = ClosedResourceError()
+    c.__cause__ = d
+    d.__context__ = c  # cycle, but transport error is reachable
+    assert _is_session_expired_error(c) is True
+
+
 def test_is_session_expired_traversal_is_budget_bounded():
     """Pathologically long chains stop at the node budget without spinning."""
     import tools.mcp_tool as mcp_mod
