@@ -9,8 +9,10 @@ subcommand dispatch.
 
 import json
 import os
+import stat
 import tempfile
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -155,6 +157,26 @@ _SKILL = (
 # ---------------------------------------------------------------------------
 # Pending store CRUD
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("subsystem", ("memory", "skills"))
+def test_stage_write_creates_private_pending_record(hermes_home, subsystem):
+    """Pending payloads must be owner-only even under a common 0o022 umask."""
+    from tools import write_approval as wa
+
+    previous_umask = os.umask(0o022)
+    try:
+        record = wa.stage_write(
+            subsystem,
+            {"action": "add", "content": "fixture"},
+            summary="fixture",
+            origin="foreground",
+        )
+    finally:
+        os.umask(previous_umask)
+
+    pending_path = Path(hermes_home) / "pending" / subsystem / f"{record['id']}.json"
+    assert stat.S_IMODE(pending_path.stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------
