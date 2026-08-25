@@ -154,6 +154,15 @@ def estimate_context_tokens(agent: Any) -> int:
     neither is available — callers treat 0 as "below threshold".
 
     MUST be called BEFORE ``agent.switch_model()`` — see module docstring.
+
+    Approximation note (PR #94753 review): the provider-reported count comes
+    from the OLD model's last API call. The NEW model may tokenize the same
+    conversation differently, so this is an upper-bound estimate of what it
+    will re-read, not an exact figure — hence the "up to ~Nk" wording in
+    the notice. This is inherent: the new model has no call history yet, so
+    a pre-switch estimate under the old tokenizer is the best signal
+    available. The rough fallback (system + messages + tools) is
+    model-agnostic and slightly more conservative.
     """
     if agent is None:
         return 0
