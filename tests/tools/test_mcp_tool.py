@@ -702,11 +702,32 @@ class TestToolHandler:
                 results = list(pool.map(invoke, (1, 2)))
             assert all("error" not in json.loads(item) for item in results)
             assert {
-                (item["message_id"], item["tool_call_id"], item["session_id"])
+                (
+                    item["platform"],
+                    item["profile"],
+                    item["chat_id"],
+                    item["message_id"],
+                    item["tool_call_id"],
+                    item["session_id"],
+                )
                 for item in seen
             } == {
-                ("event-1", "call-1", "session-1"),
-                ("event-2", "call-2", "session-2"),
+                (
+                    "wearable",
+                    "test-profile",
+                    "device-context",
+                    "event-1",
+                    "call-1",
+                    "session-1",
+                ),
+                (
+                    "wearable",
+                    "test-profile",
+                    "device-context",
+                    "event-2",
+                    "call-2",
+                    "session-2",
+                ),
             }
         finally:
             mcp_mod._servers.pop("test_srv", None)
