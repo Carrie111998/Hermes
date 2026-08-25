@@ -9,6 +9,8 @@ Verifies that the agent cache correctly:
 - Preserves frozen system prompt across turns
 """
 
+import json
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -1158,6 +1160,51 @@ class TestHonchoCacheBustingMemo:
             "same-mtime size-changing rewrite served the stale memo entry"
         )
         assert len(parses) == 2
+
+    def test_real_file_same_mtime_different_size_invalidates(self, tmp_path, monkeypatch):
+        """A real profile-local file refreshes when only its size changes.
+
+        This is deliberately not a mocked ``Path.stat`` sequence: it verifies
+        profile-local path resolution, the actual ``HonchoClientConfig`` parser,
+        and the cache-busting entry point under the coarse-mtime condition.
+        """
+        from gateway.run import GatewayRunner
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "honcho.json"
+        fixed_mtime_ns = 1_700_000_000_123_456_789
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        def write_config(peer_name: str) -> None:
+            config_path.write_text(
+                json.dumps({"apiKey": "test-key", "peerName": peer_name}),
+                encoding="utf-8",
+            )
+            os.utime(config_path, ns=(fixed_mtime_ns, fixed_mtime_ns))
+
+        GatewayRunner._HONCHO_CACHE_BUSTING_MEMO = {}
+        write_config("a")
+        first_stat = config_path.stat()
+        first_mtime_ns = first_stat.st_mtime_ns
+        first_size = first_stat.st_size
+        first = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        write_config("a-peer-name-that-is-longer")
+        second_stat = config_path.stat()
+        # Windows-backed temporary filesystems can quantize utime's nanosecond
+        # argument.  The cache only observes the resulting stat identity, so
+        # compare the two observed timestamps rather than the requested value.
+        assert second_stat.st_mtime_ns == first_mtime_ns
+        assert second_stat.st_size != first_size
+        second = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert first["honcho.peer_name"] == "a"
+        assert second["honcho.peer_name"] == "a-peer-name-that-is-longer"
 
     def test_identical_stat_reuses_memo_without_reparsing(self, monkeypatch):
         """The memo's whole purpose: identical stat identity == no re-parse."""
