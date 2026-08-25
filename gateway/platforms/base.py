@@ -6928,7 +6928,9 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
+            if callable(_post_cb) and (
+                not delivery_attempted or delivery_succeeded
+            ):
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
@@ -6938,6 +6940,11 @@ class BasePlatformAdapter(ABC):
                         )
                 except (asyncio.TimeoutError, Exception):
                     pass
+            elif callable(_post_cb):
+                logger.debug(
+                    "[%s] Skipping post-delivery callback because final delivery failed",
+                    self.name,
+                )
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.

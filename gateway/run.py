@@ -5449,8 +5449,17 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
+        # A Telegram turn that exposes interim commentary uses one temporary
+        # live-status bubble, then the normal delivery path sends the completed
+        # answer and removes the status. Plain Telegram streaming keeps the
+        # upstream delta/finalize contract when no status bubble is requested.
+        _telegram_status_mode = bool(
+            ctx.source.platform == Platform.TELEGRAM and _want_interim_messages
+        )
+        _want_stream_deltas = (
+            _streaming_enabled and not _telegram_status_mode
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -6458,7 +6467,16 @@ class TurnRunner:
                 _fr = result.get("final_response")
                 if isinstance(_fr, str) and _fr.strip() and _fr != "(empty)":
                     _final_for_stream = _fr
-            if _final_for_stream is not None:
+            _ephemeral_telegram_status = bool(
+                ctx.source.platform == Platform.TELEGRAM
+                and getattr(
+                    getattr(_stream_consumer, "cfg", None),
+                    "commentary_edit_in_place",
+                    False,
+                )
+                and not _want_stream_deltas
+            )
+            if _final_for_stream is not None and not _ephemeral_telegram_status:
                 # Duck-type safe: test doubles / older consumers may expose a
                 # zero-arg finish(). The payload is an optimization, not a
                 # requirement — fall back to the bare signal.
@@ -12270,8 +12288,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before the owner was removed from it, must not silently
             # receive a full agent response on gateway restart just
             # because it has a resume-pending marker (issue #23778).
+            # Run the check inside the owning profile's runtime scope. Without
+            # it there is no secret scope installed here (this runs at startup,
+            # not inside a turn), so ``_auth_env`` -> ``get_secret`` raises
+            # ``UnscopedSecretError``, is swallowed, and silently falls back to
+            # the process-global ``os.environ`` - i.e. the DEFAULT profile's
+            # allowlist. A secondary-profile session then fails authorization
+            # against a list it was never meant to be on.
             try:
-                if not self._is_user_authorized(source):
+                try:
+                    _resume_home = self._resolve_profile_home_for_source(source)
+                except Exception:
+                    _resume_home = None
+                if _resume_home is not None:
+                    with _profile_runtime_scope(_resume_home):
+                        _resume_authorized = self._is_user_authorized(source)
+                else:
+                    _resume_authorized = self._is_user_authorized(source)
+                if not _resume_authorized:
                     logger.warning(
                         "Skipping auto-resume for %s: session owner is no "
                         "longer authorized under the current allowlist",
@@ -19030,7 +19064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
-        _msg_start_time = time.time()
+        _msg_start_time_ms = time.time_ns() // 1_000_000
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
@@ -20474,7 +20508,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
-            _response_time = time.time() - _msg_start_time
+            _response_time = (
+                (time.time_ns() // 1_000_000) - _msg_start_time_ms
+            ) / 1000.0
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
             logger.info(
@@ -24644,6 +24680,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
+    def _resolve_session_cwd_for_source(self, source: SessionSource) -> str:
+        """Resolve a multiplex turn against its routed profile, never its owner."""
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return ""
+        try:
+            profile_home = Path(self._resolve_profile_home_for_source(source)).resolve()
+            with _profile_runtime_scope(profile_home):
+                from hermes_cli.config import load_config
+
+                profile_config = load_config()
+            terminal_config = profile_config.get("terminal") or {}
+            configured = str(terminal_config.get("cwd") or "").strip()
+            backend = str(terminal_config.get("backend") or "local").strip().lower()
+            if configured and configured not in CWD_PLACEHOLDERS:
+                if not _is_ssh_remote_tilde_cwd(backend, configured):
+                    configured = os.path.expanduser(configured)
+                if Path(configured).is_dir():
+                    return configured
+                logger.warning(
+                    "Profile-scoped terminal.cwd does not exist for %s: %s; "
+                    "falling back to profile home",
+                    getattr(source, "profile", "") or "default",
+                    configured,
+                )
+            return str(profile_home)
+        except Exception:
+            logger.warning(
+                "Could not resolve profile-scoped cwd for %s; suppressing "
+                "gateway-owner cwd",
+                getattr(source, "profile", "") or "default",
+                exc_info=True,
+            )
+            try:
+                return str(Path(self._resolve_profile_home_for_source(source)).resolve())
+            except Exception:
+                return ""
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -24679,6 +24752,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=self._resolve_session_cwd_for_source(context.source),
             async_delivery=_async_delivery,
             cron_session="",
         )
@@ -27813,6 +27887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             fresh_final_after_seconds=_fresh_final_secs,
             transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            commentary_edit_in_place=(source.platform == Platform.TELEGRAM),
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
@@ -30060,6 +30135,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?", _edit_err,
                         )
 
+        # The Telegram live-status bubble is temporary too. Add it to the same
+        # post-delivery cleanup list so ordering is guaranteed: send the final
+        # answer first, then call deleteMessage on the status id.
+        if (
+            source.platform == Platform.TELEGRAM
+            and _cleanup_progress
+            and _sc is not None
+            and getattr(getattr(_sc, "cfg", None), "commentary_edit_in_place", False)
+            and getattr(_sc, "message_id", None)
+        ):
+            _status_id = str(_sc.message_id)
+            if _status_id not in _cleanup_msg_ids:
+                _cleanup_msg_ids.append(_status_id)
+
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
         # breadcrumbs for the user to see what work happened. Only fires on
@@ -30399,6 +30488,59 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     """
     from cron.scheduler_provider import InProcessCronScheduler
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
+
+
+def _run_profile_cron_provider(
+    profile_name: str,
+    profile_home: "Path",
+    provider,
+    stop_event,
+    *,
+    adapters=None,
+    loop=None,
+    can_dispatch=None,
+):
+    """Run a secondary profile's provider inside its isolated runtime/store."""
+    from cron.jobs import use_cron_store
+
+    with _profile_runtime_scope(Path(profile_home)):
+        with use_cron_store(profile_home):
+            logger.info(
+                "Starting isolated cron scheduler for multiplex profile %s",
+                profile_name,
+            )
+            kwargs = {"adapters": adapters, "loop": loop}
+            if can_dispatch is not None:
+                kwargs["can_dispatch"] = can_dispatch
+            provider.start(stop_event, **kwargs)
+
+
+def _start_secondary_profile_cron_schedulers(runner, stop_event, *, loop):
+    """Start one profile-scoped scheduler for each connected secondary profile."""
+    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+    from hermes_cli.profiles import get_profile_dir
+
+    handles = []
+    profile_adapters = getattr(runner, "_profile_adapters", None) or {}
+    for profile_name, adapters in sorted(profile_adapters.items()):
+        profile_home = Path(get_profile_dir(profile_name))
+        with _profile_runtime_scope(profile_home):
+            provider = resolve_cron_scheduler()
+        kwargs = {"adapters": adapters, "loop": loop}
+        if isinstance(provider, InProcessCronScheduler):
+            kwargs["can_dispatch"] = lambda: not (
+                runner._draining or runner._external_drain_active
+            )
+        thread = threading.Thread(
+            target=_run_profile_cron_provider,
+            args=(profile_name, profile_home, provider, stop_event),
+            kwargs=kwargs,
+            daemon=True,
+            name=f"cron-scheduler-{profile_name}",
+        )
+        thread.start()
+        handles.append((provider, thread))
+    return handles
 
 
 def _stop_cron_provider(provider) -> None:
@@ -31229,30 +31371,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
 
-    # Multiplex profiles: tell the built-in ticker which profile homes to
-    # tick so secondary-profile cron jobs actually fire (#69377).
-    # Without this, only the process-global HERMES_HOME (default profile)
-    # is iterated and every secondary profile's cron store is silently
-    # ignored — jobs show as "scheduled" with a valid next_run_at but
-    # never execute because no ticker owns that store.
-    if (
-        isinstance(cron_provider, InProcessCronScheduler)
-        and multiplex_cron
-    ):
-        try:
-            profile_homes = _multiplex_profile_homes(runner.config)
-            if profile_homes:
-                cron_start_kwargs["profile_homes"] = profile_homes
-                logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
-                    len(profile_homes),
-                    [p[0] if isinstance(p, tuple) else p for p in profile_homes],
-                )
-        except Exception as exc:
-            logger.warning(
-                "Could not resolve profile homes for multiplex cron: %s",
-                exc,
-            )
+    # Secondary stores need their own runtime, secret and adapter scope. The
+    # process-global provider therefore remains owner-profile-only.
 
     # External cron providers own their remote scheduling contract. Only the
     # in-process ticker polls local due jobs, so only it receives the local
@@ -31269,6 +31389,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="cron-scheduler",
     )
     cron_thread.start()
+    secondary_cron_handles = (
+        _start_secondary_profile_cron_schedulers(
+            runner,
+            cron_stop,
+            loop=asyncio.get_running_loop(),
+        )
+        if multiplex_cron
+        else []
+    )
 
     # Preflight tell for the hosted fire path: an external cron provider
     # (Chronos) delivers scheduled fires over HTTP to THIS process's
@@ -31356,11 +31485,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # delivery finishes before we tear down.
     cron_stop.set()
     _stop_cron_provider(cron_provider)
+    for profile_cron_provider, _profile_cron_thread in secondary_cron_handles:
+        _stop_cron_provider(profile_cron_provider)
     if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
         logger.warning(
             "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
             "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
         )
+    for _profile_cron_provider, profile_cron_thread in secondary_cron_handles:
+        if not await _await_thread_exit(
+            profile_cron_thread,
+            timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT,
+        ):
+            logger.warning(
+                "Profile cron ticker %s did not exit within %.0fs of shutdown.",
+                profile_cron_thread.name,
+                _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+            )
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )

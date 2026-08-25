@@ -74,9 +74,43 @@ def test_format_footer_skips_missing_context_length():
     assert "/tmp/wd" in out
 
 
+def test_format_footer_duration_uses_russian_timer_line():
+    out = format_runtime_footer(
+        model="m",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        fields=("duration",),
+        duration_seconds=54.04,
+    )
+    assert out == "⏱ Думал 54.0 сек"
+
+
+def test_format_footer_duration_reuses_turn_measurement():
+    out = format_runtime_footer(
+        model="m",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        fields=("duration",),
+        turn_seconds=54.04,
+    )
+    assert out == "⏱ Думал 54.0 сек"
+
+
 # ---------------------------------------------------------------------------
 # resolve_footer_config
 # ---------------------------------------------------------------------------
+
+
+def test_resolve_fields_accepts_config_cli_json_string():
+    user = {
+        "display": {
+            "runtime_footer": {"enabled": True, "fields": '["duration"]'}
+        }
+    }
+    cfg = resolve_footer_config(user, "telegram")
+    assert cfg["fields"] == ["duration"]
 
 
 def test_resolve_platform_override_wins():

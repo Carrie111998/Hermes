@@ -245,3 +245,88 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+    def test_real_sdk_annotations_read_only_hint_survives_2x_rename(self):
+        pytest.importorskip("mcp.types")
+        from mcp.types import ToolAnnotations
+
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=ToolAnnotations(readOnlyHint=True))
+        ) is True
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=ToolAnnotations(readOnlyHint=False))
+        ) is False
+
+    def test_real_sdk_tool_read_only_hint_captured_at_registration(self):
+        pytest.importorskip("mcp.types")
+        from mcp.types import Tool, ToolAnnotations
+        from tools.registry import ToolRegistry
+
+        server = mcp_tool.MCPServerTask("srv-sdk")
+        server.session = MagicMock()
+        server._tools = [
+            Tool(
+                name="list_repos",
+                description="",
+                inputSchema={"type": "object"},
+                annotations=ToolAnnotations(readOnlyHint=True),
+            ),
+            Tool(
+                name="delete_repo",
+                description="",
+                inputSchema={"type": "object"},
+                annotations=ToolAnnotations(readOnlyHint=False),
+            ),
+        ]
+        config = {
+            "trust": "untrusted",
+            "tools": {"resources": False, "prompts": False},
+        }
+        with patch("tools.registry.registry", ToolRegistry()), \
+             patch("tools.mcp_tool._track_mcp_tool_server"):
+            mcp_tool._register_server_tools("srv-sdk", server, config)
+
+        hints = mcp_tool._tool_read_only_hints["srv-sdk"]
+        assert hints.get("list_repos") is True
+        assert hints.get("delete_repo") is False
+
+    def test_real_sdk_tool_input_schema_survives_2x_rename_in_cache_write_through(self):
+        pytest.importorskip("mcp.types")
+        from mcp.types import Tool
+        from tools.registry import ToolRegistry
+
+        real_schema = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        server = mcp_tool.MCPServerTask("srv-schema")
+        server.session = MagicMock()
+        server._tools = [
+            Tool(
+                name="read_file",
+                description="Read a file",
+                inputSchema=real_schema,
+            )
+        ]
+        config = {
+            "trust": "full",
+            "tools": {"resources": False, "prompts": False},
+        }
+        captured = {}
+
+        def _capture_write(_name, _fingerprint, **kwargs):
+            captured["tools"] = kwargs["tools"]
+
+        with patch("tools.registry.registry", ToolRegistry()), \
+             patch("tools.mcp_tool._track_mcp_tool_server"), \
+             patch(
+                 "tools.mcp_schema_cache.write_cache_entry",
+                 side_effect=_capture_write,
+             ):
+            mcp_tool._register_server_tools("srv-schema", server, config)
+
+        entry = next(
+            item for item in captured["tools"] if item["name"] == "read_file"
+        )
+        assert entry["inputSchema"] == real_schema

@@ -1183,6 +1183,34 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
 
 
+@pytest.mark.asyncio
+async def test_telegram_streaming_keeps_status_separate_from_final(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-telegram-status-separate-final",
+        config_data={
+            "display": {"interim_assistant_messages": True},
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.TELEGRAM,
+    )
+
+    # The temporary status was created and updated, but the completed answer
+    # remains for the gateway's normal final-delivery path. This is what makes
+    # cleanup_progress safe: deleting the status cannot delete the answer.
+    assert result.get("already_sent") is not True
+    assert [call["content"] for call in adapter.sent] == [
+        "I'll inspect the repo first."
+    ]
+    assert all(edit["content"] != "done" for edit in adapter.edits)
+
+
 class TransformedStreamAgent:
     """Streams a response, then signals the gateway that a plugin hook
     (``transform_llm_output``) modified the final text after streaming

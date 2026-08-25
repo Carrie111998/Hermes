@@ -2921,6 +2921,35 @@ def terminal_tool(
         # owned, no supervisor) now also PASSES this guard: intentional and
         # harmless, since without a supervisor there is no KeepAlive to turn a
         # self-restart into a respawn loop.
+        # Every agent turn shares the same service boundary, including CLI,
+        # serve/Desktop and standalone cron contexts. Block direct lifecycle
+        # commands and numeric signals before the narrower supervised-gateway
+        # referenced-script scan below.
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command,
+            kill_targets_gateway_main_pid,
+        )
+
+        if contains_gateway_lifecycle_command(command) or kill_targets_gateway_main_pid(command):
+            logger.warning(
+                "Blocked gateway-lifecycle command from an agent turn: %s",
+                _safe_command_preview(command),
+            )
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": 1,
+                    "error": (
+                        "Blocked: an agent turn may not restart, stop, install, "
+                        "uninstall, enable, disable, or signal the shared Hermes "
+                        "gateway. Ask the owner to perform the lifecycle action "
+                        "from a shell outside Hermes."
+                    ),
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+
         from tools.process_registry import _is_supervised_gateway_process
 
         if _is_supervised_gateway_process():

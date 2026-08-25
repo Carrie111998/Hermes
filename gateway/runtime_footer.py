@@ -34,11 +34,28 @@ piecemeal, the footer is sent as a separate trailing message via
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+
+
+def _normalise_fields(value: Any) -> list[str] | None:
+    """Accept the documented YAML list plus config-CLI JSON-list strings."""
+    if isinstance(value, list) and value:
+        return [str(field) for field in value]
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, list) and parsed:
+            return [str(field) for field in parsed]
+        return [text]
+    return None
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -80,8 +97,9 @@ def resolve_footer_config(
     if isinstance(global_cfg, dict):
         if "enabled" in global_cfg:
             resolved["enabled"] = bool(global_cfg.get("enabled"))
-        if isinstance(global_cfg.get("fields"), list) and global_cfg["fields"]:
-            resolved["fields"] = [str(f) for f in global_cfg["fields"]]
+        normalised = _normalise_fields(global_cfg.get("fields"))
+        if normalised:
+            resolved["fields"] = normalised
 
     if platform_key:
         platforms = cfg.get("platforms") or {}
@@ -91,8 +109,9 @@ def resolve_footer_config(
             if isinstance(plat_footer, dict):
                 if "enabled" in plat_footer:
                     resolved["enabled"] = bool(plat_footer.get("enabled"))
-                if isinstance(plat_footer.get("fields"), list) and plat_footer["fields"]:
-                    resolved["fields"] = [str(f) for f in plat_footer["fields"]]
+                normalised = _normalise_fields(plat_footer.get("fields"))
+                if normalised:
+                    resolved["fields"] = normalised
 
     return resolved
 
@@ -116,6 +135,7 @@ def format_runtime_footer(
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    duration_seconds: Optional[float] = None,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
@@ -123,6 +143,9 @@ def format_runtime_footer(
     partially-populated footer is better than a line with ``?%`` or empty slots.
     """
     parts: list[str] = []
+    duration_value = (
+        duration_seconds if duration_seconds is not None else turn_seconds
+    )
     for field in fields:
         if field == "model":
             m = _model_short(model)
@@ -141,6 +164,9 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "duration":
+            if duration_value is not None and duration_value >= 0:
+                parts.append(f"⏱ Думал {duration_value:.1f} сек")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -157,6 +183,7 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    duration_seconds: Optional[float] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -178,4 +205,5 @@ def build_footer_line(
         cwd=cwd,
         turn_seconds=turn_seconds,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        duration_seconds=duration_seconds,
     )

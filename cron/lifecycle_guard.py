@@ -44,7 +44,10 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import stat
+import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -58,6 +61,11 @@ class GatewayLifecycleBlocked(ValueError):
 # Shell-level command shapes that target the gateway lifecycle. Each branch
 # is anchored on a concrete command identifier so a match can only fire on
 # actual shell-command-shaped strings, not on prose.
+_KILL_AT_COMMAND_POSITION = (
+    r"(?:\A|[;&|(){}\n])[ \t]*(?:sudo[ \t]+(?:-\S+[ \t]+)*)?p?kill\b"
+)
+
+
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
     # Branch A: destructive `hermes gateway` operations.
@@ -71,7 +79,7 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # matching via the `/hermes` tail, while every real command position
     # (start of text, whitespace, `;`/`&`/`|`, `$(`, backtick, even a
     # U+FFFD from binary-content decoding) still matches.
-    r"(?:(?<![/\w.\-])hermes\s+gateway\s+(?:restart|stop|uninstall)\b)"
+    r"(?:(?<![/\w.\-])hermes[ \t]+(?:(?!gateway\b)\S+[ \t]+)*gateway[ \t]+(?:restart|stop|install|uninstall)\b)"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -93,14 +101,68 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # "force=True cannot help here" — let them through (#80260).
     r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch C: systemctl ops on a hermes-gateway unit.
-    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
+    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start|enable|disable)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
     # Leading \b ensures we match "pkill" or "kill" as whole words, not as
     # suffixes of other words (e.g. "skill" -> "kill").
-    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    rf"|(?:{_KILL_AT_COMMAND_POSITION}[^\n]*\bhermes[.\-]?gateway)"
+    rf"|(?:\bhermes[.\-]?gateway\b[^\n]*{_KILL_AT_COMMAND_POSITION})"
 )
+
+_KILL_COMMAND_RE = re.compile(_KILL_AT_COMMAND_POSITION, re.IGNORECASE)
+_MAIN_PID_TTL_SECONDS = 5.0
+_main_pid_cache = (0.0, None)
+
+
+def _resolve_gateway_main_pid():
+    """Return the supervised gateway MainPID, or ``None`` on any failure."""
+    global _main_pid_cache
+    now = time.monotonic()
+    stamp, cached = _main_pid_cache
+    if cached is not None and (now - stamp) < _MAIN_PID_TTL_SECONDS:
+        return cached
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return None
+    try:
+        from hermes_cli.gateway import get_service_name
+
+        service = get_service_name()
+    except Exception:
+        service = "hermes-gateway"
+    for scope in (["--user"], []):
+        try:
+            result = subprocess.run(
+                [
+                    systemctl,
+                    *scope,
+                    "show",
+                    service,
+                    "--property=MainPID",
+                    "--value",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        value = (result.stdout or "").strip()
+        if value.isdigit() and int(value) > 0:
+            _main_pid_cache = (now, int(value))
+            return int(value)
+    return None
+
+
+def kill_targets_gateway_main_pid(text: str) -> bool:
+    """Fail-open numeric-PID companion to the command-shaped text guard."""
+    if not text or not _KILL_COMMAND_RE.search(text):
+        return False
+    pid = _resolve_gateway_main_pid()
+    if not pid:
+        return False
+    return re.search(r"(?<![0-9])" + str(pid) + r"(?![0-9])", text) is not None
 
 
 # A backslash immediately followed by a newline is a POSIX shell line

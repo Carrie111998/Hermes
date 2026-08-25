@@ -20988,3 +20988,12 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_project_tree_excludes_internal_worker_sources():
+    assert set(server._PROJECT_TREE_EXCLUDED_SOURCES) == {
+        "cron",
+        "kanban",
+        "tool",
+        "subagent",
+    }

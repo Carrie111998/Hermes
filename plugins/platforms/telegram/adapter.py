@@ -227,7 +227,6 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
 
-
 def _flood_cap_result(wait: float) -> "SendResult":
     """The shared fail-closed SendResult for an over-cap flood wait."""
     return SendResult(
@@ -319,6 +318,40 @@ def _probe_voice_duration_seconds(path: str) -> Optional[int]:
         pass
 
     return None
+
+
+def _coerce_dm_topics(raw: Any, adapter_name: str = "Telegram") -> List[Dict[str, Any]]:
+    """Normalize YAML or JSON-string DM topic configuration."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "[%s] extra.dm_topics is not valid JSON (%s); DM topics disabled.",
+                adapter_name,
+                exc,
+            )
+            return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        logger.warning(
+            "[%s] extra.dm_topics has unsupported type %s; DM topics disabled.",
+            adapter_name,
+            type(raw).__name__,
+        )
+        return []
+    entries = [entry for entry in raw if isinstance(entry, dict)]
+    dropped = len(raw) - len(entries)
+    if dropped:
+        logger.warning(
+            "[%s] extra.dm_topics ignored %d non-object entries.",
+            adapter_name,
+            dropped,
+        )
+    return entries
 
 
 def telegram_deps_present() -> bool:
@@ -809,12 +842,29 @@ class TelegramAdapter(BasePlatformAdapter):
         self._status_offline_text: str = str(
             self.config.extra.get("status_offline", "Offline")
         )
-        # DM Topics config from extra.dm_topics
-        self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
+        # DM Topics config from extra.dm_topics. Coerced because config.yaml may
+        # deliver it as a JSON string rather than a YAML sequence.
+        self._dm_topics_config: List[Dict[str, Any]] = _coerce_dm_topics(
+            self.config.extra.get("dm_topics", []), self.name
+        )
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
         self._dm_topic_chat_ids: Set[str] = {
-            str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e
+            str(e["chat_id"])
+            for e in self._dm_topics_config
+            if isinstance(e, dict) and "chat_id" in e
         }
+        # A configured-but-unreadable dm_topics used to fail silently: ``"chat_id"
+        # in e`` is a substring test on a str entry, so the set came out empty
+        # with no diagnostic at all. Say so instead of degrading quietly.
+        if self._dm_topics_config and not self._dm_topic_chat_ids:
+            logger.warning(
+                "[%s] dm_topics is configured (%d entr%s) but no chat_id could be "
+                "read from it - root-DM ignore and topic setup will be skipped. "
+                "Expected a list of {chat_id, topics} objects.",
+                self.name,
+                len(self._dm_topics_config),
+                "y" if len(self._dm_topics_config) == 1 else "ies",
+            )
         # Document size cap. Telegram's public Bot API caps getFile at 20MB; a
         # locally-hosted telegram-bot-api server (configured via extra.base_url)
         # raises that to 2GB, so the presence of base_url is the opt-in.
@@ -5220,7 +5270,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if self._should_attempt_rich(
+                content, metadata=metadata
+            ):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -5237,21 +5289,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix. Escape the
-                # MarkdownV2-special parentheses so Telegram doesn't reject the
-                # chunk and fall back to plain text.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(
-                        re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
-                    )
-                    for chunk in chunks
-                ]
+            # Convert Markdown to safe Telegram HTML, then split only on block
+            # boundaries. Every chunk contains balanced code/pre tags.
+            chunks = self._html_chunks(content)
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
@@ -5319,22 +5359,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
+                        # Try Telegram HTML first, fall back to plain text if it fails
                         try:
                             msg = await self._bot.send_message(
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
+                                parse_mode=ParseMode.HTML,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
-                        except Exception as md_error:
-                            # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
+                        except Exception as html_error:
+                            # HTML parsing failed, try clean plain text.
+                            if "parse" in str(html_error).lower() or "entity" in str(html_error).lower():
+                                logger.warning("[%s] HTML parse failed, falling back to plain text: %s", self.name, html_error)
+                                plain_chunk = _html.unescape(re.sub(r"<[^>]+>", "", chunk))
                                 msg = await self._bot.send_message(
                                     chat_id=normalize_telegram_chat_id(chat_id),
                                     text=plain_chunk,
@@ -5657,26 +5697,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
 
-            formatted = self.format_message(content)
+            formatted = self.format_message_html(content)
             try:
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=formatted,
-                    parse_mode=ParseMode.MARKDOWN_V2,
+                    parse_mode=ParseMode.HTML,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
-                # Fallback: strip MarkdownV2 escapes and retry as clean plain text
+                # Fallback: strip HTML tags and retry as clean plain text.
                 safe_format_error = _redact_telegram_error_text(fmt_err)
                 logger.warning(
-                    "[%s] MarkdownV2 edit failed, falling back to plain text: %s",
+                    "[%s] HTML edit failed, falling back to plain text: %s",
                     self.name,
                     safe_format_error,
                 )
-                _plain = _strip_mdv2(content) if content else content
+                _plain = _html.unescape(re.sub(r"<[^>]+>", "", formatted)) if content else content
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
@@ -8394,6 +8434,200 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
 
+    def format_message_html(self, content: str) -> str:
+        """Convert agent Markdown to Telegram-safe HTML.
+
+        User text is escaped before supported markup is inserted. In ordinary
+        text only ``&``, ``<`` and ``>`` need escaping for Telegram HTML.
+        Code, preformatted blocks and link attributes are escaped separately.
+        """
+        if not content:
+            return content
+
+        placeholders: dict[str, str] = {}
+        counter = [0]
+        placeholder_prefix = "\x00HT"
+        while placeholder_prefix in content:
+            placeholder_prefix += "X"
+
+        def _ph(value: str) -> str:
+            key = f"{placeholder_prefix}{counter[0]}\x00"
+            counter[0] += 1
+            placeholders[key] = value
+            return key
+
+        text = _wrap_markdown_tables(content)
+
+        def _fenced(m):
+            lang = (m.group(1) or "").strip()
+            body = m.group(2)
+            escaped = _html.escape(body, quote=False)
+            if lang and re.fullmatch(r"[A-Za-z0-9_+.-]+", lang):
+                cls = _html.escape(f"language-{lang}", quote=True)
+                return _ph(f'<pre><code class="{cls}">{escaped}</code></pre>')
+            return _ph(f"<pre>{escaped}</pre>")
+
+        text = re.sub(
+            r"```([^\n`]*)\n([\s\S]*?)```",
+            _fenced,
+            text,
+        )
+        text = re.sub(
+            r"`([^`\n]+)`",
+            lambda m: _ph(f"<code>{_html.escape(m.group(1), quote=False)}</code>"),
+            text,
+        )
+
+        def _link(m):
+            label = _html.escape(m.group(1), quote=False)
+            href = _html.escape(m.group(2), quote=True)
+            return _ph(f'<a href="{href}">{label}</a>')
+
+        text = re.sub(
+            r"\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)",
+            _link,
+            text,
+        )
+
+        # Escape all remaining user/model text before adding Telegram HTML tags.
+        text = _html.escape(text, quote=False)
+        def _header(m):
+            inner = m.group(1).strip()
+            inner = re.sub(r"^\*\*(.*?)\*\*$", r"\1", inner)
+            return f"<b>{inner}</b>"
+
+        text = re.sub(
+            r"^#{1,6}\s+(.+)$",
+            _header,
+            text,
+            flags=re.MULTILINE,
+        )
+        text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
+        text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+        text = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
+        text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
+        text = re.sub(r"^\s*[-*]\s+", "• ", text, flags=re.MULTILINE)
+
+        for key in reversed(list(placeholders.keys())):
+            text = text.replace(key, placeholders[key])
+        return text
+
+    def _html_chunks(self, content: str) -> list[str]:
+        """Format and split Markdown on block boundaries for Telegram HTML.
+
+        Fenced code blocks are atomic whenever they fit. Oversized code blocks
+        are split only at source line boundaries and each resulting chunk gets
+        its own complete ``pre/code`` wrapper, so HTML tags are never torn.
+        """
+        target = max(32, min(4000, int(self.MAX_MESSAGE_LENGTH) - 32))
+        lines = content.splitlines(keepends=True)
+        blocks: list[str] = []
+        buf: list[str] = []
+        in_fence = False
+
+        def flush() -> None:
+            if buf:
+                blocks.append("".join(buf))
+                buf.clear()
+
+        for line in lines:
+            if line.lstrip().startswith("```"):
+                if not in_fence:
+                    flush()
+                    in_fence = True
+                    buf.append(line)
+                else:
+                    buf.append(line)
+                    in_fence = False
+                    flush()
+                continue
+            if in_fence:
+                buf.append(line)
+            elif not line.strip():
+                flush()
+            else:
+                buf.append(line)
+        flush()
+
+        def split_large_plain(block: str) -> list[str]:
+            words = re.findall(r"\S+\s*", block)
+            parts: list[str] = []
+            current = ""
+
+            def split_overlong_token(token: str) -> list[str]:
+                token_parts: list[str] = []
+                token_current = ""
+                for char in token:
+                    candidate = token_current + char
+                    if (
+                        token_current
+                        and utf16_len(self.format_message_html(candidate)) > target
+                    ):
+                        token_parts.append(token_current)
+                        token_current = char
+                    else:
+                        token_current = candidate
+                if token_current:
+                    token_parts.append(token_current)
+                return token_parts
+
+            for word in words:
+                if utf16_len(self.format_message_html(word)) > target:
+                    if current:
+                        parts.append(current.rstrip())
+                        current = ""
+                    parts.extend(split_overlong_token(word))
+                    continue
+                candidate = current + word
+                if current and utf16_len(self.format_message_html(candidate)) > target:
+                    parts.append(current.rstrip())
+                    current = word
+                else:
+                    current = candidate
+            if current.strip():
+                parts.append(current.rstrip())
+            return parts or [block]
+
+        expanded: list[str] = []
+        for block in blocks or [content]:
+            if utf16_len(self.format_message_html(block)) <= target:
+                expanded.append(block)
+                continue
+            fence = re.fullmatch(r"```([^\n`]*)\n([\s\S]*?)```\s*", block)
+            if not fence:
+                expanded.extend(split_large_plain(block))
+                continue
+            lang, body = fence.group(1), fence.group(2)
+            current_lines: list[str] = []
+            for source_line in body.splitlines(keepends=True):
+                candidate_body = "".join(current_lines) + source_line
+                candidate = f"```{lang}\n{candidate_body}```"
+                if current_lines and utf16_len(self.format_message_html(candidate)) > target:
+                    expanded.append(f"```{lang}\n{''.join(current_lines)}```")
+                    current_lines = [source_line]
+                else:
+                    current_lines.append(source_line)
+            if current_lines:
+                expanded.append(f"```{lang}\n{''.join(current_lines)}```")
+
+        raw_chunks: list[str] = []
+        current = ""
+        for block in expanded:
+            candidate = block if not current else f"{current}\n\n{block}"
+            if current and utf16_len(self.format_message_html(candidate)) > target:
+                raw_chunks.append(current)
+                current = block
+            else:
+                current = candidate
+        if current:
+            raw_chunks.append(current)
+
+        chunks = [self.format_message_html(chunk) for chunk in raw_chunks]
+        if len(chunks) > 1:
+            chunks = [f"{chunk}\n\n({i}/{len(chunks)})" for i, chunk in enumerate(chunks, 1)]
+        return chunks
+
     def format_message(self, content: str) -> str:
         """
         Convert standard markdown to Telegram MarkdownV2 format.
@@ -10319,11 +10553,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._dm_topic_chat_ids = set()
                 return
 
-            # Update in-memory config and cache any new thread_ids
+            # Update in-memory config and cache any new thread_ids. Coerce here
+            # too: a config reload re-reads the same JSON-string shape.
+            dm_topics = _coerce_dm_topics(dm_topics, self.name)
             self._dm_topics_config = dm_topics
             # Rebuild the chat_id set for O(1) root-DM ignore lookup
             self._dm_topic_chat_ids = {
-                str(chat_entry["chat_id"]) for chat_entry in dm_topics if "chat_id" in chat_entry
+                str(chat_entry["chat_id"])
+                for chat_entry in dm_topics
+                if isinstance(chat_entry, dict) and "chat_id" in chat_entry
             }
             for chat_entry in dm_topics:
                 cid = chat_entry.get("chat_id")

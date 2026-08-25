@@ -831,6 +831,44 @@ class TestInterimCommentaryMessages:
         assert sent_texts == ["I'll inspect the repository first.", "Done."]
         assert consumer.final_response_sent is True
 
+    @pytest.mark.asyncio
+    async def test_commentary_edit_in_place_reuses_status_for_final(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="status_1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="status_1")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(
+                edit_interval=0.01,
+                buffer_threshold=5,
+                commentary_edit_in_place=True,
+            ),
+        )
+
+        consumer.on_commentary("🔎 Проверяю…")
+        consumer.on_commentary("🧩 Собираю ответ…")
+        consumer.on_delta("Готово.")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert adapter.send.call_count == 1
+        assert adapter.send.call_args.kwargs["content"] == "🔎 Проверяю…"
+        edited_texts = [
+            call.kwargs["content"]
+            for call in adapter.edit_message.call_args_list
+        ]
+        assert "🧩 Собираю ответ…" in edited_texts
+        assert edited_texts[-1] == "Готово."
+        assert consumer.final_response_sent is True
+
 
 class TestCancelledConsumerSetsFlags:
     """Cancellation must set final_response_sent when already_sent is True.
@@ -1487,4 +1525,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-

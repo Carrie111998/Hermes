@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import utf16_len
+from telegram.constants import ParseMode
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +441,7 @@ class TestFormatMessageTables:
 
 
 @pytest.mark.asyncio
-async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
+async def test_send_uses_html_chunk_indicators(adapter):
     adapter.MAX_MESSAGE_LENGTH = 80
     adapter._bot = MagicMock()
 
@@ -458,8 +460,66 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
 
     assert result.success is True
     assert len(sent_texts) > 1
-    assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[0])
-    assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])
+    assert re.search(r"\([0-9]+/[0-9]+\)$", sent_texts[0])
+    assert adapter._bot.send_message.await_args_list[0].kwargs["parse_mode"] == ParseMode.HTML
+    assert re.search(r"\([0-9]+/[0-9]+\)$", sent_texts[-1])
+
+
+@pytest.mark.asyncio
+async def test_html_special_characters_and_code_deliver_without_fallback(adapter):
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=77))
+    content = "Спецсимволы: . ! - ( ) # + = | { } &\n\n`x < 3 && y > 1`"
+
+    result = await adapter.send("123", content)
+
+    assert result.success is True
+    assert adapter._bot.send_message.await_count == 1
+    call = adapter._bot.send_message.await_args.kwargs
+    assert call["parse_mode"] == ParseMode.HTML
+    assert "&amp;" in call["text"]
+    assert "<code>x &lt; 3 &amp;&amp; y &gt; 1</code>" in call["text"]
+
+
+@pytest.mark.asyncio
+async def test_html_long_answer_splits_on_blocks_with_balanced_pre_tags(adapter):
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(
+        side_effect=[SimpleNamespace(message_id=i) for i in range(1, 10)]
+    )
+    paragraph = "Длинный блок текста. " * 120
+    content = f"{paragraph}\n\n```python\nprint('код')\n```\n\n{paragraph}"
+
+    result = await adapter.send("123", content)
+
+    assert result.success is True
+    calls = adapter._bot.send_message.await_args_list
+    assert len(calls) >= 2
+    for call in calls:
+        text = call.kwargs["text"]
+        assert utf16_len(text) <= adapter.MAX_MESSAGE_LENGTH
+        assert text.count("<pre") == text.count("</pre>")
+        assert text.count("<code") == text.count("</code>")
+        assert call.kwargs["parse_mode"] == ParseMode.HTML
+
+
+@pytest.mark.asyncio
+async def test_html_long_unbroken_token_stays_within_limit(adapter):
+    adapter.MAX_MESSAGE_LENGTH = 80
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(
+        side_effect=lambda **kwargs: SimpleNamespace(
+            message_id=adapter._bot.send_message.await_count
+        )
+    )
+
+    result = await adapter.send("123", "x" * 500)
+
+    assert result.success is True
+    assert adapter._bot.send_message.await_count > 1
+    for call in adapter._bot.send_message.await_args_list:
+        assert utf16_len(call.kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert call.kwargs["parse_mode"] == ParseMode.HTML
 
 
 # =========================================================================
@@ -468,6 +528,29 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
 
 
 class TestEditMessageStreamingSafety:
+
+    @pytest.mark.asyncio
+    async def test_final_edit_uses_html_with_plain_fallback(self):
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock(
+            side_effect=[Exception("can't parse entities"), None]
+        )
+
+        result = await adapter.edit_message(
+            "123", "456", "final **bold**", finalize=True
+        )
+
+        assert result.success is True
+        first_call = adapter._bot.edit_message_text.await_args_list[0].kwargs
+        second_call = adapter._bot.edit_message_text.await_args_list[1].kwargs
+        assert first_call["text"] == "final <b>bold</b>"
+        assert first_call["parse_mode"] == ParseMode.HTML
+        assert second_call == {
+            "chat_id": 123,
+            "message_id": 456,
+            "text": "final bold",
+        }
 
 
     @pytest.mark.asyncio

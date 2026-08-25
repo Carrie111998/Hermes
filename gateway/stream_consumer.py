@@ -159,6 +159,9 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+    # Reuse one editable commentary bubble as live status. Callers may replace
+    # it with final text; Telegram keeps it temporary and sends final separately.
+    commentary_edit_in_place: bool = False
 
 
 class GatewayStreamConsumer:
@@ -1289,20 +1292,27 @@ class GatewayStreamConsumer:
                     return
 
                 if commentary_text is not None:
-                    # Stream-is-the-message adapters: commentary posts as its
-                    # own message (no notify → no seal-interception), and the
-                    # native stream continues cumulatively. Resetting here
-                    # would break the append-only invariant the connector's
-                    # delta computation depends on (whole-snapshot re-append).
-                    _stream_is_msg_c = self._stream_is_message()
-                    if _stream_is_msg_c and self._use_draft_streaming:
-                        await self._send_commentary(commentary_text)
+                    if self.cfg.commentary_edit_in_place:
+                        # Operational commentary is a live status, not durable
+                        # transcript content. Reuse the same message for every
+                        # status and, when deltas are enabled, the final answer.
+                        self._accumulated = ""
+                        await self._upsert_commentary(commentary_text)
                         self._last_edit_time = time.monotonic()
                     else:
-                        self._reset_segment_state()
-                        await self._send_commentary(commentary_text)
-                        self._last_edit_time = time.monotonic()
-                        self._reset_segment_state()
+                        # Stream-is-the-message adapters: commentary posts as
+                        # its own message while the native stream continues
+                        # cumulatively. Resetting would break its append-only
+                        # delta invariant.
+                        _stream_is_msg_c = self._stream_is_message()
+                        if _stream_is_msg_c and self._use_draft_streaming:
+                            await self._send_commentary(commentary_text)
+                            self._last_edit_time = time.monotonic()
+                        else:
+                            self._reset_segment_state()
+                            await self._send_commentary(commentary_text)
+                            self._last_edit_time = time.monotonic()
+                            self._reset_segment_state()
 
                 # Tool boundary: reset message state so the next text chunk
                 # creates a fresh message below any tool-progress messages.
@@ -2099,6 +2109,42 @@ class GatewayStreamConsumer:
             return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)
+            return False
+
+    async def _upsert_commentary(self, text: str) -> bool:
+        """Create or edit the single live-status bubble in place."""
+        text = self._clean_for_display(text)
+        if not text.strip():
+            return False
+        try:
+            if self._message_id and self._message_id != "__no_edit__":
+                # Keep Telegram status edits inside its roughly one-edit/second
+                # envelope. The adapter also honours RetryAfter as a fallback.
+                min_interval = max(float(self.cfg.edit_interval or 0.0), 0.8)
+                elapsed = time.monotonic() - self._last_edit_time
+                if elapsed < min_interval:
+                    await asyncio.sleep(min_interval - elapsed)
+                result = await self._edit_message(
+                    message_id=self._message_id,
+                    content=text,
+                )
+            else:
+                result = await self.adapter.send(
+                    chat_id=self.chat_id,
+                    content=text,
+                    metadata=self._metadata_for_send(expect_edits=True),
+                )
+                if result.success and result.message_id:
+                    self._message_id = str(result.message_id)
+                    self._message_created_ts = time.monotonic()
+                    self._track_preview_ids_from_result(result)
+                    self._notify_new_message()
+            if result.success:
+                self._last_sent_text = text
+                self._delivered_commentary_texts.append(text)
+            return bool(result.success)
+        except Exception as e:
+            logger.error("Commentary upsert error: %s", e)
             return False
 
     def _should_send_fresh_final(self) -> bool:
