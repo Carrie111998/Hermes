@@ -172,3 +172,45 @@ def test_grounding_route_is_visible_in_success_result(image_tool):
 
     assert payload["success"] is True
     assert payload.get("grounding_route") == "managed_gateway_forced_by_local_reference"
+
+
+def test_stale_nous_upload_token_error_has_context_and_setup_guidance(image_tool, tmp_path, monkeypatch):
+    """PR #94307 review Note 1: when arguments already contain a nous-upload:
+    token (i.e. a local source was already uploaded) but managed access is
+    now unavailable, the error must (a) stay explicit about the stale/managed
+    -token situation, (b) reuse the normal actionable setup/remediation
+    guidance from `_build_no_backend_setup_message()`, and (c) the direct FAL
+    route must never receive the managed token."""
+    model_id = "fal-ai/flux-2/klein/9b"
+    meta = image_tool.FAL_MODELS[model_id]
+    direct_client = Mock()
+    direct_client.submit.side_effect = AssertionError("direct route was reached")
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    patches = _generation_patches(image_tool, meta)
+    with patches[0], patches[1], patches[2], \
+         patch.object(image_tool, "_resolve_fal_model", return_value=(model_id, meta)), \
+         patch.object(image_tool, "resolve_managed_tool_gateway", return_value=None), \
+         patch.object(image_tool, "fal_client", direct_client):
+        # Simulate arguments that already carry a stale nous-upload: token
+        # (e.g. a previously-uploaded reference) by feeding it straight in
+        # as the image_url — `_upload_local_fal_sources` is bypassed because
+        # a nous-upload: string is not a local path, so it flows straight
+        # into the `_contains_managed_upload` gate unchanged.
+        payload = json.loads(image_tool.image_generate_tool(
+            "edit it", image_url="nous-upload:stale-token",
+        ))
+
+    assert payload["success"] is False
+    error = payload["error"]
+    # Explicit about the stale/managed-token condition.
+    assert "nous-upload:" in error
+    assert "managed FAL" in error
+    assert "unavailable" in error
+    assert "stale" in error.lower() or "lost managed access" in error.lower()
+    # Reuses the normal actionable setup/remediation guidance verbatim
+    # (via `_build_no_backend_setup_message()`), not a duplicated blurb.
+    setup_message = image_tool._build_no_backend_setup_message()
+    assert setup_message in error
+    # The direct FAL route must never be reached / never receive the token.
+    direct_client.submit.assert_not_called()

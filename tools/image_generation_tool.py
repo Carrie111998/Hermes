@@ -911,7 +911,12 @@ def _contains_managed_upload(value: Any) -> bool:
 
 
 def _is_local_image_source(value: Any) -> bool:
-    """Identify path-like sources without changing URL/data/token handling."""
+    """Identify path-like sources without changing URL/data/token handling.
+
+    By contract, callers only ever pass a URL, a ``data:`` URI, a
+    ``nous-upload:`` token, or a local filesystem path — this treats
+    anything not matching one of the recognized non-local schemes as local.
+    """
     if not isinstance(value, str) or not value.strip():
         return False
     source = value.strip().lower()
@@ -1366,7 +1371,8 @@ def image_generate_tool(
             if resolve_managed_tool_gateway("fal-queue") is None:
                 raise ValueError(
                     "A nous-upload: image reference requires managed FAL "
-                    "gateway access, but it is unavailable."
+                    "gateway access, but it is unavailable (stale token or "
+                    "lost managed access).\n\n" + _build_no_backend_setup_message()
                 )
         elif not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
             raise ValueError(_build_no_backend_setup_message())
