@@ -3325,12 +3325,16 @@ class ContextCompressor(ContextEngine):
         # strictly better than discarding context for a transient blip
         # (#29559, #25585). Independent of abort_on_summary_failure.
         self._last_summary_network_failure: bool = False
-        # Set when the summarizer returns a well-formed response with empty
-        # content (see the guard in _generate_summary): the provider is
-        # degraded/broken, not permanently misconfigured, so compress() must
-        # ABORT and preserve the session unchanged rather than drop the
-        # middle window for a placeholder marker (#94448). Retrying once the
-        # provider recovers is strictly better than destroying context.
+        # Set when the summarizer produced no usable checkpoint at all: a
+        # well-formed response with empty content (see the guard in
+        # _generate_summary), or the auxiliary boundary's own "no usable
+        # response" terminal errors — None response / invalid response with
+        # missing or malformed choices (_validate_llm_response, #7264). All
+        # three shapes mean the provider is degraded/broken, not permanently
+        # misconfigured, so compress() must ABORT and preserve the session
+        # unchanged rather than drop the middle window for a placeholder
+        # marker (#94448). Retrying once the provider recovers is strictly
+        # better than destroying context.
         self._last_summary_empty_content_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
@@ -5145,14 +5149,21 @@ This compaction should PRIORITISE preserving all information related to the focu
             # back to the main model instead of entering a 60-second cooldown.
             # See issue #18458.
             _is_streaming_closed = _is_connection_error(e)
-            # The empty-content guard above raises a RuntimeError with this
-            # exact message; distinguish it from other RuntimeErrors (e.g.
-            # "no LLM provider configured", handled earlier) so a genuinely
-            # empty response from a degraded provider can be flagged for the
-            # abort path below instead of falling into the destructive
-            # generic-failure branch (#94448).
-            _is_empty_content = (
-                isinstance(e, RuntimeError) and "returned empty content" in _err_str
+            # The empty-content guard above raises a RuntimeError with the
+            # first message below; the auxiliary boundary's own
+            # _validate_llm_response (#7264) raises the other two terminal
+            # "no usable response" shapes — a None response, or a response
+            # missing/malformed choices[0].message — once its own
+            # recovery/fallback has been exhausted. Distinguish all three
+            # from other RuntimeErrors (e.g. "no LLM provider configured",
+            # handled earlier) so a genuinely unusable response from a
+            # degraded provider is flagged for the abort path below instead
+            # of falling into the destructive generic-failure branch
+            # (#94448).
+            _is_empty_content = isinstance(e, RuntimeError) and (
+                "returned empty content" in _err_str
+                or "returned none response" in _err_str
+                or "returned invalid response" in _err_str
             )
             # Authentication, permission, and exhausted-quota failures are NOT
             # transient or fixable by retrying the same request. Flag them so

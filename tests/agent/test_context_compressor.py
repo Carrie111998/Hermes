@@ -2863,6 +2863,56 @@ class TestCooldownReentryAbort:
         assert c._last_compress_aborted is True
         assert c._last_summary_fallback_used is False
 
+    def test_auxiliary_none_response_aborts_compression(self):
+        """#94459 review: the auxiliary boundary's own terminal "None
+        response" error (_validate_llm_response, #7264) is a sibling of the
+        empty-content case and must ABORT the same way, not fall through to
+        the destructive static-fallback path."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("Auxiliary compression: LLM returned None response"),
+        ):
+            first = c.compress(msgs, current_tokens=999999, force=True)
+        assert first == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_empty_content_failure is True
+
+    def test_auxiliary_invalid_response_aborts_compression(self):
+        """Same sibling coverage for the malformed/missing-choices terminal
+        error (_validate_llm_response, #7264)."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError(
+                "Auxiliary compression: LLM returned invalid response "
+                "(type=str): 'oops'. Expected object with .choices[0].message "
+                "— check provider adapter or custom endpoint compatibility."
+            ),
+        ):
+            first = c.compress(msgs, current_tokens=999999, force=True)
+        assert first == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_empty_content_failure is True
+
 
 class TestDoubleCompactionSummaryRole:
     """PR #52160 (salvaged from #52167): when only the system prompt is
