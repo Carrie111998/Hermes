@@ -979,6 +979,70 @@ def _dup_guard_timeout_seconds() -> float:
     return val if val > 0 else _DEFAULT_DUP_GUARD_TIMEOUT_S
 
 
+# === Suspend-aware timeout accounting (2026-08-25 incident) =================
+#
+# The run watchdog polls every _POLL_INTERVAL seconds and charges the job for
+# monotonic elapsed time. If the HOST suspends, monotonic keeps advancing on
+# resume but the poll loop did not run at all -- so the job gets billed for
+# hours it was never given.
+#
+# 2026-08-25: jobflow-ats-url-resolve was killed with
+#   "exceeded wall-clock limit 3600s (elapsed 24269.4s)
+#    -- last activity: waiting for non-streaming API response"
+# which reads exactly like a hung API call. It was not. telemetry/activity.db
+# shows a 6.67h gap across the ENTIRE cron fleet (11:20:06Z tracker-operator-drain
+# -> 18:00:01Z jobflow-matcher), so every job froze, not this one. The watchdog
+# then resumed, measured 24269s, and correctly applied a limit to time the job
+# never had. The healthy watchdog signature is a SMALL overshoot (a historical
+# jobflow-scout kill shows 1804s against an 1800s limit); a 20,669s overshoot is
+# the tell that the loop itself stopped.
+#
+# A suspend must not be charged to the job. The poll gap is the evidence: the
+# loop wakes every _POLL_INTERVAL, so a gap orders of magnitude larger means the
+# loop was not running.
+_CRON_SUSPEND_GAP_SECS = 60.0
+
+
+def suspended_seconds(gap: float, poll_interval: float,
+                      threshold: float = _CRON_SUSPEND_GAP_SECS) -> float:
+    """Seconds of one poll `gap` attributable to the loop not running at all.
+
+    Below `threshold` a gap is ordinary scheduling jitter (a loaded host can
+    stretch a 5s poll to tens of seconds) and is charged to the job in full.
+    Above it, everything except one normal poll interval is time the loop was
+    suspended and the job could not have progressed.
+    """
+    if gap <= threshold or gap <= poll_interval:
+        return 0.0
+    return gap - poll_interval
+
+
+def wallclock_exceeded(elapsed_raw: float, suspended: float,
+                       limit: Optional[float]) -> bool:
+    """True when a run has used its wall-clock budget of ACTIVE time.
+
+    `elapsed_raw` is raw monotonic elapsed; `suspended` is the accumulated time
+    the poll loop was not running. Charging the difference is what stops a host
+    suspend from being reported as a job overrun.
+    """
+    if limit is None:
+        return False
+    return (elapsed_raw - suspended) >= limit
+
+
+def inactivity_exceeded(idle_raw: float, suspended_since_activity: float,
+                        limit: Optional[float]) -> bool:
+    """True when the agent has been idle for `limit` seconds of ACTIVE time.
+
+    Same hazard as the wall-clock check and it fires FIRST in the poll loop:
+    the agent's last-activity stamp predates a suspend, so raw idle is inflated
+    by the full suspend duration.
+    """
+    if limit is None:
+        return False
+    return max(0.0, idle_raw - suspended_since_activity) >= limit
+
+
 # === Min-interval-since-last-fire guard (Guard #4, 2026-04-30 follow-up) ====
 #
 # Closes the SEQUENTIAL-burst gap left by Guard #3.  Guard #3 only catches
@@ -5567,10 +5631,31 @@ def _run_job_impl(
                 # watchdog, and the fork's HERMES_CRON_HARD_TIMEOUT
                 # wall-clock limit.
                 result = None
+                _last_poll = _time.monotonic()
+                _suspended_total = 0.0
+                _suspend_since_activity = 0.0
+                _prev_idle = None
                 while True:
                     done, _ = concurrent.futures.wait(
                         {_cron_future}, timeout=_POLL_INTERVAL,
                     )
+                    _now = _time.monotonic()
+                    # A gap far larger than the poll interval means THIS LOOP did
+                    # not run — host suspend, VM pause, severe starvation. That
+                    # time is not the job's to pay for (see suspended_seconds).
+                    _gap_suspend = suspended_seconds(
+                        _now - _last_poll, _POLL_INTERVAL
+                    )
+                    if _gap_suspend > 0:
+                        _suspended_total += _gap_suspend
+                        _suspend_since_activity += _gap_suspend
+                        logger.warning(
+                            "Job '%s': poll loop stalled %gs (host suspend or "
+                            "starvation) — not charging it to the run budget "
+                            "(total discounted %gs)",
+                            job_name, _gap_suspend, _suspended_total,
+                        )
+                    _last_poll = _now
                     if done:
                         result = _cron_future.result()
                         break
@@ -5584,15 +5669,27 @@ def _run_job_impl(
                                 _idle_secs = _act.get("seconds_since_activity", 0.0)
                             except Exception:
                                 pass
-                        if _idle_secs >= _cron_inactivity_limit:
+                        # Fresh activity retires the suspend credit: only a
+                        # suspend that happened SINCE the last activity can be
+                        # inflating this idle reading.
+                        if _prev_idle is not None and _idle_secs < _prev_idle:
+                            _suspend_since_activity = 0.0
+                        _prev_idle = _idle_secs
+                        if inactivity_exceeded(
+                            _idle_secs,
+                            _suspend_since_activity,
+                            _cron_inactivity_limit,
+                        ):
                             _inactivity_timeout = True
                             break
                     # Wall-clock (hard) limit check — fork.
-                    if _cron_hard_limit is not None:
-                        _elapsed = _time.monotonic() - _cron_start_time
-                        if _elapsed >= _cron_hard_limit:
-                            _wallclock_timeout = True
-                            break
+                    if wallclock_exceeded(
+                        _now - _cron_start_time,
+                        _suspended_total,
+                        _cron_hard_limit,
+                    ):
+                        _wallclock_timeout = True
+                        break
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
@@ -5601,7 +5698,12 @@ def _run_job_impl(
 
         if _wallclock_timeout:
             # Build diagnostic summary from the agent's activity tracker.
-            _wc_elapsed = _time.monotonic() - _cron_start_time
+            # Report ACTIVE elapsed, not raw: the 2026-08-25 incident logged a
+            # raw 24269s against a 3600s limit, which read as a hung API call
+            # when the host had simply been suspended for 6.67h. Raw elapsed is
+            # still reported alongside so a real overrun stays legible.
+            _wc_raw = _time.monotonic() - _cron_start_time
+            _wc_elapsed = _wc_raw - _suspended_total
             _activity = {}
             if hasattr(agent, "get_activity_summary"):
                 try:
@@ -5617,9 +5719,11 @@ def _run_job_impl(
                 # %g, not %.0f: HERMES_CRON_HARD_TIMEOUT uses 0 for UNLIMITED,
                 # so a sub-second limit rounded to "0s" reads as "no limit was
                 # set" at the moment the limit fired.
-                "Job '%s' exceeded wall-clock limit %gs (elapsed %gs) "
+                "Job '%s' exceeded wall-clock limit %gs (active %gs of %gs raw; "
+                "%gs discounted as host suspend) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _cron_hard_limit, _wc_elapsed,
+                job_name, _cron_hard_limit, _wc_elapsed, _wc_raw,
+                _suspended_total,
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
