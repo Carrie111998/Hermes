@@ -29,13 +29,13 @@ import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
   $gatewaySwapTarget,
-  $newChatProfile,
   $newChatRoute,
   $showAllProfiles,
   type AgentProfileRoute,
   ensureGatewayAgent,
   ensureGatewayProfile,
-  normalizeProfileKey
+  normalizeProfileKey,
+  resolveNewSessionProfile
 } from '@/store/profile'
 import {
   $projectScope,
@@ -226,7 +226,7 @@ async function desktopSessionCreateParams(
     provider: $currentProvider.get().trim()
   }
 
-  const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
+  const profile = capturedRoute?.profile || resolveNewSessionProfile()
 
   if (capturedRoute) {
     await ensureGatewayAgent(capturedRoute.connectionId, profile)
