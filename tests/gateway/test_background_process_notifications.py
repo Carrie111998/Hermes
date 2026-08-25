@@ -508,7 +508,39 @@ async def test_concise_mode_no_interim_output_updates(monkeypatch, tmp_path):
 def test_parse_session_key_with_extra_parts():
     """6th part in a group key may be a user_id, not a thread_id — omit it."""
     result = _parse_session_key("agent:main:discord:group:chan123:thread456")
-    assert result == {"platform": "discord", "chat_type": "group", "chat_id": "chan123"}
+    assert result == {
+        "platform": "discord",
+        "chat_type": "group",
+        "chat_id": "chan123",
+        # ``main`` is the default profile's namespace literal, not a profile.
+        "profile": None,
+    }
+
+
+def test_parse_session_key_accepts_profile_namespace():
+    """A named profile's key (``agent:alpha:...``) must parse, and report the
+    profile.
+
+    ``_session_key_namespace`` reuses ``parts[1]`` to carry the profile under
+    ``gateway.multiplex_profiles``. Requiring the literal ``main`` here made
+    every secondary profile's session unparseable, which stripped the routing
+    metadata off its completions.
+    """
+    result = _parse_session_key("agent:alpha:matrix:group:!room:example.org")
+    assert result == {
+        "platform": "matrix",
+        "chat_type": "group",
+        "chat_id": "!room",
+        "profile": "alpha",
+    }
+
+
+def test_parse_session_key_rejects_non_agent_and_short_keys():
+    """Control: raw api_server session ids still return None, so the
+    self-post recovery path in _inject_watch_notification is unaffected."""
+    assert _parse_session_key("sess_abc123") is None
+    assert _parse_session_key("agent:main:matrix:dm") is None
+    assert _parse_session_key("agent::matrix:dm:!room") is None
 
 
 # ---------------------------------------------------------------------------

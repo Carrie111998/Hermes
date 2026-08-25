@@ -3858,9 +3858,22 @@ def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key into its component parts.
 
     Session keys follow the format
-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
-    Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
-    optionally ``thread_id`` keys, or None if the key doesn't match.
+    ``agent:{namespace}:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
+    Returns a dict with ``platform``, ``chat_type``, ``chat_id``, ``profile``,
+    and optionally ``thread_id`` keys, or None if the key doesn't match.
+
+    ``parts[1]`` is the profile namespace produced by
+    :func:`gateway.session._session_key_namespace`: the default profile emits
+    the historical literal ``main`` (``profile`` is then ``None``), and a named
+    profile ``alpha`` emits ``agent:alpha`` (``profile`` is then
+    ``"alpha"``). Under
+    ``gateway.multiplex_profiles`` every secondary profile's sessions use the
+    latter form, so requiring ``parts[1] == "main"`` here made this parser
+    blind to them: keys like ``agent:alpha:matrix:group:!room:@user`` returned
+    ``None`` and their completions lost their routing metadata (or, worse,
+    were misclassified as raw api_server session ids by
+    ``_inject_watch_notification``). The positional layout is identical for
+    both forms, so accepting any namespace is safe for existing callers.
 
     The 6th element is only returned as ``thread_id`` for chat types where
     it is unambiguous (``dm`` and ``thread``).  For group/channel sessions
@@ -3868,11 +3881,16 @@ def _parse_session_key(session_key: str) -> "dict | None":
     thread_id, so we leave ``thread_id`` out to avoid mis-routing.
     """
     parts = session_key.split(":")
-    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+    if len(parts) >= 5 and parts[0] == "agent" and parts[1]:
+        namespace = parts[1]
         result = {
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
+            # ``main`` is the default profile's static namespace literal, not
+            # a profile name — normalise it to None so callers can pass this
+            # straight to profile-aware resolvers.
+            "profile": None if namespace == "main" else namespace,
         }
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
@@ -25197,6 +25215,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_profile = None
 
         if session_key:
             try:
@@ -25220,6 +25239,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_profile = _parsed.get("profile")
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -25268,6 +25288,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "the connector's tenant guard (user_id fallback only).",
                 platform_name, chat_id, chat_type,
             )
+        # Carry the profile through. A reconstructed source that drops it
+        # resolves against the DEFAULT profile's adapter map, which under
+        # multiplexing is the wrong bot (or, commonly, no adapter at all for
+        # that platform) — see _inject_watch_notification's profile-aware
+        # resolution.
+        profile = str(evt.get("profile") or "").strip() or derived_profile
         return SessionSource(
             platform=platform,
             chat_id=chat_id,
@@ -25276,6 +25302,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
             scope_id=scope_id,
+            profile=profile,
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -25363,20 +25390,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the shared transport resolver — native adapter wins; relay is
         # eligible only when it advertises fronting the logical platform.
         adapter = None
+        # Profile-aware resolution FIRST (multiplex plane): under
+        # ``gateway.multiplex_profiles`` one gateway process serves the
+        # default profile plus every named profile, and only the default
+        # profile's adapters live in ``self.adapters`` — each secondary
+        # profile's adapters live in ``_profile_adapters[profile]``. Both
+        # scans below read ``self.adapters`` only, so a completion for a
+        # secondary profile (``@alpha-bot:example.org``'s dedicated Matrix
+        # connection, say) found no adapter and hit the bare ``return None``
+        # under this block: no
+        # delivery, no synthetic turn, and no log line to say so. Reuse
+        # ``_adapter_for_source``, the resolver the kanban notifier already
+        # trusts for exactly this (gateway/authz_mixin.py), which consults
+        # the stamped ``source.profile`` and fails closed rather than
+        # replying out of the default profile's bot.
         try:
-            _platform_enum = Platform(platform_name)
-        except (ValueError, KeyError):
-            _platform_enum = None
-        if _platform_enum is not None:
+            adapter = self._adapter_for_source(source)
+        except Exception as exc:
+            logger.debug(
+                "Profile-aware adapter resolution failed for %s (profile=%r): %s",
+                platform_name, getattr(source, "profile", None), exc,
+            )
+            adapter = None
+        # Whether the ``self.adapters`` fallbacks below are allowed to answer.
+        # They read the DEFAULT profile's map, so for a source stamped with a
+        # secondary profile that owns a registry entry they would deliver out
+        # of the wrong bot. ``_authorization_adapter`` fails closed in exactly
+        # that case; mirror its rule here instead of undoing it. A profile
+        # with no registry entry at all (relay-fronted deployments, where
+        # secondary profiles deliberately register no adapters) keeps the
+        # historical fallback behaviour.
+        _profile_name = (getattr(source, "profile", None) or "").strip() or None
+        _fallback_ok = not (
+            _profile_name
+            and _profile_name != "default"
+            and _profile_name in (getattr(self, "_profile_adapters", None) or {})
+        )
+        if adapter is None and _fallback_ok:
             try:
-                _transport = resolve_delivery_transport(
-                    _platform_enum, self.config, self.adapters,
-                )
-            except Exception:
-                _transport = None
-            if _transport is not None:
-                adapter = _transport.adapter
-        if adapter is None:
+                _platform_enum = Platform(platform_name)
+            except (ValueError, KeyError):
+                _platform_enum = None
+            if _platform_enum is not None:
+                try:
+                    _transport = resolve_delivery_transport(
+                        _platform_enum, self.config, self.adapters,
+                    )
+                except Exception:
+                    _transport = None
+                if _transport is not None:
+                    adapter = _transport.adapter
+        if adapter is None and _fallback_ok:
             # Legacy literal scan — still correct for native adapters, and
             # keeps minimal runner stubs (tests) and exotic platform strings
             # working when the resolver can't run.
@@ -25385,6 +25449,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter = a
                     break
         if not adapter:
+            # Previously a bare ``return None``. This is the last silent drop
+            # on the completion path (the two above it already log), and it
+            # is the one a multiplexed deployment actually hits, so say which
+            # platform/profile could not be resolved.
+            logger.warning(
+                "Dropping watch notification for process %s: no adapter for "
+                "platform=%s profile=%r (multiplex profiles registered: %s)",
+                evt.get("session_id", "unknown"),
+                platform_name,
+                getattr(source, "profile", None),
+                sorted(getattr(self, "_profile_adapters", None) or {}) or "none",
+            )
             return None
         from gateway.wake import adapter_supports_push as _wake_push_ok
         if not _wake_push_ok(adapter):
