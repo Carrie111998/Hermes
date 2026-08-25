@@ -237,6 +237,7 @@ def finalize_turn(
 
     _response_transformed = False
     _pre_transform_response = None
+    _failed_mutations = {}
 
     # File-mutation verifier user-facing backstop. Apply it before persistence
     # so an unresolved edit cannot leave a false success claim in the durable
@@ -619,11 +620,6 @@ def finalize_turn(
             # only when a hook actually changed the response; the durable row
             # already contains the pre-hook blocked result.
             if _plugin_response_transformed and not interrupted:
-                _failed_mutations = (
-                    agent._unresolved_file_mutation_failures()
-                    if agent._file_mutation_verifier_enabled()
-                    else {}
-                )
                 if _failed_mutations:
                     final_response = agent._apply_file_mutation_failure_notice(
                         final_response,

@@ -146,6 +146,37 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class FailedMetadataEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=False, error="edit rejected")
+
+
+class NoEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=None)
+
+    async def edit_message(self, *args, **kwargs) -> SendResult:
+        raise AssertionError("no-edit transport must never receive an edit")
+
+
 class RetryableFirstEditProgressCaptureAdapter(ProgressCaptureAdapter):
     """Fail one progress edit transiently, then accept later edits."""
 
@@ -1237,6 +1268,55 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_transformed_response_edit_failure_falls_through_to_normal_send(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-edit-failed",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=FailedMetadataEditProgressCaptureAdapter,
+    )
+
+    assert adapter.edits
+    assert result.get("already_sent") is not True
+
+
+@pytest.mark.asyncio
+async def test_transformed_response_no_edit_transport_falls_through_to_normal_send(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-no-edit",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="thread",
+        adapter_cls=NoEditProgressCaptureAdapter,
+    )
+
+    assert adapter.sent
+    assert adapter.edits == []
+    assert result.get("already_sent") is not True
 
 
 @pytest.mark.asyncio

@@ -376,7 +376,7 @@ class TestRecordFileMutationResult:
 
         assert list(agent._turn_failed_file_mutations) == ["src/sibling.py"]
 
-    def test_fingerprint_budget_is_aggregate_and_exhaustion_is_conservative(
+    def test_fingerprint_budget_is_bounded_per_phase_and_exhaustion_is_conservative(
         self, tmp_path, monkeypatch,
     ):
         first = tmp_path / "first.txt"
@@ -412,12 +412,41 @@ class TestRecordFileMutationResult:
         first.write_bytes(b"changed!")
         second.write_bytes(b"changed!")
         third.write_bytes(b"changed!")
-        unresolved = agent._unresolved_file_mutation_failures()
+        unresolved = agent._unresolved_file_mutation_failures(fingerprint_phase="final")
 
-        assert list(unresolved) == [str(first), str(second), str(third)]
+        assert list(unresolved) == [str(second), str(third)]
         assert agent._turn_file_mutation_fingerprint_bytes <= 12
+        assert agent._turn_file_mutation_fingerprint_phase_bytes == {
+            "capture": 8,
+            "final": 8,
+        }
         footer = agent._format_file_mutation_failure_footer(unresolved)
-        assert "3 failed file mutation target(s) remain unresolved" in footer
+        assert "2 failed file mutation target(s) remain unresolved" in footer
+
+    def test_recovery_gate_cannot_starve_final_recovery_fingerprint(
+        self, tmp_path, monkeypatch,
+    ):
+        target = tmp_path / "large-within-test-budget.bin"
+        target.write_bytes(b"original")
+        monkeypatch.setattr(run_agent_module, "_FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES", 8)
+        monkeypatch.setattr(run_agent_module, "_FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES", 8)
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target)},
+            json.dumps({"error": "replace failed"}),
+            is_error=True,
+        )
+
+        assert agent._build_file_mutation_recovery_nudge("Done.") is not None
+        target.write_bytes(b"recovery")
+        assert agent._unresolved_file_mutation_failures() == {}
+        assert agent._turn_file_mutation_fingerprint_phase_bytes == {
+            "capture": 8,
+            "recovery_gate": 8,
+            "final": 8,
+        }
 
 
     def test_landed_paths_prefer_resolved_tool_result(self):
@@ -800,6 +829,17 @@ class TestUserFacingMutationFailure:
         assert "File-mutation verifier" in out
         assert "private-source.py" in out
 
+    def test_explicit_raw_detail_replaces_false_success_before_diagnostics(self):
+        out = AIAgent._apply_file_mutation_failure_notice(
+            "Done — I updated the source.",
+            self.FAILED,
+            user_message="Show the raw file-mutation verifier details.",
+        )
+
+        assert out.startswith(AIAgent._FILE_MUTATION_BLOCKED_MESSAGE)
+        assert "updated the source" not in out
+        assert "File-mutation verifier" in out
+
     def test_temporary_path_never_leaks_in_ordinary_notice(self, tmp_path):
         target = tmp_path / "scratch-secret.txt"
         failed = {
@@ -826,7 +866,7 @@ class TestUserFacingMutationFailure:
         monkeypatch.setattr(
             agent,
             "_unresolved_file_mutation_failures",
-            lambda: dict(self.FAILED),
+            lambda **_kwargs: dict(self.FAILED),
         )
 
         nudge = agent._build_file_mutation_recovery_nudge("Done.")
@@ -843,7 +883,7 @@ class TestUserFacingMutationFailure:
         monkeypatch.setattr(
             agent,
             "_unresolved_file_mutation_failures",
-            lambda: dict(self.FAILED),
+            lambda **_kwargs: dict(self.FAILED),
         )
 
         assert agent._build_file_mutation_recovery_nudge(

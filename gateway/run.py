@@ -30039,26 +30039,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
-                # existing streamed message instead of sending a duplicate.
+                # existing streamed message instead of sending a duplicate. Use
+                # the same conservative delivery checks as stale-finalize
+                # reconciliation above: a split tail is not the whole response,
+                # ``__no_edit__`` is not editable, and an unsuccessful result
+                # must fall through to the normal final send.
                 _sc_msg_id = _sc.message_id
-                if _sc_msg_id:
+                _sc_adapter = getattr(_sc, "adapter", None)
+                if getattr(_sc, "_turn_split_delivery", False):
+                    logger.info(
+                        "Transformed streamed response for session %s used multi-message split delivery; skipping in-place reconciliation and delivering the complete response via normal final send.",
+                        session_key or "?",
+                    )
+                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
-                        await _sc.adapter.edit_message(
+                        _transform_edit_res = await _sc_adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transform_edit_res, "success", True):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Transformed-response reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
+                                session_key or "?",
+                                getattr(_transform_edit_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
-                            "Failed to edit streamed message for session %s: %s",
+                            "Failed to edit transformed streamed message for session %s: %s; sending complete response via normal final send.",
                             session_key or "?", _edit_err,
                         )
+                else:
+                    logger.info(
+                        "Transformed streamed response for session %s has no editable message; delivering complete response via normal final send.",
+                        session_key or "?",
+                    )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

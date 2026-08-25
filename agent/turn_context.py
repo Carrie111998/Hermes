@@ -1353,6 +1353,8 @@ def build_turn_context(
     agent._turn_file_mutation_paths = set()
     agent._turn_file_mutation_fingerprint_bytes = 0
     agent._turn_file_mutation_fingerprint_budget_exhausted = False
+    agent._turn_file_mutation_fingerprint_phase_bytes = {}
+    agent._turn_file_mutation_fingerprint_exhausted_phases = set()
     agent._turn_file_mutation_fingerprint_lock = threading.Lock()
     agent._turn_file_mutation_state_lock = threading.Lock()
     agent._verification_stop_nudges = 0

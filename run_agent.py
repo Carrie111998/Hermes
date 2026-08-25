@@ -225,8 +225,9 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname, e
 
 
 _FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES = 64 * 1024 * 1024
-# A target may be fingerprinted after failure and again at turn finalization.
-# Keep the complete hidden verifier workload bounded across the whole turn.
+# Each verifier phase (failure capture, recovery gate, finalization) gets this
+# aggregate cap. Separate bounded phases keep a later recovery observable even
+# when the earlier snapshot consumed its full allowance.
 _FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES = 2 * _FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES
 
 
@@ -3759,6 +3760,7 @@ class AIAgent:
                         resolved_path,
                         task_id=task_id,
                         resolved_path=resolved_path,
+                        fingerprint_phase="capture",
                     )
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
@@ -3822,6 +3824,7 @@ class AIAgent:
         *,
         task_id: Optional[str] = None,
         resolved_path: Optional[str] = None,
+        fingerprint_phase: str = "capture",
     ) -> tuple[Optional[str], Optional[tuple]]:
         """Return a canonical target and, when local and budgeted, its fingerprint.
 
@@ -3830,7 +3833,7 @@ class AIAgent:
         Docker/SSH/Modal paths could observe an unrelated file with the same
         spelling and incorrectly suppress a real warning.
 
-        Fingerprints consume one aggregate per-turn byte budget.  Snapshot
+        Fingerprints consume one aggregate byte budget per verifier phase. Snapshot
         requests are serialized in tool-result arrival order and target order
         within each result.  Once the next regular file does not fit,
         fingerprinting stops for the turn; that target and every later target
@@ -3871,20 +3874,36 @@ class AIAgent:
                 budget_lock = threading.Lock()
                 self._turn_file_mutation_fingerprint_lock = budget_lock
             with budget_lock:
-                if getattr(self, "_turn_file_mutation_fingerprint_budget_exhausted", False):
+                phase_bytes = getattr(
+                    self, "_turn_file_mutation_fingerprint_phase_bytes", None
+                )
+                if phase_bytes is None:
+                    phase_bytes = {}
+                    self._turn_file_mutation_fingerprint_phase_bytes = phase_bytes
+                exhausted_phases = getattr(
+                    self,
+                    "_turn_file_mutation_fingerprint_exhausted_phases",
+                    None,
+                )
+                if exhausted_phases is None:
+                    exhausted_phases = set()
+                    self._turn_file_mutation_fingerprint_exhausted_phases = exhausted_phases
+                if fingerprint_phase in exhausted_phases:
                     return resolved_text, None
-                used = int(getattr(self, "_turn_file_mutation_fingerprint_bytes", 0))
+                used = int(phase_bytes.get(fingerprint_phase, 0))
                 remaining_budget = max(
                     0,
                     _FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES - used,
                 )
                 if stat_result.st_size > remaining_budget:
+                    exhausted_phases.add(fingerprint_phase)
                     self._turn_file_mutation_fingerprint_budget_exhausted = True
                     return resolved_text, None
                 # Reserve before reading so concurrent tool-result workers can
                 # never collectively hash beyond the aggregate turn cap.  A
                 # failed/racing read keeps its reservation conservatively.
-                self._turn_file_mutation_fingerprint_bytes = used + stat_result.st_size
+                phase_bytes[fingerprint_phase] = used + stat_result.st_size
+                self._turn_file_mutation_fingerprint_bytes = max(phase_bytes.values())
 
             digest = hashlib.sha256()
             with resolved.open("rb") as handle:
@@ -3910,7 +3929,11 @@ class AIAgent:
             # Verification is advisory and must never break turn finalization.
             return resolved_text, None
 
-    def _unresolved_file_mutation_failures(self) -> Dict[str, Dict[str, Any]]:
+    def _unresolved_file_mutation_failures(
+        self,
+        *,
+        fingerprint_phase: str = "final",
+    ) -> Dict[str, Dict[str, Any]]:
         """Filter stale failures whose targets changed after the failed call.
 
         A changed, still-present fingerprint is evidence of follow-up mutation
@@ -3934,6 +3957,7 @@ class AIAgent:
             current_resolved, current = self._snapshot_file_mutation_target(
                 resolved_path,
                 task_id=info.get("task_id"),
+                fingerprint_phase=fingerprint_phase,
             )
             if (
                 current_resolved != resolved_path
@@ -4103,8 +4127,16 @@ class AIAgent:
         if cls._file_mutation_raw_diagnostics_requested(user_message):
             footer = cls._format_file_mutation_failure_footer(failed)
             if not footer:
-                return response
-            return response + ("\n\n" if response else "") + footer
+                return cls._FILE_MUTATION_BLOCKED_MESSAGE
+            # Diagnostics are opt-in, but the no-false-success invariant is
+            # not. Keep an already-honest block; otherwise replace a possible
+            # success claim before appending the requested technical detail.
+            base = (
+                response
+                if cls._file_mutation_response_is_honestly_blocked(response)
+                else cls._FILE_MUTATION_BLOCKED_MESSAGE
+            )
+            return base + "\n\n" + footer
         if cls._file_mutation_response_is_honestly_blocked(response):
             return response
         return cls._FILE_MUTATION_BLOCKED_MESSAGE
@@ -4124,7 +4156,9 @@ class AIAgent:
         """Ask the model to recover an unresolved failed edit before stopping."""
         if not self._file_mutation_verifier_enabled():
             return None
-        failed = self._unresolved_file_mutation_failures()
+        failed = self._unresolved_file_mutation_failures(
+            fingerprint_phase="recovery_gate"
+        )
         if not failed:
             return None
         if self._file_mutation_response_is_honestly_blocked(final_response):
