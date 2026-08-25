@@ -784,6 +784,21 @@ DEFAULT_CONFIG = {
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
+        "defer_while_aux_inflight": False,
+                                      # When True, auto-compression is postponed
+                                      # while other auxiliary LLM calls are in
+                                      # flight: on a single accelerator, a large
+                                      # compression prefill competing with vision
+                                      # or web_extract produces timeouts on both.
+                                      # Bounded twice — by defer_hard_ceiling and
+                                      # by at most 3 consecutively deferred checks,
+                                      # so sustained auxiliary traffic can never
+                                      # starve compression. Manual /compress is
+                                      # never deferred.
+        "defer_hard_ceiling": 0.95,   # fraction of context_length past which a
+                                      # deferred compression fires anyway: running
+                                      # out of context is worse than contention.
+                                      # Only relevant with defer_while_aux_inflight.
         "tail_mode": "legacy",        # tail retention policy (#87326):
                                       #   "legacy" — 0.20×window verbatim tail (default)
                                       #   "lean"   — clamped 2.5%-of-window tail
