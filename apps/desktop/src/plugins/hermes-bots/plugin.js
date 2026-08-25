@@ -12739,27 +12739,65 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // Events are epoch-tagged, so a superseded run's history drops out of view.
   const activityEvents = currentGroupActivity(group)
   const latestActivity = activityEvents.length ? activityEvents[activityEvents.length - 1] : null
+  const stopAllBots = async () => {
+    const roomNow = $groupChats.get()[group] || {}
+    const sessions = roomNow.sessions || {}
+    await Promise.allSettled(
+      members.map(async member => {
+        const key = groupMemberKey(member)
+        const sid = sessions[key]
+        if (!sid) return
+        try {
+          await requestForBot(member, 'session.interrupt', { session_id: sid })
+        } catch { /* per-bot failure is non-fatal */ }
+      })
+    )
+    updateGroupChat(group, r => {
+      r.running = false
+      return r
+    })
+    host.notify({ kind: 'success', message: '已停止全部 bot 任务' })
+  }
+
   const activityPanel = jsxs('div', {
     className: 'border-b border-(--ui-stroke-secondary)',
     children: [
-      jsxs('button', {
-        type: 'button',
-        'aria-expanded': activityOpen,
-        'aria-controls': `group-activity:${group}`,
-        title: activityOpen ? 'Hide room activity' : 'Show room activity',
-        className:
-          'flex w-full items-center gap-1.5 px-2.5 py-1 text-left text-[0.7rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
-        onClick: () => setActivityOpen(prev => !prev),
+      jsxs('div', {
+        className: 'flex items-center gap-1',
         children: [
-          jsx(Codicon, {
-            name: activityOpen ? 'chevron-down' : 'chevron-right',
-            className: 'shrink-0 text-[0.65rem]'
+          jsxs('button', {
+            type: 'button',
+            'aria-expanded': activityOpen,
+            'aria-controls': `group-activity:${group}`,
+            title: activityOpen ? 'Hide room activity' : 'Show room activity',
+            className:
+              'flex min-w-0 flex-1 items-center gap-1.5 px-2.5 py-1 text-left text-[0.7rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
+            onClick: () => setActivityOpen(prev => !prev),
+            children: [
+              jsx(Codicon, {
+                name: activityOpen ? 'chevron-down' : 'chevron-right',
+                className: 'shrink-0 text-[0.65rem]'
+              }),
+              jsx('span', { className: 'shrink-0 font-medium', children: 'Activity' }),
+              latestActivity
+                ? jsx('span', {
+                    className: 'min-w-0 flex-1 truncate',
+                    children: `${groupActivityLabel(latestActivity)} · ${relativeTime(latestActivity.at)}`
+                  })
+                : null
+            ]
           }),
-          jsx('span', { className: 'shrink-0 font-medium', children: 'Activity' }),
-          latestActivity
-            ? jsx('span', {
-                className: 'min-w-0 flex-1 truncate',
-                children: `${groupActivityLabel(latestActivity)} · ${relativeTime(latestActivity.at)}`
+          room.running
+            ? jsx('button', {
+                type: 'button',
+                title: 'Stop all bots working on this room',
+                className:
+                  'inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[0.7rem] font-medium text-(--ui-accent) transition-colors hover:bg-(--chrome-action-hover)',
+                onClick: () => void stopAllBots(),
+                children: [
+                  jsx(Codicon, { name: 'debug-stop', className: 'shrink-0 text-[0.75rem]' }),
+                  '停止'
+                ]
               })
             : null
         ]
@@ -12786,7 +12824,20 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                         jsx('span', {
                           className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
                           children: relativeTime(event.at)
-                        })
+                        }),
+                        event.kind === 'working'
+                          ? jsx('button', {
+                              type: 'button',
+                              title: 'Stop all bots working on this room',
+                              className:
+                                'inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-px text-[0.65rem] font-medium text-(--ui-accent) transition-colors hover:bg-(--chrome-action-hover)',
+                              onClick: () => void stopAllBots(),
+                              children: [
+                                jsx(Codicon, { name: 'debug-stop', className: 'shrink-0 text-[0.7rem]' }),
+                                '停止'
+                              ]
+                            })
+                          : null
                       ]
                     }, `${event.at}:${i}`)
                   )
