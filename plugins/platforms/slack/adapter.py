@@ -5136,6 +5136,70 @@ class SlackAdapter(BasePlatformAdapter):
                 return str(authorization["team_id"])
         return ""
 
+    def _canonical_event_team_id(
+        self, event: dict, body: Optional[dict] = None
+    ) -> str:
+        """Resolve Slack's workspace team even when an event carries an org id.
+
+        Enterprise Grid can deliver the same message through ``message`` and
+        ``app_mention`` with one inner event scoped to the enterprise and the
+        other scoped to the workspace.  The authenticated bot-client map is the
+        authoritative set of workspace ids for this adapter.
+        """
+        candidates: list[str] = []
+        for payload in (body or {}, event):
+            if not isinstance(payload, dict):
+                continue
+            team = payload.get("team_id") or payload.get("team")
+            if isinstance(team, str) and team:
+                candidates.append(team)
+            elif isinstance(team, dict) and team.get("id"):
+                candidates.append(str(team["id"]))
+        authorizations = (body or {}).get("authorizations") if isinstance(body, dict) else None
+        for authorization in authorizations or []:
+            if isinstance(authorization, dict) and authorization.get("team_id"):
+                candidates.append(str(authorization["team_id"]))
+
+        known_teams = getattr(self, "_team_clients", {})
+        for candidate in candidates:
+            if candidate in known_teams:
+                return candidate
+        channel_id = str(event.get("channel") or event.get("channel_id") or "")
+        mapped_team = getattr(self, "_channel_team", {}).get(channel_id)
+        if mapped_team and mapped_team in known_teams:
+            return str(mapped_team)
+        if len(known_teams) == 1:
+            return next(iter(known_teams))
+        return candidates[0] if candidates else ""
+
+    def _message_dedup_id(
+        self, event: dict, body: Optional[dict] = None
+    ) -> str:
+        """Return one canonical workspace/channel/message identity.
+
+        Slack's message timestamp is stable across ``message``/``app_mention``
+        fan-out and reconnect replay.  Workspace normalization absorbs an
+        Enterprise Grid org-id variant without making ``client_msg_id`` global
+        across tenants.  Edits use their changed-event timestamp, so adding a
+        mention by edit can still wake once.
+        """
+        changed_event_ts = str(event.get("_slack_changed_event_ts") or "")
+        event_ts = changed_event_ts or str(event.get("ts") or "")
+        if not event_ts:
+            return ""
+        team_id = self._canonical_event_team_id(event, body) or "unknown-workspace"
+        channel_id = str(event.get("channel") or "unknown-channel")
+        return f"slack:channel-message:{team_id}:{channel_id}:{event_ts}"
+
+    def _processed_message_key(
+        self, event: dict, body: Optional[dict], message_ts: str
+    ) -> str:
+        if not message_ts:
+            return ""
+        team_id = self._canonical_event_team_id(event, body) or "unknown-workspace"
+        channel_id = str(event.get("channel") or "unknown-channel")
+        return f"{team_id}:{channel_id}:{message_ts}"
+
     @staticmethod
     def _context_channel_id(context: Any) -> str:
         """Extract the actively viewed channel from either Slack context shape."""
@@ -5783,7 +5847,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not channel_id or not file_id:
             return
 
-        team_id = self._event_team_id(event, body)
+        team_id = self._canonical_event_team_id(event, body)
         try:
             client = self._team_clients.get(team_id) if team_id else None
             info_resp = await (client or self._get_client(channel_id)).files_info(
@@ -5829,9 +5893,10 @@ class SlackAdapter(BasePlatformAdapter):
         # If it does, _handle_slack_message records the same share ts and this
         # fallback skips instead of duplicating the user turn.
         await asyncio.sleep(0.75)
-        if ts and self._dedup.is_duplicate(
-            self._workspace_event_id(team_id, ts)
-        ):
+        fallback_dedup_id = self._message_dedup_id(
+            {"team": team_id, "channel": channel_id, "ts": ts}
+        )
+        if self._dedup.is_duplicate(fallback_dedup_id):
             return
 
         fallback_event = {
@@ -6061,9 +6126,12 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             original_message_ts = str(updated_message.get("ts") or "")
+            processed_message_key = self._processed_message_key(
+                event, payload, original_message_ts
+            )
             if (
-                original_message_ts
-                and original_message_ts in self._processed_message_ts
+                processed_message_key
+                and processed_message_key in self._processed_message_ts
             ):
                 return
             edited = updated_message.get("edited")
@@ -6089,15 +6157,12 @@ class SlackAdapter(BasePlatformAdapter):
                 normalized_event["_slack_changed_event_ts"] = changed_event_ts
             event = normalized_event
 
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
-        # Scope the dedup id by workspace: Slack event ts values are only
-        # unique within one workspace, so two teams' events with the same ts
-        # must not suppress each other.
-        event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
-        dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(
-            self._workspace_event_id(dedup_team_id, event_ts)
-        ):
+        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777).
+        # Atomically claim the strongest stable transport identity before the
+        # first await below. This covers envelope retries, message/app_mention
+        # fan-out, and concurrent deliveries on separate Bolt worker threads.
+        dedup_id = self._message_dedup_id(event, payload)
+        if self._dedup.is_duplicate(dedup_id):
             return
 
         channel_id = event.get("channel", "")
@@ -6272,7 +6337,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
-        outer_team_id = self._event_team_id(event, payload)
+        outer_team_id = self._canonical_event_team_id(event, payload)
         assistant_meta = self._lookup_assistant_thread_metadata(
             event,
             channel_id=channel_id,

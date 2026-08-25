@@ -10,10 +10,14 @@ replays >5 min later slipped through.
 Follows the slack-bolt mocking pattern from test_slack_mention.py.
 """
 
+import asyncio
 import os
 import sys
+import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 def _ensure_slack_mock():
@@ -47,7 +51,11 @@ import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 _slack_mod.SLACK_AVAILABLE = True
 
 from gateway.platforms.helpers import MessageDeduplicator  # noqa: E402
-from plugins.platforms.slack.adapter import _slack_dedup_ttl_seconds  # noqa: E402
+from gateway.config import PlatformConfig  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _slack_dedup_ttl_seconds,
+)
 
 
 def test_default_ttl_outlasts_slack_reconnect_redelivery_window():
@@ -60,5 +68,210 @@ def test_default_ttl_outlasts_slack_reconnect_redelivery_window():
 def test_env_override_is_respected():
     with patch.dict(os.environ, {"SLACK_DEDUP_TTL_SECONDS": "120"}, clear=True):
         assert _slack_dedup_ttl_seconds() == 120.0
+
+
+def test_fallback_identity_preserves_distinct_workspaces_and_channels():
+    """ID-less fallback must not merge distinct workspace messages."""
+    first = {
+        "team": "T01KC2VC5U0",
+        "channel": "C0A3PUZPGN5",
+        "ts": "1787682677.049629",
+    }
+    same_message = dict(first)
+    other_workspace = {**first, "team": "T079QU5LX36"}
+    distinct_message = {**first, "channel": "C0DISTINCT01"}
+    dedup = MessageDeduplicator()
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._team_clients = {
+        "T01KC2VC5U0": MagicMock(),
+        "T079QU5LX36": MagicMock(),
+    }
+
+    assert dedup.is_duplicate(adapter._message_dedup_id(first)) is False
+    assert dedup.is_duplicate(adapter._message_dedup_id(same_message)) is True
+    assert dedup.is_duplicate(adapter._message_dedup_id(other_workspace)) is False
+    assert dedup.is_duplicate(adapter._message_dedup_id(distinct_message)) is False
+
+
+def test_client_message_id_is_not_process_global_across_workspaces():
+    event = {"channel": "C0A3PUZPGN5", "ts": "1787682677.049629"}
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._team_clients = {
+        "T01KC2VC5U0": MagicMock(),
+        "T079QU5LX36": MagicMock(),
+    }
+
+    assert adapter._message_dedup_id(
+        {**event, "team": "T01KC2VC5U0", "client_msg_id": "same-client-id"}
+    ) != adapter._message_dedup_id(
+        {**event, "team": "T079QU5LX36", "client_msg_id": "same-client-id"}
+    )
+
+
+def test_single_authenticated_workspace_normalizes_enterprise_scope():
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._team_clients = {"T079QU5LX36": MagicMock()}
+    event = {
+        "team": "T01KC2VC5U0",
+        "channel": "C0A3PUZPGN5",
+        "ts": "1787682677.049629",
+    }
+    payload = {
+        "team_id": "T01KC2VC5U0",
+        "authorizations": [{"team_id": "T079QU5LX36"}],
+    }
+
+    assert adapter._canonical_event_team_id(event, payload) == "T079QU5LX36"
+    assert adapter._message_dedup_id(event, payload) == (
+        "slack:channel-message:T079QU5LX36:C0A3PUZPGN5:1787682677.049629"
+    )
+
+
+def test_known_channel_mapping_normalizes_enterprise_scope_with_multiple_workspaces():
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._team_clients = {
+        "T_WORKSPACE_A": MagicMock(),
+        "T079QU5LX36": MagicMock(),
+    }
+    adapter._channel_team = {"C0A3PUZPGN5": "T079QU5LX36"}
+    event = {
+        "team": "E01ENTERPRISE",
+        "channel": "C0A3PUZPGN5",
+        "ts": "1787682677.049629",
+    }
+
+    assert adapter._canonical_event_team_id(event, {}) == "T079QU5LX36"
+
+
+def test_processed_edit_keys_are_workspace_and_channel_scoped():
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._team_clients = {
+        "T_ONE": MagicMock(),
+        "T_TWO": MagicMock(),
+    }
+    first = {"team": "T_ONE", "channel": "C_ONE"}
+    second = {"team": "T_TWO", "channel": "C_TWO"}
+
+    assert adapter._processed_message_key(first, {}, "123.456") != (
+        adapter._processed_message_key(second, {}, "123.456")
+    )
+
+
+def test_scope_variants_with_different_envelopes_share_message_alias():
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._team_clients = {"T079QU5LX36": MagicMock()}
+    dedup = MessageDeduplicator()
+    enterprise_event = {
+        "team": "T01KC2VC5U0",
+        "channel": "C0A3PUZPGN5",
+        "ts": "1787682677.049629",
+    }
+    workspace_event = {**enterprise_event, "team": "T079QU5LX36"}
+    enterprise_payload = {
+        "event_id": "EvEnterpriseDelivery",
+        "team_id": "T01KC2VC5U0",
+        "authorizations": [{"team_id": "T079QU5LX36"}],
+    }
+    workspace_payload = {
+        "event_id": "EvWorkspaceDelivery",
+        "team_id": "T079QU5LX36",
+    }
+
+    assert dedup.is_duplicate(
+        adapter._message_dedup_id(enterprise_event, enterprise_payload)
+    ) is False
+    assert dedup.is_duplicate(
+        adapter._message_dedup_id(workspace_event, workspace_payload)
+    ) is True
+
+
+def test_missing_all_stable_identity_does_not_collapse_messages():
+    """Without any stable ID or timestamp, let both messages reach routing."""
+    event = {"team": "T_TEAM", "channel": "C_ONE", "text": "same text"}
+
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    assert adapter._message_dedup_id(event) == ""
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_event_runs_one_downstream_turn():
+    """Concurrent scope variants must atomically claim one Slack message."""
+
+    class SlowLookupDict(dict):
+        """Widen the check-then-set race without changing lookup results."""
+
+        @staticmethod
+        def _pause_if_missing(present):
+            if not present:
+                time.sleep(0.05)
+
+        def __contains__(self, key):
+            present = super().__contains__(key)
+            self._pause_if_missing(present)
+            return present
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            self._pause_if_missing(value is not default)
+            return value
+
+    adapter = SlackAdapter(
+        PlatformConfig(enabled=True, token="xoxb-test", extra={"require_mention": True})
+    )
+    adapter._app = MagicMock()
+    adapter._app.client = AsyncMock()
+    adapter._bot_user_id = "U_BOT"
+    adapter._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+    adapter._team_clients = {"T079QU5LX36": MagicMock()}
+    adapter._dedup._seen = SlowLookupDict()
+
+    callback_count = 0
+    callback_lock = threading.Lock()
+
+    async def downstream_turn(_event):
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+
+    adapter.handle_message = downstream_turn
+    adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+    adapter._resolve_user_name = AsyncMock(return_value="Test User")
+    adapter._resolve_channel_name = AsyncMock(return_value="test-channel")
+    adapter._humanize_user_mentions = AsyncMock(side_effect=lambda text, **_: text)
+
+    enterprise_event = {
+        "type": "message",
+        "team": "T01KC2VC5U0",
+        "channel": "C0A3PUZPGN5",
+        "channel_type": "channel",
+        "user": "U_USER",
+        "text": "<@U_BOT> run this once",
+        "ts": "1787682677.049629",
+        "client_msg_id": "11111111-2222-4333-8444-555555555555",
+    }
+    workspace_event = {**enterprise_event, "team": "T079QU5LX36"}
+    enterprise_payload = {
+        "event_id": "EvEnterpriseDelivery",
+        "team_id": "T01KC2VC5U0",
+        "event": enterprise_event,
+    }
+    workspace_payload = {
+        "event_id": "EvWorkspaceDelivery",
+        "team_id": "T079QU5LX36",
+        "event": workspace_event,
+    }
+
+    await asyncio.gather(
+        asyncio.to_thread(
+            asyncio.run,
+            adapter._handle_slack_message(enterprise_event, enterprise_payload),
+        ),
+        asyncio.to_thread(
+            asyncio.run,
+            adapter._handle_slack_message(workspace_event, workspace_payload),
+        ),
+    )
+
+    assert callback_count == 1
 
 
