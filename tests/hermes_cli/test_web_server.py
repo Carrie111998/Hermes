@@ -2279,6 +2279,32 @@ class TestWebServerEndpoints:
             "/api/sessions/does-not-exist-anywhere"
         ).status_code == 404
 
+    def test_get_session_detail_miss_does_not_bootstrap_other_profiles(self):
+        """A 404 miss must not create a state.db for a configured-but-never-run
+        profile (#94609): the cross-profile fallback loop only has a
+        config.yaml to go on, and read-only opens of a missing/zero-byte
+        store bootstrap it (see ``_open_session_db_at_path``), so the
+        fallback must skip candidates without an existing, non-empty
+        state.db instead of opening every registered profile.
+        """
+        from hermes_cli import profiles as profiles_mod
+
+        bot_home = profiles_mod.get_profile_dir("neverranbot")
+        bot_home.mkdir(parents=True)
+        (bot_home / "config.yaml").write_text("")
+
+        before = sorted(p.name for p in bot_home.iterdir())
+        assert before == ["config.yaml"]
+
+        resp = self.client.get("/api/sessions/does-not-exist-anywhere")
+        assert resp.status_code == 404
+
+        after = sorted(p.name for p in bot_home.iterdir())
+        assert after == before, (
+            f"session-detail miss must not create files under an unrelated "
+            f"never-run profile's home; found {after}"
+        )
+
     def test_export_session_streams_bounded_message_pages(self, monkeypatch):
         from hermes_state import SessionDB
 
