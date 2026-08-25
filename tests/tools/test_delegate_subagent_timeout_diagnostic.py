@@ -211,9 +211,44 @@ class TestRunSingleChildTimeoutDump:
         assert "Diagnostic:" in result["error"]
         assert str(dump_path) in result["error"]
 
+    def test_timeout_defers_close_until_worker_finishes_unwinding(
+        self, hermes_home, monkeypatch
+    ):
+        """Closing a live child can tear down resources its turn-finally still uses."""
+
+        class SlowUnwindChild(_StubChild):
+            def __init__(self):
+                super().__init__(api_call_count=1, hang_seconds=10.0)
+                self.unwinding = threading.Event()
+                self.allow_return = threading.Event()
+                self.finished = threading.Event()
+                self.closed = threading.Event()
+
+            def run_conversation(self, user_message, task_id=None, stream_callback=None):
+                self._hang.wait(self._hang_seconds)
+                self.unwinding.set()
+                self.allow_return.wait(5.0)
+                self.finished.set()
+                return {"final_response": "", "completed": False, "api_calls": 1}
+
+            def close(self):
+                self.closed.set()
+
+        child = SlowUnwindChild()
+        try:
+            result = self._invoke_with_short_timeout(child, monkeypatch)
+
+            assert result["status"] == "timeout"
+            assert child.unwinding.wait(1.0)
+            assert not child.closed.is_set(), "timed-out child closed before worker unwind"
+
+            child.allow_return.set()
+            assert child.finished.wait(1.0)
+            assert child.closed.wait(1.0)
+        finally:
+            child.allow_return.set()
 
     # ── explicit timeout metadata (#51690, salvaged from PR #60378) ────
-
 
     def test_non_timeout_error_has_null_timeout_metadata(self, hermes_home, monkeypatch):
         """The metadata fields are timeout-specific — a child that raises

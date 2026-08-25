@@ -2327,6 +2327,20 @@ class TestListSessionsRich:
         assert activity["last_activity_description"] == ""
         assert activity["last_activity_provenance"] == "unknown"
 
+    def test_clear_session_activity_labels_uses_safe_read_context(self, db, monkeypatch):
+        """The no-op probe must not bypass SessionDB's connection ownership."""
+        db.create_session("s1", "cli")
+        safe_conn = mock.MagicMock()
+        safe_conn.execute.return_value.fetchone.return_value = (None, None)
+        safe_ctx = mock.MagicMock()
+        safe_ctx.__enter__.return_value = safe_conn
+        safe_ctx.__exit__.return_value = False
+        monkeypatch.setattr(db, "_read_ctx", lambda: safe_ctx)
+
+        db.clear_session_activity_labels("s1")
+
+        safe_conn.execute.assert_called_once()
+
     def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
         """Rate-limited heartbeats can lag message writes; last_active must take max."""
         db.create_session("s1", "cli")
