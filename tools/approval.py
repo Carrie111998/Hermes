@@ -3919,10 +3919,21 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     Docker is the exception once host paths are bind-mounted into the container:
     at that point a command like ``rm -rf /workspace`` reaches host files, so it
     must go through the normal approval flow.
+
+    Plugin-registered backends declare their own isolation via the provider's
+    ``skip_container_guards`` flag (fail-soft: an unknown name or a raising
+    property keeps the approval layer ON).
     """
     if env_type == "docker":
         return not has_host_access
-    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
+    if env_type in ("singularity", "modal", "daytona", "vercel_sandbox"):
+        return True
+    try:
+        from agent.terminal_env_registry import provider_flag
+
+        return bool(provider_flag(env_type, "skip_container_guards", False))
+    except Exception:
+        return False
 
 
 def check_dangerous_command(command: str, env_type: str,

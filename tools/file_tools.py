@@ -1430,6 +1430,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _resolve_task_host_cwd,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
+        _get_plugin_env_provider,
     )
     import time
 
@@ -1502,6 +1503,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = overrides.get("modal_image") or config["modal_image"]
             elif env_type == "daytona":
                 image = overrides.get("daytona_image") or config["daytona_image"]
+            elif _get_plugin_env_provider(env_type) is not None:
+                image = overrides.get(f"{env_type}_image") or ""
             else:
                 image = ""
 

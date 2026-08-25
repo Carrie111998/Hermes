@@ -1450,10 +1450,23 @@ def _has_isolation_overrides(task_id: Optional[str]) -> bool:
     The single owner of the "is this an RL/benchmark-style isolated rollout"
     predicate — shared by container-key resolution and container creation so
     the two can't drift.
+
+    Plugin-registered backends have no fixed entry in
+    ``_ISOLATION_OVERRIDE_KEYS``; their per-task image override key is
+    ``f"{backend}_image"``, honored when the backend is actually registered
+    so an arbitrary ``*_image`` key can't trigger isolation.
     """
     if not task_id or task_id not in _task_env_overrides:
         return False
-    return bool(set(_task_env_overrides[task_id].keys()) & _ISOLATION_OVERRIDE_KEYS)
+    overrides = _task_env_overrides[task_id]
+    if set(overrides.keys()) & _ISOLATION_OVERRIDE_KEYS:
+        return True
+    _ensure_terminal_env_bridged()
+    env_type = os.getenv("TERMINAL_ENV", "local").strip().lower()
+    return (
+        f"{env_type}_image" in overrides
+        and _get_plugin_env_provider(env_type) is not None
+    )
 
 
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
@@ -1678,6 +1691,20 @@ def _get_plugin_env_provider(env_type: str):
         return None
 
 
+def _is_backend_guest_subpath(env_type: str, cwd: str) -> bool:
+    """True when *cwd* is the backend's guest-home root or a path beneath it.
+
+    A plugin backend whose guest home lives under a host-looking prefix
+    declares it via the provider's ``guest_home_root`` attribute (e.g.
+    ``/home/agent``); its subtree is a legitimate in-sandbox cwd that the
+    host-path sanitizers must not discard.
+    """
+    root = _plugin_env_flag(env_type, "guest_home_root", None)
+    if not isinstance(root, str) or not root or not cwd:
+        return False
+    return cwd == root or cwd.startswith(root.rstrip("/") + "/")
+
+
 def _is_unusable_container_cwd(cwd: str) -> bool:
     """Return True if *cwd* is a host/relative path that won't work as the
     working directory inside a container sandbox.
@@ -1791,8 +1818,9 @@ def _get_env_config() -> Dict[str, Any]:
         docker_shm_size = "1g"
 
     # Default cwd: local uses the host's current directory, ssh uses the
-    # remote home, Vercel uses its documented workspace root, and everything
-    # else starts in the backend's default root-like cwd.
+    # remote home, Vercel uses its documented workspace root, plugin backends
+    # may declare their own via the provider's ``default_cwd`` attribute, and
+    # everything else starts in the backend's default root-like cwd.
     if env_type == "local":
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
@@ -1800,7 +1828,12 @@ def _get_env_config() -> Dict[str, Any]:
     elif env_type == "vercel_sandbox":
         default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
     else:
-        default_cwd = "/root"
+        plugin_default_cwd = _plugin_env_flag(env_type, "default_cwd", None)
+        default_cwd = (
+            plugin_default_cwd
+            if isinstance(plugin_default_cwd, str) and plugin_default_cwd
+            else "/root"
+        )
 
     # Read TERMINAL_CWD but sanity-check it for container backends.
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
@@ -1821,8 +1854,14 @@ def _get_env_config() -> Dict[str, Any]:
             host_cwd = candidate
             cwd = "/workspace"
     elif _is_container_backend(env_type) and cwd:
-        # Host paths and relative paths that won't work inside containers
-        if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
+        # Host paths and relative paths that won't work inside containers. A
+        # path inside the backend's own guest-home subtree is valid even though
+        # it may share a host-looking prefix (see _is_backend_guest_subpath).
+        if (
+            _is_unusable_container_cwd(cwd)
+            and cwd != default_cwd
+            and not _is_backend_guest_subpath(env_type, cwd)
+        ):
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
                         "(host/relative path won't work in sandbox). Using %r instead.",
                         cwd, env_type, default_cwd)
@@ -2300,6 +2339,8 @@ def ensure_task_env(task_id: Optional[str] = None):
         image = overrides.get("modal_image") or config["modal_image"]
     elif env_type == "daytona":
         image = overrides.get("daytona_image") or config["daytona_image"]
+    elif _get_plugin_env_provider(env_type) is not None:
+        image = overrides.get(f"{env_type}_image") or ""
     else:
         image = ""
 
@@ -2802,6 +2843,7 @@ def _resolve_command_cwd(
         recorded
         and _is_container_backend(env_type)
         and _is_unusable_container_cwd(recorded)
+        and not _is_backend_guest_subpath(env_type, recorded)
     ):
         logger.info(
             "Ignoring recorded session cwd %r for %s backend "
@@ -2886,7 +2928,9 @@ def terminal_tool(
         # isolation-keyed RL/benchmark overrides keep resolving as before.
         overrides = resolve_task_overrides(task_id)
         
-        # Select image based on env type, with per-task override support
+        # Select image based on env type, with per-task override support.
+        # Plugin backends resolve their override under f"{backend}_image" so
+        # RL/benchmark per-task images reach provider.create_environment too.
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
         elif env_type == "singularity":
@@ -2895,6 +2939,8 @@ def terminal_tool(
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
+        elif _get_plugin_env_provider(env_type) is not None:
+            image = overrides.get(f"{env_type}_image") or ""
         else:
             image = ""
 
@@ -2914,9 +2960,13 @@ def terminal_tool(
         # When the host path IS this session's mounted workspace, remap it to
         # /workspace (where the mount lands) instead of discarding it.
         # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if _is_container_backend(env_type) and _is_unusable_container_cwd(cwd):
+        # cwd to /workspace, /root, or a backend's own guest-home subtree)
+        # pass through untouched.
+        if (
+            _is_container_backend(env_type)
+            and _is_unusable_container_cwd(cwd)
+            and not _is_backend_guest_subpath(env_type, cwd)
+        ):
             remapped = "/workspace" if host_cwd else config["cwd"]
             if cwd != remapped:
                 logger.info(

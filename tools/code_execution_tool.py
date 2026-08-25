@@ -793,6 +793,7 @@ def _get_or_create_env(task_id: str):
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
         _resolve_container_task_id, _resolve_task_host_cwd,
+        _get_plugin_env_provider,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -827,6 +828,8 @@ def _get_or_create_env(task_id: str):
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
+        elif _get_plugin_env_provider(env_type) is not None:
+            image = overrides.get(f"{env_type}_image") or ""
         else:
             image = ""
 
