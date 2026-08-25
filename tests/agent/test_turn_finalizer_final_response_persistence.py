@@ -178,6 +178,9 @@ def test_finalizer_replaces_raw_mutation_footer_with_concise_blocked_notice(monk
     assert "old_string" not in final
     assert result["response_transformed"] is True
     assert result["pre_transform_response"] == "Done — the source is fixed."
+    assert result["completed"] is False
+    assert result["failed"] is False
+    assert result["file_mutation_blocked"] is True
     assert result["messages"][-1]["content"] == final
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1]["content"] == final

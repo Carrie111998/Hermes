@@ -4129,28 +4129,24 @@ class AIAgent:
             if not footer:
                 return cls._FILE_MUTATION_BLOCKED_MESSAGE
             # Diagnostics are opt-in, but the no-false-success invariant is
-            # not. Keep an already-honest block; otherwise replace a possible
-            # success claim before appending the requested technical detail.
-            base = (
-                response
-                if cls._file_mutation_response_is_honestly_blocked(response)
-                else cls._FILE_MUTATION_BLOCKED_MESSAGE
-            )
-            return base + "\n\n" + footer
+            # not. Always use the canonical block before technical detail so a
+            # contradictory success sentence cannot survive by also containing
+            # the required failure phrase.
+            return cls._FILE_MUTATION_BLOCKED_MESSAGE + "\n\n" + footer
         if cls._file_mutation_response_is_honestly_blocked(response):
             return response
         return cls._FILE_MUTATION_BLOCKED_MESSAGE
 
     @classmethod
     def _file_mutation_response_is_honestly_blocked(cls, response: str) -> bool:
-        """Recognize the prescribed failure statement without punctuation rigidity."""
+        """Recognize only a complete, non-contradictory blocked response."""
         normalized = " ".join(
             (response or "").casefold().replace("’", "'").split()
         )
-        return (
-            "requested change did not take effect" in normalized
-            and ("i'm blocked" in normalized or "i am blocked" in normalized)
-        )
+        return re.fullmatch(
+            r"the requested change did not take effect(?:, and|\.)(?: i'm| i am) blocked\.?",
+            normalized,
+        ) is not None
 
     def _build_file_mutation_recovery_nudge(self, final_response: str) -> Optional[str]:
         """Ask the model to recover an unresolved failed edit before stopping."""

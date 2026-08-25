@@ -250,6 +250,10 @@ def finalize_turn(
                 else {}
             )
             if _failed_mutations:
+                # The model stopped, but the requested operation did not
+                # complete. Keep delivery healthy while preventing automation
+                # consumers from advancing this as a completed turn.
+                completed = False
                 _before_mutation_notice = final_response or ""
                 _after_mutation_notice = agent._apply_file_mutation_failure_notice(
                     _before_mutation_notice,
@@ -714,6 +718,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "file_mutation_blocked": bool(_failed_mutations),
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls

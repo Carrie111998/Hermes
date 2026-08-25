@@ -764,7 +764,7 @@ class TestUserFacingMutationFailure:
         assert "private-source.py" not in out
         assert "old_string" not in out
 
-    def test_honest_blocked_response_is_not_duplicated(self):
+    def test_blocked_response_with_extra_text_collapses_to_canonical_notice(self):
         response = (
             "The requested change did not take effect, and I’m blocked. "
             "I could not complete it safely."
@@ -776,7 +776,7 @@ class TestUserFacingMutationFailure:
             user_message="fix the source",
         )
 
-        assert out == response
+        assert out == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
 
     def test_equivalent_honest_blocked_response_is_not_duplicated(self):
         response = "The requested change did not take effect. I am blocked."
@@ -788,6 +788,21 @@ class TestUserFacingMutationFailure:
         )
 
         assert out == response
+
+    def test_contradictory_success_and_block_does_not_bypass_backstop(self):
+        response = (
+            "Done — I updated it. The requested change did not take effect, "
+            "and I am blocked."
+        )
+
+        out = AIAgent._apply_file_mutation_failure_notice(
+            response,
+            self.FAILED,
+            user_message="fix the source",
+        )
+
+        assert out == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
+        assert "updated it" not in out
 
     def test_empty_response_becomes_concise_blocked_notice(self):
         out = AIAgent._apply_file_mutation_failure_notice(
