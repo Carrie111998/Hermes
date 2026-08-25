@@ -516,6 +516,21 @@ class TestReasoningOverridesDefaultConfig:
         assert DEFAULT_CONFIG["agent"]["reasoning_overrides"] == {}
 
 
+    def test_default_config_has_reasoning_effort_key(self):
+        """DEFAULT_CONFIG['agent'] contains the global 'reasoning_effort' key.
+
+        The runtime reads ``agent.reasoning_effort`` via
+        ``hermes_constants.resolve_reasoning_config()``, but DEFAULT_CONFIG
+        omitted the declaration, so ``hermes config set agent.reasoning_effort``
+        emitted a false "not a recognized config key" warning.  The empty-string
+        default is the sentinel for "unset / provider default", matching every
+        other reasoning_effort leaf in DEFAULT_CONFIG.
+        """
+        from hermes_cli.config import DEFAULT_CONFIG
+        assert "reasoning_effort" in DEFAULT_CONFIG["agent"]
+        assert DEFAULT_CONFIG["agent"]["reasoning_effort"] == ""
+
+
     def test_spelling_tolerant_lookup_works_with_user_config(self):
         """resolve_per_model_reasoning_effort works with user-added overrides."""
         from hermes_constants import resolve_per_model_reasoning_effort
