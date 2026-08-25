@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from agent.account_usage import fetch_account_usage
-from ai_usage.collector import collect, write_atomic
+from ai_usage.collector import _default_warmup, collect, write_atomic
 
 
 def _home() -> str:
@@ -29,6 +29,10 @@ def main() -> int:
         db_path=db,
         prev=prev,
         fetch_usage=fetch_account_usage,
+        # Paired with the real fetcher deliberately: warming httpx only makes
+        # sense for the caller that is about to use it over the network, and
+        # collect() must not impose an SSL-context build on injected fakes.
+        warmup=_default_warmup,
     )
     write_atomic(out, data)
     print(f"wrote {out} ({len(data['providers'])} providers)")

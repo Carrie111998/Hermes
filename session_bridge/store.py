@@ -3995,17 +3995,32 @@ class SessionBridgeStore:
                 )
 
             if rebuild:
+                # Delete by session_id, NOT by joining external_message_map.
+                # The map-join form only removed rows the map still pointed at,
+                # so a session whose map rows had been lost (the map cascades
+                # from external_sessions) kept its existing copy while the
+                # insert below appended a second one -- the 2026-08-06..08-10
+                # double-ingest, 287,351 rows over 1,551 sessions. The bridge
+                # owns every message row of an external session, so deleting
+                # by session_id is both correct and unconditionally idempotent.
                 conn.execute(
-                    """DELETE FROM messages
-                       WHERE id IN (
-                           SELECT message_id FROM external_message_map
-                           WHERE session_id = ?
-                       )""",
+                    "DELETE FROM messages WHERE session_id = ?",
                     (session_id,),
                 )
 
+            # native_event_key is the same identity external_message_map keys on
+            # (native_event_id, ordinal). Carrying it onto the message row lets
+            # idx_messages_native_event_key refuse a duplicate at the storage
+            # layer, instead of relying on this method's delete-then-insert.
+            rows_to_insert = []
+            for message, row in pending:
+                row = dict(row)
+                row["native_event_key"] = (
+                    f"{message.native_event_id}:{message.ordinal}"
+                )
+                rows_to_insert.append(row)
             inserted_ids, _ = self.db._insert_message_rows_with_ids(
-                conn, session_id, [row for _, row in pending]
+                conn, session_id, rows_to_insert
             )
             for (message, _), message_id in zip(pending, inserted_ids, strict=True):
                 conn.execute(
