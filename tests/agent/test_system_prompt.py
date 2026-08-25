@@ -5,7 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+from agent.system_prompt import (
+    _CRON_ANTI_PROPAGATION_HINT,
+    build_system_prompt,
+    build_system_prompt_parts,
+)
 
 
 def _make_agent(**overrides):
@@ -542,3 +546,39 @@ class TestMemoryProviderSystemPromptGating:
         full = _build(build_system_prompt, _memory_manager=agent._memory_manager,
                       enabled_toolsets=["web_search"], disabled_toolsets=None)
         assert block not in full
+
+
+class TestCronAntiPropagationGuidance:
+    """arXiv:2608.10218 mitigation: every agent-backed cron run's system
+    prompt must warn against adopting/relaying self-propagating goals found
+    in runtime-injected content (context_from, script output, run context,
+    the persistent notepad). Deliberately NOT folded into the overridable
+    ``PLATFORM_HINTS["cron"]`` default — see ``_cron_anti_propagation_guidance``
+    in agent/system_prompt.py — so a ``platform_hints.cron.replace`` config
+    override cannot silently drop it.
+    """
+
+    def test_cron_platform_includes_guidance(self):
+        agent = _make_agent(platform="cron")
+        stable = _stable_prompt(agent)
+        assert _CRON_ANTI_PROPAGATION_HINT in stable
+
+    def test_guidance_survives_replace_override(self):
+        custom = "Custom cron hint from an enterprise profile."
+        agent = _make_agent(
+            platform="cron",
+            _platform_hint_overrides={"cron": {"replace": custom}},
+        )
+        stable = _stable_prompt(agent)
+        assert custom in stable
+        assert _CRON_ANTI_PROPAGATION_HINT in stable
+
+    def test_non_cron_platform_excludes_guidance(self):
+        agent = _make_agent(platform="cli")
+        stable = _stable_prompt(agent)
+        assert _CRON_ANTI_PROPAGATION_HINT not in stable
+
+    def test_guidance_appears_exactly_once(self):
+        agent = _make_agent(platform="cron")
+        stable = _stable_prompt(agent)
+        assert stable.count(_CRON_ANTI_PROPAGATION_HINT) == 1
