@@ -78,6 +78,7 @@ import { BlueprintSlotControl, blueprintSlotHelp, cleanBlueprintFieldError, init
 import { mutateAndRefreshCronJobs, refreshCronJobs, triggerAndRefreshCronJobs } from './cron-actions'
 import {
   cronEditorUpdates,
+  cronModelUpdates,
   jobIsScriptOnly,
   parseCronDeliveryTargets,
   toggleCronDeliveryTarget,
@@ -704,10 +705,7 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
               job={selectedJob}
               onModelChange={async (provider, model) => {
                 const { refreshError, stale } = await mutateAndRefreshCronJobs(profile, () =>
-                  updateCronJob(selectedJob.id, {
-                    model: model || null,
-                    provider: provider || null
-                  })
+                  updateCronJob(selectedJob.id, cronModelUpdates(provider, model))
                 )
 
                 if (stale) {
@@ -878,6 +876,7 @@ function CronJobDetail({
           onOpenChange={setModelPickerOpen}
           onSelect={async ({ provider, model }) => {
             setModelBusy(true)
+
             try {
               await onModelChange(provider, model)
               notify({ kind: 'success', title: c.modelUpdated, message: truncate(jobTitle(job), 60) })

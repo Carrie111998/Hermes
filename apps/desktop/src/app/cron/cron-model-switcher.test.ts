@@ -1,42 +1,27 @@
 import { describe, expect, it } from 'vitest'
 
-import type { CronJobUpdates } from '@/types/hermes'
-
-import { cronEditorUpdates } from './cron-job-model'
+import { cronEditorUpdates, cronModelUpdates } from './cron-job-model'
 
 describe('cron model switcher — updateCronJob payload', () => {
-  // The model switcher in CronJobDetail calls updateCronJob directly with
-  // { model, provider } — bypassing the editor form. Verify the payload shape
-  // matches what the API expects (null clears, string pins).
-
   it('pins a model and provider when both are provided', () => {
-    const updates: CronJobUpdates = {
-      model: 'claude-sonnet-4',
-      provider: 'anthropic'
-    }
+    const updates = cronModelUpdates('anthropic', 'claude-sonnet-4')
 
     expect(updates.model).toBe('claude-sonnet-4')
     expect(updates.provider).toBe('anthropic')
   })
 
   it('clears a previous pin when model is empty', () => {
-    const updates: CronJobUpdates = {
-      model: null,
-      provider: null
-    }
+    const updates = cronModelUpdates('', '')
 
     expect(updates.model).toBeNull()
     expect(updates.provider).toBeNull()
   })
 
-  it('pins a model with an empty provider when only model is selected', () => {
-    const updates: CronJobUpdates = {
-      model: 'gpt-4o',
-      provider: ''
-    }
+  it('normalizes an empty provider when only a model is selected', () => {
+    const updates = cronModelUpdates('  ', ' gpt-4o ')
 
-    // The API normalizes empty-string provider to null/undefined
     expect(updates.model).toBe('gpt-4o')
+    expect(updates.provider).toBeNull()
   })
 })
 
