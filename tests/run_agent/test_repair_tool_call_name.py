@@ -125,3 +125,55 @@ class TestVolcEngineXmlPollution:
         # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
         # recover the obvious target.
         assert repair('"terminal"') == "terminal"
+
+
+class TestCheckFnGatedNamesNotFuzzyRemapped:
+    """#94506: a registry-known name hidden by check_fn for this turn must
+    NOT be fuzzy-remapped onto a different available tool. The observed case:
+    kanban_list, deliberately hidden from dispatcher workers, resolved to
+    kanban_link — a dependency-WRITING sibling of a READ intent."""
+
+    @pytest.fixture
+    def gated_repair(self, monkeypatch):
+        """repair() bound to a worker-shaped agent + a registry that knows
+        both the gated tool and the available siblings."""
+        from tools import registry as registry_module
+
+        worker_valid = {"kanban_link", "kanban_create", "kanban_update"}
+        registry_all = {"kanban_list", "kanban_unblock", *worker_valid}
+
+        class _FakeRegistry:
+            def get_all_tool_names(self):
+                return sorted(registry_all)
+
+        fake = _FakeRegistry()
+        monkeypatch.setattr(
+            registry_module, "registry", fake, raising=True
+        )
+
+        from run_agent import AIAgent
+
+        stub = SimpleNamespace(valid_tool_names=worker_valid)
+        return AIAgent._repair_tool_call.__get__(stub, AIAgent)
+
+    def test_gated_tool_name_returns_none_not_a_sibling(self, gated_repair):
+        # kanban_list is a real registered tool, hidden from this worker by
+        # check_fn. It must fall through to the unknown-tool path (None),
+        # never be substituted with kanban_link.
+        assert gated_repair("kanban_list") is None
+
+    def test_gated_tool_variant_spelling_also_returns_none(self, gated_repair):
+        # A gated tool reached via a class-like emission must not remap
+        # either — the candidate set still hits the registry-known name.
+        assert gated_repair("KanbanList_tool") is None
+
+    def test_true_typo_still_fuzzy_repairs(self, gated_repair):
+        # A name that is NOT registered anywhere is a genuine typo — the
+        # fuzzy fallback keeps working for it.
+        assert gated_repair("kanban_lynk") == "kanban_link"
+
+    def test_ungated_normalization_unchanged(self, gated_repair):
+        # Available tools keep their fast-path behaviour: exact and
+        # normalized spellings never reach the gate.
+        assert gated_repair("kanban_link") == "kanban_link"
+        assert gated_repair("KanbanLink") == "kanban_link"

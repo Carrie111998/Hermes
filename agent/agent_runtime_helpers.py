@@ -3545,6 +3545,29 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
         if c and c in agent.valid_tool_names:
             return c
 
+    # A name the registry knows but check_fn gated for this turn is a REAL
+    # tool, not a typo: steps 1-4 normalize spellings of the same tool, but
+    # the fuzzy fallback below selects a *different* one. Within a shared
+    # prefix family (kanban_*, memory_*, ...) the nearest available
+    # neighbour is disproportionately likely to be an adjacent operation on
+    # the same resource — kanban_list, deliberately hidden from dispatcher
+    # workers by _check_kanban_orchestrator_mode, remapped onto kanban_link,
+    # turning a read intent into a dependency-writing call that only failed
+    # because its arguments happen to be required (#94506). Gated means
+    # "not permitted here": fall through to the unknown-tool path so the
+    # model learns the name is unavailable this turn instead of being
+    # silently dispatched to a sibling it never called.
+    try:
+        from tools.registry import registry as _tool_registry
+
+        all_names = set(_tool_registry.get_all_tool_names())
+    except Exception:
+        all_names = None
+    if all_names is not None:
+        for c in cands:
+            if c and c in all_names:
+                return None
+
     # Fuzzy match as last resort.
     matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
     if matches:
