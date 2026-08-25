@@ -81,6 +81,65 @@ class TestWindowsDestructiveTier:
         assert not _is_dangerous(cmd), f"should NOT be flagged: {cmd}"
 
 
+class TestDiskDestructionCommandPositionAnchor:
+    """The disk/volume destruction rules (Format-Volume/Clear-Disk/diskpart/
+    format.com/cipher /w) used a bare \\b anchor, matching anywhere in the
+    text — including inside quoted prose that merely mentions the tool
+    (a commit message, a doc edit, an echo). #93392/#93640 fixed the exact
+    same false-positive class for the POSIX mkfs/dd twins by anchoring to
+    command position; these five Windows analogues were the sibling gap.
+
+    Anchoring naively to the shared _CMDPOS fragment would have traded that
+    false positive for a false negative: unlike mkfs/dd (POSIX tools that
+    never run under a Windows wrapper), these commands routinely run as
+    `cmd /c "diskpart"` or `powershell -Command "diskpart"`, and
+    _command_detection_variants does not lift a separately-anchorable
+    payload variant out of those two wrapper shapes the way it does for
+    bash/sh/zsh/ksh -c. The fix instead unions _CMDPOS with the same
+    cmd/powershell wrapper shapes the del/erase/rd/rmdir and remove-item
+    rules above already recognize.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        'git commit -m "docs: mention Format-Volume in windows setup notes"',
+        'echo "never run clear-disk on prod"',
+        'echo "the diskpart tool can wipe disks"',
+        'echo "cipher /w wipes free space, be careful"',
+        'git commit -m "...format c: ..."',
+        "ls C:\\Users",
+    ])
+    def test_quoted_prose_mentioning_tool_not_flagged(self, cmd):
+        assert not _is_dangerous(cmd), f"should NOT be flagged: {cmd}"
+
+    @pytest.mark.parametrize("cmd", [
+        # bare invocation
+        "diskpart",
+        "Format-Volume -DriveLetter D",
+        "Clear-Disk -Number 1 -RemoveData",
+        "format c: /q",
+        "cipher /w:C",
+        # chained / subshell / sudo-wrapped
+        "echo hi; diskpart",
+        "$(diskpart)",
+        "sudo format-volume",
+        # cmd.exe-wrapped
+        'cmd /c "diskpart"',
+        "cmd.exe /c diskpart",
+        "cmd /k diskpart",
+        # powershell-wrapped
+        'powershell -Command "diskpart"',
+        'powershell.exe -Command "format-volume -driveletter d"',
+        'pwsh -c "clear-disk -number 1"',
+    ])
+    def test_real_invocation_still_flagged(self, cmd):
+        assert _is_dangerous(cmd), f"should be flagged: {cmd}"
+
+    def test_verb_as_non_first_word_in_cmd_wrapper_not_flagged(self):
+        # diskpart is not the first word after `cmd /c "` here — an
+        # unrelated command mentioning it in an argument, not invoking it.
+        assert not _is_dangerous('cmd /c "echo diskpart is dangerous"')
+
+
 class TestWindowsPathVariant:
     """Backslash Windows paths must survive into pattern matching.
 
