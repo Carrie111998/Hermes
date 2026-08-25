@@ -4164,8 +4164,12 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
                 or ""
             )
             clarify_lock = session.setdefault("clarify_lock", threading.Lock())
-    with _prompt_lock:
-        cancel_generation = _prompt_cancel_generation.get(sid, 0)
+        # Capture session ownership and its cancellation generation atomically.
+        # A close must either remove the session before this lookup or advance
+        # the generation after this capture; it must never fit between them and
+        # let a stale caller adopt the new session generation.
+        with _prompt_lock:
+            cancel_generation = _prompt_cancel_generation.get(sid, 0)
 
     if session is None or session.get("_turn_cancel_requested"):
         return ""

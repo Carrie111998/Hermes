@@ -697,6 +697,69 @@ def test_popping_session_cancels_its_pending_prompts(server):
     assert server._answers["request-1"] == ""
 
 
+def test_popping_session_cancels_clarify_before_generation_capture(server, monkeypatch):
+    """Close must not let a pre-registration clarify capture its new generation."""
+    session = {"history": []}
+    server._sessions["s1"] = session
+    clarify_at_prompt_lock = threading.Event()
+    release_clarify = threading.Event()
+    pop_done = threading.Event()
+    result = {}
+
+    class ClarifyGateLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "clarify-before-generation":
+                clarify_at_prompt_lock.set()
+                assert release_clarify.wait(timeout=2)
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    monkeypatch.setattr(server, "_prompt_lock", ClarifyGateLock())
+
+    clarify_thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "answer", server._clarify_block("s1", "Question?", ["yes", "no"])
+        ),
+        name="clarify-before-generation",
+        daemon=True,
+    )
+    clarify_thread.start()
+    assert clarify_at_prompt_lock.wait(timeout=2)
+
+    def pop_session():
+        result["popped"] = server._pop_session_by_id("s1")
+        pop_done.set()
+
+    pop_thread = threading.Thread(target=pop_session, daemon=True)
+    pop_thread.start()
+    pop_done.wait(timeout=0.2)
+    release_clarify.set()
+
+    pop_thread.join(timeout=2)
+    clarify_thread.join(timeout=2)
+    clarify_was_alive = clarify_thread.is_alive()
+    with server._prompt_lock:
+        pending_before_cleanup = [
+            rid
+            for rid, (event, _payload) in server._pending_prompt_payloads.items()
+            if event == "clarify.request"
+        ]
+    if clarify_was_alive:
+        server._clear_pending("s1")
+        clarify_thread.join(timeout=2)
+
+    assert result["popped"] is session
+    assert not clarify_was_alive
+    assert not pending_before_cleanup
+    assert result["answer"] == ""
+
+
 def test_approval_pending_replays_unresolved_requests(server, monkeypatch):
     from tools import approval
 
