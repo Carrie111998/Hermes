@@ -5182,6 +5182,35 @@ def _should_seed_interactive(query, image, quiet: bool, oneshot: bool) -> bool:
         return False
 
 
+def _skip_curator_for_invocation(no_self_improvement: bool) -> bool:
+    """Return True when the curator startup pass should be skipped.
+
+    The ``--no-self-improvement`` flag is session-scoped and never
+    persisted to config.yaml.  This helper makes the guard testable
+    without duplicating the ``if`` inline.
+    """
+    return bool(no_self_improvement)
+
+
+def _maybe_run_curator_on_startup(no_self_improvement: bool, on_summary=None) -> None:
+    """Run the curator startup pass unless ``--no-self-improvement`` is set.
+
+    Extracted so the guard is exercised by tests (monkeypatch
+    ``agent.curator.maybe_run_curator``) rather than re-implemented
+    inline.
+    """
+    if _skip_curator_for_invocation(no_self_improvement):
+        return
+    try:
+        from agent.curator import maybe_run_curator
+        maybe_run_curator(
+            idle_for_seconds=float("inf"),  # CLI startup = fully idle
+            on_summary=on_summary,
+        )
+    except Exception:
+        pass
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -5211,6 +5240,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        no_self_improvement: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -5227,6 +5257,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
+            no_self_improvement: Disable automatic self-improvement for this
+                session (background review forks and curator startup). Works
+                with new sessions, --resume, and --continue. Session-scoped;
+                does not persist to config.yaml.
         """
         # Initialize Rich console
         self.console = Console()
@@ -5541,7 +5575,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
-        
+
+        # --no-self-improvement: disable automatic background review forks and
+        # curator startup for this invocation only.  Session-scoped; never
+        # persisted to config.yaml.
+        self.no_self_improvement = no_self_improvement
+
         # Ephemeral system prompt: env var takes precedence, then
         # display.personality / agent.system_prompt from config.
         # hermes_cli.personality is the single owner of overlay resolution.
@@ -18356,16 +18395,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # if the schedule says we're due.  Runs in a daemon thread so it
         # never blocks the interactive loop.  Best-effort; any failure is
         # swallowed to avoid breaking session startup.
-        try:
-            from agent.curator import maybe_run_curator
-            maybe_run_curator(
-                idle_for_seconds=float("inf"),  # CLI startup = fully idle
-                on_summary=lambda msg: self._console_print(
-                    f"[dim #6b7684]💾 {msg}[/]"
-                ),
-            )
-        except Exception:
-            pass
+        _maybe_run_curator_on_startup(
+            getattr(self, "no_self_improvement", False),
+            on_summary=lambda msg: self._console_print(
+                f"[dim #6b7684]💾 {msg}[/]"
+            ),
+        )
 
         # Skill sync — best-effort periodic pull, piggy-backing on the
         # curator tick. Inert unless the access gate is open and a sync base
@@ -21775,6 +21810,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    no_self_improvement: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21802,6 +21838,10 @@ def main(
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
+        no_self_improvement: Disable automatic self-improvement for this
+            invocation (background review forks and curator startup). Works
+            with new sessions, --resume, and --continue. Session-scoped —
+            does not persist to config.yaml.
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -21813,6 +21853,9 @@ def main(
         python cli.py --resume 20260225_143052_a1b2c3  # Resume session
         python cli.py -w                         # Start in isolated git worktree
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
+        python cli.py --no-self-improvement      # New session, no self-improvement
+        python cli.py --no-self-improvement --resume <id>  # Resume without self-improvement
+        python cli.py --no-self-improvement --continue     # Continue without self-improvement
     """
     global _active_worktree
 
@@ -21977,6 +22020,7 @@ def main(
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
             ignore_rules=ignore_rules,
+            no_self_improvement=no_self_improvement,
         )
     except ImportError as e:
         # Direct `python cli.py` / `python -m cli` bypasses cmd_chat's
