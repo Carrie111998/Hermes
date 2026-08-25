@@ -88,6 +88,12 @@ async def test_startup_registers_quick_commands_only_menu(tmp_path, monkeypatch)
         await adapter._run_post_connect_housekeeping()
 
     assert adapter._bot.set_my_commands.await_count == 3
+    assert {
+        call.kwargs["scope"].kind
+        for call in adapter._bot.set_my_commands.await_args_list
+    } == set(scope_factories)
+    for scope_factory in scope_factories.values():
+        scope_factory.assert_called_once_with()
     for call in adapter._bot.set_my_commands.await_args_list:
         commands = call.args[0]
         assert [(cmd.command, cmd.description) for cmd in commands] == [
