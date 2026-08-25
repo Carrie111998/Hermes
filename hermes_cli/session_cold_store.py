@@ -309,7 +309,7 @@ def _unsafe_archive_parent(path: Path, exc: OSError | None = None) -> ValueError
 
 def _validate_directory_authority(descriptor: int, path: Path) -> None:
     opened = os.fstat(descriptor)
-    owner_is_trusted = opened.st_uid in {0, os.geteuid()}
+    owner_is_trusted = opened.st_uid in {0, os.geteuid()}  # windows-footgun: ok — cold store is POSIX-only and public entry points reject Windows
     writable_by_others = stat.S_IMODE(opened.st_mode) & 0o022
     sticky = opened.st_mode & stat.S_ISVTX
     if (
@@ -456,7 +456,7 @@ def _is_private_owned_entry(metadata: os.stat_result, *, directory: bool) -> boo
     expected_type = stat.S_ISDIR if directory else stat.S_ISREG
     return (
         expected_type(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
+        and metadata.st_uid == os.geteuid()  # windows-footgun: ok — cold store is POSIX-only and public entry points reject Windows
         and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
     )
 
