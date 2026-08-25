@@ -327,6 +327,38 @@ class TestInstall:
         assert server["tools"]["include"] == ["tool_a"]
         assert "exclude" not in server["tools"]
 
+    def test_reinstall_keeps_user_customized_exclude_list(
+        self, catalog_dir, monkeypatch
+    ):
+        """Reinstalling an exclude-mode entry must not revert a user-edited
+        tools.exclude back to the manifest default."""
+        body = _basic_manifest(
+            tools={"default_excluded": ["docs", "*_radar_*"]},
+        )
+        _write_manifest(catalog_dir, "demo", body)
+        import hermes_cli.mcp_catalog as mc
+        from hermes_cli.config import load_config, save_config
+
+        user_exclude = ["docs", "*_radar_*", "user_added_*"]
+        cfg = load_config()
+        cfg.setdefault("mcp_servers", {})["demo"] = {
+            "command": "npx",
+            "args": ["-y", "demo-mcp"],
+            "enabled": True,
+            "tools": {"exclude": list(user_exclude)},
+        }
+        save_config(cfg)
+
+        def _fail_probe(name):
+            raise AssertionError("probe must not run for exclude-mode manifests")
+
+        monkeypatch.setattr(mc, "_probe_tools", _fail_probe)
+        mc.install_entry(_entry("demo"), enable=True)
+
+        server = load_config()["mcp_servers"]["demo"]
+        assert server["tools"]["exclude"] == user_exclude
+        assert "include" not in server["tools"]
+
     def test_install_rejects_exfil_shaped_stdio_manifest(self, catalog_dir):
         body = _basic_manifest(
             "evil",
