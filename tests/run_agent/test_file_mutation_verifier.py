@@ -1,4 +1,4 @@
-"""Tests for the per-turn file-mutation verifier footer.
+"""Tests for per-turn file-mutation verification and recovery.
 
 Covers the three moving pieces:
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -520,6 +521,44 @@ class TestRecordFileMutationResult:
 
         assert agent._unresolved_file_mutation_failures() == {}
 
+    def test_protected_config_recovers_through_hermes_config_cli(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        env = {**os.environ, "HERMES_HOME": str(hermes_home)}
+        command = [sys.executable, "-m", "hermes_cli.main", "config"]
+        subprocess.run(
+            [*command, "set", "display.file_mutation_verifier", "false"],
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        target = hermes_home / "config.yaml"
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target)},
+            json.dumps({"error": "protected config; use hermes config set"}),
+            is_error=True,
+        )
+
+        subprocess.run(
+            [*command, "set", "display.file_mutation_verifier", "true"],
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        verified = subprocess.run(
+            [*command, "get", "display.file_mutation_verifier"],
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        assert "true" in verified.stdout.lower()
+        assert agent._unresolved_file_mutation_failures() == {}
+
     def test_created_target_recovers_failed_write_file(self, tmp_path):
         target = tmp_path / "new.txt"
         agent = _bare_agent()
@@ -661,6 +700,159 @@ class TestFormatFooter:
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestUserFacingMutationFailure:
+    FAILED = {
+        "/tmp/private-source.py": {
+            "tool": "patch",
+            "error_preview": "old_string not found in /tmp/private-source.py",
+        }
+    }
+
+    def test_success_claim_gets_concise_blocked_notice_without_raw_diagnostics(self):
+        out = AIAgent._apply_file_mutation_failure_notice(
+            "Done — I updated the source.",
+            self.FAILED,
+            user_message="fix the source",
+        )
+
+        assert out == "The requested change did not take effect, and I’m blocked."
+        assert "updated the source" not in out
+        assert "File-mutation verifier" not in out
+        assert "private-source.py" not in out
+        assert "old_string" not in out
+        assert "[patch]" not in out
+
+    def test_draw_request_does_not_opt_in_to_raw_diagnostics(self):
+        out = AIAgent._apply_file_mutation_failure_notice(
+            "Done — I updated the source.",
+            self.FAILED,
+            user_message="Draw a diagram of the file mutation verifier.",
+        )
+
+        assert out == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
+        assert "private-source.py" not in out
+        assert "old_string" not in out
+
+    def test_honest_blocked_response_is_not_duplicated(self):
+        response = (
+            "The requested change did not take effect, and I’m blocked. "
+            "I could not complete it safely."
+        )
+
+        out = AIAgent._apply_file_mutation_failure_notice(
+            response,
+            self.FAILED,
+            user_message="fix the source",
+        )
+
+        assert out == response
+
+    def test_equivalent_honest_blocked_response_is_not_duplicated(self):
+        response = "The requested change did not take effect. I am blocked."
+
+        out = AIAgent._apply_file_mutation_failure_notice(
+            response,
+            self.FAILED,
+            user_message="fix the source",
+        )
+
+        assert out == response
+
+    def test_empty_response_becomes_concise_blocked_notice(self):
+        out = AIAgent._apply_file_mutation_failure_notice(
+            "",
+            self.FAILED,
+            user_message="fix the source",
+        )
+
+        assert out == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
+
+    @pytest.mark.parametrize(
+        "detail_request",
+        [
+            "Show me the raw file-mutation verifier details.",
+            "Include the full technical diagnostics for the failed file edit.",
+        ],
+    )
+    def test_explicit_raw_detail_request_preserves_diagnostic_footer(self, detail_request):
+        out = AIAgent._apply_file_mutation_failure_notice(
+            "The edit failed.",
+            self.FAILED,
+            user_message=detail_request,
+        )
+
+        assert "File-mutation verifier" in out
+        assert "private-source.py" in out
+        assert "old_string" in out
+
+    def test_multimodal_raw_detail_request_preserves_diagnostic_footer(self):
+        out = AIAgent._apply_file_mutation_failure_notice(
+            "The edit failed.",
+            self.FAILED,
+            user_message=[
+                {"type": "text", "text": "Show raw details for the failed file edit."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        )
+
+        assert "File-mutation verifier" in out
+        assert "private-source.py" in out
+
+    def test_temporary_path_never_leaks_in_ordinary_notice(self, tmp_path):
+        target = tmp_path / "scratch-secret.txt"
+        failed = {
+            str(target): {
+                "tool": "write_file",
+                "error_preview": f"write refused for {target}",
+            }
+        }
+
+        out = AIAgent._apply_file_mutation_failure_notice(
+            "I could not finish the request.",
+            failed,
+            user_message="create the temporary file",
+        )
+
+        assert out == "The requested change did not take effect, and I’m blocked."
+        assert str(target) not in out
+        assert "write_file" not in out
+
+    def test_unresolved_mutation_requests_backstage_recovery(self, monkeypatch):
+        agent = _bare_agent()
+        agent._turn_failed_file_mutations = dict(self.FAILED)
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+        monkeypatch.setattr(
+            agent,
+            "_unresolved_file_mutation_failures",
+            lambda: dict(self.FAILED),
+        )
+
+        nudge = agent._build_file_mutation_recovery_nudge("Done.")
+
+        assert nudge is not None
+        assert "Do not stop or claim success" in nudge
+        assert "hermes config set" in nudge
+        assert AIAgent._FILE_MUTATION_BLOCKED_MESSAGE in nudge
+        assert "private-source.py" not in nudge
+
+    def test_honest_blocked_response_does_not_request_another_recovery(self, monkeypatch):
+        agent = _bare_agent()
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+        monkeypatch.setattr(
+            agent,
+            "_unresolved_file_mutation_failures",
+            lambda: dict(self.FAILED),
+        )
+
+        assert agent._build_file_mutation_recovery_nudge(
+            AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
+        ) is None
+
+        assert agent._build_file_mutation_recovery_nudge(
+            "The requested change did not take effect. I am blocked."
+        ) is None
 
 
 # ---------------------------------------------------------------------------

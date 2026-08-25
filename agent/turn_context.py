@@ -1357,6 +1357,7 @@ def build_turn_context(
     agent._turn_file_mutation_state_lock = threading.Lock()
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
+    agent._file_mutation_recovery_nudges = 0
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

@@ -6433,8 +6433,8 @@ class TurnRunner:
 
         # Signal the stream consumer that the agent is done. Pass the
         # completed final_response as the authoritative finalize payload:
-        # it includes post-stream augmentation (file-mutation verifier
-        # footer, turn-completion explainer) the consumer's accumulator
+        # it includes post-stream augmentation (file-mutation failure
+        # notice, turn-completion explainer) the consumer's accumulator
         # never saw, so the seal/final edit delivers the TRUE final and no
         # separate corrective send fires (live finding #11). Failed turns
         # pass nothing — error text is delivered by the gateway's normal

@@ -46,10 +46,10 @@ _NEW_SEGMENT = object()
 _COMMENTARY = object()
 # Authoritative turn-final payload, enqueued by ``finish(final_text=...)``
 # just before ``_DONE``.  Carries the completed ``final_response`` —
-# including post-stream augmentation (file-mutation verifier footer,
+# including post-stream augmentation (file-mutation failure notice,
 # turn-completion explainer) — so the finalize/seal delivers the TRUE final
 # and the recorded payload reconciles (#71643 / live finding #11: the
-# footer-bearing final previously arrived only via a separate plain send).
+# augmented final previously arrived only via a separate plain send).
 _FINAL_TEXT = object()
 
 # Queue marker for a synchronous flush barrier.  Enqueued as
@@ -674,7 +674,7 @@ class GatewayStreamConsumer:
 
         ``final_text``, when provided, is the AUTHORITATIVE completed
         ``final_response`` — including post-stream augmentation the
-        accumulator never saw (file-mutation verifier footer,
+        accumulator never saw (file-mutation failure notice,
         turn-completion explainer, plugin transforms).  The drain loop
         adopts it as the finalize payload so the sealed/edited message IS
         the true final and no separate corrective send is needed

@@ -43,6 +43,7 @@ def _make_adapter():
 
 BODY = "the split answer body"
 FOOTER = "\n\n⚠️ File-mutation verifier: 1 file(s) were NOT modified this turn."
+CONCISE_FAILURE = "The requested change did not take effect, and I’m blocked."
 
 
 def _consumer(adapter):
@@ -107,3 +108,23 @@ class TestSplitSuffixReconcile:
         sc.finish(BODY + FOOTER)
         await task
         assert sc.delivered_final_matches(BODY + FOOTER) is True
+
+    @pytest.mark.asyncio
+    async def test_concise_mutation_failure_reconciles_without_raw_footer(self):
+        adapter = _make_adapter()
+        sc = _consumer(adapter)
+        task = asyncio.create_task(sc.run())
+        sc.on_delta(BODY)
+        await asyncio.sleep(0.06)
+        # The fail-closed finalizer replaces the streamed false success claim;
+        # the gateway must reconcile the existing message by edit, not append.
+        sc.finish(CONCISE_FAILURE)
+        await task
+
+        assert sc.delivered_final_matches(CONCISE_FAILURE) is True
+        all_payloads = adapter.send_calls + [
+            edit["content"] for edit in adapter.edit_calls
+        ]
+        assert any(CONCISE_FAILURE in payload for payload in all_payloads)
+        assert all_payloads[-1] == CONCISE_FAILURE
+        assert all("File-mutation verifier" not in payload for payload in all_payloads)

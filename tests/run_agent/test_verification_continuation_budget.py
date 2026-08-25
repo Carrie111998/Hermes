@@ -147,6 +147,44 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     agent._handle_max_iterations.assert_not_called()
 
 
+def test_failed_mutation_gets_one_backstage_recovery_turn(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([
+        _response("Done — I changed the file."),
+        _response(AIAgent._FILE_MUTATION_BLOCKED_MESSAGE),
+    ])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    agent._file_mutation_verifier_enabled = lambda: True
+    agent._unresolved_file_mutation_failures = lambda: {
+        "/tmp/private-source.py": {
+            "tool": "patch",
+            "error_preview": "old_string not found",
+        }
+    }
+    emitted = []
+    agent.interim_assistant_callback = lambda text, **kw: emitted.append(text)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = agent.run_conversation("fix the file")
+
+    assert result["final_response"] == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert result["completed"] is True
+    assert emitted == []
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert all(
+        not message.get("_file_mutation_recovery_synthetic")
+        for message in result["messages"]
+    )
+    agent._handle_max_iterations.assert_not_called()
+
+
 def test_multiple_verification_retries_publish_each_candidate_once(agent, monkeypatch):
     """Multiple verification retries should publish each candidate once, in order."""
     agent.max_iterations = 3

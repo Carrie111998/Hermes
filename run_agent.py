@@ -250,6 +250,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_file_mutation_recovery_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
@@ -3944,7 +3945,7 @@ class AIAgent:
         return unresolved
 
     def _file_mutation_verifier_enabled(self) -> bool:
-        """Check whether the per-turn file-mutation verifier footer is on.
+        """Check whether the per-turn file-mutation verifier is on.
 
         Config path: ``display.file_mutation_verifier`` (bool, default True).
         ``HERMES_FILE_MUTATION_VERIFIER`` env var overrides config.  Exposed
@@ -4053,6 +4054,92 @@ class AIAgent:
         # already backticked above; the lookbehind keeps it from being
         # double-wrapped).
         return cls._neutralize_footer_paths("\n".join(lines))
+
+    _FILE_MUTATION_BLOCKED_MESSAGE = (
+        "The requested change did not take effect, and I’m blocked."
+    )
+
+    @staticmethod
+    def _file_mutation_raw_diagnostics_requested(user_message: Any) -> bool:
+        """Return true only for an explicit request for low-level edit diagnostics."""
+        text = " ".join(flatten_message_text(user_message).lower().split())
+        if not text:
+            return False
+        explicit_detail = (
+            re.search(r"\braw\b", text) is not None
+            or "full technical" in text
+            or "technical diagnostic" in text
+            or "stack trace" in text
+            or "exact error" in text
+        )
+        mutation_context = (
+            "file-mutation" in text
+            or "file mutation" in text
+            or "failed file edit" in text
+            or "failed edit" in text
+            or "verifier" in text
+        )
+        return explicit_detail and mutation_context
+
+    @classmethod
+    def _apply_file_mutation_failure_notice(
+        cls,
+        final_response: str,
+        failed: Dict[str, Dict[str, Any]],
+        *,
+        user_message: Any,
+    ) -> str:
+        """Make unresolved mutation failure honest without exposing internals.
+
+        The verifier is a safety backstop, not a user-action request. Normal
+        replies therefore collapse to one stable plain-English sentence and no
+        path, tool, error preview, or contradictory success claim. A model that
+        already stated the block plainly is left untouched. Explicit requests
+        for raw diagnostics retain the detailed legacy footer.
+        """
+        if not failed:
+            return final_response
+        response = (final_response or "").rstrip()
+        if cls._file_mutation_raw_diagnostics_requested(user_message):
+            footer = cls._format_file_mutation_failure_footer(failed)
+            if not footer:
+                return response
+            return response + ("\n\n" if response else "") + footer
+        if cls._file_mutation_response_is_honestly_blocked(response):
+            return response
+        return cls._FILE_MUTATION_BLOCKED_MESSAGE
+
+    @classmethod
+    def _file_mutation_response_is_honestly_blocked(cls, response: str) -> bool:
+        """Recognize the prescribed failure statement without punctuation rigidity."""
+        normalized = " ".join(
+            (response or "").casefold().replace("’", "'").split()
+        )
+        return (
+            "requested change did not take effect" in normalized
+            and ("i'm blocked" in normalized or "i am blocked" in normalized)
+        )
+
+    def _build_file_mutation_recovery_nudge(self, final_response: str) -> Optional[str]:
+        """Ask the model to recover an unresolved failed edit before stopping."""
+        if not self._file_mutation_verifier_enabled():
+            return None
+        failed = self._unresolved_file_mutation_failures()
+        if not failed:
+            return None
+        if self._file_mutation_response_is_honestly_blocked(final_response):
+            return None
+        return (
+            "A file mutation from this turn is still unresolved. Do not stop or "
+            "claim success yet. Recover using the correct supported path and "
+            "verify that the requested change actually landed. For protected "
+            "Hermes configuration, use `hermes config set`/`unset` and then "
+            "`hermes config get`; do not retry patch/write_file. If recovery is "
+            "not possible, state exactly: “"
+            + self._FILE_MUTATION_BLOCKED_MESSAGE
+            + "” Do not expose verifier internals, raw tool errors, or local paths "
+            "unless the user explicitly requested technical diagnostics."
+        )
 
     def _turn_completion_explainer_enabled(self) -> bool:
         """Check whether the end-of-turn completion explainer footer is on.
