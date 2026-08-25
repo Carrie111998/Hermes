@@ -1078,8 +1078,10 @@ class TestProfileRestoration:
         run_import(args)
 
         # Only valid profile should get a wrapper
-        assert (wrapper_dir / "valid").exists()
-        assert not (wrapper_dir / "empty").exists()
+        valid_wrapper = wrapper_dir / ("valid.bat" if os.name == "nt" else "valid")
+        empty_wrapper = wrapper_dir / ("empty.bat" if os.name == "nt" else "empty")
+        assert valid_wrapper.exists()
+        assert not empty_wrapper.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1478,7 +1480,10 @@ class TestQuickSnapshotProjectsKanban:
         monkeypatch.setattr(bk, "_safe_copy_db", _spy)
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
         # The board db was copied via _safe_copy_db (not raw copy).
-        assert any(s.endswith("boards/work/kanban.db") for s in called["db"]), called["db"]
+        assert any(
+            Path(s).as_posix().endswith("boards/work/kanban.db")
+            for s in called["db"]
+        ), called["db"]
         copy = hermes_home / "state-snapshots" / snap_id / "kanban" / "boards" / "work" / "kanban.db"
         rows = sqlite3.connect(str(copy)).execute("SELECT * FROM tasks").fetchall()
         assert rows == [("w1", "ship")]
@@ -1845,9 +1850,10 @@ class TestMemoryProviderExternalPaths:
         restored = dst_home / ".honcho" / "config.json"
         assert restored.exists()
         assert restored.read_text() == '{"peer":"bob"}'
-        # Credential-shaped file tightened.
-        assert (restored.stat().st_mode & 0o777) == 0o600
+        # Credential-shaped file tightened where POSIX mode bits are enforced.
+        # Windows does not expose Unix permission bits through pathlib.stat().
+        if os.name != "nt":
+            assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
