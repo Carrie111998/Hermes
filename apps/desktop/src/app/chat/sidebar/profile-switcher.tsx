@@ -60,6 +60,7 @@ import {
   $profileCreateRequest,
   $profileOrder,
   $profiles,
+  $profilesConnectionId,
   $profileScope,
   ALL_PROFILES,
   normalizeProfileKey,
@@ -77,6 +78,7 @@ import {
   refreshProfileRemoteOverrides
 } from '@/store/profile-remote-override'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
+import { $connection } from '@/store/session'
 import type { ProfileInfo } from '@/types/hermes'
 
 import { CreateProfileDialog } from '../../profiles/create-profile-dialog'
@@ -146,6 +148,8 @@ export function ProfileRail() {
   const { t } = useI18n()
   const p = t.profiles
   const profiles = useStore($profiles)
+  const profilesConnectionId = useStore($profilesConnectionId)
+  const connection = useStore($connection)
   const scope = useStore($profileScope)
   const gatewayProfile = useStore($activeGatewayProfile)
   const order = useStore($profileOrder)
@@ -194,18 +198,22 @@ export function ProfileRail() {
   const activeKey = normalizeProfileKey(gatewayProfile)
   const defaultProfile = profiles.find(profile => profile.is_default)
   const defaultLabel = defaultProfile ? profileLabel(defaultProfile) : ''
-  const onDefault = !isAll && activeKey === 'default'
+  const rosterCurrent = profilesConnectionId === (connection?.connectionId ?? null)
+  const exactActiveProfile = profiles.find(profile => normalizeProfileKey(profile.name) === activeKey)
 
-  const activeProfile = isAll
+  const activeProfile = isAll || !rosterCurrent
     ? null
-    : profiles.find(profile => normalizeProfileKey(profile.name) === activeKey) ?? defaultProfile ?? null
+    : exactActiveProfile ?? (activeKey === 'default' ? defaultProfile : null) ?? null
+
+  const onDefault = activeProfile?.is_default === true
+  const activeProfileKey = activeProfile ? normalizeProfileKey(activeProfile.name) : null
 
   const named = sortByProfileOrder(
     profiles.filter(profile => !profile.is_default),
     order
   )
 
-  const compactNamed = isAll ? named : named.filter(profile => normalizeProfileKey(profile.name) !== activeKey)
+  const compactNamed = isAll ? named : named.filter(profile => normalizeProfileKey(profile.name) !== activeProfileKey)
 
   const multiProfile = profiles.length > 1
 
@@ -297,12 +305,12 @@ export function ProfileRail() {
         ) : null)}
 
       {/* Single-profile: the active default owner's identity next to create. */}
-      {!multiProfile && defaultProfile && (
+      {!multiProfile && activeProfile?.is_default && (
         <ActiveProfilePill
-          color={resolveProfileColor(defaultLabel, colors)}
-          label={defaultLabel}
-          onSelect={() => selectProfile(defaultProfile.name)}
-          profileName={defaultProfile.name}
+          color={resolveProfileColor(profileLabel(activeProfile), colors)}
+          label={profileLabel(activeProfile)}
+          onSelect={() => selectProfile(activeProfile.name)}
+          profileName={activeProfile.name}
         />
       )}
 
@@ -311,7 +319,7 @@ export function ProfileRail() {
         // reorder, no long-press recolor, no per-square context menu — Manage
         // covers rename/delete at this scale.
         <div className="flex min-w-0 flex-1 items-center gap-1">
-          {defaultProfile && (isAll || !onDefault) && (
+          {rosterCurrent && defaultProfile && (isAll || !onDefault) && (
             <OwnerProfileCompact
               color={resolveProfileColor(defaultLabel, colors)}
               label={defaultLabel}
@@ -332,7 +340,7 @@ export function ProfileRail() {
           className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           ref={scrollRef}
         >
-          {multiProfile && defaultProfile && (isAll || !onDefault) && (
+          {multiProfile && rosterCurrent && defaultProfile && (isAll || !onDefault) && (
             <OwnerProfileCompact
               color={resolveProfileColor(defaultLabel, colors)}
               label={defaultLabel}

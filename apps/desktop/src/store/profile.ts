@@ -21,7 +21,7 @@ import {
   openGatewayForProfile
 } from '@/store/gateway'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
-import { setConnection } from '@/store/session'
+import { $connection, setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
@@ -49,6 +49,10 @@ export const $activeProfile = atom<string>('default')
 // Cached profile list for the picker. Refreshed lazily; the dropdown also
 // re-fetches on open so a profile created elsewhere shows up.
 export const $profiles = atom<ProfileInfo[]>([])
+// Connection id that produced the cached roster. The list deliberately stays
+// visible while another gateway loads, so identity-sensitive controls compare
+// this source before showing a machine owner's display name or avatar.
+export const $profilesConnectionId = atom<null | string>(null)
 
 export function setActiveProfile(name: string): void {
   $activeProfile.set(name || 'default')
@@ -72,10 +76,14 @@ export function invalidateProfileListFetches(): void {
 
 export async function refreshProfiles(): Promise<ProfileInfo[]> {
   const epoch = profileListEpoch
+  const connectionId = $connection.get()?.connectionId ?? null
   const { profiles } = await getProfiles()
 
   if (epoch === profileListEpoch) {
     $profiles.set(profiles)
+    // Publish after the roster: consumers may briefly hide identity while the
+    // two atoms settle, but can never bless the PREVIOUS roster as current.
+    $profilesConnectionId.set(connectionId)
   }
 
   return profiles

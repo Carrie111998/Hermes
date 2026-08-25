@@ -57,6 +57,7 @@ vi.mock('@/store/profile', () => ({
   $profileCreateRequest: atom(0),
   $profileOrder: atom([]),
   $profiles: atom([{ is_default: true, name: 'default' }]),
+  $profilesConnectionId: atom('pc'),
   $profileScope: atom('default'),
   ALL_PROFILES: '*',
   normalizeProfileKey: (name: string) => name,
@@ -71,6 +72,7 @@ vi.mock('@/store/profile', () => ({
 }))
 
 vi.mock('@/store/connections', () => ({ $hasMultipleConnections: atom(false) }))
+vi.mock('@/store/session', () => ({ $connection: atom({ connectionId: 'pc' }) }))
 
 vi.mock('@/store/profile-share', () => ({
   runExportProfileFlow: vi.fn(),
@@ -93,7 +95,8 @@ vi.mock('../../profiles/rename-profile-dialog', () => ({ RenameProfileDialog: ()
 
 const { $hasMultipleConnections } = await import('@/store/connections')
 const hasMultipleConnections = $hasMultipleConnections as ReturnType<typeof atom<boolean>>
-const { $activeGatewayProfile, $profileScope, $profiles } = await import('@/store/profile')
+const { $activeGatewayProfile, $profileScope, $profiles, $profilesConnectionId } = await import('@/store/profile')
+const { $connection } = await import('@/store/session')
 
 const profiles = $profiles as ReturnType<
   typeof atom<Array<{ display_name?: string; is_default: boolean; name: string }>>
@@ -101,6 +104,8 @@ const profiles = $profiles as ReturnType<
 
 const profileScope = $profileScope as ReturnType<typeof atom<string>>
 const activeGatewayProfile = $activeGatewayProfile as ReturnType<typeof atom<string>>
+const profilesConnectionId = $profilesConnectionId as ReturnType<typeof atom<null | string>>
+const connection = $connection as ReturnType<typeof atom<{ connectionId: string } | null>>
 
 beforeEach(() => {
   gatewayState.current = { id: 'pc' }
@@ -114,6 +119,8 @@ afterEach(() => {
   profiles.set([{ is_default: true, name: 'default' }])
   profileScope.set('default')
   activeGatewayProfile.set('default')
+  profilesConnectionId.set('pc')
+  connection.set({ connectionId: 'pc' })
 })
 
 describe('ProfileRail multi-gateway entry point', () => {
@@ -185,6 +192,33 @@ describe('ProfileRail multi-gateway entry point', () => {
     expect(within(owner).getByText('C')).toBeTruthy()
     expect(within(owner).queryByText('Clyde')).toBeNull()
     expect(within(founder).getByText('F')).toBeTruthy()
+  })
+
+  it('uses is_default to recognize a root-keyed machine owner', () => {
+    activeGatewayProfile.set('root')
+    profileScope.set('root')
+    profiles.set([
+      { display_name: 'Bellow', is_default: true, name: 'root' },
+      { display_name: 'Sagan', is_default: false, name: 'sagan' }
+    ])
+    render(<ProfileRail />)
+
+    const ownerButtons = screen.getAllByRole('button', { name: 'Bellow' })
+    const owner = ownerButtons[0]!
+
+    expect(ownerButtons).toHaveLength(1)
+    expect(within(owner).getByText('Bellow')).toBeTruthy()
+  })
+
+  it('does not flash the previous gateway owner name while the next roster loads', () => {
+    profiles.set([
+      { display_name: 'Clyde', is_default: true, name: 'default' },
+      { display_name: 'Picasso', is_default: false, name: 'picasso' }
+    ])
+    connection.set({ connectionId: 'forge' })
+    render(<ProfileRail />)
+
+    expect(screen.queryByRole('button', { name: 'Clyde' })).toBeNull()
   })
 
   it('uses the default profile avatar when the gateway has one', async () => {

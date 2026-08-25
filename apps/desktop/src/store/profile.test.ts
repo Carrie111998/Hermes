@@ -23,6 +23,7 @@ vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 const {
   $activeGatewayProfile,
   $profiles,
+  $profilesConnectionId,
   ensureGatewayProfile,
   invalidateProfileListFetches,
   prewarmProfileBackend,
@@ -59,6 +60,7 @@ beforeEach(() => {
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
   $profiles.set([])
+  $profilesConnectionId.set(null)
   vi.stubGlobal('window', { hermesDesktop: { getConnection } })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
@@ -161,6 +163,15 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
 })
 
 describe('refreshProfiles shared rail list (#49289)', () => {
+  it('records which registry connection produced the cached roster', async () => {
+    $connection.set(remoteConn({ connectionId: 'forge' }))
+    vi.mocked(getProfiles).mockResolvedValueOnce({ profiles: [profile('default', true), profile('sagan')] })
+
+    await refreshProfiles()
+
+    expect($profilesConnectionId.get()).toBe('forge')
+  })
+
   it('removes a deleted profile from the shared $profiles cache after Manage Profiles refreshes', async () => {
     $profiles.set([profile('default', true), profile('test1')])
     vi.mocked(getProfiles).mockResolvedValueOnce({ profiles: [profile('default', true)] })
