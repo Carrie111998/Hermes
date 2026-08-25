@@ -6,7 +6,7 @@ description: "How to build a secret-manager backend plugin for Hermes Agent"
 
 # Building a Secret Source Plugin
 
-Secret sources resolve provider credentials from an external secret manager (a vault, a password manager, an OS keystore, a custom script) into environment variables at process startup — after `~/.hermes/.env` loads, before Hermes reads credentials. Bitwarden, 1Password, and a generic command-helper source ship in-tree; **every other backend is a plugin**. This guide covers building one.
+Secret sources resolve provider credentials from an external secret manager (a vault, a password manager, an OS keystore, a custom script) into environment variables at process startup â€” after `~/.hermes/.env` loads, before Hermes reads credentials. Bitwarden, 1Password, and a generic command-helper source ship in-tree; **every other backend is a plugin**. This guide covers building one.
 
 :::tip
 The bundled set is deliberately closed, same policy as [memory providers](/developer-guide/memory-provider-plugin): PRs adding new vault backends under `agent/secret_sources/` are closed with a pointer to this guide. Publish your backend as a standalone plugin repo and share it in the Nous Research Discord (`#plugins-skills-and-skins`).
@@ -25,7 +25,7 @@ That closes the "replace Bitwarden with my vault" first-process gap (#64177).
 - Sources only supply env vars through the orchestrator; there is **no**
   plugin API to dump other plugins' or the user's entire secret store beyond
   what your source's own config allows.
-- Reading `os.environ` after load is possible for any in-process code — the
+- Reading `os.environ` after load is possible for any in-process code â€” the
   trust boundary remains "enabled plugins run with agent privilege".
 
 ## What the framework owns vs. what you own
@@ -40,14 +40,14 @@ The orchestrator (`agent.secret_sources.registry.apply_all`) owns everything sec
 | Protected bootstrap tokens | Declaring which env var IS your bootstrap token |
 | Per-source wall-clock timeout | Keeping `fetch()` reasonably fast |
 | Per-var provenance + `(from X)` labels | A human-readable `label` |
-| `os.environ` writes | Nothing — you never touch the environment |
+| `os.environ` writes | Nothing â€” you never touch the environment |
 
 ## Directory structure
 
 ```
 ~/.hermes/plugins/my-vault/
-├── plugin.yaml      # name, description
-└── __init__.py      # SecretSource subclass + register(ctx)
+â”œâ”€â”€ plugin.yaml      # name, description
+â””â”€â”€ __init__.py      # SecretSource subclass + register(ctx)
 ```
 
 ## The SecretSource ABC
@@ -68,7 +68,7 @@ from agent.secret_sources.base import (
 class MyVaultSource(SecretSource):
     name = "myvault"          # config section key: secrets.myvault
     label = "My Vault"        # used in startup lines + provenance labels
-    shape = "mapped"          # "mapped" (explicit VAR→ref map) or "bulk" (project dump)
+    shape = "mapped"          # "mapped" (explicit VARâ†’ref map) or "bulk" (project dump)
     scheme = "mv"             # optional: unique URI scheme you own (mv://...)
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
@@ -83,7 +83,7 @@ class MyVaultSource(SecretSource):
         try:
             proc = run_secret_cli(
                 ["myvault-cli", "export", "--json"],
-                allow_env=["MYVAULT_TOKEN"],   # ONLY your auth vars — never full os.environ
+                allow_env=["MYVAULT_TOKEN"],   # ONLY your auth vars â€” never full os.environ
                 timeout=30,
             )
         except RuntimeError as exc:           # spawn failure / timeout
@@ -100,22 +100,22 @@ class MyVaultSource(SecretSource):
         return result
 
     def protected_env_vars(self, cfg: dict):
-        # Your bootstrap token — no source (including yours) may ever overwrite it.
+        # Your bootstrap token â€” no source (including yours) may ever overwrite it.
         return frozenset({"MYVAULT_TOKEN"})
 ```
 
 ### Contract rules (enforced, not suggestions)
 
-- **`fetch()` never raises.** Errors go in `result.error` + `result.error_kind`. A raising fetch is contained by the orchestrator and reported as `INTERNAL` — a contract violation, not a feature.
+- **`fetch()` never raises.** Errors go in `result.error` + `result.error_kind`. A raising fetch is contained by the orchestrator and reported as `INTERNAL` â€” a contract violation, not a feature.
 - **`fetch()` never prompts.** Startup runs in non-TTY contexts (gateway, cron, Docker). `run_secret_cli()` closes stdin so a prompting helper fails fast. Interactive auth belongs in your CLI setup flow, never on the startup path.
 - **Sync, within budget.** The orchestrator enforces a wall-clock timeout (default 120s, user-tunable via `secrets.<name>.timeout_seconds`). Exceeding it reports `TIMEOUT` and your result is discarded.
-- **You fetch; the orchestrator applies.** Return the mapping you *would* contribute. Never write `os.environ` yourself — you'd bypass precedence, conflict detection, and provenance.
+- **You fetch; the orchestrator applies.** Return the mapping you *would* contribute. Never write `os.environ` yourself â€” you'd bypass precedence, conflict detection, and provenance.
 - **API versioning.** `SecretSource.api_version` defaults to the current `SECRET_SOURCE_API_VERSION`. The registry skips (with a warning) sources built against a different version instead of crashing startup.
 
 ### Choosing your `shape`
 
-- `mapped` — the user explicitly binds env-var names to references in config (like 1Password's `env:` map). Strongest intent: mapped claims beat bulk claims on contested vars.
-- `bulk` — you inject a whole project/folder of secrets implicitly (like Bitwarden BSM). Yields to mapped sources.
+- `mapped` â€” the user explicitly binds env-var names to references in config (like 1Password's `env:` map). Strongest intent: mapped claims beat bulk claims on contested vars.
+- `bulk` â€” you inject a whole project/folder of secrets implicitly (like Bitwarden BSM). Yields to mapped sources.
 
 ### Optional hooks
 
@@ -126,11 +126,11 @@ class MyVaultSource(SecretSource):
 | `protected_env_vars(cfg)` | empty | You have a bootstrap token (you almost certainly do) |
 | `fetch_timeout_seconds(cfg)` | 120s | Your backend needs a different budget |
 | `config_schema()` | `{}` | Declare config keys for setup surfaces |
-| `remediation(kind, cfg)` | generic per-`ErrorKind` hints | You want failure warnings to point at your own fix-it command (e.g. the bundled sources return `Run hermes secrets <name> token…` for `AUTH_FAILED`). Must be a pure kind→string mapping: no I/O, never raises. Return `""` to suppress the hint. |
+| `remediation(kind, cfg)` | generic per-`ErrorKind` hints | You want failure warnings to point at your own fix-it command (e.g. the bundled sources return `Run hermes secrets <name> tokenâ€¦` for `AUTH_FAILED`). Must be a pure kindâ†’string mapping: no I/O, never raises. Return `""` to suppress the hint. |
 
 ## Subprocess safety: use `run_secret_cli()`
 
-If your backend shells out to a CLI, use the shared helper instead of `subprocess.run` directly. It gives you the audited posture for free: argv-only (no `shell=True`), a **minimal allowlisted child environment** (by the time sources run, `os.environ` holds every credential Hermes knows — never hand that to a child process), `NO_COLOR` + ANSI-scrubbed stderr, stdin closed, timeout → clean `RuntimeError`. Pass user-supplied reference strings after a `--` terminator in your argv so they can never parse as flags.
+If your backend shells out to a CLI, use the shared helper instead of `subprocess.run` directly. It gives you the audited posture for free: argv-only (no `shell=True`), a **minimal allowlisted child environment** (by the time sources run, `os.environ` holds every credential Hermes knows â€” never hand that to a child process), `NO_COLOR` + ANSI-scrubbed stderr, stdin closed, timeout â†’ clean `RuntimeError`. Pass user-supplied reference strings after a `--` terminator in your argv so they can never parse as flags.
 
 ## Registering
 
@@ -143,7 +143,7 @@ def register(ctx):
 Registration is rejected (with a log warning, never a crash) for: non-`SecretSource` instances, invalid/duplicate names, a `scheme` another source owns, wrong `api_version`, or a `shape` outside `mapped`/`bulk`.
 
 :::note Timing
-Plugin discovery runs later in startup than the first `load_hermes_dotenv()` call. Immediately after discovery, Hermes re-pulls enabled plugin secret sources (`reset_secret_source_cache()` + `load_hermes_dotenv()`), so the discovering process *does* pick them up — see [First-process bootstrap timing](#first-process-bootstrap-timing) above (#64177). The re-pull is fail-open and skipped when no plugin source is enabled. Any code that reads `os.environ` during the plugin module's import or `register(ctx)` still runs before the re-pull and cannot depend on credentials supplied by that same source; keep credentialed work inside `fetch()`. Gateway, cron, and subagent processes perform the same discovery/re-pull sequence.
+Plugin discovery runs later in startup than the first `load_hermes_dotenv()` call. Immediately after discovery, Hermes re-pulls enabled plugin secret sources (`reset_secret_source_cache()` + `load_hermes_dotenv()`), so the discovering process *does* pick them up â€” see [First-process bootstrap timing](#first-process-bootstrap-timing) above (#64177). The re-pull is fail-open and skipped when no plugin source is enabled. Any code that reads `os.environ` during the plugin module's import or `register(ctx)` still runs before the re-pull and cannot depend on credentials supplied by that same source; keep credentialed work inside `fetch()`. Gateway, cron, and subagent processes perform the same discovery/re-pull sequence.
 :::
 
 ## Users configure it like any other source
@@ -156,7 +156,7 @@ secrets:
     # ... your config_schema keys
 ```
 
-Multi-source precedence, conflict warnings, and `(from My Vault)` provenance labels all work automatically — see the [user-facing secrets docs](/user-guide/secrets/) for the precedence ladder.
+Multi-source precedence, conflict warnings, and `(from My Vault)` provenance labels all work automatically â€” see the [user-facing secrets docs](/user-guide/secrets/) for the precedence ladder.
 
 ## Validate with the conformance kit
 
@@ -183,6 +183,6 @@ It checks the rules that break other people when violated: never-raises on malfo
 | `AUTH_FAILED` / `AUTH_EXPIRED` | Bad / expired credentials |
 | `REF_INVALID` | A secret reference failed validation |
 | `NETWORK` | Transport-level failure |
-| `EMPTY_VALUE` | Backend returned nothing for a ref — never apply `""` over a good credential |
+| `EMPTY_VALUE` | Backend returned nothing for a ref â€” never apply `""` over a good credential |
 | `TIMEOUT` | Fetch exceeded its budget |
 | `INTERNAL` | Anything else (bug, unexpected shape) |
