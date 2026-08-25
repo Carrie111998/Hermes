@@ -798,6 +798,12 @@ def _print_key_limit_guidance(agent, *, provider: str, model: str) -> bool:
     return bool(message)
 
 
+def _key_limit_terminal_response(*, summary: str, provider: str, model: str) -> str:
+    """Build the canonical terminal response for a per-key spending cap."""
+    guidance = _key_limit_message(provider=provider, model=model)
+    return f"API key spending limit reached: {summary}\n\n{guidance}"
+
+
 def _key_limit_failure_result(
     *,
     classified,
@@ -808,9 +814,12 @@ def _key_limit_failure_result(
     model: str,
 ) -> dict:
     """Structured terminal result for a per-credential spend-cap failure."""
-    guidance = _key_limit_message(provider=provider, model=model)
     return {
-        "final_response": f"API key spending limit reached: {summary}\n\n{guidance}",
+        "final_response": _key_limit_terminal_response(
+            summary=summary,
+            provider=provider,
+            model=model,
+        ),
         "messages": messages,
         "api_calls": api_call_count,
         "completed": False,
@@ -6604,9 +6613,10 @@ def run_conversation(
                             unverified=_billing_unverified,
                         )
                     elif classified.reason == FailoverReason.key_limit:
-                        _final_response = (
-                            f"API key spending limit reached: {_final_summary}\n\n"
-                            f"{_key_limit_message(provider=_provider, model=_model)}"
+                        _final_response = _key_limit_terminal_response(
+                            summary=_final_summary,
+                            provider=_provider,
+                            model=_model,
                         )
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
