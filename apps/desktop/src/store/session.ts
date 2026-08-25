@@ -543,6 +543,23 @@ export function touchSessionActivity(
 export const $connection = atom<HermesConnection | null>(null)
 export const $gatewayState = atom<ConnectionState>('idle')
 export const $sessions = atom<SessionInfo[]>([])
+// Recent sessions aggregated from OTHER registered gateways into the active
+// profile's sidebar (the "other gateways" section). Keyed by connectionId so
+// each foreign gateway's slice is fetched + replaced independently and never
+// collides with `$sessions`, which stays the ACTIVE connection's own list.
+// Additive: a foreign gateway's rows render badged with their origin and open
+// routed to that gateway — the local profile scope never changes.
+export const $foreignGatewaySessions = atom<Record<string, SessionInfo[]>>({})
+export const $foreignGatewaySessionsLoading = atom<Record<string, boolean>>({})
+
+export function setForeignGatewaySessions(connectionId: string, sessions: SessionInfo[]) {
+  $foreignGatewaySessions.set({ ...$foreignGatewaySessions.get(), [connectionId]: sessions })
+}
+
+export function setForeignGatewaySessionsLoading(connectionId: string, loading: boolean) {
+  $foreignGatewaySessionsLoading.set({ ...$foreignGatewaySessionsLoading.get(), [connectionId]: loading })
+}
+
 // Cron-job sessions (source === 'cron') are fetched as their own list so the
 // scheduler's always-newest sessions never crowd recents out of the page
 // budget. Powers the collapsed "Cron jobs" sidebar section.

@@ -23,6 +23,7 @@ import {
   getStatus,
   LATEST_SESSION_MESSAGES_LIMIT,
   listAllProfileSessions,
+  listGatewayRecentSessions,
   listSessions,
   listSidebarSessions,
   pluginSocket,
@@ -102,6 +103,34 @@ describe('Hermes REST helpers', () => {
           '/api/profiles/sessions/sidebar?recents_profile=work&recents_limit=30&cron_limit=50' +
           '&messaging_limit=100&recents_exclude=cron%2Ctool&messaging_exclude=cron%2Cdesktop',
         timeoutMs: 60_000
+      })
+    )
+  })
+
+  it('fetches a FOREIGN gateway recents list pinned to that connection + profile', async () => {
+    await listGatewayRecentSessions('mimir', 'default', 40, { excludeSources: ['cron', 'tool'] })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path:
+          '/api/profiles/sessions?limit=40&offset=0&min_messages=1' +
+          '&archived=exclude&order=recent&profile=default&exclude_sources=cron%2Ctool',
+        timeoutMs: 60_000,
+        connectionId: 'mimir',
+        profile: 'default'
+      })
+    )
+  })
+
+  it('uses the gateway profile as the scoped profile when one is supplied', async () => {
+    await listGatewayRecentSessions('surtr', 'work')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/profiles/sessions?limit=20&offset=0&min_messages=1&archived=exclude&order=recent&profile=work',
+        timeoutMs: 60_000,
+        connectionId: 'surtr',
+        profile: 'work'
       })
     )
   })

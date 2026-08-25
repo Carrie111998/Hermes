@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/sidebar'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
+import type { DesktopRegistryConnection } from '@/global'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
@@ -113,6 +114,8 @@ import { openRouteTile } from '@/store/route-tiles'
 import {
   $cronSessions,
   $currentCwd,
+  $foreignGatewaySessions,
+  $foreignGatewaySessionsLoading,
   $gatewayState,
   $messagingPlatformTotals,
   $messagingSessions,
@@ -122,6 +125,7 @@ import {
   $sessionsLoading,
   $unreadFinishedSessionIds,
   markAllSessionsRead,
+  requestSessionResume,
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
@@ -411,6 +415,44 @@ export function ChatSidebar({
       : null
 
   const sessionConnectionOrigin = activeConnectionOrigin && activeConnectionOrigin.kind !== 'local' ? activeConnectionOrigin : null
+
+  // ── Other-gateway session aggregation ───────────────────────────────────
+  // Sessions from every OTHER registered gateway, listed under the ACTIVE
+  // profile. Each got fetched into $foreignGatewaySessions keyed by
+  // connectionId (never clobbering $sessions) by refreshForeignGatewaySessions;
+  // rows render badged with their origin and OPEN routed to their owning
+  // gateway — the local profile scope itself never changes.
+  const foreignGatewaySessions = useStore($foreignGatewaySessions)
+  const foreignGatewaySessionsLoading = useStore($foreignGatewaySessionsLoading)
+  const [foreignGatewayOpen, setForeignGatewayOpen] = useState<Record<string, boolean>>({})
+
+  const foreignGatewaySections = useMemo(() => {
+    if (!connectionsRegistry) {
+      return []
+    }
+
+    const currentId = activeConnectionId
+    const rows: { connection: DesktopRegistryConnection; sessions: SessionInfo[]; loading: boolean }[] = []
+
+    for (const connection of connectionsRegistry.connections) {
+      if (connection.kind === 'local' || connection.id === currentId) {
+        continue
+      }
+
+      const sessions = foreignGatewaySessions[connection.id] ?? []
+      const loading = Boolean(foreignGatewaySessionsLoading[connection.id])
+
+      // Skip a connection that has neither rows nor an in-flight fetch: an
+      // empty section (no sessions, not loading) is just noise.
+      if (sessions.length === 0 && !loading) {
+        continue
+      }
+
+      rows.push({ connection, sessions, loading })
+    }
+
+    return rows
+  }, [connectionsRegistry, activeConnectionId, foreignGatewaySessions, foreignGatewaySessionsLoading])
 
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
@@ -1963,6 +2005,47 @@ export function ChatSidebar({
                 open={cronOpen}
               />
             )}
+
+            {!trimmedQuery &&
+              foreignGatewaySections.length > 0 &&
+              foreignGatewaySections.map(({ connection, sessions, loading }) => {
+                const openId = `foreign-${connection.id}`
+                const isOpen = foreignGatewayOpen[openId] ?? true
+
+                return (
+                  <SidebarSessionsSection
+                    activeSessionId={activeSidebarSessionId}
+                    connection={connection}
+                    contentClassName={cn('flex max-h-56 flex-col gap-px pb-1.75', GROUP_BODY)}
+                    emptyState={loading ? <SidebarSessionSkeletons /> : null}
+                    key={connection.id}
+                    label={connection.label}
+                    onArchiveSession={onArchiveSession}
+                    onDeleteSession={onDeleteSession}
+                    onResumeSession={sessionId => {
+                      // Route this foreign session's resume to ITS owning
+                      // gateway: requestSessionResume publishes the ownerRoute
+                      // (connectionId + profile) that use-route-resume forwards
+                      // to the sdk resume, which dispatches the session-scoped
+                      // RPC on that connection's own socket via
+                      // requestForSessionProfile → requestGatewayForAgent.
+                      requestSessionResume(sessionId, {
+                        connectionId: connection.id,
+                        profile: connection.remoteProfile || 'default',
+                        mode: 'remote'
+                      })
+                      onResumeSession(sessionId)
+                    }}
+                    onToggle={() => setForeignGatewayOpen(prev => ({ ...prev, [openId]: !(prev[openId] ?? true) }))}
+                    onTogglePin={pinSession}
+                    onToggleUnread={toggleUnread}
+                    open={isOpen}
+                    pinned={false}
+                    rootClassName="shrink-0 p-0"
+                    sessions={sessions}
+                  />
+                )
+              })}
           </div>
         )}
 

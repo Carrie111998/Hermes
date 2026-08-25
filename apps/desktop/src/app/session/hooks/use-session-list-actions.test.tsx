@@ -2,10 +2,14 @@ import { act, render, renderHook } from '@testing-library/react'
 import { Suspense } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { DesktopConnectionsRegistry, HermesConnection } from '@/global'
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+import { $connectionsRegistry } from '@/store/connections'
 import { $cronJobs, setCronJobs } from '@/store/cron'
 import {
+  $connection,
   $cronSessions,
+  $foreignGatewaySessions,
   $messagingPlatformTotals,
   $messagingSessions,
   $sessions,
@@ -61,6 +65,7 @@ const sidebar = (
 
 const listSidebarSessions = vi.fn()
 const listAllProfileSessions = vi.fn()
+const listGatewayRecentSessions = vi.fn()
 const getCronJobs = vi.fn()
 const gatewayScope = vi.hoisted(() => ({ epoch: 0 }))
 
@@ -75,6 +80,7 @@ vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getCronJobs: (...args: unknown[]) => getCronJobs(...args),
   listAllProfileSessions: (...args: unknown[]) => listAllProfileSessions(...args),
+  listGatewayRecentSessions: (...args: unknown[]) => listGatewayRecentSessions(...args),
   listSidebarSessions: (...args: unknown[]) => listSidebarSessions(...args)
 }))
 
@@ -97,6 +103,7 @@ beforeEach(() => {
   getCronJobs.mockResolvedValue([])
   listSidebarSessions.mockReset()
   listAllProfileSessions.mockReset()
+  listGatewayRecentSessions.mockReset()
   removed.ids = new Set()
   setCronJobs([])
   setSessions([])
@@ -115,6 +122,9 @@ afterEach(() => {
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
   setSessionsLoading(false)
+  $connectionsRegistry.set(null)
+  $connection.set(null)
+  $foreignGatewaySessions.set({})
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
@@ -705,5 +715,70 @@ describe('messaging profile scope', () => {
 
     expect(listAllProfileSessions).not.toHaveBeenCalled()
     expect($messagingPlatformTotals.get()).toEqual({ 'work:signal': 12 })
+  })
+})
+
+describe('refreshForeignGatewaySessions', () => {
+  it('fetches and stores each foreign gateway recents slice keyed by connectionId', async () => {
+    listGatewayRecentSessions.mockImplementation((connectionId: string) =>
+      Promise.resolve({
+        limit: 20,
+        offset: 0,
+        sessions: [row(connectionId === 'mimir' ? 'm-1' : 's-1', { profile: 'default' })],
+        total: 1
+      })
+    )
+
+    $connection.set({ connectionId: 'local', profile: 'default' } as unknown as HermesConnection)
+    $connectionsRegistry.set({
+      version: 2,
+      primary: 'local',
+      launchMode: 'primary',
+      lastUsed: 'local',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device' },
+        { id: 'mimir', kind: 'remote', label: 'Mimir', url: 'http://mimir.invalid', authMode: 'token' },
+        { id: 'surtr', kind: 'remote', label: 'Surtr', url: 'http://surtr.invalid', authMode: 'token' }
+      ]
+    } as unknown as DesktopConnectionsRegistry)
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshForeignGatewaySessions()
+    })
+
+    // Active (local) is skipped; each foreign gateway is fetched scoped to it.
+    expect(listGatewayRecentSessions).toHaveBeenCalledWith('mimir', 'default', expect.any(Number), expect.anything())
+    expect(listGatewayRecentSessions).toHaveBeenCalledWith('surtr', 'default', expect.any(Number), expect.anything())
+    expect($foreignGatewaySessions.get().mimir?.[0]?.id).toBe('m-1')
+    expect($foreignGatewaySessions.get().surtr?.[0]?.id).toBe('s-1')
+    // The active connection's own list is never written by aggregation.
+    expect($sessions.get()).toEqual([])
+  })
+
+  it('does nothing when a foreign fetch errors, leaving the slice stale', async () => {
+    listGatewayRecentSessions.mockRejectedValue(new Error('unreachable'))
+
+    $connection.set({ connectionId: 'local', profile: 'default' } as unknown as HermesConnection)
+    $connectionsRegistry.set({
+      version: 2,
+      primary: 'local',
+      launchMode: 'primary',
+      lastUsed: 'local',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device' },
+        { id: 'mimir', kind: 'remote', label: 'Mimir', url: 'http://mimir.invalid', authMode: 'token' }
+      ]
+    } as unknown as DesktopConnectionsRegistry)
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshForeignGatewaySessions()
+    })
+
+    expect($foreignGatewaySessions.get().mimir).toBeUndefined()
+    expect(listGatewayRecentSessions).toHaveBeenCalledTimes(1)
   })
 })
