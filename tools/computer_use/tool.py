@@ -237,8 +237,8 @@ def _warn_bypass_escalation(session_id: str) -> None:
     )
 
 
-def _cua_permission_mode(session_id: str) -> str:
-    """Map Hermes's explicit approval bypass onto Cua's immutable mode.
+def _approval_bypass_active(session_id: str) -> bool:
+    """Resolve the canonical bypass across both Hermes session namespaces.
 
     Hermes has TWO session-identity namespaces: the tool-dispatch path passes
     the DB ``session_id`` (``agent.session_id``), while gateway ``/yolo``
@@ -248,7 +248,9 @@ def _cua_permission_mode(session_id: str) -> str:
     gateway ``/yolo`` toggle silently invisible to computer_use (works in
     CLI, dead on messaging platforms), so we consult both namespaces —
     bypass in either means the user explicitly opted out of approvals for
-    this run. Fails closed on any resolution error.
+    this run. Keeping this lookup shared prevents the wrapper prompt and
+    Cua's immutable permission mode from disagreeing. Fails closed on any
+    resolution error.
     """
     try:
         from tools.approval import (
@@ -257,15 +259,21 @@ def _cua_permission_mode(session_id: str) -> str:
         )
 
         if is_approval_bypass_active_for_session(session_id):
-            _warn_bypass_escalation(session_id)
-            return "unrestricted"
+            return True
         current_key = get_current_session_key(default="")
         if current_key and is_approval_bypass_active_for_session(current_key):
-            _warn_bypass_escalation(session_id)
-            return "unrestricted"
+            return True
     except Exception:
         # Approval state must fail closed if it cannot be resolved.
         pass
+    return False
+
+
+def _cua_permission_mode(session_id: str) -> str:
+    """Map Hermes's explicit approval bypass onto Cua's immutable mode."""
+    if _approval_bypass_active(session_id):
+        _warn_bypass_escalation(session_id)
+        return "unrestricted"
     try:
         # Without YOLO, honor the configured mode (standard | bounded).
         # bounded requires computer_use.capability_manifest; the backend
@@ -638,6 +646,11 @@ def _request_approval(action: str, args: Dict[str, Any],
             return None
         if scope_key in _always_allow.get(session_id, set()):
             return None
+    # Hard safety validation runs in ``handle_computer_use`` before reaching
+    # this prompt gate. The canonical approval bypass suppresses only the
+    # duplicate interactive wrapper prompt; it does not bypass those guards.
+    if _approval_bypass_active(session_id):
+        return None
     cb = _approval_callback
     if cb is None:
         # No CLI approval wired — default allow. Gateway approval is handled
