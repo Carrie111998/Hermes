@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-import select
+import selectors
 import shlex
 import subprocess
 import threading
@@ -1179,27 +1179,48 @@ class BaseEnvironment(ABC):
                 return
             idle_after_exit = 0
             try:
-                while True:
-                    try:
-                        ready, _, _ = select.select([fd], [], [], 0.1)
-                    except (ValueError, OSError):
-                        break  # fd already closed
-                    if ready:
+                # select.select() only accepts fds below FD_SETSIZE (usually
+                # 1024).  Once the Electron/desktop process accumulates more
+                # than 1024 open fds, the terminal's stdout pipe lands at
+                # fd >= 1024 and select() raises "ValueError: filedescriptor
+                # out of range in select()" — which the old handler misread as
+                # "fd already closed", silently discarding ALL of the command's
+                # output while still reporting a correct exit code (#94928).
+                # selectors.DefaultSelector() (epoll/kqueue/poll on POSIX) has
+                # no fd-number limit, and a genuine readiness error is now
+                # logged instead of swallowed.
+                _selector = selectors.DefaultSelector()
+                try:
+                    _selector.register(fd, selectors.EVENT_READ)
+                    while True:
                         try:
-                            chunk = os.read(fd, 4096)
-                        except (ValueError, OSError):
+                            ready = _selector.select(timeout=0.1)
+                        except (ValueError, OSError) as _exc:
+                            logger.warning(
+                                "drain: readiness poll failed for fd %s (%r); "
+                                "stopping drain — output may be truncated",
+                                fd, _exc,
+                            )
                             break
-                        if not chunk:
-                            break  # true EOF — all writers closed
-                        output.append(decoder.decode(chunk))
-                        idle_after_exit = 0
-                    elif proc.poll() is not None:
-                        # bash is gone and the pipe was idle for ~100ms.  Give
-                        # it two more cycles to catch any buffered tail, then
-                        # stop — otherwise we wait forever on a grandchild pipe.
-                        idle_after_exit += 1
-                        if idle_after_exit >= 3:
-                            break
+                        if ready:
+                            try:
+                                chunk = os.read(fd, 4096)
+                            except (ValueError, OSError):
+                                break
+                            if not chunk:
+                                break  # true EOF — all writers closed
+                            output.append(decoder.decode(chunk))
+                            idle_after_exit = 0
+                        elif proc.poll() is not None:
+                            # bash is gone and the pipe was idle for ~100ms.
+                            # Give it two more cycles to catch any buffered
+                            # tail, then stop — otherwise we wait forever on a
+                            # grandchild pipe.
+                            idle_after_exit += 1
+                            if idle_after_exit >= 3:
+                                break
+                finally:
+                    _selector.close()
             finally:
                 # Flush any bytes buffered mid-sequence.  With ``errors="replace"``
                 # this emits U+FFFD for any final incomplete sequence rather than
