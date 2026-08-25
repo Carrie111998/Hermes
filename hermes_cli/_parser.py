@@ -13,6 +13,24 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 import argparse
 
 
+class _NoWrapHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep top-level CLI help on the lines authored by the parser."""
+
+    def __init__(self, prog, indent_increment=2, max_help_position=24):
+        # Help is also consumed by terminal tools and pagers. A large formatter
+        # width prevents argparse from inserting terminal-width line breaks;
+        # explicit newlines in descriptions and epilogues remain intact.
+        super().__init__(
+            prog,
+            indent_increment=indent_increment,
+            max_help_position=max_help_position,
+            width=10_000,
+        )
+
+    def _split_lines(self, text, width):
+        return text.splitlines() or [""]
+
+
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
 # argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
 # so it isn't on the parser. Listed here so all "carry over on relaunch"
@@ -92,7 +110,7 @@ def build_top_level_parser():
     parser = argparse.ArgumentParser(
         prog="hermes",
         description="Hermes Agent - AI assistant with tool-calling capabilities",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_NoWrapHelpFormatter,
         epilog=_EPILOGUE,
     )
 
@@ -302,12 +320,14 @@ def build_top_level_parser():
     # test_argparse_flag_propagation.py).
     _inherited_flag(
         chat_parser,
-        "-m", "--model",
+        "-m",
+        "--model",
         default=argparse.SUPPRESS,
         help="Model to use (e.g., anthropic/claude-sonnet-4)",
     )
     chat_parser.add_argument(
-        "-t", "--toolsets",
+        "-t",
+        "--toolsets",
         default=argparse.SUPPRESS,
         help="Comma-separated toolsets to enable",
     )
