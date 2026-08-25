@@ -17,6 +17,7 @@ Behaviour contract:
   * disconnect(): dangling streams sealed.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -242,4 +243,20 @@ class TestFinalizeSendDraftRace:
         assert late_frame["result"].success
         client.chat_appendStream.assert_not_awaited()
         client.chat_startStream.assert_awaited_once()
+        assert "D1" not in adapter._active_streams
+
+    @pytest.mark.asyncio
+    async def test_stream_popped_even_if_seal_raises(self):
+        """If chat.stopStream raises instead of returning, the stream entry
+        must still be popped — otherwise it's stuck with sealing=True
+        forever and every later send_draft for that chat silently drops
+        content (early-return at the top of send_draft)."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Hello wo", metadata=META)
+
+        client.chat_stopStream = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter.send("D1", "Hello world, done.", metadata=META)
+
         assert "D1" not in adapter._active_streams

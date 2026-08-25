@@ -3345,8 +3345,10 @@ class SlackAdapter(BasePlatformAdapter):
         # for "no active stream" and opening a duplicate one (#94435).
         stream["sealing"] = True
         ts = stream["ts"]
-        ok = await self._seal_stream(chat_id, stream, final_text=text)
-        self._active_streams.pop(chat_id, None)
+        try:
+            ok = await self._seal_stream(chat_id, stream, final_text=text)
+        finally:
+            self._active_streams.pop(chat_id, None)
         if not ok:
             # Could not stop the stream — post normally so the user still
             # gets the final answer; the dangling stream times out on
