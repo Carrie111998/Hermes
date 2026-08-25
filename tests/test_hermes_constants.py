@@ -387,11 +387,16 @@ class TestParseReasoningEffort:
 
     @pytest.mark.parametrize(
         "value",
-        ["bogus", "very-high", "0", "off", "true", "default"],
+        ["bogus", "very-high", "0", "true", "default"],
     )
     def test_unknown_levels_return_none(self, value):
         """Unrecognized strings fall back to the caller default (None)."""
         assert parse_reasoning_effort(value) is None
+
+    @pytest.mark.parametrize("value", ["off", "no"])
+    def test_string_disable_aliases(self, value):
+        """CLI strings retain the same disable semantics as YAML booleans."""
+        assert parse_reasoning_effort(value) == {"enabled": False}
 
     def test_known_supported_levels_are_documented(self):
         """Guard against silently dropping a documented level.
