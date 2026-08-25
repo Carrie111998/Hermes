@@ -275,6 +275,7 @@ import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySet
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
+  REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS,
   RemoteLivenessTracker,
   RemoteRevalidationCoordinator,
   revalidatePooledRemoteBackends,
@@ -1313,6 +1314,14 @@ function registerMediaProtocol() {
 let mainWindow = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
+// Pooled remotes are probed on the renderer reconnect cadence (minutes apart),
+// not the primary's sub-minute retry loop, so they need a failure window wider
+// than that cadence or a dead pooled descriptor's streak resets on every tick
+// and it is never dropped (#94381).
+const pooledRemoteLiveness = new RemoteLivenessTracker(
+  undefined,
+  REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS
+)
 const remoteRevalidation = new RemoteRevalidationCoordinator()
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
@@ -12611,7 +12620,7 @@ function revalidatePool() {
     log: rememberLog,
     probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
     stopBackend: stopPoolBackend,
-    tracker: remoteLiveness
+    tracker: pooledRemoteLiveness
   })
 }
 
