@@ -1249,7 +1249,7 @@ def parse_session_key(session_key: str) -> Optional[Dict[str, Any]]:
 
     Returns ``platform``, ``chat_type``, ``chat_id``, ``profile`` and, when
     present, ``scope_id`` / ``thread_id``; ``None`` when *session_key* is not a
-    structured agent key (a raw ``api_server`` session id, say).
+    structured agent key, e.g. a raw ``api_server`` session id.
 
     Follows the per-platform grammar rather than a flat ``split(":")``:
 
