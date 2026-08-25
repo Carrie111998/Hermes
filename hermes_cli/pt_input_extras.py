@@ -222,7 +222,18 @@ def _install_literal_key_data_patch() -> bool:
         return False
 
     def _call_handler(self, key, insert_text):  # type: ignore[no-untyped-def]
-        if isinstance(key, str) and not isinstance(key, Keys) and len(key) == 1:
+        # Only rewrite when the parser handed us a real payload that is the
+        # raw escape bytes. Stock _call_handler blanks insert_text for every
+        # key after the first in a multi-key ANSI match (Alt+letter →
+        # (Escape, "a") with "" on the letter). Reviving that blank would
+        # insert the letter and break meta chords (Shift+Alt+a → "A").
+        if (
+            isinstance(key, str)
+            and not isinstance(key, Keys)
+            and len(key) == 1
+            and insert_text
+            and insert_text != key
+        ):
             insert_text = key
         return original_call_handler(self, key, insert_text)
 

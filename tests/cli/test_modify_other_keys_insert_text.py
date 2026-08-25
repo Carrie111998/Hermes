@@ -120,6 +120,34 @@ def test_ctrl_combo_bindings_still_fire():
     assert _type("bc" + _mok(ord("a"), modifier=5) + "X") == "Xbc"
 
 
+def test_alt_letter_does_not_insert_the_letter():
+    """Alt+letter is (Escape, letter) with blanked data on the letter.
+
+    The insert-text patch must not revive that intentional blank, or meta
+    chords leak a character into the buffer.
+    """
+    assert _type(_mok(ord("a"), modifier=3)) == ""
+    assert _type("x" + _mok(ord("a"), modifier=3)) == "x"
+
+
+def test_shift_alt_letter_does_not_insert_the_capital():
+    """Shift+Alt+letter → (Escape, UPPER); must not type the capital."""
+    assert _type(_mok(ord("a"), modifier=4)) == ""
+    assert _type("x" + _mok(ord("a"), modifier=4)) == "x"
+
+
+def test_alt_letter_key_press_keeps_blanked_tail_data():
+    presses = []
+    parser = _parser_class()(presses.append)
+    for ch in _mok(ord("a"), modifier=3):
+        parser.feed(ch)
+    parser.flush()
+    assert len(presses) == 2
+    assert presses[0].key == Keys.Escape
+    assert presses[1].key == "a"
+    assert presses[1].data == ""
+
+
 def test_named_keys_keep_their_raw_data():
     presses = []
     parser = _parser_class()(presses.append)
