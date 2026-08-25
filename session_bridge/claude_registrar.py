@@ -298,6 +298,23 @@ class WindowsConPtyFactory:
             for name in _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS
         ):
             raise RuntimeError("unsafe Claude launch environment")
+        # Drop every inherited CLAUDE_CODE_* before re-adding the two this
+        # registrar sets deliberately. A host agent session exports these into
+        # everything it spawns, and an inherited copy makes the launched CLI
+        # ignore ~/.claude/.credentials.json and report itself logged out -- so
+        # the registration turn never runs and no transcript is written, which
+        # from the job's side is indistinguishable from an unsubmitted prompt.
+        # Measured live 2026-08-24 as a controlled pair from one cwd: stripped
+        # wrote a transcript, inherited wrote none. Stripping rather than
+        # raising is deliberate -- launch-session-bridge.ps1 does not scrub
+        # them and is itself usually run from an agent session, so refusing
+        # here would take the lane down instead of keeping it running. The
+        # narrower guard above still refuses the two onboarding values, which
+        # force a modal rather than merely breaking auth.
+        for name in [
+            name for name in child_env if name.startswith("CLAUDE_CODE_")
+        ]:
+            del child_env[name]
         child_env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
         child_env["DISABLE_UPDATES"] = "1"
         child_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
