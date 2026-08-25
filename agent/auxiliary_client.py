@@ -5670,30 +5670,42 @@ _VISION_STRICT_BACKENDS = (
     "deepinfra",
 )
 
-# The subset walked when vision is set to AUTO. ``nous`` (2026-08-23) and
-# ``openrouter`` (2026-08-24) are deliberately excluded: neither has a
-# credential in either auth store, so auto-probing them only ever logged
-# that they were unavailable and quarantined the label. Because
-# ``get_available_vision_backends()`` runs on every vision AVAILABILITY
-# check -- not just on a real vision call -- a dead entry here is noisier
-# than a dead entry in the text chain.
+# The aggregators walked when vision is set to AUTO. **Deliberately empty**
+# as of 2026-08-24: none of the three strict backends has a credential on
+# this machine, and each was removed as that was established --
+# ``nous`` (08-23, no provider entry since 2026-06-30), ``openrouter``
+# (08-24, sole pool entry was a dangling env pointer, since pruned), and
+# ``deepinfra`` (08-24, no pool entry in either store and DEEPINFRA_API_KEY
+# unset everywhere).
 #
-# This is SEPARATE from _VISION_STRICT_BACKENDS on purpose: an explicit
-# ``auxiliary.vision.provider: openrouter`` (or ``nous``) must still route
-# to the strict backend and warn loudly that it cannot be served.
-# Collapsing the two back into one tuple silently changes explicit-override
-# routing -- that regression was caught once already, by
+# Why an empty tuple rather than leaving dead names in it: this list is
+# walked by ``get_available_vision_backends()`` on every vision AVAILABILITY
+# check -- tool gating, setup, routing -- not just on a real vision call, so
+# each dead entry cost a probe and a log line every time.
+#
+# Consequence, and it is the whole behaviour change: vision AUTO now
+# resolves the user's MAIN provider (step 1 of
+# ``get_available_vision_backends``) or NOTHING. There is no aggregator
+# fallback left. Nothing crashes on the empty case -- both call sites are
+# plain ``for`` loops that simply do not execute, and an empty backend list
+# is already handled (``hermes setup`` reports vision unconfigured, and
+# ``resolve_vision_provider_client`` returns ``(None, None, None)``). But a
+# main provider that reports no vision capability -- deepseek, for one --
+# now means no vision at all rather than falling through.
+#
+# To restore vision via an aggregator: add its credential, then put its name
+# back in this tuple. Membership in _VISION_STRICT_BACKENDS is NOT enough --
+# see below.
+#
+# This is SEPARATE from _VISION_STRICT_BACKENDS on purpose, and that tuple
+# is deliberately NOT emptied: it is a MEMBERSHIP test deciding how an
+# EXPLICIT ``auxiliary.vision.provider`` routes. All three still route to
+# their strict backend and fail loudly there, which is correct -- an
+# explicit request for a provider nobody can serve should say so, not
+# silently fall through to the generic router. Collapsing these two back
+# into one name breaks that; the regression was caught once already by
 # ``test_explicit_provider_override_still_wins``.
-#
-# NB: this leaves ``deepinfra`` as the only auto aggregator, and it has no
-# credential either -- so in practice vision AUTO resolves the user's MAIN
-# provider (step 1 of ``get_available_vision_backends``) or nothing. That is
-# the pre-existing state, not a new gap: an empty list is handled (``hermes
-# setup`` reports vision unconfigured). Left in place because, unlike the two
-# above, nobody has decided deepinfra is dead weight.
-_VISION_AUTO_PROVIDER_ORDER = tuple(
-    p for p in _VISION_STRICT_BACKENDS if p not in {"nous", "openrouter"}
-)
+_VISION_AUTO_PROVIDER_ORDER: Tuple[str, ...] = ()
 
 
 def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
@@ -5776,9 +5788,13 @@ def _strict_vision_backend_available(provider: str) -> bool:
 def get_available_vision_backends() -> List[str]:
     """Return the currently available vision backends in auto-selection order.
 
-    Order: active provider → OpenRouter → Nous → stop.  This is the single
-    source of truth for setup, tool gating, and runtime auto-routing of
-    vision tasks.
+    Order: active provider → ``_VISION_AUTO_PROVIDER_ORDER`` → stop.  This
+    is the single source of truth for setup, tool gating, and runtime
+    auto-routing of vision tasks.
+
+    That aggregator tuple is currently EMPTY (see its definition), so this
+    returns either ``[main_provider]`` or ``[]``. An empty result is a
+    supported state, not an error -- callers report vision as unconfigured.
     """
     available: List[str] = []
     # 1. Active provider — if the user configured a provider, try it first.
@@ -5791,7 +5807,9 @@ def get_available_vision_backends() -> List[str]:
             client, _ = resolve_provider_client(main_provider, _read_main_model())
             if client is not None:
                 available.append(main_provider)
-    # 2. OpenRouter, 3. Nous — skip if already covered by main provider.
+    # 2. Aggregator fallbacks — skip any already covered by the main
+    #    provider. This tuple is empty today, so the loop is a no-op; it
+    #    stays so that restoring an aggregator is a one-line change.
     for p in _VISION_AUTO_PROVIDER_ORDER:
         if p not in available and _strict_vision_backend_available(p):
             available.append(p)

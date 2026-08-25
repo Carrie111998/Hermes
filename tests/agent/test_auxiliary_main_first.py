@@ -523,8 +523,18 @@ class TestResolveVisionMainFirst:
         assert captured == {"is_agent_turn": True, "is_vision": False}
         assert "default_headers" not in mock_openai.call_args.kwargs
 
-    def test_main_unavailable_vision_falls_through_to_aggregators(self):
-        """Main provider fails → fall back to the remaining strict backends."""
+    def test_main_unavailable_vision_falls_through_to_aggregators(self, monkeypatch):
+        """Main provider fails → fall back to the aggregator chain.
+
+        The chain is pinned to a SENTINEL: this test is about the
+        fall-through MECHANISM, which must keep working whatever the live
+        aggregator roster contains (it is empty today -- see
+        test_vision_auto_empty_yields_no_client for that state).
+        """
+        monkeypatch.setattr(
+            "agent.auxiliary_client._VISION_AUTO_PROVIDER_ORDER",
+            ("sentinel-aggregator",),
+        )
         fallback_client = MagicMock()
         with patch(
             "agent.auxiliary_client._read_main_provider", return_value="deepseek",
@@ -545,10 +555,43 @@ class TestResolveVisionMainFirst:
             provider, client, model = resolve_vision_provider_client()
 
         assert client is fallback_client
-        # openrouter and nous left the AUTO subset (no credentials); the
-        # remaining auto aggregator is what the fall-through must reach.
+        assert provider == "sentinel-aggregator"
+
+    def test_vision_auto_empty_yields_no_client_without_crashing(self):
+        """The live state: no aggregator has a credential, so AUTO is empty.
+
+        A main provider with no vision capability then means no vision at
+        all. That must return cleanly rather than raise -- callers report
+        vision as unconfigured (hermes_cli/setup.py) and the tool is gated
+        off. Guards the empty-tuple path that the sentinel tests above
+        deliberately bypass.
+        """
         from agent.auxiliary_client import _VISION_AUTO_PROVIDER_ORDER
-        assert provider in set(_VISION_AUTO_PROVIDER_ORDER)
+
+        assert _VISION_AUTO_PROVIDER_ORDER == (), (
+            "this test documents the empty-roster state; update it "
+            "deliberately if an aggregator is restored"
+        )
+        strict = MagicMock(side_effect=AssertionError(
+            "no aggregator should be probed when the AUTO tuple is empty"))
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="deepseek",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="deepseek-chat",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ), patch(
+            "agent.auxiliary_client._resolve_strict_vision_backend", strict,
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ):
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client()
+
+        assert (provider, client, model) == (None, None, None)
 
     def test_explicit_provider_override_still_wins(self):
         """Explicit config override bypasses main-first policy."""
