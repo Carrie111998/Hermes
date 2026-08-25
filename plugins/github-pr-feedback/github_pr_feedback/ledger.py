@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -61,6 +62,27 @@ class FeedbackLedger:
             """
         )
         self._migrate_lease_columns()
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ci_audit_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                base_sha TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                manifest_digest TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('passed', 'failed')),
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                UNIQUE (repository, pr_number, head_sha, manifest_digest, completed_at)
+            )
+            """
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ci_receipt_lookup ON ci_audit_receipts "
+            "(repository, pr_number, head_sha, manifest_digest, status, completed_at)"
+        )
 
     def _migrate_lease_columns(self) -> None:
         columns = {
@@ -276,6 +298,65 @@ class FeedbackLedger:
             if status in counts:
                 counts[status] = int(count)
         return counts
+
+    def record_ci_receipt(self, receipt: object) -> None:
+        """Atomically persist one typed receipt; prose cannot enter this boundary."""
+
+        from .ci_runner import CIAuditReceipt
+
+        if not isinstance(receipt, CIAuditReceipt):
+            raise TypeError("receipt must be a CIAuditReceipt")
+        payload = json.dumps(receipt.to_payload(), sort_keys=True, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > 1_000_000:
+            raise ValueError("CI receipt evidence exceeds its bounded limit")
+        with self._transaction():
+            self._connection.execute(
+                "INSERT INTO ci_audit_receipts "
+                "(receipt_id, repository, pr_number, base_sha, head_sha, manifest_digest, status, "
+                "started_at, completed_at, evidence_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    receipt.receipt_id,
+                    receipt.identity.repository,
+                    receipt.identity.pr_number,
+                    receipt.identity.base_sha,
+                    receipt.identity.head_sha,
+                    receipt.manifest_digest,
+                    receipt.status,
+                    receipt.started_at.isoformat(),
+                    receipt.completed_at.isoformat(),
+                    payload,
+                ),
+            )
+
+    def latest_passing_ci_receipt(
+        self,
+        repository: str,
+        pr_number: int,
+        head_sha: str,
+        *,
+        manifest_digest: str,
+        not_before: datetime,
+    ) -> object | None:
+        """Return only a fresh typed passing receipt for an exact head and manifest."""
+
+        from .ci_runner import CIAuditReceipt
+
+        boundary = _aware_utc(not_before, "not_before")
+        row = self._connection.execute(
+            "SELECT evidence_json FROM ci_audit_receipts WHERE repository = ? AND pr_number = ? "
+            "AND head_sha = ? AND manifest_digest = ? AND status = 'passed' AND completed_at >= ? "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (repository, pr_number, head_sha, manifest_digest, boundary.isoformat()),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            receipt = CIAuditReceipt.from_payload(json.loads(row[0]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise LedgerStateError("stored CI receipt is invalid") from error
+        if receipt.status != "passed":
+            raise LedgerStateError("stored CI receipt status is inconsistent")
+        return receipt
 
     def close(self) -> None:
         self._connection.close()

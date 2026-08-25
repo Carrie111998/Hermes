@@ -221,6 +221,7 @@ def test_github_client_reads_private_repository_and_canonical_merge_state() -> N
         mergeable=True,
         merge_state_status="CLEAN",
         base_branch="stable",
+        base_sha="b" * 40,
         head_repository="acme/widgets",
         author_login="owner",
         head_ref_name="codex/fix",
@@ -425,7 +426,11 @@ def canonical_pull(number: int = 17, head_sha: str = "a" * 40) -> dict[str, obje
     return {
         "number": number,
         "state": "open",
-        "base": {"repo": {"full_name": "acme/widgets"}, "ref": "stable"},
+        "base": {
+            "repo": {"full_name": "acme/widgets"},
+            "ref": "stable",
+            "sha": "b" * 40,
+        },
         "head": {"repo": {"full_name": "acme/widgets"}, "ref": "codex/fix", "sha": head_sha},
         "user": {"login": "owner"},
     }

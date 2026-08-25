@@ -76,6 +76,7 @@ class PullRequestMergeState:
     mergeable: bool
     merge_state_status: str
     base_branch: str
+    base_sha: str
     head_repository: str
     author_login: str
     head_ref_name: str
@@ -194,6 +195,7 @@ class GitHubClient:
                 mergeable=mergeable,
                 merge_state_status=merge_state_status.upper(),
                 base_branch=_required_string(base["ref"]),
+                base_sha=_validated_sha(base["sha"]),
                 head_repository=_validated_repository(head["repo"]["full_name"]),
                 author_login=_required_string(row["user"]["login"]),
                 head_ref_name=_required_string(head["ref"]),
