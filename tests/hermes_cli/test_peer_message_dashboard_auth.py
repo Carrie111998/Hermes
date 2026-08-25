@@ -29,6 +29,7 @@ def test_peer_message_uses_its_own_bearer_auth() -> None:
 
     async def call_next(_request: Request):
         nonlocal reached_route
+        assert _request.headers.get("authorization") == "Bearer opaque-peer-key"
         reached_route = True
         return JSONResponse({"detail": "peer verifier owns this request"}, status_code=401)
 
