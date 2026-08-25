@@ -270,6 +270,55 @@ def test_lineage_accounting_lock_rejects_late_queue_and_releases_after_flush(
         archive_db.close()
 
 
+def test_failed_accounting_lock_survives_later_success_until_owner_close(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    archive_db = SessionDB(db_path)
+    accounting_db = SessionDB(db_path)
+    accounting_closed = False
+    try:
+        archive_db.create_session("terminal", source="cli")
+        archive_db.end_session("terminal", "completed")
+        assert archive_db.set_session_archived("terminal", True)
+        original_update = accounting_db.update_token_counts
+        attempts = 0
+
+        def fail_once(session_id: str, **kwargs) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("forced accounting failure")
+            original_update(session_id, **kwargs)
+
+        accounting_db.update_token_counts = fail_once  # type: ignore[method-assign]
+        accounting_db.queue_token_counts(
+            "terminal", input_tokens=1, model="failed-model"
+        )
+        assert not accounting_db.flush_token_counts(timeout=10)
+        accounting_db.queue_token_counts(
+            "terminal", input_tokens=2, model="successful-model"
+        )
+        assert not accounting_db.flush_token_counts(timeout=10)
+
+        with pytest.raises(PendingSessionAccountingError, match="pending token"):
+            with cold_store._exclusive_lineage_accounting_locks(
+                archive_db, "terminal"
+            ):
+                pass
+
+        accounting_db.close()
+        accounting_closed = True
+        with cold_store._exclusive_lineage_accounting_locks(
+            archive_db, "terminal"
+        ):
+            pass
+    finally:
+        if not accounting_closed:
+            accounting_db.close()
+        archive_db.close()
+
+
 def test_purge_rolls_back_tombstone_when_source_delete_fails(
     tmp_path: Path,
 ) -> None:

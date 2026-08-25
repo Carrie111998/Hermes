@@ -1013,7 +1013,7 @@ def cmd_sessions(args, sessions_parser=None):
                 print(f"  local snapshot retained: {purged.snapshot_dir}")
                 db.close()
                 return 0
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (OSError, RuntimeError, sqlite3.DatabaseError, ValueError) as exc:
             print(f"Error: cold archive lock failed: {exc}")
             print("The source rows and local archive were left unchanged.")
             db.close()

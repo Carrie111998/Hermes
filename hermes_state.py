@@ -8349,7 +8349,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         still_queued = {session_id for session_id, _kwargs in self._token_queue}
         completed = {
             session_id for session_id, _kwargs in batch
-        } - still_queued - failed_sessions
+        } - still_queued - self._token_writer_failed_sessions
         for session_id in completed:
             descriptor = self._token_accounting_lock_fds.pop(session_id, None)
             if descriptor is not None:

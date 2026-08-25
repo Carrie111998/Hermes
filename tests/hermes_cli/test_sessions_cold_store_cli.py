@@ -549,6 +549,49 @@ def test_cold_archive_refuses_cross_instance_pending_accounting(
         accounting_owner.close()
 
 
+def test_cold_archive_accounting_lock_database_error_fails_closed(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "cold-root"
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+
+    class FailingAccountingLock:
+        def __enter__(self):
+            raise sqlite3.DatabaseError("forced accounting-lock plan failure")
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        cold_store,
+        "_exclusive_lineage_accounting_locks",
+        lambda *_args, **_kwargs: FailingAccountingLock(),
+    )
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-archive",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--yes",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "Error: cold archive lock failed" in out
+    assert "forced accounting-lock plan failure" in out
+    assert not archive_root.exists()
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+
+
 def test_cold_archive_resolution_database_error_fails_closed(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -10,9 +10,11 @@ sessions.json mirror lagged behind (or never existed).
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 
 import hermes_state
+import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 
@@ -180,6 +182,51 @@ class TestFallbacks:
         data = json.loads(sessions_json.read_text(encoding="utf-8"))
         assert data[entry.session_key]["last_prompt_tokens"] == 1234
         assert _routing_row(store, entry.session_key)["last_prompt_tokens"] == 1234
+        store._db.close()
+
+    def test_tombstone_rejected_upsert_does_not_fall_back_to_legacy_mirror(
+        self, tmp_path, monkeypatch
+    ):
+        store = _make_store(tmp_path, monkeypatch)
+        entry = store.get_or_create_session(_source())
+        sessions_json = tmp_path / "sessions" / "sessions.json"
+        before = sessions_json.read_bytes()
+
+        def reject(*args, **kwargs):
+            raise sqlite3.IntegrityError(
+                "gateway route targets a cold-archived session ID"
+            )
+
+        monkeypatch.setattr(store._db, "save_gateway_routing_entry", reject)
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            store.update_session(entry.session_key, last_prompt_tokens=4321)
+
+        assert sessions_json.read_bytes() == before
+        store._db.close()
+
+    def test_tombstone_rejected_full_rewrite_does_not_write_legacy_mirror(
+        self, tmp_path, monkeypatch
+    ):
+        store = _make_store(tmp_path, monkeypatch)
+        store.get_or_create_session(_source())
+        with store._lock:
+            data, generation = store._snapshot_routing_locked()
+
+        def reject(*args, **kwargs):
+            raise sqlite3.IntegrityError(
+                "gateway route targets a cold-archived session ID"
+            )
+
+        monkeypatch.setattr(store._db, "replace_gateway_routing_entries", reject)
+        monkeypatch.setattr(
+            store,
+            "_save_sessions_json",
+            lambda _data: (_ for _ in ()).throw(
+                AssertionError("legacy mirror must not be written")
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            store._persist_routing_data(data, generation)
         store._db.close()
 
 

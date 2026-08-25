@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
 
+from hermes_cold_archive_errors import is_cold_archive_tombstone_rejection
+
 logger = logging.getLogger(__name__)
 
 
@@ -1736,6 +1738,8 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
+                        if is_cold_archive_tombstone_rejection(exc):
+                            raise
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
@@ -1905,6 +1909,8 @@ class SessionStore:
                     fast_persisted[session_key] = (revision, entry_json)
                 return
             except Exception as exc:
+                if is_cold_archive_tombstone_rejection(exc):
+                    raise
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r "
                     "(%s); falling back to full index rewrite",
