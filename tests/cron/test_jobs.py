@@ -549,6 +549,40 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused"] is False
 
+    def test_resume_clears_the_flag_on_an_already_live_job(self, tmp_cron_dir):
+        """The exact shape found in the live store, 2026-08-24 04:20 snapshot.
+
+        A jobflow containment on 2026-08-23 bulk-paused 8 jobs, then `hermes
+        cron resume` lifted it. Resume cleared enabled/state/paused_at/
+        paused_reason but not `paused`, leaving SIX rows as
+        `paused: True` + `enabled: True` + `state: "scheduled"` — running jobs
+        that any `grep paused` audit reads as contained. Clearing them took a
+        hand-written guarded sweep (MemPalace jobflow/
+        bridge-business-state-rollback-2026-08-23).
+
+        Note there is nothing to archive here: the WHY was already destroyed by
+        the earlier resume, before this code existed. Re-resuming must still
+        clear the flag, and must not fabricate a history entry.
+        """
+        job = create_job(prompt="Contained then lifted", schedule="every 1h")
+        update_job(
+            job["id"],
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused": True,
+                "paused_at": None,
+                "paused_reason": None,
+            },
+        )
+
+        resumed = resume_job(job["id"])
+
+        assert resumed["paused"] is False
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert "paused_history" not in resumed
+
     def test_resume_leaves_records_that_never_had_paused_flag_alone(self, tmp_cron_dir):
         """Don't grow every record a key it never carried."""
         job = create_job(prompt="Resume me", schedule="every 1h")
