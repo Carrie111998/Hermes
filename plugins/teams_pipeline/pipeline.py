@@ -39,6 +39,10 @@ from tools.transcription_tools import transcribe_audio
 
 logger = logging.getLogger(__name__)
 
+# ffmpeg audio-extraction ceiling: malformed/truncated recordings can make
+# ffmpeg hang forever; the pipeline must retry, not wedge.
+_FFMPEG_EXTRACT_TIMEOUT_S = 180.0
+
 TERMINAL_PIPELINE_STATES = {"completed", "failed", "retry_scheduled"}
 ACTIVE_PIPELINE_STATES = {
     "received",
@@ -517,7 +521,18 @@ class TeamsMeetingPipeline:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _stdout, stderr = await proc.communicate()
+        # ffmpeg hangs indefinitely on malformed/truncated recordings; bound
+        # the extraction so the pipeline retries instead of wedging.
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_FFMPEG_EXTRACT_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise TeamsPipelineRetryableError(
+                f"ffmpeg audio extraction timed out after "
+                f"{_FFMPEG_EXTRACT_TIMEOUT_S:.0f}s: {recording_path.name}"
+            )
         if proc.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
             raise TeamsPipelineRetryableError(f"ffmpeg audio extraction failed: {detail}")
