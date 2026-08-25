@@ -16,17 +16,18 @@ user turn is already flushed at turn start (``turn_context._persist_session``),
 and ``append_message`` is a raw INSERT with no dedup — a gateway re-write would
 duplicate the user turn (#860 / #42039).
 
-Codex also projects the submitted input as a fresh leading ``userMessage``
-dict. The persistence marker cannot identify that semantically equal copy, so
-the runtime must discard the exact leading transport echo before splicing the
-remaining projected messages. This test locks in:
+The projection-splice comment in ``run_codex_app_server_turn`` documents why
+Codex's leading ``userMessage`` is a transport echo rather than a second user
+action. These tests lock in:
 
 1. ``run_codex_app_server_turn`` flushes projected messages and returns
    ``agent_persisted=True``.
 2. Exactly-once persistence: the already-flushed user turn is NOT re-written,
    the projected input echo is NOT inserted, and the assistant lands once.
-3. A later distinct user projection is preserved.
-4. The gateway resolution expression preserves standard-runtime behaviour.
+3. Assistant-only and non-matching leading projections are preserved.
+4. A later distinct user projection is preserved.
+5. Rich input is matched against the exact text submitted on the wire.
+6. The gateway resolution expression preserves standard-runtime behaviour.
 """
 
 import tempfile
@@ -39,7 +40,7 @@ from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _make_turn(*, user_echo=None):
+def _make_turn(*, user_echo=None, submitted_user_text=None):
     projected_messages = []
     if user_echo is not None:
         projected_messages.append({"role": "user", "content": user_echo})
@@ -49,6 +50,7 @@ def _make_turn(*, user_echo=None):
         error=None,
         thread_id="thread-1",
         turn_id="turn-1",
+        submitted_user_text=submitted_user_text,
         projected_messages=projected_messages,
         tool_iterations=0,
         final_text="CODEX_ASSISTANT",
@@ -82,7 +84,11 @@ def test_codex_success_flushes_and_reports_persisted():
         effective_task_id="task-1",
     )
     assert result["completed"] is True
-    assert isinstance(result["messages"][-1]["timestamp"], float)
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", "hello"),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+    assert isinstance(result["messages"][1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
 
@@ -125,6 +131,7 @@ def test_codex_drops_only_the_leading_matching_user_echo():
         {"role": "user", "content": "STEER"},
         {"role": "assistant", "content": "CODEX_ASSISTANT"},
     ]
+    turn.submitted_user_text = "hello"
     agent._codex_session.run_turn.return_value = turn
 
     result = run_codex_app_server_turn(
@@ -139,6 +146,52 @@ def test_codex_drops_only_the_leading_matching_user_echo():
         ("user", "hello"),
         ("assistant", "INTERIM"),
         ("user", "STEER"),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+
+
+def test_codex_preserves_nonmatching_leading_user_projection():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn(user_echo="DIFFERENT", submitted_user_text="hello")
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", "hello"),
+        ("user", "DIFFERENT"),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+
+
+def test_codex_drops_echo_of_coerced_rich_wire_text():
+    rich_input = [
+        {"type": "text", "text": "caption"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ]
+    submitted_text = "caption\n\n[image attached]"
+    agent = _make_agent(session_db=None)
+    agent._codex_session.run_turn.return_value = _make_turn(
+        user_echo=submitted_text,
+        submitted_user_text=submitted_text,
+    )
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message=rich_input,
+        original_user_message=rich_input,
+        messages=[{"role": "user", "content": rich_input}],
+        effective_task_id="task-1",
+    )
+
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", rich_input),
         ("assistant", "CODEX_ASSISTANT"),
     ]
 
@@ -171,7 +224,10 @@ def test_codex_turn_persists_each_message_exactly_once():
         # leading userMessage before the assistant response.  Hermes already
         # owns and flushed that input at turn start, so the transport echo
         # must not become a second durable user row.
-        agent._codex_session.run_turn.return_value = _make_turn(user_echo="USER_TURN")
+        agent._codex_session.run_turn.return_value = _make_turn(
+            user_echo="USER_TURN",
+            submitted_user_text="USER_TURN",
+        )
         agent.tool_progress_callback = None
 
         # Model the real flow: the inbound user turn is flushed at turn start

@@ -678,7 +678,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 def run_codex_app_server_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
@@ -831,15 +831,21 @@ def run_codex_app_server_turn(
         # ``turn/start`` materializes the submitted input as the leading
         # ``userMessage`` item.  That item is a transport echo, not a second
         # user action: build_turn_context already appended and persisted the
-        # same input before this early-return runtime was entered.  Drop only
-        # that exact leading echo.  Later/non-matching user projections remain
-        # intact so a distinct user event (for example a future turn/steer
-        # projection) is never erased by broad role- or content-based dedupe.
+        # same input before this early-return runtime was entered. ``run_turn``
+        # records the exact text it serialized into the wire input after rich
+        # content coercion; use that value rather than the original Hermes
+        # shape. Drop only an exact match — normalization here could erase a
+        # distinct user event such as a future turn/steer projection.
         first_projected = projected_messages[0]
+        submitted_user_text = getattr(turn, "submitted_user_text", None)
+        if submitted_user_text is None and isinstance(user_message, str):
+            # Compatibility for older/mocked TurnResult shapes. Live sessions
+            # always return submitted_user_text.
+            submitted_user_text = user_message
         if (
             isinstance(first_projected, dict)
             and first_projected.get("role") == "user"
-            and first_projected.get("content") == user_message
+            and first_projected.get("content") == submitted_user_text
         ):
             projected_messages = projected_messages[1:]
 
