@@ -32,6 +32,7 @@ _COORDINATION_SESSION_REFERENCES = (
     ("compression_locks", "session_id"),
     ("session_turn_leases", "conversation_id"),
 )
+_PRE_UPGRADE_OPTIONAL_ASYNC_DELEGATION_COLUMNS = frozenset({"origin_session_id"})
 
 
 def _canonical_archive_root(archive_root: Path) -> Path:
@@ -876,7 +877,7 @@ def _reject_legacy_routing_references(physical_ids: tuple[str, ...]) -> None:
 
 def _required_table_columns(
     conn: sqlite3.Connection, table: str, required: tuple[str, ...]
-) -> None:
+) -> set[str]:
     """Reject stale or damaged soft-reference schemas before purge."""
     quoted_table = _quoted_identifier(table)
     rows = conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
@@ -888,6 +889,7 @@ def _required_table_columns(
             "cold purge cannot verify soft references because the session "
             f"database schema is missing {missing_names}"
         )
+    return columns
 
 
 def _reject_state_meta_references(
@@ -917,9 +919,26 @@ def _reject_async_delegation_references(
     conn: sqlite3.Connection, physical_ids: tuple[str, ...]
 ) -> None:
     """Reject durable delegation rows naming any covered session."""
-    required_columns = ("delegation_id", *ASYNC_DELEGATION_SESSION_COLUMNS)
-    _required_table_columns(conn, "async_delegations", required_columns)
+    required_columns = (
+        "delegation_id",
+        *(
+            column
+            for column in ASYNC_DELEGATION_SESSION_COLUMNS
+            if column not in _PRE_UPGRADE_OPTIONAL_ASYNC_DELEGATION_COLUMNS
+        ),
+    )
+    available_columns = _required_table_columns(
+        conn, "async_delegations", required_columns
+    )
     for column in ASYNC_DELEGATION_SESSION_COLUMNS:
+        if column not in available_columns:
+            # ``origin_session_id`` was added with an empty default. A read-only
+            # first post-upgrade dry-run cannot reconcile the schema, and an
+            # absent column cannot contain a reference. Older reference columns
+            # remain mandatory above so unknown schema damage still fails closed.
+            if column not in _PRE_UPGRADE_OPTIONAL_ASYNC_DELEGATION_COLUMNS:
+                raise AssertionError(f"required async delegation column missing: {column}")
+            continue
         quoted_column = _quoted_identifier(column)
         for ids in _id_chunks(physical_ids):
             placeholders = ",".join("?" for _ in ids)
@@ -1030,12 +1049,20 @@ def _reject_uncovered_session_references(
                     )
 
 
+def _build_sqlite_purge_reference_plan(
+    conn: sqlite3.Connection, terminal_id: str
+) -> _StorePlan:
+    """Build the source plan and reject references stored in SQLite."""
+    plan = _build_store_plan(conn, terminal_id)
+    _reject_uncovered_session_references(conn, plan.physical_ids)
+    return plan
+
+
 def _build_purge_reference_plan(
     conn: sqlite3.Connection, terminal_id: str
 ) -> _StorePlan:
-    """Build the archived source plan and reject every deletion reference."""
-    plan = _build_store_plan(conn, terminal_id)
-    _reject_uncovered_session_references(conn, plan.physical_ids)
+    """Build the source plan and reject SQLite plus legacy-file references."""
+    plan = _build_sqlite_purge_reference_plan(conn, terminal_id)
     _reject_legacy_routing_references(plan.physical_ids)
     return plan
 
@@ -1088,17 +1115,34 @@ def purge_archived_lineage(
 ) -> PurgedLineage:
     """Delete exactly one verified archived compression lineage from SQLite.
 
-    Store eligibility, source records, and the existing snapshot fingerprint
-    are re-read under the final ``BEGIN IMMEDIATE`` transaction. Archive files
-    are read for verification only and are never removed by this operation.
+    Archive and legacy-route files are verified before the final write
+    transaction. Store eligibility, source records, and SQLite references are
+    then re-read under ``BEGIN IMMEDIATE`` and compared with that evidence.
+    Archive files are never removed by this operation.
     """
     _require_supported_platform()
     archive_root = Path(os.path.abspath(os.fspath(archive_root)))
 
+    if not db.flush_token_counts():
+        raise RuntimeError("cold purge could not flush pending token accounting")
+
+    verified = validate_purge_archived_lineage(db, terminal_id, archive_root)
+
     def _purge(conn: sqlite3.Connection) -> PurgedLineage:
-        plan, snapshot_dir = _validated_purge_plan(
-            conn, terminal_id, archive_root
-        )
+        # Keep this final transaction SQLite-only and short. Supported gateway
+        # route persistence writes SQLite before its legacy mirror: a write that
+        # committed before BEGIN is visible here, while one that starts later is
+        # blocked and then rejected by the tombstone trigger after commit.
+        plan = _build_sqlite_purge_reference_plan(conn, terminal_id)
+        if (
+            plan.terminal_id != verified.terminal_id
+            or plan.physical_ids != verified.physical_ids
+            or plan.source_fingerprint != verified.source_fingerprint
+        ):
+            raise ValueError(
+                "cold purge source lineage changed after snapshot verification"
+            )
+        snapshot_dir = verified.snapshot_dir
 
         deleted_at = datetime.now(UTC).timestamp()
         conn.executemany(
@@ -1155,8 +1199,6 @@ def purge_archived_lineage(
             snapshot_dir,
         )
 
-    if not db.flush_token_counts():
-        raise RuntimeError("cold purge could not flush pending token accounting")
     return db._execute_write(_purge)
 
 

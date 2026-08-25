@@ -238,6 +238,58 @@ def test_cold_archive_dry_run_is_read_only_and_does_not_require_snapshot(
     assert _message_rows() == before_messages
 
 
+def test_cold_archive_dry_run_accepts_pre_upgrade_delegation_schema(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "new-cold-root"
+    db_path = session_home / "state.db"
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "ALTER TABLE async_delegations DROP COLUMN origin_session_id"
+        )
+        columns_before = tuple(
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(async_delegations)")
+        )
+        schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+    assert "origin_session_id" not in columns_before
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-archive",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--dry-run",
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "resolved terminal ID: lineage-terminal" in out
+    assert "nothing was written or deleted" in out
+    assert not archive_root.exists()
+    with sqlite3.connect(db_path) as conn:
+        columns_after = tuple(
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(async_delegations)")
+        )
+        assert columns_after == columns_before
+        assert int(conn.execute("PRAGMA schema_version").fetchone()[0]) == schema_version
+        assert conn.execute(
+            "SELECT id, archived FROM sessions ORDER BY id"
+        ).fetchall() == before_sessions
+        assert conn.execute(
+            "SELECT session_id, content FROM messages ORDER BY id"
+        ).fetchall() == before_messages
+
+
 def test_cold_archive_lock_contention_fails_before_store_without_mutation(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,

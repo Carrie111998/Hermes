@@ -99,6 +99,54 @@ def test_purge_rejects_missing_or_mismatched_snapshot_and_retains_source_rows(
         db.close()
 
 
+def test_purge_finishes_filesystem_reads_before_final_write_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="stored")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        stored = store_archived_lineage(db, "terminal", archive_root)
+
+        final_write_started = False
+        filesystem_reads: list[str] = []
+        original_execute_write = db._execute_write
+        original_verify_snapshot = cold_store._verify_plan_snapshot
+        original_legacy_routes = cold_store._reject_legacy_routing_references
+
+        def tracked_execute_write(callback):
+            nonlocal final_write_started
+            final_write_started = True
+            return original_execute_write(callback)
+
+        def tracked_verify_snapshot(*args, **kwargs):
+            assert not final_write_started, "snapshot verification ran inside final write"
+            filesystem_reads.append("snapshot")
+            return original_verify_snapshot(*args, **kwargs)
+
+        def tracked_legacy_routes(*args, **kwargs):
+            assert not final_write_started, "legacy-route read ran inside final write"
+            filesystem_reads.append("legacy-routes")
+            return original_legacy_routes(*args, **kwargs)
+
+        monkeypatch.setattr(db, "_execute_write", tracked_execute_write)
+        monkeypatch.setattr(cold_store, "_verify_plan_snapshot", tracked_verify_snapshot)
+        monkeypatch.setattr(
+            cold_store, "_reject_legacy_routing_references", tracked_legacy_routes
+        )
+
+        result = purge_archived_lineage(db, "terminal", archive_root)
+
+        assert filesystem_reads == ["legacy-routes", "snapshot"]
+        assert result.snapshot_dir == stored.snapshot_dir
+        assert db.get_session("terminal") is None
+    finally:
+        db.close()
+
+
 def test_purge_flushes_pending_token_accounting_before_final_recheck(
     tmp_path: Path,
 ) -> None:
@@ -428,6 +476,51 @@ def test_purge_rejects_source_mutation_after_store_and_retains_source_rows(
         db.close()
 
 
+def test_purge_rechecks_source_after_pretransaction_snapshot_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="stored")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        original_execute_write = db._execute_write
+
+        def mutate_before_final_transaction(callback):
+            with sqlite3.connect(db.db_path) as mutator:
+                mutator.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("terminal", "assistant", "late source change", 1.0),
+                )
+            return original_execute_write(callback)
+
+        monkeypatch.setattr(
+            db, "_execute_write", mutate_before_final_transaction
+        )
+
+        with pytest.raises(
+            ValueError, match="source lineage changed after snapshot verification"
+        ):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("terminal") is not None
+        assert [message["content"] for message in db.get_messages("terminal")] == [
+            "stored",
+            "late source change",
+        ]
+        assert db._conn is not None
+        assert db._conn.execute(
+            "SELECT 1 FROM cold_archive_tombstones WHERE session_id = ?",
+            ("terminal",),
+        ).fetchone() is None
+    finally:
+        db.close()
+
+
 def test_purge_rechecks_pin_inside_delete_transaction(tmp_path: Path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     archive_root = tmp_path / "archive"
@@ -548,7 +641,7 @@ def test_purge_rejects_unverifiable_routing_entries_and_retains_all_rows(
 
 
 @pytest.mark.parametrize("operation", ["preflight", "purge"])
-def test_purge_fails_closed_when_optional_delegation_reference_column_is_absent(
+def test_purge_accepts_absent_pre_upgrade_delegation_reference_column(
     tmp_path: Path,
     operation: str,
 ) -> None:
@@ -571,14 +664,55 @@ def test_purge_fails_closed_when_optional_delegation_reference_column_is_absent(
         before_delegations = db._conn.execute(
             "SELECT * FROM async_delegations ORDER BY delegation_id"
         ).fetchall()
-        assert (
-            db._conn.execute("SELECT COUNT(*) FROM gateway_routing").fetchone()[0]
-            == 0
+
+        if operation == "preflight":
+            result = validate_purge_archived_lineage(db, "terminal", archive_root)
+            assert db.get_session("terminal") is not None
+            assert db.get_messages("terminal")[0]["content"] == "keep me"
+        else:
+            result = purge_archived_lineage(db, "terminal", archive_root)
+            assert db.get_session("terminal") is None
+            assert db.get_messages("terminal") == []
+
+        assert result.terminal_id == "terminal"
+        assert db._conn.execute(
+            "SELECT key, value FROM state_meta ORDER BY key"
+        ).fetchall() == before_meta
+        assert db._conn.execute(
+            "SELECT * FROM async_delegations ORDER BY delegation_id"
+        ).fetchall() == before_delegations
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("operation", ["preflight", "purge"])
+def test_purge_fails_closed_when_required_delegation_reference_column_is_absent(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="keep me")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        assert db._conn is not None
+        db._conn.execute(
+            "ALTER TABLE async_delegations DROP COLUMN parent_session_id"
         )
+        db._conn.commit()
+        before_meta = db._conn.execute(
+            "SELECT key, value FROM state_meta ORDER BY key"
+        ).fetchall()
+        before_delegations = db._conn.execute(
+            "SELECT * FROM async_delegations ORDER BY delegation_id"
+        ).fetchall()
 
         with pytest.raises(
             ValueError,
-            match=r"schema is missing async_delegations\.origin_session_id",
+            match=r"schema is missing async_delegations\.parent_session_id",
         ):
             if operation == "preflight":
                 validate_purge_archived_lineage(db, "terminal", archive_root)
