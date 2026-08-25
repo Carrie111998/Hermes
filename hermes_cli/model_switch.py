@@ -525,6 +525,7 @@ _BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
 _DIRECT_ALIASES_CACHE_KEY: Optional[tuple[str, int, int]] = None
+_DIRECT_ALIASES_CACHE_SNAPSHOT: Optional[dict[str, DirectAlias]] = None
 
 
 def _direct_aliases_cache_key() -> tuple[str, int, int]:
@@ -614,14 +615,23 @@ def _ensure_direct_aliases() -> None:
     in place so imports that hold a reference to ``DIRECT_ALIASES`` remain
     valid.
     """
-    global _DIRECT_ALIASES_CACHE_KEY
+    global _DIRECT_ALIASES_CACHE_KEY, _DIRECT_ALIASES_CACHE_SNAPSHOT
 
     key = _direct_aliases_cache_key()
     if key == _DIRECT_ALIASES_CACHE_KEY:
+        # DIRECT_ALIASES is a long-standing public mutable mapping. Preserve
+        # deliberate caller/test injections made in place while the config
+        # identity is unchanged; an empty loaded mapping remains cacheable.
+        if (
+            _DIRECT_ALIASES_CACHE_SNAPSHOT is not None
+            and DIRECT_ALIASES != _DIRECT_ALIASES_CACHE_SNAPSHOT
+        ):
+            _DIRECT_ALIASES_CACHE_SNAPSHOT = dict(DIRECT_ALIASES)
         return
     DIRECT_ALIASES.clear()
     DIRECT_ALIASES.update(_load_direct_aliases())
     _DIRECT_ALIASES_CACHE_KEY = key
+    _DIRECT_ALIASES_CACHE_SNAPSHOT = dict(DIRECT_ALIASES)
 
 
 # ---------------------------------------------------------------------------
