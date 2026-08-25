@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
 import { $desktopOnboarding } from '@/store/onboarding'
@@ -12,9 +12,9 @@ import { BootFailureOverlay } from './boot-failure-overlay'
 // to an in-line connect form — instead of stranding them (the old bug forced a
 // hand-edit of connection.json).
 
-function failBoot() {
+function failBoot(error = 'Could not connect to Hermes gateway') {
   $desktopBoot.set({
-    error: 'Could not connect to Hermes gateway',
+    error,
     fakeMode: false,
     message: 'boot failed',
     phase: 'renderer.error',
@@ -25,11 +25,11 @@ function failBoot() {
   })
 }
 
-function stubDesktop(config: Record<string, unknown>) {
+function stubDesktop(config: Record<string, unknown>, extra: Record<string, unknown> = {}) {
   const original = window.hermesDesktop
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
-    value: { getRecentLogs: async () => ({ lines: [] }), getConnectionConfig: async () => config }
+    value: { getRecentLogs: async () => ({ lines: [] }), getConnectionConfig: async () => config, ...extra }
   })
 
   return () => Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: original })
@@ -45,6 +45,12 @@ const remoteToken = {
   remoteTokenSet: true,
   remoteUrl: 'http://100.116.104.53:9191',
   cloudOrg: ''
+}
+
+const remoteOauth = {
+  ...remoteToken,
+  remoteAuthMode: 'oauth',
+  remoteUrl: 'https://gateway-b.example.test'
 }
 
 beforeEach(() => {
@@ -94,6 +100,30 @@ describe('BootFailureOverlay', () => {
       await waitFor(() => expect(screen.queryByRole('button', { name: /repair/i })).toBeNull())
       expect(screen.getByRole('button', { name: /gateway settings/i })).toBeTruthy()
       expect(screen.getByRole('button', { name: /use local gateway/i })).toBeTruthy()
+    } finally {
+      restore()
+    }
+  })
+
+  it('scopes boot-failure reauth logout to the active remote gateway', async () => {
+    const logout = vi.fn().mockResolvedValue(undefined)
+    const login = vi.fn().mockResolvedValue({ connected: false })
+    const restore = stubDesktop(remoteOauth, {
+      oauthLoginConnectionConfig: login,
+      oauthLogoutConnectionConfig: logout,
+      probeConnectionConfig: vi.fn().mockResolvedValue({ providers: null })
+    })
+
+    failBoot('Your remote gateway session has expired. Open Settings and sign in again.')
+
+    try {
+      render(<BootFailureOverlay />)
+      const signIn = await screen.findByRole('button', { name: /sign out and sign in/i })
+
+      fireEvent.click(signIn)
+
+      await waitFor(() => expect(logout).toHaveBeenCalledWith(remoteOauth.remoteUrl))
+      expect(login).toHaveBeenCalledWith(remoteOauth.remoteUrl)
     } finally {
       restore()
     }
