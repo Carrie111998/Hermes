@@ -225,10 +225,9 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   // slash-worker pipe timeout and the "not a quick/plugin/skill command"
   // fallback noise for commands the dispatcher doesn't handle inline.
   // These commands have gateway RPCs, but their established desktop behavior
-  // carries richer CLI semantics: /agents includes delegations, /stop cancels
-  // them, /steer falls back to a next-turn prompt, and /usage is a formatted
-  // live report. Keep them on slash.exec until their RPC contracts are fully
-  // equivalent.
+  // carries richer CLI semantics: /agents includes delegations, /steer falls
+  // back to a next-turn prompt, and /usage is a formatted live report. Keep
+  // them on slash.exec until their RPC contracts are fully equivalent.
   {
     name: '/approvals',
     description: 'Show or set approval mode [manual|smart|off]',
@@ -316,7 +315,11 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec(),
     argumentMode: 'text'
   },
-  { name: '/stop', description: 'Stop running background processes', surface: exec() },
+  {
+    name: '/stop',
+    description: 'Stop running background processes and delegations',
+    surface: rpc('process.stop', ctx => ({ session_id: ctx.sessionId }))
+  },
   {
     name: '/tools',
     description: 'List or toggle tools available to the agent',

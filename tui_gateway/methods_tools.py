@@ -41,7 +41,25 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.process_registry import process_registry
 
-        return _ok(rid, {"killed": process_registry.kill_all()})
+        killed = process_registry.kill_all()
+        delegations_interrupted = 0
+        try:
+            from tools.async_delegation import active_count, interrupt_all
+
+            if active_count():
+                delegations_interrupted = interrupt_all(reason="/stop")
+        except Exception:
+            # Match the classic CLI: an unavailable async-delegation registry
+            # must not prevent /stop from cleaning up terminal processes.
+            pass
+
+        return _ok(
+            rid,
+            {
+                "killed": killed,
+                "delegations_interrupted": delegations_interrupted,
+            },
+        )
     except Exception as e:
         return _err(rid, 5010, str(e))
 
@@ -436,6 +454,28 @@ def _(rid, params: dict) -> dict:
     if resolved != name:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
+
+    if name == "stop":
+        stop_response = _methods["process.stop"](rid, params)
+        if "error" in stop_response:
+            return stop_response
+        stop_result = stop_response.get("result", {})
+        killed = int(stop_result.get("killed", 0) or 0)
+        delegations = int(stop_result.get("delegations_interrupted", 0) or 0)
+        if killed or delegations:
+            parts = []
+            if killed:
+                parts.append(
+                    f"{killed} background process{'es' if killed != 1 else ''}"
+                )
+            if delegations:
+                parts.append(
+                    f"{delegations} delegation{'s' if delegations != 1 else ''}"
+                )
+            output = f"Stopped {' and '.join(parts)}."
+        else:
+            output = "No background processes or delegations to stop."
+        return _ok(rid, {"type": "exec", "output": output})
 
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:

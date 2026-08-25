@@ -37,6 +37,53 @@ def _dispatch_sync(req: dict, transport=None) -> dict | None:
         reset_transport(token)
 
 
+def test_process_stop_cleans_processes_and_background_delegations(monkeypatch):
+    from tools.process_registry import process_registry
+
+    reasons = []
+    monkeypatch.setattr(process_registry, "kill_all", lambda: 2)
+    monkeypatch.setattr(ad, "active_count", lambda: 1)
+    monkeypatch.setattr(
+        ad,
+        "interrupt_all",
+        lambda reason: reasons.append(reason) or 1,
+    )
+
+    response = server._methods["process.stop"]("r1", {})
+
+    assert response["result"] == {"killed": 2, "delegations_interrupted": 1}
+    assert reasons == ["/stop"]
+
+
+def test_slash_exec_routes_stop_without_slash_worker(monkeypatch):
+    from tools.process_registry import process_registry
+
+    class _ExplodingWorker:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("slash worker should not run for /stop")
+
+    monkeypatch.setattr(process_registry, "kill_all", lambda: 2)
+    monkeypatch.setattr(ad, "active_count", lambda: 1)
+    monkeypatch.setattr(ad, "interrupt_all", lambda reason: 1)
+
+    server._sessions["stop-sid"] = {
+        "session_key": "stop-key",
+        "slash_worker": _ExplodingWorker(),
+    }
+    try:
+        response = server._methods["slash.exec"](
+            "r2",
+            {"session_id": "stop-sid", "command": "/stop"},
+        )
+    finally:
+        server._sessions.pop("stop-sid", None)
+
+    assert response["result"] == {
+        "type": "exec",
+        "output": "Stopped 2 background processes and 1 delegation.",
+    }
+
+
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.
@@ -2482,8 +2529,9 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
 
     result = server._load_enabled_toolsets()
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    expected = {"desktop_ui", "kanban", "memory", "project"}
+    assert expected <= set(result)
+    assert set(result) - expected <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -2508,8 +2556,9 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
 
     result = server._load_enabled_toolsets()
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    expected = {"desktop_ui", "kanban", "memory", "project"}
+    assert expected <= set(result)
+    assert set(result) - expected <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
