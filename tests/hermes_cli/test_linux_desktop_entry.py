@@ -525,3 +525,38 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line == f'"{spaced}" desktop'
+
+
+def test_running_interpreter_keeps_venv_semantic_path(tmp_path, monkeypatch):
+    """Lexical preserved only when pyvenv.cfg marks the path as a venv."""
+    import os as _os
+    import sys as _sys
+
+    # venv layout: bin/python symlink -> base, pyvenv.cfg at venv root
+    base = tmp_path / "base" / "python3.11"
+    base.parent.mkdir(parents=True)
+    base.write_text("", encoding="utf-8")
+    venv_root = tmp_path / "venv"
+    venv_bin = venv_root / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_root / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(base)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    assert lde._running_interpreter() == str(venv_python)
+
+    # non-venv symlink: resolve instead (durability over lexical)
+    plain_root = tmp_path / "plain" / "bin"
+    plain_root.mkdir(parents=True)
+    plain_link = plain_root / "python3"
+    plain_link.symlink_to(base)
+    monkeypatch.setattr(lde.sys, "executable", str(plain_link))
+    assert lde._running_interpreter() == str(base)
+
+
+def test_running_interpreter_resolves_plain_interpreter(monkeypatch):
+    """A non-symlinked, non-venv executable resolves to itself."""
+    monkeypatch.setattr(lde.sys, "executable", "/usr/bin/python3")
+    out = lde._running_interpreter()
+    assert Path(out).is_absolute()
