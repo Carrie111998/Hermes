@@ -198,6 +198,26 @@ export function assertLocalProfileCanStart(
 }
 
 /**
+ * Complete asynchronous backend preparation before performing the final spawn
+ * guard. A deletion can begin while preparation is awaiting (for example,
+ * while resolving the Desktop parent identity); checking before that await
+ * leaves a window where the delete evicts an entry with no process handle and
+ * the resumed start creates an unowned backend. The returned value must be
+ * consumed synchronously by the caller before it invokes ``spawn``.
+ */
+export async function awaitProfileSpawnPreparation<T>(
+  profile: unknown,
+  gate: ProfileDeletionGate,
+  profileDirectoryExists: (profile: string) => boolean,
+  prepare: () => Promise<T>
+): Promise<T> {
+  const prepared = await prepare()
+  assertLocalProfileCanStart(profile, gate, profileDirectoryExists)
+
+  return prepared
+}
+
+/**
  * A local profile can occupy the legacy bare pool slot or the explicit-local
  * registry slot when the v1 route points elsewhere. Both processes own the
  * same on-disk profile and must be stopped before deleting it.

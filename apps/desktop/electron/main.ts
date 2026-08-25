@@ -253,6 +253,7 @@ import {
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import {
   assertLocalProfileCanStart,
+  awaitProfileSpawnPreparation,
   decideProfileDeleteAction,
   dispatchConnectionScopedProfileDelete,
   localProfilePoolKeys,
@@ -10517,11 +10518,22 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     directoryExists(path.join(HERMES_HOME, 'profiles', key))
   )
 
-  rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
+  // This is intentionally the LAST async boundary before spawn. The earlier
+  // directory/gate check is a fast rejection, but a profile delete can start
+  // while the parent identity probe is awaiting; without this second check,
+  // teardown evicts an entry whose process is still null and the resumed spawn
+  // becomes an unowned Python backend.
+  const parentStartMarker = await awaitProfileSpawnPreparation(
+    profile,
+    profileDeletionGate,
+    key => directoryExists(path.join(HERMES_HOME, 'profiles', key)),
+    () => desktopParentStartMarker()
+  )
 
-  const parentStartMarker = await desktopParentStartMarker()
   const backendNonce = crypto.randomBytes(16).toString('hex')
   const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
+
+  rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
   const child = spawn(
     backend.command,
@@ -10900,12 +10912,20 @@ async function startHermes() {
     const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
-    rememberLog(`Starting Hermes backend via ${backend.label}`)
 
     const profile = primaryProfileKey()
-    const parentStartMarker = await desktopParentStartMarker()
+
+    const parentStartMarker = await awaitProfileSpawnPreparation(
+      profile,
+      profileDeletionGate,
+      key => directoryExists(path.join(HERMES_HOME, 'profiles', key)),
+      () => desktopParentStartMarker()
+    )
+
     const backendNonce = crypto.randomBytes(16).toString('hex')
     const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
+
+    rememberLog(`Starting Hermes backend via ${backend.label}`)
 
     const hermesProcess = spawn(
       backend.command,
