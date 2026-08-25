@@ -88,6 +88,28 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     assert Path(exec_line.split(" ")[0]).is_absolute()
 
 
+def test_module_fallback_preserves_venv_python_symlink(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    base_python = tmp_path / "uv" / "python3.11"
+    base_python.parent.mkdir()
+    base_python.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    assert entry is not None
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
+    assert str(base_python) not in exec_line
+    assert exec_line.endswith("-m hermes_cli.main desktop")
+
+
 # #90292: the shell installer's bash wrapper makes argv[0] the repo `hermes`
 # python script whose `#!/usr/bin/env python3` shebang resolves to the SYSTEM
 # interpreter when the DE spawns the .desktop entry → ModuleNotFoundError,
@@ -107,10 +129,40 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    interpreter = str(Path(sys.executable).absolute())
     assert exec_line.split(" ")[0].strip('"') == interpreter
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
+
+
+def test_exec_preserves_venv_python_symlink_for_env_shebang_script(
+    tmp_path, xdg_home, monkeypatch
+):
+    root = _make_project(tmp_path)
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+
+    base_python = tmp_path / "uv" / "python3.11"
+    base_python.parent.mkdir()
+    base_python.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    assert entry is not None
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # The symlink is the venv boundary. Resolving it to the uv/base interpreter
+    # drops site-packages, so the launcher must preserve sys.executable verbatim.
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
+    assert str(base_python) not in exec_line
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
@@ -135,7 +187,7 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
+    interpreter = str(Path(sys.executable).absolute())
     hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
