@@ -18,6 +18,28 @@ class MemoryScope(str, Enum):
     AMBIGUOUS = "ambiguous"
 
 
+EXECUTION_INTENT_MARKERS = (
+    "설정해", "설치해", "수정해", "테스트해", "만들어", "실행해", "확인해", "적용해", "환경을 구성해",
+)
+
+
+def is_memory_intent(content: str) -> bool:
+    """Return whether content explicitly asks for durable memory storage.
+
+    Execution intent markers are guidance-only: an explicit request to remember
+    always wins, while wording such as "앞으로" alone is not a memory request.
+    """
+    text = content.casefold()
+    return any(marker in text for marker in (
+        "기억해",
+        "기억해둬",
+        "다음에도 기억해",
+        "앞으로도 이 설정을 기억해",
+        "장기적으로 저장해둬",
+        "내 선호로 기억해",
+    ))
+
+
 def classify_memory_scope(content: str) -> MemoryScope:
     """Conservatively classify a requested memory's stated content.
 
@@ -61,7 +83,12 @@ def classify_memory_scope(content: str) -> MemoryScope:
 
 
 MEMORY_ROUTING_GUIDANCE = (
-    "When asked to remember something, classify its scope before writing. "
+    "Only route explicit memory requests (for example, 기억해) to memory storage; "
+    "execution requests for package installs, venv creation, running tests, editing "
+    "files, environment or PATH changes, dev-environment setup, debugging procedures, "
+    "or running commands must not be stored in USER.md, MEMORY.md, or AGENTS.md unless "
+    "the user explicitly asks to remember them. 앞으로 alone does not make something a "
+    "memory request. When asked to remember something, classify its scope before writing. "
     "Project-specific facts, decisions, architecture, conventions, commands, or "
     "configuration belong in the current project's AGENTS.md: identify the current "
     "project from the active CWD, prefer its git root when present, then use loaded "
