@@ -8,6 +8,7 @@ These tests exercise the real ``AIAgent`` guard helpers and the streaming
 consume-loop, asserting that exactly one writer ever reaches the turn.
 """
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -30,8 +31,13 @@ def _make_agent():
     return agent
 
 
-def _chunk(content=None, finish_reason=None, model=None):
-    delta = SimpleNamespace(content=content, tool_calls=None, reasoning_content=None, reasoning=None)
+def _chunk(content=None, finish_reason=None, model=None, tool_calls=None):
+    delta = SimpleNamespace(
+        content=content,
+        tool_calls=tool_calls,
+        reasoning_content=None,
+        reasoning=None,
+    )
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model=model, usage=None)
 
@@ -137,6 +143,75 @@ class TestSingleWriterLoop:
         assert "-stale-tail" not in "".join(delivered)
         assert response.choices[0].finish_reason == "stop"
         assert response.choices[0].message.content == "first-stale-tail"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_terminal_marker_survives_stale_watchdog_cancellation(
+        self, _close, mock_create, monkeypatch
+    ):
+        """A terminal chunk already in flight wins over watchdog cancellation."""
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.05")
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+        agent = _make_agent()
+        delivered = []
+        agent.stream_delta_callback = delivered.append
+        agent._stream_callback = None
+
+        def stream_gen():
+            yield _chunk(content="first")
+            time.sleep(0.7)
+            yield _chunk(content="-tail", finish_reason="stop", model="m")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = stream_gen()
+        mock_create.return_value = mock_client
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert delivered == ["first"]
+        assert response.choices[0].finish_reason == "stop"
+        assert response.choices[0].message.content == "first-tail"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_stale_terminal_tool_call_skips_generation_callback(
+        self, _close, mock_create
+    ):
+        """A stale terminal tool call is returned without stale UI callbacks."""
+        agent = _make_agent()
+        delivered = []
+        tool_gen_callbacks = []
+        agent.stream_delta_callback = delivered.append
+        agent.tool_gen_callback = tool_gen_callbacks.append
+        agent._stream_callback = None
+        tool_delta = SimpleNamespace(
+            index=0,
+            id="call-1",
+            function=SimpleNamespace(name="dangerous_tool", arguments="{}"),
+            extra_content=None,
+        )
+
+        def stream_gen():
+            yield _chunk(content="first")
+            agent._claim_stream_writer()
+            yield _chunk(
+                finish_reason="tool_calls",
+                model="m",
+                tool_calls=[tool_delta],
+            )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = stream_gen()
+        mock_create.return_value = mock_client
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert delivered == ["first"]
+        assert tool_gen_callbacks == []
+        assert response.choices[0].finish_reason == "tool_calls"
+        assert [
+            tool.function.name for tool in response.choices[0].message.tool_calls
+        ] == ["dangerous_tool"]
 
     def test_chat_parser_failure_closes_managed_stream(self):
         agent = _make_agent()

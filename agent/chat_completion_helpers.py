@@ -3952,6 +3952,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        provider_finish_consumed = False
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -4331,8 +4332,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     name = entry["function"]["name"]
                     if name and idx not in tool_gen_notified:
                         tool_gen_notified.add(idx)
-                        _fire_first_delta()
-                        agent._fire_tool_gen_started(name)
+                        if not terminal_chunk_crossed_fence:
+                            _fire_first_delta()
+                            agent._fire_tool_gen_started(name)
                         # Record the partial tool-call name so the outer
                         # stub-builder can surface a user-visible warning
                         # if streaming dies before this tool's arguments
@@ -4342,7 +4344,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # discarding the attempted action.
                         result["partial_tool_names"].append(name)
 
-            if chunk_finish_reason:
+            if chunk_finish_reason is not None:
+                provider_finish_consumed = True
                 finish_reason = chunk_finish_reason
 
             # Usage in the final chunk
@@ -4351,7 +4354,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         _close_managed_stream()
 
-        if _stream_attempt_was_cancelled(stream_attempt_id):
+        if (
+            _stream_attempt_was_cancelled(stream_attempt_id)
+            and not provider_finish_consumed
+        ):
             raise _httpx.RemoteProtocolError(
                 f"stream attempt {stream_attempt_id} was superseded"
             )
