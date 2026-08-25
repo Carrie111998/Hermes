@@ -75,10 +75,6 @@ def _context_file_scanning_policy(home_override: "Path | None" = None) -> str:
         if home_token is not None:
             reset_hermes_home_override(home_token)
 
-    # YAML 1.1 loaders parse an unquoted ``off`` scalar as ``False``. Accept
-    # that representation so the documented enum works when written by hand.
-    if configured is False:
-        return "off"
     if isinstance(configured, str):
         policy = configured.strip().lower()
         if policy in {"enforce", "warn", "off"}:

@@ -2374,7 +2374,7 @@ Pre-execution security scanning and secret redaction:
 ```yaml
 security:
   redact_secrets: true           # Redact API key patterns in tool output and logs (on by default)
-  context_file_scanning: enforce # enforce | warn | off (default: enforce)
+  context_file_scanning: "enforce" # "enforce" | "warn" | "off" (default: "enforce")
   tirith_enabled: true           # Enable Tirith security scanning for terminal commands
   tirith_path: "tirith"          # Path to tirith binary (default: "tirith" in $PATH)
   tirith_timeout: 5              # Seconds to wait for tirith scan before timing out

@@ -3802,7 +3802,7 @@ _SECURITY_COMMENT = """
 #
 # security:
 #   redact_secrets: true
-#   context_file_scanning: enforce  # enforce | warn | off
+#   context_file_scanning: "enforce"  # "enforce" | "warn" | "off"
 #   tirith_enabled: true
 #   tirith_path: "tirith"
 #   tirith_timeout: 5
@@ -3841,7 +3841,7 @@ _COMMENTED_SECTIONS = """
 #
 # security:
 #   redact_secrets: true
-#   context_file_scanning: enforce  # enforce | warn | off
+#   context_file_scanning: "enforce"  # "enforce" | "warn" | "off"
 #
 # ── Fallback Model ────────────────────────────────────────────────────
 # Automatic provider failover when primary is unavailable.

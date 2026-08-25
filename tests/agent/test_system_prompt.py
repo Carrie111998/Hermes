@@ -331,11 +331,11 @@ def test_bare_thread_uses_agent_profile_scan_policy(monkeypatch, tmp_path):
         ambient_home.mkdir(parents=True)
         agent_home.mkdir(parents=True)
         (ambient_home / "config.yaml").write_text(
-            f"security:\n  context_file_scanning: {ambient_policy}\n",
+            f'security:\n  context_file_scanning: "{ambient_policy}"\n',
             encoding="utf-8",
         )
         (agent_home / "config.yaml").write_text(
-            f"security:\n  context_file_scanning: {agent_policy}\n",
+            f'security:\n  context_file_scanning: "{agent_policy}"\n',
             encoding="utf-8",
         )
         (agent_home / "SOUL.md").write_text(malicious, encoding="utf-8")
