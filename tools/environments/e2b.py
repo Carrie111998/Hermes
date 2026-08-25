@@ -13,8 +13,9 @@ import os
 import posixpath
 import shlex
 import threading
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from e2b import SandboxLifecycle
@@ -28,6 +29,7 @@ from tools.environments.base import (
     _save_json_store,
 )
 from tools.environments.file_sync import (
+    _SYNC_BACK_MAX_BYTES,
     FileSyncManager,
     iter_sync_files,
     quoted_mkdir_command,
@@ -42,6 +44,31 @@ _E2B_HERMES_HOME = f"{DEFAULT_E2B_CWD}/.hermes"
 _SANDBOX_STORE_NAME = "e2b_sandboxes.json"
 _COMMAND_TIMEOUT_GRACE_SECONDS = 5
 _STORE_LOCK = threading.Lock()
+_ACTIVE_COMMANDS_LOCK = threading.Lock()
+_ACTIVE_COMMANDS_BY_SANDBOX: dict[str, int] = {}
+
+
+def _increment_active_commands(sandbox_id: str) -> None:
+    with _ACTIVE_COMMANDS_LOCK:
+        _ACTIVE_COMMANDS_BY_SANDBOX[sandbox_id] = (
+            _ACTIVE_COMMANDS_BY_SANDBOX.get(sandbox_id, 0) + 1
+        )
+
+
+def _decrement_active_commands(sandbox_id: str) -> None:
+    with _ACTIVE_COMMANDS_LOCK:
+        remaining = _ACTIVE_COMMANDS_BY_SANDBOX.get(sandbox_id, 0) - 1
+        if remaining > 0:
+            _ACTIVE_COMMANDS_BY_SANDBOX[sandbox_id] = remaining
+        else:
+            _ACTIVE_COMMANDS_BY_SANDBOX.pop(sandbox_id, None)
+
+
+def _active_command_count(sandbox_id: str | None) -> int:
+    if not sandbox_id:
+        return 0
+    with _ACTIVE_COMMANDS_LOCK:
+        return _ACTIVE_COMMANDS_BY_SANDBOX.get(sandbox_id, 0)
 
 
 def _ensure_e2b_sdk() -> None:
@@ -115,6 +142,71 @@ def _delete_sandbox_record(
         _save_json_store(_sandbox_store_path(), data)
 
 
+def _store_sandbox_sync_state(
+    task_id: str,
+    template: str,
+    sandbox_id: str,
+    state: dict,
+    *,
+    pending: bool = False,
+) -> None:
+    """Attach write-ahead or committed sync state to a sandbox record.
+
+    The baseline is what makes a later resume deterministic: recovery compares
+    the paused sandbox against it before any host snapshot is pushed. Only the
+    record for *sandbox_id* is updated, so a record replaced by a newer
+    sandbox never inherits a stale baseline.
+    """
+    if not task_id or not sandbox_id:
+        raise ValueError("task_id and sandbox_id are required for sync-state persistence")
+    with _STORE_LOCK:
+        data = _load_json_store(_sandbox_store_path())
+        record = data.get(_record_key(task_id, template))
+        if not isinstance(record, dict) or record.get("sandbox_id") != sandbox_id:
+            raise RuntimeError("sandbox record changed before sync state could be persisted")
+        if pending:
+            record["sync_pending_state"] = state
+        else:
+            record["sync_state"] = state
+            record.pop("sync_pending_state", None)
+        _save_json_store(_sandbox_store_path(), data)
+
+
+def _load_sandbox_sync_state(
+    task_id: str,
+    template: str,
+    sandbox_id: str,
+) -> dict | None:
+    if not task_id or not sandbox_id:
+        return None
+    with _STORE_LOCK:
+        record = _load_json_store(_sandbox_store_path()).get(
+            _record_key(task_id, template)
+        )
+    if not isinstance(record, dict) or record.get("sandbox_id") != sandbox_id:
+        return None
+    state = record.get("sync_state")
+    return state if isinstance(state, dict) else None
+
+
+def _load_sandbox_pending_sync_state(
+    task_id: str,
+    template: str,
+    sandbox_id: str,
+) -> dict | None:
+    """Load an unpromoted write-ahead snapshot for crash recovery."""
+    if not task_id or not sandbox_id:
+        return None
+    with _STORE_LOCK:
+        record = _load_json_store(_sandbox_store_path()).get(
+            _record_key(task_id, template)
+        )
+    if not isinstance(record, dict) or record.get("sandbox_id") != sandbox_id:
+        return None
+    state = record.get("sync_pending_state")
+    return state if isinstance(state, dict) else None
+
+
 def _sandbox_id(sandbox: Any) -> str:
     value = getattr(sandbox, "sandbox_id", None) or getattr(sandbox, "id", None)
     if not isinstance(value, str) or not value:
@@ -166,7 +258,12 @@ class E2BEnvironment(BaseEnvironment):
         self._lock = threading.RLock()
         self._sandbox: Any | None = None
         self._sandbox_id: str | None = None
+        self._active_commands = 0
         self._created_for_initialization = False
+        self._resumed_existing_sandbox = False
+        # Monotonic lower bound of the server-side sandbox lease deadline.
+        # Only ever moved forward; see _extend_lease_for_command().
+        self._lease_deadline = 0.0
         hermes_home = get_hermes_home()
         self._sync_manager = FileSyncManager(
             get_files_fn=lambda: iter_sync_files(_E2B_HERMES_HOME),
@@ -178,6 +275,8 @@ class E2BEnvironment(BaseEnvironment):
                 (str(hermes_home / "skills"), f"{_E2B_HERMES_HOME}/skills"),
                 (str(hermes_home / "memories"), f"{_E2B_HERMES_HOME}/memories"),
             ],
+            on_state_pending=self._persist_pending_sync_state,
+            on_state_committed=self._persist_sync_state,
         )
 
         try:
@@ -215,6 +314,10 @@ class E2BEnvironment(BaseEnvironment):
 
         sandbox_id = _sandbox_id(sandbox)
         self._created_for_initialization = True
+        # A freshly created sandbox (including a replacement made from
+        # _ensure_sandbox_ready) holds no earlier session's state to recover.
+        self._resumed_existing_sandbox = False
+        self._track_lease_from_now()
         if self._persistent:
             _store_sandbox_record(self._task_id, sandbox_id, self._template)
         logger.info("E2B: created sandbox %s for task %s", sandbox_id, self._task_id)
@@ -226,6 +329,7 @@ class E2BEnvironment(BaseEnvironment):
         from e2b.exceptions import SandboxNotFoundException
 
         self._created_for_initialization = False
+        self._resumed_existing_sandbox = False
 
         record = (
             _load_sandbox_record(self._task_id, self._template)
@@ -242,6 +346,8 @@ class E2BEnvironment(BaseEnvironment):
                     api_key=self._api_key,
                 )
                 logger.info("E2B: resumed sandbox %s for task %s", sandbox_id, self._task_id)
+                self._resumed_existing_sandbox = True
+                self._track_lease_from_now()
                 return sandbox
             except SandboxNotFoundException:
                 logger.info(
@@ -256,8 +362,16 @@ class E2BEnvironment(BaseEnvironment):
         return self._create_sandbox()
 
     def _initialize_remote_state(self) -> None:
-        """Create the state root and require one successful sync cycle."""
+        """Create the state root and require one successful sync cycle.
+
+        A resumed sandbox is recovered first: its filesystem can hold the only
+        copy of agent-authored state (crash before cleanup, failed sync-back),
+        so remote changes must reach the host before the host snapshot is
+        pushed — the push would otherwise overwrite them.
+        """
         self._ensure_remote_hermes_dir()
+        if self._resumed_existing_sandbox:
+            self._recover_resumed_state()
         try:
             sync_succeeded = self._sync_manager.sync(force=True)
         except Exception as exc:
@@ -267,6 +381,71 @@ class E2BEnvironment(BaseEnvironment):
                 "initial state sync",
                 RuntimeError("Hermes state could not be uploaded to the sandbox"),
             )
+
+    def _recover_resumed_state(self) -> None:
+        """Pull a resumed sandbox's changes to the host before any push.
+
+        Loads the committed baseline persisted with the sandbox record so the
+        pull applies exactly the files the remote changed since the last
+        commit (deterministic conflict handling: remote wins with a warning,
+        matching sync_back's documented last-write-wins rule). Without a
+        stored baseline every remote file counts as remote-authored, which is
+        the conservative reading of a sandbox we cannot diff.
+        """
+        state = _load_sandbox_sync_state(
+            self._task_id, self._template, self._sandbox_id or ""
+        )
+        pending_state = _load_sandbox_pending_sync_state(
+            self._task_id, self._template, self._sandbox_id or ""
+        )
+        loaded = self._sync_manager.load_state(
+            state,
+            pending_state=pending_state,
+        )
+        if not loaded:
+            logger.warning(
+                "E2B: resumed sandbox %s has no committed sync baseline; "
+                "recovering remote skills/memories before upload",
+                self._sandbox_id,
+            )
+        # Without a baseline nothing distinguishes host-owned files
+        # (credentials, cache) from remote-authored ones, so the pull is
+        # restricted to the declared agent-state roots — general prefix
+        # inference could otherwise recreate a credential the host deleted.
+        if not self._sync_manager.sync_back(
+            require_prior_sync=loaded,
+            restrict_to_roots=not loaded,
+        ):
+            raise _connection_error(
+                "resumed state recovery",
+                RuntimeError(
+                    "remote Hermes state could not be recovered before the "
+                    "host snapshot upload"
+                ),
+            )
+
+    def _persist_sync_state(self, state: dict) -> None:
+        """Persist the committed sync baseline alongside the sandbox record."""
+        if not self._persistent or not self._sandbox_id:
+            return
+        _store_sandbox_sync_state(
+            self._task_id,
+            self._template,
+            self._sandbox_id,
+            state,
+        )
+
+    def _persist_pending_sync_state(self, state: dict) -> None:
+        """Persist write-ahead state before either side is mutated."""
+        if not self._persistent or not self._sandbox_id:
+            return
+        _store_sandbox_sync_state(
+            self._task_id,
+            self._template,
+            self._sandbox_id,
+            state,
+            pending=True,
+        )
 
     def _initialize_replacement_sandbox(self) -> None:
         """Bootstrap a newly-created replacement before exposing it to tools."""
@@ -329,10 +508,13 @@ class E2BEnvironment(BaseEnvironment):
         try:
             # Explicitly reconnect so an E2B lifecycle timeout that paused the
             # sandbox is handled without enabling cross-profile auto-resume.
+            # For a running sandbox the SDK only ever extends the timeout, so
+            # this cannot shorten a longer lease set for an in-flight command.
             self._sandbox.connect(
                 timeout=self._sandbox_timeout,
                 api_key=self._api_key,
             )
+            self._track_lease_from_now()
         except SandboxNotFoundException:
             stale_id = self._sandbox_id
             _delete_sandbox_record(self._task_id, self._template, stale_id)
@@ -352,6 +534,46 @@ class E2BEnvironment(BaseEnvironment):
         if sandbox is None:
             raise EnvironmentConnectionError("E2B sandbox is not attached")
         return sandbox
+
+    def _track_lease_from_now(self) -> None:
+        """Record that the server lease now extends at least the default lease.
+
+        ``create`` sets the lease to ``_sandbox_timeout``; ``connect`` resumes
+        with it or extends a shorter running lease. Both leave the server
+        deadline at or beyond ``now + _sandbox_timeout``, so the tracked value
+        stays a lower bound.
+        """
+        with self._lock:
+            self._lease_deadline = max(
+                self._lease_deadline, time.monotonic() + self._sandbox_timeout
+            )
+
+    def _extend_lease_for_command(self, command_timeout: int) -> None:
+        """Renew the sandbox lease to cover *command_timeout* before execution.
+
+        The environment is cached across commands, so the lease derived from
+        construction can be shorter than a later command's deadline — the
+        configured ``on_timeout`` lifecycle would then pause or kill the
+        sandbox mid-command. Renewing to at least
+        ``max(configured lease, command timeout + grace)`` on every launch
+        keeps the two contracts aligned; the tracked deadline only moves
+        forward, so a short command never truncates the lease a longer
+        concurrent command just requested.
+        """
+        required = max(
+            self._sandbox_timeout,
+            int(command_timeout) + _COMMAND_TIMEOUT_GRACE_SECONDS,
+        )
+        with self._lock:
+            sandbox = self._require_sandbox()
+            now = time.monotonic()
+            if now + required <= self._lease_deadline:
+                return
+            try:
+                sandbox.set_timeout(required, api_key=self._api_key)
+            except Exception as exc:
+                raise _connection_error("sandbox lease renewal", exc) from exc
+            self._lease_deadline = now + required
 
     def _ensure_remote_hermes_dir(self) -> None:
         """Create the synced Hermes state directory in a fresh template."""
@@ -420,7 +642,29 @@ class E2BEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     f"E2B bulk download failed: {getattr(result, 'stderr', '')}"
                 )
-            dest_tar_path.write_bytes(bytes(sandbox.files.read(remote_tar, format="bytes")))
+            # Stream the archive to disk with a counting writer so the
+            # sync-back size cap bounds the transfer itself, not just the
+            # extraction of an archive already materialized in memory. On
+            # overflow the partial file stays over the cap, so the caller's
+            # existing size check skips extraction exactly as before.
+            stream = sandbox.files.read(remote_tar, format="stream")
+            written = 0
+            try:
+                with open(dest_tar_path, "wb") as out:
+                    for chunk in stream:
+                        out.write(chunk)
+                        written += len(chunk)
+                        if written > _SYNC_BACK_MAX_BYTES:
+                            logger.warning(
+                                "E2B: remote state archive exceeds %d bytes; "
+                                "stopping transfer",
+                                _SYNC_BACK_MAX_BYTES,
+                            )
+                            break
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
         finally:
             try:
                 sandbox.files.remove(remote_tar)
@@ -430,7 +674,16 @@ class E2BEnvironment(BaseEnvironment):
     def _before_execute(self) -> None:
         with self._lock:
             self._ensure_sandbox_ready()
-            self._sync_manager.sync()
+            # A failed incremental sync means the command would run against
+            # stale credentials, skills, cache files, or undeleted state —
+            # surface it instead of executing, mirroring the initial-sync path.
+            if not self._sync_manager.sync():
+                raise _connection_error(
+                    "state sync before command",
+                    RuntimeError(
+                        "Hermes state changes could not be uploaded to the sandbox"
+                    ),
+                )
 
     def _run_bash(
         self,
@@ -440,13 +693,24 @@ class E2BEnvironment(BaseEnvironment):
         timeout: int = 120,
         stdin_data: str | None = None,
     ):
-        """Run through E2B and cancel only the command PID on timeout/interrupt."""
+        """Run through E2B and cancel only the command PID on timeout/interrupt.
+
+        Output is streamed chunk-by-chunk into the process handle's pipe so
+        the base class's bounded collector applies while the command is still
+        producing output — a verbose command never accumulates its full
+        stdout/stderr in this process first.
+        """
         del stdin_data
         sandbox = self._require_sandbox()
+        command_sandbox_id = self._sandbox_id or _sandbox_id(sandbox)
         shell_cmd = f"bash {'-l ' if login else ''}-c {shlex.quote(cmd_string)}"
         sdk_timeout = max(int(timeout) + _COMMAND_TIMEOUT_GRACE_SECONDS, 5)
+        self._extend_lease_for_command(int(timeout))
         state_lock = threading.Lock()
         state: dict[str, Any] = {"handle": None, "cancel_requested": False}
+        with self._lock:
+            self._active_commands += 1
+            _increment_active_commands(command_sandbox_id)
 
         def cancel() -> None:
             with state_lock:
@@ -455,7 +719,7 @@ class E2BEnvironment(BaseEnvironment):
             if handle is not None:
                 handle.kill()
 
-        def exec_fn() -> tuple[str, int]:
+        def exec_fn(write: Callable[[str], None]) -> int:
             from e2b.sandbox.commands.command_handle import CommandExitException
             from e2b.exceptions import AuthenticationException, SandboxException
 
@@ -472,23 +736,46 @@ class E2BEnvironment(BaseEnvironment):
                 if cancel_requested:
                     handle.kill()
 
-                chunks: list[str] = []
+                emitted = False
+
+                def forward(value: str) -> None:
+                    nonlocal emitted
+                    if value:
+                        emitted = True
+                        write(value)
+                    # The pinned e2b SDK also accumulates every chunk in the
+                    # handle's private lists to build its final CommandResult,
+                    # which would defeat bounded capture for verbose commands.
+                    # Drop chunks already forwarded; guarded so an SDK without
+                    # these internals simply keeps its own copy.
+                    for attr in ("_stdout_chunks", "_stderr_chunks"):
+                        sdk_chunks = getattr(handle, attr, None)
+                        if isinstance(sdk_chunks, list):
+                            sdk_chunks.clear()
+
                 try:
-                    result = handle.wait(
-                        on_stdout=lambda value: chunks.append(value),
-                        on_stderr=lambda value: chunks.append(value),
-                    )
-                    if not chunks:
-                        chunks.extend([result.stdout or "", result.stderr or ""])
-                    return "".join(chunks), result.exit_code
+                    result = handle.wait(on_stdout=forward, on_stderr=forward)
+                    if not emitted:
+                        write((result.stdout or "") + (result.stderr or ""))
+                    return result.exit_code
                 except CommandExitException as exc:
-                    if not chunks:
-                        chunks.extend([exc.stdout or "", exc.stderr or ""])
-                    return "".join(chunks), exc.exit_code
+                    if not emitted:
+                        write((exc.stdout or "") + (exc.stderr or ""))
+                    return exc.exit_code
             except (AuthenticationException, SandboxException) as exc:
                 raise _connection_error("command execution", exc) from exc
+            finally:
+                with self._lock:
+                    self._active_commands -= 1
+                    _decrement_active_commands(command_sandbox_id)
 
-        return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
+        try:
+            return _ThreadedProcessHandle(stream_exec_fn=exec_fn, cancel_fn=cancel)
+        except BaseException:
+            with self._lock:
+                self._active_commands -= 1
+                _decrement_active_commands(command_sandbox_id)
+            raise
 
     def _wait_for_process(
         self,
@@ -509,6 +796,22 @@ class E2BEnvironment(BaseEnvironment):
 
     def cleanup(self) -> None:
         with self._lock:
+            active_commands = max(
+                self._active_commands,
+                _active_command_count(self._sandbox_id),
+            )
+            if active_commands:
+                # Persistent E2B is profile-scoped and may be shared by other
+                # gateway/WebUI sessions. A closing sibling session must not
+                # pause the sandbox underneath an in-flight command. The
+                # command retains this environment object; later construction
+                # can reconnect through the durable pointer and recover state.
+                logger.info(
+                    "E2B: deferring cleanup for task %s while %d command(s) run",
+                    self._task_id,
+                    active_commands,
+                )
+                return
             sandbox = self._sandbox
             sandbox_id = self._sandbox_id
             if sandbox is None:
@@ -539,9 +842,22 @@ class E2BEnvironment(BaseEnvironment):
                     return
 
             try:
-                self._sync_manager.sync_back()
+                synced_back = self._sync_manager.sync_back()
             except Exception as exc:
+                synced_back = False
                 logger.warning("E2B: sync_back failed for task %s: %s", self._task_id, exc)
+            if not synced_back and self._persistent:
+                # Pausing below still preserves the un-pulled files, and the
+                # stored baseline was not advanced, so the next construction's
+                # resume recovery pulls them before any host upload. The
+                # sandbox is therefore NOT promoted as safely persisted.
+                logger.warning(
+                    "E2B: remote changes in sandbox %s for task %s were not "
+                    "pulled back; they remain in the sandbox and will be "
+                    "recovered on the next resume",
+                    sandbox_id,
+                    self._task_id,
+                )
 
             cleanup_succeeded = False
             try:

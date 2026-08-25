@@ -87,6 +87,22 @@ class RecordingCommands:
         return RecordingCommandHandle(result) if kwargs.get("background") else result
 
 
+class FakeStreamReader:
+    """Chunked download stream mirroring the SDK's FileStreamReader shape."""
+
+    def __init__(self, payload: bytes, chunk_size: int = 7):
+        self._chunks = [
+            payload[i : i + chunk_size] for i in range(0, len(payload), chunk_size)
+        ]
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+    def close(self):
+        self.closed = True
+
+
 class RecordingFiles:
     def __init__(self):
         self.write_calls: list[tuple[str, bytes]] = []
@@ -94,6 +110,7 @@ class RecordingFiles:
         self.remove_calls: list[str] = []
         self.remove_effects: dict[str, Exception] = {}
         self.read_payload = b"archive"
+        self.stream_readers: list[FakeStreamReader] = []
 
     def write(self, path: str, data: bytes):
         self.write_calls.append((path, data))
@@ -108,8 +125,10 @@ class RecordingFiles:
             raise effect
 
     def read(self, path: str, *, format: str):
-        assert format == "bytes"
-        return bytearray(self.read_payload)
+        assert format == "stream"
+        reader = FakeStreamReader(self.read_payload)
+        self.stream_readers.append(reader)
+        return reader
 
 
 class SandboxSession:
@@ -120,9 +139,11 @@ class SandboxSession:
         self.connect_calls: list[dict] = []
         self.pause_calls: list[dict] = []
         self.kill_calls: list[dict] = []
+        self.set_timeout_calls: list[tuple[int, dict]] = []
         self.reconnect_effect: Exception | None = None
         self.pause_effect: Exception | None = None
         self.kill_effect: Exception | None = None
+        self.set_timeout_effect: Exception | None = None
         self.pause_result = True
         self.kill_result = True
 
@@ -131,6 +152,11 @@ class SandboxSession:
         if self.reconnect_effect:
             raise self.reconnect_effect
         return self
+
+    def set_timeout(self, timeout: int, **kwargs):
+        self.set_timeout_calls.append((timeout, kwargs))
+        if self.set_timeout_effect:
+            raise self.set_timeout_effect
 
     def pause(self, **kwargs):
         self.pause_calls.append(kwargs)
@@ -171,7 +197,8 @@ class RecordingSyncManager:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.sync_calls: list[bool] = []
-        self.sync_back_calls = 0
+        self.sync_back_calls: list[bool] = []
+        self.load_state_calls: list[object] = []
         self.reset_calls = 0
         self.instances.append(self)
 
@@ -179,8 +206,13 @@ class RecordingSyncManager:
         self.sync_calls.append(force)
         return True
 
-    def sync_back(self):
-        self.sync_back_calls += 1
+    def sync_back(self, hermes_home=None, *, require_prior_sync=True, restrict_to_roots=False):
+        self.sync_back_calls.append((require_prior_sync, restrict_to_roots))
+        return True
+
+    def load_state(self, state, *, pending_state=None):
+        self.load_state_calls.append((state, pending_state))
+        return False
 
     def reset_remote_state(self):
         self.reset_calls += 1
@@ -230,6 +262,7 @@ def e2b_backend(monkeypatch):
     from tools.environments import e2b as backend
 
     RecordingSyncManager.instances.clear()
+    backend._ACTIVE_COMMANDS_BY_SANDBOX.clear()
     monkeypatch.setattr(backend, "_ensure_e2b_sdk", lambda: None)
     monkeypatch.setattr(backend, "FileSyncManager", RecordingSyncManager)
     monkeypatch.setattr(backend.E2BEnvironment, "init_session", lambda self: None)
@@ -287,6 +320,27 @@ def test_ephemeral_cleanup_kills_sandbox(e2b_backend):
 
     assert session.kill_calls == [{"api_key": "profile-key"}]
     assert session.pause_calls == []
+
+
+def test_cleanup_does_not_interrupt_an_active_shared_command(e2b_backend, caplog):
+    backend, _service = e2b_backend
+    env = make_environment(backend, persistent_filesystem=True)
+    session = env._sandbox
+    env._active_commands = 1
+    caplog.set_level("INFO", logger=backend.__name__)
+
+    env.cleanup()
+
+    assert "deferring cleanup" in caplog.text
+    assert session.pause_calls == []
+    assert session.kill_calls == []
+    assert env._sandbox is session
+
+    env._active_commands = 0
+    env.cleanup()
+    assert session.pause_calls == [
+        {"keep_memory": False, "api_key": "profile-key"}
+    ]
 
 
 def test_false_kill_result_means_sandbox_is_already_gone(e2b_backend, caplog):
@@ -402,13 +456,61 @@ def test_command_cancellation_is_pid_scoped_and_race_safe(e2b_backend):
     session.commands.run_hook = delayed_run
     process = env._run_bash("sleep 30", timeout=1)
     assert run_entered.wait(timeout=2)
+    assert env._active_commands == 1
+
+    # A sibling gateway session may close while this shared environment is
+    # executing. Cleanup must not pause/kill the sandbox under the command.
+    env.cleanup()
+    assert session.pause_calls == []
+    assert session.kill_calls == []
+    assert env._sandbox is session
+
     process.kill()
     allow_handle.set()
 
     assert process.wait(timeout=2) == 137
+    assert env._active_commands == 0
     assert handle.kill_calls == 1
     assert session.kill_calls == []
     env.cleanup()
+
+
+def test_sibling_cleanup_does_not_interrupt_shared_sandbox_command(e2b_backend):
+    backend, _service = e2b_backend
+    running_env = make_environment(backend, persistent_filesystem=True)
+    sibling_env = make_environment(backend, persistent_filesystem=True)
+    session = running_env._sandbox
+    assert sibling_env._sandbox is session
+    run_entered = threading.Event()
+    command_killed = threading.Event()
+
+    class BlockingCommandHandle(RecordingCommandHandle):
+        def wait(self, on_stdout=None, on_stderr=None):
+            run_entered.set()
+            assert command_killed.wait(timeout=2)
+            raise CommandFailed(stderr="killed", exit_code=137)
+
+        def kill(self):
+            super().kill()
+            command_killed.set()
+            return True
+
+    handle = BlockingCommandHandle()
+    session.commands.run_hook = lambda _command, _kwargs: handle
+    process = running_env._run_bash("sleep 30", timeout=1)
+    assert run_entered.wait(timeout=2)
+
+    sibling_env.cleanup()
+    assert session.pause_calls == []
+    assert sibling_env._sandbox is session
+
+    process.kill()
+    assert process.wait(timeout=2) == 137
+    assert backend._active_command_count(session.sandbox_id) == 0
+    sibling_env.cleanup()
+    assert session.pause_calls == [
+        {"keep_memory": False, "api_key": "profile-key"}
+    ]
 
 
 def test_command_cancellation_after_handle_creation_kills_only_command(e2b_backend):
@@ -460,6 +562,101 @@ def test_command_transport_failure_is_reported_as_backend_degradation(e2b_backen
     assert service.sessions[session.sandbox_id] is session
 
 
+def test_cached_environment_renews_lease_for_longer_command_deadline(e2b_backend):
+    """A later command with a longer timeout must extend the sandbox lease.
+
+    The environment is created with ``lifetime_seconds=90``; without renewal
+    the configured on-timeout lifecycle could pause the sandbox halfway
+    through a valid 600-second command.
+    """
+    backend, _service = e2b_backend
+    env = make_environment(backend, persistent_filesystem=True)
+    session = env._sandbox
+
+    short = env._run_bash("true", timeout=30)
+    assert short.wait(timeout=2) == 0
+    assert all(timeout >= 90 for timeout, _ in session.set_timeout_calls)
+
+    long_cmd = env._run_bash("sleep 600", timeout=600)
+    assert long_cmd.wait(timeout=2) == 0
+    renewed, kwargs = session.set_timeout_calls[-1]
+    assert renewed >= 605
+    assert kwargs == {"api_key": "profile-key"}
+
+    # A later short command must never truncate the longer lease.
+    calls_after_long = list(session.set_timeout_calls)
+    short_again = env._run_bash("true", timeout=30)
+    assert short_again.wait(timeout=2) == 0
+    assert session.set_timeout_calls == calls_after_long
+    env.cleanup()
+
+
+def test_failed_lease_renewal_surfaces_as_backend_degradation(e2b_backend):
+    backend, _service = e2b_backend
+    env = make_environment(backend, persistent_filesystem=False)
+    env._sandbox.set_timeout_effect = ApiRateLimited("throttled")
+
+    with pytest.raises(backend.EnvironmentConnectionError, match="lease renewal"):
+        env._run_bash("sleep 600", timeout=600)
+    env._sandbox.set_timeout_effect = None
+    env.cleanup()
+
+
+def test_verbose_command_output_is_streamed_and_bounded(e2b_backend):
+    """Output must be bounded while produced, not after full accumulation.
+
+    Both retention points are checked: the Hermes-side collector keeps a
+    head/tail window under the tool-output cap, and the SDK handle's private
+    chunk buffers are drained as chunks are forwarded.
+    """
+    backend, _service = e2b_backend
+    env = make_environment(backend, persistent_filesystem=False)
+    session = env._sandbox
+
+    chunk = "x" * 1024
+    total_chunks = 500
+
+    class SdkBufferingHandle(RecordingCommandHandle):
+        def __init__(self):
+            super().__init__()
+            self._stdout_chunks: list[str] = []
+            self._stderr_chunks: list[str] = []
+            self.max_buffered = 0
+
+        def wait(self, on_stdout=None, on_stderr=None):
+            for _ in range(total_chunks):
+                self._stdout_chunks.append(chunk)
+                on_stdout(chunk)
+                self.max_buffered = max(self.max_buffered, len(self._stdout_chunks))
+            return CommandResult(exit_code=0)
+
+    handle = SdkBufferingHandle()
+    session.commands.run_hook = lambda _command, _kwargs: handle
+
+    result = env.execute("spam", timeout=10, bounded_capture=True)
+
+    assert result["returncode"] == 0
+    assert "x" in result["output"]
+    # Hermes-side retention stays within the tool-output window instead of
+    # holding all 512k chars.
+    assert len(result["output"]) < total_chunks * len(chunk) // 2
+    # SDK-side buffers were drained during production, not at the end.
+    assert handle.max_buffered <= 1
+    assert handle._stdout_chunks == []
+    env.cleanup()
+
+
+def test_threaded_process_handle_requires_exactly_one_exec_fn():
+    from tools.environments.base import _ThreadedProcessHandle
+
+    with pytest.raises(ValueError, match="exactly one"):
+        _ThreadedProcessHandle()
+    with pytest.raises(ValueError, match="exactly one"):
+        _ThreadedProcessHandle(
+            lambda: ("", 0), stream_exec_fn=lambda write: 0
+        )
+
+
 def test_e2b_file_transport_uses_bulk_bytes_and_idempotent_delete(
     e2b_backend,
     tmp_path,
@@ -488,6 +685,29 @@ def test_e2b_file_transport_uses_bulk_bytes_and_idempotent_delete(
     env._sandbox.files.read_payload = b"tar-bytes"
     env._e2b_bulk_download(destination)
     assert destination.read_bytes() == b"tar-bytes"
+    assert env._sandbox.files.stream_readers[-1].closed
+
+
+def test_bulk_download_stops_transferring_beyond_size_cap(
+    e2b_backend,
+    monkeypatch,
+    tmp_path,
+):
+    backend, _service = e2b_backend
+    env = make_environment(backend, persistent_filesystem=False)
+    monkeypatch.setattr(backend, "_SYNC_BACK_MAX_BYTES", 10)
+    env._sandbox.files.read_payload = b"0123456789abcdefghij"
+
+    destination = tmp_path / "sync.tar"
+    env._e2b_bulk_download(destination)
+
+    transferred = destination.stat().st_size
+    # The counting writer stops after crossing the cap instead of
+    # materializing the whole archive; the partial file stays over the cap so
+    # the sync-back size check refuses to extract it.
+    assert 10 < transferred < 20
+    assert env._sandbox.files.stream_readers[-1].closed
+    env.cleanup()
 
 
 def test_config_bridge_and_profile_scoped_cache_keys(monkeypatch):
@@ -543,6 +763,7 @@ def test_e2b_cache_key_is_stable_across_gateway_sessions(monkeypatch):
     from tools import terminal_tool
 
     monkeypatch.setenv("TERMINAL_ENV", "e2b")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
     monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
     expected = f"e2b:{hermes_home_key()}:default"
     resolved = []
@@ -561,6 +782,72 @@ def test_e2b_cache_key_is_stable_across_gateway_sessions(monkeypatch):
         reset_session_vars()
 
     assert resolved == [expected, expected]
+
+
+def test_nonpersistent_e2b_isolates_sessions_but_subagents_share_parent(monkeypatch):
+    """Paired with the persistent test above: with persistence disabled, two
+    gateway sessions must NOT share one nominally ephemeral sandbox, while a
+    subagent still shares its parent session's sandbox."""
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
+    from hermes_constants import hermes_home_key
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "e2b")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    resolved: dict[str, str] = {}
+
+    try:
+        for session_key in ("gateway-session-a", "gateway-session-b"):
+            tokens = set_session_vars(session_key=session_key)
+            try:
+                parent_key = terminal_tool._resolve_container_task_id(None)
+                child_key = terminal_tool._resolve_container_task_id("subagent-task")
+            finally:
+                clear_session_vars(tokens)
+            assert child_key == parent_key
+            resolved[session_key] = parent_key
+    finally:
+        reset_session_vars()
+
+    prefix = f"e2b:{hermes_home_key()}:"
+    assert resolved["gateway-session-a"] == f"{prefix}session:gateway-session-a"
+    assert resolved["gateway-session-b"] == f"{prefix}session:gateway-session-b"
+
+    # Outside a session (CLI), non-persistent E2B keeps the shared default
+    # slot — single-session processes are unaffected.
+    assert terminal_tool._resolve_container_task_id(None) == f"{prefix}default"
+    assert terminal_tool._resolve_container_task_id("subagent-task") == (
+        f"{prefix}default"
+    )
+
+
+def test_e2b_isolation_override_still_wins_in_nonpersistent_mode(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
+    from hermes_constants import hermes_home_key
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "e2b")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    terminal_tool.register_task_env_overrides("benchmark-task", {"env_type": "e2b"})
+    tokens = set_session_vars(session_key="gateway-session")
+    try:
+        assert terminal_tool._resolve_container_task_id("benchmark-task") == (
+            f"e2b:{hermes_home_key()}:benchmark-task"
+        )
+    finally:
+        clear_session_vars(tokens)
+        reset_session_vars()
+        terminal_tool.clear_task_env_overrides("benchmark-task")
 
 
 def test_e2b_isolation_override_wins_without_losing_profile_scope(monkeypatch):
@@ -630,6 +917,62 @@ def test_gateway_sessions_reuse_e2b_environment_and_cleanup_after_context_clears
     assert env.cleanup_calls == 1
     assert terminal_tool._active_environments == {}
     assert terminal_tool._last_activity == {}
+
+
+def test_nonpersistent_gateway_sessions_get_separate_environments(monkeypatch):
+    """Production-path pair to the persistent reuse test above: with
+    persistence disabled, two sessions create two environments, and one
+    session's cleanup must not tear down the other's."""
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "e2b")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    envs_by_task: dict[str, CleanupRecorder] = {}
+
+    def create_environment(**kwargs):
+        env = CleanupRecorder()
+        envs_by_task[kwargs["task_id"]] = env
+        return env
+
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_create_environment", create_environment)
+
+    session_envs: dict[str, CleanupRecorder] = {}
+    try:
+        for session_key in ("gateway-session-a", "gateway-session-b"):
+            tokens = set_session_vars(session_key=session_key)
+            try:
+                session_envs[session_key] = terminal_tool.ensure_task_env(None)
+            finally:
+                clear_session_vars(tokens)
+
+        assert len(envs_by_task) == 2
+        assert session_envs["gateway-session-a"] is not session_envs["gateway-session-b"]
+
+        # Session B closes while its context is still active — only B's
+        # sandbox may be cleaned.
+        tokens = set_session_vars(session_key="gateway-session-b")
+        try:
+            terminal_tool.cleanup_vm("gateway-session-b")
+        finally:
+            clear_session_vars(tokens)
+    finally:
+        reset_session_vars()
+
+    assert session_envs["gateway-session-b"].cleanup_calls == 1
+    assert session_envs["gateway-session-a"].cleanup_calls == 0
+    assert list(terminal_tool._active_environments.values()) == [
+        session_envs["gateway-session-a"]
+    ]
 
 
 def test_cleanup_vm_resolves_config_only_e2b_key(monkeypatch):
@@ -740,6 +1083,64 @@ def test_persistence_store_is_structured_and_template_scoped(e2b_backend):
     assert backend._load_sandbox_record("task-1", "custom")["sandbox_id"] == "sb-custom"
     raw = json.loads(backend._sandbox_store_path().read_text(encoding="utf-8"))
     assert len(raw) == 2
+
+
+def test_pending_sync_state_is_atomically_promoted(e2b_backend):
+    backend, _service = e2b_backend
+    backend._store_sandbox_record("task-1", "sb-base", "base")
+    pending = {
+        "synced_files": {"/remote": [1.0, 2]},
+        "pushed_hashes": {"/remote": "pending-hash"},
+        "upload_only_host_paths": [],
+    }
+    committed = {
+        "synced_files": {"/remote": [2.0, 3]},
+        "pushed_hashes": {"/remote": "committed-hash"},
+        "upload_only_host_paths": [],
+    }
+
+    backend._store_sandbox_sync_state(
+        "task-1",
+        "base",
+        "sb-base",
+        pending,
+        pending=True,
+    )
+    assert backend._load_sandbox_pending_sync_state(
+        "task-1", "base", "sb-base"
+    ) == pending
+    assert backend._load_sandbox_sync_state("task-1", "base", "sb-base") is None
+
+    backend._store_sandbox_sync_state(
+        "task-1",
+        "base",
+        "sb-base",
+        committed,
+    )
+    assert backend._load_sandbox_sync_state(
+        "task-1", "base", "sb-base"
+    ) == committed
+    assert (
+        backend._load_sandbox_pending_sync_state("task-1", "base", "sb-base")
+        is None
+    )
+
+
+def test_persistence_store_preserves_symlink_target(e2b_backend):
+    backend, _service = e2b_backend
+    store = backend._sandbox_store_path()
+    target = store.with_name("sandbox-store-target.json")
+    target.write_text("{}", encoding="utf-8")
+    try:
+        store.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    backend._store_sandbox_record("task-1", "sb-base", "base")
+
+    assert store.is_symlink()
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    assert raw[backend._record_key("task-1", "base")]["sandbox_id"] == "sb-base"
 
 
 def test_setup_wizard_persists_e2b_backend_template_and_key(monkeypatch):

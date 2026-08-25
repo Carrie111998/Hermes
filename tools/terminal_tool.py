@@ -1460,6 +1460,21 @@ def _current_session_profile() -> str:
     return get_session_env("HERMES_SESSION_PROFILE", "")
 
 
+def _e2b_persistent_filesystem_enabled() -> bool:
+    """True when E2B keeps one profile-scoped sandbox across sessions.
+
+    Reads the same ``container_persistent`` setting the E2B environment is
+    constructed with, so sandbox identity and sandbox lifecycle can't drift:
+    persistent mode reconnects one filesystem sandbox per profile, while
+    non-persistent mode is a statement that state must not survive the
+    session — sharing one ephemeral sandbox across sessions contradicts it
+    (shared shell state and files, plus either session's cleanup killing the
+    sandbox under the other).
+    """
+    _ensure_terminal_env_bridged()
+    return os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"}
+
+
 _ISOLATION_OVERRIDE_KEYS = frozenset({
     "docker_image", "modal_image", "singularity_image",
     "daytona_image", "env_type",
@@ -1523,6 +1538,19 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         profile_prefix = f"e2b:{hermes_home_key()}:"
         if task_id and task_id.startswith(profile_prefix):
             return task_id
+        # Persistent E2B intentionally shares ONE filesystem sandbox across
+        # gateway/WebUI sessions within a profile — the pointer store and the
+        # sync lifecycle reconnect it by profile-scoped key. Non-persistent
+        # E2B keeps the session isolation below: nominally ephemeral sandboxes
+        # must not share shell state across sessions, and one session's
+        # cleanup must not kill a sandbox another session is still using.
+        # Subagents inherit the parent's session key (and collapse to
+        # "default" outside sessions), so they share the parent's sandbox in
+        # both modes; isolation overrides stay authoritative either way.
+        if container_key == "default" and not _e2b_persistent_filesystem_enabled():
+            session_key = _current_session_key()
+            if session_key:
+                container_key = f"session:{session_key}"
         return f"{profile_prefix}{container_key}"
 
     # Per-session isolation: when a session key is present (the WebUI streaming
