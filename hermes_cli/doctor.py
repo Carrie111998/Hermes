@@ -208,7 +208,18 @@ def _report_database_journal_modes(
             continue
         mode, error = _read_journal_mode(path)
         size = _format_db_size(path)
-        if error is not None:
+        if error == "file is empty":
+            # A 0-byte file here is never real data — it's a stale placeholder
+            # (e.g. left behind by a probe that opened the path with sqlite3
+            # before the real DB was known to live elsewhere, or an init that
+            # never completed). Surfacing it as info only, gated behind the
+            # unrelated WAL-reset check, buried the one signal an operator
+            # needs: "this file looks like a database but has nothing in it."
+            check_warn(
+                f"{name} is empty (0 bytes)",
+                "(stale placeholder, not real data — confirm the active DB path)",
+            )
+        elif error is not None:
             if vulnerable:
                 check_warn(
                     f"{name}: journal mode could not be read",
