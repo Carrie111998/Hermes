@@ -1,20 +1,28 @@
-"""Contracts enforced by the canonical test runner's clean environment."""
+"""Behavioral contracts for the canonical test runner's clean environment."""
 
 from pathlib import Path
+import subprocess
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_canonical_runner_bypasses_loopback_proxies():
-    """Local fixture servers must never inherit an OS-level proxy route."""
-    runner = (PROJECT_ROOT / "scripts" / "run_tests.sh").read_text(encoding="utf-8")
-    no_proxy_line = next(
-        line.strip() for line in runner.splitlines() if line.strip().startswith("NO_PROXY=")
+    """Every child process must bypass proxies for all loopback spellings."""
+    result = subprocess.run(
+        ["bash", str(PROJECT_ROOT / "scripts" / "run_tests.sh"), "--print-env"],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    # Drop a trailing shell line-continuation backslash (e.g. `::1 \`).
-    no_proxy_value = no_proxy_line.split("=", 1)[1].rstrip(" \\")
-    no_proxy = {
-        host.strip() for host in no_proxy_value.split(",") if host.strip()
-    }
+    emitted = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if line.startswith(("NO_PROXY=", "no_proxy="))
+    )
 
-    assert {"127.0.0.1", "localhost", "::1"} <= no_proxy
+    expected = {"127.0.0.1", "localhost", "::1"}
+    for name in ("NO_PROXY", "no_proxy"):
+        assert expected <= {
+            host.strip() for host in emitted[name].split(",") if host.strip()
+        }
+    assert emitted["no_proxy"] == emitted["NO_PROXY"]
