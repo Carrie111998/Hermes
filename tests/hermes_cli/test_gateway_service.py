@@ -189,6 +189,24 @@ class TestGeneratedSystemdUnits:
         timeout = int(max(60, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30))
         return f"TimeoutStopSec={timeout}"
 
+    @pytest.mark.parametrize("system", [False, True])
+    def test_restart_exit_is_clean_but_still_forces_relaunch(self, system, monkeypatch):
+        if system:
+            monkeypatch.setattr(
+                gateway_cli,
+                "_system_service_identity",
+                lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+            )
+
+        unit = gateway_cli.generate_systemd_unit(
+            system=system,
+            run_as_user="alice" if system else None,
+        )
+
+        assert f"SuccessExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
+        assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
+        assert f"RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}" in unit
+
 
 
     def test_user_unit_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):

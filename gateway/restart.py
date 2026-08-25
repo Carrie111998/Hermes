@@ -15,6 +15,15 @@ GATEWAY_SERVICE_RESTART_EXIT_CODE = 75
 # restarting the gateway.  See #51228.
 GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
 
+
+def signal_shutdown_exit_code(
+    *, signal_initiated: bool, restart_requested: bool
+) -> int | None:
+    """Return the supervisor relaunch code for an unexpected signal shutdown."""
+    if signal_initiated and not restart_requested:
+        return GATEWAY_SERVICE_RESTART_EXIT_CODE
+    return None
+
 # Set by ``hermes gateway run --external-supervisor``. Unlike systemd's
 # INVOCATION_ID and launchd's XPC_SERVICE_NAME, this survives wrappers that
 # intentionally replace the child environment (for example ``sudo env -i``).

@@ -7,7 +7,10 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import MessageEvent
-from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+from gateway.restart import (
+    GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    signal_shutdown_exit_code,
+)
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
@@ -58,6 +61,24 @@ def test_cron_provider_stop_cannot_override_gateway_exit_code(caplog):
 
     provider.stop.assert_called_once_with()
     assert f"attempted to exit the gateway with code {GATEWAY_SERVICE_RESTART_EXIT_CODE}; ignoring" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("signal_initiated", "restart_requested", "expected"),
+    [
+        (True, False, GATEWAY_SERVICE_RESTART_EXIT_CODE),
+        (True, True, None),
+        (False, False, None),
+        (False, True, None),
+    ],
+)
+def test_signal_shutdown_exit_code_only_relaunches_unplanned_signals(
+    signal_initiated, restart_requested, expected
+):
+    assert signal_shutdown_exit_code(
+        signal_initiated=signal_initiated,
+        restart_requested=restart_requested,
+    ) == expected
 
 
 @pytest.mark.asyncio

@@ -2708,6 +2708,7 @@ from gateway.restart import (
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
     resolve_cron_drain_budget,
+    signal_shutdown_exit_code,
 )
 
 
@@ -31157,19 +31158,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         raise SystemExit(runner.exit_code)
 
     # When an unexpected SIGTERM caused the shutdown and it wasn't a planned
-    # restart (/restart, /update, SIGUSR1), exit non-zero so systemd's
-    # Restart=on-failure revives the process.  This covers:
+    # restart (/restart, /update, SIGUSR1), use the same explicit supervisor
+    # relaunch status as in-band restarts. This covers:
     #   - hermes update killing the gateway mid-work
     #   - External kill commands
     #   - WSL2/container runtime sending unexpected signals
     # `hermes gateway stop` and interactive Ctrl+C are handled above as
     # planned stops and should not trigger service-manager revival.
-    if _signal_initiated_shutdown and not runner._restart_requested:
+    signal_exit_code = signal_shutdown_exit_code(
+        signal_initiated=_signal_initiated_shutdown,
+        restart_requested=runner._restart_requested,
+    )
+    if signal_exit_code is not None:
         logger.info(
-            "Exiting with code 1 (signal-initiated shutdown without restart "
-            "request) so systemd Restart=on-failure can revive the gateway."
+            "Exiting with code %d (signal-initiated shutdown without restart "
+            "request) so the service manager relaunches the gateway.",
+            signal_exit_code,
         )
-        return False  # → sys.exit(1) in the caller
+        raise SystemExit(signal_exit_code)
 
     # Older restart paths may reach here without ``runner.exit_code`` set.
     # Keep the historical non-zero fallback for service-managed restarts.
