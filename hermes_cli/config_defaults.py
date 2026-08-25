@@ -7,6 +7,16 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Optional global ceiling on simultaneous in-flight provider model
+    # requests. This is a REQUEST-level limit (how many provider API calls
+    # may be outstanding at once) and is strictly independent of the
+    # AGENT-level subagent concurrency governed by
+    # ``delegation.max_concurrent_children``. It is provider-agnostic and
+    # optional: ``None`` (default) means "unlimited" and changes nothing.
+    # The slot is held only for the duration of the actual HTTP model
+    # request, never while the agent executes tools / reads files / runs
+    # subprocesses / waits. Children and the main agent share this capacity.
+    "provider_max_concurrent_requests": None,
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
