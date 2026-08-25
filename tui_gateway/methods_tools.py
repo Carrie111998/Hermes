@@ -2525,11 +2525,11 @@ def _(rid, params: dict) -> dict:
             if params.get("confirm") is not True:
                 return _err(
                     rid,
-                    4019,
+                    4021,
                     "plugins.reload_dashboard_routes requires confirm=true",
                 )
             protocol_version = params.get("protocol_version", 1)
-            if protocol_version != 1:
+            if type(protocol_version) is not int or protocol_version != 1:
                 return _err(
                     rid,
                     4020,

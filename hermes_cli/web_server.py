@@ -18944,25 +18944,69 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
-_dashboard_plugin_api_route_ids: set[int] = set()
+_dashboard_plugin_api_routes: list[Any] = []
 _dashboard_plugin_api_module_names: set[str] = set()
 _dashboard_plugin_api_mount_lock = threading.RLock()
 DASHBOARD_ROUTE_REMOUNT_PROTOCOL = "fleet-graph.dashboard-routes"
 DASHBOARD_ROUTE_REMOUNT_PROTOCOL_VERSION = 1
 
 
-def _remove_dashboard_plugin_api_routes() -> None:
-    """Remove only routes previously mounted from dashboard plugin APIs."""
-    if _dashboard_plugin_api_route_ids:
+def _remove_dashboard_plugin_api_routes() -> Optional[int]:
+    """Remove owned routes and return their original insertion position."""
+    first_route_index: Optional[int] = None
+    if _dashboard_plugin_api_routes:
+        owned_routes = tuple(_dashboard_plugin_api_routes)
+        for index, route in enumerate(app.router.routes):
+            if any(route is owned_route for owned_route in owned_routes):
+                first_route_index = index
+                break
         app.router.routes = [
             route
             for route in app.router.routes
-            if id(route) not in _dashboard_plugin_api_route_ids
+            if not any(route is owned_route for owned_route in owned_routes)
         ]
-        _dashboard_plugin_api_route_ids.clear()
+        _dashboard_plugin_api_routes.clear()
     for module_name in tuple(_dashboard_plugin_api_module_names):
         sys.modules.pop(module_name, None)
     _dashboard_plugin_api_module_names.clear()
+    return first_route_index
+
+
+def _restore_dashboard_plugin_api_route_position(
+    first_route_index: Optional[int],
+) -> None:
+    """Put newly mounted plugin routes back where the old routes lived."""
+    if first_route_index is None or not _dashboard_plugin_api_routes:
+        return
+    owned_routes = tuple(_dashboard_plugin_api_routes)
+    mounted_routes = [
+        route
+        for route in app.router.routes
+        if any(route is owned_route for owned_route in owned_routes)
+    ]
+    if not mounted_routes:
+        return
+    remaining_routes = [
+        route
+        for route in app.router.routes
+        if not any(route is owned_route for owned_route in owned_routes)
+    ]
+    insertion_index = min(first_route_index, len(remaining_routes))
+    app.router.routes = (
+        remaining_routes[:insertion_index]
+        + mounted_routes
+        + remaining_routes[insertion_index:]
+    )
+
+
+def _dashboard_plugin_api_mount_names() -> list[str]:
+    return sorted(
+        {
+            str(getattr(route, "_hermes_dashboard_plugin", ""))
+            for route in app.router.routes
+            if getattr(route, "_hermes_dashboard_plugin", "")
+        }
+    )
 
 
 def remount_dashboard_plugin_api_routes() -> dict[str, Any]:
@@ -18974,19 +19018,42 @@ def remount_dashboard_plugin_api_routes() -> dict[str, Any]:
     dashboard process.  Only routes and modules previously owned by this
     loader are removed.
     """
+    global _dashboard_plugins_cache
     with _dashboard_plugin_api_mount_lock:
-        _remove_dashboard_plugin_api_routes()
-        global _dashboard_plugins_cache
+        previous_routes = list(app.router.routes)
+        previous_owned_routes = list(_dashboard_plugin_api_routes)
+        previous_module_names = set(_dashboard_plugin_api_module_names)
+        dashboard_module_prefix = "hermes_dashboard_plugin_"
+        previous_dashboard_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name.startswith(dashboard_module_prefix)
+        }
+        previous_plugins_cache = _dashboard_plugins_cache
+        first_route_index = _remove_dashboard_plugin_api_routes()
         _dashboard_plugins_cache = None
         _invalidate_plugins_hub_cache()
-        _mount_plugin_api_routes()
-        mounted = sorted(
-            {
-                str(getattr(route, "_hermes_dashboard_plugin", ""))
-                for route in app.router.routes
-                if getattr(route, "_hermes_dashboard_plugin", "")
-            }
-        )
+        try:
+            _mount_plugin_api_routes()
+            _restore_dashboard_plugin_api_route_position(first_route_index)
+        except Exception:
+            app.router.routes = previous_routes
+            _dashboard_plugin_api_routes.clear()
+            _dashboard_plugin_api_routes.extend(previous_owned_routes)
+            _dashboard_plugin_api_module_names.clear()
+            _dashboard_plugin_api_module_names.update(previous_module_names)
+            _dashboard_plugins_cache = previous_plugins_cache
+            for name in tuple(sys.modules):
+                if (
+                    name.startswith(dashboard_module_prefix)
+                    and name not in previous_dashboard_modules
+                ):
+                    sys.modules.pop(name, None)
+            sys.modules.update(previous_dashboard_modules)
+            _log.exception("Failed to remount dashboard plugin API routes")
+            mounted = _dashboard_plugin_api_mount_names()
+            return {"ok": False, "mounted": mounted, "count": len(mounted)}
+        mounted = _dashboard_plugin_api_mount_names()
         return {"ok": True, "mounted": mounted, "count": len(mounted)}
 
 
@@ -19100,12 +19167,16 @@ def _mount_plugin_api_routes():
             if router is None:
                 _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
                 continue
-            existing_route_ids = {id(route) for route in app.router.routes}
+            existing_routes = tuple(app.router.routes)
             app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
-            for route in app.router.routes:
-                if id(route) not in existing_route_ids:
-                    setattr(route, "_hermes_dashboard_plugin", plugin["name"])
-                    _dashboard_plugin_api_route_ids.add(id(route))
+            new_routes = [
+                route
+                for route in app.router.routes
+                if not any(route is existing_route for existing_route in existing_routes)
+            ]
+            for route in new_routes:
+                setattr(route, "_hermes_dashboard_plugin", plugin["name"])
+            _dashboard_plugin_api_routes.extend(new_routes)
             _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
         except Exception as exc:
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
