@@ -110,9 +110,9 @@ def test_governance_task_bodies_delegate_validation_to_controller() -> None:
 
 def test_mandatory_implementation_inventory_overlays_are_admissible() -> None:
     expected_toolsets = {
-        "02-builder": ("file", "kanban", "terminal"),
-        "09-test": ("file", "kanban", "terminal"),
-        "06-integration": ("file", "kanban", "terminal"),
+        "02-builder": ("file", "kanban"),
+        "09-test": ("file", "kanban"),
+        "06-integration": ("file", "kanban"),
         "08-release": ("file", "kanban"),
     }
     assert set(expected_toolsets) == set(controller.MANDATORY_IMPLEMENTATION_PROFILES)
@@ -122,10 +122,8 @@ def test_mandatory_implementation_inventory_overlays_are_admissible() -> None:
         assert contract.allowed_toolsets == toolsets
         assert contract.workspace_only is True
         assert contract.allowed_tools
-        if profile == "08-release":
-            assert "terminal" not in contract.allowed_tools
-        else:
-            assert "terminal" in contract.allowed_tools
+        assert "terminal" not in contract.allowed_tools
+        assert "process" not in contract.allowed_tools
         assert "execute_code" not in contract.allowed_tools
         assert set(contract.allowed_tools) <= {
             "read_file",

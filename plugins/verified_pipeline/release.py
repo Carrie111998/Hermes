@@ -468,7 +468,7 @@ def _validated_completion_sha256(
     board: str,
     db_path: Optional[str | os.PathLike[str]],
     kanban_db_path: str | os.PathLike[str],
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     try:
         completion = execution.record_execution_completion(
             execution_key,
@@ -483,7 +483,7 @@ def _validated_completion_sha256(
             "execution completion failed exact custody revalidation",
         ) from exc
     completion.pop("replayed", None)
-    return execution._digest(completion)
+    return execution._digest(completion), completion
 
 
 def record_release_ready(
@@ -496,7 +496,7 @@ def record_release_ready(
 ) -> dict[str, Any]:
     """Record exact release-readiness evidence without granting merge authority."""
     init_release_schema(db_path)
-    completion_sha256 = _validated_completion_sha256(
+    completion_sha256, completion = _validated_completion_sha256(
         execution_key,
         board=board,
         db_path=db_path,
@@ -516,6 +516,7 @@ def record_release_ready(
         },
         db_path=db_path,
     )
+    source_candidate = completion.get("source_candidate")
     if (
         authority["completion_sha256"] != completion_sha256
         or not isinstance(authority["repository"], str)
@@ -524,6 +525,9 @@ def record_release_ready(
         or not authority["base_ref"]
         or not _is_sha(authority["head_sha"])
         or not _is_digest(authority["evidence_sha256"])
+        or not isinstance(source_candidate, dict)
+        or authority["repository"].lower() != source_candidate.get("repository")
+        or authority["head_sha"].lower() != source_candidate.get("commit_sha")
     ):
         raise ReleaseBoundaryError(
             "RELEASE_READY_EVIDENCE_INVALID",
@@ -584,12 +588,13 @@ def _validated_release_ready(
         },
         db_path=db_path,
     )
-    completion_sha256 = _validated_completion_sha256(
+    completion_sha256, completion = _validated_completion_sha256(
         execution_key,
         board=board,
         db_path=db_path,
         kanban_db_path=kanban_db_path,
     )
+    source_candidate = completion.get("source_candidate")
     if (
         authority["completion_sha256"] != completion_sha256
         or not isinstance(authority["repository"], str)
@@ -598,6 +603,9 @@ def _validated_release_ready(
         or not authority["base_ref"]
         or not _is_sha(authority["head_sha"])
         or not _is_digest(authority["evidence_sha256"])
+        or not isinstance(source_candidate, dict)
+        or authority["repository"].lower() != source_candidate.get("repository")
+        or authority["head_sha"].lower() != source_candidate.get("commit_sha")
     ):
         raise ReleaseBoundaryError(
             "RELEASE_READY_EVIDENCE_INVALID",

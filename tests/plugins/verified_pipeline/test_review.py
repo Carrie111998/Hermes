@@ -192,36 +192,78 @@ def _complete(kanban_path: Path, task_id: str) -> None:
     conn = kanban_db.connect(db_path=kanban_path)
     try:
         task_row, run_id = _admit_fixture_run(conn, task_id)
-        artifact = Path(task_row.workspace_path) / "stage-output.txt"
-        artifact.write_text(f"verified stage output for {task_id}\n", encoding="utf-8")
+        workspace = Path(task_row.workspace_path)
+        parent_row = conn.execute(
+            "SELECT parent.workspace_path FROM task_links "
+            "JOIN tasks AS parent ON parent.id = task_links.parent_id "
+            "WHERE task_links.child_id = ? ORDER BY parent.id LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        parent_workspace = (
+            Path(parent_row["workspace_path"])
+            if parent_row is not None and parent_row["workspace_path"]
+            else None
+        )
         if task_row.workspace_kind == "worktree":
-            subprocess.run(["git", "init", "-q"], cwd=artifact.parent, check=True)
+            if parent_workspace is not None and (parent_workspace / ".git").exists():
+                subprocess.run(
+                    ["git", "clone", "-q", str(parent_workspace), str(workspace)],
+                    check=True,
+                )
+            else:
+                subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
             subprocess.run(
                 ["git", "config", "user.email", "pipeline-fixture@example.invalid"],
-                cwd=artifact.parent,
+                cwd=workspace,
                 check=True,
             )
             subprocess.run(
                 ["git", "config", "user.name", "Pipeline Fixture"],
-                cwd=artifact.parent,
+                cwd=workspace,
                 check=True,
             )
-            subprocess.run(["git", "add", "stage-output.txt"], cwd=artifact.parent, check=True)
-            subprocess.run(
-                ["git", "commit", "-q", "-m", f"fixture output for {task_id}"],
-                cwd=artifact.parent,
-                check=True,
-            )
+            remote_url = "https://github.com/jasonwu-ai/hermes-agent.git"
+            has_remote = subprocess.run(
+                ["git", "config", "--get", "remote.origin.url"],
+                cwd=workspace,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode == 0
+            remote_command = ["git", "remote", "set-url", "origin", remote_url]
+            if not has_remote:
+                remote_command = ["git", "remote", "add", "origin", remote_url]
+            subprocess.run(remote_command, cwd=workspace, check=True)
+
+        is_exact_test = (
+            task_row.workspace_kind == "worktree"
+            and execution._implementation_role(task_row.assignee) == "test"
+            and parent_workspace is not None
+        )
+        artifact_name = "test-evidence.txt" if is_exact_test else "stage-output.txt"
+        artifact = workspace / artifact_name
+        artifact.write_text(f"verified stage output for {task_id}\n", encoding="utf-8")
+        if task_row.workspace_kind == "worktree":
+            if not is_exact_test:
+                subprocess.run(["git", "add", artifact_name], cwd=workspace, check=True)
+                subprocess.run(
+                    ["git", "commit", "-q", "-m", f"fixture output for {task_id}"],
+                    cwd=workspace,
+                    check=True,
+                )
             commit_sha = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=artifact.parent, text=True
+                ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
+            ).strip()
+            branch_name = subprocess.check_output(
+                ["git", "branch", "--show-current"], cwd=workspace, text=True
             ).strip()
             completion_metadata = {
                 "artifacts": [str(artifact)],
                 "source_commit": {
                     "schema": "git-source/v1",
-                    "repository": artifact.parent.as_uri(),
+                    "repository": remote_url,
                     "commit_sha": commit_sha,
-                    "branch": "fixture",
+                    "branch": branch_name,
                 }
             }
         else:
@@ -289,7 +331,7 @@ def _plan(request: dict, *, dispositions: list[dict] | None = None) -> dict:
                 "dependencies": ["build"],
                 "deliverable": "A reproducible qualification receipt.",
                 "acceptance_criteria": ["The exact implementation artifact passes qualification."],
-                "workspace": "scratch",
+                "workspace": "worktree",
             },
         ],
         "final_task_id": "verify",
@@ -1686,6 +1728,15 @@ def test_execution_completion_rejects_missing_stage_receipt(tmp_path):
     }
 
 
+def test_execution_artifact_size_limit_fails_before_hashing(tmp_path):
+    oversized = tmp_path / "oversized.bin"
+    with oversized.open("wb") as handle:
+        handle.truncate(execution.MAX_IMPLEMENTATION_ARTIFACT_BYTES + 1)
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution._sha256_regular_file(oversized)
+    assert exc.value.code == "EXECUTION_ARTIFACT_TOO_LARGE"
+
+
 def test_execution_completion_rejects_source_commit_drift(tmp_path):
     control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
     execution.arm_execution(
@@ -1716,6 +1767,123 @@ def test_execution_completion_rejects_source_commit_drift(tmp_path):
             db_path=control_db, kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_DRIFT"
+
+
+def test_execution_completion_rejects_non_head_source_commit(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    build_id = projected["task_map"]["build"]
+    _complete(kanban_path, build_id)
+    _complete(kanban_path, projected["task_map"]["verify"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        workspace = Path(kanban_db.get_task(conn, build_id).workspace_path)
+    finally:
+        conn.close()
+    (workspace / "later.txt").write_text("later commit\n", encoding="utf-8")
+    subprocess.run(["git", "add", "later.txt"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "later"], cwd=workspace, check=True)
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_DRIFT"
+
+
+def test_execution_completion_rejects_source_branch_mismatch(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    _complete(kanban_path, projected["task_map"]["verify"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        row = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? AND status = 'done'",
+            (projected["task_map"]["build"],),
+        ).fetchone()
+        metadata = json.loads(row["metadata"])
+        metadata["source_commit"]["branch"] = "attacker/other"
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, sort_keys=True), row["id"]),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_MISMATCH"
+
+
+def test_execution_completion_rejects_tracked_worktree_drift(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    build_id = projected["task_map"]["build"]
+    _complete(kanban_path, build_id)
+    _complete(kanban_path, projected["task_map"]["verify"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        workspace = Path(kanban_db.get_task(conn, build_id).workspace_path)
+    finally:
+        conn.close()
+    (workspace / "stage-output.txt").write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_SOURCE_RECEIPT_DIRTY"
+
+
+def test_execution_completion_rejects_test_commit_divergence(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    verify_id = projected["task_map"]["verify"]
+    _complete(kanban_path, verify_id)
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        workspace = Path(kanban_db.get_task(conn, verify_id).workspace_path)
+        subprocess.run(["git", "add", "test-evidence.txt"], cwd=workspace, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "unauthorized test mutation"], cwd=workspace, check=True)
+        divergent_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
+        ).strip()
+        row = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? AND status = 'done'",
+            (verify_id,),
+        ).fetchone()
+        metadata = json.loads(row["metadata"])
+        metadata["source_commit"]["commit_sha"] = divergent_sha
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, sort_keys=True), row["id"]),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_SOURCE_LINEAGE_MISMATCH"
 
 
 def test_execution_completion_rejects_terminal_profile_drift(tmp_path):
@@ -1999,9 +2167,9 @@ def _release_ready_authority(control_db: Path, execution_key: str, completion: d
         schema=release.RELEASE_READY_AUTH_SCHEMA,
         fields={
             "completion_sha256": execution._digest(completion),
-            "repository": "jasonwu-ai/hermes-agent",
+            "repository": completion["source_candidate"]["repository"],
             "base_ref": "main",
-            "head_sha": "1" * 40,
+            "head_sha": completion["source_candidate"]["commit_sha"],
             "evidence_sha256": "2" * 64,
         },
     )
@@ -2203,6 +2371,33 @@ def test_release_boundary_rejects_missing_predecessor_and_scope_drift(tmp_path):
     assert exc.value.code == "MERGE_AUTHORITY_SCOPE_INVALID"
 
 
+def test_release_ready_rejects_head_not_bound_to_completion_source(tmp_path):
+    control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
+    execution_key = intent["idempotency_key"]
+    authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.RELEASE_READY_DECISION,
+        schema=release.RELEASE_READY_AUTH_SCHEMA,
+        fields={
+            "completion_sha256": execution._digest(completion),
+            "repository": completion["source_candidate"]["repository"],
+            "base_ref": "main",
+            "head_sha": "9" * 40,
+            "evidence_sha256": "2" * 64,
+        },
+    )
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_release_ready(
+            execution_key,
+            authority_key=authority["authority_key"],
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "RELEASE_READY_EVIDENCE_INVALID"
+
+
 def test_release_boundary_rejects_db_writer_self_signed_readiness(tmp_path):
     control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
     execution_key = intent["idempotency_key"]
@@ -2214,9 +2409,9 @@ def test_release_boundary_rejects_db_writer_self_signed_readiness(tmp_path):
         schema=release.RELEASE_READY_AUTH_SCHEMA,
         fields={
             "completion_sha256": execution._digest(completion),
-            "repository": "jasonwu-ai/hermes-agent",
+            "repository": completion["source_candidate"]["repository"],
             "base_ref": "main",
-            "head_sha": "1" * 40,
+            "head_sha": completion["source_candidate"]["commit_sha"],
             "evidence_sha256": "2" * 64,
         },
         signing_key=attacker_key,

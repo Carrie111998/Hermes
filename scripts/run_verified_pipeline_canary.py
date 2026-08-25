@@ -148,10 +148,25 @@ def _complete(kanban_path: Path, task_id: str, result: str) -> None:
             kanban_db._append_event(
                 conn, task.id, "role_contract_admitted", receipt, run_id=run_id
             )
-        artifact = workspace / "canary-stage-receipt.txt"
-        artifact.write_text(f"{result}\n", encoding="utf-8")
+        parent_row = conn.execute(
+            "SELECT parent.workspace_path FROM task_links "
+            "JOIN tasks AS parent ON parent.id = task_links.parent_id "
+            "WHERE task_links.child_id = ? ORDER BY parent.id LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        parent_workspace = (
+            Path(parent_row["workspace_path"])
+            if parent_row is not None and parent_row["workspace_path"]
+            else None
+        )
+        remote_url = "https://github.com/jasonwu-ai/hermes-agent.git"
         if task.workspace_kind == "worktree":
-            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            if parent_workspace is not None and (parent_workspace / ".git").exists():
+                subprocess.run(
+                    ["git", "clone", "-q", str(parent_workspace), str(workspace)], check=True
+                )
+            else:
+                subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
             subprocess.run(
                 ["git", "config", "user.email", "pipeline-canary@example.invalid"],
                 cwd=workspace,
@@ -162,22 +177,46 @@ def _complete(kanban_path: Path, task_id: str, result: str) -> None:
                 cwd=workspace,
                 check=True,
             )
-            subprocess.run(["git", "add", artifact.name], cwd=workspace, check=True)
-            subprocess.run(
-                ["git", "commit", "-q", "-m", f"canary stage {task_id}"],
+            has_remote = subprocess.run(
+                ["git", "config", "--get", "remote.origin.url"],
                 cwd=workspace,
-                check=True,
-            )
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode == 0
+            remote_command = ["git", "remote", "set-url", "origin", remote_url]
+            if not has_remote:
+                remote_command = ["git", "remote", "add", "origin", remote_url]
+            subprocess.run(remote_command, cwd=workspace, check=True)
+
+        is_exact_test = (
+            task.workspace_kind == "worktree"
+            and execution._implementation_role(task.assignee) == "test"
+            and parent_workspace is not None
+        )
+        artifact = workspace / f"{task.assignee}-canary-stage-receipt.txt"
+        artifact.write_text(f"{result}\n", encoding="utf-8")
+        if task.workspace_kind == "worktree":
+            if not is_exact_test:
+                subprocess.run(["git", "add", artifact.name], cwd=workspace, check=True)
+                subprocess.run(
+                    ["git", "commit", "-q", "-m", f"canary stage {task_id}"],
+                    cwd=workspace,
+                    check=True,
+                )
             commit_sha = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
+            ).strip()
+            branch_name = subprocess.check_output(
+                ["git", "branch", "--show-current"], cwd=workspace, text=True
             ).strip()
             completion_metadata = {
                 "artifacts": [str(artifact)],
                 "source_commit": {
                     "schema": "git-source/v1",
-                    "repository": workspace.as_uri(),
+                    "repository": remote_url,
                     "commit_sha": commit_sha,
-                    "branch": "canary",
+                    "branch": branch_name,
                 }
             }
         else:
@@ -215,7 +254,7 @@ def _plan(request: dict[str, Any]) -> dict[str, Any]:
             "dependencies": ["build"],
             "deliverable": "A deterministic Test-stage completion receipt.",
             "acceptance_criteria": ["Test cannot advance before Builder completes."],
-            "workspace": "scratch",
+            "workspace": "worktree",
         },
         {
             "id": "integrate",
@@ -387,9 +426,9 @@ def _persist_release_ready_authority(
         "execution_key": execution_key,
         "decision": release.RELEASE_READY_DECISION,
         "completion_sha256": execution._digest(canonical_completion),
-        "repository": "disposable/canary",
+        "repository": canonical_completion["source_candidate"]["repository"],
         "base_ref": "sandbox",
-        "head_sha": "1" * 40,
+        "head_sha": canonical_completion["source_candidate"]["commit_sha"],
         "evidence_sha256": hashlib.sha256(b"connected-canary-evidence").hexdigest(),
         "issuer": verifier["issuer"],
         "key_id": verifier["key_id"],

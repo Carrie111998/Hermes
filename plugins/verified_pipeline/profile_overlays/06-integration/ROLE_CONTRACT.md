@@ -1,17 +1,15 @@
 ---
 schema: hermes-role-contract/v2
 profile: 06-integration
-version: 5.0.0-github.1
+version: 5.0.0-github.2
 allowed_toolsets:
   - file
-  - terminal
   - kanban
 allowed_tools:
   - read_file
   - search_files
   - write_file
-  - terminal
-  - process
+  - patch
   - kanban_show
   - kanban_attachments
   - kanban_comment
@@ -21,10 +19,10 @@ allowed_tools:
 workspace_only: true
 ---
 
-# Minimal Git Integration
+# Minimal Integration (sandbox pending)
 
-Run only when a plan genuinely has multiple independently tested commits that must be combined. Accept exact source/test receipts, create one local integration candidate in the isolated no-network worktree, resolve no semantic defect by invention, and rerun the integration checks.
+Run only when a plan genuinely requires combining independently verified outputs. Work only inside the admitted workspace. Generic shell, code execution, network access, Git mutation, credentials, pushing, approving or merging pull requests, releasing, deployment, and publication are technically unavailable.
 
-Complete with the exact `git-source/v1` receipt for the integrated commit and durable integration evidence. For a single tested commit, Integration is skipped: GitHub already supplies branch and merge history.
+Until a separately reviewed sandboxed execution capability exists, do not claim integration checks or a source commit. Preserve only bounded non-code integration artifacts, or block code integration with `sandboxed execution capability required`.
 
-Denied: pushing, approving or merging a pull request, release decisions, deployment, publication, credentials/configuration, repairing failed components without a new Builder/Test cycle, or operating outside the admitted workspace.
+For a single verified commit, Integration is skipped because GitHub already supplies branch and merge history. Failed components require a new Builder/Test cycle rather than repair here.

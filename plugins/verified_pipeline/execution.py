@@ -908,6 +908,9 @@ def arm_execution(
         conn.close()
 
 
+MAX_IMPLEMENTATION_ARTIFACT_BYTES = 25 * 1024 * 1024
+
+
 def _sha256_regular_file(path: Path) -> tuple[str, int]:
     try:
         before = path.lstat()
@@ -915,6 +918,11 @@ def _sha256_regular_file(path: Path) -> tuple[str, int]:
         raise ExecutionError("EXECUTION_ARTIFACT_MISSING", "captured artifact is missing") from exc
     if not stat.S_ISREG(before.st_mode):
         raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact is not a regular file")
+    if before.st_size > MAX_IMPLEMENTATION_ARTIFACT_BYTES:
+        raise ExecutionError(
+            "EXECUTION_ARTIFACT_TOO_LARGE",
+            "captured artifact exceeds the 25 MiB implementation-stage limit",
+        )
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -927,6 +935,11 @@ def _sha256_regular_file(path: Path) -> tuple[str, int]:
             or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
         ):
             raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact changed while opening")
+        if opened.st_size > MAX_IMPLEMENTATION_ARTIFACT_BYTES:
+            raise ExecutionError(
+                "EXECUTION_ARTIFACT_TOO_LARGE",
+                "captured artifact exceeds the 25 MiB implementation-stage limit",
+            )
         digest = hashlib.sha256()
         size = 0
         while True:
@@ -1080,7 +1093,9 @@ def _implementation_stage_receipt(
                 "source commit receipt must be an object",
             )
         commit_sha = str(source_commit.get("commit_sha") or "").lower()
-        repository = str(source_commit.get("repository") or "").strip()
+        repository = _canonical_repository_identity(
+            str(source_commit.get("repository") or "").strip()
+        )
         if (
             source_commit.get("schema") != "git-source/v1"
             or not repository
@@ -1095,13 +1110,20 @@ def _implementation_stage_receipt(
             "repository": repository,
             "commit_sha": commit_sha,
         }
-        for optional_key in ("tree_sha", "branch", "pull_request_url"):
+        for optional_key in ("tree_sha", "pull_request_url"):
             value = source_commit.get(optional_key)
             if isinstance(value, str) and value.strip():
                 normalized_source_commit[optional_key] = value.strip()
+        declared_branch = str(source_commit.get("branch") or "").strip()
+        if not declared_branch:
+            raise ExecutionError(
+                "EXECUTION_SOURCE_RECEIPT_INVALID",
+                "source commit receipt must name the exact checked-out branch",
+            )
+        normalized_source_commit["branch"] = declared_branch
 
         workspace_row = board_conn.execute(
-            "SELECT workspace_path FROM tasks WHERE id = ?",
+            "SELECT workspace_path, branch_name FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         workspace_path = (
@@ -1128,6 +1150,24 @@ def _implementation_stage_receipt(
                 stderr=subprocess.DEVNULL,
                 timeout=15,
             ).strip()
+            observed_head = subprocess.check_output(
+                ["git", "-C", str(workspace_path), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            ).strip().lower()
+            observed_branch = subprocess.check_output(
+                ["git", "-C", str(workspace_path), "branch", "--show-current"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            ).strip()
+            tracked_status = subprocess.check_output(
+                ["git", "-C", str(workspace_path), "status", "--porcelain", "--untracked-files=no"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            ).strip()
             remote = subprocess.run(
                 ["git", "-C", str(workspace_path), "config", "--get", "remote.origin.url"],
                 text=True,
@@ -1140,8 +1180,30 @@ def _implementation_stage_receipt(
                 "EXECUTION_SOURCE_RECEIPT_DRIFT",
                 "exact source commit is not present in the task worktree",
             ) from exc
-        workspace_uri = workspace_path.as_uri()
-        if repository not in {workspace_uri, remote}:
+        workspace_uri = _canonical_repository_identity(workspace_path.as_uri())
+        remote_identity = _canonical_repository_identity(remote)
+        expected_branch = str(workspace_row["branch_name"] or "").strip()
+        if observed_head != commit_sha:
+            raise ExecutionError(
+                "EXECUTION_SOURCE_RECEIPT_DRIFT",
+                "declared source commit is not the task worktree's exact HEAD",
+            )
+        if not observed_branch or declared_branch != observed_branch:
+            raise ExecutionError(
+                "EXECUTION_SOURCE_RECEIPT_MISMATCH",
+                "declared source branch does not match the checked-out task branch",
+            )
+        if expected_branch and observed_branch != expected_branch:
+            raise ExecutionError(
+                "EXECUTION_SOURCE_RECEIPT_MISMATCH",
+                "checked-out source branch does not match the dispatcher-assigned branch",
+            )
+        if tracked_status:
+            raise ExecutionError(
+                "EXECUTION_SOURCE_RECEIPT_DIRTY",
+                "task worktree index or tracked files differ from the declared HEAD",
+            )
+        if repository not in {workspace_uri, remote_identity}:
             raise ExecutionError(
                 "EXECUTION_SOURCE_RECEIPT_MISMATCH",
                 "source repository does not match the task worktree or its origin",
@@ -1168,6 +1230,112 @@ def _implementation_stage_receipt(
         "artifacts": artifacts,
         "source_commit": normalized_source_commit,
     }
+
+
+def _implementation_role(profile: str) -> str:
+    return re.sub(r"^\d+-", "", profile).lower()
+
+
+def _canonical_repository_identity(value: str) -> str:
+    text = value.strip()
+    patterns = (
+        r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+        r"ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+        r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+        r"([^/\s]+/[^/\s]+)",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).removesuffix(".git").lower()
+    return text
+
+
+def _validate_source_lineage(
+    board_conn: sqlite3.Connection,
+    *,
+    plan: Mapping[str, Any],
+    task_results: Mapping[str, Mapping[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Bind Git-backed stages and return the source candidate at the final task."""
+    effective_sources: dict[str, Optional[dict[str, Any]]] = {}
+    for task in materializer._topological_tasks(plan):
+        child_receipt = task_results[task["id"]]["stage_receipt"]
+        child_source = child_receipt["source_commit"]
+        parent_sources = [
+            effective_sources[parent]
+            for parent in task["dependencies"]
+            if effective_sources[parent] is not None
+        ]
+        if not parent_sources:
+            effective_sources[task["id"]] = child_source
+            continue
+        role = _implementation_role(task["assignee"])
+        parent_identities = {
+            (source["repository"], source["commit_sha"]) for source in parent_sources
+        }
+        if child_source is None:
+            if role != "release" or len(parent_identities) != 1:
+                raise ExecutionError(
+                    "EXECUTION_SOURCE_LINEAGE_MISSING",
+                    "Git-backed predecessor requires one exact successor source receipt",
+                )
+            effective_sources[task["id"]] = parent_sources[0]
+            continue
+        repositories = {source["repository"] for source in parent_sources}
+        repositories.add(child_source["repository"])
+        if len(repositories) != 1:
+            raise ExecutionError(
+                "EXECUTION_SOURCE_LINEAGE_MISMATCH",
+                "source repository identity diverges across dependent stages",
+            )
+        if role == "test":
+            parent_commits = {source["commit_sha"] for source in parent_sources}
+            if len(parent_commits) != 1 or child_source["commit_sha"] not in parent_commits:
+                raise ExecutionError(
+                    "EXECUTION_SOURCE_LINEAGE_MISMATCH",
+                    "Test must attest the exact unchanged predecessor commit",
+                )
+            effective_sources[task["id"]] = child_source
+            continue
+        task_row = board_conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?",
+            (child_receipt["task_id"],),
+        ).fetchone()
+        child_workspace = (
+            Path(task_row["workspace_path"]).resolve()
+            if task_row is not None and task_row["workspace_path"]
+            else None
+        )
+        if child_workspace is None:
+            raise ExecutionError(
+                "EXECUTION_SOURCE_LINEAGE_MISSING",
+                "source lineage has no successor worktree",
+            )
+        for parent_source in parent_sources:
+            try:
+                result = subprocess.run(
+                    [
+                        "git", "-C", str(child_workspace), "merge-base", "--is-ancestor",
+                        parent_source["commit_sha"], child_source["commit_sha"],
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ExecutionError(
+                    "EXECUTION_SOURCE_LINEAGE_DRIFT",
+                    "source ancestry could not be verified",
+                ) from exc
+            if result.returncode != 0:
+                raise ExecutionError(
+                    "EXECUTION_SOURCE_LINEAGE_MISMATCH",
+                    "successor source does not descend from every Git-backed predecessor",
+                )
+        effective_sources[task["id"]] = child_source
+    return effective_sources.get(plan["final_task_id"])
 
 
 def _validated_completion_receipt_on_board_connection(
@@ -1219,7 +1387,7 @@ def _validated_completion_receipt_on_board_connection(
         authorized=True,
     )
     task_results: dict[str, dict[str, Any]] = {}
-    for task in payload["plan"]["tasks"]:
+    for task in materializer._topological_tasks(payload["plan"]):
         task_id = intent["task_map"][task["id"]]
         task_row = board_conn.execute(
             "SELECT status, result, completed_at FROM tasks WHERE id = ?",
@@ -1239,6 +1407,11 @@ def _validated_completion_receipt_on_board_connection(
             "completed_at": task_row["completed_at"],
             "stage_receipt": stage_receipt,
         }
+    source_candidate = _validate_source_lineage(
+        board_conn,
+        plan=payload["plan"],
+        task_results=task_results,
+    )
     receipt = {
         "schema": EXECUTION_CONTROLLER_ID,
         "execution_key": execution_key,
@@ -1247,6 +1420,7 @@ def _validated_completion_receipt_on_board_connection(
         "status": COMPLETION_STATUS,
         "final_task_id": intent["task_map"][payload["plan"]["final_task_id"]],
         "task_results": task_results,
+        "source_candidate": source_candidate,
         "boundary": "release review required; no merge, deploy, or release authority",
     }
     if require_existing:
