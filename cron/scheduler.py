@@ -2891,25 +2891,37 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # in config.yaml for clean output. cron.response_format: "header" (default) or
+    # "footer" controls the layout — footer puts content first with the job id as
+    # a trailing signature, so the id is trivially extractable programmatically.
     wrap_response = True
+    response_format = "header"
     user_cfg = None
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        cron_cfg = user_cfg.get("cron", {}) if user_cfg else {}
+        wrap_response = cron_cfg.get("wrap_response", True)
+        response_format = str(cron_cfg.get("response_format", "header")).lower()
     except Exception:
         pass
 
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+        if response_format == "footer":
+            delivery_content = (
+                f"{content}\n\n"
+                f"-------------\n"
+                f"Cronjob Response: {task_name} (job_id: {job_id})"
+            )
+        else:
+            delivery_content = (
+                f"Cronjob Response: {task_name}\n"
+                f"(job_id: {job_id})\n"
+                f"-------------\n\n"
+                f"{content}\n\n"
+                f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            )
     else:
         delivery_content = content
 
