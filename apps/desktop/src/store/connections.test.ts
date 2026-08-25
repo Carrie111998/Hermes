@@ -39,7 +39,8 @@ const {
   refreshConnectionsRegistry,
   _resetConnectionsForTests,
   selectConnection,
-  setConnectionsRegistry
+  setConnectionsRegistry,
+  startSessionOnSource
 } = await import('./connections')
 
 const registry: DesktopConnectionsRegistry = {
@@ -290,5 +291,46 @@ describe('selectConnection', () => {
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
     expect(wipeSessionListsForGatewaySwitch).not.toHaveBeenCalled()
     expect($connection.get()?.mode).toBe('remote')
+  })
+})
+
+describe('startSessionOnSource', () => {
+  it('opens a fresh draft in place on the same source (no dial)', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    const openDraft = vi.fn()
+
+    await startSessionOnSource('local', openDraft)
+
+    expect(openDraft).toHaveBeenCalledTimes(1)
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+  })
+
+  it('dials a different source but does NOT re-home the list or jump profile', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    $newChatProfile.set(null)
+    const openDraft = vi.fn()
+
+    await startSessionOnSource('homelab', openDraft)
+
+    expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default')
+    expect(openDraft).toHaveBeenCalledTimes(1)
+    // The destructive selectConnection side-effects must not run.
+    expect(wipeSessionListsForGatewaySwitch).not.toHaveBeenCalled()
+    expect(requestFreshSession).not.toHaveBeenCalled()
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+    expect($newChatProfile.get()).toBeNull()
+  })
+
+  it('is a no-op when the target source is not registered', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    const openDraft = vi.fn()
+
+    await startSessionOnSource('unknown', openDraft)
+
+    expect(openDraft).not.toHaveBeenCalled()
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
   })
 })

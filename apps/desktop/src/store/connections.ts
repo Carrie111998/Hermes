@@ -249,9 +249,13 @@ export async function selectConnection(connectionId: string): Promise<void> {
  * Start a brand-new session on a specific registered source (the per-session
  * "where does this session run?" affordance). Same source → just open a fresh
  * draft on the active profile (the historical one-click behavior). A different
- * source → re-home there first via `selectConnection` (which also lands on a
- * fresh intro draft), then open the draft to be explicit. Throws if the target
- * source cannot become active, leaving the current session untouched.
+ * source → dial that source so the session streams over it, WITHOUT the
+ * destructive re-home `selectConnection` performs (no session-list wipe, no
+ * profile jump, no double session create). The window's active socket moves to
+ * the chosen source (one socket per window — Phase 2 introduces true
+ * per-session routing), but the current profile and its list stay put. Throws
+ * if the target source cannot become active, leaving the current session
+ * untouched.
  */
 export async function startSessionOnSource(
   connectionId: string,
@@ -263,6 +267,18 @@ export async function startSessionOnSource(
     return
   }
 
-  await selectConnection(connectionId)
+  const registry = $connectionsRegistry.get()
+  const targetConnection = registry?.connections.find(connection => connection.id === connectionId)
+
+  if (!registry || !targetConnection) {
+    return
+  }
+
+  await ensureGatewayAgent(connectionId, normalizeProfileKey($activeGatewayProfile.get()))
+
+  if ($connection.get()?.connectionId !== connectionId) {
+    throw new Error(`Connection "${targetConnection.label}" did not become active.`)
+  }
+
   startFreshSessionDraft()
 }
