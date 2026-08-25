@@ -3938,7 +3938,6 @@ class SessionStore:
         """
         if self._fts_rebuild_attempted:
             return False
-        self._fts_rebuild_attempted = True
         db = self._db
         if db is None or not hasattr(db, "rebuild_fts"):
             return False
@@ -3954,7 +3953,12 @@ class SessionStore:
                     "transcript writes remain available.",
                     foreign_holders,
                 )
+                # Transient condition (e.g. `sessions optimize-storage` ran
+                # concurrently): do NOT burn the once-per-lifetime attempt,
+                # or a long-running gateway whose startup raced one reader
+                # would never rebuild the index.
                 return False
+        self._fts_rebuild_attempted = True
         try:
             rebuilt = db.rebuild_fts()
         except Exception as exc:
