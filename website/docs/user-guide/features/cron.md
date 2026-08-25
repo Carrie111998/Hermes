@@ -351,10 +351,11 @@ cron:
 
 ### Failure incidents: acknowledge a known failure
 
-A recurring job that keeps failing with the *same* error pings you on every
-run. Each failure is also recorded as a durable **incident**, keyed by the
-job plus a normalized signature of the error text, in the same per-profile
-ledger database as the execution history.
+A recurring job that keeps failing with the *same* error creates a durable
+**incident**, keyed by the job plus a normalized signature of the raw error
+text, in the same per-profile ledger database as the execution history. The
+incident alerts immediately, then after four hours, then daily while it stays
+open. Failed alert deliveries remain due and retry on the next failed run.
 
 ```bash
 hermes cron incidents                 # list incidents (newest activity first)
@@ -362,9 +363,9 @@ hermes cron incidents --state alerted # filter: detected | alerted | closed
 hermes cron incidents ack <id>        # acknowledge — stop re-pinging
 ```
 
-Acknowledging an incident silences the per-run failure ping for that exact
-signature only. Nothing else changes: the run history still records every
-failure, the failure streak keeps counting, and the moment the job starts
+Acknowledging an incident silences future alerts for that exact signature
+only. Nothing else changes: the run history still records every failure, the
+failure streak keeps counting, and the moment the job starts
 failing with a *different* error a new incident is minted and alerts fire
 again. A successful run doesn't touch incidents — they are per-signature, not
 per-job.

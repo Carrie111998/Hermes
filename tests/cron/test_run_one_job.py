@@ -10,8 +10,11 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
+import cron.incidents as incidents
 import cron.scheduler as s
 
 
@@ -235,6 +238,83 @@ def test_escaped_failure_delivery_stays_quiet_below_the_threshold(monkeypatch):
 
     assert ok is False
     assert delivered == ["⚠️ Cron 'scout' failed: provider failed"]
+
+
+def test_escaped_failure_uses_incident_escalation_and_keeps_due_nudge(
+    monkeypatch, tmp_path
+):
+    delivered = []
+    started = datetime(2026, 8, 26, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+    )
+    monkeypatch.setattr(incidents, "_hermes_now", lambda: started)
+    _patch_escaped_failure(
+        monkeypatch, delivered, exec_id="exec-escalation", err="provider failed 123"
+    )
+    job = {
+        "id": "escaped-escalation",
+        "name": "scout",
+        "deliver": "telegram",
+        "schedule": {"kind": "interval"},
+        "failure_streak": 0,
+    }
+
+    assert s.run_one_job(job) is False
+
+    monkeypatch.setattr(
+        incidents, "_hermes_now", lambda: started + timedelta(hours=1)
+    )
+    assert s.run_one_job({**job, "failure_streak": 1}) is False
+
+    monkeypatch.setattr(
+        incidents, "_hermes_now", lambda: started + timedelta(hours=4)
+    )
+    assert s.run_one_job({**job, "failure_streak": 2}) is False
+
+    assert len(delivered) == 2
+    assert "failed 3 runs in a row" in delivered[-1]
+
+
+def test_unresolved_origin_does_not_confirm_alert_delivery(
+    monkeypatch, tmp_path
+):
+    delivered = []
+    started = datetime(2026, 8, 26, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+    )
+    monkeypatch.setattr(incidents, "_hermes_now", lambda: started)
+    _patch_escaped_failure(
+        monkeypatch, delivered, exec_id="exec-origin", err="provider failed"
+    )
+    monkeypatch.setattr(s, "_resolve_delivery_targets", lambda _job: [])
+    job = {
+        "id": "origin-retry",
+        "name": "scout",
+        "deliver": "origin",
+        "schedule": {"kind": "interval"},
+    }
+
+    assert s.run_one_job(job) is False
+    incident_id = incidents.list_incidents()[0]["id"]
+    row = incidents.get_incident(incident_id)
+    assert row is not None
+    assert row["state"] == "detected"
+    assert row["last_alerted_at"] is None
+
+    monkeypatch.setattr(
+        incidents, "_hermes_now", lambda: started + timedelta(hours=1)
+    )
+    monkeypatch.setattr(
+        s, "_resolve_delivery_targets", lambda _job: ["telegram:test"]
+    )
+    assert s.run_one_job(job) is False
+
+    assert len(delivered) == 2
+    row = incidents.get_incident(incident_id)
+    assert row is not None
+    assert row["state"] == "alerted"
 
 
 def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):

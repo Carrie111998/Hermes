@@ -2,15 +2,17 @@
 
 The executions ledger (``cron.executions``) records every attempt; this module
 groups the *failures* into durable incidents keyed by ``(job_id, error
-signature)`` so the same job failing with the same error does not re-ping the
-operator every run once they have acknowledged it.
+signature)``. An open incident alerts immediately, then after four hours, then
+daily; acknowledgment closes that signature and silences it entirely.
 
 Lifecycle: ``detected`` → ``alerted`` → ``closed``. Closing
 (acking) an incident is per-signature: the same job + same normalized error
 keeps resolving to the SAME incident id, so a closed incident stays closed (no
 re-alert) until the error text changes, which mints a brand-new incident.
 ``detected`` means the failure was recorded; ``alerted`` means at least one
-failure ping for the signature actually reached the operator. Richer states
+failure ping for the signature actually reached the operator. The
+``last_alerted_at`` confirmation makes due reminders retry after delivery
+failure without moving reminder bookkeeping into the scheduler. Richer states
 (e.g. a dv9.6 ``reviewed``) are deliberately NOT reserved here — state
 validity lives in ``INCIDENT_STATES`` (Python), not a SQLite CHECK, exactly
 so a future slice can add states without a table rebuild.
@@ -27,6 +29,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -48,6 +51,8 @@ _FAILURE_TYPE_ORDER = (
 )
 MAX_ERROR_CHARS = 500
 _MAX_SIGNATURE_ERROR_CHARS = 200
+_FIRST_REMINDER_SECONDS = 4 * 60 * 60
+_DAILY_REMINDER_SECONDS = 24 * 60 * 60
 
 _lock = threading.RLock()
 
@@ -94,6 +99,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              failure_type  TEXT NOT NULL DEFAULT 'unknown',
              first_seen_at TEXT NOT NULL,
              last_seen_at  TEXT NOT NULL,
+             last_alerted_at TEXT,
              acked_at      TEXT,
              closed_at     TEXT,
              error         TEXT NOT NULL,
@@ -108,6 +114,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_cron_incidents_state "
         "ON cron_incidents(state)"
     )
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(cron_incidents)")
+    }
+    if "last_alerted_at" not in columns:
+        conn.execute(
+            "ALTER TABLE cron_incidents ADD COLUMN last_alerted_at TEXT"
+        )
 
 
 @contextmanager
@@ -147,8 +160,16 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
+    """Dedup key for a job's raw error, independent of delivered message text.
+
+    Dynamic hexadecimal ids and decimal numbers normalize before signing so
+    request ids, ports, retry counters, and the streak count in a separately
+    composed ``_failure_streak_nudge`` cannot fragment one incident. Callers
+    must pass the error itself, never the summarized/nudged delivery message.
+    """
     normalized = _normalize_error(error)[:_MAX_SIGNATURE_ERROR_CHARS]
+    normalized = re.sub(r"\b[0-9a-f]{8,}\b", "<id>", normalized)
+    normalized = re.sub(r"\d+", "<n>", normalized)
     digest = hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()
     return digest[:12]
 
@@ -172,6 +193,79 @@ def _classify_failure_type(error: str) -> str:
     return "unknown"
 
 
+def _alert_window(first_seen_at: str, value_at: str) -> int:
+    """Return the escalation window containing ``value_at``.
+
+    Window 0 starts at detection, window 1 starts four hours later, and each
+    later window starts after another day. Comparing the last confirmed alert
+    window with the current one produces immediate → 4h → daily reminders.
+    """
+    try:
+        age = (
+            datetime.fromisoformat(value_at) - datetime.fromisoformat(first_seen_at)
+        ).total_seconds()
+    except (TypeError, ValueError):
+        return 0
+    if age < _FIRST_REMINDER_SECONDS:
+        return 0
+    return 1 + int((age - _FIRST_REMINDER_SECONDS) // _DAILY_REMINDER_SECONDS)
+
+
+def _should_alert(row: sqlite3.Row, now: str) -> bool:
+    state = row["state"]
+    if state == "closed":
+        return False
+    if state == "detected":
+        # Retry the first ping until delivery confirms it by moving the row to
+        # alerted and stamping last_alerted_at.
+        return True
+    last_alerted_at = row["last_alerted_at"] or row["first_seen_at"]
+    return _alert_window(row["first_seen_at"], now) > _alert_window(
+        row["first_seen_at"], last_alerted_at
+    )
+
+
+def _upsert_incident(
+    job_id: str,
+    error: str,
+    *,
+    job_name: Optional[str] = None,
+    failure_type: Optional[str] = None,
+    output_file: Optional[str] = None,
+    decide_alert: bool = False,
+) -> tuple[str, bool, bool]:
+    job_id = str(job_id or "")
+    sig = _error_signature(job_id, error)
+    stored_error = _redact_error(error)
+    incident_id = _incident_id(job_id, sig)
+    now = _hermes_now().isoformat()
+    failure_type = failure_type or _classify_failure_type(error)
+    output_file = str(output_file) if output_file is not None else None
+
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM cron_incidents WHERE id=?", (incident_id,)
+        ).fetchone()
+        if row is not None:
+            should_alert = _should_alert(row, now) if decide_alert else False
+            conn.execute(
+                """UPDATE cron_incidents
+                   SET last_seen_at=?, error=?, output_file=?
+                   WHERE id=?""",
+                (now, stored_error, output_file, incident_id),
+            )
+            return incident_id, False, should_alert
+        conn.execute(
+            """INSERT INTO cron_incidents
+               (id, job_id, error_sig, state, failure_type,
+                first_seen_at, last_seen_at, error, output_file)
+               VALUES (?, ?, ?, 'detected', ?, ?, ?, ?, ?)""",
+            (incident_id, job_id, sig, failure_type, now, now,
+             stored_error, output_file),
+        )
+        return incident_id, True, True
+
+
 def upsert_incident(
     job_id: str,
     error: str,
@@ -187,35 +281,53 @@ def upsert_incident(
     current state — a ``closed`` (acked) incident stays closed for the same
     signature. A changed error text mints a new incident automatically.
     """
-    job_id = str(job_id or "")
-    sig = _error_signature(job_id, error)
-    stored_error = _redact_error(error)
-    incident_id = _incident_id(job_id, sig)
-    now = _hermes_now().isoformat()
-    failure_type = failure_type or _classify_failure_type(error)
-    output_file = str(output_file) if output_file is not None else None
+    incident_id, is_new, _ = _upsert_incident(
+        job_id,
+        error,
+        job_name=job_name,
+        failure_type=failure_type,
+        output_file=output_file,
+    )
+    return incident_id, is_new
 
+
+def upsert_incident_for_alert(
+    job_id: str,
+    error: str,
+    *,
+    job_name: Optional[str] = None,
+    failure_type: Optional[str] = None,
+    output_file: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Record a failure and atomically apply the incident alert policy.
+
+    Returns ``(incident_id, should_alert)``. New and not-yet-delivered
+    incidents alert immediately. Confirmed alerts then back off to a reminder
+    after four hours and daily reminders thereafter. Closed incidents never
+    alert. ``last_seen_at`` is refreshed regardless of the decision.
+    """
+    incident_id, _, should_alert = _upsert_incident(
+        job_id,
+        error,
+        job_name=job_name,
+        failure_type=failure_type,
+        output_file=output_file,
+        decide_alert=True,
+    )
+    return incident_id, should_alert
+
+
+def mark_incident_alerted(incident_id: str) -> bool:
+    """Confirm a delivered alert and advance the incident's reminder clock."""
+    now = _hermes_now().isoformat()
     with _transaction() as conn:
-        row = conn.execute(
-            "SELECT id FROM cron_incidents WHERE id=?", (incident_id,)
-        ).fetchone()
-        if row is not None:
-            conn.execute(
-                """UPDATE cron_incidents
-                   SET last_seen_at=?, error=?, output_file=?
-                   WHERE id=?""",
-                (now, stored_error, output_file, incident_id),
-            )
-            return incident_id, False
-        conn.execute(
-            """INSERT INTO cron_incidents
-               (id, job_id, error_sig, state, failure_type,
-                first_seen_at, last_seen_at, error, output_file)
-               VALUES (?, ?, ?, 'detected', ?, ?, ?, ?, ?)""",
-            (incident_id, job_id, sig, failure_type, now, now,
-             stored_error, output_file),
+        cursor = conn.execute(
+            """UPDATE cron_incidents
+               SET state='alerted', last_alerted_at=?
+               WHERE id=? AND state != 'closed'""",
+            (now, incident_id),
         )
-        return incident_id, True
+        return cursor.rowcount > 0
 
 
 def set_incident_state(incident_id: str, state: str) -> bool:

@@ -344,40 +344,42 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
 
 def _upsert_incident_for_failure(
     job: dict, error: str, *, output_file: Optional[Any] = None
-) -> tuple[bool, Optional[str]]:
+) -> tuple[bool, bool, Optional[str]]:
     """Record a durable failure incident for this run.
 
-    The incident store groups "same job + same error signature" across runs so
-    an operator-acked failure stops re-pinging every run. Returns
-    ``(acked, incident_id)``: ``acked`` is True when the incident for this
-    exact signature is already ``closed`` (acked) — the per-run failure ping
-    should be suppressed. ``incident_id`` lets the caller mark the incident
-    ``alerted`` after the ping actually goes out. The streak nudge and
-    ``_summarize_cron_failure_for_delivery`` text stay intact for un-acked
-    failures.
+    The incident store groups "same job + same raw error signature" across
+    runs and owns the escalating alert policy. Returns ``(should_alert,
+    closed, incident_id)``. Open incidents alert immediately, then after four
+    hours, then daily; closed (acked) incidents stay silent. The raw ``error``
+    is signed before the separately composed failure summary and streak nudge,
+    so the nudge's changing run count cannot fragment the incident.
 
     Best-effort: an incident-store error must never break the cron run or the
     delivery path — failures are logged at debug and the caller delivers as if
     no incident existed.
     """
     try:
-        from cron.incidents import get_incident, upsert_incident
+        from cron.incidents import get_incident, upsert_incident_for_alert
 
-        incident_id, _is_new = upsert_incident(
+        incident_id, should_alert = upsert_incident_for_alert(
             job["id"],
             str(error or ""),
             job_name=job.get("name"),
             output_file=output_file,
         )
         incident = get_incident(incident_id)
-        acked = bool(incident and incident.get("state") == "closed")
-        return acked, incident_id
+        closed = bool(incident and incident.get("state") == "closed")
+        if closed:
+            # Ack may race the upsert/decision transaction. Never deliver when
+            # the follow-up state read already proves the incident is closed.
+            should_alert = False
+        return should_alert, closed, incident_id
     except Exception as exc:
         logger.debug(
             "Incident store unavailable for job %s (delivery unaffected): %s",
             job["id"], exc,
         )
-        return False, None
+        return True, False, None
 
 
 def _mark_incident_alerted(incident_id: Optional[str]) -> None:
@@ -390,9 +392,9 @@ def _mark_incident_alerted(incident_id: Optional[str]) -> None:
     if not incident_id:
         return
     try:
-        from cron.incidents import set_incident_state
+        from cron.incidents import mark_incident_alerted
 
-        set_incident_state(incident_id, "alerted")
+        mark_incident_alerted(incident_id)
     except Exception as exc:
         logger.debug("Failed marking incident %s alerted: %s", incident_id, exc)
 
@@ -6826,7 +6828,8 @@ def _run_one_job_body(
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
     # set on the failure paths below; consumed by the delivery_outcome
     # computation and the post-delivery "alerted" transition.
-    incident_acked = False
+    incident_should_alert = True
+    incident_closed = False
     failure_incident_id = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
@@ -7006,16 +7009,19 @@ def _run_one_job_body(
                 if success:
                     deliver_content = final_response
                 else:
-                    # Durable failure incident: record this job+error
-                    # signature once and, when the operator already acked it,
-                    # suppress the per-run failure ping (the streak nudge and
-                    # the failure summarizer stay intact for un-acked
-                    # failures). Best-effort — an incident-store error never
-                    # breaks the delivery path (see _upsert_incident_for_failure).
-                    incident_acked, failure_incident_id = _upsert_incident_for_failure(
+                    # Durable failure incident: the store decides whether this
+                    # raw-error signature is due for its immediate / four-hour
+                    # / daily alert. Summary + streak nudge are composed only
+                    # after that decision, so their changing text never affects
+                    # dedup. Best-effort — a store error fails open.
+                    (
+                        incident_should_alert,
+                        incident_closed,
+                        failure_incident_id,
+                    ) = _upsert_incident_for_failure(
                         job, error or "", output_file=output_file
                     )
-                    if incident_acked and not drift_skip:
+                    if not incident_should_alert and not drift_skip:
                         deliver_content = ""
                     else:
                         deliver_content = (
@@ -7172,17 +7178,17 @@ def _run_one_job_body(
             delivery_outcome = "not_configured"
         elif should_deliver and normalized_deliver != "local":
             delivery_outcome = "delivered"
-        elif incident_acked and not success:
+        elif incident_closed and not success:
             # Distinct from plain "suppressed" (silence marker / local jobs):
             # the failure ping was withheld because the operator acked this
             # exact signature via `hermes cron incidents ack`.
             delivery_outcome = "suppressed_acked"
         else:
             delivery_outcome = "suppressed"
-        if delivery_outcome in ("delivered", "not_configured") and not success:
-            # The failure ping left the process (or was composed for a
-            # configured target) — record it on the incident so the CLI
-            # distinguishes "failure seen" from "operator was pinged".
+        if delivery_outcome == "delivered" and not success:
+            # Confirm only an alert that reached a configured delivery target.
+            # An unresolved origin remains due so configuring it later retries
+            # immediately instead of waiting for the next escalation window.
             _mark_incident_alerted(failure_incident_id)
         finish_execution(
             execution_id,
@@ -7220,14 +7226,19 @@ def _run_one_job_body(
                 job.get("deliver", "local")
             )
             unresolved_origin = False
-            # Durable failure incident: same ack gate as the normal failure
-            # delivery above — an acked signature stays silent on this path
-            # too, so the retry-path alert cannot re-ping after acknowledgment.
-            incident_acked, failure_incident_id = _upsert_incident_for_failure(
-                job, _err_text
-            )
-            if incident_acked:
-                delivery_outcome = "suppressed_acked"
+            # Apply the same store-owned escalation policy as the normal
+            # failure path. When a reminder is due, the escaped-run streak
+            # nudge below remains part of the delivered alert (#88655).
+            (
+                incident_should_alert,
+                incident_closed,
+                failure_incident_id,
+            ) = _upsert_incident_for_failure(job, _err_text)
+            if not incident_should_alert:
+                if incident_closed:
+                    delivery_outcome = "suppressed_acked"
+                else:
+                    delivery_outcome = "suppressed"
             else:
                 try:
                     delivery_attempted = True
@@ -7257,7 +7268,7 @@ def _run_one_job_body(
                     delivery_outcome = "not_configured"
                 elif normalized_deliver != "local":
                     delivery_outcome = "delivered"
-                if delivery_outcome in ("delivered", "not_configured"):
+                if delivery_outcome == "delivered":
                     _mark_incident_alerted(failure_incident_id)
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
