@@ -1239,3 +1239,69 @@ class MemoryManager:
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
                 )
+        # Rebuild tool routing table after initialization — providers may
+        # report different schemas after initialize() (e.g. Cortext sets
+        # _available=True).  Without this, tools injected via
+        # inject_memory_provider_tools() are visible in the tool surface but
+        # unroutable in handle_tool_call(), causing "Unknown tool" errors.
+        self._reindex_tool_routing()
+        logger.debug(
+            "Memory tool routing reindexed after init: %s",
+            sorted(self._tool_to_provider),
+        )
+
+    def _reindex_tool_routing(self) -> None:
+        """Rebuild _tool_to_provider from all providers' current schemas.
+
+        Called after initialize_all() so that providers whose
+        get_tool_schemas() returned [] before initialize() (because
+        _available was False) get their tools into the routing table.
+
+        This is a full rebuild, not an additive update: providers that
+        *remove* tools during initialize() have their stale routes cleared.
+        Core tool names are still respected — a provider can never shadow
+        a built-in.  First-provider-wins on name conflicts, matching
+        add_provider() semantics.
+
+        Init-time only; the dict swap is atomic under CPython so concurrent
+        readers of _tool_to_provider see either the old or new table, never
+        a partially-built one.
+        """
+        from toolsets import _HERMES_CORE_TOOLS
+
+        _core_tool_names = set(_HERMES_CORE_TOOLS)
+        new_routing: Dict[str, Any] = {}
+        for provider in self._providers:
+            try:
+                for raw_schema in provider.get_tool_schemas():
+                    schema = normalize_tool_schema(raw_schema)
+                    if schema is None:
+                        continue
+                    tool_name = schema["name"]
+                    if tool_name in _core_tool_names:
+                        logger.warning(
+                            "Memory provider '%s' tool '%s' shadows a "
+                            "reserved core tool name; skipped during reindex.",
+                            provider.name, tool_name,
+                        )
+                        continue
+                    if not tool_name:
+                        continue
+                    if tool_name in new_routing:
+                        logger.warning(
+                            "Memory tool name conflict during reindex: '%s' "
+                            "already routed to %s, ignoring from %s",
+                            tool_name,
+                            new_routing[tool_name].name,
+                            provider.name,
+                        )
+                        continue
+                    new_routing[tool_name] = provider
+            except Exception as exc:
+                logger.warning(
+                    "Memory provider '%s' get_tool_schemas() failed during "
+                    "reindex: %s",
+                    provider.name, exc,
+                )
+                continue
+        self._tool_to_provider = new_routing

@@ -1158,3 +1158,128 @@ class TestTrivialPromptClassifier:
                   "hello world", "ok so what's next", "what's my name",
                   "hey can you check the logs", "continue the migration plan"):
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
+
+
+# ---------------------------------------------------------------------------
+# Routing reindex after initialize_all() — regression tests
+# ---------------------------------------------------------------------------
+
+
+class DeferredSchemaProvider(FakeMemoryProvider):
+    """Provider whose schemas appear only after initialize()."""
+
+    def __init__(self, name="deferred", tools_after_init=None):
+        super().__init__(name=name, available=True, tools=[])
+        self._tools_after_init = tools_after_init or [
+            {"name": "late_tool", "description": "Appears after init",
+             "parameters": {"type": "object", "properties": {}}},
+        ]
+
+    def initialize(self, session_id, **kwargs):
+        self.initialized = True
+        self._tools = list(self._tools_after_init)
+
+
+class ShrinkingSchemaProvider(FakeMemoryProvider):
+    """Provider that removes all tools during initialize()."""
+
+    def __init__(self, name="shrinking"):
+        super().__init__(name=name, available=True, tools=[
+            {"name": "early_tool", "description": "Goes away after init",
+             "parameters": {"type": "object", "properties": {}}},
+        ])
+
+    def initialize(self, session_id, **kwargs):
+        self.initialized = True
+        self._tools = []
+
+
+class GeneratorBoomProvider(FakeMemoryProvider):
+    """Provider whose get_tool_schemas() yields then raises mid-iteration."""
+
+    def __init__(self, name="boom"):
+        super().__init__(name=name, available=True, tools=[])
+
+    def initialize(self, session_id, **kwargs):
+        self.initialized = True
+
+    def get_tool_schemas(self):
+        yield {"name": "before_boom", "description": "partial",
+               "parameters": {"type": "object", "properties": {}}}
+        raise RuntimeError("iteration boom")
+
+
+class TestRoutingReindex:
+    """Regression: tools advertised after initialize() must be routable."""
+
+    def test_deferred_schemas_become_routable(self):
+        """Provider whose schemas appear only after initialize() must
+        have its tools in the routing table after initialize_all().
+        """
+        mgr = MemoryManager()
+        p = DeferredSchemaProvider()
+        mgr.add_provider(p)
+        # Before init: no tools in routing table
+        assert not mgr.has_tool("late_tool")
+        mgr.initialize_all("test-session")
+        assert mgr.has_tool("late_tool")
+        result = mgr.handle_tool_call("late_tool", {})
+        assert json.loads(result)["handled"] == "late_tool"
+
+    def test_stale_routes_removed_after_rebuild(self):
+        """Provider that removes tools during initialize() must not
+        leave stale routes in the routing table.
+        """
+        mgr = MemoryManager()
+        p = ShrinkingSchemaProvider()
+        mgr.add_provider(p)
+        # Before init: early_tool is routed
+        assert mgr.has_tool("early_tool")
+        mgr.initialize_all("test-session")
+        # After init: early_tool must be gone (true rebuild, not additive)
+        assert not mgr.has_tool("early_tool")
+
+    def test_generator_exception_does_not_crash_reindex(self):
+        """A provider whose get_tool_schemas() raises mid-iteration must
+        not crash _reindex_tool_routing; other providers remain routable.
+        """
+        mgr = MemoryManager()
+        good = FakeMemoryProvider(
+            "good", tools=[{"name": "good_tool", "description": "ok",
+                            "parameters": {}}]
+        )
+        boom = GeneratorBoomProvider()
+        mgr.add_provider(good)
+        mgr.add_provider(boom)
+        mgr.initialize_all("test-session")
+        # good_tool must still be routable despite boom's failure
+        assert mgr.has_tool("good_tool")
+
+    def test_core_tool_shadowing_still_enforced(self):
+        """A provider that advertises a reserved core tool name after
+        initialize() must not shadow the built-in.
+        """
+        from toolsets import _HERMES_CORE_TOOLS
+        core_name = next(iter(_HERMES_CORE_TOOLS))
+        p = DeferredSchemaProvider(
+            tools_after_init=[{"name": core_name, "description": "shadow",
+                               "parameters": {}}]
+        )
+        mgr = MemoryManager()
+        mgr.add_provider(p)
+        mgr.initialize_all("test-session")
+        assert not mgr.has_tool(core_name)
+
+    def test_first_provider_wins_on_conflict(self):
+        """When two providers advertise the same tool name, the first
+        registered provider wins after reindex.
+        """
+        tool_schema = {"name": "shared", "description": "shared",
+                        "parameters": {}}
+        p1 = FakeMemoryProvider("first", tools=[tool_schema])
+        p2 = FakeMemoryProvider("second", tools=[tool_schema])
+        mgr = MemoryManager()
+        mgr.add_provider(p1)
+        mgr.add_provider(p2)
+        mgr.initialize_all("test-session")
+        assert mgr._tool_to_provider["shared"] is p1
