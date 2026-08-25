@@ -44,11 +44,21 @@ def _clean_browser_use_lifecycle():
     sessions = getattr(bu_cli, "_browser_use_sessions", None)
     if sessions is not None:
         sessions.clear()
+    with bu_cli._browser_use_cleanup_lock:
+        claim = bu_cli._browser_use_instance_claim
+        bu_cli._browser_use_instance_claim = None
+        bu_cli._browser_use_instance_active_calls = 0
+    bu_cli._browser_use_release_reap_lock(claim)
     yield
     if stop is not None:
         stop()
     if sessions is not None:
         sessions.clear()
+    with bu_cli._browser_use_cleanup_lock:
+        claim = bu_cli._browser_use_instance_claim
+        bu_cli._browser_use_instance_claim = None
+        bu_cli._browser_use_instance_active_calls = 0
+    bu_cli._browser_use_release_reap_lock(claim)
 
 
 def _fake_cli(tmp_path, body):
@@ -245,6 +255,12 @@ class TestBrowserUseLifecycle:
         assert root.name.startswith("hbu-")
         assert len(str(socket_path).encode("utf-8")) < 104
 
+    def test_session_runtime_names_do_not_collide_after_sanitization(self):
+        first = bu_cli._browser_use_session_dir_name("a" * 64)
+        second = bu_cli._browser_use_session_dir_name("a" * 63 + "b")
+
+        assert first != second
+
     def test_cli_timeout_reloads_the_exact_harness_daemon(
         self, tmp_path, monkeypatch
     ):
@@ -308,7 +324,10 @@ class TestBrowserUseLifecycle:
         runtime = bu_cli._managed_browser_use_runtime("old-session", {})
         assert runtime is not None
         bu_cli._browser_use_update_state(
-            runtime, last_activity=0.0, active_pid=None
+            runtime,
+            session="old-session",
+            last_activity=0.0,
+            active_pid=None,
         )
         calls = []
 
@@ -332,13 +351,16 @@ class TestBrowserUseLifecycle:
         profile_root = bu_cli._browser_use_profile_root()
         assert profile_root is not None
         instance = profile_root / "dead-instance"
-        runtime = instance / "old-session"
+        runtime = instance / "not-the-session-name"
         runtime.mkdir(parents=True)
         instance.joinpath(".hermes_owner.json").write_text(
             json.dumps({"pid": 999999, "instance_id": "dead-instance"})
         )
         bu_cli._browser_use_update_state(
-            runtime, last_activity=0.0, active_pid=None
+            runtime,
+            session="actual-session",
+            last_activity=0.0,
+            active_pid=None,
         )
         calls = []
         monkeypatch.setattr(
@@ -351,8 +373,73 @@ class TestBrowserUseLifecycle:
         bu_cli._cleanup_browser_use_sessions(now=200.0)
 
         assert cli + ["--reload"] in [item[0] for item in calls]
+        assert calls[0][1]["env"]["BU_NAME"] == "actual-session"
         assert not instance.joinpath(".hermes_reap.lock").exists()
         assert not runtime.joinpath(".hermes_state.json").exists()
+
+    def test_live_instance_claim_blocks_reaper(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cli = self._patch_local_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr(bu_cli, "_browser_use_inactivity_timeout", lambda: 120)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+        profile_root = bu_cli._browser_use_profile_root()
+        assert profile_root is not None
+        instance = profile_root / "live-instance"
+        runtime = instance / "session-dir"
+        runtime.mkdir(parents=True)
+        instance.joinpath(".hermes_owner.json").write_text(
+            json.dumps({"pid": os.getpid(), "instance_id": "live-instance"})
+        )
+        instance.joinpath(".hermes_reap.lock").write_text(
+            json.dumps({"pid": os.getpid(), "token": "live-claim"})
+        )
+        bu_cli._browser_use_update_state(
+            runtime,
+            session="session-name",
+            last_activity=0.0,
+            active_pid=None,
+        )
+        calls = []
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((list(command), kwargs))
+            or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        )
+
+        bu_cli._cleanup_browser_use_sessions(now=200.0)
+
+        assert calls == []
+        assert instance.joinpath(".hermes_reap.lock").exists()
+
+    def test_invalid_persisted_session_identity_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        self._patch_local_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr(bu_cli, "_browser_use_inactivity_timeout", lambda: 120)
+        runtime = bu_cli._managed_browser_use_runtime("valid-session", {})
+        assert runtime is not None
+        bu_cli._browser_use_update_state(
+            runtime,
+            session="invalid/session",
+            last_activity=0.0,
+            active_pid=None,
+        )
+        calls = []
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((list(command), kwargs))
+            or subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        )
+
+        bu_cli._cleanup_browser_use_sessions(now=200.0)
+
+        assert calls == []
+        assert runtime.joinpath(".hermes_state.json").exists()
 
     def test_active_owner_marker_blocks_stale_runtime_reap(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
@@ -363,6 +450,7 @@ class TestBrowserUseLifecycle:
         assert runtime is not None
         bu_cli._browser_use_update_state(
             runtime,
+            session="busy-session",
             last_activity=0.0,
             active_pid=os.getpid(),
             active_started_at=0.0,

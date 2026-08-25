@@ -109,6 +109,8 @@ _browser_use_sessions: Dict[str, Dict[str, Any]] = {}
 _browser_use_cleanup_thread: Optional[threading.Thread] = None
 _browser_use_cleanup_running = False
 _browser_use_cleanup_lock = threading.RLock()
+_browser_use_instance_claim: Optional[tuple[Path, str]] = None
+_browser_use_instance_active_calls = 0
 
 
 def _browser_use_inactivity_timeout() -> int:
@@ -201,6 +203,13 @@ def _browser_use_runtime_root() -> Optional[Path]:
         return None
 
 
+def _browser_use_session_dir_name(session: str) -> str:
+    raw = session or "default"
+    prefix = _TASK_ID_SAFE_RE.sub("_", raw)[:32] or "default"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}-{digest}"
+
+
 def _managed_browser_use_runtime(
     session: str, env: Dict[str, str]
 ) -> Optional[Path]:
@@ -218,7 +227,7 @@ def _managed_browser_use_runtime(
     if root is None:
         return None
     session_name = session or "default"
-    safe_name = _TASK_ID_SAFE_RE.sub("_", session_name)[:80] or "default"
+    safe_name = _browser_use_session_dir_name(session_name)
     runtime = root / safe_name
     try:
         if runtime.is_symlink():
@@ -400,6 +409,41 @@ def _browser_use_release_reap_lock(claim: Optional[tuple[Path, str]]) -> None:
         pass
 
 
+def _browser_use_acquire_instance_lease(timeout: float = 5.0) -> bool:
+    """Acquire the same cross-process lease used by persisted reaping."""
+    global _browser_use_instance_claim, _browser_use_instance_active_calls
+    deadline = time.monotonic() + timeout
+    while True:
+        with _browser_use_cleanup_lock:
+            if _browser_use_instance_claim is not None:
+                _browser_use_instance_active_calls += 1
+                return True
+            instance = _browser_use_runtime_root()
+            claim = (
+                _browser_use_claim_reap_lock(instance) if instance is not None else None
+            )
+            if claim is not None:
+                _browser_use_instance_claim = claim
+                _browser_use_instance_active_calls = 1
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _browser_use_release_instance_lease() -> None:
+    global _browser_use_instance_claim, _browser_use_instance_active_calls
+    with _browser_use_cleanup_lock:
+        _browser_use_instance_active_calls = max(
+            0, _browser_use_instance_active_calls - 1
+        )
+        if _browser_use_instance_active_calls:
+            return
+        claim = _browser_use_instance_claim
+        _browser_use_instance_claim = None
+    _browser_use_release_reap_lock(claim)
+
+
 def _browser_use_reload_env(runtime: Path, session: str) -> Dict[str, str]:
     """Build a reload environment scoped to one Hermes-owned runtime."""
     env = _base_subprocess_env()
@@ -458,6 +502,7 @@ def _acquire_browser_use_state(
                     "command": list(command),
                     "active_calls": 0,
                     "last_activity": 0.0,
+                    "daemon_stopping": False,
                     "operation_lock": threading.Lock(),
                 }
                 _browser_use_sessions[key] = state
@@ -467,6 +512,10 @@ def _acquire_browser_use_state(
         operation_lock.acquire()
         with _browser_use_cleanup_lock:
             if _browser_use_sessions.get(key) is state:
+                if state.get("daemon_stopping"):
+                    _browser_use_sessions.pop(key, None)
+                    operation_lock.release()
+                    continue
                 state["runtime_dir"] = runtime
                 state["command"] = list(command)
                 return state, operation_lock
@@ -500,9 +549,20 @@ def _register_browser_use_session(
     if state is None or operation_lock is None:
         return None
     try:
+        if not _browser_use_acquire_instance_lease():
+            with _browser_use_cleanup_lock:
+                if state["active_calls"] == 0:
+                    _browser_use_sessions.pop(key, None)
+            return None
         state["active_calls"] += 1
         state["last_activity"] = time.time()
-        _browser_use_touch_activity(runtime, state["last_activity"])
+        _browser_use_update_state(
+            runtime,
+            session=key,
+            last_activity=state["last_activity"],
+            active_pid=None,
+            active_started_at=None,
+        )
         if state["active_calls"] == 1:
             state["active_started_at"] = time.time()
             _browser_use_write_active(runtime)
@@ -519,6 +579,7 @@ def _finish_browser_use_session(
     key = state["session"]
     operation_lock = _lock_existing_browser_use_state(key, state)
     if operation_lock is None:
+        _browser_use_release_instance_lease()
         return
     try:
         with _browser_use_cleanup_lock:
@@ -527,7 +588,9 @@ def _finish_browser_use_session(
             active = state["active_calls"] > 0
             if daemon_stopped:
                 _browser_use_sessions.pop(key, None)
-        if not daemon_stopped:
+        if daemon_stopped:
+            _browser_use_remove_markers(state["runtime_dir"])
+        else:
             _browser_use_update_state(
                 state["runtime_dir"],
                 last_activity=state["last_activity"],
@@ -538,6 +601,7 @@ def _finish_browser_use_session(
             )
     finally:
         operation_lock.release()
+        _browser_use_release_instance_lease()
 
 
 def _stop_browser_use_session_now(state: Dict[str, Any]) -> bool:
@@ -550,12 +614,11 @@ def _stop_browser_use_session_now(state: Dict[str, Any]) -> bool:
         with _browser_use_cleanup_lock:
             if state["active_calls"] > 1:
                 return False
+            state["daemon_stopping"] = True
         stopped = _reload_browser_use_daemon(state)
-        if stopped:
+        if not stopped:
             with _browser_use_cleanup_lock:
-                if _browser_use_sessions.get(key) is state:
-                    _browser_use_sessions.pop(key, None)
-            _browser_use_remove_markers(state["runtime_dir"])
+                state["daemon_stopping"] = False
         return stopped
     finally:
         operation_lock.release()
@@ -573,17 +636,27 @@ def _cleanup_browser_use_state(
                 return
             if state["active_calls"] or now - state["last_activity"] < timeout:
                 return
-        if not _reload_browser_use_daemon(state):
+        if not _browser_use_acquire_instance_lease(timeout=0):
+            return
+        try:
+            with _browser_use_cleanup_lock:
+                state["daemon_stopping"] = True
+            if not _reload_browser_use_daemon(state):
+                with _browser_use_cleanup_lock:
+                    if _browser_use_sessions.get(key) is state:
+                        state["last_activity"] = time.time()
+                        state["daemon_stopping"] = False
+                _browser_use_touch_activity(
+                    state["runtime_dir"], state["last_activity"]
+                )
+                return
             with _browser_use_cleanup_lock:
                 if _browser_use_sessions.get(key) is state:
-                    state["last_activity"] = time.time()
-            _browser_use_touch_activity(state["runtime_dir"], state["last_activity"])
-            return
-        with _browser_use_cleanup_lock:
-            if _browser_use_sessions.get(key) is state:
-                _browser_use_sessions.pop(key, None)
-        _browser_use_remove_markers(state["runtime_dir"])
-        logger.info("Reaped inactive Browser Use daemon for session %s", key)
+                    _browser_use_sessions.pop(key, None)
+            _browser_use_remove_markers(state["runtime_dir"])
+            logger.info("Reaped inactive Browser Use daemon for session %s", key)
+        finally:
+            _browser_use_release_instance_lease()
     finally:
         operation_lock.release()
 
@@ -611,6 +684,10 @@ def _cleanup_browser_use_persisted_instance(
             if runtime.is_symlink():
                 continue
             key = runtime.name
+            persisted = _browser_use_read_state(runtime)
+            session = persisted.get("session") if persisted is not None else None
+            if not isinstance(session, str) or not _SESSION_RE.fullmatch(session):
+                continue
             last_activity = _browser_use_read_activity(runtime)
             if last_activity is None or now - last_activity < timeout:
                 continue
@@ -618,7 +695,7 @@ def _cleanup_browser_use_persisted_instance(
             if active_owner is not False:
                 continue
             state = {
-                "session": key,
+                "session": session,
                 "runtime_dir": runtime,
                 "command": list(command),
                 "active_calls": 0,
@@ -652,7 +729,11 @@ def _cleanup_browser_use_sessions(now: Optional[float] = None) -> None:
         for runtime in runtimes:
             if runtime.is_symlink():
                 continue
-            key = runtime.name
+            persisted = _browser_use_read_state(runtime)
+            session = persisted.get("session") if persisted is not None else None
+            if not isinstance(session, str) or not _SESSION_RE.fullmatch(session):
+                continue
+            key = session
             with _browser_use_cleanup_lock:
                 if key in _browser_use_sessions:
                     continue
