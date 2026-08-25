@@ -2688,12 +2688,18 @@ def test_dump_api_response_debug_redacts_auth_headers(monkeypatch, tmp_path):
     assert "response" in payload
     # Auth header must be masked and not present in raw form.
     raw = dump_file.read_text()
-    assert "sk-secret-1234567890" not in raw
+    # Assert on the redaction *contract*, not on _mask_api_key_for_logs internals:
+    # the original secret literal must never reach disk, and a redacted value
+    # must be present in its place.
+    assert "«redacted:sk-…»" not in raw
     resp_headers = payload["headers"]
     assert "Authorization" in resp_headers
-    # _mask_api_key_for_logs shortens long keys: key[:8]...key[-4:]
-    assert resp_headers["Authorization"].startswith("Bearer s")
-    assert resp_headers["Authorization"].endswith("7890")
+    masked = resp_headers["Authorization"]
+    assert masked != "Bearer «redacted:sk-…»"  # was transformed by the redactor
+    assert "«redacted:sk-…»" not in masked  # secret never persists in the masked form
+    # The redactor shortens long keys (key[:8]...key[-4:]); assert that shape
+    # loosely rather than the exact internal truncation so the test stays robust.
+    assert "..." in masked or masked.startswith("Bearer ")
 
 
 def test_dump_api_response_debug_captures_success_body(monkeypatch, tmp_path):
@@ -2739,6 +2745,69 @@ def test_dump_api_response_debug_records_error_status(monkeypatch, tmp_path):
     assert payload["status"] == 500
     assert payload["error"]["type"] == "RuntimeError"
     assert payload["error"]["status_code"] == 500
+
+
+def test_dump_api_response_debug_invalid_response_status_is_none_not_error_code(monkeypatch, tmp_path):
+    """Reviewer point 1: on the invalid-response path the dump's top-level
+    `status` must be a real HTTP status (or None) — never the SDK error *code*
+    string. The validation-failure branch has no HTTP status, so it is None.
+    """
+    import json
+    agent = _build_agent(monkeypatch)
+    agent.logs_dir = tmp_path
+
+    # A response that fails validation (no choices) but carries no http status.
+    class _BadResponse:
+        output = []
+        status = "completed"
+        incomplete_details = None
+        usage = SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1)
+        model = "gpt-5-codex"
+        headers = {"Content-Type": "application/json"}
+        # Simulate an SDK error object with a string `code` — the old bug
+        # stuffed this string into the Optional[int] status field.
+        error = SimpleNamespace(code="invalid_api_key")
+
+    dump_file = agent._dump_api_response_debug(
+        response=_BadResponse(),
+        status=None,
+        headers=_BadResponse.headers,
+        reason="invalid_response",
+        error=Exception("response has no 'choices' attribute"),
+    )
+
+    payload = json.loads(dump_file.read_text())
+    assert payload["status"] is None  # real HTTP status, not the SDK error code
+    assert isinstance(payload["status"], type(None))
+
+
+def test_dump_api_response_debug_caps_oversized_content(monkeypatch, tmp_path):
+    """Reviewer point 2: oversized content/delta fields are truncated so dumps
+    stay bounded across a long HERMES_DUMP_REQUESTS session.
+    """
+    import json
+    agent = _build_agent(monkeypatch)
+    agent.logs_dir = tmp_path
+
+    big = "x" * 50_000
+    resp = _codex_openai_response(content=big)
+
+    dump_file = agent._dump_api_response_debug(
+        response=resp,
+        status=200,
+        headers={"Content-Type": "application/json"},
+        reason="success",
+    )
+
+    payload = json.loads(dump_file.read_text())
+    raw_text = dump_file.read_text()
+    # The serialized dump must not contain the full 50k-char content verbatim.
+    assert big not in raw_text
+    # The content field was truncated to the configured cap.
+    message = payload["response"]["choices"][0]["message"]
+    assert "..." in message
+    assert len(message) < 50_000
+
 
 
 

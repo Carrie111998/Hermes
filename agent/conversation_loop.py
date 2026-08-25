@@ -3796,7 +3796,9 @@ def run_conversation(
                         api_kwargs=api_kwargs,
                         error_type="InvalidAPIResponse",
                         error_message=", ".join(error_details) or "Invalid API response",
-                        status_code=getattr(getattr(response, "error", None), "code", None),
+                        # Derive a *real* HTTP status where available; the invalid-response
+                        # path is a validation failure (no HTTP status), so this is None.
+                        status_code=getattr(response, "status_code", None),
                         retry_count=retry_count,
                         max_retries=max_retries,
                         retryable=True,
@@ -3807,7 +3809,10 @@ def run_conversation(
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         agent._dump_api_response_debug(
                             response=response,
-                            status=getattr(getattr(response, "error", None), "code", None),
+                            # No genuine HTTP status on a validation-failure path;
+                            # record None rather than stuffing the SDK error *code*
+                            # (a string) into an Optional[int] field.
+                            status=getattr(response, "status_code", None),
                             headers=getattr(response, "headers", None),
                             reason="invalid_response",
                             error=Exception(", ".join(error_details)) if error_details else None,

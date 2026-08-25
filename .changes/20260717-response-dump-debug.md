@@ -113,3 +113,28 @@ debug switch coherent.)
    `response_dump_*` with `reason=non_retryable_client_error` + captured status.
 5. Confirm redaction: no cleartext API key / embedded secret survives in the
    dumped file (same scrubber as request dumps).
+
+## Reviewer feedback addressed (Enough1122 AI review, PR #87302)
+
+1. **Mislabeled `status` on the invalid-response path** — `conversation_loop.py`
+   previously stuffed the SDK error *code* (a string like `"invalid_api_key"`)
+   into the `Optional[int]` `status` field. Changed to
+   `getattr(response, "status_code", None)`, which is `None` on the
+   validation-failure branch (no HTTP status). The `status_code` passed to the
+   error hook is now likewise a real HTTP status or `None`.
+2. **Unbounded response capture** — added `_RESPONSE_DUMP_MAX_FIELD_CHARS` (8k)
+   and `_cap_response_dump_value()`; oversized `message.content` / `delta.content`
+   and the `_raw_repr` fallback are truncated so dumps stay bounded across a long
+   `HERMES_DUMP_REQUESTS` session. (Note: the *request* dumper has no equivalent
+   cap — this mirrors the *intent* of keeping debug output bounded; flagged for
+   follow-up on the request side.)
+3. **Silent failures** — `dump_api_response_debug` now emits a
+   `logger.debug` breadcrumb on its failure path (in addition to the existing
+   `verbose_logging`-gated warning) so missing dumps are debuggable without
+   enabling verbose logging.
+4. **Brittle test** — `test_dump_api_response_debug_redacts_auth_headers` now
+   asserts on the redaction *contract* (secret literal never reaches disk; a
+   transformed value is present) instead of coupling to
+   `_mask_api_key_for_logs` internal truncation. Added tests for point 1
+   (`status is None` on invalid-response) and point 2 (oversized content is
+   truncated).

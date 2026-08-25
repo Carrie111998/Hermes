@@ -2143,6 +2143,26 @@ def dump_api_request_debug(
         return None
 
 
+# Bound the per-turn response dump so a long HERMES_DUMP_REQUESTS session does
+# not accumulate unbounded artifacts. The completion body (choices/content/
+# usage) can be large; cap individual string fields before serializing.
+_RESPONSE_DUMP_MAX_CONTENT_CHARS = 20_000
+_RESPONSE_DUMP_MAX_FIELD_CHARS = 8_000
+
+
+def _cap_response_dump_value(value: Any) -> Any:
+    """Truncate oversized string fields in a normalized response dump.
+
+    Mirrors the *intent* of the request dumper (keep debug output bounded) by
+    capping the serialized size of large string fields (message content,
+    deltas, and any captured raw repr). Non-string / structured fields pass
+    through unchanged.
+    """
+    if isinstance(value, str) and len(value) > _RESPONSE_DUMP_MAX_FIELD_CHARS:
+        return value[:_RESPONSE_DUMP_MAX_FIELD_CHARS] + f"...[truncated {len(value) - _RESPONSE_DUMP_MAX_FIELD_CHARS} chars]"
+    return value
+
+
 def dump_api_response_debug(
     agent,
     *,
@@ -2193,11 +2213,14 @@ def dump_api_response_debug(
                 if _choices is not None:
                     _choices_out = []
                     for _ch in _choices:
+                        _ch_msg = getattr(_ch, "message", None)
+                        _ch_delta = getattr(_ch, "delta", None)
                         _ch_out: Dict[str, Any] = {
                             "index": getattr(_ch, "index", None),
                             "finish_reason": getattr(_ch, "finish_reason", None),
-                            "message": getattr(_ch, "message", None),
-                            "delta": getattr(_ch, "delta", None),
+                            # Cap large content/delta fields so dumps stay bounded.
+                            "message": _cap_response_dump_value(getattr(_ch_msg, "content", _ch_msg)),
+                            "delta": _cap_response_dump_value(getattr(_ch_delta, "content", _ch_delta)),
                         }
                         _choices_out.append(_ch_out)
                     resp_norm["choices"] = _choices_out
@@ -2208,7 +2231,7 @@ def dump_api_response_debug(
                         resp_norm[_extra] = _v
             except Exception as norm_err:
                 _ra().logger.debug("Could not normalize response for debug dump: %s", norm_err)
-                resp_norm = {"_raw_repr": repr(response)}
+                resp_norm = {"_raw_repr": repr(response)[:_RESPONSE_DUMP_MAX_FIELD_CHARS]}
 
         _safe_headers = {}
         if headers:
@@ -2276,6 +2299,9 @@ def dump_api_response_debug(
     except Exception as dump_error:
         if agent.verbose_logging:
             logger.warning(f"Failed to dump API response debug payload: {dump_error}")
+        # Make the debug tool debuggable: when dumps mysteriously stop
+        # appearing, leave a breadcrumb on the always-on debug channel.
+        _ra().logger.debug("dump_api_response_debug failed for reason=%s: %s", reason, dump_error)
         return None
 
 
