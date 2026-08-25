@@ -1353,6 +1353,14 @@ class TestSecretManagementGuidance:
         agent = self._make_agent(secret_management_guidance=False)
         assert SECRET_MANAGEMENT_GUIDANCE not in agent._build_system_prompt()
 
+    def test_names_hermes_config_set_for_config_yaml(self):
+        """The block must name the sanctioned path for config.yaml changes
+        (`hermes config set`), not just forbid the terminal workaround —
+        otherwise the model is told what not to do without being told what
+        to do instead."""
+        from agent.prompt_builder import SECRET_MANAGEMENT_GUIDANCE
+        assert "hermes config set" in SECRET_MANAGEMENT_GUIDANCE
+
     def test_no_tools_no_injection(self):
         from agent.prompt_builder import SECRET_MANAGEMENT_GUIDANCE
         with (
