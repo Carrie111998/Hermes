@@ -445,3 +445,108 @@ class TestKeepPromptCompressionFingerprintPairing:
         finally:
             db.close()
             reset_hermes_home_override(token)
+
+    def test_keep_prompt_does_not_pair_stale_cache_with_current_digest_when_durable_already_rebuilt(
+        self, tmp_path
+    ):
+        """Another writer already persisted (current prompt, current digest).
+
+        A stale long-lived agent still holding old SOUL bytes in cache must
+        not overwrite that pair with (stale cache, current digest) just
+        because stored_fp already equals the current digest.
+        """
+        from agent.conversation_compression import compress_context
+        from run_agent import AIAgent
+
+        _home, token, db = _open_home(tmp_path, CURRENT_SOUL)
+        try:
+            session_id = "keep-prompt-multi-writer-stale-cache"
+            stale_prompt = (
+                "You are Hermes Agent.\n"
+                f"{STALE_SOUL}\n"
+                "Model: test/model\n"
+                "Provider: openrouter"
+            )
+            current_prompt = (
+                "You are Hermes Agent.\n"
+                f"{CURRENT_SOUL}\n"
+                "Model: test/model\n"
+                "Provider: openrouter"
+            )
+            db.create_session(
+                session_id,
+                source="api",
+                model="test/model",
+                system_prompt=current_prompt,
+            )
+
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                agent = AIAgent(
+                    api_key="test-key",
+                    base_url="https://openrouter.ai/api/v1",
+                    model="test/model",
+                    quiet_mode=True,
+                    session_db=db,
+                    session_id=session_id,
+                    skip_context_files=True,
+                    skip_memory=True,
+                    load_soul_identity=True,
+                )
+            current_fp = compute_current_context_fingerprint(agent)
+            assert current_fp
+            conn = db._conn
+            assert conn is not None
+            conn.execute(
+                "UPDATE sessions SET system_prompt_fingerprint = ? WHERE id = ?",
+                (current_fp, session_id),
+            )
+            conn.commit()
+            stored = db.get_session(session_id) or {}
+            assert CURRENT_SOUL in (stored.get("system_prompt") or "")
+            assert stored.get("system_prompt_fingerprint") == current_fp
+
+            agent.compression_in_place = True
+            agent._compression_feasibility_checked = True
+            agent._use_prompt_caching = False
+            agent._cached_system_prompt = stale_prompt
+            agent._memory_manager = None
+
+            def _fake_compress(
+                messages, current_tokens=None, focus_topic=None, force=False
+            ):
+                return [
+                    {
+                        "role": "user",
+                        "content": "[CONTEXT COMPACTION] summary of prior turns",
+                    },
+                    {"role": "assistant", "content": "recent reply"},
+                ]
+
+            agent.context_compressor.compress = _fake_compress
+            agent.context_compressor._last_compress_aborted = False
+            agent.context_compressor._last_summary_error = None
+            agent.context_compressor.compression_count = 1
+
+            messages = [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"message {i} " + ("word " * 20),
+                }
+                for i in range(8)
+            ]
+            compress_context(
+                agent, messages, "sys", approx_tokens=100_000, force=True
+            )
+
+            row = db.get_session(session_id) or {}
+            persisted = row.get("system_prompt") or ""
+            persisted_fp = row.get("system_prompt_fingerprint")
+            assert current_fp == compute_current_context_fingerprint(agent)
+            assert not (
+                STALE_SOUL in persisted and persisted_fp == current_fp
+            ), (
+                "kept stale prompt bytes must not be paired with a current digest"
+            )
+        finally:
+            db.close()
+            reset_hermes_home_override(token)
