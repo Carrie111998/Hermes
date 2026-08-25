@@ -99,6 +99,7 @@ const ACTIVATION_LEASE_MS = 30_000
 // runtime behavior is identical to plain module state.
 interface GatewayRegistryState {
   config: RegistryConfig | null
+  primaryConnectionId: null | string
   primaryGateway: HermesGateway | null
   primaryProfile: string
   activeKey: string
@@ -113,6 +114,7 @@ const STATE_KEY = Symbol.for('hermes.desktop.gatewayRegistryState')
 function createRegistryState(): GatewayRegistryState {
   return {
     config: null,
+    primaryConnectionId: null,
     primaryGateway: null,
     primaryProfile: 'default',
     activeKey: 'default',
@@ -185,9 +187,14 @@ export function emitLocalGatewayEvent(event: GatewayEvent): void {
   g.config?.onEvent(event)
 }
 
-export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
+export function setPrimaryGateway(
+  gateway: HermesGateway | null,
+  profile = 'default',
+  connectionId: null | string = null
+): void {
   g.primaryGateway = gateway
   g.primaryProfile = normKey(profile)
+  g.primaryConnectionId = connectionId?.trim() || null
 }
 
 export function isActivePrimary(): boolean {
@@ -222,10 +229,18 @@ export function activeGateway(): HermesGateway | null {
  */
 export function activeGatewayConnectionId(): null | string {
   if (g.activeKey === g.primaryProfile) {
-    return null
+    return g.primaryConnectionId ?? null
   }
 
   return g.secondaries.get(g.activeKey)?.connectionId ?? null
+}
+
+function primaryOwnsAgent(connectionId: null | string, profile: string): boolean {
+  return Boolean(
+    g.primaryConnectionId &&
+      connectionId?.trim() === g.primaryConnectionId &&
+      normKey(profile) === g.primaryProfile
+  )
 }
 
 /**
@@ -662,6 +677,17 @@ export async function requestGatewayForAgent<T>(
   signal?: AbortSignal
 ): Promise<T> {
   const key = normKey(profile)
+
+  if (primaryOwnsAgent(connectionId, key)) {
+    if (!g.primaryGateway) {
+      throw new Error(`Hermes gateway unavailable for connection "${connectionId}"`)
+    }
+
+    return timeoutMs === undefined && signal === undefined
+      ? g.primaryGateway.request<T>(method, params)
+      : g.primaryGateway.request<T>(method, params, timeoutMs, signal)
+  }
+
   const scope = registryBackendScopeKey(connectionId, key)
 
   if (scope === key) {
@@ -865,7 +891,22 @@ export async function openGatewayForProfile(profile: string): Promise<void> {
 // routing. Feature-detected: without the Electron getConnectionFor door these
 // throw, and roster surfaces disable non-local rows instead.
 
-export async function openGatewayForAgent(connectionId: null | string, profile: string): Promise<void> {
+// `activationLease`: hold the same prune lease ensureGatewayForAgent holds for
+// the whole dial. Phase one of the two-phase source switch (store/connections
+// selectConnection) opens the target here and activates it right after; without
+// the lease a live-work recompute during the cold spawn would dispose the entry
+// mid-dial and the click would die (#89622). Plain pre-warms stay prunable —
+// a hovered-but-never-activated socket must not be pinned off another source's
+// live work.
+export async function openGatewayForAgent(
+  connectionId: null | string,
+  profile: string,
+  { activationLease = false }: { activationLease?: boolean } = {}
+): Promise<void> {
+  if (primaryOwnsAgent(connectionId, profile)) {
+    return
+  }
+
   const scope = registryBackendScopeKey(connectionId, profile)
 
   if (scope === normKey(profile)) {
@@ -886,6 +927,13 @@ export async function openGatewayForAgent(connectionId: null | string, profile: 
 }
 
 export async function ensureGatewayForAgent(connectionId: null | string, profile: string): Promise<boolean> {
+  if (primaryOwnsAgent(connectionId, profile)) {
+    const activationEpoch = beginGatewayActivation()
+    applyActive(g.primaryProfile, activationEpoch)
+
+    return true
+  }
+
   const scope = registryBackendScopeKey(connectionId, profile)
 
   if (scope === normKey(profile)) {

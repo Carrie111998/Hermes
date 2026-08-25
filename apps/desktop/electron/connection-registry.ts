@@ -333,6 +333,22 @@ export function resolvedConnectionId(
   return matchingConnectionId(registry, route, 'unique') ?? null
 }
 
+/**
+ * Whether a registry-scoped request names the already-running primary backend.
+ * Main uses this before opening a pooled registry backend so the registry's
+ * primary SSH/remote source cannot spawn a second isolated server for the same
+ * descriptor.
+ */
+export function registrySourceOwnsPrimaryBackend(
+  registry: ConnectionRegistry,
+  connectionId: null | string | undefined,
+  descriptor: ResolvedConnectionDescriptor
+): boolean {
+  const id = String(connectionId ?? '').trim()
+
+  return Boolean(id) && id === registry.primary && resolvedConnectionId(registry, descriptor) === id
+}
+
 function normalizedSshTarget(route: { host?: unknown; port?: unknown; user?: unknown }): null | string {
   const ssh = normalizeSshConfig({ ...route, mode: 'ssh' })
 

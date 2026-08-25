@@ -62,7 +62,7 @@ const sidebar = (
 const listSidebarSessions = vi.fn()
 const listAllProfileSessions = vi.fn()
 const getCronJobs = vi.fn()
-const gatewayScope = vi.hoisted(() => ({ epoch: 0 }))
+const gatewayScope = vi.hoisted(() => ({ connectionId: null as null | string, epoch: 0 }))
 
 interface Deferred<T> {
   promise: Promise<T>
@@ -80,6 +80,7 @@ vi.mock('@/hermes', async importOriginal => ({
 
 vi.mock('@/store/gateway', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
+  activeGatewayConnectionId: () => gatewayScope.connectionId,
   gatewayActivationEpoch: () => gatewayScope.epoch
 }))
 
@@ -92,6 +93,7 @@ vi.mock('@/store/projects', () => ({
 }))
 
 beforeEach(() => {
+  gatewayScope.connectionId = null
   gatewayScope.epoch = 0
   getCronJobs.mockReset()
   getCronJobs.mockResolvedValue([])
@@ -118,6 +120,23 @@ afterEach(() => {
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
+  it('stamps sidebar rows with the registry connection that returned them', async () => {
+    gatewayScope.connectionId = 'hermes-vps'
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [row('remote')] }, [row('cron')], [row('telegram', { source: 'telegram' })])
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get()[0].connection_id).toBe('hermes-vps')
+    expect($cronSessions.get()[0].connection_id).toBe('hermes-vps')
+    expect($messagingSessions.get()[0].connection_id).toBe('hermes-vps')
+  })
+
   it('keeps the previous $sessions array when the refresh is content-identical', async () => {
     const rows = [row('a'), row('b')]
     listSidebarSessions.mockResolvedValue(sidebar({ sessions: rows }))

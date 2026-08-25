@@ -8,7 +8,7 @@ import {
   MESSAGING_SESSION_SOURCE_IDS,
   normalizeSessionSource
 } from '@/lib/session-source'
-import { gatewayActivationEpoch } from '@/store/gateway'
+import { activeGatewayConnectionId, gatewayActivationEpoch } from '@/store/gateway'
 import {
   $pinnedSessionIds,
   $sessionsLimit,
@@ -65,6 +65,16 @@ function dropTombstoned(sessions: SessionInfo[]): SessionInfo[] {
   return tombstones.size
     ? sessions.filter(s => !tombstones.has(s.id) && !(s._lineage_root_id && tombstones.has(s._lineage_root_id)))
     : sessions
+}
+
+/** Bind rows to the registry source that returned them. Profile alone is not
+ * an owner: local and SSH gateways can both expose `default`. Without this
+ * stamp a later source switch makes session.resume fall back to whichever
+ * backend is active, producing a false 404 for a durable session. */
+function stampConnectionOwner(sessions: SessionInfo[], connectionId: null | string): SessionInfo[] {
+  const owner = connectionId?.trim()
+
+  return owner ? sessions.map(session => ({ ...session, connection_id: owner })) : sessions
 }
 
 // Rows a session refresh must preserve even if the aggregator omits them:
@@ -227,6 +237,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   const refreshSessions = useCallback(async () => {
     const sessionProfile = sidebarProfileForScope(profileScope)
     const activationEpoch = gatewayActivationEpoch()
+    const connectionId = activeGatewayConnectionId()
 
     if (sidebarProfileForScope(profileScopeRef.current) !== sessionProfile) {
       return
@@ -280,7 +291,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         // in-flight mutation and the backend page still carries the doomed row.
         // Honoring the optimistic tombstone keeps the removal from flashing back
         // (the tombstone self-clears once projects.tree confirms the delete).
-        const incoming = dropTombstoned(recents.sessions)
+        const incoming = dropTombstoned(stampConnectionOwner(recents.sessions, connectionId))
 
         // Signature-gate the swap (same pattern as cron/messaging): a refresh
         // that returns content-identical rows must keep the previous array
@@ -320,12 +331,19 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
         // Cron section: latest N cron sessions (kept so a pinned cron run still
         // resolves via sessionByAnyId), signature-gated like above.
-        setCronSessions(prev => (sameCronSignature(prev, result.cron.sessions) ? prev : result.cron.sessions))
+        const cronRows = stampConnectionOwner(result.cron.sessions, connectionId)
+
+        setCronSessions(prev => (sameCronSignature(prev, cronRows) ? prev : cronRows))
 
         // Messaging sections: drop any non-messaging source the broad exclude
         // didn't catch (custom sources stay in local recents), then split per
         // platform in the UI.
-        const messagingRows = dropTombstoned(result.messaging.sessions.filter(s => isMessagingSource(s.source)))
+        const messagingRows = dropTombstoned(
+          stampConnectionOwner(
+            result.messaging.sessions.filter(s => isMessagingSource(s.source)),
+            connectionId
+          )
+        )
 
         setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
         // Hit the cap → at least one platform may have more on disk than loaded.

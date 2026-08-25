@@ -451,7 +451,7 @@ export function useGatewayBoot({
         const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
         const key = normalizeProfileKey(profileKey)
         $activeGatewayProfile.set(key)
-        setPrimaryGateway(gateway, key)
+        setPrimaryGateway(gateway, key, $connection.get()?.connectionId ?? null)
         void ensureGatewayForProfile(key)
       } catch {
         $activeGatewayProfile.set(normalizeProfileKey(override))
@@ -594,7 +594,11 @@ export function useGatewayBoot({
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    setPrimaryGateway(
+      gateway,
+      survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()),
+      $connection.get()?.connectionId ?? null
+    )
     // Secondary (background-profile) sockets funnel into the same handler.
     // Record each event's source scope first: registry-tagged events feed the
     // (connectionId, profile) keep-set so two sources exposing the same

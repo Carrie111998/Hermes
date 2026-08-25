@@ -39,6 +39,7 @@ vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() })
 const {
   $gateway,
   activeGateway,
+  activeGatewayConnectionId,
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForAgent,
@@ -92,6 +93,20 @@ afterEach(() => {
 })
 
 describe('registry-agent scope eviction (activeGateway must never silently hit the primary)', () => {
+  it('reuses the primary socket when its registry source owns the requested agent', async () => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default', 'hermes-vps')
+    const desktop = installAgentDesktop()
+
+    await ensureGatewayForAgent('hermes-vps', 'default')
+
+    expect(activeGatewayConnectionId()).toBe('hermes-vps')
+    expect(isActivePrimary()).toBe(true)
+    expect(activeGateway()).toBe(primary)
+    expect(desktop.getConnectionFor).not.toHaveBeenCalled()
+    expect(gatewayMocks.connect).not.toHaveBeenCalled()
+  })
+
   it('activates the agent socket, not the primary, for a registry scope', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')

@@ -126,6 +126,7 @@ import {
   reconcileAppliedGlobalConnection,
   reconcileRegistryDrift,
   rememberSshEnumeration,
+  registrySourceOwnsPrimaryBackend,
   removeConnection,
   resolvedConnectionId,
   resolveRegistryLocalRoute,
@@ -10167,6 +10168,18 @@ async function ensureRegistryBackend(connectionId, profile) {
 
   if (!source) {
     throw new Error(`No connection with id "${id}".`)
+  }
+
+  // The v1 primary and the registry primary can describe the same remote SSH
+  // backend. Reuse the already-running primary before allocating a composite
+  // registry pool entry; otherwise one Desktop window starts two isolated
+  // servers whose transient runtime ids are not interchangeable.
+  if (id === registry.primary) {
+    const primary = await ensureBackend(profile)
+
+    if (registrySourceOwnsPrimaryBackend(registry, id, primary)) {
+      return primary
+    }
   }
 
   if (source.kind === 'local') {
