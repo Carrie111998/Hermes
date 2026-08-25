@@ -14,6 +14,8 @@ grp = pytest.importorskip("grp")
 import hermes_cli.gateway as gateway_cli
 from gateway import status
 from gateway.restart import (
+    CRON_DRAIN_CLEANUP_RESERVE_S,
+    DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -214,6 +216,131 @@ class TestGeneratedSystemdUnits:
 
         assert str(local_bin) in unit
         assert str(profile_node_bin) not in unit
+
+    def test_user_unit_timeout_stop_sec_sizes_from_cron_drain_floor(self, monkeypatch):
+        """Regression for #94759: the generated user unit's TimeoutStopSec must
+        be at least ``cron_drain_timeout + CRON_DRAIN_CLEANUP_RESERVE_S + 30``,
+        NOT merely ``restart_drain_timeout + 30`` — otherwise systemd SIGKILLs
+        an in-budget cron drain the moment the restart timeout elapses.
+
+        Pre-fix the unit sized 60s (default restart_drain_timeout=0 → max(60, 30)
+        → 60s); with the default cron_drain_timeout=30s the floor is 40s and
+        the unit must reflect that.
+        """
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_drain_timeout", lambda: 0.0
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_get_cron_drain_timeout",
+            lambda: float(DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT),
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        cron_floor = int(DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT) + int(
+            CRON_DRAIN_CLEANUP_RESERVE_S
+        )
+        expected = int(max(60, cron_floor + 30))
+        assert f"TimeoutStopSec={expected}" in unit
+        # Sanity: the bug would have produced 60s with these inputs.
+        assert expected > 60, (
+            "Test invariant: with cron_drain_timeout=30 the floor (40) must "
+            "push TimeoutStopSec above the 60s minimum, otherwise this test "
+            "can't detect the regression."
+        )
+
+    def test_user_unit_timeout_stop_sec_takes_max_of_restart_and_cron_drain(
+        self, monkeypatch
+    ):
+        """When the configured restart drain exceeds the cron floor, the
+        unit's TimeoutStopSec must follow the larger of the two (#94759)."""
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_drain_timeout", lambda: 180.0
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_get_cron_drain_timeout", lambda: 5.0
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        # restart(180) > cron floor(15) → unit sizes from 180 + 30 = 210
+        assert "TimeoutStopSec=210" in unit
+
+    def test_user_unit_timeout_stop_sec_floor_when_both_drains_zero(
+        self, monkeypatch
+    ):
+        """The 60s floor must still apply when BOTH drains are zero —
+        pre-existing behavior we must not regress while fixing #94759."""
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_drain_timeout", lambda: 0.0
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_get_cron_drain_timeout", lambda: 0.0
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        # cron floor(10) > restart(0) → max(60, 10 + 30) = 60
+        assert "TimeoutStopSec=60" in unit
+
+    def test_system_unit_timeout_stop_sec_reflects_cron_drain_too(
+        self, monkeypatch
+    ):
+        """The system-unit branch must receive the same cron-drain correction
+        as the user-unit branch — both call ``generate_systemd_unit`` and
+        both write a TimeoutStopSec directive."""
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_drain_timeout", lambda: 0.0
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_get_cron_drain_timeout",
+            lambda: float(DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT),
+        )
+
+        # Stub the system-unit-specific helpers so we can call the system
+        # path without actually shelling out for users/groups.
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda user: ("alice", "alice", "/home/alice"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_hermes_home_for_target_user",
+            lambda home: "/home/alice/.hermes",
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_systemd_watchdog_service_fields",
+            lambda hermes_home: ("simple", ""),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_profile_arg_for_target_user", lambda *a, **kw: ""
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_remap_path_for_user", lambda p, home: p
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_append_node_dir_for_service",
+            lambda entries, base=None: entries.append("/fake/node"),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda *a, **kw: []
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_wsl_interop_paths", lambda *a, **kw: []
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        cron_floor = int(DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT) + int(
+            CRON_DRAIN_CLEANUP_RESERVE_S
+        )
+        expected = int(max(60, cron_floor + 30))
+        assert f"TimeoutStopSec={expected}" in unit
 
     def test_launchd_plist_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):
         # Same #48700 regression for the macOS twin generate_launchd_plist().
