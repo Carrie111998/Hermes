@@ -549,6 +549,53 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+
+def _repair_shallow_boundary(git_cmd, branch: str, repo_root) -> bool:
+    """Heal a shallow checkout whose ``merge --ff-only`` failed (#94477).
+
+    The banner and ``hermes update --check`` paths historically fetched with
+    ``--depth 1`` on shallow installer checkouts. Once upstream advances,
+    that fetch moves ``origin/<branch>`` onto a commit DISCONNECTED from HEAD
+    (git never re-sends history below a shallow boundary the client already
+    has), so the updater's ``merge --ff-only`` fails with "unrelated
+    histories" and the divergence fallback hard-resets — even though the
+    checkout has zero local commits. A ``git fetch --unshallow origin
+    <branch>`` merges the stacked boundaries and restores the real ancestry,
+    after which the fast-forward succeeds.
+
+    Returns True when the boundary was repaired and the fast-forward then
+    succeeded (the caller must skip its reset). Returns False for non-shallow
+    repos, when the unshallow fetch fails (e.g. offline), or when the retried
+    fast-forward still fails (real divergence — e.g. local commits), so the
+    caller keeps its existing divergence handling. Never raises.
+    """
+    try:
+        shallow_probe = subprocess.run(
+            git_cmd + ["rev-parse", "--is-shallow-repository"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if shallow_probe.stdout.strip() != "true":
+            return False
+        unshallow_result = subprocess.run(
+            git_cmd + ["fetch", "--unshallow", "origin", branch],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if unshallow_result.returncode != 0:
+            return False
+        retry_result = subprocess.run(
+            git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        return retry_result.returncode == 0
+    except Exception:
+        return False
+
 # Files that define the editable install. A pull that touches none of them
 # cannot have invalidated it.
 _INSTALL_DEFINING_FILES = (
@@ -3600,6 +3647,76 @@ def _print_fetch_failure(stderr: str) -> None:
         print(f"  {stderr.splitlines()[0]}")
 
 
+def _check_update_shallow(git_cmd, branch: str) -> None:
+    """Passive update check for shallow installer checkouts (#94477).
+
+    Never fetches locally. The old flow fetched with ``--depth 1`` to
+    "preserve" the shallow boundary — but once upstream advances, that fetch
+    moves ``origin/<branch>`` onto a commit DISCONNECTED from HEAD, stacking
+    ``.git/shallow`` entries; the next ``hermes update`` ``merge --ff-only``
+    then fails with "unrelated histories" and hard-resets a checkout with
+    zero local commits. Instead, compare HEAD against the remote tip via
+    ls-remote (honouring the upstream-remote preference for ``main``) and
+    recover the exact behind-count from the GitHub compare API.
+    """
+    remote_name = "origin"
+    if branch == "main":
+        # Non-fork installs have no 'upstream' remote; prefer it when present
+        # (canonical reference for forks), same as the non-shallow flow.
+        has_upstream = (
+            subprocess.run(
+                git_cmd + ["remote", "get-url", "upstream"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            ).returncode
+            == 0
+        )
+        if has_upstream:
+            remote_name = "upstream"
+    remote_url = (
+        subprocess.run(
+            git_cmd + ["remote", "get-url", remote_name],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        ).stdout.strip()
+    )
+
+    from hermes_cli.banner import _github_compare_behind, _ls_remote_tip
+    from hermes_cli.config import recommended_update_command
+
+    target_sha = _ls_remote_tip(remote_url, branch)
+    if not target_sha:
+        print(f"✗ Could not reach {remote_name} to check for updates.")
+        sys.exit(1)
+    head_sha = (
+        subprocess.run(
+            git_cmd + ["rev-parse", "HEAD"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        ).stdout.strip()
+    )
+    if head_sha and head_sha == target_sha:
+        print("✓ Already up to date.")
+        return
+    counted = _github_compare_behind(head_sha, target_sha)
+    if counted == 0:
+        # Local commits on top of the remote tip — not behind.
+        print("✓ Already up to date.")
+        return
+    if counted is not None:
+        commits_word = "commit" if counted == 1 else "commits"
+        print(
+            f"⚕ Update available: {counted} {commits_word} behind "
+            f"{remote_name}/{branch}."
+        )
+    else:
+        print(f"⚕ Update available (behind {remote_name}/{branch}).")
+    print(f"  Run '{recommended_update_command()}' to install.")
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -3656,11 +3773,9 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # Note: upstream/<branch> may not exist for non-main branches (a fork's
     # bb/gui has no upstream counterpart), so when the caller picks a
     # non-default branch we skip the upstream probe and use origin directly.
-    # Installer checkouts are shallow (`git clone --depth 1`). A plain
-    # `git fetch` would unshallow the repo (dragging in the whole history —
-    # the exact cost the shallow clone avoided) and the rev-list count below
-    # would then report a huge bogus "behind" number. Detect shallow up front:
-    # fetch with --depth 1 to preserve the boundary and report presence-only.
+    # Installer checkouts are shallow (`git clone --depth 1`). Detect shallow
+    # up front: the shallow check probes the remote tip passively (no local
+    # fetch — see #94477) instead of running the fetch + rev-list flow below.
     is_shallow = (
         subprocess.run(
             git_cmd + ["rev-parse", "--is-shallow-repository"],
@@ -3670,7 +3785,13 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         ).stdout.strip()
         == "true"
     )
-    depth_args = ["--depth", "1"] if is_shallow else []
+
+    if is_shallow:
+        # Never fetch with --depth 1 here: once upstream advances, that fetch
+        # moves origin/<branch> onto a commit DISCONNECTED from HEAD and the
+        # next `hermes update` hard-resets (#94477).
+        _check_update_shallow(git_cmd, branch)
+        return
 
     if branch == "main":
         # Probe locally (~6 ms) whether an 'upstream' remote exists at all
@@ -3690,7 +3811,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         if has_upstream_remote:
             print("→ Fetching from upstream...")
             fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["upstream", branch],
+                git_cmd + ["fetch", "upstream", branch],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -3702,7 +3823,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             # No upstream remote, or the upstream fetch failed — use origin.
             print("→ Fetching from origin...")
             fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["origin", branch],
+                git_cmd + ["fetch", "origin", branch],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -3713,7 +3834,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # Non-default branch: compare against origin/<branch> directly.
         print("→ Fetching from origin...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
+            git_cmd + ["fetch", "origin", branch],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3738,38 +3859,6 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if verify_result.returncode != 0:
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
         sys.exit(1)
-
-    if is_shallow:
-        # No history to count across the shallow boundary. Compare tip SHAs
-        # (mirrors the banner's _check_via_local_git), then try to recover the
-        # exact count via the GitHub compare API — the remote graph is complete
-        # even when the local one is truncated.
-        head_sha = subprocess.run(
-            git_cmd + ["rev-parse", "HEAD"],
-            cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        ).stdout.strip()
-        target_sha = subprocess.run(
-            git_cmd + ["rev-parse", compare_branch],
-            cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        ).stdout.strip()
-        if head_sha and target_sha and head_sha == target_sha:
-            print("✓ Already up to date.")
-        else:
-            from hermes_cli.banner import _github_compare_behind
-            from hermes_cli.config import recommended_update_command
-
-            counted = _github_compare_behind(head_sha, target_sha)
-            if counted == 0:
-                # Local commits on top of the remote tip — not behind.
-                print("✓ Already up to date.")
-                return
-            if counted is not None:
-                commits_word = "commit" if counted == 1 else "commits"
-                print(f"⚕ Update available: {counted} {commits_word} behind {compare_branch}.")
-            else:
-                print(f"⚕ Update available (behind {compare_branch}).")
-            print(f"  Run '{recommended_update_command()}' to install.")
-        return
 
     rev_result = subprocess.run(
         git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
@@ -7749,26 +7838,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
-                    print(
-                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                    )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
-                        if reset_result.stderr.strip():
-                            print(f"  {reset_result.stderr.strip()}")
+                    # Same branch as the update target — historically a true
+                    # upstream force-push/rebase. Local changes are already
+                    # stashed; reset to match the remote exactly (original
+                    # behaviour).
+                    #
+                    # #94477 exception: on a shallow installer checkout the
+                    # ff-only failure is usually NOT divergence. A --depth 1
+                    # fetch from the banner / --check path moves
+                    # origin/<branch> onto a disconnected shallow boundary,
+                    # so `merge --ff-only` fails with "unrelated histories"
+                    # even though the checkout has zero local commits. Repair
+                    # the boundary (fetch --unshallow) and retry the
+                    # fast-forward before treating it as divergence.
+                    if _repair_shallow_boundary(git_cmd, branch, _m().PROJECT_ROOT):
                         print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                            "  ✓ Repaired shallow clone boundary — "
+                            f"fast-forwarded to origin/{branch}."
                         )
-                        sys.exit(1)
+                    else:
+                        print(
+                            "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                        )
+                        reset_result = subprocess.run(
+                            git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        if reset_result.returncode != 0:
+                            print(f"✗ Failed to reset to origin/{branch}.")
+                            if reset_result.stderr.strip():
+                                print(f"  {reset_result.stderr.strip()}")
+                            print(
+                                f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                            )
+                            sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

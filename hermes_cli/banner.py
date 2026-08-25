@@ -255,6 +255,27 @@ def _upstream_main_sha() -> Optional[str]:
     return upstream_rev or None
 
 
+def _ls_remote_tip(remote_url: str | None, branch: str) -> Optional[str]:
+    """Tip SHA of ``refs/heads/<branch>`` on ``remote_url`` via ls-remote.
+
+    Passive network probe — never writes local refs, so it cannot move
+    ``origin/<branch>`` across a shallow clone's boundary (#94477).
+    """
+    if not remote_url:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", remote_url, f"refs/heads/{branch}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.strip().split()[0] or None
+
+
 def _check_via_rev(local_rev: str) -> Optional[int]:
     """Compare an embedded git revision to upstream main via ls-remote.
 
@@ -307,16 +328,42 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         counted = _github_compare_behind(head_rev, upstream_rev)
         return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
-    # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
-    # clone the history stops at a single commit, so a plain `git fetch` would
-    # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
-    # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
-    # --depth 1 to preserve the boundary and compare tip SHAs instead of
-    # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
+    # Installer checkouts are shallow (`git clone --depth 1`). Detect shallow
+    # up front: on a shallow repo we probe the remote tip passively via
+    # ls-remote (never a local fetch — see #94477 below) and compare tip SHAs
+    # instead of counting. Full clones (developers, Docker dev images) keep
+    # the exact count path unchanged.
     shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
     is_shallow = shallow == "true"
+
+    if is_shallow:
+        # A `--depth 1` fetch here to "preserve" the boundary is what POISONS
+        # it (#94477): once upstream advances, the fetch moves origin/main
+        # onto a commit DISCONNECTED from HEAD (git never re-sends history
+        # below a shallow boundary the client already has) and stacks a new
+        # .git/shallow entry. The next `hermes update` merge --ff-only then
+        # fails with "unrelated histories" and hard-resets a checkout with
+        # zero local commits. Probe the remote tip passively instead — same
+        # tip SHA, zero local ref movement, boundary untouched.
+        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+        target_rev = _ls_remote_tip(origin_url, "main")
+        if not target_rev:
+            # Offline or no usable remote — fall back to whatever stale ref
+            # we have (never a fetch, which would move the boundary).
+            target_rev = (
+                _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
+                or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            )
+        if not head_rev or not target_rev:
+            return None
+        if head_rev == target_rev:
+            return 0
+        # Tips differ but the shallow boundary hides the history between them.
+        # Recover the exact count from the GitHub compare API when possible
+        # (ahead_by == 0 means local-ahead ⇒ up to date); otherwise report the
+        # honest "update available, count unknown" sentinel.
+        counted = _github_compare_behind(head_rev, target_rev)
+        return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
     try:
         # Self-heal abandoned git lock files before fetching. A stale
@@ -375,26 +422,6 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             except Exception:
                 pass
         return None
-
-    if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        target_rev = (
-            _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
-        )
-        if not head_rev or not target_rev:
-            return None
-        if head_rev == target_rev:
-            return 0
-        # Tips differ but the shallow boundary hides the history between them.
-        # Recover the exact count from the GitHub compare API when possible
-        # (ahead_by == 0 means local-ahead ⇒ up to date); otherwise report the
-        # honest "update available, count unknown" sentinel.
-        counted = _github_compare_behind(head_rev, target_rev)
-        return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
     try:
         result = subprocess.run(
