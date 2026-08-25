@@ -939,8 +939,8 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
 
-    # Surface context-file truncation warnings through the normal agent status
-    # channel so gateway/CLI users see them in chat instead of only in logs.
+    # Surface context-file truncation and security-scan warnings through the
+    # normal agent status channel so users see them instead of only in logs.
     for warning in drain_truncation_warnings():
         agent._emit_status(warning)
 

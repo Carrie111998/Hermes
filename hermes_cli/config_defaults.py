@@ -2519,6 +2519,10 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Context files enter the system prompt with high authority. "enforce"
+        # blocks a whole file when the injection scanner finds a threat;
+        # "warn" loads it with a visible banner; "off" skips the scan.
+        "context_file_scanning": "enforce",
         # Persisted acknowledgement for unattended model overrides whose tier
         # lets the vendor train on prompts/completions. The startup guard still
         # prints the full warning on every run and never bypasses cost guards.

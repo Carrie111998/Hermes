@@ -58,8 +58,30 @@ logger = logging.getLogger(__name__)
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
+def _context_file_scanning_policy() -> str:
+    """Return the configured context-file scan policy, failing closed."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        security = load_config_readonly().get("security", {})
+        configured = security.get("context_file_scanning", "enforce")
+    except Exception as exc:
+        logger.debug("Could not read context-file scanning policy: %s", exc)
+        return "enforce"
+
+    if isinstance(configured, str):
+        policy = configured.strip().lower()
+        if policy in {"enforce", "warn", "off"}:
+            return policy
+    logger.warning(
+        "invalid security.context_file_scanning value %r; using enforce",
+        configured,
+    )
+    return "enforce"
+
+
 def _scan_context_content(content: str, filename: str) -> str:
-    """Scan context file content for injection. Returns sanitized content.
+    """Apply the configured injection policy to context-file content.
 
     Uses the "context" scope from the shared threat-pattern library, which
     covers classic injection + promptware/C2 patterns + role-play hijack.
@@ -67,7 +89,9 @@ def _scan_context_content(content: str, filename: str) -> str:
     applied here — those are too aggressive for a context file in a
     cloned repo (security research, infra docs).  Content matching is
     BLOCKED at this layer because the file would otherwise enter the
-    system prompt verbatim and the user has no chance to intervene.
+    system prompt verbatim and the user has no chance to intervene. The
+    default ``enforce`` policy preserves that behavior; ``warn`` loads the
+    file with an in-prompt banner, and ``off`` bypasses scanning explicitly.
     """
     # Editors (Windows Notepad, PowerShell Out-File without -Encoding
     # utf8NoBOM, some VS Code profiles) prefix a UTF-8 BOM as an encoding
@@ -77,10 +101,40 @@ def _scan_context_content(content: str, filename: str) -> str:
     if content.startswith("\ufeff"):
         content = content[1:]
 
+    policy = _context_file_scanning_policy()
+    if policy == "off":
+        return content
+
     findings = _scan_for_threats(content, scope="context")
     if findings:
-        logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
-        return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
+        finding_text = ", ".join(findings)
+        if policy == "warn":
+            logger.warning(
+                "Context file %s matched scanner but was loaded by warn policy: %s",
+                filename,
+                finding_text,
+            )
+            _record_truncation_warning(
+                f"⚠ Context file {filename} matched the prompt-injection scanner "
+                f"({finding_text}); content was loaded because "
+                "security.context_file_scanning is warn."
+            )
+            return (
+                f"[WARNING: {filename} matched potential prompt injection "
+                f"({finding_text}). Content loaded because "
+                f"security.context_file_scanning=warn.]\n\n{content}"
+            )
+
+        logger.warning("Context file %s blocked: %s", filename, finding_text)
+        _record_truncation_warning(
+            f"⚠ Context file {filename} was blocked by the prompt-injection "
+            f"scanner ({finding_text}). Review the file or set "
+            "security.context_file_scanning to warn/off only if you trust it."
+        )
+        return (
+            f"[BLOCKED: {filename} contained potential prompt injection "
+            f"({finding_text}). Content not loaded.]"
+        )
 
     return content
 
@@ -1618,7 +1672,7 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
         logger.debug("Could not read context_file_max_chars from config: %s", e)
     return _dynamic_context_file_max_chars(context_length)
 
-# Collect truncation warnings so the caller (run_agent) can surface them.
+# Collect context-file warnings so the caller (run_agent) can surface them.
 # A ContextVar (not a module-global list) isolates accumulation per thread /
 # per async task, so concurrent gateway-session prompt builds can't drain or
 # clear each other's pending warnings (cross-session leak). Each build runs in
@@ -1638,7 +1692,12 @@ def _record_truncation_warning(msg: str) -> None:
 
 
 def drain_truncation_warnings() -> list:
-    """Return and clear any truncation warnings accumulated in this context."""
+    """Return and clear context-file warnings accumulated in this context.
+
+    The historical name is retained for compatibility; the channel now also
+    carries security-scan notices because both must reach the user while the
+    system prompt is built.
+    """
     warnings = _truncation_warnings.get()
     if not warnings:
         return []
