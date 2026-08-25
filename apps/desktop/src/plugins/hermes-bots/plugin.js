@@ -7889,23 +7889,43 @@ async function harvestStrandedUntilSettled(group, members, thread) {
  *  Returns the thread id the message landed in. */
 // Slash commands typed in a group room have no handler: the room composer
 // submits verbatim into sendToGroupChat, so "/new" lands in every member's
-// session as literal chat text (#93947). The 1:1 composer reroutes /new via
-// its middleware; rooms have no such path and reset semantics are ambiguous
-// at room scope (member sessions are keyed per-room, shared across threads).
-// Until a design decision lands, reject slash-style input visibly instead of
-// delivering it as a prompt the bots answer literally.
-const GROUP_SLASH_INPUT_RE = /^\/\S/
+// session as literal chat text (#93947). The 1:1 composer does NOT broadly
+// intercept slash input either — its middleware only reroutes /new|/reset —
+// but there a stray command degrades to one session's chat text, while a
+// room fans it out to EVERY member. Rooms therefore reject command-shaped
+// input visibly instead of delivering it as prompts the bots answer
+// literally. The shape is deliberately narrower than "starts with /": paths
+// like "/etc/hosts — what is this?" or "/usr/bin/env python3 …" are common
+// prose openers, so only a command-like first token (a letter-led word,
+// optionally followed by args) trips the guard.
+const GROUP_SLASH_INPUT_RE = /^\/[a-z][\w-]*(?:\s|$)/i
 
 function isGroupSlashInput(text) {
   return GROUP_SLASH_INPUT_RE.test(String(text || '').trim())
 }
 
-function notifyGroupSlashUnsupported() {
+function notifyGroupSlashUnsupported(text) {
+  const token = String(text || '').trim().split(/\s+/)[0]?.slice(0, 24) || ''
+
   host.notify?.({
     kind: 'info',
     title: 'Slash commands aren’t supported in group rooms',
-    message: 'The text was not sent — it would reach every bot as a literal message.'
+    message: token
+      ? `“${token}” was not sent — it would reach every bot as a literal message.`
+      : 'The text was not sent — it would reach every bot as a literal message.'
   })
+}
+
+// One shared rejection point for both room composers (and any future one):
+// adding an allow-list later becomes a one-line edit HERE.
+function rejectGroupSlashIfNeeded(text) {
+  if (!isGroupSlashInput(text)) {
+    return false
+  }
+
+  notifyGroupSlashUnsupported(text)
+
+  return true
 }
 
 function sendToGroupChat(group, members, text, thread, images) {
@@ -7913,6 +7933,16 @@ function sendToGroupChat(group, members, text, thread, images) {
   const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
 
   if ((!trimmed && !attached.length) || !members.length) {
+    return null
+  }
+
+  // Defense-in-depth backstop (#93947): the composers guard before they
+  // submit; if a future non-composer caller ever lands here with slash
+  // input, refuse delivery rather than reintroduce literal-command fan-out.
+  // Returning null reuses the established "nothing was sent" contract.
+  if (!attached.length && isGroupSlashInput(trimmed)) {
+    console.warn('[hermes-bots] blocked slash-style input from reaching sendToGroupChat')
+
     return null
   }
 
@@ -12828,9 +12858,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       return
     }
 
-    if (isGroupSlashInput(text)) {
-      notifyGroupSlashUnsupported()
-
+    if (rejectGroupSlashIfNeeded(text)) {
       return
     }
 
@@ -12864,9 +12892,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       return
     }
 
-    if (isGroupSlashInput(text)) {
-      notifyGroupSlashUnsupported()
-
+    if (rejectGroupSlashIfNeeded(text)) {
       return
     }
 
