@@ -735,6 +735,7 @@ def _user_ask_gate(pattern: str, command: str,
         autoapprove_log_prefix="approvals.ask rule",
         honor_yolo_bypass=False,
         fail_closed_when_no_human=True,
+        require_human=True,
         no_human_block_message=(
             f"BLOCKED: Command matches the user-defined ask rule '{pattern}' "
             "(approvals.ask in config.yaml) but no interactive user or "
@@ -3501,6 +3502,7 @@ def _run_approval_gate(
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
     honor_yolo_bypass: bool = True,
+    require_human: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3552,6 +3554,10 @@ def _run_approval_gate(
     if honor_yolo_bypass and (
             _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()):
         return {"approved": True, "message": None}
+    if require_human and is_approved(get_current_session_key(), pattern_key):
+        # Cached human grant for THIS ask rule — additive-authority keys are
+        # checked by callers before reaching here for other findings.
+        return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
@@ -3570,7 +3576,57 @@ def _run_approval_gate(
         is_cli = False
         is_gateway = False
 
-    if not is_cli and not is_gateway:
+    # Ask rules are an explicit demand for a HUMAN decision: generic
+    # unattended policy (cron_mode / single_query_mode = approve) exists to
+    # waive the heuristic dangerous-command prompt, not a rule whose whole
+    # purpose is to force a human. When require_human=True those modes can
+    # only deny-or-block, never silently approve (review blocker 3).
+    if require_human and (is_cli or is_gateway):
+        pass  # a real answer surface exists; fall through to prompting below
+    elif require_human:
+        if _is_single_query_approval_context():
+            if _get_single_query_approval_mode() == "deny":
+                return {
+                    "approved": False,
+                    "message": single_query_deny_message,
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
+            logger.warning(
+                "%s (pattern: %s): %s — single-query mode cannot authorize an "
+                "ask rule; BLOCKED (an ask rule demands a human).",
+                autoapprove_log_prefix, pattern_key, description,
+            )
+            return {
+                "approved": False,
+                "message": single_query_deny_message,
+                "pattern_key": pattern_key,
+                "description": description,
+            }
+        if _is_cron_approval_context():
+            return {
+                "approved": False,
+                "message": cron_deny_message,
+                "pattern_key": pattern_key,
+                "description": description,
+            }
+        if fail_closed_when_no_human:
+            logger.warning(
+                "%s (pattern: %s): %s — no interactive user/gateway present; "
+                "BLOCKED (fail-closed). Set HERMES_INTERACTIVE or "
+                "HERMES_GATEWAY_SESSION to answer the prompt.",
+                autoapprove_log_prefix, pattern_key, description,
+            )
+            return {
+                "approved": False,
+                "message": no_human_block_message or (
+                    f"BLOCKED: approval required ({description}) but no "
+                    "interactive user or gateway is present to approve it."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+            }
+    elif not is_cli and not is_gateway:
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
@@ -3795,6 +3851,13 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
 
 
+
+def _is_also_dangerous_helper(command: str) -> bool:
+    """Detection-only probe reused by the container pre-policy blocks."""
+    is_dangerous, _, _ = detect_dangerous_command(command)
+    return is_dangerous
+
+
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None,
                             has_host_access: bool = False) -> dict:
@@ -3814,6 +3877,29 @@ def check_dangerous_command(command: str, env_type: str,
         {"approved": True/False, "message": str or None, ...}
     """
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        # Isolation skips ORDINARY guards, but an operator's explicit
+        # approvals.deny / approvals.ask policy precedes the optimization:
+        # a sandbox is not consent to ignore stated policy (composes with
+        # the deny-side topology from #91029).
+        deny_pattern = _match_user_deny_rule(command)
+        if deny_pattern is not None:
+            logger.warning("User deny rule %r blocked command: %s",
+                           deny_pattern, command[:200])
+            return _user_deny_block_result(deny_pattern)
+        ask_pattern = _match_user_ask_rule(command)
+        if ask_pattern is not None:
+            logger.info("User ask rule %r requires approval: %s",
+                        ask_pattern, command[:200])
+            _is_also_dangerous, _, _desc = detect_dangerous_command(command)
+            if _is_also_dangerous:
+                # Strip the isolation fast-path so the combined gate below
+                # gathers the full finding set for this host-reaching rule.
+                return check_all_command_guards(
+                    command, "local",
+                    approval_callback=approval_callback,
+                    has_host_access=False)
+            return _user_ask_gate(ask_pattern, command,
+                                  approval_callback=approval_callback)
         return {"approved": True, "message": None}
 
     # Hardline floor: commands with no recovery path (rm -rf /, mkfs, dd
@@ -3839,10 +3925,23 @@ def check_dangerous_command(command: str, env_type: str,
     # the yolo bypass — an ask rule is the user saying "always show me this,
     # even when approvals are otherwise bypassed". Unlike deny, a match does
     # not block; it routes through the shared human-approval gate.
+    #
+    # An ask grant is ADDITIVE authority: it may only suppress the ASK
+    # prompt itself, never an independently-detected dangerous/Tirith
+    # finding on the same command. When both fire, defer to the combined
+    # gather-then-decide gate in check_all_command_guards so the single
+    # prompt carries every reason (a cached `ask_rule:<glob>` approval
+    # cannot launder `ssh host ; <dangerous suffix>` past its own detector).
     ask_pattern = _match_user_ask_rule(command)
     if ask_pattern is not None:
         logger.info("User ask rule %r requires approval: %s",
                     ask_pattern, command[:200])
+        _is_also_dangerous, _, _desc = detect_dangerous_command(command)
+        if _is_also_dangerous:
+            return check_all_command_guards(
+                command, env_type,
+                approval_callback=approval_callback,
+                has_host_access=has_host_access)
         return _user_ask_gate(ask_pattern, command,
                               approval_callback=approval_callback)
 
@@ -4445,9 +4544,33 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
-    # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
+    # Skip ordinary guards for isolated containers — but never an operator's
+    # explicit approvals.deny / approvals.ask policy (composes with #91029;
+    # Docker stops skipping once host paths are bind-mounted into the sandbox).
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        deny_pattern = _match_user_deny_rule(command)
+        if deny_pattern is not None:
+            logger.warning("User deny rule %r blocked command: %s",
+                           deny_pattern, command[:200])
+            return _user_deny_block_result(deny_pattern)
+        ask_pattern = _match_user_ask_rule(command)
+        if ask_pattern is not None:
+            logger.info("User ask rule %r requires approval: %s",
+                        ask_pattern, command[:200])
+            try:
+                from tools.tirith_security import check_command_security as _ccs
+                _also_tirith = _ccs(command).get("action") in ("block", "warn")
+            except ImportError:
+                _also_tirith = False
+            if not (_is_also_dangerous_helper(command) or _also_tirith):
+                return _user_ask_gate(ask_pattern, command,
+                                      approval_callback=approval_callback)
+            # Combined path: re-enter without the fast-path so the findings
+            # phase assembles every reason into one prompt.
+            return check_all_command_guards(
+                command, "local",
+                approval_callback=approval_callback,
+                has_host_access=False)
         return {"approved": True, "message": None}
 
     # Hardline floor: unconditional block for catastrophic commands
@@ -4481,12 +4604,29 @@ def check_all_command_guards(command: str, env_type: str,
 
     # User-defined ask rules (approvals.ask): same pre-yolo placement as in
     # check_dangerous_command — prompt even under yolo / mode=off.
+    #
+    # Additive-authority invariant: a cached ask grant may silence the ask
+    # key alone, never an independent security finding. So when the command
+    # also trips dangerous-pattern or Tirith detection, do NOT short-circuit
+    # here and do NOT re-enter via the gate (its cached-grant shortcut would
+    # approve before the detectors' findings are seen) — fall through to the
+    # findings phase, which gathers BOTH reasons into one prompt and lets
+    # the cached ask key cover just the ask part.
     ask_pattern = _match_user_ask_rule(command)
+    _ask_has_independent_finding = False
     if ask_pattern is not None:
         logger.info("User ask rule %r requires approval: %s",
                     ask_pattern, command[:200])
-        return _user_ask_gate(ask_pattern, command,
-                              approval_callback=approval_callback)
+        _is_also_dangerous, _, _ = detect_dangerous_command(command)
+        try:
+            from tools.tirith_security import check_command_security as _ccs
+            _also_tirith = _ccs(command).get("action") in ("block", "warn")
+        except ImportError:
+            _also_tirith = False
+        if not (_is_also_dangerous or _also_tirith):
+            return _user_ask_gate(ask_pattern, command,
+                                  approval_callback=approval_callback)
+        _ask_has_independent_finding = True
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
@@ -4515,7 +4655,15 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if (not is_cli and not is_gateway and not is_ask
+            and not _ask_has_independent_finding):
+        # An explicit PURE ask match overrides this historical auto-approve:
+        # its whole purpose is to force a human decision, so a bare-script /
+        # unattended context fails closed through the ask gate instead of
+        # silently approving here (blockers 1+3). A COMBINED match (ask +
+        # independent finding) skips this block entirely so the findings
+        # phase below assembles every reason; with no answer surface it
+        # surfaces pending_approval rather than an approval bypass.
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
@@ -4718,6 +4866,19 @@ def check_all_command_guards(command: str, env_type: str,
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
+
+    # Additive ask finding (see the pre-yolo block above): when this command
+    # reached the findings phase despite an ask match, surface the ask rule
+    # as its own warning line. A cached ask grant suppresses exactly this
+    # entry; it never suppresses the tirith/dangerous entries above.
+    if ask_pattern is not None and not is_approved(
+            session_key, f"ask_rule:{ask_pattern}"):
+        warnings.append((
+            f"ask_rule:{ask_pattern}",
+            f"user-defined ask rule '{ask_pattern}' (approvals.ask in "
+            "config.yaml) requires your approval",
+            False,
+        ))
 
     # Nothing to warn about
     if not warnings:
