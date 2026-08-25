@@ -491,8 +491,47 @@ def install_modify_other_keys_aliases() -> int:
     # created before this install (or in earlier tests) can't misparse.
     if changed:
         _clear_vt100_prefix_cache()
+    _install_printable_alias_data_fix()
 
     return changed
+
+
+def _install_printable_alias_data_fix() -> None:
+    """Make plain-string ``ANSI_SEQUENCES`` values typeable.
+
+    ``Vt100Parser`` always attaches the raw matched bytes as
+    ``KeyPress.data``, and the TextArea catch-all ``self-insert`` binding
+    types ``event.data`` — so an alias whose value is a plain printable
+    string can never work: ``ESC[27;2;70~`` -> ``'F'`` typed the raw
+    sequence ``[27;2;70~`` into the buffer instead of ``F`` (#94921).
+    Stock prompt_toolkit values are ``Keys`` enums (whose bindings ignore
+    data); only the aliases installed here use plain strings, so rewrite
+    the data to the key for exactly that shape: plain-``str`` key +
+    escape-prefixed raw data + printable key. Normal typing (key == data)
+    and ``Keys``-enum matches pass through untouched, and tuple
+    (Alt-style) recursion — whose second element carries ``""`` data — is
+    unaffected. Idempotent.
+    """
+    try:
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+    except ImportError:  # pragma: no cover - CLI-only extra
+        return
+    if getattr(Vt100Parser._call_handler, "_hermes_printable_alias_fix", False):
+        return
+    original = Vt100Parser._call_handler
+
+    def _call_handler(self, key, insert_text):
+        if (
+            type(key) is str
+            and insert_text.startswith("\x1b")
+            and key
+            and not key.startswith("\x1b")
+        ):
+            insert_text = key
+        return original(self, key, insert_text)
+
+    _call_handler._hermes_printable_alias_fix = True
+    Vt100Parser._call_handler = _call_handler
 
 
 def install_ignored_terminal_sequences() -> int:

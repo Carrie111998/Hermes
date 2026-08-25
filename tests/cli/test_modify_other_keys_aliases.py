@@ -479,6 +479,101 @@ def test_shift_letter_with_capslock_types_uppercase():
 
 def test_esc_key_with_numlock_is_escape():
     assert _parse("\x1b[27;129u") == [Keys.Escape]  # 1 + 128
+
+
+# ---------------------------------------------------------------------------
+# Plain-string aliases must carry data == key (#94921)
+# ---------------------------------------------------------------------------
+
+def _parse_presses(byte_seq: str):
+    """Like _parse but returns full KeyPress objects (key AND data)."""
+    out = []
+    parser = Vt100Parser(out.append)
+    for ch in byte_seq:
+        parser.feed(ch)
+    parser.flush()
+    return out
+
+
+SHIFT_LETTERS = [chr(c) for c in range(ord('A'), ord('Z') + 1)]
+
+
+@pytest.mark.parametrize("letter", SHIFT_LETTERS)
+def test_modify_other_keys_shift_letter_data_is_the_letter(letter):
+    """#94921: the VT100 parser attaches the raw matched bytes as
+    KeyPress.data and TextArea's self-insert types event.data — so a
+    plain-string alias whose data stays raw typed ``[27;2;70~`` into the
+    buffer instead of ``F``. The key must carry itself as data."""
+    presses = _parse_presses(f"\x1b[27;2;{ord(letter)}~")
+    assert len(presses) == 1
+    assert presses[0].key == letter
+    assert presses[0].data == letter, (
+        f"data={presses[0].data!r} would be typed literally"
+    )
+
+
+def test_modify_other_keys_shift_space_data_is_space():
+    """Shift+Space maps to a plain " " string — same data requirement."""
+    presses = _parse_presses("\x1b[27;2;32~")
+    assert len(presses) == 1
+    assert (presses[0].key, presses[0].data) == (" ", " ")
+
+
+def test_lock_bit_space_alias_data_is_space():
+    """The kitty lock-bit plain-key twins (e.g. Space with NumLock on,
+    ESC[32;129u) map to plain strings too — data must follow the key."""
+    presses = _parse_presses("\x1b[32;129u")
+    assert len(presses) == 1
+    assert (presses[0].key, presses[0].data) == (" ", " ")
+
+
+def test_plain_typing_data_unchanged():
+    """Ordinary typing (key == data already) and Keys-enum matches must
+    pass through the data fix untouched."""
+    presses = _parse_presses("ok")
+    assert [(p.key, p.data) for p in presses] == [("o", "o"), ("k", "k")]
+    # Keys-enum alias: data stays the raw sequence (bindings ignore it).
+    presses = _parse_presses("\x1b[27;5;99~")  # Ctrl+C
+    assert presses[0].key is Keys.ControlC
+    assert presses[0].data == "\x1b[27;5;99~"
+
+
+def test_alt_tuple_recursion_data_unchanged():
+    """Alt+letter aliases recurse through the tuple branch whose second
+    element carries "" data — the fix must not rewrite that."""
+    presses = _parse_presses("\x1b[27;3;97~")  # Alt+a
+    assert [(p.key, p.data) for p in presses] == [
+        (Keys.Escape, "\x1b[27;3;97~"),
+        ("a", ""),
+    ]
+
+
+def test_shift_letter_types_into_textarea_end_to_end():
+    """The reporter's programmatic repro: feed exactly what Ghostty sends
+    for Shift+F through a real pipe-input TextArea and assert the letter
+    lands in the buffer (not the raw sequence)."""
+    import asyncio
+
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.widgets import TextArea
+
+    async def _run(seq):
+        with create_pipe_input() as inp:
+            area = TextArea()
+            app = Application(layout=Layout(area), input=inp)
+            inp.send_text(seq)
+            task = asyncio.ensure_future(app.run_async())
+            await asyncio.sleep(0.25)
+            app.exit()
+            await task
+            return area.text
+
+    assert asyncio.get_event_loop().run_until_complete(
+        _run("\x1b[27;2;70~")
+    ) == "F"
+    assert asyncio.get_event_loop().run_until_complete(_run("q")) == "q"
     assert _parse("\x1b[27;133u") == [Keys.Escape]  # 5 + 128
 
 
