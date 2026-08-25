@@ -228,6 +228,15 @@ class WeComAdapter(BasePlatformAdapter):
         # WeCom stream lifetime: server rejects updates after ~6 minutes
         # (errcode 846608). Keepalives do NOT extend it. Use 330s for margin.
         self.THINKING_STREAM_MAX_S = 330.0
+        # Turn-ended fence: chat_id -> monotonic ts of the final delivery of
+        # the last turn (stream finish OR markdown fallback). send_typing
+        # refuses to open a fresh bubble shortly after an end with no new
+        # inbound message — stale progress-loop stragglers would otherwise
+        # orphan a placeholder nobody closes.
+        self._turn_ended_at: Dict[str, float] = {}
+        # chat_id -> monotonic ts when the latest inbound message was seen
+        # (re-arms the fence above).
+        self._req_seen_at: Dict[str, float] = {}
         # Opt-out switch: platforms.wecom.extra.thinking_bubble (default on).
         self._thinking_bubble_enabled = bool(extra.get("thinking_bubble", True))
 
@@ -996,6 +1005,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
             self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
+        # A genuinely new inbound message re-arms the turn-ended fence.
+        self._req_seen_at[normalized_chat_id] = time.monotonic()
+        self._turn_ended_at.pop(normalized_chat_id, None)
 
     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
         normalized = str(reply_to or "").strip()
@@ -1493,6 +1505,8 @@ class WeComAdapter(BasePlatformAdapter):
             ok = await self._write_stream(
                 chat_id, content, finish=is_final)
             if ok:
+                if is_final:
+                    self._turn_ended_at[chat_id] = time.monotonic()
                 return SendResult(
                     success=True,
                     message_id=st["id"],
@@ -1527,6 +1541,11 @@ class WeComAdapter(BasePlatformAdapter):
         if error:
             return SendResult(success=False, error=error)
 
+        # Final markdown delivery (incl. expired-stream fallback) ends the
+        # turn visually — arm the fence so straggler send_typing calls don't
+        # open an orphan bubble. Mid-turn markdown (no _wecom_final) doesn't.
+        if is_final:
+            self._turn_ended_at[chat_id] = time.monotonic()
         return SendResult(
             success=True,
             message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
@@ -1643,6 +1662,21 @@ class WeComAdapter(BasePlatformAdapter):
         st = self._thinking_streams.get(chat_id)
         if st is not None:
             return  # already open; its keepalive task is running
+        # Turn-ended fence: if the previous turn's final delivery just happened
+        # (stream finish OR markdown fallback) and no NEW inbound message has
+        # arrived since, a send_typing here is a stale progress-loop straggler —
+        # opening a bubble now would orphan a placeholder nobody will ever
+        # close. The fence clears when the next inbound message re-arms
+        # _last_chat_req_ids (line ~996), i.e. a genuinely new turn began.
+        ended = self._turn_ended_at.get(chat_id)
+        if ended is not None:
+            if time.monotonic() - ended < 15.0 and \
+                    self._req_seen_at.get(chat_id, 0.0) < ended:
+                logger.debug(
+                    "[%s] suppressing typing bubble: turn for %s already "
+                    "delivered; no new inbound since", self.name, chat_id)
+                return
+            self._turn_ended_at.pop(chat_id, None)
 
         stream_id = f"stream_{uuid.uuid4().hex[:16]}"
 
