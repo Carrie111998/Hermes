@@ -862,9 +862,7 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
 }
 
 export type SessionEventOwnerRouteResolution =
-  | { kind: 'ambiguous' }
-  | { kind: 'known'; route: SessionProfileRoute }
-  | { kind: 'unknown' }
+  { kind: 'ambiguous' } | { kind: 'known'; route: SessionProfileRoute } | { kind: 'unknown' }
 
 /**
  * Resolve the authoritative owner route for one registry event. The registry
@@ -890,54 +888,77 @@ export function sessionEventOwnerRoute(
   const sourceMatches = (route: SessionProfileRoute | undefined) =>
     route?.connectionId.trim() === connectionId && (route.profile.trim() || 'default') === profile
 
-  const tileRoutes = $sessionTiles
+  const distinctRouteResolution = (routes: SessionProfileRoute[]): SessionEventOwnerRouteResolution => {
+    const distinctRoutes = new Map<string, SessionProfileRoute>()
+
+    for (const route of routes) {
+      const routeProfile = route.profile.trim() || 'default'
+      const targetProfile = route.targetProfile?.trim() || routeProfile
+      distinctRoutes.set(JSON.stringify([route.connectionId.trim(), routeProfile, targetProfile]), route)
+    }
+
+    if (distinctRoutes.size > 1) {
+      return { kind: 'ambiguous' }
+    }
+
+    const route = distinctRoutes.values().next().value
+
+    return route ? { kind: 'known', route } : { kind: 'unknown' }
+  }
+
+  const sourceTiles = $sessionTiles
     .get()
-    .filter(tile => {
-      // A live runtime binding is the strongest identity. Compression can
-      // rotate the backend's stored id while the mounted tile intentionally
-      // retains the durable lineage id.
-      if (runtimeId && tile.runtimeId) {
-        return tile.runtimeId === runtimeId
-      }
+    .filter((tile): tile is SessionTile & { ownerRoute: SessionProfileRoute } =>
+      Boolean(tile.ownerRoute && sourceMatches(tile.ownerRoute))
+    )
 
-      // Fall back to durable identity only when the event has no runtime id or
-      // the tile has not acquired one. Never let a matching stored id override
-      // two explicit, differing runtime bindings.
-      const durableId = storedId || runtimeId
+  // Ownership confidence, strongest first:
+  // 1. An exact live runtime binding is authoritative even if compression has
+  //    rotated the stored id retained by the mounted tile.
+  const exactRuntimeResolution = distinctRouteResolution(
+    sourceTiles.filter(tile => Boolean(runtimeId && tile.runtimeId === runtimeId)).map(tile => tile.ownerRoute)
+  )
 
-      return Boolean(durableId && tile.storedSessionId === durableId)
-    })
-    .map(tile => tile.ownerRoute)
-    .filter((route): route is SessionProfileRoute => sourceMatches(route))
+  if (exactRuntimeResolution.kind !== 'unknown') {
+    return exactRuntimeResolution
+  }
 
-  if (tileRoutes.length > 1) {
+  const durableId = storedId || runtimeId
+
+  // 2. A durable-id match with a different explicit runtime is negative
+  //    ownership evidence. It globally blocks every lower-confidence candidate
+  //    (including stale hints) unless the exact-runtime rung above resolved.
+  const hasConflictingRuntime = Boolean(
+    runtimeId &&
+    durableId &&
+    sourceTiles.some(
+      tile => tile.storedSessionId === durableId && Boolean(tile.runtimeId && tile.runtimeId !== runtimeId)
+    )
+  )
+
+  if (hasConflictingRuntime) {
     return { kind: 'ambiguous' }
   }
 
-  if (tileRoutes.length === 1) {
-    return { kind: 'known', route: tileRoutes[0] }
+  // 3. Durable tile identity is eligible only when the event has no runtime or
+  //    the tile has not bound one yet.
+  const durableTileResolution = distinctRouteResolution(
+    sourceTiles
+      .filter(tile => Boolean(durableId && tile.storedSessionId === durableId && (!runtimeId || !tile.runtimeId)))
+      .map(tile => tile.ownerRoute)
+  )
+
+  if (durableTileResolution.kind !== 'unknown') {
+    return durableTileResolution
   }
 
+  // 4. Hints are the final rung and are considered only after stronger tile
+  //    evidence has produced neither an owner nor a contradiction.
   const hintRoutes = [...new Set([storedId, runtimeId].filter(Boolean))]
     .map(id => getSessionOwnerHint(id, { connectionId, profile }))
     .filter((route): route is SessionProfileRoute => Boolean(route))
 
-  if (hintRoutes.length > 1) {
-    const first = hintRoutes[0]
-
-    const sameRoute = hintRoutes.every(
-      route =>
-        route.connectionId === first.connectionId &&
-        route.profile === first.profile &&
-        route.targetProfile === first.targetProfile
-    )
-
-    if (!sameRoute) {
-      return { kind: 'ambiguous' }
-    }
-  }
-
-  return hintRoutes[0] ? { kind: 'known', route: hintRoutes[0] } : { kind: 'unknown' }
+  return distinctRouteResolution(hintRoutes)
 }
 
 /**

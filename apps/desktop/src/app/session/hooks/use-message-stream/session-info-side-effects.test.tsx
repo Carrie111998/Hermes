@@ -7,8 +7,8 @@ import { isTargetSessionBusy } from '@/app/session/hooks/use-prompt-actions/util
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
-import { setCurrentModel, setCurrentProvider } from '@/store/session'
-import { $sessionTiles } from '@/store/session-states'
+import { setCurrentModel, setCurrentProvider, setSessionOwnerHint } from '@/store/session'
+import { $sessionTiles, sessionEventOwnerRoute } from '@/store/session-states'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from './utils'
@@ -241,7 +241,56 @@ describe('session.info model-options invalidation gating', () => {
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: socketKey })
   })
 
-  it('rejects a stale alias tile when both runtime ids differ despite a matching stored id', () => {
+  it('keeps an unbound tile eligible for durable-id fallback', () => {
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+    const ownerRoute = {
+      connectionId: 'remote-owner',
+      mode: 'remote' as const,
+      profile: 'bot-alias',
+      targetProfile: 'backend-bot'
+    }
+
+    const targetKey = modelOptionsQueryKey(
+      { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile },
+      ACTIVE_SID
+    )
+
+    $sessionTiles.set([{ ownerRoute, storedSessionId: 'stored-unbound-bot' }])
+    sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
+    invalidate.mockClear()
+
+    act(() =>
+      stream.handleEvent({
+        connectionId: ownerRoute.connectionId,
+        payload: { model: 'm2', provider: 'p1', running: true, stored_session_id: 'stored-unbound-bot' },
+        profile: ownerRoute.profile,
+        session_id: ACTIVE_SID,
+        type: 'session.info'
+      })
+    )
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: targetKey })
+  })
+
+  it('prefers an unambiguous exact runtime route over contradictory durable evidence', () => {
+    const source = { connectionId: 'remote-owner', profile: 'bot-alias' }
+    const exactRoute = { ...source, mode: 'remote' as const, targetProfile: 'backend-exact' }
+    const staleRoute = { ...source, mode: 'remote' as const, targetProfile: 'backend-stale' }
+
+    $sessionTiles.set([
+      { ownerRoute: exactRoute, runtimeId: ACTIVE_SID, storedSessionId: 'stored-lineage-root' },
+      { ownerRoute: staleRoute, runtimeId: 'different-runtime', storedSessionId: 'stored-rotated-tip' }
+    ])
+
+    expect(sessionEventOwnerRoute(ACTIVE_SID, 'stored-rotated-tip', source)).toEqual({
+      kind: 'known',
+      route: exactRoute
+    })
+  })
+
+  it('fails closed when both explicit runtime ids differ despite a matching stored id', () => {
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
 
@@ -251,16 +300,6 @@ describe('session.info model-options invalidation gating', () => {
       profile: 'bot-alias',
       targetProfile: 'stale-backend-bot'
     }
-
-    const socketKey = modelOptionsQueryKey(
-      { connectionId: ownerRoute.connectionId, profile: ownerRoute.profile },
-      ACTIVE_SID
-    )
-
-    const staleTargetKey = modelOptionsQueryKey(
-      { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile },
-      ACTIVE_SID
-    )
 
     $sessionTiles.set([{ ownerRoute, runtimeId: 'stale-runtime', storedSessionId: 'stored-shared' }])
     sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
@@ -276,8 +315,41 @@ describe('session.info model-options invalidation gating', () => {
       })
     )
 
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: socketKey })
-    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: staleTargetKey })
+    expect(invalidate).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when a stale stored-id hint contradicts an explicit tile runtime', () => {
+    setApiRequestConnection('ambient-remote')
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    const storedSessionId = 'stored-stale-hint-conflict'
+
+    const ownerRoute = {
+      connectionId: 'remote-owner',
+      mode: 'remote' as const,
+      profile: 'bot-alias',
+      targetProfile: 'stale-backend-bot'
+    }
+
+    $sessionTiles.set([{ ownerRoute, runtimeId: 'different-runtime', storedSessionId }])
+    setSessionOwnerHint(storedSessionId, ownerRoute)
+
+    expect(sessionEventOwnerRoute(ACTIVE_SID, storedSessionId, ownerRoute)).toEqual({ kind: 'ambiguous' })
+
+    sessionInfo(ACTIVE_SID, { model: 'm1', provider: 'p1', running: true })
+    invalidate.mockClear()
+
+    act(() =>
+      stream.handleEvent({
+        connectionId: ownerRoute.connectionId,
+        payload: { model: 'm2', provider: 'p1', running: true, stored_session_id: storedSessionId },
+        profile: ownerRoute.profile,
+        session_id: ACTIVE_SID,
+        type: 'session.info'
+      })
+    )
+
+    expect(invalidate).not.toHaveBeenCalled()
   })
 
   it('fails closed instead of invalidating a guessed catalog when exact owner routes conflict', () => {
