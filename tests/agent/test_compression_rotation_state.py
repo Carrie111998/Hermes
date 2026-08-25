@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor, _DB_PERSISTED_MARKER
+from agent.conversation_compression import CompressionCommitFence
 from hermes_state import SessionDB
 
 
@@ -385,6 +386,137 @@ class TestRotationChildFlushDedup:
         assert _count_rows(
             child_rows, content="live tool question", role="user"
         ) == 1
+        assert _count_rows(child_rows, content="tool result", role="tool") == 1
+
+    def test_mid_tool_loop_rows_do_not_duplicate_after_failed_parent_flush_direct_path(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ROT_TOOL_LOOP_DIRECT"
+        db.create_session(parent, source="cli")
+        db.append_message(parent, "user", "persisted question")
+        db.append_message(parent, "assistant", "persisted answer")
+
+        loaded = db.get_messages_as_conversation(parent)
+        assistant_turn = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        }
+        tool_turn = {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "tool result",
+        }
+        messages = [
+            *loaded,
+            {"role": "user", "content": "live tool question"},
+            assistant_turn,
+            tool_turn,
+        ]
+
+        agent = _build_agent_with_db(db, parent)
+        agent._persist_user_message_idx = len(loaded)
+        agent.context_compressor.compress.return_value = [
+            copy.deepcopy(assistant_turn),
+            copy.deepcopy(tool_turn),
+        ]
+
+        real_flush = agent._flush_messages_to_session_db
+        with patch.object(
+            agent,
+            "_flush_messages_to_session_db",
+            side_effect=RuntimeError("simulated parent flush failure"),
+        ):
+            _returned, _ = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=120_000,
+                commit_fence=CompressionCommitFence(),
+            )
+
+        assert agent.session_id != parent
+        real_flush(messages, conversation_history=loaded)
+
+        child_rows = db.get_messages_as_conversation(
+            agent.session_id, include_inactive=True
+        )
+        assert _count_rows(
+            child_rows, content="live tool question", role="user"
+        ) == 1
+        assert _count_rows(child_rows, content="", role="assistant") == 1
+        assert _count_rows(child_rows, content="tool result", role="tool") == 1
+
+    def test_timestampless_duplicate_content_rows_are_all_stamped(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ROT_DUPLICATE_CONTENT"
+        db.create_session(parent, source="cli")
+        db.append_message(parent, "user", "persisted question")
+        db.append_message(parent, "assistant", "persisted answer")
+
+        loaded = db.get_messages_as_conversation(parent)
+        assistant_turn = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        }
+        tool_turn = {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "tool result",
+        }
+        messages = [
+            *loaded,
+            {"role": "user", "content": "live tool question"},
+            assistant_turn,
+            copy.deepcopy(assistant_turn),
+            tool_turn,
+            copy.deepcopy(tool_turn),
+        ]
+
+        agent = _build_agent_with_db(db, parent)
+        agent._persist_user_message_idx = len(loaded)
+        agent.context_compressor.compress.return_value = [
+            copy.deepcopy(assistant_turn),
+            copy.deepcopy(tool_turn),
+        ]
+
+        real_flush = agent._flush_messages_to_session_db
+        with patch.object(
+            agent,
+            "_flush_messages_to_session_db",
+            side_effect=RuntimeError("simulated parent flush failure"),
+        ):
+            _returned, _ = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=120_000,
+                commit_fence=CompressionCommitFence(),
+            )
+
+        real_flush(messages, conversation_history=loaded)
+
+        child_rows = db.get_messages_as_conversation(
+            agent.session_id, include_inactive=True
+        )
+        assert _count_rows(
+            child_rows, content="live tool question", role="user"
+        ) == 1
+        assert _count_rows(child_rows, content="", role="assistant") == 1
         assert _count_rows(child_rows, content="tool result", role="tool") == 1
 
     def test_rotation_stamps_diverged_session_messages_entry_only_when_it_matches(
