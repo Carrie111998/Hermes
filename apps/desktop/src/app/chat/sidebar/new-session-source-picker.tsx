@@ -45,8 +45,8 @@ export function NewSessionSourcePicker({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-64" side="right">
-        <DropdownMenuLabel className="px-3 py-2">
+      <DropdownMenuContent align="start" className="w-64 p-1" side="right">
+        <DropdownMenuLabel className="px-2 py-1.5">
           {t.settings.connections.title}
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
@@ -67,17 +67,33 @@ export function NewSessionSourcePicker({
             <Fragment key={connection.id}>
               {index > 0 && <DropdownMenuSeparator className="my-0.5" />}
               <DropdownMenuItem
-                className={cn('flex items-center gap-2 px-3 py-1.5', isActive && 'text-foreground')}
+                aria-pressed={isActive}
+                className={cn(
+                  'flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5',
+                  isActive && 'bg-(--ui-control-active-background) text-foreground'
+                )}
                 onSelect={() => onPick(connection.id)}
               >
-                <Icon className="size-4 shrink-0 text-(--ui-text-tertiary)" />
+                <Icon
+                  className={cn(
+                    'size-4 shrink-0',
+                    isActive ? 'text-(--ui-accent)' : 'text-(--ui-text-tertiary)'
+                  )}
+                />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[0.8125rem] leading-tight">{connection.label}</span>
-                  <span className="block truncate text-[0.6875rem] leading-tight text-(--ui-text-tertiary)">
+                  <span className="block truncate text-[0.8125rem] leading-tight">
+                    {connection.label}
+                  </span>
+                  <span
+                    className={cn(
+                      'block truncate text-[0.6875rem] leading-tight',
+                      isActive ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-tertiary)'
+                    )}
+                  >
                     {kindLabel}
                   </span>
                 </span>
-                {isActive && <Check className="size-4 shrink-0 text-(--ui-text-tertiary)" />}
+                {isActive && <Check className="size-4 shrink-0 text-(--ui-accent)" />}
               </DropdownMenuItem>
             </Fragment>
           )
