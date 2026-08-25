@@ -77,9 +77,13 @@ def _builtin_gateway_liveness() -> Optional[bool]:
     try:
         if _active_cron_provider_name() != "builtin":
             return True  # external provider fires jobs without the gateway
-        from hermes_cli.gateway import find_gateway_pids
+        # Use the pid-file check (no self-exclusion) rather than
+        # find_gateway_pids(): that helper excludes os.getpid(), and when the
+        # cron tool runs INSIDE the gateway process os.getpid() IS the gateway
+        # PID, so it always self-excluded and reported a false "not running".
+        from gateway.status import is_gateway_running
 
-        return bool(find_gateway_pids())
+        return is_gateway_running()
     except Exception:
         return None
 
