@@ -280,6 +280,11 @@ def _cua_permission_mode(session_id: str) -> str:
 def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
     """True when config already carries the authorization for this action.
 
+    In ``bounded`` mode, a readable version-3 capability manifest is the
+    durable authorization for the run. Hermes only recognizes that reviewed
+    boundary here; cua-driver remains authoritative for every declared tool
+    and resource and fails closed when the manifest does not allow the call.
+
     ``computer_use.grant_existing_profile`` is a durable, file-backed opt-in
     that the model can never set. When it is on, an extra runtime prompt for
     the existing-profile prepare asks the user to re-authorize what they
@@ -287,18 +292,30 @@ def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
     non-interactive run, where the prompt has nobody to answer it and the
     call dies on approval timeout instead of attaching.
 
-    Scope is deliberately narrow: only the existing-profile prepare, only
-    when the grant is present. Isolated-profile launches still prompt, and
-    any resolution failure falls closed to prompting.
+    Outside bounded mode, scope stays deliberately narrow: only the
+    existing-profile prepare, only when the grant is present. Any resolution
+    failure falls closed to prompting.
     """
-    if action != "cua_browser_prepare":
-        return False
-    if args.get("profile_mode") != "existing_profile":
-        return False
     try:
-        from tools.computer_use.cua_backend import _cua_grant_existing_profile
+        from tools.computer_use.cua_backend import (
+            _cua_capability_manifest,
+            _cua_configured_permission_mode,
+            _cua_grant_existing_profile,
+            _manifest_is_mode_independent,
+        )
 
-        return _cua_grant_existing_profile() is True
+        if _cua_configured_permission_mode() == "bounded":
+            manifest = _cua_capability_manifest()
+            if not manifest:
+                return False
+            manifest = os.path.abspath(os.path.expanduser(manifest))
+            return _manifest_is_mode_independent(manifest)
+
+        return (
+            action == "cua_browser_prepare"
+            and args.get("profile_mode") == "existing_profile"
+            and _cua_grant_existing_profile() is True
+        )
     except Exception:
         return False
 
