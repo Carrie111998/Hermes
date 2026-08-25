@@ -24692,6 +24692,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _transport_profile = self._transport_owner_profile(context.source) or ""
         except Exception:
             _transport_profile = ""
+        try:
+            _transport_slot = self._ingress_transport_slot(context.source) or ""
+        except Exception:
+            _transport_slot = ""
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -24708,6 +24712,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             transport_profile=_transport_profile,
+            transport_slot=_transport_slot,
             async_delivery=_async_delivery,
             cron_session="",
         )
@@ -25357,7 +25362,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = None
         _return_address = (
             "platform=%s chat_type=%s chat_id=%s thread=%s scope=%s "
-            "runtime profile=%r transport provenance=%r "
+            "runtime profile=%r transport provenance=%r slot=%r "
             "(multiplex profiles registered: %s)" % (
                 platform_name,
                 getattr(source, "chat_type", None),
@@ -25366,6 +25371,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(source, "scope_id", None),
                 getattr(source, "profile", None),
                 str(evt.get("transport_profile") or "") or None,
+                str(evt.get("transport_slot") or "") or None,
                 sorted(getattr(self, "_profile_adapters", None) or {}) or "none",
             )
         )
@@ -25374,7 +25380,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # drops the completion or answers from another bot.
         _transport_profile = str(evt.get("transport_profile") or "").strip() or None
         _provenance_is_default = _transport_profile == TRANSPORT_PROFILE_DEFAULT
-        if _transport_profile and not _provenance_is_default:
+        # Owner map plus slot is exact: it names the one adapter the turn
+        # arrived on, so no alias resolution runs. Without the slot, a default
+        # owner and a relay-fronted platform are indistinguishable from a
+        # native one, and resolve_delivery_transport picks the native adapter
+        # by contract — a completion out of a different bot and credential.
+        _transport_slot = str(evt.get("transport_slot") or "").strip() or None
+        if _transport_slot:
+            try:
+                adapter = self._adapter_for_transport_slot(
+                    _transport_slot, _transport_profile,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Transport-slot adapter resolution failed for %s/%s: %s",
+                    _transport_profile, _transport_slot, exc,
+                )
+                adapter = None
+            if adapter is None:
+                logger.warning(
+                    "Dropping watch notification for process %s: ingress "
+                    "transport %r/%r is no longer live — %s",
+                    evt.get("session_id", "unknown"),
+                    _transport_profile,
+                    _transport_slot,
+                    _return_address,
+                )
+                return None
+        elif _transport_profile and not _provenance_is_default:
             # A named profile owns the transport, so fail closed on a miss
             # rather than delivering out of another profile's bot.
             try:
@@ -26261,6 +26294,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # turn arrived on; delivery re-resolves the latter.
                         "profile": watcher.get("profile", ""),
                         "transport_profile": watcher.get("transport_profile", ""),
+                        "transport_slot": watcher.get("transport_slot", ""),
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
                         "exit_code": session.exit_code,

@@ -36,6 +36,7 @@ def matrix_turn():
         session_key="agent:alpha:matrix:group:!room:example.org",
         profile="alpha",
         transport_profile="default",
+        transport_slot="matrix",
     )
     try:
         yield
@@ -55,6 +56,8 @@ def slack_turn():
         session_key="agent:main:slack:group:T0WORKSPACE:C0CHANNEL:U0USER",
         profile="",
         transport_profile="default",
+        # Relay ingress: the owner map is the default one, the slot is not.
+        transport_slot="relay",
     )
     try:
         yield
@@ -81,6 +84,7 @@ def test_capture_records_the_slack_workspace_scope(slack_turn):
     assert origin["scope_id"] == "T0WORKSPACE"
     assert origin["chat_id"] == "C0CHANNEL"
     assert origin["transport_profile"] == "default"
+    assert origin["transport_slot"] == "relay"
 
 
 def test_capture_outside_a_gateway_turn_is_empty():
@@ -147,6 +151,10 @@ def test_slack_completion_event_routes_to_the_right_chat(monkeypatch, slack_turn
 
     assert evt["chat_id"] == "C0CHANNEL"
     assert evt["scope_id"] == "T0WORKSPACE"
+    assert evt["transport_slot"] == "relay", (
+        "the completion would be resolved by the native-wins alias router and "
+        "leave through a different Slack transport than the turn arrived on"
+    )
 
 
 def test_routing_address_survives_a_restart(hermes_home, matrix_turn, monkeypatch):
@@ -170,6 +178,7 @@ def test_routing_address_survives_a_restart(hermes_home, matrix_turn, monkeypatc
     persisted = json.loads(task_json)
     assert persisted["chat_id"] == "!room:example.org"
     assert persisted["transport_profile"] == "default"
+    assert persisted["transport_slot"] == "matrix"
 
     # Restart: the owning process is gone.
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
@@ -187,3 +196,4 @@ def test_routing_address_survives_a_restart(hermes_home, matrix_turn, monkeypatc
     assert event["chat_id"] == "!room:example.org"
     assert event["profile"] == "alpha"
     assert event["transport_profile"] == "default"
+    assert event["transport_slot"] == "matrix"

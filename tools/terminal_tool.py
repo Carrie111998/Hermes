@@ -3494,6 +3494,12 @@ def terminal_tool(
                             proc_session.watcher_transport_profile = _gse(
                                 "HERMES_SESSION_TRANSPORT_PROFILE", ""
                             )
+                            # ...and which of that profile's adapter slots
+                            # received it, so a relay-fronted platform is not
+                            # answered by a native adapter for the same one.
+                            proc_session.watcher_transport_slot = _gse(
+                                "HERMES_SESSION_TRANSPORT_SLOT", ""
+                            )
                             # Stamp the spawning conversation's session-db id
                             # so the gateway's completion pre-flight
                             # (_classify_completion_target) can drop the
@@ -3544,6 +3550,7 @@ def terminal_tool(
                             "message_id": proc_session.watcher_message_id,
                             "profile": proc_session.watcher_profile,
                             "transport_profile": proc_session.watcher_transport_profile,
+                            "transport_slot": proc_session.watcher_transport_slot,
                             "notify_on_complete": True,
                             "parent_session_id": proc_session.parent_session_id,
                         })

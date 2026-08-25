@@ -410,11 +410,20 @@ async def test_relay_ingress_records_default_provenance():
         "a relayed turn recorded no transport provenance, so its completion "
         "would fall back to the runtime profile's own adapter"
     )
+    assert runner._ingress_transport_slot(source) == "relay", (
+        "the owner map alone cannot tell relay ingress from native ingress "
+        "when both front the same logical platform"
+    )
 
 
 @pytest.mark.asyncio
-async def test_relay_completion_is_not_answered_by_a_secondary_bot():
-    """That provenance sends the completion back out the relay chain."""
+async def test_relay_completion_is_delivered_through_the_relay():
+    """That provenance sends the completion back out the relay chain.
+
+    The relay stub deliberately does not advertise ``fronts_platform``: the
+    recorded slot is exact provenance, so delivery must not depend on the
+    alias resolver being able to re-derive it.
+    """
     relay = _Adapter("relay")
     alpha_slack = _Adapter("slack-alpha")
     runner = _runner(
@@ -430,11 +439,19 @@ async def test_relay_completion_is_not_answered_by_a_secondary_bot():
         "scope_id": "T0WORKSPACE",
         "profile": "alpha",
         "transport_profile": "default",
+        "transport_slot": "relay",
         "status": "completed",
     }
 
-    await runner._inject_watch_notification("[task finished]", evt)
+    result = await runner._inject_watch_notification("[task finished]", evt)
 
+    assert result is True, (
+        f"injection returned {result!r} — the completion was dropped, which a "
+        "'not the other bot' assertion alone would have passed"
+    )
+    assert relay.handle_message.await_count == 1, (
+        "the completion did not leave through the relay the turn arrived on"
+    )
     assert alpha_slack.handle_message.await_count == 0, (
         "delivered through the secondary profile's own Slack bot although the "
         "originating turn arrived over the shared relay transport"

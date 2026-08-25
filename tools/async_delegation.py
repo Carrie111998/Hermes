@@ -214,6 +214,7 @@ _ROUTING_ORIGIN_FIELDS = (
     ("user_name", "HERMES_SESSION_USER_NAME"),
     ("profile", "HERMES_SESSION_PROFILE"),
     ("transport_profile", "HERMES_SESSION_TRANSPORT_PROFILE"),
+    ("transport_slot", "HERMES_SESSION_TRANSPORT_SLOT"),
 )
 
 _ROUTING_ORIGIN_KEYS = tuple(key for key, _ in _ROUTING_ORIGIN_FIELDS)

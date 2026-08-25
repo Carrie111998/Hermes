@@ -109,6 +109,13 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 _SESSION_TRANSPORT_PROFILE: ContextVar = ContextVar(
     "HERMES_SESSION_TRANSPORT_PROFILE", default=_UNSET
 )
+# Which adapter slot inside that profile's map received the turn, as a platform
+# value. Distinct from ``_SESSION_PLATFORM``, the logical platform used for the
+# send: a Slack turn arriving over Relay is ``relay`` here and ``slack`` there.
+# "" means the ingress transport was not identifiable.
+_SESSION_TRANSPORT_SLOT: ContextVar = ContextVar(
+    "HERMES_SESSION_TRANSPORT_SLOT", default=_UNSET
+)
 _BROWSER_CONTROL_PRINCIPAL: ContextVar = ContextVar(
     "HERMES_BROWSER_CONTROL_PRINCIPAL", default=_UNSET
 )
@@ -165,6 +172,7 @@ _VAR_MAP = {
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_SESSION_TRANSPORT_PROFILE": _SESSION_TRANSPORT_PROFILE,
+    "HERMES_SESSION_TRANSPORT_SLOT": _SESSION_TRANSPORT_SLOT,
     "HERMES_BROWSER_CONTROL_PRINCIPAL": _BROWSER_CONTROL_PRINCIPAL,
     "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY": _BROWSER_CONTROL_TRANSPORT_FAMILY,
     "HERMES_CRON_SESSION": _CRON_SESSION,
@@ -245,6 +253,7 @@ def set_session_vars(
     message_id: str = "",
     profile: str = "",
     transport_profile: str = "",
+    transport_slot: str = "",
     browser_control_principal: str = "",
     browser_control_transport_family: str = "",
     cwd: str = "",
@@ -293,6 +302,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_TRANSPORT_PROFILE.set(transport_profile),
+        _SESSION_TRANSPORT_SLOT.set(transport_slot),
         _BROWSER_CONTROL_PRINCIPAL.set(browser_control_principal),
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
         _CRON_SESSION.set(cron_session),
@@ -335,6 +345,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _SESSION_TRANSPORT_PROFILE,
+        _SESSION_TRANSPORT_SLOT,
         _BROWSER_CONTROL_PRINCIPAL,
         _BROWSER_CONTROL_TRANSPORT_FAMILY,
         _CRON_SESSION,

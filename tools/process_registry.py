@@ -390,6 +390,7 @@ def _watcher_return_address(session: "ProcessSession") -> Dict[str, Any]:
         "message_id": session.watcher_message_id,
         "profile": session.watcher_profile,
         "transport_profile": session.watcher_transport_profile,
+        "transport_slot": session.watcher_transport_slot,
     }
 
 
@@ -431,6 +432,10 @@ class ProcessSession:
     # runtimes. A name, never an adapter object, so it survives reconnects and
     # restarts and is re-resolved to whatever adapter is live at completion.
     watcher_transport_profile: str = ""
+    # Which adapter slot in that map received it, as a platform value: "relay"
+    # for relay ingress, the platform's own value for native ingress. Owner
+    # alone cannot tell the two apart when both front the same platform.
+    watcher_transport_slot: str = ""
     watcher_user_id: str = ""
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
@@ -2782,6 +2787,7 @@ class ProcessRegistry:
                             "watcher_scope_id": s.watcher_scope_id,
                             "watcher_profile": s.watcher_profile,
                             "watcher_transport_profile": s.watcher_transport_profile,
+                            "watcher_transport_slot": s.watcher_transport_slot,
                             "watcher_user_id": s.watcher_user_id,
                             "watcher_user_name": s.watcher_user_name,
                             "watcher_thread_id": s.watcher_thread_id,
@@ -2885,6 +2891,7 @@ class ProcessRegistry:
                 watcher_scope_id=entry.get("watcher_scope_id", ""),
                 watcher_profile=entry.get("watcher_profile", ""),
                 watcher_transport_profile=entry.get("watcher_transport_profile", ""),
+                watcher_transport_slot=entry.get("watcher_transport_slot", ""),
                 watcher_user_id=entry.get("watcher_user_id", ""),
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),

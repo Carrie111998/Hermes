@@ -235,6 +235,41 @@ class GatewayAuthorizationMixin:
                 return profile
         return None
 
+    def _ingress_transport_slot(self, source) -> Optional[str]:
+        """Return the adapter-map key the turn's receiving adapter sits under.
+
+        ``_transport_owner_profile`` names which map owns the adapter; this
+        names which slot inside that map received the turn. The two are
+        separate dimensions wherever an alias exists: a Slack turn arriving
+        over Relay is registered under ``Platform.RELAY`` while the source
+        keeps ``slack`` as its logical platform, and a deployment may run both
+        (``GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS``). ``None`` means no live
+        transport provenance, so the caller keeps alias resolution.
+        """
+        if self._registered_transport_adapter(source) is not None:
+            # Registration was found under the source's own platform key.
+            platform = getattr(source, "platform", None)
+            value = getattr(platform, "value", platform)
+            return str(value) if value else None
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            return Platform.RELAY.value
+        return None
+
+    def _adapter_for_transport_slot(self, transport_slot, transport_profile):
+        """Re-resolve the live adapter for a recorded owner + slot pair.
+
+        Exact provenance, so the lookup is the recorded slot rather than the
+        logical platform: no alias resolution, and a miss means the ingress
+        transport is gone and the caller must fail closed.
+        """
+        if not transport_slot:
+            return None
+        try:
+            platform = Platform(str(transport_slot))
+        except (ValueError, KeyError):
+            return None
+        return self._authorization_adapter(platform, transport_profile or None)
+
     def _adapter_for_transport_profile(self, platform, transport_profile):
         """Re-resolve the currently live adapter for a recorded provenance token.
 
