@@ -576,6 +576,9 @@ def collect_unknown_config_keys(raw_config: dict | None) -> list[str]:
 
     _walk(raw_config, DEFAULT_CONFIG)
     return unknown
+
+
+def collect_deprecated_config_keys(raw_config: dict | None) -> list[tuple[str, str]]:
     """Return ``(legacy_path, replacement)`` for deprecated keys present in *raw_config*.
 
     Only keys that appear in the on-disk YAML are reported (raw file load, not
