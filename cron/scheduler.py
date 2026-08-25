@@ -2400,6 +2400,19 @@ def _relay_fronted_delivery_platforms(connected: set) -> set:
         return set()
 
 
+def _proxy_fronted_delivery_platforms(connected: set) -> set:
+    """Logical platforms deliverable through a connected API proxy outbox."""
+    if "api_server" not in connected:
+        return set()
+    try:
+        from gateway.proxy_outbox import enabled_platforms
+
+        return enabled_platforms()
+    except Exception:
+        logger.debug("proxy outbox platform lookup failed", exc_info=True)
+        return set()
+
+
 def cron_delivery_targets() -> list[dict]:
     """Return the platforms a cron job can auto-deliver to.
 
@@ -2421,6 +2434,7 @@ def cron_delivery_targets() -> list[dict]:
         gateway_config = load_gateway_config()
         connected = {p.value for p in gateway_config.get_connected_platforms()}
         connected |= _relay_fronted_delivery_platforms(connected)
+        connected |= _proxy_fronted_delivery_platforms(connected)
     except Exception:
         logger.debug("cron_delivery_targets: gateway config unavailable", exc_info=True)
         connected = set()
@@ -3417,12 +3431,11 @@ def _deliver_result(
             pconfig = config.platforms.get(platform)
             runtime_adapter = None
 
-        if transport is not None and transport.is_relay:
-            # A relay transport carries the RELAY adapter's config, and
-            # resolve_delivery_transport already applied relay's enablement
-            # rule (config block absent OR enabled). The logical platform is
-            # deliberately NOT natively enabled in a relay-fronted deployment
-            # (its credential lives in the connector), so the native
+        if transport is not None and transport.forwarded:
+            # A forwarding transport carries its own adapter's config, and
+            # resolve_delivery_transport already applied that transport's
+            # enablement rule. The logical platform is deliberately NOT
+            # natively enabled because its credential stays on the thin gateway.
             # configured/enabled gate below must not apply — it used to
             # reject exactly the targets the relay was resolved to serve.
             if pconfig is None:
@@ -3706,8 +3719,17 @@ def _deliver_result(
                     else:
                         send_result = None
                         timeout_handled = False
+                        send_timeout = (
+                            650
+                            if transport is not None
+                            and transport.transport_platform == Platform.API_SERVER
+                            else 60
+                        )
                         try:
-                            send_result = future.result(timeout=60)
+                            # The API-server proxy waits for the thin gateway's
+                            # acknowledgement. Other transports keep the
+                            # established 60s bound.
+                            send_result = future.result(timeout=send_timeout)
                         except TimeoutError:
                             # #38922: a slow confirmation does NOT necessarily
                             # mean the send failed — but we must distinguish two
@@ -3744,10 +3766,10 @@ def _deliver_result(
                                 timeout_handled = True
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
+                                    "after %ss; already dispatched (in flight), "
                                     "assuming delivered (skipping standalone fallback "
                                     "to avoid duplicate)",
-                                    job["id"], platform_name, chat_id,
+                                    job["id"], platform_name, chat_id, send_timeout,
                                 )
                         except Exception as ex:
                             # A real send error (not a slow confirmation) — fall
@@ -3807,7 +3829,7 @@ def _deliver_result(
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                if transport is not None and transport.forwarded:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
@@ -3964,7 +3986,7 @@ def _deliver_result(
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                if transport is not None and transport.is_relay:
+                if transport is not None and transport.forwarded:
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
                     logger.warning(
@@ -3973,13 +3995,13 @@ def _deliver_result(
                     )
 
         if not delivered:
-            if transport is not None and transport.is_relay:
-                # Relay owns the logical destination and its connector owns the
-                # platform credential. A native retry could duplicate delivery
-                # and cannot be authenticated correctly, so fail closed.
+            if transport is not None and transport.forwarded:
+                # The forwarding adapter owns the logical destination and its
+                # credential. A native retry could duplicate delivery and
+                # cannot be authenticated correctly, so fail closed.
                 if not target_errors:
                     target_errors.append(
-                        f"relay delivery to {platform_name}:{chat_id} failed"
+                        f"forwarded delivery to {platform_name}:{chat_id} failed"
                     )
                 delivery_errors.extend(target_errors)
                 continue
@@ -5503,6 +5525,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                     p.value for p in gateway_config.get_connected_platforms()
                 }
                 connected |= _relay_fronted_delivery_platforms(connected)
+                connected |= _proxy_fronted_delivery_platforms(connected)
             except Exception:
                 logger.debug(
                     "preflight: gateway config unavailable — skipping "
