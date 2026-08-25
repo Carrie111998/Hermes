@@ -7,10 +7,10 @@ import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
 import { parseCommandDispatch, parseSlashCommand, sessionTitle } from '@/lib/chat-runtime'
 import {
   type CommandsCatalogLike,
+  describeDelegateRouteAuthorization,
   type DesktopActionId,
   type DesktopCommandSurface,
   type DesktopPickerId,
-  describeDelegateRouteAuthorization,
   desktopSlashUnavailableMessage,
   isDesktopSlashCommand,
   resolveDesktopCommand
@@ -247,6 +247,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       // path that talks to slash.exec / command.dispatch.
       async function runExec(ctx: SlashActionCtx): Promise<void> {
         const { arg, command, name } = ctx
+
         if (
           (name === 'delegate-route' || name === 'delegate_route') &&
           arg.trim() &&
@@ -258,10 +259,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             confirmLabel: 'Authorize',
             cancelLabel: 'Cancel'
           })
+
           if (!ok) {
             return
           }
         }
+
         const resolved = await withSlashOutput(ctx)
 
         if (!resolved) {
