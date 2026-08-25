@@ -20,6 +20,14 @@ approval:
   blocklist_message: "此命令位于无条件拦截列表中，无法被批准。"
 
 gateway:
+  errors:
+    delivery_failed:            "⚠️ 消息多次投递失败。请重试——你的请求已处理，但回复无法送达。"
+    formatting_failed:          "（回复格式化失败，以纯文本显示：）\n\n{content}"
+    provider_auth_failed:       "⚠️ 供应商认证失败。请检查所配置的凭据，详情见下方。"
+    provider_rejected:          "⚠️ 模型供应商拒绝了请求。原始供应商响应已保留在下方供参考。"
+    provider_unreachable:       "⚠️ 模型服务无响应——配置的端点可能宕机或不可达。详情见下方。"
+    provider_rate_limited:      "⏱️ 模型供应商正在限流，请稍等片刻再试。"
+    provider_failed:            "⚠️ 模型供应商重试后仍失败。原始供应商详情保留在下方。"
   approval_expired: "⚠️ 批准已过期（代理不再等待）。请让代理重试。"
   draining:         "⏳ 正在等待 {count} 个活跃代理结束后重启..."
   goal_cleared:     "✓ 目标已清除。"

@@ -30,6 +30,14 @@ approval:
   blocklist_message: "This command is on the unconditional blocklist and cannot be approved."
 
 gateway:
+  errors:
+    delivery_failed:            "⚠️ Message delivery failed after multiple attempts. Please try again — your request was processed but the response could not be sent."
+    formatting_failed:          "(Response formatting failed, plain text:)\n\n{content}"
+    provider_auth_failed:       "⚠️ Provider authentication failed. Check the configured credentials; details below."
+    provider_rejected:          "⚠️ The model provider rejected the request. I kept the raw provider response below for reference."
+    provider_unreachable:       "⚠️ The model server is not responding — it looks like the configured endpoint is down or unreachable. Details below."
+    provider_rate_limited:      "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+    provider_failed:            "⚠️ The model provider failed after retries. I kept raw provider details below."
   # Messenger replies to slash commands and implicit state changes.
   approval_expired: "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
   draining:         "⏳ Draining {count} active agent(s) before restart..."
