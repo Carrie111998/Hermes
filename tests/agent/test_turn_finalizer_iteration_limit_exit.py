@@ -374,7 +374,7 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
 
 
 def test_budget_exhaustion_recorded_only_for_dispatcher_owned_worker(monkeypatch):
-    """LOCAL PATCH 14 regression matrix.
+    """Budget-attribution regression matrix.
 
     Budget-exhaustion recording must fire ONLY for the dispatcher-owned
     worker agent.  In-process children running inside a worker (delegate

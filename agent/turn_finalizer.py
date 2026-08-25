@@ -106,7 +106,7 @@ def _record_kanban_budget_exhausted(
 
 
 def _should_record_budget_exhaustion(agent) -> bool:
-    """LOCAL PATCH 14 — budget-exhaustion recording is dispatcher-owned only.
+    """Budget-exhaustion recording is dispatcher-owned only.
 
     ``HERMES_KANBAN_TASK`` stays set in ``os.environ`` for in-process children
     (delegate_task subagents, background-review forks, cron jobs fired via the
@@ -228,8 +228,9 @@ def finalize_turn(
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        # LOCAL PATCH 14: skip when this exhaustion belongs to an in-process
-        # child (delegate subagent / review fork / in-worker cron agent).
+        # Skip when this exhaustion belongs to an in-process child
+        # (delegate subagent / review fork / in-worker cron agent): its
+        # budget belongs to the child, not this dispatcher-owned task.
         if _kanban_task and _should_record_budget_exhaustion(agent):
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
@@ -244,8 +245,9 @@ def finalize_turn(
         # is a no-op if another path closed it — the CAS invariant in
         # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        # LOCAL PATCH 14: skip when this exhaustion belongs to an in-process
-        # child (delegate subagent / review fork / in-worker cron agent).
+        # Skip when this exhaustion belongs to an in-process child
+        # (delegate subagent / review fork / in-worker cron agent): its
+        # budget belongs to the child, not this dispatcher-owned task.
         if _kanban_task and _should_record_budget_exhaustion(agent):
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
