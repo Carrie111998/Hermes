@@ -41,19 +41,113 @@ FALLBACK_PROVIDER = "custom"
 FALLBACK_BASE_URL = "http://localhost:4000/v1"
 NAMED_PROXY = "litellm_proxy"
 
+SAFETY_GATE_ERROR_MARKERS = (
+    "unsafe provider/base_url",
+    "refusing to run",
+    "not allowed",
+)
+
+
+def _iter_compatible_provider_entries(config: dict) -> list:
+    """Yield custom-provider entries from legacy list and v12 ``providers:`` dict.
+
+    Prefers ``get_compatible_custom_providers`` so config v12 (which migrates
+    ``custom_providers`` into ``providers`` and deletes the list) still
+    surfaces ``litellm_proxy``.
+    """
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+
+        entries = get_compatible_custom_providers(config)
+        if isinstance(entries, list):
+            return entries
+    except Exception:
+        pass
+
+    entries: list = []
+    legacy = config.get("custom_providers")
+    if isinstance(legacy, list):
+        entries.extend(legacy)
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for key, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            item = dict(entry)
+            item.setdefault("provider_key", str(key))
+            if not str(item.get("name") or "").strip():
+                item["name"] = str(key)
+            if not str(item.get("base_url") or "").strip():
+                item["base_url"] = item.get("api") or item.get("url") or ""
+            entries.append(item)
+    return entries
+
 
 def resolve_litellm_target(config: dict | None) -> tuple[str, str]:
     """Return (provider, base_url) for this host's LiteLLM proxy."""
     if isinstance(config, dict):
-        for entry in config.get("custom_providers") or []:
+        for entry in _iter_compatible_provider_entries(config):
             if not isinstance(entry, dict):
                 continue
-            if str(entry.get("name") or "").strip() != NAMED_PROXY:
+            name = str(entry.get("name") or "").strip()
+            key = str(entry.get("provider_key") or "").strip()
+            if name != NAMED_PROXY and key != NAMED_PROXY:
                 continue
             url = str(entry.get("base_url") or "").strip().rstrip("/")
             if url:
                 return NAMED_PROXY, url
     return FALLBACK_PROVIDER, FALLBACK_BASE_URL
+
+
+def _needs_safety_gate_resume(job: dict) -> bool:
+    """True when a paused/error job is stuck on the provider/base_url gate."""
+    if job.get("state") not in {"paused", "error"}:
+        return False
+    last_error = job.get("last_error") or ""
+    return any(marker in last_error for marker in SAFETY_GATE_ERROR_MARKERS)
+
+
+def process_target_job(
+    job: dict,
+    good_provider: str,
+    good_base_url: str,
+    *,
+    dry_run: bool = False,
+    compute_next_run=None,
+    current_provider: str | None = None,
+    current_base_url: str | None = None,
+) -> tuple[bool, str | None]:
+    """Apply idempotent routing and auto-resume.
+
+    Returns ``(needs_write, resumed_from_state)``. Routing that is already
+    correct must not skip the resume block: a job can already point at the
+    desired provider/URL while remaining paused/error with a safety-gate
+    last_error.
+    """
+    routing_ok = current_provider == good_provider and current_base_url == good_base_url
+    needs_resume = _needs_safety_gate_resume(job)
+    if routing_ok and not needs_resume:
+        return False, None
+
+    previous_state = job.get("state") if needs_resume else None
+    if not dry_run:
+        if not routing_ok:
+            job["provider"] = good_provider
+            job["base_url"] = good_base_url
+            # Drop a stale snapshot from the old ollama/openrouter pairing.
+            job["provider_snapshot"] = None
+        if needs_resume:
+            next_run_fn = compute_next_run
+            if next_run_fn is None:
+                from cron.jobs import compute_next_run as next_run_fn
+            job["enabled"] = True
+            job["state"] = "scheduled"
+            job["paused_at"] = None
+            job["paused_reason"] = None
+            job["consecutive_failures"] = 0
+            job["last_error"] = None
+            job["next_run_at"] = next_run_fn(job.get("schedule", {}), job.get("last_run_at"))
+    return True, previous_state
 
 
 def _load_hermes_config() -> dict | None:
@@ -91,30 +185,24 @@ def main():
         print(f"    provider: {current_provider!r} → {good_provider!r}")
         print(f"    base_url: {current_base_url!r} → {good_base_url!r}")
 
-        if current_provider == good_provider and current_base_url == good_base_url:
-            print("    already at target — skip")
+        routing_ok = current_provider == good_provider and current_base_url == good_base_url
+        if routing_ok:
+            print("    already at target")
+
+        wrote, resumed_from = process_target_job(
+            job,
+            good_provider,
+            good_base_url,
+            dry_run=args.dry_run,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
+        )
+        if not wrote:
+            print("    skip")
             continue
 
-        if not args.dry_run:
-            job["provider"] = good_provider
-            job["base_url"] = good_base_url
-            # Drop a stale snapshot from the old ollama/openrouter pairing.
-            job["provider_snapshot"] = None
-            # If the job was auto-paused due to the base_url error, re-enable it.
-            if job.get("state") in {"paused", "error"} and (
-                "unsafe provider/base_url" in (job.get("last_error") or "")
-                or "refusing to run" in (job.get("last_error") or "")
-                or "not allowed" in (job.get("last_error") or "")
-            ):
-                from cron.jobs import compute_next_run
-                job["enabled"] = True
-                job["state"] = "scheduled"
-                job["paused_at"] = None
-                job["paused_reason"] = None
-                job["consecutive_failures"] = 0
-                job["last_error"] = None
-                job["next_run_at"] = compute_next_run(job.get("schedule", {}), job.get("last_run_at"))
-                print(f"    state: auto-resumed (was {job.get('state', '?')})")
+        if resumed_from is not None:
+            print(f"    state: auto-resumed (was {resumed_from})")
 
         changed.append(job_id)
 
