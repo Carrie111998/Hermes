@@ -2087,8 +2087,13 @@ def _post_restart_agent_health_check() -> tuple[bool, str | None]:
     keeps import-time side effects out of the long-lived gateway process and
     disables bytecode writes in the checkout.
     """
-    probe_env = os.environ.copy()
-    probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    from tools.environments.local import build_subprocess_env
+
+    probe_env = build_subprocess_env(
+        scrub_secrets=False,
+        inherit_profile_home=False,
+        extra={"PYTHONDONTWRITEBYTECODE": "1"},
+    )
     try:
         result = subprocess.run(
             [sys.executable, "-c", "import run_agent"],

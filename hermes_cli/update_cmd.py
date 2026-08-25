@@ -478,8 +478,13 @@ def _critical_module_import_failures(
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
-        probe_env = os.environ.copy()
-        probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        from tools.environments.local import build_subprocess_env
+
+        probe_env = build_subprocess_env(
+            scrub_secrets=False,
+            inherit_profile_home=False,
+            extra={"PYTHONDONTWRITEBYTECODE": "1"},
+        )
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
