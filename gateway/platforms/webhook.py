@@ -746,6 +746,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Cannot parse body"}, status=400
                 )
 
+        if route_config.get("intake_callback"):
+            return await self._handle_intake_callback(payload, secret)
+
         # Check event type filter
         event_type = (
             request.headers.get("X-GitHub-Event", "")
@@ -1472,3 +1475,144 @@ class WebhookAdapter(BasePlatformAdapter):
             metadata = {"thread_id": thread_id}
 
         return await adapter.send(chat_id, content, metadata=metadata)
+
+    def _signed_intake_receipt(
+        self, receipt: dict[str, Any], secret: str, *, status: int = 200
+    ) -> "web.Response":
+        """Return a body-bound receipt accepted by the MIS callback client."""
+        body = json.dumps(receipt, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        timestamp = str(int(time.time()))
+        signature = hmac.new(
+            secret.encode("utf-8"), timestamp.encode("utf-8") + b"." + body,
+            hashlib.sha256,
+        ).hexdigest()
+        return web.Response(
+            body=body,
+            status=status,
+            content_type="application/json",
+            headers={
+                "X-Hermes-Receipt-Timestamp": timestamp,
+                "X-Hermes-Receipt-Signature-V2": signature,
+            },
+        )
+
+    @staticmethod
+    def _intake_callback_content(payload: dict[str, Any]) -> str | None:
+        summary = payload.get("summary")
+        options = payload.get("numbered_replies")
+        if not isinstance(summary, str) or not summary.strip() or not isinstance(options, list):
+            return None
+        lines = [summary.strip()[:4000]]
+        for option in options:
+            if not isinstance(option, dict):
+                return None
+            number = option.get("number")
+            action = option.get("action")
+            if not isinstance(number, int) or not isinstance(action, str):
+                return None
+            labels = {
+                "approve_item": "approve this item",
+                "save_note_and_approve": "save the associated note and approve this item",
+                "process_item": "retry processing this item",
+                "leave_pending": "leave this item pending",
+            }
+            label = labels.get(action)
+            if label is None:
+                return None
+            lines.append(f"{number}. {label}")
+        return chr(10).join(lines)
+
+    async def _handle_intake_callback(
+        self, payload: Any, secret: str
+    ) -> "web.Response":
+        """Resolve a signed link_analyzed callback to its original chat."""
+        if not isinstance(payload, dict) or payload.get("event") != "link_analyzed":
+            return web.json_response({"error": "Unsupported intake callback"}, status=400)
+        token = payload.get("reply_token")
+        delivery_id = payload.get("delivery_id")
+        if not isinstance(token, str) or not token or not isinstance(delivery_id, str) or not delivery_id:
+            return web.json_response({"error": "Missing callback capability"}, status=400)
+        content = self._intake_callback_content(payload)
+        if content is None:
+            return web.json_response({"error": "Invalid callback choices"}, status=400)
+        runner = self.gateway_runner
+        store = getattr(runner, "session_store", None) if runner is not None else None
+        if store is None:
+            return web.json_response({"error": "Original session unavailable"}, status=503)
+        try:
+            from hermes_cli.intake_reply_tokens import (
+                begin_delivery,
+                discard_actions,
+                finish_delivery,
+                register_actions,
+                release_delivery,
+                session_id_for_token,
+            )
+
+            token_session_id = session_id_for_token(token)
+            if token_session_id is None:
+                return web.json_response({"error": "Unknown callback capability"}, status=404)
+            entry = store.lookup_by_session_id(token_session_id)
+            origin_source = getattr(entry, "origin", None) if entry is not None else None
+            origin = origin_source.to_dict() if origin_source is not None else None
+            if not isinstance(origin, dict):
+                return web.json_response({"error": "Original session unavailable"}, status=410)
+            claim = begin_delivery(token, delivery_id, origin)
+        except Exception:
+            logger.exception("[webhook] intake callback token resolution failed")
+            return web.json_response({"error": "Callback resolution failed"}, status=503)
+
+        if claim.status == "delivered":
+            return self._signed_intake_receipt(
+                {
+                    "status": "delivered",
+                    "delivery_id": delivery_id,
+                    "original_session_delivered": True,
+                    "action_ledger_ready": True,
+                }, secret,
+            )
+        if claim.status in {"unknown", "expired", "wrong_delivery", "invalid", "uncertain"}:
+            return web.json_response({"error": "Rejected callback capability"}, status=409)
+        if claim.status == "in_progress":
+            return web.json_response({"error": "Callback delivery in progress"}, status=409)
+        if claim.status != "claimed" or not claim.origin:
+            return web.json_response({"error": "Callback delivery unavailable"}, status=503)
+
+        if not register_actions(
+            token=token,
+            delivery_id=delivery_id,
+            session_id=claim.session_id,
+            payload=payload,
+        ):
+            release_delivery(token, delivery_id)
+            return web.json_response({"error": "Invalid callback action ledger"}, status=400)
+
+        extra = {"chat_id": str(claim.origin.get("chat_id") or "")}
+        if claim.origin.get("thread_id"):
+            extra["thread_id"] = str(claim.origin["thread_id"])
+        if claim.origin.get("profile"):
+            extra["profile"] = str(claim.origin["profile"])
+        platform = claim.origin.get("platform")
+        if not isinstance(platform, str) or not platform or not extra["chat_id"]:
+            discard_actions(delivery_id)
+            release_delivery(token, delivery_id)
+            return web.json_response({"error": "Invalid original session"}, status=410)
+        try:
+            result = await self._direct_deliver(
+                content, {"deliver": platform, "deliver_extra": extra, "payload": payload}
+            )
+        except Exception:
+            logger.exception("[webhook] intake callback delivery failed")
+            result = SendResult(success=False, error="Delivery failed")
+        if not result.success or not finish_delivery(token, delivery_id):
+            discard_actions(delivery_id)
+            release_delivery(token, delivery_id)
+            return web.json_response({"error": "Original delivery failed"}, status=502)
+        return self._signed_intake_receipt(
+            {
+                "status": "delivered",
+                "delivery_id": delivery_id,
+                "original_session_delivered": True,
+                "action_ledger_ready": True,
+            }, secret,
+        )
