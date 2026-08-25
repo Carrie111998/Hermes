@@ -19340,7 +19340,7 @@ def _report_port_in_use(host: str, port: int) -> None:
     )
 
 
-_DEFAULT_DASHBOARD_FORWARDED_ALLOW_IPS = ("127.0.0.1",)
+_DEFAULT_DASHBOARD_FORWARDED_ALLOW_IPS = ("127.0.0.1", "::1")
 
 
 def _dashboard_forwarded_allow_ips(dashboard_config: dict[str, Any]) -> list[str]:
@@ -19393,6 +19393,9 @@ def _dashboard_forwarded_allow_ips(dashboard_config: dict[str, Any]) -> list[str
 
         if normalized not in trusted:
             trusted.append(normalized)
+
+    if trusted != list(_DEFAULT_DASHBOARD_FORWARDED_ALLOW_IPS):
+        _log.info("Dashboard trusted proxies: %s", ", ".join(trusted))
 
     return trusted
 

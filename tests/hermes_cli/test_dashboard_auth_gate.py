@@ -4,6 +4,7 @@ Phase 0 — establish a baseline pin on the current (pre-OAuth) behavior so
 later phases can prove they didn't break loopback mode.
 """
 import asyncio
+import logging
 
 import pytest
 
@@ -231,12 +232,15 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
         assert web_server.app.state.auth_required is True
         assert captured["kwargs"].get("host") == "0.0.0.0"
         assert captured["kwargs"].get("proxy_headers") is True
-        assert captured["kwargs"].get("forwarded_allow_ips") == ["127.0.0.1"]
+        assert captured["kwargs"].get("forwarded_allow_ips") == [
+            "127.0.0.1",
+            "::1",
+        ]
     finally:
         clear_providers()
 
 
-def test_start_server_passes_bounded_trusted_proxy_networks(monkeypatch):
+def test_start_server_passes_bounded_trusted_proxy_networks(monkeypatch, caplog):
     """A configured proxy network reaches uvicorn without broadening to all peers."""
     from hermes_cli.dashboard_auth import clear_providers, register_provider
     from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
@@ -250,14 +254,20 @@ def test_start_server_passes_bounded_trusted_proxy_networks(monkeypatch):
         lambda: {"dashboard": {"trusted_proxies": ["172.18.0.23/16"]}},
     )
     try:
-        web_server.start_server(
-            host="0.0.0.0", port=9119,
-            open_browser=False, allow_public=False,
-        )
+        with caplog.at_level(logging.INFO, logger=web_server._log.name):
+            web_server.start_server(
+                host="0.0.0.0", port=9119,
+                open_browser=False, allow_public=False,
+            )
         assert captured["kwargs"]["forwarded_allow_ips"] == [
             "127.0.0.1",
+            "::1",
             "172.18.0.0/16",
         ]
+        assert (
+            "Dashboard trusted proxies: 127.0.0.1, ::1, 172.18.0.0/16"
+            in caplog.text
+        )
     finally:
         clear_providers()
 
@@ -268,7 +278,7 @@ def test_trusted_proxy_allowlist_rejects_unbounded_entries(caplog):
         "trusted_proxies": ["*", "0.0.0.0/0", "::/0", "172.18.0.7"],
     })
 
-    assert trusted == ["127.0.0.1", "172.18.0.7"]
+    assert trusted == ["127.0.0.1", "::1", "172.18.0.7"]
     assert "never '*' or a /0 network" in caplog.text
 
 
@@ -314,6 +324,7 @@ def test_trusted_container_proxy_controls_https_detection():
         return observed["https"]
 
     assert asyncio.run(detected_scheme("172.18.0.9")) is True
+    assert asyncio.run(detected_scheme("::1")) is True
     assert asyncio.run(detected_scheme("198.51.100.9")) is False
 
 
