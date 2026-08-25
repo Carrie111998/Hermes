@@ -85,6 +85,8 @@ def classify_provenance(provenance: TransportProvenance, platform_name: Any) -> 
     A slot is only credible for the two adapter maps a turn on *platform_name*
     can arrive through: that platform's own slot, or the relay fronting it.
     """
+    # deferred: keeps this module importable from tools/ without pulling
+    # gateway.config in at import time.
     from gateway.config import Platform
 
     profile, slot = provenance

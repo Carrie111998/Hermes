@@ -2884,11 +2884,11 @@ class ProcessRegistry:
                 detached=True,  # Can't read output, but can report status + kill
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),
-                # Absent on pre-existing checkpoints: empty provenance is the
-                # legacy-record signal the gateway falls back on.
                 watcher_chat_type=entry.get("watcher_chat_type", ""),
                 watcher_scope_id=entry.get("watcher_scope_id", ""),
                 watcher_profile=entry.get("watcher_profile", ""),
+                # absent on pre-existing checkpoints: an empty pair is the
+                # legacy-record signal the gateway falls back on.
                 **provenance_fields(
                     read_provenance(entry, prefix="watcher_"), prefix="watcher_"
                 ),
