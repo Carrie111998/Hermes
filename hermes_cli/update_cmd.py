@@ -428,66 +428,45 @@ _UPDATE_CRITICAL_MODULES = (
 )
 
 
-def _validate_critical_modules_import(
-    root, *, strict: bool = False
-) -> tuple[bool, str | None, str | None]:
-    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+_IMPORT_PROBE_MARKER = "__HERMES_IMPORT_PROBE__"
 
-    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
-    cross-module breakage: a partially-updated tree where ``agent/`` is new but
-    ``tools/`` is old parses perfectly and still dies at startup with
-    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
-    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
 
-    That skew is reachable on the Windows ZIP-update path, whose copy loop
-    walks top-level entries in ``os.listdir`` order and replaces each one
-    independently — ``agent/`` lands long before ``tools/``, so a failure or
-    interruption between them leaves exactly that mismatch on disk.
-
-    Runs in a subprocess because importing these modules into the running
-    updater would pollute ``sys.modules`` and execute import-time side effects
-    against the half-updated tree. Costs ~0.4s.
-
-    Uses the project venv's interpreter when there is one (matching
-    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
-    different Python than the install's own, and probing the wrong
-    interpreter would test a tree the user never runs.
-
-    ``strict=True`` is used after applying user source changes. In that phase,
-    failing to execute the proof is itself unsafe: the updater must not drop
-    the recovery stash or proceed to a gateway restart without a verdict.
-    Existing post-install callers keep the historical best-effort behavior
-    with the default ``strict=False`` because they may run before dependency
-    installation.
-
-    Returns ``(ok, failing_module, error_message)``.
-    """
+def _critical_module_import_failures(
+    root, *, report_runtime_errors: bool = False, strict: bool = False
+) -> tuple[dict[str, str], str | None]:
+    """Return import failures plus any failure to obtain a reliable probe."""
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
 
     probe = (
-        "import importlib, sys\n"
+        "import importlib, json, sys\n"
+        "failures = []\n"
         "for name in %r:\n"
         "    try:\n"
         "        importlib.import_module(name)\n"
         "    except ModuleNotFoundError as exc:\n"
-        # A missing *third-party* module means dependencies aren't installed
-        # yet, not a skewed checkout. Only our own packages count as breakage.
-        # The root set is injected from hermes_constants so this can't drift
-        # from the hint the user is shown (they disagreed once already).
+        # A missing third-party module means dependencies are not installed
+        # yet, not that the checkout is inconsistent.
         "        missing = (getattr(exc, 'name', '') or '').split('.')[0]\n"
         "        if missing in %r or missing.startswith('hermes_'):\n"
-        "            sys.stdout.write(name + '\\n' + str(exc))\n"
-        "            raise SystemExit(3)\n"
+        "            failures.append((name, str(exc)))\n"
         "    except ImportError as exc:\n"
-        "        sys.stdout.write(name + '\\n' + str(exc))\n"
-        "        raise SystemExit(3)\n"
+        "        failures.append((name, str(exc)))\n"
         "    except SyntaxError as exc:\n"
-        "        sys.stdout.write(name + '\\n' + str(exc))\n"
-        "        raise SystemExit(3)\n"
-        "    except Exception:\n"
-        "        pass\n"  # non-import errors (config/env) aren't update breakage
-        "raise SystemExit(0)\n"
-        % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
+        "        failures.append((name, str(exc)))\n"
+        "    except Exception as exc:\n"
+        "        if %r:\n"
+        "            failures.append((name, str(exc)))\n"
+        "    except BaseException as exc:\n"
+        "        if %r:\n"
+        "            failures.append((name, str(exc)))\n"
+        "sys.stdout.write(%r + json.dumps(failures))\n"
+        % (
+            _UPDATE_CRITICAL_MODULES,
+            tuple(sorted(FIRST_PARTY_MODULE_ROOTS)),
+            report_runtime_errors,
+            report_runtime_errors,
+            _IMPORT_PROBE_MARKER,
+        )
     )
     try:
         interpreter = sys.executable
@@ -510,23 +489,48 @@ def _validate_critical_modules_import(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         if strict:
-            return False, "critical-module-import-probe", f"could not run probe: {exc}"
-        # The pre-dependency-install callers cannot always execute the probe;
-        # preserve their existing best-effort behavior.
-        return True, None, None
-    if result.returncode == 3:
-        parts = (result.stdout or "").split("\n", 1)
-        module = parts[0].strip() or "unknown"
-        detail = parts[1].strip() if len(parts) > 1 else ""
-        return False, module, detail
-    if strict and result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        suffix = f": {detail[:400]}" if detail else ""
-        return (
-            False,
-            "critical-module-import-probe",
-            f"probe exited with status {result.returncode}{suffix}",
-        )
+            return {}, f"could not run probe: {exc}"
+        return {}, None
+
+    output = result.stdout or ""
+    if result.returncode != 0:
+        if strict:
+            detail = (result.stderr or output).strip()
+            suffix = f": {detail[:400]}" if detail else ""
+            return {}, f"probe exited with status {result.returncode}{suffix}"
+        return {}, None
+
+    marker_at = output.rfind(_IMPORT_PROBE_MARKER)
+    if marker_at < 0:
+        if strict:
+            return {}, "probe did not emit a complete health verdict"
+        return {}, None
+    try:
+        import json
+
+        raw_failures = json.loads(output[marker_at + len(_IMPORT_PROBE_MARKER) :])
+        failures: dict[str, str] = {}
+        for item in raw_failures:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError("invalid import failure entry")
+            failures[str(item[0])] = str(item[1])
+        return failures, None
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        if strict:
+            return {}, f"probe emitted invalid health data: {exc}"
+        return {}, None
+
+
+def _validate_critical_modules_import(
+    root, *, strict: bool = False
+) -> tuple[bool, str | None, str | None]:
+    """Return the first critical-module import failure, if any."""
+    failures, probe_error = _critical_module_import_failures(root, strict=strict)
+    if probe_error:
+        return False, "critical-module-import-probe", probe_error
+    if failures:
+        module = next(iter(failures))
+        return False, module, failures[module]
     return True, None, None
 
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
@@ -2298,6 +2302,16 @@ def _restore_stashed_changes(
         print(f"  Restore manually after checking the checkout: git stash apply {stash_ref}")
         raise SystemExit(1)
 
+    clean_import_failures, probe_error = _critical_module_import_failures(
+        cwd, report_runtime_errors=True, strict=True
+    )
+    if probe_error:
+        print("✗ Cannot safely restore local changes without an import health verdict.")
+        print(f"  {probe_error}")
+        print(f"  Your changes remain preserved in stash: {stash_ref}")
+        print(f"  Restore manually after checking the checkout: git stash apply {stash_ref}")
+        raise SystemExit(1)
+
     print("→ Restoring local changes...")
     restore = subprocess.run(
         git_cmd + ["stash", "apply", stash_ref],
@@ -2383,16 +2397,34 @@ def _restore_stashed_changes(
             syntax_error,
         )
 
-    import_ok, failing_module, import_error = _validate_critical_modules_import(
-        cwd, strict=True
+    restored_import_failures, probe_error = _critical_module_import_failures(
+        cwd, report_runtime_errors=True, strict=True
     )
-    if not import_ok:
+    if probe_error:
         _reject_unsafe_stash_restore(
             git_cmd,
             cwd,
             stash_ref,
             preexisting_untracked,
-            f"agent import {failing_module or 'unknown'}",
+            "critical-module-import-probe",
+            probe_error,
+        )
+    changed_import_failure = next(
+        (
+            (module, error)
+            for module, error in restored_import_failures.items()
+            if clean_import_failures.get(module) != error
+        ),
+        None,
+    )
+    if changed_import_failure is not None:
+        failing_module, import_error = changed_import_failure
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            f"agent import {failing_module}",
             import_error,
         )
 

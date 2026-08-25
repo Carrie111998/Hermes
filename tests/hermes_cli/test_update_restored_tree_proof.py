@@ -83,6 +83,84 @@ def test_valid_python_restore_still_drops_the_stash(
     assert _git(repo, "stash", "list").stdout == ""
 
 
+def test_new_import_time_failure_is_rejected_and_parked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    source = repo / "consumer.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add import probe module")
+    source.write_text(
+        "raise RuntimeError('restored local failure')\n", encoding="utf-8"
+    )
+    stash_ref = update_cmd._stash_local_changes_if_needed(["git"], repo)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._restore_stashed_changes(["git"], repo, stash_ref)
+
+    assert exc_info.value.code == 1
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _git(repo, "stash", "list").stdout.strip()
+
+
+def test_unavailable_import_probe_cannot_drop_new_runtime_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    source = repo / "consumer.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add import probe module")
+    source.write_text(
+        "raise RuntimeError('restored local failure')\n", encoding="utf-8"
+    )
+    stash_ref = update_cmd._stash_local_changes_if_needed(["git"], repo)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+    real_run = update_cmd.subprocess.run
+
+    def fail_import_probe(cmd, *args, **kwargs):
+        if cmd and cmd[0] != "git" and len(cmd) >= 2 and cmd[1] == "-c":
+            raise OSError("simulated interpreter launch failure")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fail_import_probe)
+
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._restore_stashed_changes(["git"], repo, stash_ref)
+
+    assert exc_info.value.code == 1
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _git(repo, "stash", "list").stdout.strip()
+
+
+def test_preexisting_import_time_failure_does_not_block_valid_restore(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    consumer = repo / "consumer.py"
+    consumer.write_text(
+        "raise RuntimeError('missing local config')\n", encoding="utf-8"
+    )
+    local_file = repo / "local.txt"
+    local_file.write_text("original\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add preexisting import failure")
+    local_file.write_text("restored\n", encoding="utf-8")
+    stash_ref = update_cmd._stash_local_changes_if_needed(["git"], repo)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+
+    assert update_cmd._restore_stashed_changes(["git"], repo, stash_ref) is True
+    assert local_file.read_text(encoding="utf-8") == "restored\n"
+    assert _git(repo, "stash", "list").stdout == ""
+
+
 def test_invalid_untracked_python_is_part_of_the_restore_proof(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
