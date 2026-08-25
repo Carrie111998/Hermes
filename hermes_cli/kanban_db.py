@@ -331,6 +331,7 @@ def _fire_dispatch_tick_hook(
             outcome = "skipped_locked"
         elif not any((
             result.spawned,
+            result.spawn_failed,
             result.reclaimed,
             result.promoted,
             result.reconciled_orphans,
@@ -344,6 +345,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.capacity_limited,
         )):
             outcome = "idle"
         invoke_hook(
@@ -8025,6 +8027,11 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    spawn_failed: list[str] = field(default_factory=list)
+    """Task ids whose worker could not be launched this tick.
+    Unlike ``auto_blocked``, this records the first failed attempt too so
+    dispatcher health telemetry cannot mistake a real launch failure for an
+    expected capacity deferral."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -8082,6 +8089,39 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    capacity_limited: Optional[str] = None
+    """Configured concurrency cap that intentionally deferred this tick:
+    ``"max_spawn"`` for the board-local cap or ``"max_in_progress"`` for
+    the host-wide cap. ``None`` means neither cap stopped dispatch."""
+
+
+def dispatch_health_bad_tick(
+    ready_pending: bool,
+    results: Iterable[Optional[DispatchResult]],
+) -> bool:
+    """Return whether a no-spawn tick is unexpectedly stuck.
+
+    Capacity, locking, memory pressure, respawn guards, and per-profile caps
+    are deliberate deferrals. A recorded spawn failure always wins over those
+    signals so a mixed tick still alerts the operator.
+    """
+    if not ready_pending:
+        return False
+    observed = [result for result in results if result is not None]
+    if any(result.spawned for result in observed):
+        return False
+    if any(result.spawn_failed for result in observed):
+        return True
+    return not (observed and all(
+        result.capacity_limited
+        or result.skipped_locked
+        or result.memory_pressure
+        or result.respawn_guarded
+        or result.rate_limited
+        or result.skipped_per_profile_capped
+        or result.skipped_nonspawnable
+        for result in observed
+    ))
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9988,6 +10028,7 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_limited = "max_spawn"
             return result
         spawn_budget = max_spawn - running_count
 
@@ -10004,6 +10045,7 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_limited = "max_in_progress"
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -10237,6 +10279,7 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            result.spawn_failed.append(claimed.id)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -10289,6 +10332,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            result.spawn_failed.append(claimed.id)
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -10364,6 +10408,7 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            result.spawn_failed.append(claimed.id)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -10409,6 +10454,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            result.spawn_failed.append(claimed.id)
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,

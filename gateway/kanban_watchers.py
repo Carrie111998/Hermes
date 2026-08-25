@@ -1728,10 +1728,11 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(_tick_once)
-                    any_spawned = False
+                    dispatch_results = []
                     for slug, res in (results or []):
+                        if res is not None:
+                            dispatch_results.append(res)
                         if res is not None and getattr(res, "spawned", None):
-                            any_spawned = True
                             # Quiet by default — only log when something actually
                             # happened, so an idle gateway stays silent.
                             logger.info(
@@ -1747,7 +1748,7 @@ class GatewayKanbanWatchersMixin:
                             )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await _to_thread_process_service(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    if _kb.dispatch_health_bad_tick(ready_pending, dispatch_results):
                         bad_ticks += 1
                     else:
                         bad_ticks = 0

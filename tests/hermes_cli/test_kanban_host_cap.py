@@ -151,6 +151,41 @@ def test_max_in_progress_counts_other_boards(
     # Host budget (2) already consumed by the second board → nothing spawns.
     assert not spawns
     assert not res.spawned
+    assert res.capacity_limited == "max_in_progress"
+
+
+def test_dispatch_health_capacity_deferral_is_not_stuck():
+    result = kb.DispatchResult(capacity_limited="max_in_progress")
+
+    assert not kb.dispatch_health_bad_tick(True, [result])
+
+
+def test_dispatch_health_spawn_failure_still_warns_when_capacity_is_mixed():
+    failed = kb.DispatchResult(spawn_failed=["t_failed"])
+    deferred = kb.DispatchResult(capacity_limited="max_spawn")
+
+    assert kb.dispatch_health_bad_tick(True, [deferred, failed])
+
+
+def test_one_deferred_board_does_not_mask_an_unsignaled_board():
+    deferred = kb.DispatchResult(capacity_limited="max_spawn")
+    unsignaled = kb.DispatchResult()
+
+    assert kb.dispatch_health_bad_tick(True, [deferred, unsignaled])
+
+
+def test_dispatch_records_first_spawn_failure(
+    kanban_home, all_assignees_spawnable,
+):
+    def fail_to_spawn(task, workspace, board=None):
+        raise OSError("worker executable missing")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="launch me", assignee="alice")
+        result = kb.dispatch_once(conn, spawn_fn=fail_to_spawn)
+
+    assert result.spawn_failed == [task_id]
+    assert kb.dispatch_health_bad_tick(True, [result])
 
 
 def test_max_in_progress_partial_budget_across_boards(

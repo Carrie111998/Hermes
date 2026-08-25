@@ -55,6 +55,7 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
     assert spawn_assignees.count("beta") == 2
     assert capped_assignees.count("alpha") == 3
     assert capped_assignees.count("beta") == 1
+    assert not kb.dispatch_health_bad_tick(True, [res])
 
 
 
@@ -96,5 +97,4 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert len(res2.spawned) == 1
     assert len(res2.skipped_per_profile_capped) == 1
     assert res2.spawned[0][0] != spawned_id  # different task this time
-
 

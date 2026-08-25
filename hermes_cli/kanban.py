@@ -2675,6 +2675,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
+            "spawn_failed": res.spawn_failed,
+            "capacity_limited": res.capacity_limited,
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -2702,6 +2704,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Spawn failed: {len(res.spawn_failed)}")
+    if res.spawn_failed:
+        print(f"  {', '.join(res.spawn_failed)}")
+    if res.capacity_limited:
+        print(f"Deferred (capacity): {res.capacity_limited}")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
@@ -2797,8 +2804,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        spawned_any = bool(res.spawned)
-        if ready_pending and not spawned_any:
+        if kb.dispatch_health_bad_tick(ready_pending, [res]):
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
