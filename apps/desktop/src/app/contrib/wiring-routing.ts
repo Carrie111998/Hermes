@@ -5,6 +5,18 @@
  * React/Electron controller module.
  */
 
+import { knownSessionOwner } from '@/store/session'
+import type { SessionOwnerScope, SessionProfileRoute } from '@/store/session-request-router'
+import type { SessionInfo } from '@/types/hermes'
+
+export function resolveKnownSessionRpcOwner(
+  sessions: readonly SessionInfo[],
+  routingSessionId: null | string,
+  tileOwner?: SessionProfileRoute
+): SessionOwnerScope {
+  return tileOwner ?? knownSessionOwner(sessions, routingSessionId)
+}
+
 /**
  * Resolve a runtime session id back to its stored id by reverse-scanning the
  * stored->runtime binding map — the same ladder use-session-tile-delegate's

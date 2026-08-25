@@ -72,7 +72,6 @@ import {
   $selectedStoredSessionId,
   $sessionResumeRequest,
   $sessions,
-  knownSessionProfile,
   sessionMatchesStoredId,
   sessionPinId,
   setAwaitingResponse,
@@ -153,7 +152,7 @@ import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
-import { findStoredIdForRuntimeId, resolveRoutingSessionId } from './wiring-routing'
+import { findStoredIdForRuntimeId, resolveKnownSessionRpcOwner, resolveRoutingSessionId } from './wiring-routing'
 
 // Overlay views the controller mounts over the shell — lazy, load on demand.
 // The workspace-route full-page views (skills/messaging/artifacts) are the
@@ -356,9 +355,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           undefined
       })
 
-      let owner: SessionOwnerScope =
-        (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
-        knownSessionProfile($sessions.get(), routingSessionId)
+      let owner: SessionOwnerScope = resolveKnownSessionRpcOwner(
+        $sessions.get(),
+        routingSessionId,
+        routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined
+      )
 
       if (!owner && routingSessionId) {
         // Unknown owner for a REAL session: probe across profiles (REST, not the

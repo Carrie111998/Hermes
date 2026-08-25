@@ -7,7 +7,11 @@ export interface SessionProfileRoute {
   targetProfile?: string
 }
 
-export type SessionOwnerScope = undefined | null | string | SessionProfileRoute
+export interface AmbiguousSessionOwner {
+  ambiguous: true
+}
+
+export type SessionOwnerScope = undefined | null | string | AmbiguousSessionOwner | SessionProfileRoute
 
 // ── Session-scoped RPC routing (the #89206 class) ───────────────────────────
 // A session-scoped RPC (session.resume / session.activate / session.usage /
@@ -31,6 +35,9 @@ const normKey = (profile: null | string | undefined): string => (profile ?? '').
 
 const isRoute = (owner: SessionOwnerScope): owner is SessionProfileRoute =>
   Boolean(owner && typeof owner === 'object' && 'connectionId' in owner)
+
+const isAmbiguousOwner = (owner: SessionOwnerScope): owner is AmbiguousSessionOwner =>
+  Boolean(owner && typeof owner === 'object' && 'ambiguous' in owner)
 
 function routeParams(route: SessionProfileRoute, params: Record<string, unknown>): Record<string, unknown> {
   if (!route.targetProfile || !Object.prototype.hasOwnProperty.call(params, 'profile')) {
@@ -79,6 +86,10 @@ export function requestForSessionProfile<T>(
   timeoutMs?: number,
   signal?: AbortSignal
 ): Promise<T> {
+  if (isAmbiguousOwner(ownerProfile)) {
+    return Promise.reject(new Error('Session owner is ambiguous; refusing to route session-scoped RPC'))
+  }
+
   if (isRoute(ownerProfile)) {
     const connectionId = ownerProfile.connectionId.trim()
 

@@ -152,6 +152,19 @@ describe('sessionRpcNeedsProfileRoute', () => {
 })
 
 describe('requestForSessionProfile', () => {
+  it('rejects an ambiguous owner before ambient, agent, or profile routing', async () => {
+    const ambient = vi.fn(async () => ({ ambient: true }))
+
+    await expect(
+      requestForSessionProfile({ ambiguous: true }, ambient as never, 'session.resume', {
+        session_id: 'contradictory-owner'
+      })
+    ).rejects.toThrow('Session owner is ambiguous; refusing to route session-scoped RPC')
+
+    expect(ambient).not.toHaveBeenCalled()
+    expect(secondaryGateways).toHaveLength(0)
+  })
+
   it('keeps concurrent same-name requests pinned while foreground activation changes', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
