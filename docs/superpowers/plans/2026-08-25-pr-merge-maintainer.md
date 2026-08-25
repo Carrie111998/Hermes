@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an opt-in deterministic maintainer that produces authoritative exact-head local-CI receipts, automatically squash-merges only strictly eligible same-repository PRs, and optionally rebuilds/relaunches a desktop app without starting a protected runtime.
+**Goal:** Build an opt-in deterministic maintainer that produces authoritative exact-head local-CI receipts, automatically merges only strictly eligible same-repository PRs through an explicitly allowed repository method, and optionally rebuilds/relaunches a desktop app without starting a protected runtime.
 
 **Architecture:** Extend the existing `github-pr-feedback` plugin at its fixed-argv GitHub, exact-head worktree, SQLite ledger, and CLI boundaries. Models may investigate and report, while deterministic Python owners exclusively run CI, evaluate gates, acquire leases, merge, verify readback, and execute the separately receipted post-merge hook.
 
@@ -14,7 +14,7 @@
 
 - Disabled by default; enabled configuration rejects missing or unknown fields.
 - Public code and profile names are generic; private branding exists only in local configuration.
-- Automatic merges are squash-only and strict-scope: exact repository, one author, same repository head, exact base, admitted branch prefix.
+- Automatic merges use an explicit ordered allowlist of repository-enabled methods and strict scope: exact repository, one author, same repository head, exact base, admitted branch prefix.
 - Models cannot waive gates, create passing CI receipts, construct merge argv, merge, approve, push, force, rebase, or delete branches.
 - Unavailable, stale, ambiguous, conflicting, dirty, or raced state fails closed.
 - All external commands use literal argv, `shell=False`, bounded timeouts, and typed validated fields.
@@ -58,7 +58,7 @@ raw["merge_maintainer"] = {
 }
 ```
 
-Assert rejection of extra keys, non-private-path shapes, absolute runtime entries, shell strings, empty argv, non-squash modes, wrong repository/target combinations, non-positive freshness, and a post-merge hook without `enabled`.
+Assert rejection of extra keys, non-private-path shapes, absolute runtime entries, shell strings, empty argv, unknown or duplicate merge methods, wrong repository/target combinations, non-positive freshness, and a post-merge hook without `enabled`.
 
 - [ ] **Step 2: Run tests and observe RED**
 
@@ -86,6 +86,7 @@ class MergeMaintainerPolicy:
     repository: str
     author_login: str
     base_branch: str
+    merge_methods: tuple[str, ...]
     receipt_max_age_seconds: int
     report_only: bool
     post_merge: PostMergePolicy | None
@@ -113,7 +114,7 @@ git commit -m "feat(plugin): define strict merge maintainer policy"
 - Modify: `plugins/github-pr-feedback/tests/test_github_client.py`
 
 **Interfaces:**
-- Produces: `PullRequestMergeState`, `ReviewState`, `CheckState`, `MergeReadback`, `get_merge_state()`, `get_review_state()`, `get_check_state()`, `repository_is_private()`, and `squash_merge()`.
+- Produces: `RepositoryMergePolicy`, `PullRequestMergeState`, `ReviewState`, `CheckState`, `MergeReadback`, `get_merge_state()`, `get_review_state()`, `get_check_state()`, `get_repository_merge_policy()`, and `merge_pull_request()`.
 - Consumes: existing `CommandRunner.run(argv: list[str]) -> str`.
 
 - [ ] **Step 1: Write failing fixed-argv and shape tests**
@@ -121,7 +122,7 @@ git commit -m "feat(plugin): define strict merge maintainer policy"
 Cover exact REST reads for repository privacy and PR merge state, a GraphQL query using `gh api graphql -f query=... -F owner=... -F name=... -F number=...` for unresolved review threads, check-run/status reads when Actions is enabled, and the only write:
 
 ```python
-["gh", "pr", "merge", "17", "--repo", "owner/repo", "--squash", "--match-head-commit", head]
+["gh", "pr", "merge", "17", "--repo", "owner/repo", method_flag, "--match-head-commit", head]
 ```
 
 Use hostile title/body/branch fixtures and assert none enters argv. Reject null/unknown mergeability, truncated pagination, malformed review nodes, missing check conclusions, and ambiguous write output.
@@ -134,7 +135,7 @@ Expected: failures for missing adapters.
 
 - [ ] **Step 3: Implement typed canonical reads and fixed write**
 
-Use immutable dataclasses. Split repository only after validating the existing exact `owner/repo` grammar. `squash_merge()` accepts only repository, positive PR number, and a full hexadecimal SHA; it returns no success claim. `get_merge_state()` after the write is the sole source of merged truth and merge commit OID.
+Use immutable dataclasses. Split repository only after validating the existing exact `owner/repo` grammar. `merge_pull_request()` accepts only repository, positive PR number, one enumerated method, and a full hexadecimal SHA; it returns no success claim. `get_merge_state()` after the write is the sole source of merged truth and merge commit OID.
 
 - [ ] **Step 4: Run focused and full adapter tests**
 
@@ -222,7 +223,7 @@ Expected: missing module failure.
 
 - [ ] **Step 3: Implement pure evaluation then leased execution**
 
-Keep `evaluate_merge()` side-effect free. Store a digest of typed gate inputs, not remote prose. In `execute_merge()`, acquire an SQLite `BEGIN IMMEDIATE` lease, reread every volatile field, require the digest to match a fresh decision, call fixed squash merge, reread GitHub, and record the merge commit OID. Use states `claimed`, `verification_required`, `completed`, and `failed`; never issue a second write from an uncertain state.
+Keep `evaluate_merge()` side-effect free. Store a digest of typed gate inputs, not remote prose. In `execute_merge()`, acquire an SQLite `BEGIN IMMEDIATE` lease, reread every volatile field, require the digest to match a fresh decision, choose the first configured method GitHub reports enabled, call the fixed merge command, reread GitHub, and record the method plus merge commit OID. Use states `claimed`, `verification_required`, `completed`, and `failed`; never issue a second write from an uncertain state.
 
 - [ ] **Step 4: Run merge and ledger tests**
 
@@ -234,7 +235,7 @@ Expected: PASS.
 
 ```bash
 git add plugins/github-pr-feedback/github_pr_feedback/merge_controller.py plugins/github-pr-feedback/github_pr_feedback/ledger.py plugins/github-pr-feedback/tests/test_merge_controller.py
-git commit -m "feat(plugin): enforce leased exact-head squash merges"
+git commit -m "feat(plugin): enforce leased exact-head merges"
 ```
 
 ### Task 5: Safe Post-Merge Rebuild and Relaunch
@@ -338,7 +339,7 @@ git commit -m "feat(plugin): wire deterministic merge maintainer"
 
 - [ ] **Step 1: Write an end-to-end test with fake executables**
 
-Create a temp `HERMES_HOME`, exact-head Git repository, fake `gh`, fake package tool, fake process census, and fake app opener. Drive receipt creation, report-only evaluation, live squash merge, canonical merged readback, post-merge fast-forward/build/relaunch, and receipt/status inspection through CLI entry points. Record fake argv and assert hostile PR content never appears.
+Create a temp `HERMES_HOME`, exact-head Git repository, fake `gh`, fake package tool, fake process census, and fake app opener. Drive receipt creation, report-only evaluation, live deterministic merge selection, canonical merged readback, post-merge fast-forward/build/relaunch, and receipt/status inspection through CLI entry points. Record fake argv and assert hostile PR content never appears.
 
 - [ ] **Step 2: Run the E2E test and observe any integration failures**
 
@@ -394,7 +395,7 @@ Set private values locally, with automatic merge and post-merge disabled. Run do
 
 - [ ] **Step 4: Enable automatic merge after report-only agreement**
 
-Revalidate repository privacy and strict author/head/base scope, enable automatic squash merge, and observe one exact-head merge receipt. Do not enable post-merge in the same step.
+Revalidate repository privacy, enabled merge methods, and strict author/head/base scope; enable automatic merge and observe one exact-head merge receipt. Do not enable post-merge in the same step.
 
 - [ ] **Step 5: Enable and observe rebuild/relaunch separately**
 

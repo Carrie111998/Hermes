@@ -5,8 +5,8 @@ Status: approved design
 
 ## Purpose
 
-Add an opt-in Hermes plugin capability that automatically squash-merges pull
-requests only after deterministic, exact-head safety gates pass. A companion
+Add an opt-in Hermes plugin capability that automatically merges pull requests
+only after deterministic, exact-head safety gates pass. A companion
 maintainer profile may investigate and explain blockers, but no language model
 owns merge authority or constructs the merge command.
 
@@ -16,7 +16,8 @@ configuration.
 
 ## Goals
 
-- Automatically squash-merge strictly scoped, same-repository pull requests.
+- Automatically merge strictly scoped, same-repository pull requests using an
+  enabled method from an explicit deterministic preference order.
 - Bind every decision to the canonical pull-request head SHA.
 - Require authoritative local-CI evidence produced by deterministic commands.
 - Fail closed on missing, stale, conflicting, or unavailable state.
@@ -29,8 +30,8 @@ configuration.
 ## Non-goals
 
 - Merging forks, dependency-bot pull requests, or untrusted authors.
-- Force-merging, bypassing protections, rebasing, pushing code, or deleting
-  branches.
+- Force-merging, bypassing protections, rewriting or pushing source branches,
+  or deleting branches.
 - Allowing a model to waive a gate or decide that ambiguous evidence is safe.
 - Treating comments, prose summaries, or model output as CI authority.
 - Starting, stopping, resuming, or otherwise controlling the protected trading
@@ -48,7 +49,7 @@ Required policy fields identify:
 - the exact repository and default base branch;
 - one allowed author login;
 - same-repository heads only;
-- squash as the only merge method;
+- an ordered allowlist of `squash`, `rebase`, and `merge` methods;
 - the exact maintainer profile name;
 - whether automatic merging is enabled;
 - the maximum age of an authoritative CI receipt;
@@ -137,10 +138,14 @@ Under that lease it rereads every volatile gate, including current head,
 mergeability, reviews, unresolved threads, feedback, Actions/check state, and
 the CI receipt.
 
-The only merge command is a literal argv equivalent to:
+The executor reads repository merge-method capabilities and selects the first
+enabled method in the configured preference order. The only merge command is a
+literal argv equivalent to one of:
 
 ```text
 gh pr merge <number> --repo <owner/repository> --squash --match-head-commit <sha>
+gh pr merge <number> --repo <owner/repository> --rebase --match-head-commit <sha>
+gh pr merge <number> --repo <owner/repository> --merge --match-head-commit <sha>
 ```
 
 Repository, number, and SHA come from validated typed fields. PR titles,
@@ -279,7 +284,8 @@ Unit and integration coverage must include:
 2. Deploy the deterministic CI runner and collect receipts without merging.
 3. Run merge evaluation in report-only mode and compare decisions with operator
    review.
-4. Enable automatic squash merge for one strictly scoped private repository.
+4. Enable automatic merge for one strictly scoped private repository, preferring
+   squash and falling back only to another explicitly allowed repository method.
 5. Keep post-merge deployment disabled until merge receipts are proven stable.
 6. Enable rebuild/relaunch with runtime-absence enforcement and observe the
    first run before unattended recurrence.
