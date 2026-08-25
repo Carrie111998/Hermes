@@ -253,6 +253,68 @@ def _log_exit(reason: str) -> None:
     print(f"[gateway-exit] {reason}", file=sys.stderr, flush=True)
 
 
+# Orphan guard for the stdio TUI gateway. The gateway is a child of the TUI
+# host process (node launcher on the classic `hermes --tui` path, dashboard
+# pty host, or desktop build). If the host dies without closing our stdin —
+# a shared/wrapper-held descriptor keeps the pipe open past the host's death
+# — this loop would otherwise run forever: a stale gateway holding session
+# leases, config locks, and (on Windows) .pyd handle chains.
+#
+# Mirrors the slash_worker watchdog (same parent-death idea, simpler policy):
+# on POSIX a dead parent reparents us, so os.getppid() changing is a reliable
+# orphan signal (pid-reuse false-positives are vanishingly rare inside a
+# single boot). On Windows there is no reparenting — os.getppid() keeps
+# returning the dead pid — so this watchdog is POSIX-only there; Windows
+# relies on stdin-EOF (the fast path) plus the KILL_ON_JOB_CLOSE self-attach
+# below. Fail-safe: any exception in the poll loop keeps the gateway alive
+# rather than crashing it.
+_WATCHDOG_POLL_S = 1.0
+
+
+def _start_parent_death_watchdog() -> None:
+    try:
+        original_ppid = os.getppid()
+    except (OSError, AttributeError):
+        return
+    if not original_ppid or original_ppid <= 0:
+        return
+
+    def _loop() -> None:
+        while True:
+            time.sleep(_WATCHDOG_POLL_S)
+            try:
+                if os.getppid() == original_ppid:
+                    continue
+            except (OSError, AttributeError):
+                continue
+            _log_exit(
+                f"parent (pid {original_ppid}) died — orphaned, exiting"
+            )
+            os._exit(0)
+
+    threading.Thread(target=_loop, name="tui-parent-watchdog", daemon=True).start()
+
+
+def _attach_job_object_on_windows() -> None:
+    """Windows: kill our child tree with us via KILL_ON_JOB_CLOSE.
+
+    Best-effort mirror of the gateway/run.py + web_server.py call site: the
+    gateway is put into its own job so every descendant tool process dies
+    atomically with it — no two-hop child chains left holding .pyd locks
+    after the gateway is killed. No-op elsewhere. Never blocks startup.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        from hermes_cli.process_identity import (
+            attach_self_to_kill_on_close_job,
+        )
+
+        attach_self_to_kill_on_close_job()
+    except Exception:
+        pass
+
+
 def wait_for_mcp_discovery(timeout: "float | None" = None) -> None:
     """Block until background MCP discovery finishes, up to the resolved bound.
 
@@ -421,6 +483,12 @@ def ensure_mcp_discovery_started() -> None:
 
 def main():
     _install_sidecar_publisher()
+
+    # Die with our spawning host instead of lingering as an orphan: the
+    # ppid watchdog covers POSIX; the job-object self-attach covers the
+    # Windows child-tree cleanup (killed-with-parent comes from stdin-EOF).
+    _start_parent_death_watchdog()
+    _attach_job_object_on_windows()
 
     # One-time sweep of session rows orphaned by a previous gateway process
     # (#65194) — the in-process WS-orphan reap timer dies with the process.
