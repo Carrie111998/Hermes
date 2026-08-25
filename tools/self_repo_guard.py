@@ -582,8 +582,19 @@ def _read_git_alias(executable: str, target: Path, alias: str) -> str | None | o
         )
     except (OSError, subprocess.SubprocessError):
         return _ALIAS_READ_ERROR
-    value = result.stdout.strip()
-    return value if result.returncode == 0 and value else None
+    # ``git config --get`` exits 1 for the clean "no such key" case; that
+    # (plus a successful rc=0 read that happens to yield an empty value) is
+    # the only status treated as "no alias configured, safe to continue".
+    # Every other nonzero status (invalid config file, bad argument, a
+    # partially-written config, etc.) means we could not determine what the
+    # subcommand actually resolves to, so it must not collapse into the
+    # same value as "no alias".
+    if result.returncode == 0:
+        value = result.stdout.strip()
+        return value if value else None
+    if result.returncode == 1:
+        return None
+    return _ALIAS_READ_ERROR
 
 
 def _inspect_git(
