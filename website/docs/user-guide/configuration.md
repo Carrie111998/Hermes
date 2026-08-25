@@ -753,7 +753,7 @@ Separately from truncation, oversized tool *results* are spilled to disk rather 
 The generic per-result threshold can be lowered for a known-chatty tool without shrinking every tool or the model context window:
 
 ```yaml
-tool_budget:
+tool_output:
   tool_overrides:
     web_search: 20000       # spill this named tool above 20K chars
 ```
@@ -763,7 +763,7 @@ Overrides must be positive integers, are keyed by the exact tool name, and are c
 MCP tool results (tools named `mcp_*`) spill at a tighter **50,000-char** default: MCP servers routinely return large un-paginated payloads (tool-discovery catalogs, batched executions) that would otherwise sit under the generic threshold and bloat context on every subsequent turn. Nothing is lost — the full result is preserved on disk. Override the threshold via:
 
 ```yaml
-tool_budget:
+tool_output:
   mcp_result_size_chars: 50000   # per-result spillover threshold for mcp_* tools
 ```
 
