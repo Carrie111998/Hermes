@@ -125,22 +125,27 @@ def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, cap
     assert any("remember the launch date" in e for e in reloaded.memory_entries)
 
 
-def test_load_on_disk_store_honors_configured_char_limits(hermes_home, monkeypatch):
-    """load_on_disk_store() must read memory.memory_char_limit /
-    user_char_limit from config so approvals applied without a live agent
-    enforce the SAME caps as the live agent (agent_init.py). Falls back to
-    defaults when config can't be loaded.
-    """
+def test_load_on_disk_store_honors_configured_limits_and_permissions(hermes_home, monkeypatch):
+    """Fresh approval stores must match the live agent's limits and target gates."""
     from tools.memory_tool import load_on_disk_store
 
-    # Config override path: helper picks up the configured limits.
+    # Config override path: helper picks up configured limits and store flags.
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
-        lambda: {"memory": {"memory_char_limit": 999, "user_char_limit": 444}},
+        lambda: {
+            "memory": {
+                "memory_char_limit": 999,
+                "user_char_limit": 444,
+                "memory_enabled": False,
+                "user_profile_enabled": True,
+            }
+        },
     )
     store = load_on_disk_store()
     assert store.memory_char_limit == 999
     assert store.user_char_limit == 444
+    assert store.memory_enabled is False
+    assert store.user_profile_enabled is True
 
     # Failure path: config raises → defaults, never blows up.
     def _boom():
@@ -150,6 +155,8 @@ def test_load_on_disk_store_honors_configured_char_limits(hermes_home, monkeypat
     fallback = load_on_disk_store()
     assert fallback.memory_char_limit == 2200
     assert fallback.user_char_limit == 1375
+    assert fallback.memory_enabled is True
+    assert fallback.user_profile_enabled is True
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1703,198 @@ def test_descriptor_anchored_skill_apply_supports_every_mutation(
         assert stat.S_IMODE(note.stat().st_mode) == 0o644
     elif action == "remove_file":
         assert not (skill_dir / "references" / "note.md").exists()
+
+
+@pytest.mark.parametrize("action", ["edit", "patch", "write_file"])
+def test_background_review_approved_replay_preserves_staged_read_proof(
+    hermes_home, monkeypatch, action
+):
+    """Approval replay must not lose the exact read proven before staging."""
+    from pathlib import Path
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as sm
+    from tools import skill_usage
+    from tools import write_approval as wa
+    from tools.skill_provenance import (
+        BACKGROUND_REVIEW,
+        reset_current_write_origin,
+        set_current_write_origin,
+    )
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    note = skill_dir / "references" / "note.md"
+    note.parent.mkdir()
+    note.write_text("old note", encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(wa, "collect_session_context", lambda **_kwargs: dict(_SESSION_CONTEXT))
+    monkeypatch.setattr(skill_usage, "is_protected_builtin", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_hub_installed", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_bundled", lambda _name: False)
+    monkeypatch.setattr(
+        skill_usage,
+        "load_usage",
+        lambda: {"demo": {"created_by": "agent"}},
+    )
+    monkeypatch.setattr(
+        skill_usage,
+        "get_record",
+        lambda _name: {"created_by": "agent", "pinned": False},
+    )
+    _set_approval("skills", True)
+
+    origin_token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        target = note if action == "write_file" else skill_md
+        sm.mark_background_review_skill_read(target)
+        if action == "edit":
+            staged_raw = sm.skill_manage(
+                action="edit",
+                name="demo",
+                content=_SKILL.replace("body", "edited body"),
+            )
+        elif action == "patch":
+            staged_raw = sm.skill_manage(
+                action="patch",
+                name="demo",
+                old_string="body",
+                new_string="patched body",
+            )
+        else:
+            staged_raw = sm.skill_manage(
+                action="write_file",
+                name="demo",
+                file_path="references/note.md",
+                file_content="updated note",
+            )
+        staged = json.loads(staged_raw)
+    finally:
+        reset_current_write_origin(origin_token)
+
+    assert staged["success"] is True and staged["staged"] is True, staged
+    record = wa.list_pending(wa.SKILLS)[0]
+    assert record["background_review_read_verified"] is True
+
+    # Approval runs in a fresh command context, without the review fork's
+    # process-local ContextVar marks. The record-bound proof must survive.
+    sm._reset_background_review_read_marks()
+    output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert output == "Approved 1 skills write(s)."
+    if action == "edit":
+        assert "edited body" in skill_md.read_text(encoding="utf-8")
+    elif action == "patch":
+        assert "patched body" in skill_md.read_text(encoding="utf-8")
+    else:
+        assert note.read_text(encoding="utf-8") == "updated note"
+
+
+def test_background_review_write_without_read_is_not_staged(hermes_home, monkeypatch):
+    """The approval gate must not bypass the background read-before-write rule."""
+    from pathlib import Path
+    from tools import skill_manager_tool as sm
+    from tools import skill_usage
+    from tools import write_approval as wa
+    from tools.skill_provenance import (
+        BACKGROUND_REVIEW,
+        reset_current_write_origin,
+        set_current_write_origin,
+    )
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_SKILL, encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(wa, "collect_session_context", lambda **_kwargs: dict(_SESSION_CONTEXT))
+    monkeypatch.setattr(skill_usage, "is_protected_builtin", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_hub_installed", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_bundled", lambda _name: False)
+    monkeypatch.setattr(
+        skill_usage,
+        "load_usage",
+        lambda: {"demo": {"created_by": "agent"}},
+    )
+    monkeypatch.setattr(
+        skill_usage,
+        "get_record",
+        lambda _name: {"created_by": "agent", "pinned": False},
+    )
+    _set_approval("skills", True)
+
+    origin_token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        result = json.loads(
+            sm.skill_manage(
+                action="patch",
+                name="demo",
+                old_string="body",
+                new_string="patched body",
+            )
+        )
+    finally:
+        reset_current_write_origin(origin_token)
+
+    assert result["success"] is False
+    assert result["_read_before_write_required"] is True
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_legacy_background_pending_without_read_proof_fails_closed(
+    hermes_home, monkeypatch
+):
+    """Pre-proof records remain reviewable but cannot bypass the live read guard."""
+    from pathlib import Path
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as sm
+    from tools import skill_usage
+    from tools import write_approval as wa
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(skill_usage, "is_protected_builtin", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_hub_installed", lambda _name: False)
+    monkeypatch.setattr(skill_usage, "is_bundled", lambda _name: False)
+    monkeypatch.setattr(
+        skill_usage,
+        "load_usage",
+        lambda: {"demo": {"created_by": "agent"}},
+    )
+    monkeypatch.setattr(
+        skill_usage,
+        "get_record",
+        lambda _name: {"created_by": "agent", "pinned": False},
+    )
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": "demo",
+            "old_string": "body",
+            "new_string": "patched body",
+        },
+        summary="legacy patch",
+        origin="background_review",
+        session_context=_SESSION_CONTEXT,
+        target_tree_pre_image_hash=sm._target_tree_pre_image_hash("demo"),
+    )
+
+    sm._reset_background_review_read_marks()
+    output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert output is not None
+    assert "Approved 0 skills write(s)." in output
+    assert "Failed:" in output
+    assert "read-before-write" in output or "has not been loaded" in output
+    assert skill_md.read_text(encoding="utf-8") == _SKILL
+    assert wa.pending_count(wa.SKILLS) == 1
 
 
 def test_background_review_origin_survives_skill_approval(hermes_home, monkeypatch):

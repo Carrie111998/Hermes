@@ -57,9 +57,25 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
-)
+class _BackgroundReviewReadMarks:
+    """Read marks shared by copied tool contexts within one review run."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._paths: set[str] = set()
+
+    def add(self, path: str) -> None:
+        with self._lock:
+            self._paths.add(path)
+
+    def contains(self, path: str) -> bool:
+        with self._lock:
+            return path in self._paths
+
+
+_background_review_read_paths: (
+    "_ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]]"
+) = _ctxvars.ContextVar("background_review_read_paths", default=None)
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -82,9 +98,11 @@ def mark_background_review_skill_read(path: Path) -> None:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    marks = _background_review_read_paths.get()
+    if marks is None:
+        marks = _BackgroundReviewReadMarks()
+        _background_review_read_paths.set(marks)
+    marks.add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -92,12 +110,13 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    marks = _background_review_read_paths.get()
+    return marks is not None and marks.contains(resolved)
 
 
 def _reset_background_review_read_marks() -> None:
-    """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    """Start a fresh, isolated read set for the current review context."""
+    _background_review_read_paths.set(_BackgroundReviewReadMarks())
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
@@ -330,16 +349,30 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
 
 
 def _pinned_guard(name: str) -> Optional[str]:
-    """Return a refusal message if *name* is pinned, else None.
+    """Return a refusal message if *name* is pinned or essential, else None.
 
     Pin protects a skill from **deletion** — both the curator's auto-archive
     passes and the agent's ``skill_manage(action="delete")`` tool call. The
     agent can still patch/edit pinned skills; pin only guards against
     irrecoverable loss, not against content evolution.
 
+    Essential skills (``agent/skill_utils.ESSENTIAL_SKILLS``, e.g.
+    ``hermes-agent``) are treated as permanently pinned: the system prompt
+    always references them, so deleting one leaves a dangling instruction.
+
     Best-effort: if the sidecar is unreadable we let the delete through
     rather than block on a broken telemetry file.
     """
+    try:
+        from agent.skill_utils import ESSENTIAL_SKILLS
+        if name in ESSENTIAL_SKILLS:
+            return (
+                f"Skill '{name}' is essential to Hermes (the agent's own "
+                f"operating manual referenced by the system prompt) and "
+                f"cannot be deleted. Patches and edits are still allowed."
+            )
+    except Exception:
+        logger.debug("essential-guard lookup failed for %s", name, exc_info=True)
     try:
         from tools import skill_usage
         rec = skill_usage.get_record(name)
@@ -486,6 +519,8 @@ def _background_review_read_before_write_guard(
     file_label: str,
 ) -> Optional[Dict[str, Any]]:
     """Require review forks to load the exact target before mutating it."""
+    if _pending_apply_read_guard_bypass.get():
+        return None
     try:
         from tools.skill_provenance import is_background_review
         if not is_background_review():
@@ -507,6 +542,41 @@ def _background_review_read_before_write_guard(
         ),
         "_read_before_write_required": True,
     }
+
+
+def _background_review_staging_read_preflight(
+    action: str,
+    name: str,
+    file_path: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Verify and bind a background review's exact read before staging."""
+    try:
+        from tools.skill_provenance import is_background_review
+        if not is_background_review():
+            return None, False
+    except Exception:
+        return None, False
+
+    existing = _find_skill(name)
+    if not existing:
+        return None, False
+    if action == "edit" or (action == "patch" and not file_path):
+        target = existing["path"] / "SKILL.md"
+        file_label = "SKILL.md"
+    elif action in {"patch", "write_file", "remove_file"}:
+        if not file_path:
+            return None, False
+        target, error = _resolve_skill_target(existing["path"], file_path)
+        if error or target is None or not target.exists():
+            return None, False
+        file_label = file_path or "SKILL.md"
+    else:
+        return None, False
+
+    guard = _background_review_read_before_write_guard(
+        name, target, action, file_label
+    )
+    return guard, guard is None
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
@@ -1596,6 +1666,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False
 )
+_pending_apply_read_guard_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
+    "pending_apply_read_guard_bypass", default=False
+)
 
 
 _MAX_PENDING_PRE_IMAGE_BYTES = 64 * 1024 * 1024
@@ -2583,6 +2656,7 @@ def _apply_skill_write_gate(
     *,
     session_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
+    background_review_read_verified: bool = False,
     **payload_kwargs,
 ):
     """Evaluate the skill write gate. Returns a JSON tool-result string when the
@@ -2629,6 +2703,11 @@ def _apply_skill_write_gate(
                 tool_call_id=tool_call_id,
             ),
             target_tree_pre_image_hash=target_hash,
+            background_review_read_verified=(
+                background_review_read_verified
+                if wa.current_origin() == "background_review"
+                else None
+            ),
         )
     except (OSError, ValueError, wa.PendingStoreError) as exc:
         return tool_error(f"Skill write was not staged safely: {exc}", success=False)
@@ -2644,6 +2723,7 @@ def apply_skill_pending(
     *,
     expected_target_tree_pre_image_hash: Optional[str] = None,
     origin: str = "foreground",
+    background_review_read_verified: bool = False,
 ) -> str:
     """Replay a staged skill write after revalidating bound state and origin."""
     if not expected_target_tree_pre_image_hash:
@@ -2658,6 +2738,9 @@ def apply_skill_pending(
         expected_target_tree_pre_image_hash
     )
     origin_token = set_current_write_origin(origin)
+    read_guard_token = _pending_apply_read_guard_bypass.set(
+        origin == "background_review" and background_review_read_verified is True
+    )
     try:
         return skill_manage(
             action=payload.get("action", ""),
@@ -2672,6 +2755,7 @@ def apply_skill_pending(
             absorbed_into=payload.get("absorbed_into"),
         )
     finally:
+        _pending_apply_read_guard_bypass.reset(read_guard_token)
         reset_current_write_origin(origin_token)
         _pending_apply_pre_image_hash.reset(pre_image_token)
         _skill_gate_bypass.reset(token)
@@ -2751,6 +2835,12 @@ def _skill_manage_unlocked(
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
+    read_preflight, background_review_read_verified = (
+        _background_review_staging_read_preflight(action, name, file_path)
+    )
+    if read_preflight is not None:
+        return json.dumps(read_preflight, ensure_ascii=False)
+
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
     # (default) passes straight through. The gate is bypassed when this call is
@@ -2761,6 +2851,7 @@ def _skill_manage_unlocked(
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
         session_id=session_id, tool_call_id=tool_call_id,
+        background_review_read_verified=background_review_read_verified,
     )
     if gate_result is not None:
         return gate_result

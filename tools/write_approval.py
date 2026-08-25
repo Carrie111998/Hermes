@@ -247,6 +247,9 @@ def validate_pending_record(record: Dict[str, Any]) -> tuple[bool, str]:
         target_hash = record.get("target_tree_pre_image_hash")
         if not isinstance(target_hash, str) or not _SHA256_RE.fullmatch(target_hash):
             return False, "pending skill record has no valid target pre-image hash"
+        read_verified = record.get("background_review_read_verified")
+        if read_verified is not None and not isinstance(read_verified, bool):
+            return False, "pending skill record has invalid read-before-write proof"
     try:
         expected_record_hash = hashlib.sha256(
             _canonical_record_bytes(record)
@@ -371,6 +374,7 @@ def stage_write(
     origin: str,
     session_context: Optional[Dict[str, str]] = None,
     target_tree_pre_image_hash: Optional[str] = None,
+    background_review_read_verified: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
 
@@ -410,6 +414,10 @@ def stage_write(
     }
     if target_tree_pre_image_hash is not None:
         record["target_tree_pre_image_hash"] = target_tree_pre_image_hash
+    if background_review_read_verified is not None:
+        record["background_review_read_verified"] = (
+            background_review_read_verified
+        )
     record["record_hash"] = hashlib.sha256(
         _canonical_record_bytes(record)
     ).hexdigest()

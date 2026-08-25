@@ -172,6 +172,9 @@ def _apply_one(subsystem: str, rec, memory_store):
                         "target_tree_pre_image_hash"
                     ),
                     origin=rec.get("origin", "foreground"),
+                    background_review_read_verified=rec.get(
+                        "background_review_read_verified", False
+                    ),
                 )
             )
             return bool(result.get("success")), result.get("error", "")
