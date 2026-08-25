@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 from pathlib import Path
 from unittest.mock import patch
 
@@ -58,6 +59,42 @@ class TestAtomicJsonWrite:
 
         assert json.loads(target.read_text(encoding="utf-8")) == {"api_key": "secret"}
 
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX-only mode assertion")
+    def test_create_mode_is_set_before_replacement(self, tmp_path, monkeypatch):
+        """A reader must never observe the temp file's restrictive mode."""
+        import utils
+
+        target = tmp_path / "runtime.json"
+        events = []
+        real_fchmod = os.fchmod
+        real_replace = utils.atomic_replace
+
+        def record_fchmod(fd, mode):
+            events.append(("fchmod", mode))
+            return real_fchmod(fd, mode)
+
+        def record_replace(tmp_path_arg, target_arg):
+            events.append(("replace", stat.S_IMODE(Path(tmp_path_arg).stat().st_mode)))
+            return real_replace(tmp_path_arg, target_arg)
+
+        monkeypatch.setattr(utils.os, "fchmod", record_fchmod)
+        monkeypatch.setattr(utils, "atomic_replace", record_replace)
+
+        atomic_json_write(target, {"ok": True}, create_mode=0o644)
+
+        assert events == [("fchmod", 0o644), ("replace", 0o644)]
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX-only mode assertion")
+    def test_create_mode_does_not_change_existing_target_mode(self, tmp_path):
+        target = tmp_path / "existing.json"
+        target.write_text('{"old": true}', encoding="utf-8")
+        target.chmod(0o640)
+
+        atomic_json_write(target, {"new": True}, create_mode=0o644)
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
 
     def test_concurrent_writes_dont_corrupt(self, tmp_path):
         """Multiple rapid writes should each produce valid JSON."""
