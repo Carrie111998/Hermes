@@ -449,6 +449,20 @@ describe('createProject', () => {
     expect(request).toHaveBeenCalledWith('projects.create', expect.objectContaining({ profile: 'default' }))
   })
 
+  it('still refuses project creation in All-profiles view when the profile roster has not loaded yet', async () => {
+    $activeGatewayProfile.set('default')
+    $profiles.set([])
+    setShowAllProfiles(true)
+
+    const request = vi.fn()
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await expect(createProject({ folders: ['/srv/demo'], name: 'Demo' })).rejects.toThrow(
+      'Projects are unavailable while viewing all profiles'
+    )
+    expect(request).not.toHaveBeenCalled()
+  })
+
   it('still refuses project creation in All-profiles view when more than one profile exists', async () => {
     $activeGatewayProfile.set('default')
     $profiles.set([profile('default', true), profile('work')])

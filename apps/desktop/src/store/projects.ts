@@ -364,8 +364,11 @@ function projectProfile(): null | string {
   // user (`multiProfile && profileScope === ALL_PROFILES`, sidebar/index.tsx)
   // so the UI looks unchanged in this state. Mirror that gate here: with only
   // one profile there's nothing to disambiguate, so resolve to it instead of
-  // hard-failing project creation with an inscrutable error.
-  return $profiles.get().length > 1 ? null : profile
+  // hard-failing project creation with an inscrutable error. An empty roster
+  // means the profile list hasn't loaded (or failed to), not that there's
+  // genuinely one profile, so it must keep refusing rather than resolve to a
+  // possibly-stale `$activeGatewayProfile`.
+  return $profiles.get().length === 1 ? profile : null
 }
 
 function projectParams(
