@@ -61,6 +61,13 @@ export function createScreenAnnotationsController({
   let shapes: MappedAnnotationShape[] = []
   let ttlTimer: NodeJS.Timeout | null = null
 
+  // Draw/clear ordering guard. `annotate` suspends at the window-enumeration
+  // await, and requests can overlap (the main window and the HUD each run
+  // their own session), so an older draw could resume after a newer draw or
+  // clear and overwrite it with stale shapes and a stale TTL. Every request
+  // takes a generation at entry; the shared state only accepts the latest.
+  let requestGeneration = 0
+
   const url = () => {
     if (devServer) {
       return `${devServer.endsWith('/') ? devServer.slice(0, -1) : devServer}/?win=annotate#/`
@@ -211,6 +218,7 @@ export function createScreenAnnotationsController({
     request: unknown,
     senderBounds: AnnotationBounds | null
   ): Promise<Record<string, unknown>> => {
+    const generation = ++requestGeneration
     const req = (request && typeof request === 'object' ? request : {}) as Record<string, unknown>
     const action = typeof req.action === 'string' ? req.action.trim().toLowerCase() : 'draw'
 
@@ -243,6 +251,13 @@ export function createScreenAnnotationsController({
       targetInfo = { target: 'screen' }
     } else {
       const windows = await enumerateWindowsFrontToBack(process.pid, titlesAvailable())
+
+      // The one suspension point. Everything below runs synchronously, so a
+      // single staleness check here is enough to keep an older request from
+      // overwriting a newer draw or clear that landed while we enumerated.
+      if (generation !== requestGeneration) {
+        return { error: 'Superseded by a newer screen-annotation request.', success: false }
+      }
 
       if (enumerationFailed(windows)) {
         return {
@@ -300,6 +315,11 @@ export function createScreenAnnotationsController({
   }
 
   const close = () => {
+    // Invalidate any in-flight draw so it cannot respawn the overlay behind a
+    // quitting app. (The TTL's own clear() deliberately does NOT bump the
+    // generation: it belongs to the shapes it expired, and a newer draw that
+    // is mid-enumeration when it fires must still land.)
+    requestGeneration += 1
     disarmTtl()
 
     if (window && !window.isDestroyed()) {
