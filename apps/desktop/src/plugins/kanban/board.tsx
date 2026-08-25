@@ -1515,13 +1515,16 @@ export function KanbanBoardPage() {
 
             for (const [name, lane] of laneElements.current) {
               const distance = Math.abs(lane.offsetLeft - scroller.scrollLeft - scroller.clientLeft)
+
               if (distance < nearestDistance) {
                 nearestDistance = distance
                 nearestName = name
               }
             }
 
-            if (nearestName !== selectedLane) {setSelectedLane(nearestName)}
+            if (nearestName !== selectedLane) {
+              setSelectedLane(nearestName)
+            }
           }}
           ref={lanesRef}
           role="region"
