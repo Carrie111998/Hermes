@@ -5474,6 +5474,8 @@ def run_conversation(
                         False if _is_upstream
                         else _ra()._pool_may_recover_from_rate_limit(
                             agent._credential_pool,
+                            provider=getattr(agent, "provider", "") or "",
+                            error_context=classified.error_context,
                         )
                     )
                     if not pool_may_recover:

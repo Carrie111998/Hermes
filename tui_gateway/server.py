@@ -11472,6 +11472,13 @@ def _run_prompt_submit(
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(_profile_home_str)))
+            # A Desktop/TUI agent can outlive config edits for hours. Refresh
+            # the chain inside the per-profile turn scope so an already-open or
+            # remounted session adopts fallback_providers without an agent
+            # rebuild, matching the messaging gateway's cached-agent path.
+            from hermes_cli.fallback_config import apply_fallback_chain_to_agent
+
+            apply_fallback_chain_to_agent(agent, _load_fallback_model())
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty

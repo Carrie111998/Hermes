@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 
@@ -99,3 +100,25 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+def apply_fallback_chain_to_agent(agent: Any, chain: list[dict[str, Any]] | None) -> None:
+    """Align a reused agent with the current configured fallback chain."""
+    if agent is None:
+        return
+    new_chain = list(chain or [])
+    rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
+    if (
+        getattr(agent, "_fallback_activated", False)
+        and rate_limited_until > time.monotonic()
+    ):
+        return
+    old_chain = list(getattr(agent, "_fallback_chain", []) or [])
+    agent._fallback_chain = new_chain
+    agent._fallback_model = new_chain[0] if new_chain else None
+    if not getattr(agent, "_fallback_activated", False):
+        agent._fallback_index = 0
+    if new_chain != old_chain:
+        unavailable = getattr(agent, "_unavailable_fallback_keys", None)
+        if unavailable:
+            unavailable.clear()

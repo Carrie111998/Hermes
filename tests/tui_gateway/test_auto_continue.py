@@ -152,6 +152,39 @@ def test_concluded_turn_clears_marker(emits, turn_env, marker_home):
     assert read_turn_marker(marker_home, "session-key") is None
 
 
+def test_live_turn_refreshes_fallback_chain_from_current_config(
+    emits, turn_env, marker_home, monkeypatch
+):
+    configured = [{"provider": "xai-oauth", "model": "grok-4.6"}]
+    seen_chain: list[list[dict]] = []
+
+    def _run(message, **kwargs):
+        seen_chain.append(list(agent._fallback_chain))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=_run,
+        clear_interrupt=lambda: None,
+        _fallback_chain=[],
+        _fallback_model=None,
+        _fallback_index=0,
+        _fallback_activated=False,
+        _rate_limited_until=0,
+        _unavailable_fallback_keys={("old", "entry")},
+    )
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: configured)
+
+    server._run_prompt_submit(
+        "rid", "sid", _session(agent=agent, running=True), "do the thing"
+    )
+
+    assert seen_chain == [configured]
+    assert agent._fallback_model == configured[0]
+    assert agent._fallback_index == 0
+    assert agent._unavailable_fallback_keys == set()
+
+
 def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
     """An exception is a CONCLUDED turn (terminal frame + retained snapshot own
     recovery) — only a process death may leave the marker behind."""

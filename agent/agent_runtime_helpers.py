@@ -1176,6 +1176,23 @@ def recover_with_credential_pool(
                 or "usage limit reached" in context_message
                 or "usage limit has been reached" in context_message
             )
+        if (
+            usage_limit_reached
+            and current_provider == "openai-codex"
+            and len(pool.entries()) > 1
+            and getattr(agent, "_fallback_index", 0)
+            < len(getattr(agent, "_fallback_chain", []) or [])
+            and not _ra()._pool_may_recover_from_rate_limit(
+                pool,
+                provider=current_provider,
+                error_context=error_context,
+            )
+        ):
+            _ra().logger.info(
+                "Codex usage-limit quota is shared by the available pool entries — "
+                "deferring directly to the fallback chain"
+            )
+            return False, True
         if not has_retried_429 and not usage_limit_reached:
             return False, True
         rotate_status = status_code if status_code is not None else 429

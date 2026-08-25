@@ -316,7 +316,12 @@ def _routermint_headers() -> dict:
     }
 
 
-def _pool_may_recover_from_rate_limit(pool) -> bool:
+def _pool_may_recover_from_rate_limit(
+    pool,
+    *,
+    provider: str = "",
+    error_context: dict | None = None,
+) -> bool:
     """Decide whether to wait for credential-pool rotation instead of falling back.
 
     The existing pool-rotation path requires the pool to (1) exist and (2) have
@@ -338,7 +343,41 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
         return False
     if not pool.has_available():
         return False
-    return len(pool.entries()) > 1
+    entries = pool.entries()
+    if len(entries) <= 1:
+        return False
+
+    context_reason = str((error_context or {}).get("reason") or "").lower()
+    context_message = str((error_context or {}).get("message") or "").lower()
+    usage_limit_reached = (
+        "usage_limit_reached" in context_reason
+        or "gousagelimit" in context_reason
+        or "usage limit reached" in context_message
+        or "usage limit has been reached" in context_message
+    )
+    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
+    current_provider = str(provider or pool_provider).strip().lower()
+    if current_provider == "openai-codex" and usage_limit_reached:
+        from hermes_cli.auth import _decode_jwt_claims
+
+        account_ids: list[str] = []
+        for entry in entries:
+            token = str(getattr(entry, "runtime_api_key", "") or "")
+            claims = _decode_jwt_claims(token)
+            auth_claim = claims.get("https://api.openai.com/auth")
+            account_id = (
+                auth_claim.get("chatgpt_account_id")
+                if isinstance(auth_claim, dict)
+                else None
+            )
+            # Unknown identity must preserve ordinary pool rotation. Only
+            # collapse entries when the JWTs prove they share one quota scope.
+            if not isinstance(account_id, str) or not account_id:
+                return True
+            account_ids.append(account_id)
+        return len(set(account_ids)) > 1
+
+    return True
 
 
 def _qwen_portal_headers() -> dict:
