@@ -693,6 +693,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["script"] = job["script"]
     if job.get("reasoning_effort"):
         result["reasoning_effort"] = job["reasoning_effort"]
+    if job.get("post_script"):
+        result["post_script"] = job["post_script"]
     if job.get("monitor_script"):
         result["monitor_script"] = job["monitor_script"]
     if job.get("monitor_url"):
@@ -1281,6 +1283,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    post_script: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1325,6 +1328,12 @@ def cronjob(
                 monitor_error = _validate_cron_script_path(monitor_script)
                 if monitor_error:
                     return tool_error(monitor_error, success=False)
+
+            # Same containment rules for the post-run hook.
+            if post_script:
+                post_error = _validate_cron_script_path(post_script)
+                if post_error:
+                    return tool_error(post_error, success=False)
 
             # Reject a model-supplied base_url that would route a named
             # provider's stored credential to an attacker endpoint (F8).
@@ -1387,6 +1396,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    post_script=_normalize_optional_job_value(post_script),
                     # reasoning_effort reaches here from the CLI
                     # (hermes cron create --reasoning-effort) ONLY — it is
                     # deliberately absent from CRONJOB_SCHEMA and the model
@@ -1637,6 +1647,15 @@ def cronjob(
                 updates["monitor_url"] = (
                     _normalize_optional_job_value(monitor_url) if monitor_url else None
                 )
+            if post_script is not None:
+                # Pass empty string to clear an existing post_script
+                if post_script:
+                    post_error = _validate_cron_script_path(post_script)
+                    if post_error:
+                        return tool_error(post_error, success=False)
+                updates["post_script"] = (
+                    _normalize_optional_job_value(post_script) if post_script else None
+                )
             if monitor_script is not None or monitor_url is not None:
                 eff_mon_script = (
                     updates["monitor_script"] if "monitor_script" in updates else job.get("monitor_script")
@@ -1794,6 +1813,10 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "type": "string",
                 "description": "Optional http(s) URL used as the monitor source instead of a script — fetched with a bounded GET (30s timeout, 256KB cap) each tick. Same hash-suppression semantics as monitor_script. Mutually exclusive with monitor_script. On update, pass empty string to clear."
             },
+            "post_script": {
+                "type": "string",
+                "description": f"Optional hook script run AFTER the run has been recorded, on both the success and the failure path (same rules as `script`: relative to {display_hermes_home()}/scripts/, .sh/.bash via bash, else Python). It receives HERMES_JOB_ID and HERMES_RUN_ID in its environment — use it to declare the run's outcome to an external tracker, release a claim, or kick a downstream pipeline. Best-effort: a failing post_script is logged, never fails the run, and its stdout is NOT delivered. On update, pass empty string to clear."
+            },
             "no_agent": {
                 "type": "boolean",
                 "default": False,
@@ -1911,6 +1934,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        post_script=args.get("post_script"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),

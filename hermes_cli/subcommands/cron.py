@@ -84,6 +84,18 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--post-script",
+        dest="post_script",
+        help=(
+            "Path to a script under ~/.hermes/scripts/ run AFTER the run is "
+            "recorded, on both success and failure. Receives HERMES_JOB_ID "
+            "and HERMES_RUN_ID in its environment — use it to declare the "
+            "run's outcome to an external tracker, release a claim, or kick "
+            "a downstream pipeline. Its stdout is not delivered, and a "
+            "failure is logged without failing the run."
+        ),
+    )
+    cron_create.add_argument(
         "--monitor-url",
         dest="monitor_url",
         help=(
@@ -226,6 +238,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="monitor_url",
         help=(
             "Set/replace the monitor source URL. Pass empty string to clear."
+        ),
+    )
+    cron_edit.add_argument(
+        "--post-script",
+        dest="post_script",
+        help=(
+            "Set/replace the post-run hook script (see `hermes cron create "
+            "--post-script`). Pass empty string to clear."
         ),
     )
     cron_edit.add_argument(
