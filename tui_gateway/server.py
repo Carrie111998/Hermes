@@ -146,6 +146,10 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
+# Per-session cancellation generation.  A serialized clarify captures this before
+# waiting for its session lock; _block compares it atomically with registration so
+# interrupt/teardown cannot miss a waiter that was not pending yet.
+_prompt_cancel_generation: dict[str, int] = {}
 # Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}.
 # Written by clarify.respond (per-question lock, update-in-place), read out by
 # _block on resolution/timeout so locked answers survive the deadline.
@@ -1014,6 +1018,10 @@ def _pop_session_by_id(sid: str) -> dict | None:
             _sessions.pop(sid, None)
     if session is None:
         return None
+    # Detach and cancel as one ownership operation.  In particular this wakes
+    # the active clarify and advances its generation so a sibling serialized on
+    # clarify_lock cannot publish a fresh card after close.
+    _clear_pending(sid)
     # The session is already out of _sessions here, so downstream teardown
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
@@ -4034,10 +4042,16 @@ def _block(
     payload: dict,
     timeout: float | None = 300,
     batch_qids: list[str] | None = None,
+    cancel_generation: int | None = None,
 ) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
+        if (
+            cancel_generation is not None
+            and _prompt_cancel_generation.get(sid, 0) != cancel_generation
+        ):
+            return ""
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
         _pending_prompt_payloads[rid] = (event, dict(payload))
@@ -4139,7 +4153,7 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
     """
     with _sessions_lock:
         session = _sessions.get(sid)
-        if session is None:
+        if session is None or session.get("_turn_cancel_requested"):
             tool_id = ""
             clarify_lock = None
         else:
@@ -4150,6 +4164,11 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
                 or ""
             )
             clarify_lock = session.setdefault("clarify_lock", threading.Lock())
+    with _prompt_lock:
+        cancel_generation = _prompt_cancel_generation.get(sid, 0)
+
+    if session is None or session.get("_turn_cancel_requested"):
+        return ""
 
     def request() -> str:
         if questions:
@@ -4168,6 +4187,7 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
                 {"questions": wire, **({"tool_id": tool_id} if tool_id else {})},
                 timeout=_clarify_timeout_seconds(),
                 batch_qids=[entry["qid"] for entry in questions],
+                cancel_generation=cancel_generation,
             )
         # multi_select is a pass-through hint: renderers with checkbox
         # support can honor it; older renderers ignore the extra field
@@ -4183,6 +4203,7 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
                 else {"question": q, "choices": c, **({"tool_id": tool_id} if tool_id else {})}
             ),
             timeout=_clarify_timeout_seconds(),
+            cancel_generation=cancel_generation,
         )
 
     if clarify_lock is None:
@@ -4269,6 +4290,8 @@ def _clear_pending(sid: str | None = None) -> None:
     None, every pending prompt is released (used during shutdown).
     """
     with _prompt_lock:
+        if sid is not None:
+            _prompt_cancel_generation[sid] = _prompt_cancel_generation.get(sid, 0) + 1
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
                 _answers[rid] = ""

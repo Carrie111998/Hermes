@@ -628,6 +628,75 @@ def test_concurrent_clarify_calls_keep_execution_local_tool_ids_and_serialize(ca
     assert set(results.values()) == {"first", "second"}
 
 
+def test_interrupt_cancels_clarify_waiting_for_session_lock(capture):
+    """A serialized clarify must not open after its turn was interrupted."""
+    server, _buf = capture
+    session = {
+        "history": [],
+        "history_lock": threading.RLock(),
+        "_turn_cancel_requested": False,
+    }
+    server._sessions["s1"] = session
+    started = threading.Barrier(3)
+    results = {}
+
+    def run(call_id, question):
+        server._on_tool_start("s1", call_id, "clarify", {})
+        started.wait()
+        results[call_id] = server._clarify_block("s1", question, ["yes", "no"])
+
+    threads = [
+        threading.Thread(target=run, args=("call-a", "Question A?"), daemon=True),
+        threading.Thread(target=run, args=("call-b", "Question B?"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    started.wait()
+
+    deadline = time.monotonic() + 2
+    active_request_id = None
+    while time.monotonic() < deadline:
+        with server._prompt_lock:
+            pending = [
+                rid
+                for rid, (event, _payload) in server._pending_prompt_payloads.items()
+                if event == "clarify.request"
+            ]
+        if pending:
+            active_request_id = pending[0]
+            break
+        time.sleep(0.01)
+    assert active_request_id is not None
+
+    with session["history_lock"]:
+        session["_turn_cancel_requested"] = True
+    server._clear_pending("s1")
+
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert set(results.values()) == {""}
+    with server._prompt_lock:
+        assert not [
+            rid
+            for rid, (event, _payload) in server._pending_prompt_payloads.items()
+            if event == "clarify.request"
+        ]
+
+
+def test_popping_session_cancels_its_pending_prompts(server):
+    session = {"history": []}
+    event = threading.Event()
+    server._sessions["s1"] = session
+    server._pending["request-1"] = ("s1", event)
+
+    assert server._pop_session_by_id("s1") is session
+
+    assert event.is_set()
+    assert server._answers["request-1"] == ""
+
+
 def test_approval_pending_replays_unresolved_requests(server, monkeypatch):
     from tools import approval
 
