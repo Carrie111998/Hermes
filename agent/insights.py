@@ -177,6 +177,10 @@ class InsightsEngine:
             Dict with all computed insights
         """
         cutoff = since if since is not None else time.time() - (days * 86400)
+        # Sentinel for "no upper bound": SQLite compares REAL columns against
+        # this numerically, so every query below can stay a single prepared
+        # statement instead of branching on whether `until` was given. The
+        # pinned-index tests bind this same sentinel deliberately.
         until_bound = until if until is not None else float("inf")
         period_label = self._format_period_label(days, since, until)
 
