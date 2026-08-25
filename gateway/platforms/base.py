@@ -1531,8 +1531,32 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
     return mounts
 
 
-def _default_docker_workspace_host_root() -> Optional[Path]:
-    """Host path for Docker's default persistent ``/workspace`` mount."""
+def _docker_sandbox_dir_name(session_key: str = "") -> str:
+    """Host sandbox directory name for a session's persistent Docker container.
+
+    Mirrors ``_resolve_container_task_id(None)`` (tools/terminal_tool.py):
+    gateway sessions key their container ``session:<session_key>`` and
+    tools/environments/docker.py names the host directory after
+    :func:`sanitize_task_id_for_path` of that id. Contexts without a session
+    key share the historical ``default`` sandbox.
+
+    Takes the key explicitly because the delivery pipeline runs after
+    ``_handle_message_with_agent`` cleared the turn's session contextvars
+    (#93950) — an ambient lookup here would silently collapse onto
+    ``default`` and miss the session's real sandbox.
+    """
+    if not session_key:
+        return "default"
+    try:
+        from tools.environments.base import sanitize_task_id_for_path
+
+        return sanitize_task_id_for_path(f"session:{session_key}")
+    except Exception:
+        return "default"
+
+
+def _default_docker_workspace_host_root(session_key: str = "") -> Optional[Path]:
+    """Host path for this session's persistent ``/workspace`` mount."""
     if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
         return None
     if os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() not in {
@@ -1558,20 +1582,22 @@ def _default_docker_workspace_host_root() -> Optional[Path]:
     try:
         from tools.environments.base import get_sandbox_dir
 
-        root = (get_sandbox_dir() / "docker" / "default" / "workspace").resolve(strict=False)
+        root = (
+            get_sandbox_dir() / "docker" / _docker_sandbox_dir_name(session_key) / "workspace"
+        ).resolve(strict=False)
     except Exception:
         return None
     return root if root.is_dir() else None
 
 
-def _docker_persistent_home_host_root() -> Optional[Path]:
-    """Host path for Docker's default persistent ``/root`` home mount.
+def _docker_persistent_home_host_root(session_key: str = "") -> Optional[Path]:
+    """Host path for this session's persistent ``/root`` home mount.
 
     Persistent containers bind ``<sandbox>/docker/<task>/home`` to ``/root``
     (tools/environments/docker.py), so an agent that writes ``/root/out.png``
-    produced a real host file the gateway couldn't find. Same collapse rule as
-    the workspace mount: the gateway's container sharing resolves to the
-    ``default`` task sandbox.
+    produced a real host file the gateway couldn't find. The task directory
+    is derived from the delivering session's key so session-scoped sandboxes
+    resolve to the container that produced the file (#93950).
     """
     if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
         return None
@@ -1585,7 +1611,9 @@ def _docker_persistent_home_host_root() -> Optional[Path]:
     try:
         from tools.environments.base import get_sandbox_dir
 
-        root = (get_sandbox_dir() / "docker" / "default" / "home").resolve(strict=False)
+        root = (
+            get_sandbox_dir() / "docker" / _docker_sandbox_dir_name(session_key) / "home"
+        ).resolve(strict=False)
     except Exception:
         return None
     return root if root.is_dir() else None
@@ -1613,11 +1641,31 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         return []
 
 
-def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
+def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str) -> None:
+    """Name WHY a container-absolute MEDIA path failed translation (#93950).
+
+    Under Docker these failures used to surface only as the generic
+    "Skipping unsafe MEDIA directive path" line one level up, leaving the
+    file seemingly vanished. Point at the sandbox/session mismatch instead.
+    Gated to Docker mode so host-path rejections stay quiet.
+    """
+    if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
+        return
+    logger.warning(
+        "Docker MEDIA path %s did not resolve to a host sandbox file (%s%s); "
+        "the producing container's sandbox directory may not exist yet or "
+        "was pruned",
+        _log_safe_path(str(candidate)),
+        reason,
+        f", session_key={session_key}" if session_key else "",
+    )
+
+
+def _translate_docker_container_media_path(candidate: Path, session_key: str = "") -> Optional[Path]:
     """Translate a container-absolute path to its host path when possible.
 
     Uses longest-prefix match across configured ``docker_volumes``, the
-    auto-mounted Hermes cache dirs (``/root/.hermes/...``), the default
+    auto-mounted Hermes cache dirs (``/root/.hermes/...``), the session's
     persistent Docker ``/workspace`` host root, and the persistent ``/root``
     home mount.
     """
@@ -1638,13 +1686,13 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     mounts = list(_parse_docker_volume_mounts())
     mounts.extend(_cache_dir_container_mounts())
     # Synthetic /workspace mount for default persistent sandbox / cwd bind.
-    default_ws = _default_docker_workspace_host_root()
+    default_ws = _default_docker_workspace_host_root(session_key)
     if default_ws is not None and not any(c.as_posix() == "/workspace" for _, c in mounts):
         mounts.append((default_ws, Path("/workspace")))
     # Synthetic /root mount for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
-    default_home = _docker_persistent_home_host_root()
+    default_home = _docker_persistent_home_host_root(session_key)
     if default_home is not None and not any(c.as_posix() == "/root" for _, c in mounts):
         # /root/.hermes/* that did NOT match a cache mount is the container's
         # credential/secret surface (.env, auth.json, ... are individually
@@ -1656,8 +1704,8 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
             mounts.append((default_home, Path("/root")))
 
     if not mounts:
+        _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved")
         return None
-
     # Longest container-prefix match.
     best: Optional[Tuple[Path, Path, int]] = None
     candidate_posix = candidate.as_posix()
@@ -1668,20 +1716,21 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
             if best is None or score > best[2]:
                 best = (host_root, container_root, score)
     if best is None:
+        _warn_unresolved_docker_media(candidate, session_key, "no mounted prefix matches")
         return None
-
     host_root, container_root, _ = best
     try:
         relative = candidate.relative_to(container_root)
         translated = (host_root / relative).resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
+        _warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox")
         return None
     if translated != host_root and not _path_is_within(translated, host_root):
         return None
     return translated
 
 
-def validate_media_delivery_path(path: str) -> Optional[str]:
+def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
     Default mode (single-user / private gateway): accept any existing regular
@@ -1722,7 +1771,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
-    translated = _translate_docker_container_media_path(expanded)
+    translated = _translate_docker_container_media_path(expanded, session_key=session_key)
     if translated is not None:
         resolved = translated
     else:
@@ -3082,6 +3131,14 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        # Owning profile for a multiplexed secondary adapter, installed by
+        # ``GatewayRunner._configure_profile_adapter``. Adapter-level session
+        # keys must carry the profile namespace, but ``source.profile`` is only
+        # stamped later by the runner's profile message handler — so at adapter
+        # ingress every bot in a multiplexed gateway would otherwise derive the
+        # same ``agent:main:`` key (see ``_session_key_profile``). ``None`` on a
+        # primary/single-profile adapter, which keeps the legacy namespace.
+        self._owner_profile: Optional[str] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3216,6 +3273,7 @@ class BasePlatformAdapter(ABC):
         self,
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Whether this adapter supports native streaming-draft updates.
 
@@ -3224,6 +3282,10 @@ class BasePlatformAdapter(ABC):
         same ``draft_id`` and growing text.  Adapters that implement
         ``send_draft`` should return True here for the chat types where the
         platform supports it (Telegram restricts drafts to private DMs).
+
+        ``chat_id`` lets multi-platform adapters (relay) resolve the answer
+        through the chat's own negotiated capability profile instead of the
+        primary identity's; single-platform adapters may ignore it.
 
         Default implementation returns False.  Stream consumers fall back to
         the edit-based path (``send`` + ``edit_message``) when this returns
@@ -3746,6 +3808,57 @@ class BasePlatformAdapter(ABC):
         thread replies without explicit mentions).
         """
         self._session_store = session_store
+
+    def set_owner_profile(self, profile_name: Optional[str]) -> None:
+        """Declare which multiplex profile owns this adapter.
+
+        Installed by ``GatewayRunner._configure_profile_adapter`` for secondary
+        profiles. Read by :meth:`_session_key_profile` so adapter-level keys
+        land in this profile's namespace instead of the shared ``agent:main:``.
+        """
+        name = (profile_name or "").strip() or None
+        self._owner_profile = None if name == "default" else name
+
+    def _session_key_profile(self, source: Optional[Any] = None) -> Optional[str]:
+        """Resolve the profile namespace for an adapter-derived session key.
+
+        Adapter ingress runs BEFORE the runner stamps ``source.profile``
+        (``_make_profile_message_handler``), so the session store's resolver
+        falls back to the *active* profile and every bot in a multiplexed
+        gateway derives the same ``agent:main:`` key. Batching dicts,
+        ``_active_sessions`` and the busy-session guard are keyed on that
+        string, so two profiles sharing a chat id — which is EVERY Telegram DM,
+        where ``chat.id`` is the user's own id — collide on one lane.
+
+        Resolution order:
+          1. ``source.profile`` when already stamped (relay/connector ingress).
+          2. ``self._owner_profile`` — this adapter's own credential owner.
+          3. The session store's resolver (active profile / no-multiplex None).
+
+        ``getattr`` throughout: adapters are routinely constructed without
+        ``BasePlatformAdapter.__init__`` (``object.__new__`` in tests, subclasses
+        that build their own state), so no attribute here may be assumed to
+        exist — see the ``object.__new__`` pitfall in AGENTS.md. Every candidate
+        is also type-checked: a duck-typed/mock session store returns a truthy
+        non-string from ``_resolve_profile_for_key``, which would otherwise be
+        interpolated straight into the key as ``agent:<MagicMock ...>:``.
+        """
+        for candidate in (
+            getattr(source, "profile", None) if source is not None else None,
+            getattr(self, "_owner_profile", None),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        store = getattr(self, "_session_store", None)
+        resolver = getattr(store, "_resolve_profile_for_key", None) if store else None
+        if callable(resolver):
+            try:
+                resolved = resolver(source)
+            except Exception:
+                return None
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved
+        return None
     
     def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
         """Return media paths already delivered in prior turns of this session.
@@ -4758,17 +4871,17 @@ class BasePlatformAdapter(ABC):
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
     @staticmethod
-    def validate_media_delivery_path(path: str) -> Optional[str]:
+    def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
         """Return a resolved path if it is safe for native attachment upload."""
-        return validate_media_delivery_path(path)
+        return validate_media_delivery_path(path, session_key=session_key)
 
     @staticmethod
-    def filter_media_delivery_paths(media_files) -> List[Tuple[str, bool]]:
+    def filter_media_delivery_paths(media_files, session_key: str = "") -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
         safe_media: List[Tuple[str, bool]] = []
         for media_path, is_voice in media_files or []:
             raw = str(media_path)
-            safe_path = validate_media_delivery_path(raw)
+            safe_path = validate_media_delivery_path(raw, session_key=session_key)
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
@@ -4776,12 +4889,12 @@ class BasePlatformAdapter(ABC):
         return safe_media
 
     @staticmethod
-    def filter_local_delivery_paths(file_paths) -> List[str]:
+    def filter_local_delivery_paths(file_paths, session_key: str = "") -> List[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
         safe_paths: List[str] = []
         for file_path in file_paths or []:
             raw = str(file_path)
-            safe_path = validate_media_delivery_path(raw)
+            safe_path = validate_media_delivery_path(raw, session_key=session_key)
             if safe_path:
                 safe_paths.append(safe_path)
             else:
@@ -6003,12 +6116,11 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        _sk_store = getattr(self, "_session_store", None)
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=_sk_store._resolve_profile_for_key(event.source) if _sk_store else None,
+            profile=self._session_key_profile(event.source),
         )
         expected_session_key = str(
             (event.metadata or {}).get("gateway_session_key") or ""
@@ -6321,7 +6433,7 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -6340,7 +6452,7 @@ class BasePlatformAdapter(ABC):
                     # system/command notices so config paths stay visible text
                     # instead of becoming native uploads.
                     local_files, text_content = self.extract_local_files(text_content)
-                    local_files = self.filter_local_delivery_paths(local_files)
+                    local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
                     # Do NOT load the full SQLite transcript for ordinary text or
                     # explicit MEDIA tags.  History is needed only for bare local
                     # paths auto-detected above.  Run that synchronous DB/decode
