@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import afterPack, { restoreMacLocaleMarkers } from './after-pack.mjs'
 
@@ -36,6 +36,19 @@ test('restoreMacLocaleMarkers recreates only framework locale directories', asyn
     assert.equal(fs.statSync(path.join(contents, 'Resources', 'en_GB.lproj')).isDirectory(), true)
     assert.equal(fs.existsSync(path.join(contents, 'Resources', 'locale.pak')), false)
   } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('restoreMacLocaleMarkers leaves packing intact when framework resources are unavailable', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-after-pack-'))
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  try {
+    assert.equal(await restoreMacLocaleMarkers(root, 'Hermes'), 0)
+    assert.equal(warn.mock.calls.length, 1)
+    assert.match(warn.mock.calls[0][0], /macOS locale markers were not restored/)
+  } finally {
+    warn.mockRestore()
     fs.rmSync(root, { recursive: true, force: true })
   }
 })

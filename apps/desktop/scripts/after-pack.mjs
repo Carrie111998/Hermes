@@ -10,6 +10,7 @@
  *
  * On macOS, restore the empty app-level locale directories that electron-builder
  * drops while copying Electron. Chromium uses them to select the renderer locale.
+ * Windows identity stamping stays best-effort so a cosmetic failure cannot fail a package.
  *
  * electron-builder passes a context with:
  *   - electronPlatformName: 'win32' | 'darwin' | 'linux'
@@ -23,22 +24,28 @@ import path from 'node:path'
 import { stampExeIdentity } from './set-exe-identity.mjs'
 
 async function restoreMacLocaleMarkers(appOutDir, productName) {
-  const appContents = path.join(appOutDir, `${productName}.app`, 'Contents')
-  const frameworkResources = path.join(
-    appContents,
-    'Frameworks',
-    'Electron Framework.framework',
-    'Versions',
-    'A',
-    'Resources'
-  )
-  const appResources = path.join(appContents, 'Resources')
-  const entries = await readdir(frameworkResources, { withFileTypes: true })
-  const localeMarkers = entries.filter(entry => entry.isDirectory() && entry.name.endsWith('.lproj'))
+  try {
+    const appContents = path.join(appOutDir, `${productName}.app`, 'Contents')
+    const frameworkResources = path.join(
+      appContents,
+      'Frameworks',
+      'Electron Framework.framework',
+      'Versions',
+      'A',
+      'Resources'
+    )
+    const appResources = path.join(appContents, 'Resources')
+    const entries = await readdir(frameworkResources, { withFileTypes: true })
+    const localeMarkers = entries.filter(entry => entry.isDirectory() && entry.name.endsWith('.lproj'))
 
-  await Promise.all(localeMarkers.map(entry => mkdir(path.join(appResources, entry.name), { recursive: true })))
+    await Promise.all(localeMarkers.map(entry => mkdir(path.join(appResources, entry.name), { recursive: true })))
 
-  return localeMarkers.length
+    return localeMarkers.length
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    console.warn(`[after-pack] macOS locale markers were not restored: ${detail}`)
+    return 0
+  }
 }
 
 export default async function afterPack(context) {
