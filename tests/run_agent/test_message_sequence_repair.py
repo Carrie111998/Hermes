@@ -763,6 +763,65 @@ def test_sanitize_dedup_drops_tool_calls_key_when_all_removed():
     assert assistant2["content"] == "retrying"
 
 
+def test_full_pipeline_closes_replayed_call_with_only_historical_result():
+    """A historical result must not satisfy a replayed call positionally.
+
+    Production session ``20260825_173121_8c9021`` contained this shape after
+    compaction: a completed call/result pair remained earlier in history, then
+    the same call id was replayed beside a fresh call whose result was the only
+    one immediately following. DeepSeek rejects the replayed call because its
+    old result is not in the contiguous tool-result run after the declaration.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    def call(call_id: str, content: str = "") -> dict:
+        return {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{
+                "id": call_id,
+                "call_id": call_id,
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+            }],
+        }
+
+    messages = [
+        {"role": "user", "content": "first task"},
+        call("call_old"),
+        {"role": "tool", "tool_call_id": "call_old", "content": "old result"},
+        {"role": "user", "content": "new task"},
+        call("call_old"),  # replayed by compaction; only historical result exists
+        call("call_new", content="continuing"),
+        {"role": "tool", "tool_call_id": "call_new", "content": "new result"},
+    ]
+
+    agent = _bare_agent()
+    AIAgent._repair_message_sequence(agent, messages)
+    out = sanitize_api_messages(messages)
+
+    for index, message in enumerate(out):
+        calls = message.get("tool_calls") or []
+        if message.get("role") != "assistant" or not calls:
+            continue
+        declared = {
+            tc.get("call_id") or tc.get("id")
+            for tc in calls
+            if tc.get("call_id") or tc.get("id")
+        }
+        answered = set()
+        cursor = index + 1
+        while cursor < len(out) and out[cursor].get("role") == "tool":
+            tool_call_id = out[cursor].get("tool_call_id")
+            if tool_call_id:
+                answered.add(tool_call_id)
+            cursor += 1
+        assert declared <= answered, (
+            f"assistant at index {index} has positionally unanswered calls: "
+            f"{sorted(declared - answered)}"
+        )
+
+
 def test_repair_drops_duplicate_tool_result_keyed_on_sibling_id():
     """A duplicate result must be dropped even when it uses the OTHER id variant.
 
