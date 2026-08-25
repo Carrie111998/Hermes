@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import threading
 from typing import Any, Dict, List, Optional
+import uuid
 
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -1244,6 +1245,11 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # Unique per-fork identity so read-before-write marks in
+            # tools.skill_manager_tool (keyed by this id) round-trip through
+            # tool-call worker threads; turn_context binds it onto the fork
+            # ContextVar at turn start.
+            review_agent._review_fork_id = f"bg-review-{uuid.uuid4().hex[:12]}"
             # The review fork pins the parent's cached system prompt and keeps
             # ``tools[]`` byte-identical to the parent so its outbound request
             # hits the same provider cache prefix (see the toolset-parity note
@@ -1477,6 +1483,19 @@ def _run_review_in_thread(
                     )
             finally:
                 clear_thread_tool_whitelist()
+                # Drop this fork's read-before-write mark bucket so a later
+                # fork never inherits stale "already read" approvals.
+                try:
+                    from tools.skill_manager_tool import clear_background_review_read_marks
+
+                    clear_background_review_read_marks(
+                        getattr(review_agent, "_review_fork_id", None)
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to clear background-review read marks",
+                        exc_info=True,
+                    )
                 # Attribute the review fork's usage to the PARENT session.
                 # Snapshot BEFORE unregister/close so counters survive teardown.
                 # Placed in this finally so a fork that consumed tokens and THEN

@@ -29,6 +29,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
+import uuid
 
 from hermes_constants import get_hermes_home
 from tools import skill_usage
@@ -1961,6 +1962,10 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # turn_context.py binds this onto the write-origin ContextVar at turn
         # start (see agent/turn_context.py).
         review_agent._memory_write_origin = "background_review"
+        # Unique per-fork identity for read-before-write marks in
+        # tools.skill_manager_tool; turn_context binds it onto the fork
+        # ContextVar at turn start.
+        review_agent._review_fork_id = f"curator-{uuid.uuid4().hex[:12]}"
 
         # Redirect the forked agent's stdout/stderr to /dev/null while it
         # runs so its tool-call chatter doesn't pollute the foreground
@@ -2006,6 +2011,15 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
                 review_agent.close()
             except Exception:
                 pass
+            try:
+                from tools.skill_manager_tool import clear_background_review_read_marks
+
+                clear_background_review_read_marks(review_agent._review_fork_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear background-review read marks",
+                    exc_info=True,
+                )
     return result_meta
 
 

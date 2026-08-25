@@ -52,9 +52,66 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
+# Read-before-write marks for the background-review fork.
+#
+# These must NOT live in a ContextVar. The fork's tool calls run in worker
+# threads via ``propagate_context_to_thread``, which executes each tool in a
+# *snapshot* of the fork's context (``contextvars.copy_context()`` +
+# ``ctx.run()``). A mark set by skill_view inside that snapshot is discarded
+# when the worker returns, so a later skill_manage in a different worker
+# never saw it — the read-before-write guard could never pass and the
+# background curator was stuck refusing every patch/edit of an existing
+# skill, retrying and logging WARNINGs forever. Marks are therefore stored
+# in a module-level dict keyed by a per-fork id bound through the same
+# ContextVar path as the write origin (so mark and guard in worker threads
+# resolve the same bucket; concurrent review forks never share marks).
+# A fork drops its key when it finishes via clear_background_review_read_marks.
+_background_review_read_paths: "Dict[str, set]" = {}
+
+_background_review_fork_id: "_ctxvars.ContextVar[Optional[str]]" = _ctxvars.ContextVar(
+    "background_review_fork_id", default=None
 )
+
+
+def set_background_review_fork_id(fork_id: Optional[str]) -> None:
+    """Bind the current background-review fork's identity in this context.
+
+    Called at fork turn start (agent/turn_context.py) from the fork's
+    ``_review_fork_id`` attribute; the value propagates into every tool-call
+    worker snapshot alongside the write origin.
+    """
+    _background_review_fork_id.set(fork_id)
+
+
+def clear_background_review_read_marks(fork_id: Optional[str] = None) -> None:
+    """Drop read-before-write marks.
+
+    With ``fork_id`` given, only that fork's marks are cleared (called when
+    a review fork finishes). With ``None``, every fork's marks are cleared
+    (test helper / shutdown).
+    """
+    if fork_id is None:
+        _background_review_read_paths.clear()
+        return
+    _background_review_read_paths.pop(fork_id, None)
+
+
+def _background_review_fork_bucket() -> Optional[str]:
+    """Resolve the mark bucket for the current execution context.
+
+    Only the background-review fork participates: its write origin is bound
+    on the fork thread at turn start and propagates into worker snapshots,
+    and the fork id picks the specific fork's bucket. Falls back to the
+    origin string when no explicit id is bound (same-thread test paths and
+    any fork that did not bind an id still get a consistent bucket).
+    """
+    try:
+        from tools.skill_provenance import is_background_review
+        if not is_background_review():
+            return None
+    except Exception:
+        return None
+    return _background_review_fork_id.get() or "background_review"
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -66,33 +123,32 @@ def mark_background_review_skill_read(path: Path) -> None:
     paths below require the corresponding target path to be present when the
     current origin is ``background_review``.
     """
-    try:
-        from tools.skill_provenance import is_background_review
-        if not is_background_review():
-            return
-    except Exception:
+    bucket = _background_review_fork_bucket()
+    if bucket is None:
         return
 
     try:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    _background_review_read_paths.setdefault(bucket, set()).add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
+    bucket = _background_review_fork_bucket()
+    if bucket is None:
+        return False
+
     try:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    return resolved in _background_review_read_paths.get(bucket, ())
 
 
 def _reset_background_review_read_marks() -> None:
     """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    clear_background_review_read_marks()
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.

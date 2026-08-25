@@ -504,6 +504,16 @@ def build_turn_context(
 
     # Bind the skill write-origin ContextVar for this thread.
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    # Bind the background-review fork id the same way, so skill
+    # read-before-write marks (tools/skill_manager_tool) resolve to this
+    # fork's bucket inside tool-call worker threads. Lazy import: this
+    # module sits high in the import graph.
+    try:
+        from tools.skill_manager_tool import set_background_review_fork_id
+
+        set_background_review_fork_id(getattr(agent, "_review_fork_id", None))
+    except Exception:
+        logger.debug("Could not bind background-review fork id", exc_info=True)
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
