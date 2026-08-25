@@ -297,13 +297,11 @@ def _detect_python_recipe(root: Path) -> Recipe | None:
             ),
         )
 
-    if is_fastapi:
+    if is_fastapi and ((root / "main.py").exists() or (root / "app.py").exists()):
         if (root / "main.py").exists():
             app_module = "main:app"
-        elif (root / "app.py").exists():
-            app_module = "app:app"
         else:
-            app_module = "main:app"
+            app_module = "app:app"
         return Recipe(
             name="FastAPI app",
             kind="fastapi",
