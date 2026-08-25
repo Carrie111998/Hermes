@@ -154,6 +154,9 @@ class PtySessionRegistry:
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
+        # Strong refs to reaped-session close() tasks so the GC cannot reap
+        # them mid-close (the loop keeps only weak references to tasks).
+        self._reaped_close_tasks: set = set()
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
                               ) -> Tuple[PtySession, bool]:
@@ -198,7 +201,12 @@ class PtySessionRegistry:
             raise RegistryFull()
         oldest = min(idle, key=lambda s: s.last_detached_at or 0.0)
         self._sessions.pop(oldest.key, None)
-        asyncio.create_task(oldest.close())
+        # Retain a strong ref: the loop keeps only weak references to tasks,
+        # so an unreferenced close() can be GC-reaped and the PTY leaked.
+        task = asyncio.create_task(oldest.close())
+        self._reaped_close_tasks.add(task)
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._reaped_close_tasks.discard)
 
     async def close_all(self) -> None:
         for key in list(self._sessions):
