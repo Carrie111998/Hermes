@@ -2988,13 +2988,15 @@ class MCPServerTask:
         if not pids or self._is_http():
             return False
         for pid in pids:
-            # windows-footgun: ok — psutil.pid_exists handles Windows; the
-            # os.kill probe below only runs when psutil is unavailable.
+            # windows-footgun: ok — psutil.pid_exists is the cross-platform
+            # liveness probe. os.kill(pid, 0) cannot answer this on Windows:
+            # an exited-but-unreaped child raises nothing (the parent still
+            # holds the handle) and a vanished PID raises OSError WinError 87,
+            # not ProcessLookupError.
             import psutil
 
             if not psutil.pid_exists(pid):
                 continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
             return False  # at least one child alive
         return True
 
