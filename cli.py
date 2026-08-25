@@ -11265,6 +11265,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"  ✓ Model switched: {_display_new}")
         _cprint(f"    Provider: {provider_label}")
 
+        # Mid-session cache-rebuild notice (display.cache_switch_notice).
+        # Informational only — never blocks the switch. Silent when the
+        # estimated context is below the noise threshold or the toggle is off.
+        try:
+            from hermes_cli.cache_switch_notice import cache_switch_notice_for_agent
+
+            _cache_notice = cache_switch_notice_for_agent(
+                agent=self.agent,
+                old_model_display=_display_old,
+                new_model_display=_display_new,
+            )
+            if _cache_notice:
+                for _line in _cache_notice.splitlines():
+                    _cprint(f"  {_line}")
+        except Exception as exc:
+            logger.debug("cache-switch notice failed: %s", exc)
+
         # Context: always resolve via the provider-aware chain so Codex OAuth,
         # Copilot, and Nous-enforced caps win over the raw models.dev entry
         # (e.g. gpt-5.5 is 1.05M on openai but 272K on Codex OAuth).
@@ -11661,6 +11678,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         provider_label = result.provider_label or result.target_provider
         _cprint(f"  ✓ Model switched: {_display_new}")
         _cprint(f"    Provider: {provider_label}")
+
+        # Mid-session cache-rebuild notice (display.cache_switch_notice).
+        # Informational only — never blocks the switch. Silent when the
+        # estimated context is below the noise threshold or the toggle is off.
+        try:
+            from hermes_cli.cache_switch_notice import cache_switch_notice_for_agent
+
+            _cache_notice = cache_switch_notice_for_agent(
+                agent=self.agent,
+                old_model_display=_display_old,
+                new_model_display=_display_new,
+            )
+            if _cache_notice:
+                for _line in _cache_notice.splitlines():
+                    _cprint(f"  {_line}")
+        except Exception as exc:
+            logger.debug("cache-switch notice failed: %s", exc)
 
         # Context: always resolve via the provider-aware chain so Codex OAuth,
         # Copilot, and Nous-enforced caps win over the raw models.dev entry

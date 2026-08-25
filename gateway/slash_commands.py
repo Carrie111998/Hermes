@@ -1748,6 +1748,43 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    def _append_cache_switch_notice(
+        self,
+        lines: list,
+        *,
+        session_key: str,
+        old_model_display: str,
+        new_model_display: str,
+        agent=None,
+    ) -> None:
+        """Append the mid-session cache-rebuild notice if it applies.
+
+        Prefer a live agent when one is handed in (or found in the agent
+        cache); fall back to a silent no-op when neither is available so a
+        cold gateway still switches cleanly without a noisy estimate of 0.
+        """
+        try:
+            from hermes_cli.cache_switch_notice import cache_switch_notice_for_agent
+
+            live_agent = agent
+            if live_agent is None:
+                _cache_lock = getattr(self, "_agent_cache_lock", None)
+                _cache = getattr(self, "_agent_cache", None)
+                if _cache_lock is not None and _cache is not None:
+                    with _cache_lock:
+                        _entry = _cache.get(session_key)
+                    if _entry and _entry[0] is not None:
+                        live_agent = _entry[0]
+            notice = cache_switch_notice_for_agent(
+                agent=live_agent,
+                old_model_display=old_model_display,
+                new_model_display=new_model_display,
+            )
+            if notice:
+                lines.extend(notice.splitlines())
+        except Exception as exc:
+            logger.debug("cache-switch notice failed: %s", exc)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 
@@ -1937,6 +1974,7 @@ class GatewaySlashCommandsMixin:
 
                         # Update cached agent in-place
                         cached_entry = None
+                        _switched_agent = None
                         _cache_lock = getattr(_self, "_agent_cache_lock", None)
                         _cache = getattr(_self, "_agent_cache", None)
                         if _cache_lock and _cache is not None:
@@ -1951,6 +1989,9 @@ class GatewaySlashCommandsMixin:
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
                                 )
+                                # Hold the live agent so the cache-rebuild notice
+                                # can still estimate context after we evict below.
+                                _switched_agent = cached_entry[0]
                             except Exception as exc:
                                 # The in-place swap rolled the agent back to the
                                 # OLD working model/client and re-raised.  Abort
@@ -2131,6 +2172,16 @@ class GatewaySlashCommandsMixin:
                             if mi.max_output:
                                 lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
+                        # Mid-session cache-rebuild notice (display.cache_switch_notice).
+                        # Uses the agent we switched in-place above — the cache
+                        # has already been evicted by this point.
+                        _self._append_cache_switch_notice(
+                            lines,
+                            session_key=_session_key,
+                            old_model_display=_display_cur,
+                            new_model_display=_display_new,
+                            agent=_switched_agent,
+                        )
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
                         if persist_global:
@@ -2249,6 +2300,7 @@ class GatewaySlashCommandsMixin:
             """Apply the resolved switch (agent, session, config) and build the reply."""
             # If there's a cached agent, update it in-place
             cached_entry = None
+            _switched_agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
             if _cache_lock and _cache is not None:
@@ -2264,6 +2316,9 @@ class GatewaySlashCommandsMixin:
                         base_url=result.base_url,
                         api_mode=result.api_mode,
                     )
+                    # Hold the live agent so the cache-rebuild notice can still
+                    # estimate context after we evict the cache entry below.
+                    _switched_agent = cached_entry[0]
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
                     # model/client and re-raised.  Abort the commit: skip DB
@@ -2466,6 +2521,18 @@ class GatewaySlashCommandsMixin:
             )
             if cache_enabled:
                 lines.append(t("gateway.model.prompt_caching_enabled"))
+
+            # Mid-session cache-rebuild notice (display.cache_switch_notice).
+            # Informational only — never blocks. Silent below the noise threshold.
+            # Pass the agent we switched in-place above — the cache has already
+            # been evicted by this point so a cache lookup would miss.
+            self._append_cache_switch_notice(
+                lines,
+                session_key=session_key,
+                old_model_display=format_model_for_display(current_model),
+                new_model_display=format_model_for_display(result.new_model),
+                agent=_switched_agent,
+            )
 
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
