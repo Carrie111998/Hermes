@@ -22,6 +22,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
+import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { CodeEditor } from '@/components/chat/code-editor'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -59,6 +60,7 @@ import {
   $profileCreateRequest,
   $profileOrder,
   $profiles,
+  $profilesConnectionId,
   $profileScope,
   ALL_PROFILES,
   normalizeProfileKey,
@@ -76,6 +78,7 @@ import {
   refreshProfileRemoteOverrides
 } from '@/store/profile-remote-override'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
+import { $connection } from '@/store/session'
 import type { ProfileInfo } from '@/types/hermes'
 
 import { CreateProfileDialog } from '../../profiles/create-profile-dialog'
@@ -87,45 +90,67 @@ import { ProfileRemoteOverrideDialog } from './profile-remote-override-dialog'
 import { useProfilePrewarm } from './use-profile-prewarm'
 import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
 
-const RAIL_GAP = 4 // px — matches gap-1 between squares.
-
 // Past this many profiles the strip of colored squares stops scaling (tiny
 // drag targets, endless horizontal scroll), so the rail collapses to a compact
 // menu. Drag-reorder and long-press-recolor live only on the squares path.
 const PROFILE_DROPDOWN_THRESHOLD = 13
 
-// Neighbors reflow on RAIL_TRANSITION; the dragged square glides between
-// snapped cells on the snappier DRAG_TRANSITION. Both come from the SHARED
-// reorder primitive (lib/reorder.ts) so every reorder strip feels identical.
+// Neighbors reflow on RAIL_TRANSITION; the dragged square follows the snappier
+// DRAG_TRANSITION while closestCenter resolves variable-width slots. Both
+// transitions come from the shared reorder primitive (lib/reorder.ts).
 const RAIL_TRANSITION = REORDER_RAIL_TRANSITION
 const DRAG_TRANSITION = REORDER_DRAG_TRANSITION_CSS
 
-// The rail is a single horizontal strip of fixed cells. Pin drags to the x-axis
-// (no cross-axis scrollbar), snap to whole cells so a square steps slot-to-slot
-// instead of gliding, and clamp to the occupied strip so it can't float past the
-// last profile onto the "+".
-const stepThroughCells: Modifier = ({ containerNodeRect, draggingNodeRect, transform }) => {
+// The active profile is wider than compact initials, so the rail no longer has a
+// uniform cell pitch. Keep drags continuous on the x-axis and let closestCenter
+// resolve the variable-width positions, while clamping to the occupied strip.
+export function clampRailDragX(x: number, minX: number, maxX: number): number {
+  return Math.min(maxX, Math.max(minX, x))
+}
+
+const clampToRail: Modifier = ({ containerNodeRect, draggingNodeRect, transform }) => {
   if (!draggingNodeRect || !containerNodeRect) {
     return { ...transform, y: 0 }
   }
 
-  const pitch = draggingNodeRect.width + RAIL_GAP
   const minX = containerNodeRect.left - draggingNodeRect.left
   const maxX = containerNodeRect.right - draggingNodeRect.right
-  const snapped = Math.round(transform.x / pitch) * pitch
 
-  return { ...transform, x: Math.min(maxX, Math.max(minX, snapped)), y: 0 }
+  return { ...transform, x: clampRailDragX(transform.x, minX, maxX), y: 0 }
 }
 
-// Arc-Spaces-style profile rail at the sidebar foot: a default↔all toggle pinned
-// left, the colored named profiles scrolling between, and Manage pinned right.
-// The active profile pops in its own color — the "where am I" cue. Gateway
-// identity lives in the statusbar, so this strip remains entirely available to
-// profiles regardless of how many backends are registered.
+export function mergeCompactProfileOrder(
+  allIds: string[],
+  compactIds: string[],
+  activeId: string,
+  overId: string
+): string[] {
+  const from = compactIds.indexOf(activeId)
+  const to = compactIds.indexOf(overId)
+
+  if (from < 0 || to < 0 || from === to) {
+    // Referential equality is the caller's no-op signal: no reorder haptic and
+    // no persistence write when the drag did not produce a valid move.
+    return allIds
+  }
+
+  const reordered = arrayMove(compactIds, from, to)
+  const compact = new Set(compactIds)
+  let cursor = 0
+
+  return allIds.map(id => (compact.has(id) ? reordered[cursor++] : id))
+}
+
+// Arc-Spaces-style profile rail at the sidebar foot: the active identity expands
+// on the left, inactive profiles stay compact in the scrolling strip, and Manage
+// remains pinned right. The default profile's circular initial marks it as the
+// machine owner; ordinary profiles use rounded squares.
 export function ProfileRail() {
   const { t } = useI18n()
   const p = t.profiles
   const profiles = useStore($profiles)
+  const profilesConnectionId = useStore($profilesConnectionId)
+  const connection = useStore($connection)
   const scope = useStore($profileScope)
   const gatewayProfile = useStore($activeGatewayProfile)
   const order = useStore($profileOrder)
@@ -173,12 +198,23 @@ export function ProfileRail() {
   const isAll = scope === ALL_PROFILES
   const activeKey = normalizeProfileKey(gatewayProfile)
   const defaultProfile = profiles.find(profile => profile.is_default)
-  const onDefault = !isAll && activeKey === 'default'
+  const defaultLabel = defaultProfile ? profileLabel(defaultProfile) : ''
+  const rosterCurrent = profilesConnectionId === (connection?.connectionId ?? null)
+  const exactActiveProfile = profiles.find(profile => normalizeProfileKey(profile.name) === activeKey)
+
+  const activeProfile = isAll || !rosterCurrent
+    ? null
+    : exactActiveProfile ?? (activeKey === 'default' ? defaultProfile : null) ?? null
+
+  const onDefault = activeProfile?.is_default === true
+  const activeProfileKey = activeProfile ? normalizeProfileKey(activeProfile.name) : null
 
   const named = sortByProfileOrder(
     profiles.filter(profile => !profile.is_default),
     order
   )
+
+  const compactNamed = isAll ? named : named.filter(profile => normalizeProfileKey(profile.name) !== activeProfileKey)
 
   const multiProfile = profiles.length > 1
 
@@ -213,11 +249,11 @@ export function ProfileRail() {
     }
 
     const ids = named.map(profile => profile.name)
-    const from = ids.indexOf(String(active.id))
-    const to = ids.indexOf(String(over.id))
+    const compactIds = compactNamed.map(profile => profile.name)
+    const next = mergeCompactProfileOrder(ids, compactIds, String(active.id), String(over.id))
 
-    if (from >= 0 && to >= 0) {
-      setProfileOrder(arrayMove(ids, from, to))
+    if (next !== ids) {
+      setProfileOrder(next)
       reorderCommitHaptic()
     }
   }
@@ -257,30 +293,35 @@ export function ProfileRail() {
 
   return (
     <div aria-label={p.title} className="flex min-w-0 items-center gap-0.5" data-slot="profile-rail" role="group">
-      {/* One button toggles default ↔ all: home face when scoped to a profile,
-          layers face when showing everything. Pinned left like Manage is right.
-          Hidden until a second profile exists. */}
-      {multiProfile &&
-        (defaultProfile ? (
-          // On default → toggle to all. Anywhere else (all view or a named
-          // profile) → return to default. So leaving a profile never lands on all.
-          <ProfilePill
-            active={isAll || onDefault}
-            glyph={isAll ? 'layers' : 'home'}
-            label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
-            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
-          />
-        ) : (
-          <ProfilePill active={isAll} glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
-        ))}
-
-      {/* Single-profile: the active default's home icon next to the create +. */}
-      {!multiProfile && defaultProfile && (
+      {multiProfile && isAll && (
         <ProfilePill
           active
-          glyph="home"
-          label={profileLabel(defaultProfile)}
-          onSelect={() => selectProfile(defaultProfile.name)}
+          glyph="layers"
+          label={p.allProfiles}
+          onSelect={() =>
+            rosterCurrent && defaultProfile ? selectProfile(defaultProfile.name) : setShowAllProfiles(true)
+          }
+        />
+      )}
+
+      {/* Condensed rails cannot preserve individual slots, so keep the active
+          identity pinned beside the profile dropdown at that scale. */}
+      {multiProfile && condensed && !isAll && activeProfile && (
+        <ActiveProfilePill
+          color={resolveProfileColor(activeProfile.name, colors)}
+          label={profileLabel(activeProfile)}
+          onSelect={() => (activeProfile.is_default ? setShowAllProfiles(true) : selectProfile(activeProfile.name))}
+          profileName={activeProfile.name}
+        />
+      )}
+
+      {/* Single-profile: the active default owner's identity next to create. */}
+      {!multiProfile && activeProfile?.is_default && (
+        <ActiveProfilePill
+          color={resolveProfileColor(activeProfile.name, colors)}
+          label={profileLabel(activeProfile)}
+          onSelect={() => selectProfile(activeProfile.name)}
+          profileName={activeProfile.name}
         />
       )}
 
@@ -289,13 +330,20 @@ export function ProfileRail() {
         // reorder, no long-press recolor, no per-square context menu — Manage
         // covers rename/delete at this scale.
         <div className="flex min-w-0 flex-1 items-center gap-1">
+          {rosterCurrent && defaultProfile && (isAll || !onDefault) && (
+            <OwnerProfileCompact
+              color={resolveProfileColor(defaultProfile.name, colors)}
+              label={defaultLabel}
+              onSelect={() => selectProfile(defaultProfile.name)}
+            />
+          )}
           <ProfileDropdown
-            activeKey={isAll ? null : activeKey}
+            activeKey={null}
             colors={colors}
             onCreate={() => setCreateOpen(true)}
             onImport={() => void runImportProfileFlow()}
             onSelect={selectProfile}
-            profiles={named}
+            profiles={compactNamed}
           />
         </div>
       ) : (
@@ -303,34 +351,61 @@ export function ProfileRail() {
           className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           ref={scrollRef}
         >
+          {multiProfile && rosterCurrent && defaultProfile &&
+            (onDefault ? (
+              <ActiveProfilePill
+                color={resolveProfileColor(defaultProfile.name, colors)}
+                label={defaultLabel}
+                onSelect={() => setShowAllProfiles(true)}
+                profileName={defaultProfile.name}
+              />
+            ) : (
+              <OwnerProfileCompact
+                color={resolveProfileColor(defaultProfile.name, colors)}
+                label={defaultLabel}
+                onSelect={() => selectProfile(defaultProfile.name)}
+              />
+            ))}
+
           {multiProfile && (
             <DndContext
               collisionDetection={closestCenter}
-              modifiers={[stepThroughCells]}
+              modifiers={[clampToRail]}
               onDragEnd={handleDragEnd}
               onDragOver={handleDragOver}
               onDragStart={handleDragStart}
               sensors={sensors}
             >
-              <SortableContext items={named.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
+              <SortableContext items={compactNamed.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
                 {/* relative → the strip is the dragged square's offsetParent, so the
                     clamp modifier bounds drags to the occupied cells (not the +). */}
                 <div className="relative flex items-center gap-1">
-                  {named.map(profile => (
-                    <ProfileSquare
-                      active={!isAll && normalizeProfileKey(profile.name) === activeKey}
-                      color={resolveProfileColor(profile.name, colors)}
-                      key={profile.name}
-                      label={profileLabel(profile)}
-                      onConnectRemote={() => openRemoteOverrideDialog(profile.name)}
-                      onDelete={() => setPendingDelete(profile)}
-                      onEditSoul={() => setPendingSoul(profile.name)}
-                      onRecolor={color => setProfileColor(profile.name, color)}
-                      onRename={() => setPendingRename(profile)}
-                      onSelect={() => selectProfile(profile.name)}
-                      remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
-                    />
-                  ))}
+                  {named.map(profile =>
+                    !isAll && normalizeProfileKey(profile.name) === activeProfileKey ? (
+                      <ActiveProfilePill
+                        color={resolveProfileColor(profile.name, colors)}
+                        key={profile.name}
+                        label={profileLabel(profile)}
+                        onSelect={() => selectProfile(profile.name)}
+                        profileName={profile.name}
+                      />
+                    ) : (
+                      <ProfileSquare
+                        active={false}
+                        color={resolveProfileColor(profile.name, colors)}
+                        key={profile.name}
+                        label={profileLabel(profile)}
+                        onConnectRemote={() => openRemoteOverrideDialog(profile.name)}
+                        onDelete={() => setPendingDelete(profile)}
+                        onEditSoul={() => setPendingSoul(profile.name)}
+                        onRecolor={color => setProfileColor(profile.name, color)}
+                        onRename={() => setPendingRename(profile)}
+                        onSelect={() => selectProfile(profile.name)}
+                        profileName={profile.name}
+                        remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
+                      />
+                    )
+                  )}
                 </div>
               </SortableContext>
             </DndContext>
@@ -610,6 +685,111 @@ interface ProfilePillProps {
   onSelect: () => void
 }
 
+function ActiveProfilePill({
+  color,
+  label,
+  onSelect,
+  profileName
+}: {
+  color: null | string
+  label: string
+  onSelect: () => void
+  profileName: string
+}) {
+  const { gateway, requestGateway } = useGatewayRequest()
+
+  const [avatar, setAvatar] = useState<{
+    data: string
+    gateway: typeof gateway
+    profileName: string
+  } | null>(null)
+  // A gateway/profile switch renders before its passive effects run. Scope the
+  // committed image to the identity that fetched it so the previous machine's
+  // owner can never flash in the new machine's rail during that first paint.
+
+  const avatarSrc = avatar?.gateway === gateway && avatar.profileName === profileName ? avatar.data : null
+
+  useEffect(() => {
+    let live = true
+
+    if (!gateway) {
+      return () => {
+        live = false
+      }
+    }
+
+    void requestGateway<{ data?: string; found?: boolean }>('profiles.get_asset', {
+      asset: 'avatar',
+      name: profileName
+    })
+      .then(asset => {
+        if (live && asset.found && asset.data) {
+          setAvatar({ data: asset.data, gateway, profileName })
+        }
+      })
+      .catch(() => undefined)
+
+    return () => {
+      live = false
+    }
+  }, [gateway, profileName, requestGateway])
+
+  return (
+    <Tip label={label}>
+      <Button
+        aria-label={label}
+        aria-pressed="true"
+        className="max-w-28 bg-(--ui-control-active-background) px-1 text-foreground hover:bg-(--ui-control-hover-background)"
+        onClick={onSelect}
+        size="xs"
+        type="button"
+        variant="ghost"
+      >
+        {avatarSrc ? (
+          <img
+            alt=""
+            aria-hidden="true"
+            className="size-4 shrink-0 rounded-full object-cover"
+            onError={() => setAvatar(null)}
+            src={avatarSrc}
+          />
+        ) : (
+          <ProfileGlyph aria-hidden="true" color={color} isDefault={false} name={label} />
+        )}
+        <span className="truncate">{label}</span>
+      </Button>
+    </Tip>
+  )
+}
+
+function OwnerProfileCompact({
+  color,
+  label,
+  onSelect
+}: {
+  color: null | string
+  label: string
+  onSelect: () => void
+}) {
+  const hue = color ?? 'var(--ui-text-quaternary)'
+  const initial = label.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'
+
+  return (
+    <Tip label={label}>
+      <button
+        aria-label={label}
+        aria-pressed="false"
+        className="grid size-5 shrink-0 place-items-center rounded-full text-[0.5625rem] font-semibold uppercase leading-none opacity-70 ring-1 ring-current ring-offset-1 ring-offset-background transition-opacity hover:opacity-100"
+        onClick={onSelect}
+        style={{ backgroundColor: profileColorSoft(hue, 24), color: hue }}
+        type="button"
+      >
+        <span data-slot="profile-owner-compact">{initial}</span>
+      </button>
+    </Tip>
+  )
+}
+
 function ProfilePill({ active, glyph, label, onSelect }: ProfilePillProps) {
   return (
     <Tip label={label}>
@@ -635,6 +815,7 @@ interface ProfileSquareProps {
   active: boolean
   color: null | string
   label: string
+  profileName: string
   onSelect: () => void
   onRecolor: (color: null | string) => void
   onRename: () => void
@@ -667,6 +848,7 @@ function ProfileSquare({
   onRecolor,
   onRename,
   onSelect,
+  profileName,
   remoteHost
 }: ProfileSquareProps) {
   const { t } = useI18n()
@@ -677,10 +859,10 @@ function ProfileSquare({
   const suppressClick = useRef(false)
   // Hovering a square telegraphs the switch — start that profile's backend
   // spawn now so a cold click doesn't pay the full boot.
-  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(label)
+  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(profileName)
 
   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
-    id: label,
+    id: profileName,
     transition: RAIL_TRANSITION
   })
 
@@ -737,7 +919,7 @@ function ProfileSquare({
                     type="button"
                     {...attributes}
                     {...listeners}
-                    aria-label={remoteHost ? `${label} — ${p.remoteOverride.badge(remoteHost)}` : label}
+                    aria-label={label}
                     aria-pressed={active}
                     // Hold-to-recolor rides alongside the dnd pointer listener (call
                     // it first so drag tracking still arms), then a timer opens the
@@ -791,7 +973,7 @@ function ProfileSquare({
                 </TooltipTrigger>
               </ContextMenuTrigger>
             </PopoverAnchor>
-            <TooltipContent>{remoteHost ? `${label} · ${p.remoteOverride.badge(remoteHost)}` : label}</TooltipContent>
+            <TooltipContent>{label}</TooltipContent>
           </Tooltip>
         </TooltipProvider>
 

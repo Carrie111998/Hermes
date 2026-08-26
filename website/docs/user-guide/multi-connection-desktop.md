@@ -171,8 +171,15 @@ that live on one gateway.
   from two gateways to a larger fleet without turning backends into profile-like
   glyphs or crowding profile actions out of the rail.
 - Selecting a gateway restores the last profile used there. The profile rail
-  then shows only that gateway's profiles; the home pill returns to its default
-  profile and the layers pill shows **All profiles on this gateway**.
+  then shows only that gateway's profiles. Its default-profile pill shows that
+  profile's avatar and display name when active. Whichever profile is selected
+  expands in its existing rail slot to show its avatar and full display name;
+  selecting it never changes the profile order. The inactive profiles collapse
+  to compact initials. The default profile uses a circular, ringed initial while
+  inactive so it remains recognizable as the machine owner, while ordinary
+  profiles use rounded-square initials. Hover text is the profile name only.
+  The layers pill shows **All profiles on this gateway**; selecting it again
+  returns to the gateway's default machine owner.
   **Cmd/Ctrl+1–9** continue to switch profiles within the active gateway.
 - The selected gateway survives a quit and relaunch only when **Settings →
   Gateways → At startup, return to Sessions on the last-used gateway** is on.

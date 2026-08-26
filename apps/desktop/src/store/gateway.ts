@@ -682,6 +682,18 @@ export async function requestGatewayForProfile<T>(
   timeoutMs?: number,
   signal?: AbortSignal
 ): Promise<T> {
+  const key = normKey(profile)
+  const activeConnectionId = activeGatewayConnectionId()
+
+  // Legacy/session call sites can still carry only a profile name. When that
+  // profile is the ACTIVE registry agent, its source is unambiguous — keep the
+  // request on that composite route. Falling through to gatewayForProfile()
+  // keys the pool by the bare name and can spawn a same-named LOCAL backend
+  // after a remote switch (Forge Sagan/Bellow → "Profile X no longer exists").
+  if (activeConnectionId && key === activeGatewayProfileKey()) {
+    return requestGatewayForAgent<T>(activeConnectionId, key, method, params, timeoutMs, signal)
+  }
+
   const route = await gatewayForProfile(profile, true)
 
   try {
