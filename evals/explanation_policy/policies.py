@@ -16,9 +16,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict
 
-# Model used for every arm -- explainer, reader and judge alike. Holding the
-# model fixed across policies is a requirement of the evaluation contract
-# (#93382: "the same model and source content"), not a tuning knob.
+# Reference model for PUBLISHED scorecards. The runner does not pin this: by
+# default it lets the configured auxiliary route answer, like the other evals/
+# harnesses, and records whatever replied on each scorecard row. What the
+# evaluation contract actually requires is that the model be held constant
+# across policies within a run -- "the same model and source content" -- which
+# holds either way. Pass --model to force this one.
 EVAL_MODEL = "anthropic/claude-opus-5"
 
 

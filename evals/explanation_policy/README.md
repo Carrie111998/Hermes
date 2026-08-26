@@ -30,10 +30,15 @@ change.
 
 ## Usage
 
-Every arm — explainer, reader and judge — runs on `EVAL_MODEL`
-(`anthropic/claude-opus-5`), pinned in `policies.py`. Holding the model fixed
-across policies is what makes a scorecard difference attributable to the
-policy, so change it only to re-run the whole matrix, never one arm.
+By default every arm — explainer, reader and judge — goes through your
+configured auxiliary route, the way the other `evals/` harnesses call
+`call_llm`. Pass `--model` to force one; `EVAL_MODEL` in `policies.py`
+(`anthropic/claude-opus-5`) is the **reference** model that published
+scorecards should use, not a pin the runner enforces.
+
+Either way the model is held constant across policies within a run, which is
+what makes a scorecard difference attributable to the policy — and whatever
+answered is recorded per row, so a scorecard always names its own model.
 
 ```bash
 # from repo root, venv active, provider configured

@@ -158,6 +158,17 @@ def run_policy(policy: str, task: Task, signals: Signals, model: str | None,
     )
     scored = _extract_json(judged)["scores"]
 
+    # The judge has to return one score per answer, in the order asked. Without
+    # this check a short judge response silently slides a comprehension score
+    # into the transfer slot, or empties transfer entirely and reports it as 0%
+    # -- a wrong number that looks like a real result. Raise instead; main()
+    # records the failed repeat and keeps every other one.
+    if not (len(scored) == len(answers) == len(questions)):
+        raise ValueError(
+            f"cannot align scores to items: {len(questions)} questions, "
+            f"{len(answers)} answers, {len(scored)} scores"
+        )
+
     n_comp = len(task.comprehension)
     comp = scored[:n_comp]
     transfer = scored[n_comp:]
@@ -182,7 +193,12 @@ def run_policy(policy: str, task: Task, signals: Signals, model: str | None,
 
 
 def summarize(policy: str, rs: list) -> dict:
-    """Average one policy's repeats into a scorecard row."""
+    """Average one policy's repeats into a scorecard row.
+
+    The model label is this policy's own, not a union across the whole run: if
+    a route changes mid-run, a global union would make every row claim every
+    model and none of them would be true.
+    """
     def avg(key: str, digits: int = 0):
         value = sum(r[key] for r in rs) / len(rs)
         return round(value, digits) if digits else round(value)
@@ -192,12 +208,30 @@ def summarize(policy: str, rs: list) -> dict:
         "label": rs[0]["label"],
         "modality": rs[0]["modality"],
         "n": len(rs),
+        "model": ", ".join(sorted({m for r in rs for m in r["models"]})),
         "comprehension_pct": avg("comprehension_pct"),
         "transfer_pct": avg("transfer_pct"),
         "calibration_error": avg("calibration_error", 3),
         "explanation_chars": avg("explanation_chars"),
         "seconds": avg("seconds", 1),
     }
+
+
+def write_results(out_dir: Path, runs: list, failures: list, task_key: str) -> None:
+    """Persist everything gathered so far.
+
+    Called after every repeat, not once at the end: a malformed model response
+    on the last policy must not discard the completed, already-paid-for repeats
+    of every earlier one.
+    """
+    (out_dir / "runs.json").write_text(json.dumps(runs, indent=2), encoding="utf-8")
+    if failures:
+        (out_dir / "failures.json").write_text(
+            json.dumps(failures, indent=2), encoding="utf-8")
+    card = [dict(summarize(policy, [r for r in runs if r["policy"] == policy]),
+                 task=task_key)
+            for policy in dict.fromkeys(r["policy"] for r in runs)]
+    (out_dir / "scorecard.json").write_text(json.dumps(card, indent=2), encoding="utf-8")
 
 
 def main():
@@ -234,7 +268,8 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    runs = []
+    runs: list = []
+    failures: list = []
     for policy in args.policies.split(","):
         policy = policy.strip()
         if policy not in POLICIES:
@@ -242,18 +277,20 @@ def main():
             continue
         for i in range(args.repeats):
             print(f"[{policy}] run {i + 1}/{args.repeats} ...", flush=True)
-            runs.append(run_policy(policy, task, signals, args.model, args.timeout))
+            try:
+                runs.append(
+                    run_policy(policy, task, signals, args.model, args.timeout))
+            except Exception as exc:  # noqa: BLE001 - one bad call must not void the run
+                print(f"  FAILED: {type(exc).__name__}: {exc}", flush=True)
+                failures.append({"policy": policy, "repeat": i + 1,
+                                 "error": f"{type(exc).__name__}: {exc}"})
+            write_results(out_dir, runs, failures, task.key)
 
-    (out_dir / "runs.json").write_text(json.dumps(runs, indent=2), encoding="utf-8")
-
-    # The model goes on every row: a scorecard that does not say which model
-    # produced it cannot be compared to any other scorecard.
-    models = sorted({m for r in runs for m in r["models"]})
-    card = [dict(summarize(policy, [r for r in runs if r["policy"] == policy]),
-                 model=", ".join(models), task=task.key)
-            for policy in dict.fromkeys(r["policy"] for r in runs)]
-    (out_dir / "scorecard.json").write_text(json.dumps(card, indent=2), encoding="utf-8")
-    print(f"\nwrote {out_dir}/scorecard.json  ({len(runs)} runs)")
+    if not runs:
+        print("\nno successful runs; see failures.json")
+        return
+    print(f"\nwrote {out_dir}/scorecard.json  ({len(runs)} runs"
+          + (f", {len(failures)} failed)" if failures else ")"))
     print(f"render it with: python evals/explanation_policy/report.py {out_dir}")
 
 
