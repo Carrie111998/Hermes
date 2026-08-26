@@ -11,6 +11,32 @@ import pytest
 from agent import account_usage
 
 
+@pytest.fixture(autouse=True)
+def _no_real_credential_profiles(monkeypatch):
+    """Make every test in this module blind to the developer's real profiles.
+
+    ``_fetch_anthropic_account_usage`` prefers the PINNED ``~/.claude-anthropic1``
+    profile and only falls back to ``resolve_anthropic_token()`` when it is
+    absent (commit e3b034b5cf). Nothing here stubbed the anthropic1 reader, so
+    on a box that HAS that profile the fetcher read the real credential file,
+    ignored the test's patched token, and failed -- printing the live
+    ``sk-ant-oat01`` access token into the pytest assertion diff. The suite
+    passed or failed according to whose machine it ran on.
+
+    Defaulting both readers to "no profile" fixes three things at once: the
+    tests stop depending on the host, a real secret can no longer reach test
+    output, and a test that WANTS a profile has to say so (``_install_profile``
+    and the explicit monkeypatches below still win, since function-level
+    patches are applied after this fixture).
+    """
+    monkeypatch.setattr(
+        account_usage, "_read_anthropic1_credentials", lambda config_dir=None: None
+    )
+    monkeypatch.setattr(
+        account_usage, "_read_anthropic2_credentials", lambda config_dir=None: None
+    )
+
+
 class _FakeResponse:
     def __init__(self, payload):
         self._payload = payload
@@ -258,8 +284,14 @@ def test_anthropic2_refresh_failure_reports_unavailable(monkeypatch, tmp_path):
     assert "auth login" in snap.unavailable_reason
 
 
-def test_primary_anthropic_fetcher_still_works_after_refactor(monkeypatch):
-    """The refactor into _fetch_anthropic_usage_with_token must not regress it."""
+def test_primary_anthropic_falls_back_to_the_ambient_token_when_unpinned(monkeypatch):
+    """The UNPINNED path: no ~/.claude-anthropic1, so resolve_anthropic_token() serves.
+
+    Renamed from test_primary_anthropic_fetcher_still_works_after_refactor, which
+    predated the pinning in e3b034b5cf and no longer described the function: with a
+    pinned profile present the fetcher never consults resolve_anthropic_token at all.
+    The autouse fixture supplies the "unpinned" precondition this now names.
+    """
     calls = []
     _patch_client(monkeypatch, _anthropic_payload(), calls)
     monkeypatch.setattr(
@@ -271,6 +303,56 @@ def test_primary_anthropic_fetcher_still_works_after_refactor(monkeypatch):
     assert snap is not None and snap.available
     assert snap.provider == "anthropic"
     assert calls[0]["headers"]["Authorization"] == "Bearer sk-ant-oat01-primary"
+
+
+def test_primary_anthropic_prefers_the_pinned_profile_over_the_ambient_token(
+    monkeypatch,
+):
+    """The DEFAULT path, and the whole reason pinning exists.
+
+    resolve_anthropic_token() ultimately reads ~/.claude, which follows whichever
+    account the desktop app is signed into. On 2026-08-23 14:18 the primary flipped
+    from diegodearagao to diegodearagaous and this row silently became a duplicate of
+    "Claude 2" for ~13 hours. If the ambient token is ever preferred again, this test
+    fails: it makes the two sources disagree and pins which one wins.
+    """
+    calls = []
+    _patch_client(monkeypatch, _anthropic_payload(), calls)
+    monkeypatch.setattr(
+        account_usage, "_read_anthropic1_credentials",
+        lambda config_dir=None: {
+            "accessToken": "sk-ant-oat01-pinned",
+            "refreshToken": "rt-pinned",
+            "expiresAt": _future_expiry_ms(),
+        },
+    )
+
+    def _must_not_be_used():
+        raise AssertionError(
+            "ambient resolve_anthropic_token() consulted despite a pinned profile"
+        )
+
+    monkeypatch.setattr(
+        account_usage, "resolve_anthropic_token", _must_not_be_used
+    )
+
+    snap = account_usage._fetch_anthropic_account_usage()
+
+    assert snap is not None and snap.available
+    assert snap.provider == "anthropic"
+    assert calls[0]["headers"]["Authorization"] == "Bearer sk-ant-oat01-pinned"
+
+
+def test_no_test_in_this_module_can_read_a_real_credential_profile():
+    """Guards the autouse fixture itself.
+
+    The defect being prevented is not a wrong assertion -- it is a live
+    ``sk-ant-oat01`` access token reaching pytest's assertion diff because a
+    fetcher fell through to the developer's home directory. If someone removes
+    the fixture, this fails rather than silently re-arming that.
+    """
+    assert account_usage._read_anthropic1_credentials() is None
+    assert account_usage._read_anthropic2_credentials() is None
 
 
 # ---------------------------------------------------------------------------
