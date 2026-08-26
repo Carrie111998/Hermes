@@ -1258,6 +1258,7 @@ export const en: Translations = {
     disableAll: 'Disable all',
     disableUnused: 'Disable unused',
     filterByProvenance: { Learned: 'Learned', 'Built-in': 'Built-in', Hub: 'Hub', All: 'All' },
+    clearProvenanceFilter: 'Clear filter',
     bulkUpdated: count => `Updated ${count} ${count === 1 ? 'item' : 'items'} for new sessions.`,
     bulkNoChange: 'Nothing to change.',
     usageCount: count => `used ${count}×`,

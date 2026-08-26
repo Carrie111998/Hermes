@@ -161,7 +161,9 @@ function filteredSkills(
         return false
       }
 
-      return !q || includesQuery(skill.name, q) || includesQuery(skill.description, q) || includesQuery(skill.category, q)
+      return (
+        !q || includesQuery(skill.name, q) || includesQuery(skill.description, q) || includesQuery(skill.category, q)
+      )
     })
     .sort((a, b) => sign * (usageOf(b) - usageOf(a)) || asText(a.name).localeCompare(asText(b.name)))
 }
@@ -174,9 +176,22 @@ const FILTER_CHIP =
 const CHIP_OFF = 'border-transparent text-muted-foreground/60 hover:text-foreground'
 const CHIP_ON = 'border-(--ui-stroke-secondary) bg-(--ui-bg-quaternary) text-foreground'
 
-function FilterChip({ active, children, onClick }: { active: boolean; children: React.ReactNode; onClick: () => void }) {
+function FilterChip({
+  active,
+  children,
+  onClick
+}: {
+  active: boolean
+  children: React.ReactNode
+  onClick: () => void
+}) {
   return (
-    <button aria-pressed={active} className={cn(FILTER_CHIP, active ? CHIP_ON : CHIP_OFF)} onClick={onClick} type="button">
+    <button
+      aria-pressed={active}
+      className={cn(FILTER_CHIP, active ? CHIP_ON : CHIP_OFF)}
+      onClick={onClick}
+      type="button"
+    >
       {children}
     </button>
   )
@@ -201,8 +216,10 @@ function provenanceChips(
 
   const options = [...counts.entries()].sort((a, b) => b[1] - a[1])
 
-  // Nothing to narrow — hide the strip entirely rather than show one dead chip.
-  if (options.length === 0) {
+  // Nothing to narrow — hide the strip rather than show dead controls. A
+  // single provenance is still useful when some rows are unclassified, but
+  // not when applying it would leave the whole list unchanged.
+  if (options.length === 0 || (options.length === 1 && options[0][1] === skills.length)) {
     return null
   }
 
@@ -652,11 +669,25 @@ export function SkillsView({
   // an empty install says nothing exists yet.
   const capabilityEmpty = (noun: string, filtered = false) => {
     const q = query.trim()
+    const canClearSkillsFilter = noun === 'skills' && skillsProvenanceFilter !== 'all'
 
     return (
       <div className="flex h-full min-h-0 flex-1">
         <PanelEmpty
-          description={q ? t.skills.emptyNothingMatches(q) : filtered ? t.skills.emptyNoneFound(noun) : t.skills.emptyNoneAvailable(noun)}
+          action={
+            canClearSkillsFilter ? (
+              <Button onClick={() => $skillsProvenanceFilter.set('all')} size="sm">
+                {t.skills.clearProvenanceFilter}
+              </Button>
+            ) : undefined
+          }
+          description={
+            q
+              ? t.skills.emptyNothingMatches(q)
+              : filtered
+                ? t.skills.emptyNoneFound(noun)
+                : t.skills.emptyNoneAvailable(noun)
+          }
           icon="search"
           title={t.skills.emptyNoneFound(noun)}
         />

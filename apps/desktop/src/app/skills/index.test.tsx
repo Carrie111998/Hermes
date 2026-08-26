@@ -436,13 +436,27 @@ describe('SkillsView provenance filter', () => {
   const FILTER_KEY = 'hermes.desktop.capabilities.skillsProvenanceFilter'
 
   const mixedSkills = [
-    { name: 'learned-a', description: 'a learned skill', category: 'general', enabled: true, usage: 5, provenance: 'agent' },
-    { name: 'bundled-b', description: 'a bundled skill', category: 'general', enabled: true, usage: 4, provenance: 'bundled' },
+    {
+      name: 'learned-a',
+      description: 'a learned skill',
+      category: 'general',
+      enabled: true,
+      usage: 5,
+      provenance: 'agent'
+    },
+    {
+      name: 'bundled-b',
+      description: 'a bundled skill',
+      category: 'general',
+      enabled: true,
+      usage: 4,
+      provenance: 'bundled'
+    },
     { name: 'hub-c', description: 'a hub skill', category: 'general', enabled: true, usage: 3, provenance: 'hub' },
     { name: 'plain-d', description: 'no provenance', category: 'general', enabled: true, usage: 2 }
   ]
 
-  async function renderSkillsTab(waitForSkill = 'learned-a') {
+  async function renderSkillsTab(waitForSkill: null | string = 'learned-a') {
     const { SkillsView } = await import('./index')
     await act(async () => {
       render(
@@ -453,7 +467,10 @@ describe('SkillsView provenance filter', () => {
         </QueryClientProvider>
       )
     })
-    await screen.findByRole('switch', { name: waitForSkill })
+
+    if (waitForSkill) {
+      await screen.findByRole('switch', { name: waitForSkill })
+    }
   }
 
   beforeEach(async () => {
@@ -517,5 +534,29 @@ describe('SkillsView provenance filter', () => {
     await renderSkillsTab('hub-c')
 
     expect(screen.queryByRole('switch', { name: 'learned-a' })).toBeNull()
+  })
+
+  it('offers a way to clear a persisted filter with no matching rows', async () => {
+    getSkills.mockResolvedValue([mixedSkills[1]])
+    const { $skillsProvenanceFilter } = await import('./store')
+    $skillsProvenanceFilter.set('agent')
+
+    await renderSkillsTab(null)
+
+    const clear = await screen.findByRole('button', { name: 'Clear filter' })
+    await act(async () => {
+      fireEvent.click(clear)
+    })
+
+    expect(await screen.findByRole('switch', { name: 'bundled-b' })).toBeTruthy()
+  })
+
+  it('hides provenance chips when every skill has the same provenance', async () => {
+    getSkills.mockResolvedValue([mixedSkills[1], { ...mixedSkills[1], name: 'bundled-c' }])
+
+    await renderSkillsTab('bundled-b')
+
+    expect(screen.queryByRole('button', { name: 'All' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Built-in' })).toBeNull()
   })
 })
