@@ -4424,6 +4424,13 @@ def use_anthropic_claude_code_credentials(save_fn=None):
     writer("ANTHROPIC_TOKEN", "")
     writer("ANTHROPIC_API_KEY", "")
 
+    # This function is reached only after the user explicitly chooses Claude
+    # Code credentials, so it is the narrow re-engagement signal for this
+    # otherwise isolated credential source.
+    from hermes_cli.auth import unsuppress_credential_source
+
+    unsuppress_credential_source("anthropic", "claude_code")
+
 
 def save_anthropic_api_key(value: str, save_fn=None):
     """Persist an Anthropic API key and clear the OAuth/setup-token slot."""

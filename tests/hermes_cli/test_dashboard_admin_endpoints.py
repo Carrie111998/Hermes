@@ -209,6 +209,20 @@ class TestCredentialPoolEndpoints:
         sources = sorted(e.source for e in load_pool("openrouter").entries())
         assert sources == ["env:OPENROUTER_API_KEY", "manual"]
 
+    def test_post_anthropic_manual_key_preserves_claude_code_suppression(self):
+        from hermes_cli.auth import is_source_suppressed, suppress_credential_source
+
+        suppress_credential_source("anthropic", "claude_code")
+        assert is_source_suppressed("anthropic", "claude_code")
+
+        response = self.client.post(
+            "/api/credentials/pool",
+            json={"provider": "anthropic", "api_key": "test-anthropic-key"},
+        )
+
+        assert response.status_code == 200
+        assert is_source_suppressed("anthropic", "claude_code")
+
 
 
 

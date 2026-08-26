@@ -32,3 +32,21 @@ def test_use_anthropic_claude_code_credentials_clears_env_slots(tmp_path, monkey
     assert env_vars["ANTHROPIC_API_KEY"] == ""
 
 
+def test_use_anthropic_claude_code_credentials_clears_source_suppression(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli.auth import is_source_suppressed, suppress_credential_source
+    from hermes_cli.config import use_anthropic_claude_code_credentials
+
+    suppress_credential_source("anthropic", "claude_code")
+    assert is_source_suppressed("anthropic", "claude_code")
+
+    use_anthropic_claude_code_credentials()
+
+    assert not is_source_suppressed("anthropic", "claude_code")
+
+

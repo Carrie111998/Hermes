@@ -14227,6 +14227,8 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
                 )
                 suppressed = _load_auth_store().get("suppressed_sources", {})
                 for src in list(suppressed.get(provider, []) or []):
+                    if provider == "anthropic" and src == "claude_code":
+                        continue
                     unsuppress_credential_source(provider, src)
             except Exception:
                 _log.exception("unsuppress after pool add failed (non-fatal)")
