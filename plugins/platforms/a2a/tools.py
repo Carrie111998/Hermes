@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, TypedDict
@@ -62,9 +64,12 @@ def _resolve_peer(agent: str) -> Optional[dict]:
     return {
         "url": entry.get("url", ""),
         "auth": entry.get("auth", {}) or {},
+        "headers": entry.get("headers", {}) or {},
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
         "capabilities": entry.get("capabilities", []) or [],
         "tenant": entry.get("tenant", ""),
+        "idempotency": bool(entry.get("idempotency", False)),
+        "allowed_rpc_origins": entry.get("allowed_rpc_origins") or [],
     }
 
 
@@ -79,17 +84,55 @@ def _auth_header(auth: dict) -> dict:
 # --------------------------------------------------------------------------
 
 def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    req = urllib.request.Request(url, headers={"User-Agent": "Hermes-A2A/1.0", **headers}, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+# Retry budget for Cloudflare 524 (origin timeout) on blocking POST, when the
+# peer has opted in. A 524 means the proxy gave up on the response, NOT that
+# the origin failed — the peer may have already executed the task. Retrying a
+# mutating send on a 524 is only safe when the peer dedupes on message
+# identity (stable Message.messageId is re-sent byte-identically), which the
+# operator asserts per peer via `idempotency: true` in the peer config.
+# Default: no retry — the indeterminate outcome propagates to the caller.
+_POST_MAX_RETRIES = 3
+
+
+def _http_post_json(url: str, body: dict, headers: dict, timeout: int,
+                    retry_524: bool = False) -> dict:
     data = json.dumps(body).encode("utf-8")
-    hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
+    # Custom peer headers are operator-controlled but Content-Type and
+    # A2A-Version are protocol-owned and must not be clobbered; a config typo
+    # would otherwise cause peer rejection or protocol-version mismatches.
+    # User-Agent stays overridable (some proxies filter user agents).
+    hdrs = {
+        "User-Agent": "Hermes-A2A/1.0",
+        **headers,
+        "Content-Type": "application/json",
+        "A2A-Version": protocol.PROTOCOL_VERSION,
+    }
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+
+    attempts = _POST_MAX_RETRIES if retry_524 else 1
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if (retry_524 and e.code == 524 and attempt < attempts - 1):
+                # Exponential backoff: 1s, 2s, 4s. Safe as a blocking sleep:
+                # plugin tools run on worker threads (orchestrate uses a
+                # ThreadPoolExecutor; handlers never touch the gateway's
+                # event loop).
+                logger.warning(
+                    "A2A: 524 from %s (origin may have completed the task); "
+                    "peer opted into idempotent retry, backing off %.0fs",
+                    url, 2 ** attempt)
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise AssertionError("retry loop exited without a result")  # pragma: no cover
 
 
 def _card_url(base_url: str) -> str:
@@ -137,6 +180,30 @@ def _interface_tenant(card: Optional[dict], peer: dict) -> str:
     return str(peer.get("tenant") or "")
 
 
+def _url_origin(url: str) -> tuple[str, str]:
+    """(scheme, host:port) of a URL, lowercased; port defaulted per scheme."""
+    parsed = urllib.parse.urlsplit(url.strip())
+    host = (parsed.hostname or "").lower()
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme.lower(), f"{host}:{port}"
+
+
+def _url_same_origin(candidate: str, configured: str) -> bool:
+    """True when candidate and configured share scheme + host + port."""
+    try:
+        return _url_origin(candidate) == _url_origin(configured)
+    except ValueError:
+        return False
+
+
+def _allowed_rpc_origins(peer: dict) -> list[str]:
+    """Operator-pinned cross-origin RPC URLs exempt from the origin check."""
+    raw = peer.get("allowed_rpc_origins") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(u).rstrip("/") for u in raw if str(u).strip()]
+
+
 # --------------------------------------------------------------------------
 # Shared send path (used by a2a_call and a2a_orchestrate)
 # --------------------------------------------------------------------------
@@ -153,15 +220,34 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     outbound redaction, audit, persistence, and metrics.
     """
     base_url = peer.get("url", "")
-    headers = _auth_header(peer.get("auth", {}) or {})
+    headers = {**_auth_header(peer.get("auth", {}) or {}), **(peer.get("headers", {}) or {})}
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
+    # Operator asserts this peer dedupes on message identity (Hermes peers
+    # do), making 524 retries and stream-fallback resends safe. Without it, a
+    # 524 (origin may have completed the task) is surfaced, never retried.
+    idempotency = bool(peer.get("idempotency", False))
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
+    # The card is fetched WITHOUT credential-bearing headers: it is served at
+    # the configured base URL (same origin), but keeping the fetch bare keeps
+    # the credential surface exactly where the operator pinned it.
     card = None
     try:
-        card = _fetch_card(base_url, headers, min(timeout, 30))
+        card = _fetch_card(base_url, {}, min(timeout, 30))
     except Exception:
         pass
+
+    rpc_url = _rpc_url(base_url, card)
+    if not _url_same_origin(rpc_url, base_url) and str(rpc_url) not in _allowed_rpc_origins(peer):
+        # The card advertised an RPC interface on a different origin than the
+        # configured base URL. Sending there would forward operator secrets
+        # (bearer tokens, proxy service tokens) to a card-controlled host.
+        # Refuse: fall back to the configured origin, never follow the card.
+        logger.warning(
+            "A2A: peer '%s' card advertised cross-origin RPC URL %s; not in "
+            "peer's allowed_rpc_origins — using configured origin %s instead",
+            agent_label, rpc_url, base_url)
+        rpc_url = base_url.rstrip("/")
 
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
@@ -183,7 +269,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout, retry_524=idempotency)
     if "error" in resp:
         err = resp["error"]
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
@@ -385,7 +471,13 @@ def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id:
         peer = {
             "url": peer_entry.get("url", ""),
             "auth": peer_entry.get("auth", {}) or {},
+            "headers": peer_entry.get("headers", {}) or {},
+            "tenant": peer_entry.get("tenant", ""),
             "timeout": int(peer_entry.get("timeout", _DEFAULT_TIMEOUT)),
+            # Forwarded so fan-out peers keep their 524-retry opt-in and
+            # cross-origin RPC allowlist (same semantics as a2a_call).
+            "idempotency": bool(peer_entry.get("idempotency", False)),
+            "allowed_rpc_origins": peer_entry.get("allowed_rpc_origins") or [],
         }
         reply, _ctx, _state = _send_task(agent_name, peer, message, context_id)
         return (agent_name, reply or "(no reply)")
@@ -585,12 +677,20 @@ _HANDLERS = {
 def register_tools(ctx) -> None:
     """Register the client tools in the ``a2a`` toolset."""
     for name, schema in _SCHEMAS.items():
-        function_schema = schema["function"]
+        # The registry stores schemas as-is and ``get_definitions()`` wraps
+        # them in {"type": "function", "function": ...}. ``_SCHEMAS`` entries
+        # are pre-wrapped for OpenAI compatibility, so unwrap here — passing
+        # them wrapped would double-nest them and the model-facing tool defs
+        # (and ``tool_describe``) would come back empty.
+        # NOTE: upstream landed the same unwrap as cefeed4ca using hard
+        # indexing; this variant keeps the defensive ``.get()`` fallbacks
+        # and is a behavioral superset of it.
+        flat = schema.get("function", schema)
         ctx.register_tool(
             name=name,
             toolset="a2a",
-            schema=function_schema,
+            schema=flat,
             handler=_HANDLERS[name],
-            description=function_schema["description"],
+            description=flat.get("description", ""),
             emoji="\U0001f9e9",  # puzzle piece
         )
