@@ -283,7 +283,6 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import { createScreenAnnotationsController, registerScreenAnnotationsIpc } from './screen-annotations-window'
-import { createSubtitleCaptureController, registerSubtitleCaptureIpc } from './subtitle-capture-session'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -298,6 +297,7 @@ import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstra
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
+import { createSubtitleCaptureController, registerSubtitleCaptureIpc } from './subtitle-capture-session'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {

@@ -28,10 +28,10 @@ import {
   matchCapturerWindow,
   SAME_TEXT_MAX_DISTANCE,
   shipSize,
-  type SubtitleBandFractions,
-  subtitleBand,
-  subtitleShapes,
   SUBTITLE_KEEPALIVE_MS,
+  subtitleBand,
+  type SubtitleBandFractions,
+  subtitleShapes,
   type SubtitleTextBox
 } from './subtitle-capture'
 import { type EnumeratedWindow, enumerateWindowsFrontToBack, enumerationFailed, enumerationFailureNote } from './window-below'
@@ -81,6 +81,7 @@ const SUPPORTED_ACTIONS = ['start', 'status', 'stop'] as const
 
 const asBounds = (value: unknown): AnnotationBounds | null => {
   const raw = (value ?? {}) as Record<string, unknown>
+
   const nums = [raw.x, raw.y, raw.width, raw.height].map(entry =>
     typeof entry === 'number' && Number.isFinite(entry) ? entry : null
   )
@@ -140,6 +141,7 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
 
   const stop = (reason?: string): Record<string, unknown> => {
     const wasRunning = current !== null
+
     const stats = current
       ? { lines_translated: current.linesDrawn, ran_seconds: Math.round((Date.now() - current.startedAt) / 1000) }
       : {}
@@ -355,6 +357,7 @@ export function createSubtitleCaptureController(options: SubtitleCaptureOptions)
     try {
       const display = screen.getDisplayMatching(sessionAtSample.windowBounds)
       const scale = display.scaleFactor || 1
+
       const sources = await desktopCapturer.getSources({
         fetchWindowIcons: false,
         thumbnailSize: {

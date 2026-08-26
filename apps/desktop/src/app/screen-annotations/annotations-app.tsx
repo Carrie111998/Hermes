@@ -63,7 +63,7 @@ function Caption({
       y={y}
     >
       {lines.map((line, index) => (
-        <tspan key={index} x={x} dy={index === 0 ? 0 : '1.3em'}>
+        <tspan dy={index === 0 ? 0 : '1.3em'} key={index} x={x}>
           {line}
         </tspan>
       ))}
