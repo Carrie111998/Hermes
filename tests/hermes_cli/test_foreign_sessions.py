@@ -1,10 +1,11 @@
-"""Tests for hermes_cli.foreign_sessions — Claude Code / Codex CLI import.
+"""Tests for hermes_cli.foreign_sessions — Claude Code / Codex CLI / Kimi Code import.
 
 Fixture JSONL is synthesized inline (tmp_path); the SessionDB is opened
 against a temp path so nothing touches the real HERMES_HOME store.
 """
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -489,3 +490,53 @@ def test_import_kimi_session(tmp_path, session_db):
     assert origin["imported_from"]["tool"] == "kimi-code"
     assert origin["imported_from"]["foreign_session_id"] == "session_kimi-0001"
     assert session_db.resolve_session_id(session_id) == session_id
+
+
+def _rewrite_kimi_state(wire, state):
+    """Replace a fixture's state.json with ``state`` (None deletes it)."""
+    path = wire.parent.parent.parent / "state.json"
+    if state is None:
+        path.unlink()
+    else:
+        path.write_text(json.dumps(state), encoding="utf-8")
+    return wire
+
+
+def test_parse_kimi_session_legacy_state_shape(tmp_path):
+    """The older state.json spells cwd ``workDir`` and dates ISO-8601.
+
+    Both shapes exist side by side in a real store, so reading only the
+    current keys drops the cwd and the session id on every legacy dir.
+    """
+    f = _rewrite_kimi_state(
+        _write_kimi_fixture(tmp_path),
+        {
+            "workDir": "/home/user/legacy",
+            "title": "New Session",  # Kimi's placeholder, not a name
+            "updatedAt": "2026-08-24T00:37:56.953Z",
+            "isCustomTitle": False,
+        },
+    )
+    parsed = parse_kimi_session(f)
+
+    assert parsed["cwd"] == "/home/user/legacy"
+    # no "id" key in this shape — fall back to the session dir name
+    assert parsed["session_id"] == "session_kimi-0001"
+    # the placeholder title must not win over the first typed line
+    assert parsed["title_guess"].startswith("Summarize the repo")
+
+    listed = list_kimi_sessions(tmp_path / ".kimi-code" / "sessions")
+    assert len(listed) == 1
+    assert listed[0].mtime == datetime(
+        2026, 8, 24, 0, 37, 56, 953000, tzinfo=timezone.utc
+    ).timestamp()
+
+
+def test_list_kimi_sessions_falls_back_to_file_mtime(tmp_path):
+    """An unusable ``updatedAt`` must not sort the session into 1970."""
+    f = _rewrite_kimi_state(
+        _write_kimi_fixture(tmp_path), {"id": "s1", "updatedAt": "not a date"}
+    )
+    listed = list_kimi_sessions(tmp_path / ".kimi-code" / "sessions")
+    assert len(listed) == 1
+    assert listed[0].mtime == f.stat().st_mtime

@@ -24,7 +24,9 @@ Sources (read-only — foreign files are never modified):
 
 * **Kimi Code** stores one directory per session under
   ``~/.kimi-code/sessions/<wd>/<session>/`` with a ``state.json`` (cwd,
-  title, updatedAt) and ``agents/main/wire.jsonl``.  Wire records:
+  title, updatedAt — the legacy shape spells these ``workDir``, an
+  ISO-8601 ``updatedAt``, and carries no ``id``) and
+  ``agents/main/wire.jsonl``.  Wire records:
   ``context.append_message`` carries typed user messages (``origin.kind``
   ``user``; ``injection``/``task`` rows are not typed input), and assistant
   output streams as ``context.append_loop_event`` records — ``content.part``
@@ -337,6 +339,43 @@ def _kimi_state(session_dir: Path) -> Dict[str, Any]:
     return state if isinstance(state, dict) else {}
 
 
+# Kimi writes this when a session has no user-supplied or generated title.
+# It is a placeholder, not a name: taking it literally makes every untitled
+# session render identically in the picker, so it falls back like a missing
+# title does.
+_KIMI_PLACEHOLDER_TITLES = {"new session", "untitled session"}
+
+
+def _kimi_title(state: Dict[str, Any]) -> Optional[str]:
+    title = state.get("title")
+    if not isinstance(title, str):
+        return None
+    title = title.strip()
+    if not title or title.lower() in _KIMI_PLACEHOLDER_TITLES:
+        return None
+    return title
+
+
+def _kimi_mtime(state: Dict[str, Any]) -> Optional[float]:
+    """``updatedAt`` as a POSIX timestamp, or ``None`` if unusable.
+
+    Current wires store epoch milliseconds; legacy ones store an ISO-8601
+    string.  A bare-seconds value is accepted too so a future writer that
+    drops the millisecond scale doesn't land every session in 1970.
+    """
+    updated = state.get("updatedAt")
+    if isinstance(updated, bool):
+        return None
+    if isinstance(updated, (int, float)):
+        return float(updated) / 1000.0 if updated > 1e11 else float(updated)
+    if isinstance(updated, str):
+        try:
+            return datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def parse_kimi_session(path: Path) -> Dict[str, Any]:
     """Parse one Kimi Code wire.jsonl into normalized turns + meta."""
     path = Path(path)
@@ -388,16 +427,21 @@ def parse_kimi_session(path: Path) -> Dict[str, Any]:
                 turns.append(("assistant", f"[ran tool: {name}]"))
             # tool.result / step.* records carry no conversational text.
 
-    state = _kimi_state(_kimi_session_dir(path))
-    cwd = state.get("cwd")
-    title = state.get("title")
+    session_dir = _kimi_session_dir(path)
+    state = _kimi_state(session_dir)
+    # Two state.json shapes exist side by side in a real store (a survey of
+    # one found 402 current dirs and 25 legacy). The current shape has
+    # ``cwd`` / ``id`` / epoch-ms ``updatedAt``; the legacy one has
+    # ``workDir``, no ``id``, and an ISO-8601 ``updatedAt``. Reading only
+    # the current keys silently drops cwd and the session id on the legacy
+    # dirs, so both spellings are accepted.
+    cwd = state.get("cwd") or state.get("workDir")
     sid = state.get("id")
-    title_text = title.strip() if isinstance(title, str) else ""
     return {
         "turns": _merge_turns(turns),
         "cwd": cwd if isinstance(cwd, str) else None,
-        "title_guess": title_text or _first_user_line(turns),
-        "session_id": sid if isinstance(sid, str) else _kimi_session_dir(path).name,
+        "title_guess": _kimi_title(state) or _first_user_line(turns),
+        "session_id": sid if isinstance(sid, str) else session_dir.name,
     }
 
 
@@ -416,13 +460,10 @@ def list_kimi_sessions(root: Optional[Path] = None) -> List[ForeignSession]:
         parsed = parse_kimi_session(wire)
         if not parsed["turns"]:
             continue
-        updated = _kimi_state(_kimi_session_dir(wire)).get("updatedAt")
         try:
-            mtime = (
-                float(updated) / 1000.0
-                if isinstance(updated, (int, float))
-                else wire.stat().st_mtime
-            )
+            mtime = _kimi_mtime(_kimi_state(_kimi_session_dir(wire)))
+            if mtime is None:
+                mtime = wire.stat().st_mtime
         except OSError:
             continue
         results.append(
