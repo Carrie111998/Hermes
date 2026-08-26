@@ -2456,6 +2456,11 @@ const avatarFetchInflight = new Set()
 
 const avatarPushInflight = new Set()
 
+/** Last server avatar applied per bot key. Guards against re-fetching the
+ *  asset on every 5s roster refetch when the server copy is unchanged, while
+ *  still letting a CHANGED server avatar replace a stale local one. */
+const serverAvatarSeen = new Map()
+
 /** Backfill: local meta has art the server lacks -> profiles.set_asset.
  *  Server-side avatars power the inter-agent notice pfp (core #85855) and
  *  cross-machine roster art, so local-only images are a bug, not a state. */
@@ -2564,7 +2569,12 @@ function pullServerAvatars(roster) {
       continue
     }
 
-    if ($botMeta.get()[key]?.image) {
+    // Always consult the server for bots flagged has_avatar: the profile
+    // asset store is the source of truth, and a local image may be stale
+    // (updated server-side on another machine, or a leftover from before
+    // the avatar changed). Only skip when we already applied THIS server
+    // asset — otherwise a changed avatar would never replace the local one.
+    if (serverAvatarSeen.get(key) === $botMeta.get()[key]?.image) {
       continue
     }
 
@@ -2584,6 +2594,7 @@ function pullServerAvatars(roster) {
           }
           $botMeta.set({ ...current, [key]: { ...mine, image: res.data } })
           persistBotMetaSnapshot($botMeta.get(), Boolean(bot.sourceScoped))
+          serverAvatarSeen.set(key, res.data)
         }
       })
       .catch(() => undefined)
@@ -8585,9 +8596,15 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
       ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
       : previewSession?.preview || ''
   )
+  // A configured profile description is the stable identity of the bot and
+  // beats a session preview — a stale preview (e.g. the "Hey, tell me about
+  // yourself!" onboarding intro) must not linger after the description is
+  // updated. Fall back to the live preview only when no description exists.
+  const configuredDescription = String(meta?.description || bot.description || '').trim()
+  const rowSubtitle = configuredDescription || displayPreview
   const handle = botHandle(bot.name, bot)
   const gatewayLabel = bot.connectionLabel || (bot.connectionId === 'local' ? 'This device' : '')
-  const showDetailsRow = Boolean(showHandle || displayPreview || fromBot)
+  const showDetailsRow = Boolean(showHandle || rowSubtitle || fromBot)
   const rowTooltip = [displayName(bot, meta), `@${handle}`, gatewayLabel, sourceStatus.label]
     .filter(Boolean)
     .join(' · ')
@@ -8711,13 +8728,13 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                         children: `@${handle}`
                       })
                     : null,
-                  showHandle && displayPreview
+                  showHandle && rowSubtitle
                     ? jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: '·' })
                     : null,
-                  displayPreview
+                  rowSubtitle
                     ? jsx('span', {
-                        className: cn('min-w-0 truncate', fromBot && 'italic'),
-                        children: displayPreview
+                        className: cn('min-w-0 truncate', fromBot && !configuredDescription && 'italic'),
+                        children: rowSubtitle
                       })
                     : null
                 ]
