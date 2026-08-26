@@ -100,7 +100,8 @@ describe('Hermes REST helpers', () => {
       expect.objectContaining({
         path:
           '/api/profiles/sessions/sidebar?recents_profile=work&recents_limit=30&cron_limit=50' +
-          '&messaging_limit=100&recents_exclude=cron%2Ctool&messaging_exclude=cron%2Cdesktop',
+          '&messaging_limit=100&projects_limit=300&archives_limit=300' +
+          '&recents_exclude=cron%2Ctool&messaging_exclude=cron%2Cdesktop',
         timeoutMs: 60_000
       })
     )
@@ -230,6 +231,8 @@ describe('Hermes REST helpers', () => {
     expect(result.recents.sessions).toEqual([])
     expect(result.cron.sessions).toEqual([])
     expect(result.messaging.sessions).toEqual([])
+    expect(result.projects.sessions).toEqual([])
+    expect(result.archives.sessions).toEqual([])
   })
 
   it('falls back to the per-slice endpoint when the batched route 404s on an older backend', async () => {
@@ -281,13 +284,15 @@ describe('Hermes REST helpers', () => {
 
     const paths = api.mock.calls.map(call => (call[0] as { path: string }).path)
     expect(paths.filter(p => p.startsWith('/api/profiles/sessions/sidebar'))).toHaveLength(1)
-    expect(paths.filter(p => p.startsWith('/api/profiles/sessions?'))).toHaveLength(3)
+    expect(paths.filter(p => p.startsWith('/api/profiles/sessions?'))).toHaveLength(5)
     expect(
       paths.filter(path => path.startsWith('/api/profiles/sessions?') && path.includes('profile=work'))
-    ).toHaveLength(3)
+    ).toHaveLength(5)
     expect(paths.some(path => path.includes('profile=all'))).toBe(false)
     expect(paths).toContainEqual(expect.stringContaining('source=cron'))
     expect(paths).toContainEqual(expect.stringContaining('exclude_sources=cron%2Ctool'))
+    expect(paths).toContainEqual(expect.stringContaining('disposition=project'))
+    expect(paths).toContainEqual(expect.stringContaining('disposition=archive'))
   })
 
   it('remembers endpoint-missing and skips re-probing the batched route on later refreshes', async () => {
@@ -314,9 +319,9 @@ describe('Hermes REST helpers', () => {
     )
 
     // First refresh probes once and learns; the second goes straight to the
-    // per-slice route (3 calls each refresh, no repeated dead probe).
+    // per-slice route (5 calls each refresh, no repeated dead probe).
     expect(batchedProbes).toHaveLength(1)
-    expect(api.mock.calls.length).toBe(1 + 3 + 3)
+    expect(api.mock.calls.length).toBe(1 + 5 + 5)
   })
 
   it('re-probes the batched route after a gateway switch resets the capability flag', async () => {

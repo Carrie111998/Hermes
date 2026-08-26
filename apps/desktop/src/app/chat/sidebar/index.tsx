@@ -28,6 +28,7 @@ import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
+import { unclassifiedSessions } from '@/lib/session-taxonomy'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
 import { $activeConnectionId } from '@/store/connections'
@@ -117,6 +118,8 @@ import {
   $messagingPlatformTotals,
   $messagingSessions,
   $messagingTruncated,
+  $projectSessions,
+  $archiveSessions,
   $sessionProfilesTruncated,
   $sessions,
   $sessionsLoading,
@@ -173,6 +176,7 @@ import { WorktreeDialog } from './projects/worktree-dialog'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { TaxonomySidebarSections } from './taxonomy-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -382,6 +386,8 @@ export function ChatSidebar({
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
   const messagingSessions = useStore($messagingSessions)
+  const projectSessions = useStore($projectSessions)
+  const archiveSessions = useStore($archiveSessions)
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
   const messagingTruncated = useStore($messagingTruncated)
   const sessionsLoading = useStore($sessionsLoading)
@@ -1278,9 +1284,26 @@ export function ChatSidebar({
     )
   }, [profileGrouped, agentSessions, profileColors])
 
-  // The flat Sessions list always shows ALL recent sessions; Projects is a
-  // parallel grouped view, not a filter on this one — nothing is hidden here.
-  const displayAgentSessions = agentSessions
+  // The flat Sessions list shows RECENT UNCLASSIFIED sessions. Classified
+  // sessions live in their taxonomy sections (Projects / Archives) above —
+  // showing them again here would duplicate every row. The taxonomy slices are
+  // the primary organization; this list is the fallback for new work that
+  // hasn't been classified yet (and for non-default modes like search, where
+  // every match must still surface).
+  //
+  // taxonomyDefaultView is only active when classification is actually
+  // present: with an older backend (no disposition data) or an empty library
+  // the taxonomy sections render nothing, so the flat list + messaging + cron
+  // sections must keep their pre-taxonomy behavior instead of disappearing.
+  const taxonomyDefaultView =
+    !trimmedQuery &&
+    !showArchived &&
+    !inProject &&
+    !worktreeGroupingActive &&
+    !profileGrouped &&
+    (projectSessions.length > 0 || archiveSessions.length > 0)
+
+  const displayAgentSessions = taxonomyDefaultView ? unclassifiedSessions(agentSessions) : agentSessions
 
   // Pagination is scope-aware. In "All profiles" mode it tracks the global
   // unified set; scoped to one profile it tracks that profile's own truncation
@@ -1637,6 +1660,19 @@ export function ChatSidebar({
             )}
 
             {!trimmedQuery && (
+              <TaxonomySidebarSections
+                activeSessionId={activeSidebarSessionId}
+                isPinned={isPinnedSession}
+                onArchiveSession={onArchiveSession}
+                onDeleteSession={onDeleteSession}
+                onResumeSession={onResumeSession}
+                onTogglePin={pinSession}
+                onToggleUnread={toggleUnread}
+                rootClassName="shrink-0 p-0 pb-1"
+              />
+            )}
+
+            {!trimmedQuery && (
               <SidebarSessionsSection
                 activeProjectId={activeProjectId}
                 activeSessionId={activeSidebarSessionId}
@@ -1826,6 +1862,7 @@ export function ChatSidebar({
 
             {!trimmedQuery &&
               !worktreeGroupingActive &&
+              !taxonomyDefaultView &&
               messagingGroups.map(group => {
                 const visible = messagingVisible[group.sourceId] ?? NON_SESSION_INITIAL_ROWS
                 const shownSessions = group.sessions.slice(0, visible)
@@ -1870,7 +1907,7 @@ export function ChatSidebar({
                 )
               })}
 
-            {!trimmedQuery && !worktreeGroupingActive && cronJobs.length > 0 && (
+            {!trimmedQuery && !worktreeGroupingActive && !taxonomyDefaultView && cronJobs.length > 0 && (
               <SidebarCronJobsSection
                 jobs={cronJobs}
                 label={s.cronJobs}

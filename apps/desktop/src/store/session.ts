@@ -566,6 +566,14 @@ export const $messagingPlatformTotals = atom<Record<string, number>>({})
 // True when the combined seed fetch hit MESSAGING_SECTION_LIMIT, so at least
 // one platform may have more rows on disk than were loaded.
 export const $messagingTruncated = atom<boolean>(false)
+// Taxonomy slices: sessions with disposition=project (active work, grouped
+// client-side by project_group -> project) and disposition=archive (finished
+// work). These feed the sidebar's Projects / Archives sections, which replace
+// the flat recents + per-platform sections as the primary organization.
+export const $projectSessions = atom<SessionInfo[]>([])
+export const $archiveSessions = atom<SessionInfo[]>([])
+export const PROJECT_SECTION_LIMIT = 300
+export const ARCHIVE_SECTION_LIMIT = 300
 // Whether a profile's last session page was CAPPED by the request limit, keyed
 // by profile name — i.e. more rows exist on disk than were loaded. Replaces the
 // old exact per-profile totals: rendering `loaded/total` in the sidebar cost a
@@ -768,6 +776,8 @@ export const setMessagingSessions = (next: Updater<SessionInfo[]>) => updateAtom
 export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($messagingPlatformTotals, next)
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
+export const setProjectSessions = (next: Updater<SessionInfo[]>) => updateAtom($projectSessions, next)
+export const setArchiveSessions = (next: Updater<SessionInfo[]>) => updateAtom($archiveSessions, next)
 export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean>>) =>
   updateAtom($sessionProfilesTruncated, next)
 export const setSessionProfilesUsage = (next: Updater<Record<string, ProfileUsage>>) =>

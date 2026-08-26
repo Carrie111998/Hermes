@@ -51,6 +51,33 @@ describe('sameCronSignature', () => {
     const b = [session('a', 't', { archived: false, pinned: true })]
     expect(sameCronSignature(a, b)).toBe(true)
   })
+
+  // A reclassification must invalidate the memo so the Projects/Archives
+  // sections re-group (review #10 — disposition/project_group/project were
+  // not hashed, so a classification change returned identical arrays).
+  it('is false when only the disposition changed', () => {
+    const a = [session('a', 't', { disposition: 'project' })]
+    const b = [session('a', 't', { disposition: 'archive' })]
+    expect(sameCronSignature(a, b)).toBe(false)
+  })
+
+  it('is false when only project_group changed', () => {
+    const a = [session('a', 't', { disposition: 'project', project_group: 'Hermes' })]
+    const b = [session('a', 't', { disposition: 'project', project_group: 'Other' })]
+    expect(sameCronSignature(a, b)).toBe(false)
+  })
+
+  it('is false when only project changed', () => {
+    const a = [session('a', 't', { disposition: 'project', project: 'Agora' })]
+    const b = [session('a', 't', { disposition: 'project', project: 'Fusion Router' })]
+    expect(sameCronSignature(a, b)).toBe(false)
+  })
+
+  it('is true when taxonomy fields match', () => {
+    const a = [session('a', 't', { disposition: 'project', project_group: 'Hermes', project: 'Agora' })]
+    const b = [session('a', 't', { disposition: 'project', project_group: 'Hermes', project: 'Agora' })]
+    expect(sameCronSignature(a, b)).toBe(true)
+  })
 })
 
 describe('sessionMessagesSignature', () => {

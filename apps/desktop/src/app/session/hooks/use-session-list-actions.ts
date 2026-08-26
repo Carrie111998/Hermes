@@ -24,13 +24,17 @@ import {
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
+  ARCHIVE_SECTION_LIMIT,
   CRON_SECTION_LIMIT,
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
+  PROJECT_SECTION_LIMIT,
+  setArchiveSessions,
   setCronSessions,
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
+  setProjectSessions,
   setSessionProfilesTruncated,
   setSessionProfilesUsage,
   setSessions,
@@ -266,7 +270,9 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         recentsExclude: SIDEBAR_EXCLUDED_SOURCES,
         cronLimit: CRON_SECTION_LIMIT,
         messagingLimit: MESSAGING_SECTION_LIMIT,
-        messagingExclude: MESSAGING_EXCLUDED_SOURCES
+        messagingExclude: MESSAGING_EXCLUDED_SOURCES,
+        projectsLimit: PROJECT_SECTION_LIMIT,
+        archivesLimit: ARCHIVE_SECTION_LIMIT
       })
 
       if (
@@ -330,6 +336,15 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
         // Hit the cap → at least one platform may have more on disk than loaded.
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
+
+        // Taxonomy slices: active PROJECT work (grouped by project_group ->
+        // project in the sidebar) and finished ARCHIVE work. Signature-gated
+        // like the other slices so a content-identical refresh keeps array
+        // identity and the Projects/Archives memos don't recompute.
+        const projectRows = dropTombstoned(result.projects.sessions)
+        setProjectSessions(prev => (sameCronSignature(prev, projectRows) ? prev : projectRows))
+        const archiveRows = dropTombstoned(result.archives.sessions)
+        setArchiveSessions(prev => (sameCronSignature(prev, archiveRows) ? prev : archiveRows))
       }
     } finally {
       // The request id is enough here: a newer refresh owns its own loading

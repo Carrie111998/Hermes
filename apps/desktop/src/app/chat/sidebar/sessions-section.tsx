@@ -52,7 +52,7 @@ interface SidebarSectionHeaderProps {
   collapsible?: boolean
 }
 
-function SidebarSectionHeader({
+export function SidebarSectionHeader({
   label,
   open,
   onToggle,

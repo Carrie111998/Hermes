@@ -1805,6 +1805,11 @@ export interface Translations {
     results: string
     pinned: string
     sessions: string
+    taxonomy: {
+      projects: string
+      archives: string
+      unfiled: string
+    }
     cronJobs: string
     groupAriaGrouped: string
     groupAriaUngrouped: string

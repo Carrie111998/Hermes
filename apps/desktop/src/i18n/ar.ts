@@ -1681,6 +1681,12 @@ export const ar = defineLocale({
     noMatch: query => `لا توجد جلسات تطابق "${query}"`,
     results: 'النتائج',
     pinned: 'المثبتة',
+
+    taxonomy: {
+      projects: 'المشاريع',
+      archives: 'الأرشيف',
+      unfiled: 'غير مصنف'
+    },
     sessions: 'الجلسات',
     cronJobs: 'المهام المجدولة',
     groupAriaGrouped: 'الجلسات مجمعة حسب مساحة العمل',
