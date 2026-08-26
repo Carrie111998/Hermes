@@ -457,18 +457,21 @@ function Get-WindowsArch {
 }
 
 # Derive the real CPU arch now that Get-WindowsArch is defined above.
-# (Must run AFTER the function statement: during a single top-down script
+# (Must run AFTER the function statements: during a single top-down script
 # pass a function is only registered once its definition line executes, so a
 # call placed earlier in the file is a "command not found" that the catch
 # swallows and leaves this empty.)  Stage-Python / Install-Venv use it to
 # prefer native ARM64 Python on Windows-on-ARM, where uv defaults to the
 # emulated x64 build (astral-sh/uv#12906).  Never throws: non-Windows hosts
 # (dev sandboxes, tests) just keep the variable empty.
-$script:WindowsPythonArch = ''
-try { $script:WindowsPythonArch = Get-WindowsArch } catch { }
-if ($script:WindowsPythonArch -eq 'arm64') {
-    Write-Info "Windows-on-ARM detected; preferring native ARM64 Python"
+function Resolve-WindowsPythonArch {
+    $script:WindowsPythonArch = ''
+    try { $script:WindowsPythonArch = Get-WindowsArch } catch { }
+    if ($script:WindowsPythonArch -eq 'arm64') {
+        Write-Info "Windows-on-ARM detected; preferring native ARM64 Python"
+    }
 }
+$script:WindowsPythonArch = ''
 
 # ============================================================================
 
@@ -4918,6 +4921,8 @@ function Main {
 # structured JSON error frame instead of a bare exception.
 
 try {
+    # After all function definitions are registered, so Stage-* can use it.
+    Resolve-WindowsPythonArch
     if ($Ensure -ne "") {
         if ($PSBoundParameters.ContainsKey("Stage")) {
             Write-Err "Cannot use -Ensure and -Stage simultaneously"
