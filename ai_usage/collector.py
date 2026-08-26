@@ -256,6 +256,45 @@ def _flag_duplicate_accounts(providers: list[dict]) -> None:
         row["detail"] = f"same account as {incumbent.get('label')} ({email})"
 
 
+#: Provider modes that spend the deadline on a network fetch. The state.db modes
+#: read a local sqlite file in ~0s, so they neither need a budget nor should they
+#: dilute the fair share computed for the ones that do.
+_BUDGETED_MODES = ("budget", "balance")
+
+
+def _default_warmup() -> None:
+    """Pay the process-wide lazy-httpx cost BEFORE the deadline clock starts.
+
+    ``agent.account_usage`` imports httpx on FIRST USE (commit fea63d0d16, which
+    stopped a module-scope ``import httpx`` from blowing the PT6M ETL). That fix
+    is right, but it relocated the cost rather than removing it: whichever
+    provider ran first paid ``import httpx`` plus the first ``httpx.Client()``
+    -- measured on this box at 13.28s and 4.22s respectively, against ~0.03s for
+    every client after -- and paid it INSIDE ``collect()``'s cooperative budget.
+
+    Since PROVIDERS is ordered, "first" is always ``anthropic``, which is how one
+    provider came to spend 87s of a 90s budget and starve the other seven into
+    ``deadline_exhausted`` (measured 2026-08-25: anthropic 27.97s vs anthropic2
+    1.17s vs openai-codex 0.38s in one process, same code path, same endpoints).
+
+    Doing it here makes the cost a process-startup expense again, billed to no
+    provider. It does NOT make the run shorter -- the same work happens either
+    way, and the task is still bounded by its ExecutionTimeLimit. That is safe
+    because the runner exports HERMES_AI_USAGE_DEADLINE_EPOCH as an ABSOLUTE
+    finish time, so time spent here shrinks the derived deadline by exactly as
+    much and the process still lands inside the ETL.
+
+    Best-effort by construction: warming is an optimisation, and a failure here
+    must never cost a collection that would otherwise have succeeded.
+    """
+    from agent.account_usage import _ensure_httpx
+
+    httpx = _ensure_httpx()
+    # Constructing (and discarding) one client is what materialises the default
+    # SSL context / certifi bundle that every later client then reuses.
+    httpx.Client().close()
+
+
 def collect(
     *,
     db_path: str,
@@ -263,9 +302,17 @@ def collect(
     fetch_usage: Callable[..., object],
     now: Optional[datetime] = None,
     deadline_seconds: Optional[float] = None,
+    warmup: Optional[Callable[[], None]] = None,
     _monotonic: Callable[[], float] = time.monotonic,
 ) -> dict:
     now = now or datetime.now(timezone.utc)
+    # MUST precede `started`: see _default_warmup. Swallowing the exception is
+    # deliberate -- a warm-up is an optimisation and may not cost a collection.
+    if warmup is not None:
+        try:
+            warmup()
+        except Exception:  # noqa: BLE001 - advisory; never fatal to collection
+            pass
     started = _monotonic()
     if deadline_seconds is None:
         deadline_seconds = _derive_deadline_seconds()
@@ -282,10 +329,27 @@ def collect(
 
     providers: list[dict] = []
     attempts: list[dict] = []
+    # Fair-share denominator: how many budgeted providers are still AHEAD of us,
+    # including the current one. Decremented as each is attempted, so time a fast
+    # provider leaves unspent is redistributed to the ones behind it instead of
+    # being hoarded by whoever happens to be next.
+    budgeted_left = sum(1 for _k, _l, m in PROVIDERS if m in _BUDGETED_MODES)
     try:
         for key, label, mode in PROVIDERS:
             attempt_started = _monotonic()
             remaining = max(0.0, deadline - attempt_started)
+            # A single provider may spend at most its equal share of what is
+            # LEFT, never the whole pot. Before this, the budget was simply
+            # `remaining`, so the list order decided who got data: provider #1
+            # could drain all 90s and every provider behind it recorded
+            # deadline_exhausted with a carried-forward, hours-old row.
+            # `remaining` still governs whether we attempt at all; `share` governs
+            # how long the attempt may take.
+            if mode in _BUDGETED_MODES:
+                share = remaining / max(1, budgeted_left)
+                budgeted_left -= 1
+            else:
+                share = remaining
 
             if remaining <= 0:
                 if mode in ("budget", "balance"):
@@ -299,7 +363,7 @@ def collect(
                         _carry_forward(prev, key)
                         or _hermes_error_row(key, label, mode)
                     )
-                attempts.append(_diagnostic(key, "deadline_exhausted", 0.0, remaining))
+                attempts.append(_diagnostic(key, "deadline_exhausted", 0.0, share))
                 continue
 
             if mode in ("budget", "balance"):
@@ -307,7 +371,7 @@ def collect(
                 outcome = "unavailable"
                 try:
                     if accepts_budget:
-                        snapshot = fetch_usage(key, budget_seconds=remaining)
+                        snapshot = fetch_usage(key, budget_seconds=share)
                     else:
                         snapshot = fetch_usage(key)
                 except Exception:
@@ -328,7 +392,7 @@ def collect(
                     row = make(key, label, snapshot)
                     row["source"] = "official"
                 providers.append(row)
-                attempts.append(_diagnostic(key, outcome, finished - attempt_started, remaining))
+                attempts.append(_diagnostic(key, outcome, finished - attempt_started, share))
                 continue
 
             row = _state_db_row(key, label, mode, conn, now, prev)

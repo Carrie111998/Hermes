@@ -117,6 +117,8 @@ class ClaudeVisibilityConfig:
     process_timeout_seconds: int = 120
     discovery_timeout_seconds: int = 30
     float_activity: bool = False
+    archive_idle_chips: bool = False
+    idle_chip_archive_seconds: int = 86_400
 
 
 @dataclass(frozen=True)
@@ -216,6 +218,8 @@ class BridgeConfig:
                 "process_timeout_seconds",
                 "discovery_timeout_seconds",
                 "float_activity",
+                "archive_idle_chips",
+                "idle_chip_archive_seconds",
             }),
             scope="session_bridge.claude_visibility",
         )
@@ -659,6 +663,21 @@ class BridgeConfig:
                     claude_visibility_defaults.float_activity,
                 ),
                 "session_bridge.claude_visibility.float_activity",
+            ),
+            archive_idle_chips=_toml_bool(
+                claude_visibility.get(
+                    "archive_idle_chips",
+                    claude_visibility_defaults.archive_idle_chips,
+                ),
+                "session_bridge.claude_visibility.archive_idle_chips",
+            ),
+            idle_chip_archive_seconds=_toml_int(
+                claude_visibility.get(
+                    "idle_chip_archive_seconds",
+                    claude_visibility_defaults.idle_chip_archive_seconds,
+                ),
+                "session_bridge.claude_visibility.idle_chip_archive_seconds",
+                minimum=3600,
             ),
         )
         if claude_visibility_config.continuous_batch_limit != 1:

@@ -7508,3 +7508,90 @@ class TestSetCronSessionTitle:
         from cron.scheduler import _set_cron_session_title
         assert _set_cron_session_title(None, "sess-1", "X") is None
         assert _set_cron_session_title(MagicMock(), "", "X") is None
+
+
+class TestSuspendAwareTimeouts:
+    """A host suspend must not be billed to the running cron job.
+
+    Regression for 2026-08-25: jobflow-ats-url-resolve was killed with
+    "exceeded wall-clock limit 3600s (elapsed 24269.4s) -- last activity:
+    waiting for non-streaming API response", which reads like a hung API call.
+    It was not: telemetry showed a 6.67h gap across the ENTIRE cron fleet
+    (11:20:06Z -> 18:00:01Z), so every job froze. The watchdog resumed and
+    applied a limit to time the job never had.
+    """
+
+    POLL = 5.0
+
+    # --- suspended_seconds -------------------------------------------------
+
+    def test_normal_poll_is_not_suspend(self):
+        from cron.scheduler import suspended_seconds
+        assert suspended_seconds(5.2, self.POLL) == 0.0
+
+    def test_loaded_host_jitter_is_still_charged_to_the_job(self):
+        """A slow host is the job's problem; only a stopped loop is not."""
+        from cron.scheduler import suspended_seconds
+        assert suspended_seconds(45.0, self.POLL) == 0.0
+
+    def test_threshold_boundary_is_not_suspend(self):
+        from cron.scheduler import suspended_seconds, _CRON_SUSPEND_GAP_SECS
+        assert suspended_seconds(_CRON_SUSPEND_GAP_SECS, self.POLL) == 0.0
+
+    def test_real_suspend_discounts_all_but_one_poll(self):
+        from cron.scheduler import suspended_seconds
+        gap = 6.67 * 3600
+        assert suspended_seconds(gap, self.POLL) == pytest.approx(gap - self.POLL)
+
+    def test_gap_below_poll_interval_never_goes_negative(self):
+        from cron.scheduler import suspended_seconds
+        assert suspended_seconds(1.0, self.POLL) == 0.0
+
+    # --- wallclock_exceeded ------------------------------------------------
+
+    def test_the_2026_08_25_incident_no_longer_kills_the_job(self):
+        """The exact numbers from the incident must NOT trip the limit."""
+        from cron.scheduler import wallclock_exceeded, suspended_seconds
+        suspended = suspended_seconds(6.67 * 3600, self.POLL)
+        assert wallclock_exceeded(24269.4, suspended, 3600.0) is False
+
+    def test_a_genuine_overrun_still_kills(self):
+        """No suspend: the limit must behave exactly as before."""
+        from cron.scheduler import wallclock_exceeded
+        assert wallclock_exceeded(24269.4, 0.0, 3600.0) is True
+        assert wallclock_exceeded(3600.0, 0.0, 3600.0) is True
+        assert wallclock_exceeded(3599.0, 0.0, 3600.0) is False
+
+    def test_active_time_past_the_limit_after_a_suspend_still_kills(self):
+        """A suspend buys time back, it does not grant immunity."""
+        from cron.scheduler import wallclock_exceeded
+        # 10h elapsed, 6h of it suspended -> 4h active against a 1h limit.
+        assert wallclock_exceeded(36000.0, 21600.0, 3600.0) is True
+
+    def test_unlimited_is_preserved(self):
+        from cron.scheduler import wallclock_exceeded
+        assert wallclock_exceeded(1e9, 0.0, None) is False
+
+    # --- inactivity_exceeded -----------------------------------------------
+
+    def test_idle_inflated_purely_by_suspend_does_not_kill(self):
+        from cron.scheduler import inactivity_exceeded
+        assert inactivity_exceeded(24000.0, 24000.0, 600.0) is False
+
+    def test_genuine_idleness_still_kills(self):
+        from cron.scheduler import inactivity_exceeded
+        assert inactivity_exceeded(700.0, 0.0, 600.0) is True
+
+    def test_idle_beyond_the_suspend_still_kills(self):
+        from cron.scheduler import inactivity_exceeded
+        # idle 24000s of which 23000s was suspend -> 1000s real idle > 600s
+        assert inactivity_exceeded(24000.0, 23000.0, 600.0) is True
+
+    def test_inactivity_never_goes_negative(self):
+        from cron.scheduler import inactivity_exceeded
+        assert inactivity_exceeded(10.0, 24000.0, 600.0) is False
+
+    def test_inactivity_unlimited_is_preserved(self):
+        from cron.scheduler import inactivity_exceeded
+        assert inactivity_exceeded(1e9, 0.0, None) is False
+

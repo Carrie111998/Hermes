@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import pytest
+
 import ai_usage.collector as collector_module
 from ai_usage.collector import collect, write_atomic
 
@@ -239,8 +241,12 @@ def test_collect_propagates_remaining_budget_and_reports_sanitized_attempts(tmp_
         "anthropic", "anthropic2", "openai-codex", "kimi", "deepseek",
         "gemini", "xai", "opencode-go",
     ]
-    assert calls[0][1] == 5.0
-    assert calls[1][1] < calls[0][1]
+    # Provider #1 gets an equal SHARE of the pot, not the whole pot. Before the
+    # 2026-08-25 fair-share change this asserted `== 5.0` -- the drain-in-order
+    # contract that let anthropic spend 87s of a 90s budget and starve the other
+    # seven into deadline_exhausted. Eight budgeted providers => 5.0/8.
+    assert calls[0][1] == pytest.approx(5.0 / 8)
+    assert calls[0][1] < 5.0
     diagnostics = data["diagnostics"]
     assert diagnostics["deadline_seconds"] == 5.0
     assert diagnostics["elapsed_ms"] >= 0
@@ -478,3 +484,218 @@ def test_collect_uses_the_derived_deadline_when_none_is_passed(tmp_path, monkeyp
     )
 
     assert data["diagnostics"]["deadline_seconds"] == 12.5
+
+
+# ---------------------------------------------------------------------------
+# Fair-share budget + pre-deadline warm-up (2026-08-25)
+#
+# Root cause these pin: collect() walked PROVIDERS serially against ONE shared
+# budget, so provider #1 could drain it and every provider behind it recorded
+# "deadline_exhausted" and carried a stale row forward. In production anthropic
+# spent 87.1s of 90s -- not because Anthropic is slow (its two GETs measured
+# 1.20s and 0.36s) but because it ran FIRST and paid the process-wide lazy
+# `import httpx` (13.28s) plus the first httpx.Client() SSL build (4.22s).
+# Measured back-to-back in one process: anthropic 27.97s, anthropic2 1.17s,
+# openai-codex 0.38s -- same code path, same endpoints.
+
+
+def _budgeted_provider_count():
+    from ai_usage.contract import PROVIDERS
+    return sum(1 for _k, _l, mode in PROVIDERS if mode in ("budget", "balance"))
+
+
+def test_no_single_provider_may_drain_the_whole_budget(tmp_path):
+    """The regression itself: provider #1 must not be handed the entire pot."""
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    calls = []
+
+    def fetch(provider, *, budget_seconds):
+        calls.append((provider, budget_seconds))
+        return FakeSnap(True, (FakeWin("Current session", 10.0, None),))
+
+    collect(
+        db_path=str(db), prev=None, fetch_usage=fetch, now=NOW,
+        deadline_seconds=90.0, _monotonic=lambda: 0.0,
+    )
+
+    n = _budgeted_provider_count()
+    assert calls[0][0] == "anthropic"
+    assert calls[0][1] == pytest.approx(90.0 / n)
+    # Every provider is reached, and only the LAST one may see the undivided
+    # budget (by then there is nobody left to starve). The clock is frozen here,
+    # so nothing is consumed and each share is remaining/(providers left) --
+    # rising down the list. That rise is the redistribution, not a leak.
+    assert len(calls) == n
+    budgets = [b for _p, b in calls]
+    assert all(b < 90.0 for b in budgets[:-1])
+
+
+def test_a_hog_in_first_position_no_longer_starves_the_rest(tmp_path):
+    """Provider #1 burning far more than its share must not zero out the others.
+
+    Mirrors the production shape: anthropic 87s against a 90s deadline. Under
+    the old drain-in-order budget every later provider got budget 0.0 and
+    outcome deadline_exhausted; here they must still be attempted.
+    """
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    clock = {"t": 0.0}
+    calls = []
+
+    def monotonic():
+        return clock["t"]
+
+    def fetch(provider, *, budget_seconds):
+        calls.append((provider, budget_seconds))
+        # Models the real clamp: _budgeted_timeout() pins the httpx timeout to
+        # budget_seconds, so a slow provider consumes exactly what it was given
+        # and no more. anthropic is the slow one (the cold-start cost); under
+        # the old shared budget it was GIVEN all 90s and therefore ate all 90s.
+        clock["t"] += budget_seconds if provider == "anthropic" else 0.5
+        return FakeSnap(True, (FakeWin("Current session", 10.0, None),))
+
+    data = collect(
+        db_path=str(db), prev=None, fetch_usage=fetch, now=NOW,
+        deadline_seconds=90.0, _monotonic=monotonic,
+    )
+
+    reached = [p for p, _b in calls]
+    assert reached == [
+        "anthropic", "anthropic2", "openai-codex", "kimi", "deepseek",
+        "gemini", "xai", "opencode-go",
+    ]
+    outcomes = {i["key"]: i["outcome"] for i in data["diagnostics"]["providers"]}
+    assert set(outcomes.values()) == {"ok"}
+    assert "deadline_exhausted" not in outcomes.values()
+
+
+def test_unspent_time_is_redistributed_to_later_providers(tmp_path):
+    """A fast provider's leftovers must widen the share of the ones behind it."""
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    calls = []
+
+    def fetch(provider, *, budget_seconds):
+        calls.append((provider, budget_seconds))
+        return FakeSnap(True, (FakeWin("Current session", 10.0, None),))
+
+    collect(
+        db_path=str(db), prev=None, fetch_usage=fetch, now=NOW,
+        deadline_seconds=90.0, _monotonic=lambda: 0.0,  # nobody consumes time
+    )
+
+    n = _budgeted_provider_count()
+    # Clock never advances, so the pot stays full while the divisor shrinks:
+    # share strictly increases down the list rather than being a fixed 90/n.
+    budgets = [b for _p, b in calls]
+    assert budgets[0] == pytest.approx(90.0 / n)
+    assert budgets[-1] == pytest.approx(90.0)
+    assert budgets == sorted(budgets)
+
+
+def test_warmup_runs_before_the_deadline_clock_starts(tmp_path):
+    """The whole point of (a): warm-up time must not come out of any budget."""
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    clock = {"t": 0.0}
+    order = []
+    calls = []
+
+    def monotonic():
+        order.append(("tick", clock["t"]))
+        return clock["t"]
+
+    def warmup():
+        order.append(("warmup", clock["t"]))
+        clock["t"] += 17.0          # import httpx + first Client(), measured
+
+    def fetch(provider, *, budget_seconds):
+        calls.append((provider, budget_seconds))
+        return FakeSnap(True, (FakeWin("Current session", 10.0, None),))
+
+    collect(
+        db_path=str(db), prev=None, fetch_usage=fetch, now=NOW,
+        deadline_seconds=90.0, warmup=warmup, _monotonic=monotonic,
+    )
+
+    # Warm-up happened before the first clock read that anchors the deadline.
+    assert order[0][0] == "warmup"
+    # And it cost the providers nothing: #1 still sees a full equal share.
+    assert calls[0][1] == pytest.approx(90.0 / _budgeted_provider_count())
+
+
+def test_warmup_failure_never_costs_a_collection(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    calls = []
+
+    def warmup():
+        raise RuntimeError("no network at boot")
+
+    def fetch(provider, *, budget_seconds):
+        calls.append(provider)
+        return FakeSnap(True, (FakeWin("Current session", 10.0, None),))
+
+    data = collect(
+        db_path=str(db), prev=None, fetch_usage=fetch, now=NOW,
+        deadline_seconds=90.0, warmup=warmup, _monotonic=lambda: 0.0,
+    )
+
+    assert len(calls) == _budgeted_provider_count()
+    # Collection completed normally despite the warm-up blowing up.
+    outcomes = {i["key"]: i["outcome"] for i in data["diagnostics"]["providers"]}
+    assert set(outcomes.values()) == {"ok"}
+
+
+def test_warmup_is_called_exactly_once(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    hits = []
+
+    collect(
+        db_path=str(db), prev=None,
+        fetch_usage=lambda provider, *, budget_seconds: FakeSnap(True, ()),
+        now=NOW, deadline_seconds=90.0,
+        warmup=lambda: hits.append(1), _monotonic=lambda: 0.0,
+    )
+
+    assert hits == [1]
+
+
+def test_production_entrypoint_wires_the_warmup(monkeypatch, tmp_path):
+    """(a) only works if the real entry point actually passes it."""
+    import ai_usage.__main__ as entry
+
+    seen = {}
+
+    def fake_collect(**kwargs):
+        seen.update(kwargs)
+        return {"generated_at": "x", "providers": []}
+
+    monkeypatch.setattr(entry, "collect", fake_collect)
+    monkeypatch.setattr(entry, "write_atomic", lambda *a, **k: None)
+    monkeypatch.setattr(entry, "_home", lambda: str(tmp_path))
+
+    entry.main()
+
+    assert seen["warmup"] is collector_module._default_warmup
+
+
+def test_default_warmup_materialises_httpx_before_first_use(monkeypatch):
+    """_default_warmup must actually build a client, not merely import."""
+    built = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            built.append("ctor")
+
+        def close(self):
+            built.append("close")
+
+    import agent.account_usage as au
+    monkeypatch.setattr(au, "_ensure_httpx", lambda: type("M", (), {"Client": FakeClient}))
+
+    collector_module._default_warmup()
+
+    assert built == ["ctor", "close"]

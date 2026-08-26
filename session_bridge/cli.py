@@ -77,6 +77,7 @@ from .listener_watchdog import (
 from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
 from .mirror_float import (
     ClaudeMirrorFloatWorker,
+    IdleChipArchiveWorker,
     discover_ccd_registry_roots,
 )
 from .mirror import (
@@ -3588,6 +3589,20 @@ class ProductionBackend:
                 )
                 else None
             )
+            idle_chip_archiver = (
+                IdleChipArchiveWorker(
+                    registry_roots=discover_ccd_registry_roots(),
+                    idle_seconds=float(
+                        effective_config.claude_visibility.idle_chip_archive_seconds
+                    ),
+                )
+                if (
+                    not catalog_only
+                    and effective_config.claude_visibility.enabled
+                    and effective_config.claude_visibility.archive_idle_chips
+                )
+                else None
+            )
             self._coordinator = SessionBridgeCoordinator(
                 config=effective_config,
                 store=self._require_store(),
@@ -3603,6 +3618,7 @@ class ProductionBackend:
                 sidebar_verifier=sidebar_verifier,
                 sidebar_executor=sidebar_executor,
                 mirror_float=mirror_float,
+                idle_chip_archiver=idle_chip_archiver,
             )
             return self._coordinator
         except Exception:

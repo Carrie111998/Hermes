@@ -1624,3 +1624,155 @@ def test_cursor_records_are_frozen():
 
     with pytest.raises(AttributeError):
         setattr(cursor, "offset", 2)
+
+
+def test_parse_orders_messages_by_time_not_file_position(tmp_path):
+    """A reply flushed to the file before its prompt must still project second.
+
+    Claude Code does not guarantee that the user record is written before the
+    assistant records it caused.  Measured 2026-08-25 on a live registration:
+    the prompt carried the EARLIER timestamp but was appended LAST, so the
+    projection put the assistant first and _validate_projection rejected an
+    otherwise perfect registration as a fatal bridge_conflict.
+    """
+
+    project = tmp_path / "C--Users-diego--hermes"
+    project.mkdir()
+    transcript = project / "d8ae024c-57a0-5e7c-9b72-55991ecdd908.jsonl"
+    session = "d8ae024c-57a0-5e7c-9b72-55991ecdd908"
+    records = [
+        {
+            "type": "assistant",
+            "uuid": "4f022a89-0000-4000-8000-000000000001",
+            "parentUuid": "32261ccb-0000-4000-8000-000000000000",
+            "sessionId": session,
+            "timestamp": "2026-08-25T18:17:44.434Z",
+            "cwd": "C:\\Users\\diego\\.hermes",
+            "message": {
+                "id": "msg_shared",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "REGISTERED"}],
+            },
+        },
+        {
+            "type": "system",
+            "entrypoint": "cli",
+            "sessionId": session,
+            "timestamp": "2026-08-25T18:17:44.500Z",
+            "cwd": "C:\\Users\\diego\\.hermes",
+        },
+        {
+            "type": "user",
+            "uuid": "32261ccb-0000-4000-8000-000000000000",
+            "parentUuid": None,
+            "sessionId": session,
+            "timestamp": "2026-08-25T18:17:41.377Z",
+            "cwd": "C:\\Users\\diego\\.hermes",
+            "message": {"role": "user", "content": "the registration prompt"},
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=b"secret")
+    messages = adapter.parse(transcript).projection.messages
+
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert messages[0].content == "the registration prompt"
+    assert messages[1].content == "REGISTERED"
+
+
+def test_parse_keeps_file_order_when_a_timestamp_is_missing(tmp_path):
+    """Never reorder on incomplete evidence.
+
+    An unparseable timestamp projects as 0.0, so sorting on it would hoist that
+    record ahead of everything and place a stray message before the prompt --
+    the same fatal shape this ordering fix exists to prevent.
+    """
+
+    project = tmp_path / "C--Users-diego--hermes"
+    project.mkdir()
+    transcript = project / "aaaaaaaa-0000-4000-8000-00000000000a.jsonl"
+    session = "aaaaaaaa-0000-4000-8000-00000000000a"
+    records = [
+        {
+            "type": "user",
+            "uuid": "11111111-0000-4000-8000-000000000001",
+            "sessionId": session,
+            "timestamp": "2026-08-25T18:17:41.377Z",
+            "cwd": "C:\\Users\\diego\\.hermes",
+            "message": {"role": "user", "content": "first"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "22222222-0000-4000-8000-000000000002",
+            "sessionId": session,
+            "message": {
+                "id": "msg_untimed",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "second"}],
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=b"secret")
+    messages = adapter.parse(transcript).projection.messages
+
+    # The untimed record must stay where the file put it, not jump to index 0.
+    assert [message.content for message in messages] == ["first", "second"]
+
+
+def test_parse_keeps_block_order_within_one_timestamped_record(tmp_path):
+    """Blocks of one record share a timestamp; the stable sort must not shuffle."""
+
+    project = tmp_path / "C--Users-diego--hermes"
+    project.mkdir()
+    transcript = project / "bbbbbbbb-0000-4000-8000-00000000000b.jsonl"
+    session = "bbbbbbbb-0000-4000-8000-00000000000b"
+    records = [
+        {
+            "type": "user",
+            "uuid": "33333333-0000-4000-8000-000000000003",
+            "sessionId": session,
+            "timestamp": "2026-08-25T18:17:41.000Z",
+            "cwd": "C:/Users/diego/.hermes",
+            "message": {"role": "user", "content": "ask"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "44444444-0000-4000-8000-000000000004",
+            "sessionId": session,
+            "timestamp": "2026-08-25T18:17:44.000Z",
+            "cwd": "C:/Users/diego/.hermes",
+            "message": {
+                "id": "msg_blocks",
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "alpha"},
+                    {"type": "text", "text": "beta"},
+                    {"type": "text", "text": "gamma"},
+                ],
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=b"secret")
+    messages = adapter.parse(transcript).projection.messages
+
+    assert [message.content for message in messages] == [
+        "ask",
+        "alpha",
+        "beta",
+        "gamma",
+    ]
+    assert [message.ordinal for message in messages[1:]] == [0, 1, 2]

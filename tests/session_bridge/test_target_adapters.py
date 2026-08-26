@@ -27,6 +27,7 @@ from session_bridge.claude_adapter import (
     PlaceholderCreationError,
     PlaceholderResult,
     classify_claude_process_failure,
+    resolve_claude_command,
 )
 from session_bridge.codex_adapter import (
     CodexSourceAdapter,
@@ -2415,6 +2416,8 @@ def test_claude_target_default_command_cannot_bypass_unsafe_path_shim(
 ) -> None:
     shim = tmp_path / "claude.cmd"
     shim.write_text("invoke arbitrary shell content", encoding="utf-8")
+    # No desktop-shipped CLI either: the resolver must stay fail-closed.
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_ROOT", str(tmp_path / "no-desktop"))
     monkeypatch.setattr(
         shutil,
         "which",
@@ -2427,6 +2430,62 @@ def test_claude_target_default_command_cannot_bypass_unsafe_path_shim(
             marker_secret=SECRET,
             runner=lambda *args, **kwargs: pytest.fail("runner must not execute"),
         )
+
+
+def _desktop_root(tmp_path: Path, *versions: str) -> Path:
+    root = tmp_path / "desktop-claude-code"
+    for version in versions:
+        exe = root / version / "claude.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"")
+    return root
+
+
+@pytest.mark.parametrize("suffix", [".cmd", ".ps1"])
+def test_claude_path_shim_falls_back_to_desktop_shipped_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    # 2026-08-25: the npm global was uninstalled; a bare shim (~/.hermes/bin)
+    # took its place on PATH. The resolver must never execute the shim, but a
+    # shim it cannot see through should fall back to the trusted desktop
+    # install root rather than fail the whole visibility lane.
+    shim = tmp_path / f"claude{suffix}"
+    shim.write_text("invoke arbitrary shell content", encoding="utf-8")
+    root = _desktop_root(tmp_path, "2.1.9", "2.1.237")
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_ROOT", str(root))
+
+    resolved = resolve_claude_command(
+        "claude", which=lambda name: str(shim) if name == "claude" else None
+    )
+
+    # Numeric compare: 2.1.237 beats 2.1.9 despite lexical order.
+    assert resolved == (str((root / "2.1.237" / "claude.exe").resolve()),)
+
+
+def test_claude_unresolvable_name_falls_back_to_desktop_shipped_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _desktop_root(tmp_path, "2.1.237")
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_ROOT", str(root))
+
+    resolved = resolve_claude_command("claude", which=lambda name: None)
+
+    assert resolved == (str((root / "2.1.237" / "claude.exe").resolve()),)
+
+
+def test_claude_explicit_shim_path_never_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An explicitly configured shim is an operator error, not a resolution
+    # miss: surface it instead of silently substituting another binary.
+    shim = tmp_path / "claude.cmd"
+    shim.write_text("invoke arbitrary shell content", encoding="utf-8")
+    monkeypatch.setenv(
+        "HERMES_CLAUDE_CODE_ROOT", str(_desktop_root(tmp_path, "2.1.237"))
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported_shell_shim"):
+        resolve_claude_command([str(shim)])
 
 
 def test_claude_direct_runtime_keeps_provider_metacharacters_literal() -> None:
@@ -5671,10 +5730,12 @@ def test_live_characterization_resolves_recognized_claude_npm_shim_to_node_argv(
 
 @pytest.mark.parametrize("suffix", [".cmd", ".ps1", ".bat"])
 def test_live_characterization_rejects_unrecognized_shell_shims(
-    tmp_path: Path, suffix: str
+    tmp_path: Path, suffix: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     shim = tmp_path / f"claude{suffix}"
     shim.write_text("invoke arbitrary shell content", encoding="utf-8")
+    # Without a desktop-shipped CLI to fall back to, stay fail-closed.
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_ROOT", str(tmp_path / "no-desktop"))
 
     with pytest.raises(RuntimeError, match="unsupported_shell_shim"):
         resolve_cli_executable(

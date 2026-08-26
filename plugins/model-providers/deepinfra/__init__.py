@@ -24,14 +24,40 @@ class _DeepInfraProfile(ProviderProfile):
     def default_vision_model(self):  # type: ignore[override]
         """First vision-capable *chat* model from the live catalog, or None.
 
-        Key-gated so a box without ``DEEPINFRA_API_KEY`` never pays the
+        Key-gated so a box without a DeepInfra credential never pays the
         catalog round-trip. Requires the ``chat`` surface tag (not just the
         ``vision`` capability) so an image-gen/edit model that merely carries
         a ``vision`` tag can't be picked as a chat-completions vision backend.
-        """
-        import os
 
-        if not (os.environ.get("DEEPINFRA_API_KEY") or "").strip():
+        The gate asks the SAME resolver that builds the client
+        (``resolve_api_key_provider_credentials``), not ``os.environ``.
+
+        That matters because ``os.environ`` is **not reliably populated**
+        from where Hermes actually stores credentials (``~/.hermes/.env``
+        and the auth pool). ``.env`` reaches the environment only via an
+        explicit sync in ``hermes_cli.config``, which not every entry point
+        calls -- so the answer depended on WHICH PROCESS asked. Measured
+        2026-08-25 in a plain ``import agent.auxiliary_client``:
+        ``get_env_value("DEEPSEEK_API_KEY")`` truthy,
+        ``os.environ.get("DEEPSEEK_API_KEY")`` None.
+
+        Process-dependent is worse than uniformly broken. The old gate could
+        pass inside a long-lived gateway that had run the sync and fail in
+        ``hermes setup`` moments later, so a correctly-installed DeepInfra
+        key returned None here, the vision chain logged "catalog
+        unreachable", and vision stayed dead while blaming the network --
+        intermittently, which is the hardest shape to diagnose. Asking the
+        credential resolver removes the dependency entirely.
+        """
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+            creds = resolve_api_key_provider_credentials("deepinfra")
+            api_key = str(creds.get("api_key") or "").strip()
+        except Exception:
+            # Never let credential resolution break model discovery; treat an
+            # unresolvable credential as "no key" and skip the round-trip.
+            return None
+        if not api_key:
             return None
         try:
             from hermes_cli.models import _fetch_deepinfra_models_by_tag

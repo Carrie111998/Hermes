@@ -337,6 +337,21 @@ class ClaudeSourceAdapter:
                     projected_by_identity[identity] = message
                     messages.append(message)
 
+        # Claude Code does not guarantee that a user record is written before
+        # the assistant records it caused; measured 2026-08-25, a registration
+        # transcript carried the prompt with the EARLIER timestamp but appended
+        # it LAST.  Consumers read this list as an ordered turn sequence, so
+        # file position is the wrong order to hand them.
+        #
+        # Sort only when every message carries a usable timestamp.  An absent
+        # or unparseable one projects as 0.0, so sorting on it would hoist that
+        # record ahead of the prompt -- the same malformed shape this ordering
+        # exists to prevent.  The sort is stable, so messages sharing a
+        # timestamp -- notably the content blocks of one record, appended in
+        # ordinal order -- keep the order they were projected in.
+        if messages and all(message.timestamp > 0.0 for message in messages):
+            messages.sort(key=lambda message: message.timestamp)
+
         origin_kind, origin_bridge_id = _detect_origin(
             records,
             self._marker_secret,
@@ -736,12 +751,57 @@ def _command_prefix(value: str | Sequence[str], *, label: str) -> tuple[str, ...
     return tuple(normalized)
 
 
+def _desktop_shipped_claude() -> Path | None:
+    """Newest Claude CLI build the Desktop app ships, or None.
+
+    The Desktop app keeps one directory per CLI build under
+    ``%APPDATA%/Claude/claude-code/<version>/claude.exe`` and auto-updates,
+    unlike the (since-uninstalled) npm global. ``HERMES_CLAUDE_CODE_ROOT``
+    overrides the root for tests. Versions compare NUMERICALLY -- a lexical
+    sort ranks ``2.1.9`` above ``2.1.237``.
+    """
+
+    root_override = os.environ.get("HERMES_CLAUDE_CODE_ROOT")
+    if root_override:
+        root = Path(root_override)
+    else:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        root = Path(appdata) / "Claude" / "claude-code"
+    best: tuple[tuple[int, ...], Path] | None = None
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        parts = entry.name.split(".")
+        if not parts or not all(part.isdigit() for part in parts):
+            continue
+        exe = entry / "claude.exe"
+        if not exe.is_file():
+            continue
+        key = tuple(int(part) for part in parts)
+        if best is None or key > best[0]:
+            best = (key, exe)
+    return best[1] if best is not None else None
+
+
 def resolve_claude_command(
     value: str | Sequence[str],
     *,
     which: Callable[[str], str | None] | None = None,
 ) -> tuple[str, ...]:
-    """Return a shell-free Claude argv prefix safe for direct subprocess use."""
+    """Return a shell-free Claude argv prefix safe for direct subprocess use.
+
+    Shell shims are never executed. An EXPLICITLY configured shim path is an
+    operator error and always raises. A shim (or nothing at all) found via
+    PATH lookup is a resolution miss: see through the npm layout when it
+    exists, otherwise fall back to the Desktop-shipped native ``claude.exe``
+    (2026-08-25: the npm global was uninstalled after silently drifting to
+    2.1.216 while the Desktop app ran 2.1.237; a bare shim took its place on
+    PATH and the old resolver could not see through it).
+    """
 
     if not isinstance(value, str):
         command = _command_prefix(value, label="Claude executable")
@@ -750,13 +810,30 @@ def resolve_claude_command(
         return command
 
     normalized = _single_line_required_text(value, label="Claude executable")
+    # A path (any directory separator) is EXPLICIT operator configuration:
+    # never substitute another binary for it. Only a bare command name is a
+    # PATH lookup, where a dead end may fall back to the Desktop-shipped CLI.
+    bare_name = "/" not in normalized and "\\" not in normalized
     find = which or shutil.which
-    resolved = str(find(normalized) or normalized)
+    found = find(normalized)
+    resolved = str(found or normalized)
     candidate = Path(resolved).expanduser()
     suffix = candidate.suffix.casefold()
     if suffix not in {".cmd", ".ps1", ".bat"}:
-        return (str(candidate.resolve()) if candidate.exists() else resolved,)
+        if candidate.exists():
+            return (str(candidate.resolve()),)
+        # PATH lookup found nothing launchable; prefer the Desktop-shipped
+        # CLI over returning a name the spawn will immediately fail on.
+        if bare_name and found is None:
+            desktop = _desktop_shipped_claude()
+            if desktop is not None:
+                return (str(desktop.resolve()),)
+        return (resolved,)
     if candidate.stem.casefold() != "claude" or suffix == ".bat":
+        if bare_name:
+            desktop = _desktop_shipped_claude()
+            if desktop is not None:
+                return (str(desktop.resolve()),)
         raise RuntimeError("unsupported_shell_shim")
 
     npm_root = candidate.parent
@@ -772,6 +849,10 @@ def resolve_claude_command(
         else Path(str(find("node.exe") or find("node") or ""))
     )
     if not cli.is_file() or not resolved_node.is_file():
+        if bare_name:
+            desktop = _desktop_shipped_claude()
+            if desktop is not None:
+                return (str(desktop.resolve()),)
         raise RuntimeError("unsupported_shell_shim")
     return (str(resolved_node.resolve()), str(cli.resolve()))
 
