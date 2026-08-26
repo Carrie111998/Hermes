@@ -373,131 +373,131 @@ export const FREE_INPUT_KEYS = new Set([
 ])
 
 export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
-  model: 'Default Model',
-  modelContextLength: 'Context Window',
-  fallbackProviders: 'Fallback Models',
-  toolsets: 'Enabled Toolsets',
-  timezone: 'Timezone',
+  model: 'Modelo Padrão',
+  modelContextLength: 'Janela de Contexto',
+  fallbackProviders: 'Modelos de Fallback',
+  toolsets: 'Ferramentas Habilitadas',
+  timezone: 'Fuso Horário',
   display: {
-    personality: 'Personality',
-    showReasoning: 'Reasoning Blocks'
+    personality: 'Personalidade',
+    showReasoning: 'Blocos de Raciocínio'
   },
   desktop: {
-    repoScanEnabled: 'Automatic Repository Discovery',
-    repoScanRoots: 'Repository Discovery Roots',
-    repoScanExcludePaths: 'Excluded Repository Paths'
+    repoScanEnabled: 'Descoberta Automática de Repositório',
+    repoScanRoots: 'Raízes de Descoberta',
+    repoScanExcludePaths: 'Caminhos Excluídos'
   },
   agent: {
-    maxTurns: 'Max Agent Steps',
-    imageInputMode: 'Image Attachments',
-    apiMaxRetries: 'API Retries',
-    serviceTier: 'Service Tier',
-    toolUseEnforcement: 'Tool-Use Enforcement'
+    maxTurns: 'Passos Máximos do Agente',
+    imageInputMode: 'Anexos de Imagem',
+    apiMaxRetries: 'Tentativas de API',
+    serviceTier: 'Nível de Serviço',
+    toolUseEnforcement: 'Imposição de Uso de Ferramentas'
   },
   terminal: {
-    cwd: 'Working Directory',
-    backend: 'Execution Backend',
-    timeout: 'Command Timeout',
-    persistentShell: 'Persistent Shell',
-    envPassthrough: 'Environment Passthrough',
-    dockerImage: 'Docker Image',
-    singularityImage: 'Singularity Image',
-    modalImage: 'Modal Image',
-    daytonaImage: 'Daytona Image'
+    cwd: 'Diretório de Trabalho',
+    backend: 'Backend de Execução',
+    timeout: 'Tempo Limite de Comando',
+    persistentShell: 'Shell Persistente',
+    envPassthrough: 'Repasse de Ambiente',
+    dockerImage: 'Imagem Docker',
+    singularityImage: 'Imagem Singularity',
+    modalImage: 'Imagem Modal',
+    daytonaImage: 'Imagem Daytona'
   },
-  fileReadMaxChars: 'File Read Limit',
+  fileReadMaxChars: 'Limite de Leitura de Arquivo',
   toolOutput: {
-    maxBytes: 'Terminal Output Limit',
-    maxLines: 'File Page Limit',
-    maxLineLength: 'Line Length Limit'
+    maxBytes: 'Limite de Saída do Terminal',
+    maxLines: 'Limite de Página de Arquivo',
+    maxLineLength: 'Limite de Tamanho da Linha'
   },
   codeExecution: {
-    mode: 'Code Execution Mode'
+    mode: 'Modo de Execução de Código'
   },
   approvals: {
-    mode: 'Approval Mode',
-    timeout: 'Approval Timeout',
-    mcpReloadConfirm: 'Confirm MCP Reloads'
+    mode: 'Modo de Aprovação',
+    timeout: 'Tempo Limite de Aprovação',
+    mcpReloadConfirm: 'Confirmar Recarregamento de MCP'
   },
-  commandAllowlist: 'Command Allowlist',
+  commandAllowlist: 'Comandos Permitidos',
   security: {
-    redactSecrets: 'Redact Secrets',
-    allowPrivateUrls: 'Allow Private URLs'
+    redactSecrets: 'Ocultar Segredos',
+    allowPrivateUrls: 'Permitir URLs Privadas'
   },
   browser: {
-    allowPrivateUrls: 'Browser Private URLs',
-    autoLocalForPrivateUrls: 'Local Browser For Private URLs'
+    allowPrivateUrls: 'URLs Privadas no Navegador',
+    autoLocalForPrivateUrls: 'Navegador Local para URLs Privadas'
   },
   checkpoints: {
-    enabled: 'File Checkpoints',
-    maxSnapshots: 'Checkpoint Limit'
+    enabled: 'Checkpoints de Arquivos',
+    maxSnapshots: 'Limite de Checkpoints'
   },
   voice: {
-    recordKey: 'Voice Shortcut',
-    maxRecordingSeconds: 'Max Recording Length',
-    autoTts: 'Read Responses Aloud'
+    recordKey: 'Atalho de Voz',
+    maxRecordingSeconds: 'Tempo Máximo de Gravação',
+    autoTts: 'Ler Respostas em Voz Alta'
   },
   stt: {
-    enabled: 'Speech To Text',
-    echoTranscripts: 'Echo Transcripts',
-    provider: 'Speech-To-Text Provider',
+    enabled: 'Voz para Texto (STT)',
+    echoTranscripts: 'Ecoar Transcrições',
+    provider: 'Provedor de STT',
     local: {
-      model: 'Local Transcription Model',
-      language: 'Transcription Language'
+      model: 'Modelo de Transcrição Local',
+      language: 'Idioma de Transcrição'
     },
     openai: {
-      model: 'OpenAI STT Model'
+      model: 'Modelo STT OpenAI'
     },
     groq: {
-      model: 'Groq STT Model'
+      model: 'Modelo STT Groq'
     },
     mistral: {
-      model: 'Mistral STT Model'
+      model: 'Modelo STT Mistral'
     },
     elevenlabs: {
-      modelId: 'ElevenLabs STT Model',
-      languageCode: 'ElevenLabs Language',
-      tagAudioEvents: 'Tag Audio Events',
-      diarize: 'Speaker Diarization'
+      modelId: 'Modelo STT ElevenLabs',
+      languageCode: 'Idioma ElevenLabs',
+      tagAudioEvents: 'Marcar Eventos de Áudio',
+      diarize: 'Diarização de Locutor'
     }
   },
   tts: {
-    provider: 'Text-To-Speech Provider',
+    provider: 'Provedor de Texto para Voz (TTS)',
     edge: {
-      voice: 'Edge Voice'
+      voice: 'Voz Edge'
     },
     openai: {
-      model: 'OpenAI TTS Model',
-      voice: 'OpenAI Voice'
+      model: 'Modelo TTS OpenAI',
+      voice: 'Voz OpenAI'
     },
     elevenlabs: {
-      voiceId: 'ElevenLabs Voice',
-      modelId: 'ElevenLabs Model'
+      voiceId: 'Voz ElevenLabs',
+      modelId: 'Modelo ElevenLabs'
     },
     xai: {
-      voiceId: 'xAI (Grok) Voice',
-      language: 'xAI Language',
-      speed: 'xAI Playback Speed',
-      autoSpeechTags: 'xAI Auto Speech Tags',
-      optimizeStreamingLatency: 'xAI Streaming Latency Optimization',
-      sampleRate: 'xAI Sample Rate',
-      bitRate: 'xAI Bit Rate'
+      voiceId: 'Voz xAI (Grok)',
+      language: 'Idioma xAI',
+      speed: 'Velocidade de Reprodução xAI',
+      autoSpeechTags: 'Tags Automáticas de Fala xAI',
+      optimizeStreamingLatency: 'Otimização de Latência xAI',
+      sampleRate: 'Taxa de Amostragem xAI',
+      bitRate: 'Taxa de Bits xAI'
     },
     minimax: {
-      model: 'MiniMax TTS Model',
-      voiceId: 'MiniMax Voice'
+      model: 'Modelo TTS MiniMax',
+      voiceId: 'Voz MiniMax'
     },
     mistral: {
-      model: 'Mistral TTS Model',
-      voiceId: 'Mistral Voice'
+      model: 'Modelo TTS Mistral',
+      voiceId: 'Voz Mistral'
     },
     gemini: {
-      model: 'Gemini TTS Model',
-      voice: 'Gemini Voice'
+      model: 'Modelo TTS Gemini',
+      voice: 'Voz Gemini'
     },
     neutts: {
-      model: 'NeuTTS Model',
-      device: 'NeuTTS Device'
+      model: 'Modelo NeuTTS',
+      device: 'Dispositivo NeuTTS'
     },
     kittentts: {
       model: 'KittenTTS Model',
@@ -512,20 +512,20 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     }
   },
   memory: {
-    memoryEnabled: 'Persistent Memory',
-    userProfileEnabled: 'User Profile',
-    memoryCharLimit: 'Memory Budget',
-    userCharLimit: 'Profile Budget',
-    provider: 'Memory Provider'
+    memoryEnabled: 'Memória Persistente',
+    userProfileEnabled: 'Perfil do Usuário',
+    memoryCharLimit: 'Orçamento de Memória',
+    userCharLimit: 'Orçamento do Perfil',
+    provider: 'Provedor de Memória'
   },
   context: {
-    engine: 'Context Engine'
+    engine: 'Motor de Contexto'
   },
   compression: {
-    enabled: 'Auto-Compression',
-    threshold: 'Compression Threshold',
-    targetRatio: 'Compression Target',
-    protectLastN: 'Protected Recent Messages'
+    enabled: 'Compressão Automática',
+    threshold: 'Limite para Compressão',
+    targetRatio: 'Alvo da Compressão',
+    protectLastN: 'Mensagens Recentes Protegidas'
   },
   delegation: {
     model: 'Subagent Model',
@@ -545,51 +545,51 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   modelContextLength: "Leave at 0 to use the selected model's detected context window.",
   fallbackProviders: 'Backup provider:model entries to try if the default model fails.',
   display: {
-    personality: 'Default assistant style for new sessions.',
-    showReasoning: 'Show reasoning sections when the backend provides them.'
+    personality: 'Estilo padrão do assistente para novas sessões.',
+    showReasoning: 'Mostra seções de raciocínio quando o backend as fornecer.'
   },
   desktop: {
-    repoScanEnabled: 'Scan local folders for Git repositories to show in Projects.',
-    repoScanRoots: 'Folders to scan. Leave empty to scan your home directory.',
-    repoScanExcludePaths: 'Folders and their descendants to skip during repository discovery.'
+    repoScanEnabled: 'Verifica pastas locais por repositórios Git para mostrar em Projetos.',
+    repoScanRoots: 'Pastas para verificar. Deixe em branco para verificar a pasta do usuário.',
+    repoScanExcludePaths: 'Pastas ignoradas durante a descoberta de repositórios.'
   },
-  timezone: 'IANA timezone identifier. Blank uses the system timezone.',
+  timezone: 'Identificador de fuso horário IANA. Vazio usa o do sistema.',
   agent: {
     imageInputMode: 'Controls how image attachments are sent to the model.',
     maxTurns: 'Upper bound for tool-calling turns before Hermes stops a run.'
   },
   terminal: {
-    cwd: 'Default project folder for tool and terminal work.',
-    persistentShell: 'Keep shell state between commands when the backend supports it.',
-    envPassthrough: 'Environment variables to pass into tool execution.',
+    cwd: 'Pasta padrão do projeto para ferramentas e terminal.',
+    persistentShell: 'Mantém o estado do shell entre os comandos, quando suportado.',
+    envPassthrough: 'Variáveis de ambiente repassadas para a execução de ferramentas.',
     dockerImage: 'Container image used when the execution backend is Docker.',
     singularityImage: 'Image used when the execution backend is Singularity.',
     modalImage: 'Image used when the execution backend is Modal.',
     daytonaImage: 'Image used when the execution backend is Daytona.'
   },
   codeExecution: {
-    mode: 'How strictly code execution is scoped to the current project.'
+    mode: 'Quão restrita a execução de código é ao projeto atual.'
   },
-  fileReadMaxChars: 'Maximum characters Hermes can read from one file request.',
+  fileReadMaxChars: 'Máximo de caracteres que o Hermes pode ler em uma solicitação de arquivo.',
   approvals: {
-    mode: 'How Hermes handles commands that need explicit approval.',
-    timeout: 'How long approval prompts wait before timing out.'
+    mode: 'Como o Hermes lida com comandos que precisam de aprovação explícita.',
+    timeout: 'Quanto tempo o aviso aguarda antes de expirar.'
   },
   security: {
-    redactSecrets: 'Hide detected secrets from model-visible content when possible.'
+    redactSecrets: 'Oculta segredos detectados do conteúdo visível para o modelo, quando possível.'
   },
   checkpoints: {
-    enabled: 'Create rollback snapshots before file edits.'
+    enabled: 'Cria snapshots para reversão antes de edições em arquivos.'
   },
   memory: {
-    memoryEnabled: 'Save durable memories that can help future sessions.',
-    userProfileEnabled: 'Maintain a compact profile of user preferences.'
+    memoryEnabled: 'Salva memórias duráveis que ajudam em sessões futuras.',
+    userProfileEnabled: 'Mantém um perfil compacto com as preferências do usuário.'
   },
   context: {
-    engine: 'Strategy for managing long conversations near the context limit.'
+    engine: 'Estratégia para conversas longas perto do limite de contexto.'
   },
   compression: {
-    enabled: 'Summarize older context when conversations get large.'
+    enabled: 'Resume contexto antigo quando a conversa cresce.'
   },
   voice: {
     autoTts: 'Automatically speak assistant responses.'

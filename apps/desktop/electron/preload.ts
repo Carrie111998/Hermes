@@ -7,8 +7,14 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 // and takes the ENTIRE bridge down with it (window.hermesDesktop undefined =>
 // "Desktop IPC bridge is unavailable"). No reply means no glass, which degrades
 // to an ordinary opaque window rather than a page thinned over nothing.
-const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
+let translucencySupport
+try {
+  translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
+} catch (e) {
+  alert('preload crash: ' + e)
+}
 
+try {
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
@@ -483,3 +489,6 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:open-find-bar', listener)
   }
 })
+} catch (e) {
+  alert('expose crash: ' + e)
+}
