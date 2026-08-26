@@ -1122,7 +1122,7 @@ agent:
 # =============================================================================
 # System-prompt prelude (operator system-prompt override, per model)
 # =============================================================================
-# Inject one or more verbatim Markdown files as the FIRST system content, ahead
+# Inject one or more Markdown files as the FIRST system content, ahead
 # of Hermes' own identity/tools/memory layers, resolved per model via a glob
 # map. This is the same idea coding-agent CLIs expose via --system-prompt-file /
 # --append-system-prompt-file: hand a model a full, model-appropriate operating

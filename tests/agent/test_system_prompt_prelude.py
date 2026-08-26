@@ -228,6 +228,21 @@ def test_default_base_dir_is_profile_aware_hermes_home(tmp_path, monkeypatch):
     assert resolve_prelude("anthropic/claude-opus-4-6").text == "FROM_HOME"
 
 
+def test_default_base_dir_delegates_platform_and_profile_resolution(
+    tmp_path, monkeypatch
+):
+    """The prelude resolver must not reconstruct platform or profile paths."""
+    import hermes_constants
+    from agent.system_prompt_prelude import _default_base_dir
+
+    resolved_home = tmp_path / "LocalAppData" / "hermes" / "profiles" / "work"
+    monkeypatch.setattr(
+        hermes_constants, "get_hermes_home", lambda: resolved_home
+    )
+
+    assert _default_base_dir() == str(resolved_home / "system-prompts")
+
+
 def test_empty_model_returns_empty(tmp_path, monkeypatch):
     base = _make_env(tmp_path, monkeypatch, [{"match": "*", "files": ["g.md"]}])
     _write(base, "g.md", "X")
@@ -243,6 +258,47 @@ def test_no_config_returns_empty(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_PRELUDE_CONFIG", raising=False)
     with open(str(home / "config.yaml"), "w", encoding="utf-8") as fh:
         fh.write("model: \"\"\n")
+    assert resolve_prelude("anthropic/claude-opus-4-6").text == ""
+
+
+def test_config_defaults_are_disabled_and_empty():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["system_prompt_prelude"] == {
+        "enabled": False,
+        "base_dir": "",
+        "first_match": True,
+        "rules": [],
+    }
+
+
+def test_nonsecret_environment_override_is_ignored(tmp_path, monkeypatch):
+    """Prelude behavior comes only from config.yaml, not an environment path."""
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "system_prompt_prelude:\n  enabled: false\n", encoding="utf-8"
+    )
+
+    alternate = tmp_path / "alternate.yaml"
+    (tmp_path / "injected.md").write_text("ENV_OVERRIDE", encoding="utf-8")
+    import yaml
+
+    alternate.write_text(
+        yaml.safe_dump(
+            {
+                "system_prompt_prelude": {
+                    "enabled": True,
+                    "base_dir": str(tmp_path),
+                    "rules": [{"match": "*", "files": ["injected.md"]}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_PRELUDE_CONFIG", str(alternate))
+
     assert resolve_prelude("anthropic/claude-opus-4-6").text == ""
 
 

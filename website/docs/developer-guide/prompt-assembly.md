@@ -21,6 +21,8 @@ This is one of the most important design choices in the project because it affec
 Primary files:
 
 - `run_agent.py`
+- `agent/system_prompt.py`
+- `agent/system_prompt_prelude.py`
 - `agent/prompt_builder.py`
 - `tools/memory_tool.py`
 
@@ -29,14 +31,14 @@ Primary files:
 The cached system prompt is assembled as ordered tiers (see `agent/system_prompt.py`):
 
 0. **prelude** (optional, off by default), operator-supplied leading system content resolved per model via the `system_prompt_prelude` config glob map. When configured it is injected as the VERY FIRST system content, ahead of the tiers below, so a model can be handed a full model-appropriate operating prompt before Hermes' own layers. Empty when disabled or no rule matches. It is stable for the life of the conversation (re-resolved only when the cached prompt is rebuilt), so it is part of the cacheable static prefix and does not threaten prompt caching. See `cli-config.yaml.example`.
-1. **stable**, identity (`SOUL.md` or fallback), tool/model guidance, skills prompt, environment hints, platform hints
+1. **stable**, identity (`SOUL.md` or fallback), tool/model guidance, environment hints, platform hints
 2. **context**, caller-supplied `system_message` plus project context files (`.hermes.md` / `AGENTS.md` / `CLAUDE.md` / `.cursorrules`)
-3. **volatile**, built-in memory snapshot (`MEMORY.md`), user profile snapshot (`USER.md`), external memory-provider block, timestamp/session/model/provider line
+3. **volatile**, skills index, built-in memory snapshot (`MEMORY.md`), user profile snapshot (`USER.md`), external memory-provider block, timestamp/session/model/provider line
 
 The final system prompt is then joined as: `prelude` → `stable` → `context` → `volatile` (the `prelude` and `stable` tiers form the cacheable static prefix).
 
 This ordering matters for precedence discussions:
-- skills are part of the **stable** tier
+- skills are part of the **volatile** tier
 - memory/profile snapshots are part of the **volatile** tier
 - both are still in the cached system prompt (they are not injected as ad-hoc mid-turn overlays)
 

@@ -19,7 +19,8 @@ others) expose, generalized to:
 Design invariants (verified against agent/system_prompt.py):
   * The resolved prelude is prepended as a new ``prelude`` tier, joined ahead of
     ``stable``, so it is the leading system content but Hermes' layers remain.
-  * Files are read VERBATIM (utf-8), with no templating or trimming.
+  * Files are read as UTF-8 with no templating. Leading and trailing blank
+    space is normalized when the configured blocks are assembled.
   * Resolution is keyed on the runtime ``agent.model``. Because the system
     prompt is rebuilt whenever the cached prompt is invalidated (model switch
     via switch_model, context compression, new session), a model switch

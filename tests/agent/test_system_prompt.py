@@ -566,7 +566,6 @@ class TestSystemPromptPreludeAssembly:
     def _build(self, agent):
         with (
             patch("run_agent.load_soul_md", return_value=""),
-            patch("run_agent.build_nous_subscription_prompt", return_value=""),
             patch("run_agent.build_environment_hints", return_value=""),
             patch("run_agent.build_context_files_prompt", return_value="context"),
         ):
@@ -591,6 +590,26 @@ class TestSystemPromptPreludeAssembly:
         assert static.startswith("OPERATOR_PRELUDE")
         assert prompt.startswith(static)
 
+    def test_static_prefix_is_byte_stable_across_equivalent_builds(
+        self, tmp_path, monkeypatch
+    ):
+        self._setup_home(
+            tmp_path,
+            monkeypatch,
+            [{"match": "anthropic/*", "files": ["op.md"]}],
+            base_files={"op.md": "OPERATOR_PRELUDE"},
+        )
+        first = _make_agent(model="claude-opus-4-6", provider="anthropic")
+        second = _make_agent(model="claude-opus-4-6", provider="anthropic")
+
+        self._build(first)
+        self._build(second)
+
+        assert first._cached_system_prompt_static == second._cached_system_prompt_static
+        assert first._cached_system_prompt_static.encode() == (
+            second._cached_system_prompt_static.encode()
+        )
+
     def test_no_prelude_leaves_static_prefix_unchanged(self, tmp_path, monkeypatch):
         # No matching rule -> empty prelude -> prompt is byte-identical to the
         # no-prelude build and the static prefix carries no prelude text.
@@ -604,4 +623,4 @@ class TestSystemPromptPreludeAssembly:
         assert "OPERATOR_PRELUDE" not in prompt
         assert agent._cached_system_prompt_static
         assert "OPERATOR_PRELUDE" not in agent._cached_system_prompt_static
-
+        assert agent._cached_system_prompt_static == _prompt_parts(agent)["stable"]

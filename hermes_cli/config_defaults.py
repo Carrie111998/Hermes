@@ -988,7 +988,7 @@ DEFAULT_CONFIG = {
     },
 
     # Per-model system-prompt prelude (operator-supplied leading system content).
-    # Disabled by default. When enabled, one or more verbatim Markdown files are
+    # Disabled by default. When enabled, one or more Markdown files are
     # injected as the FIRST system content (ahead of Hermes' own stable/context/
     # volatile tiers), resolved per model via a glob map, so an operator can hand
     # a model a full model-appropriate operating prompt. Fully fail-soft: any
