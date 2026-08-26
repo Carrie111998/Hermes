@@ -1,4 +1,5 @@
 import { App } from '@capacitor/app'
+import { Preferences } from '@capacitor/preferences'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
@@ -8,12 +9,14 @@ import { useEffect, useRef, useState } from 'react'
 import DesktopController from '@/app'
 
 import { verifyTokenGateway, type ProbeResult } from '~bridge/auth'
+import { requestInitialMobilePermissions } from '~bridge/native'
 import { $reauthNonce, loadTarget, setTarget, setTransientTarget, type GatewayTarget } from '~bridge/state'
 
 import { ConnectScreen } from '~mobile/connect/ConnectScreen'
 import { LoginScreen } from '~mobile/connect/LoginScreen'
 import { TokenScreen } from '~mobile/connect/TokenScreen'
 import { MobileBehaviors } from '~mobile/mobile-behaviors'
+import { INITIAL_MOBILE_CAPABILITIES_KEY, shouldRequestInitialMobileCapabilities } from '~mobile/initial-capabilities'
 import { mobileBackDestination } from '~mobile/navigation'
 import { initNativeChrome } from '~mobile/native-init'
 
@@ -22,7 +25,7 @@ type View = 'loading' | 'connect' | 'login' | 'token' | 'connected'
 export function MobileRoot() {
   const [view, setView] = useState<View>('loading')
   const [probe, setProbe] = useState<ProbeResult | null>(null)
-  const initialNotificationRequest = useRef(false)
+  const initialCapabilityRequest = useRef(false)
   const reauthNonce = useStore($reauthNonce)
 
   // Boot: configure native chrome (status bar), then restore a saved gateway
@@ -65,15 +68,30 @@ export function MobileRoot() {
     if (reauthNonce > 0 && probe) setView(probe.authMode === 'token' ? 'token' : 'login')
   }, [reauthNonce, probe])
 
-  // Steven explicitly wants notification permission offered on first successful
-  // mobile connection, rather than burying the basic alert path in Settings.
-  // This requests ONLY notifications — microphone and camera remain tied to the
-  // explicit actions that use them — and never re-prompts during this app run.
+  // Steven explicitly requested first-connection capability onboarding. The
+  // non-secret marker prevents repeated permission prompts after this first
+  // chance; Android itself remains the decision-maker for every grant.
   useEffect(() => {
-    if (view !== 'connected' || initialNotificationRequest.current) return
+    if (view !== 'connected' || initialCapabilityRequest.current) return
 
-    initialNotificationRequest.current = true
-    void window.hermesDesktop?.requestNotificationPermission?.()
+    initialCapabilityRequest.current = true
+    void (async () => {
+      try {
+        const marker = await Preferences.get({ key: INITIAL_MOBILE_CAPABILITIES_KEY })
+        if (!shouldRequestInitialMobileCapabilities(marker.value)) return
+      } catch {
+        // A failed non-secret marker must not stop the explicitly requested
+        // first-connection prompts. The in-memory ref still prevents duplicates.
+      }
+
+      await requestInitialMobilePermissions()
+      try {
+        await Preferences.set({ key: INITIAL_MOBILE_CAPABILITIES_KEY, value: 'requested' })
+      } catch {
+        // Marker persistence is convenience only; native permission state stays
+        // authoritative even if this write fails.
+      }
+    })()
   }, [view])
 
   async function onProbeResult(p: ProbeResult) {

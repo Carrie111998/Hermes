@@ -54,8 +54,14 @@
          permission footprint minimal. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" tools:node="remove" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" tools:node="remove" />
-    <!-- Camera is requested only after the user taps Capture photo. Photos/files
-         otherwise use Android's system picker and URI grants, not broad storage. -->
+    <!-- Steven explicitly requested first-connection media onboarding. Android 13+
+         grants visual media (photos/videos) separately; older Android releases use
+         the legacy read grant. This is still not MANAGE_EXTERNAL_STORAGE. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Camera is requested as part of the user-approved first-connection
+         capability flow and is then used only after Capture photo is tapped. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Voice input (getUserMedia in the WebView). Capacitor's WebChromeClient
          requests the runtime grant when the chat starts a voice session. -->
@@ -65,4 +71,7 @@
          gateway WebSocket alive under Wi-Fi power-save. Without this the lock
          throws (silently, via the catch) and the stability fix never engages. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Opens Android's own first-connection battery-optimization decision.
+         It improves resume reliability but does not create a hidden service. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 </manifest>
