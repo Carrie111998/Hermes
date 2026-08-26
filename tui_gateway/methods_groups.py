@@ -61,6 +61,22 @@ def get_hosted_room_service():
     return _service
 
 
+def _profile_name() -> str:
+    return (os.getenv("HERMES_PROFILE") or "default").strip() or "default"
+
+
+def _api_server_key() -> str:
+    try:
+        from agent.secret_scope import get_secret
+
+        scoped = (get_secret("API_SERVER_KEY", "") or "").strip()
+        if scoped:
+            return scoped
+    except Exception:
+        pass
+    return (os.getenv("API_SERVER_KEY") or "").strip()
+
+
 @method("groups.capabilities")
 def _(rid, params: dict) -> dict:
     """Describe the hosted-room protocol implemented by this gateway."""
@@ -72,13 +88,41 @@ def _(rid, params: dict) -> dict:
 
     service = get_hosted_room_service()
     driver_ready = bool(service and service.runtime.status()["running"])
+    try:
+        from gateway.hosted_room_peer import (
+            derive_room_grant_secret,
+            local_catalog_mapping,
+        )
+
+        derive_room_grant_secret(_api_server_key())
+        catalog = local_catalog_mapping(
+            installation_id=local_authority_gateway_id(),
+            protocol_versions=(1,),
+            link_modes=("direct", "pull"),
+            text=True,
+            attachments=False,
+        )
+        room_link = {
+            "enabled": True,
+            "profile": _profile_name(),
+            "catalog": catalog,
+            "endpoint": catalog["endpoint"],
+        }
+    except Exception:
+        room_link = {
+            "enabled": False,
+            "reason": "gateway_api_key_required",
+        }
     return _ok(
         rid,
         {
             "protocol_version": PROTOCOL_VERSION,
             "driver": driver_ready,
-            "persistent_process": os.getenv("HERMES_DESKTOP") != "1",
+            "persistent_process": bool(
+                room_link.get("catalog", {}).get("persistent_process", False)
+            ),
             "authority_gateway_id": local_authority_gateway_id(),
+            "room_link": room_link,
             "features": [
                 "authority_epoch",
                 "coordinator_fencing",
@@ -98,10 +142,140 @@ def _(rid, params: dict) -> dict:
                 "groups.log",
                 "groups.disband",
                 "groups.stop",
+                "groups.peer.invite",
+                "groups.peer.register",
             ],
             "max_log_limit": MAX_LOG_LIMIT,
         },
     )
+
+
+@method("groups.peer.invite")
+def _(rid, params: dict) -> dict:
+    """Mint one target-issued room/profile grant for a prospective home."""
+    try:
+        from gateway.hosted_room_peer import (
+            derive_room_grant_secret,
+            issue_room_grant,
+            local_catalog_mapping,
+        )
+        from gateway.hosted_rooms import local_authority_gateway_id
+
+        installation_id = local_authority_gateway_id()
+        profile = _profile_name()
+        ttl = float(params.get("ttl_seconds", 3600))
+        if not 60 <= ttl <= 24 * 60 * 60:
+            raise ValueError("ttl_seconds must be between 60 and 86400")
+        token = issue_room_grant(
+            derive_room_grant_secret(_api_server_key()),
+            grant_id=str(params.get("grant_id") or f"grant-{os.urandom(16).hex()}"),
+            room_id=str(params.get("room_id") or ""),
+            home_install_id=str(params.get("home_install_id") or ""),
+            target_install_id=installation_id,
+            target_profile=profile,
+            ttl_seconds=ttl,
+        )
+        catalog = local_catalog_mapping(
+            installation_id=installation_id,
+            protocol_versions=(1,),
+            link_modes=("direct", "pull"),
+            text=True,
+            attachments=False,
+        )
+        return _ok(
+            rid,
+            {
+                "grant": token,
+                "target_profile": profile,
+                "catalog": catalog,
+                "endpoint": catalog["endpoint"],
+            },
+        )
+    except Exception as exc:
+        return _err(rid, 4120, str(exc))
+
+
+@method("groups.peer.register")
+def _(rid, params: dict) -> dict:
+    """Register and probe one scoped target route on the room home."""
+    service = get_hosted_room_service()
+    if service is None:
+        return _err(rid, 4121, "hosted room driver is unavailable")
+    try:
+        from gateway.hosted_room_peer import (
+            GatewayRoomCatalog,
+            validate_room_link_url,
+        )
+        from gateway.hosted_rooms import local_authority_gateway_id
+        from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient
+        from tui_gateway.hosted_room_peer_transport import PeerMemberRoute
+
+        target_url, transport_security = validate_room_link_url(
+            params.get("target_url")
+        )
+        catalog = GatewayRoomCatalog.from_mapping(params.get("catalog"))
+        if 1 not in catalog.protocol_versions:
+            raise ValueError("target does not support RoomLink protocol v1")
+        if "direct" not in catalog.link_modes:
+            raise ValueError("target does not support a direct RoomLink")
+        target_profile = str(params.get("target_profile") or "")
+        grant = str(params.get("grant") or "")
+        client = PeerRunsHTTPClient(
+            base_url=target_url,
+            api_key="",
+            receipt_db_path=service.db_path,
+        )
+        probe = client.probe(grant=grant)
+        live_catalog = GatewayRoomCatalog.from_mapping(probe.get("catalog"))
+        if live_catalog != catalog:
+            raise ValueError("target capability catalog changed during setup")
+        if (
+            1 not in live_catalog.protocol_versions
+            or "direct" not in live_catalog.link_modes
+        ):
+            raise ValueError("target RoomLink capability is incompatible")
+        room_id = str(params.get("room_id") or "")
+        home_install_id = local_authority_gateway_id()
+        if (
+            probe.get("room_id") != room_id
+            or probe.get("home_install_id") != home_install_id
+            or probe.get("target_profile") != target_profile
+        ):
+            raise ValueError("room grant scope does not match this route")
+        member_id = str(params.get("member_id") or "")
+        route = PeerMemberRoute(
+            home_install_id=home_install_id,
+            member_id=member_id,
+            target_install_id=catalog.installation_id,
+            target_profile=target_profile,
+            capability_digest=catalog.catalog_digest,
+            cancellation_scope_id=str(
+                params.get("cancellation_scope_id")
+                or f"cancel-{params.get('room_id') or ''}"
+            ),
+            trace_id=str(params.get("trace_id") or f"trace-{os.urandom(16).hex()}"),
+            grant=grant,
+        )
+        service.register_peer_route(
+            room_id=room_id,
+            member_id=member_id,
+            route=route,
+            client=client,
+            target_url=target_url,
+            catalog=catalog,
+        )
+        return _ok(
+            rid,
+            {
+                "registered": True,
+                "mode": "direct",
+                "transport_security": transport_security,
+                "target_install_id": catalog.installation_id,
+                "target_profile": target_profile,
+            },
+        )
+    except Exception as exc:
+        return _err(rid, 5120, str(exc))
 
 
 @method("groups.list")
@@ -245,6 +419,7 @@ def _(rid, params: dict) -> dict:
                 str(params.get("room_id") or ""),
                 cancel_id=str(params.get("cancel_id") or "room-disbanded"),
             )
+            service.revoke_room_routes(str(params.get("room_id") or ""))
         tombstone = disband_room(
             default_db_path(),
             room_id=params.get("room_id"),

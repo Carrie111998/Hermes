@@ -46,7 +46,10 @@ TASK_STATUSES = frozenset({
 TERMINAL_STATUSES = frozenset({"settled", "failed", "cancelled"})
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
-_TASK_PAYLOAD_FIELDS = frozenset({"target_profile", "prompt", "source_event_seq"})
+_TASK_PAYLOAD_REQUIRED_FIELDS = frozenset(
+    {"target_profile", "prompt", "source_event_seq"}
+)
+_TASK_PAYLOAD_OPTIONAL_FIELDS = frozenset({"target_member_id"})
 _LEASE_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -208,8 +211,12 @@ def _authority_epoch(value: Any) -> int:
 def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
     if not isinstance(value, dict):
         raise DriverValidationError("payload must be an object")
-    unknown = set(value) - _TASK_PAYLOAD_FIELDS
-    missing = _TASK_PAYLOAD_FIELDS - set(value)
+    unknown = (
+        set(value)
+        - _TASK_PAYLOAD_REQUIRED_FIELDS
+        - _TASK_PAYLOAD_OPTIONAL_FIELDS
+    )
+    missing = _TASK_PAYLOAD_REQUIRED_FIELDS - set(value)
     if unknown:
         raise DriverValidationError(
             f"unknown payload fields: {', '.join(sorted(unknown))}"
@@ -240,6 +247,10 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
         "prompt": prompt,
         "source_event_seq": source_event_seq,
     }
+    if "target_member_id" in value:
+        normalized["target_member_id"] = _identifier(
+            value["target_member_id"], label="target_member_id"
+        )
     encoded = json.dumps(
         normalized,
         ensure_ascii=True,

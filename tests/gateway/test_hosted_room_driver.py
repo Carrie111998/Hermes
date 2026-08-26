@@ -36,12 +36,16 @@ def _payload(
     target_profile: str = "ops",
     prompt: str = "Inspect the release candidate.",
     source_event_seq: int = 1,
+    target_member_id: str | None = None,
 ):
-    return {
+    payload = {
         "target_profile": target_profile,
         "prompt": prompt,
         "source_event_seq": source_event_seq,
     }
+    if target_member_id is not None:
+        payload["target_member_id"] = target_member_id
+    return payload
 
 
 @pytest.fixture
@@ -847,6 +851,20 @@ def test_payload_digest_is_verified_on_read(db):
 
     with pytest.raises(driver.TaskConflictError, match="integrity"):
         driver.get_task(db, identity)
+
+
+def test_optional_target_member_id_is_durable_and_digest_bound(db):
+    identity = _identity()
+    _admit(
+        db,
+        identity,
+        FakeClock(),
+        payload=_payload(target_member_id="member-remote"),
+    )
+
+    assert driver.get_task(db, identity)["payload"]["target_member_id"] == (
+        "member-remote"
+    )
 
 
 @pytest.mark.parametrize(

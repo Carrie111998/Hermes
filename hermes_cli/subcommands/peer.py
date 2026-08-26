@@ -226,6 +226,21 @@ def _message_from_args(args) -> str:
     return message
 
 
+def _peer_run_durability(base: str, key: str) -> bool | None:
+    """Return durable support, or None when an older peer cannot advertise it."""
+    try:
+        capabilities = _request(f"{base}/v1/capabilities", key)
+    except Exception:
+        return None
+    features = capabilities.get("features")
+    if not isinstance(features, dict):
+        return None
+    contract = features.get("runs_idempotency")
+    if not isinstance(contract, dict) or not contract.get("supported"):
+        return None
+    return bool(contract.get("durable"))
+
+
 def cmd_peer(args) -> int:
     action = getattr(args, "peer_action", None)
 
@@ -344,6 +359,14 @@ def cmd_peer(args) -> int:
                 )
                 return 2
             try:
+                durability = _peer_run_durability(base, key)
+                if durability is not True:
+                    print(
+                        "Warning: this peer does not advertise restart-durable "
+                        "run replay; keep the run ID and avoid blind retries "
+                        "after a gateway restart.",
+                        file=sys.stderr,
+                    )
                 session_id = _ensure_bot_chat(base, key)
                 result = _request(
                     f"{base}/v1/runs",

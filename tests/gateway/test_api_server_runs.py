@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -74,6 +74,22 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_post(
+        "/v1/room-members/invitations",
+        adapter._handle_room_member_invitation,
+    )
+    app.router.add_get(
+        "/v1/room-members/capabilities",
+        adapter._handle_room_member_capabilities,
+    )
+    app.router.add_post(
+        "/v1/room-members/grants/refresh",
+        adapter._handle_room_member_grant_refresh,
+    )
+    app.router.add_post(
+        "/v1/room-members/grants/revoke",
+        adapter._handle_room_member_grant_revoke,
+    )
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -826,6 +842,62 @@ def _use_idempotency_db(adapter, path):
 
 class TestRunIdempotency:
     @pytest.mark.asyncio
+    async def test_invalid_body_does_not_consume_idempotency_key(
+        self, adapter, tmp_path
+    ):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"Idempotency-Key": "valid-after-rejection"}
+            rejected = await cli.post(
+                "/v1/runs", json={"input": ""}, headers=headers
+            )
+            with patch.object(adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                accepted = await cli.post(
+                    "/v1/runs", json={"input": "valid"}, headers=headers
+                )
+        assert rejected.status == 400
+        assert accepted.status == 202
+
+    @pytest.mark.asyncio
+    async def test_capacity_rejection_does_not_reserve_key(
+        self, adapter, tmp_path
+    ):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        with patch.object(
+            adapter,
+            "_concurrency_limited_response",
+            side_effect=[
+                web.json_response({"error": "full"}, status=429),
+                None,
+            ],
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                headers = {"Idempotency-Key": "capacity-retry"}
+                rejected = await cli.post(
+                    "/v1/runs", json={"input": "valid"}, headers=headers
+                )
+                with patch.object(adapter, "_create_agent") as create:
+                    agent = MagicMock()
+                    agent.run_conversation.return_value = {"final_response": "done"}
+                    agent.session_prompt_tokens = agent.session_completion_tokens = (
+                        agent.session_total_tokens
+                    ) = 0
+                    create.return_value = agent
+                    accepted = await cli.post(
+                        "/v1/runs", json={"input": "valid"}, headers=headers
+                    )
+        assert rejected.status == 429
+        assert accepted.status == 202
+
+    @pytest.mark.asyncio
     async def test_sequential_duplicate_reuses_original(self, adapter, tmp_path):
         _use_idempotency_db(adapter, tmp_path / "idem.db")
         app = _create_runs_app(adapter)
@@ -1145,3 +1217,382 @@ class TestRunIdempotency:
         assert "run_old" not in adapter._run_statuses
         assert "run_old" not in adapter._run_idempotency_ids
         assert "run_old" not in adapter._run_owners
+
+    @pytest.mark.asyncio
+    async def test_no_session_id_does_not_load_session_history(
+        self, adapter, tmp_path
+    ):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        history = AsyncMock(return_value=[])
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    new=history,
+                ),
+                patch.object(adapter, "_create_agent") as create,
+            ):
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                response = await cli.post(
+                    "/v1/runs", json={"input": "no stored session"}
+                )
+        assert response.status == 202
+        history.assert_not_awaited()
+
+
+class TestHostedRoomRuns:
+    @pytest.mark.asyncio
+    async def test_invitation_uses_validated_app_managed_local_catalog(
+        self, auth_adapter, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv(
+            "HERMES_ROOM_LINK_URL", "https://peer.example.test/hermes"
+        )
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            invitation = await cli.post(
+                "/v1/room-members/invitations",
+                json={
+                    "room_id": "room-1",
+                    "home_install_id": "install-home",
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            body = await invitation.json()
+        assert invitation.status == 201
+        assert body["catalog"]["persistent_process"] is False
+        assert body["catalog"]["link_modes"] == ["direct"]
+        assert body["catalog"]["endpoint"] == {
+            "available": True,
+            "url": "https://peer.example.test/hermes",
+            "transport_security": "tls",
+        }
+
+    @pytest.mark.asyncio
+    async def test_scoped_grant_refresh_survives_dispatch_expiry_but_not_horizon(
+        self, auth_adapter, monkeypatch
+    ):
+        from gateway.hosted_room_peer import decode_room_grant, issue_room_grant
+        from gateway.hosted_rooms import local_authority_gateway_id
+
+        old_grant = issue_room_grant(
+            auth_adapter._room_grant_secret(),
+            grant_id="grant-old",
+            room_id="room-1",
+            home_install_id="install-home",
+            target_install_id=local_authority_gateway_id(),
+            target_profile="default",
+            issued_at=100,
+            ttl_seconds=10,
+            status_expires_at=1000,
+        )
+        monkeypatch.setattr("gateway.platforms.api_server.time.time", lambda: 200)
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            refreshed = await cli.post(
+                "/v1/room-members/grants/refresh",
+                json={"ttl_seconds": 300},
+                headers={"Authorization": f"HermesRoom {old_grant}"},
+            )
+            body = await refreshed.json()
+        assert refreshed.status == 200
+        assert body["grant"] != old_grant
+        claims = decode_room_grant(
+            auth_adapter._room_grant_secret(),
+            body["grant"],
+            permission="dispatch",
+            now=200,
+        )
+        assert claims["room_id"] == "room-1"
+        assert claims["home_install_id"] == "install-home"
+        assert claims["status_expires_at"] == 1000
+
+        fully_expired = issue_room_grant(
+            auth_adapter._room_grant_secret(),
+            grant_id="grant-expired",
+            room_id="room-1",
+            home_install_id="install-home",
+            target_install_id=local_authority_gateway_id(),
+            target_profile="default",
+            issued_at=100,
+            ttl_seconds=10,
+            status_expires_at=150,
+        )
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            denied = await cli.post(
+                "/v1/room-members/grants/refresh",
+                json={},
+                headers={"Authorization": f"HermesRoom {fully_expired}"},
+            )
+            denied_body = await denied.json()
+        assert denied.status == 401
+        assert denied_body["error"]["code"] == "invalid_room_grant"
+
+    @pytest.mark.asyncio
+    async def test_scoped_grant_refresh_fails_after_secret_rotation(
+        self, auth_adapter, monkeypatch
+    ):
+        from gateway.hosted_room_peer import issue_room_grant
+        from gateway.hosted_rooms import local_authority_gateway_id
+
+        monkeypatch.setattr("gateway.platforms.api_server.time.time", lambda: 200)
+        revoked = issue_room_grant(
+            b"x" * 32,
+            grant_id="grant-revoked",
+            room_id="room-1",
+            home_install_id="install-home",
+            target_install_id=local_authority_gateway_id(),
+            target_profile="default",
+            issued_at=100,
+            ttl_seconds=300,
+            status_expires_at=1000,
+        )
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            denied = await cli.post(
+                "/v1/room-members/grants/refresh",
+                json={},
+                headers={"Authorization": f"HermesRoom {revoked}"},
+            )
+            denied_body = await denied.json()
+        assert denied.status == 401
+        assert denied_body["error"]["code"] == "invalid_room_grant"
+
+    @pytest.mark.asyncio
+    async def test_scoped_grant_revoke_is_idempotent_and_fences_prior_lineage(
+        self, auth_adapter, monkeypatch
+    ):
+        from gateway.hosted_room_peer import issue_room_grant
+        from gateway.hosted_rooms import local_authority_gateway_id
+
+        for target in (
+            "gateway.platforms.api_server.time.time",
+            "gateway.hosted_room_peer.time.time",
+            "gateway.hosted_rooms.time.time",
+        ):
+            monkeypatch.setattr(target, lambda: 200)
+        claims = {
+            "room_id": "room-1",
+            "home_install_id": "install-home",
+            "target_install_id": local_authority_gateway_id(),
+            "target_profile": "default",
+        }
+        old_grant = issue_room_grant(
+            auth_adapter._room_grant_secret(),
+            grant_id="grant-old",
+            **claims,
+            issued_at=100,
+            ttl_seconds=300,
+            status_expires_at=1000,
+        )
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/v1/room-members/grants/revoke",
+                json={},
+                headers={"Authorization": f"HermesRoom {old_grant}"},
+            )
+            repeated = await cli.post(
+                "/v1/room-members/grants/revoke",
+                json={},
+                headers={"Authorization": f"HermesRoom {old_grant}"},
+            )
+            denied = await cli.get(
+                "/v1/room-members/capabilities",
+                headers={"Authorization": f"HermesRoom {old_grant}"},
+            )
+            future_grant = issue_room_grant(
+                auth_adapter._room_grant_secret(),
+                grant_id="grant-repaired",
+                **claims,
+                issued_at=201,
+                ttl_seconds=300,
+                status_expires_at=1000,
+            )
+            repaired = await cli.get(
+                "/v1/room-members/capabilities",
+                headers={"Authorization": f"HermesRoom {future_grant}"},
+            )
+        assert first.status == repeated.status == 200
+        assert denied.status == 401
+        assert repaired.status == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "suffix"),
+        [("GET", ""), ("POST", "/stop")],
+    )
+    async def test_room_grant_cannot_access_ownerless_compat_run(
+        self, auth_adapter, tmp_path, method, suffix
+    ):
+        adapter = auth_adapter
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            invitation = await cli.post(
+                "/v1/room-members/invitations",
+                json={
+                    "room_id": "room-1",
+                    "home_install_id": "install-home",
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            grant = (await invitation.json())["grant"]
+            adapter._run_statuses["run_ownerless"] = {
+                "run_id": "run_ownerless",
+                "status": "running",
+            }
+            response = await cli.request(
+                method,
+                f"/v1/runs/run_ownerless{suffix}",
+                json={} if method == "POST" else None,
+                headers={"Authorization": f"HermesRoom {grant}"},
+            )
+        assert response.status == 404
+
+    @pytest.mark.asyncio
+    async def test_scoped_grant_admits_group_session_run_without_peer_api_key(
+        self, auth_adapter, tmp_path
+    ):
+        from gateway import hosted_rooms
+
+        adapter = auth_adapter
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            invitation = await cli.post(
+                "/v1/room-members/invitations",
+                json={
+                    "grant_id": "grant-room-1",
+                    "room_id": "room-1",
+                    "home_install_id": "install-home",
+                    "ttl_seconds": 3600,
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            invitation_body = await invitation.json()
+            assert invitation.status == 201
+            grant = invitation_body["grant"]
+            catalog = invitation_body["catalog"]
+            probe = await cli.get(
+                "/v1/room-members/capabilities",
+                headers={"Authorization": f"HermesRoom {grant}"},
+            )
+            probe_body = await probe.json()
+            assert probe.status == 200
+            assert probe_body["catalog"] == catalog
+            prompt = "Review this room message."
+            dispatch = {
+                "protocol_version": 1,
+                "room_id": "room-1",
+                "home_install_id": "install-home",
+                "authority_gateway_id": "gateway-home",
+                "authority_epoch": 1,
+                "member_id": "member-reviewer",
+                "target_install_id": catalog["installation_id"],
+                "target_profile": "default",
+                "task_id": "task-room-1",
+                "execution_generation": 1,
+                "source_event_seq": 1,
+                "cancellation_scope_id": "cancel-room-1",
+                "prompt": prompt,
+                "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                "capability_digest": catalog["catalog_digest"],
+                "trace_id": "trace-room-1",
+            }
+            with patch.object(adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {
+                    "final_response": "Scoped room reply."
+                }
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                started = await cli.post(
+                    "/v1/runs",
+                    json={"input": prompt, "hosted_room_dispatch": dispatch},
+                    headers={
+                        "Authorization": f"HermesRoom {grant}",
+                        "Idempotency-Key": "room:task-room-1:1",
+                    },
+                )
+                started_body = await started.json()
+                assert started.status == 202
+                run_id = started_body["run_id"]
+                for _ in range(40):
+                    status = await cli.get(
+                        f"/v1/runs/{run_id}",
+                        headers={"Authorization": f"HermesRoom {grant}"},
+                    )
+                    status_body = await status.json()
+                    if status_body.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+            assert status.status == 200
+            assert status_body["output"] == "Scoped room reply."
+            session_id = status_body["session_id"]
+            db = await adapter._ensure_session_db_async()
+            row = db.get_session(session_id)
+            assert row["source"] == "bot_room"
+            assert row["title"] == "Group: room-1"
+            assert catalog["installation_id"] == (
+                hosted_rooms.local_authority_gateway_id()
+            )
+
+    @pytest.mark.asyncio
+    async def test_scoped_grant_rejects_capability_and_target_tampering(
+        self, auth_adapter, tmp_path
+    ):
+        adapter = auth_adapter
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            invitation = await cli.post(
+                "/v1/room-members/invitations",
+                json={
+                    "room_id": "room-1",
+                    "home_install_id": "install-home",
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            invitation_body = await invitation.json()
+            prompt = "Review."
+            dispatch = {
+                "protocol_version": 1,
+                "room_id": "room-1",
+                "home_install_id": "install-home",
+                "authority_gateway_id": "gateway-home",
+                "authority_epoch": 1,
+                "member_id": "member-reviewer",
+                "target_install_id": invitation_body["catalog"]["installation_id"],
+                "target_profile": "default",
+                "task_id": "task-room-1",
+                "execution_generation": 1,
+                "source_event_seq": 1,
+                "cancellation_scope_id": "cancel-room-1",
+                "prompt": prompt,
+                "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                "capability_digest": "f" * 64,
+                "trace_id": "trace-room-1",
+            }
+            with patch.object(adapter, "_create_agent") as create:
+                rejected = await cli.post(
+                    "/v1/runs",
+                    json={"input": prompt, "hosted_room_dispatch": dispatch},
+                    headers={
+                        "Authorization": f"HermesRoom {invitation_body['grant']}",
+                        "Idempotency-Key": "room:task-room-1:1",
+                    },
+                )
+            assert rejected.status == 403
+            create.assert_not_called()

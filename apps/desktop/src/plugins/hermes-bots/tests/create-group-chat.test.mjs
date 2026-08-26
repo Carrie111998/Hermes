@@ -40,3 +40,23 @@ test('source contract: every selected machine is persisted in the durable room r
   assert.match(pluginSource, /room\.members = roomMembers/)
   assert.doesNotMatch(pluginSource, /const remoteMembers = selected/)
 })
+
+test('source contract: creation negotiates continuity without exposing routing jargon', () => {
+  assert.match(pluginSource, /resolveAutonomousRoomPlan\(selected/)
+  assert.match(pluginSource, /describeAutonomousRoomPlan\(plan/)
+  assert.match(pluginSource, /setKeepRunning\(copy\.defaultEnabled && keepRunningPreference\.current !== 'off'\)/)
+  assert.match(pluginSource, /withHostedRoomProbeTimeout\(Promise\.all/)
+  assert.match(pluginSource, /disabled: !canCreate \|\| createPending \|\| hostProbePending/)
+  assert.match(pluginSource, /jsxs\('details'/)
+  assert.match(pluginSource, /'Advanced'/)
+  assert.match(pluginSource, /'groups\.peer\.invite'/)
+  assert.match(pluginSource, /'groups\.peer\.register'/)
+  assert.match(pluginSource, /Checking room continuity/)
+  assert.doesNotMatch(pluginSource, /children: 'RoomLink'/)
+  assert.doesNotMatch(pluginSource, /children: 'Peer transport'/)
+})
+
+test('source contract: an admitted autonomous room must roll back before any Desktop fallback', () => {
+  assert.match(pluginSource, /cancel_id: `rollback-\$\{roomId\}`/)
+  assert.doesNotMatch(pluginSource, /Room created\. Keep Desktop open until its gateways are ready\./)
+})

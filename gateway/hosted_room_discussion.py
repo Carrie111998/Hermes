@@ -54,7 +54,13 @@ _TURN_ID_RE = re.compile(
     r"m(?P<member>[0-9a-f]{24})$"
 )
 
-_MEMBER_FIELDS = frozenset({"member_id", "profile", "handle", "display_name"})
+_MEMBER_FIELDS = frozenset(
+    {"member_id", "profile", "handle", "display_name", "target"}
+)
+_LOCAL_TARGET_FIELDS = frozenset({"kind", "profile"})
+_PEER_TARGET_FIELDS = frozenset(
+    {"kind", "peer_id", "installation_id", "profile", "capability_digest"}
+)
 _REMOTE_MEMBER_FIELDS = frozenset({
     "connectionId",
     "connectionKind",
@@ -123,12 +129,13 @@ class DiscussionReconstructionError(DiscussionPolicyError):
 
 @dataclass(frozen=True)
 class DiscussionMember:
-    """One immutable member local to the room's authority gateway."""
+    """One immutable local or peer member of the hosted room."""
 
     member_id: str
     profile: str
     handle: str
     display_name: str = ""
+    target: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -447,6 +454,74 @@ def validate_user_payload(
     return normalized
 
 
+def _validate_member_target(
+    value: Any,
+    *,
+    profile: str,
+    known_profiles: set[str],
+    index: int,
+) -> dict[str, Any]:
+    if value is None:
+        if profile not in known_profiles:
+            raise DiscussionValidationError(
+                f"member {index} profile '{profile}' is not local to this gateway"
+            )
+        return {"kind": "local", "profile": profile}
+    if not isinstance(value, Mapping):
+        raise DiscussionValidationError(f"member {index} target must be an object")
+    kind = value.get("kind")
+    if kind == "local":
+        target = _exact_fields(
+            value,
+            label=f"member {index} local target",
+            required=_LOCAL_TARGET_FIELDS,
+        )
+        target_profile = _identifier(
+            target["profile"], label=f"member {index} target profile"
+        )
+        if target_profile != profile or profile not in known_profiles:
+            raise DiscussionValidationError(
+                f"member {index} local target does not match a local profile"
+            )
+        return {"kind": "local", "profile": profile}
+    if kind == "peer":
+        target = _exact_fields(
+            value,
+            label=f"member {index} peer target",
+            required=_PEER_TARGET_FIELDS,
+        )
+        target_profile = _identifier(
+            target["profile"], label=f"member {index} target profile"
+        )
+        if target_profile != profile:
+            raise DiscussionValidationError(
+                f"member {index} peer target profile does not match member profile"
+            )
+        capability_digest = target["capability_digest"]
+        if (
+            not isinstance(capability_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", capability_digest)
+        ):
+            raise DiscussionValidationError(
+                f"member {index} capability_digest must be a sha256 digest"
+            )
+        return {
+            "kind": "peer",
+            "peer_id": _identifier(
+                target["peer_id"], label=f"member {index} peer_id"
+            ),
+            "installation_id": _identifier(
+                target["installation_id"],
+                label=f"member {index} installation_id",
+            ),
+            "profile": target_profile,
+            "capability_digest": capability_digest,
+        }
+    raise DiscussionValidationError(
+        f"member {index} target kind must be local or peer"
+    )
+
+
 def validate_roster(
     value: Any,
     *,
@@ -466,7 +541,7 @@ def validate_roster(
         _identifier(profile, label="local profile") for profile in local_profiles
     }
     members: list[DiscussionMember] = []
-    profiles: set[str] = set()
+    targets: set[str] = set()
     handles: set[str] = set()
     member_ids: set[str] = set()
 
@@ -483,15 +558,17 @@ def validate_roster(
             raw,
             label=f"member {index}",
             required=frozenset({"member_id", "profile", "handle"}),
-            optional=frozenset({"display_name"}),
+            optional=frozenset({"display_name", "target"}),
         )
         member_id = _identifier(member["member_id"], label=f"member {index} id")
         profile = _identifier(member["profile"], label=f"member {index} profile")
         handle = _identifier(member["handle"], label=f"member {index} handle")
-        if profile not in known_profiles:
-            raise DiscussionValidationError(
-                f"member {index} profile '{profile}' is not local to this gateway"
-            )
+        target = _validate_member_target(
+            member.get("target"),
+            profile=profile,
+            known_profiles=known_profiles,
+            index=index,
+        )
         display_name = member.get("display_name", "")
         if not isinstance(display_name, str):
             raise DiscussionValidationError(
@@ -501,18 +578,24 @@ def validate_roster(
         if len(display_name) > hosted_rooms.MAX_ACTOR_LABEL_CHARS:
             raise DiscussionValidationError(f"member {index} display_name is too long")
 
-        profile_key = profile.casefold()
+        target_key = json.dumps(
+            target,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).casefold()
         handle_key = handle.casefold()
         member_key = member_id.casefold()
-        if profile_key in profiles:
-            raise DiscussionValidationError("member profiles must be unique")
+        if target_key in targets:
+            if target.get("kind") == "local":
+                raise DiscussionValidationError("member profiles must be unique")
+            raise DiscussionValidationError("member targets must be unique")
         if handle_key in handles or handle_key in {"all", "everyone"}:
             raise DiscussionValidationError(
                 "member handles must be unique and cannot reserve @all or @everyone"
             )
         if member_key in member_ids:
             raise DiscussionValidationError("member ids must be unique")
-        profiles.add(profile_key)
+        targets.add(target_key)
         handles.add(handle_key)
         member_ids.add(member_key)
         members.append(
@@ -521,6 +604,7 @@ def validate_roster(
                 profile=profile,
                 handle=handle,
                 display_name=display_name,
+                target=target,
             )
         )
     return tuple(members)
@@ -727,11 +811,14 @@ def _validate_member_message(
     if not isinstance(text, str) or not text.strip() or is_pass_text(text):
         raise DiscussionValidationError("message.member text must be a non-pass string")
     member = _member_by_id(room, payload.get("member_id"))
+    expected_connection = None
+    if member.target and member.target.get("kind") == "peer":
+        expected_connection = member.target.get("peer_id")
     if (
         actor.get("kind") != "member"
         or actor.get("id") != member.member_id
         or actor.get("profile") != member.profile
-        or actor.get("connection_id") is not None
+        or actor.get("connection_id") != expected_connection
     ):
         raise DiscussionValidationError("message.member actor does not match roster")
 
@@ -862,7 +949,14 @@ def _derive_member_watermarks(
 
 
 def _member_digest(member: DiscussionMember) -> str:
-    seed = f"{member.member_id}\0{member.profile}\0{member.handle}"
+    target = json.dumps(
+        member.target or {"kind": "local", "profile": member.profile},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    seed = (
+        f"{member.member_id}\0{member.profile}\0{member.handle}\0{target}"
+    )
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
@@ -1029,6 +1123,7 @@ def _make_task_plan(
         turn_id=turn_id,
     )
     payload = {
+        "target_member_id": member.member_id,
         "target_profile": member.profile,
         "prompt": prompt,
         "source_event_seq": discussion_event.seq,
@@ -1216,11 +1311,14 @@ def reconstruct_task_plan(
         raise DiscussionReconstructionError(
             "driver task has no valid identity or payload"
         )
-    if frozenset(payload) != frozenset({
+    required_payload = frozenset({
         "target_profile",
         "prompt",
         "source_event_seq",
-    }):
+    })
+    if not required_payload <= frozenset(payload) or (
+        frozenset(payload) - required_payload - {"target_member_id"}
+    ):
         raise DiscussionReconstructionError("driver task payload shape changed")
     match = _TURN_ID_RE.fullmatch(identity.turn_id)
     if match is None:
@@ -1249,9 +1347,21 @@ def reconstruct_task_plan(
             "task identity does not match its room thread"
         )
     profile = payload.get("target_profile")
+    target_member_id = payload.get("target_member_id")
     member = next(
-        (candidate for candidate in room.members if candidate.profile == profile), None
+        (
+            candidate
+            for candidate in room.members
+            if (
+                candidate.member_id == target_member_id
+                if target_member_id is not None
+                else candidate.profile == profile
+            )
+        ),
+        None,
     )
+    if member is not None and member.profile != profile:
+        member = None
     if member is None or _member_digest(member) != match.group("member"):
         raise DiscussionReconstructionError("task target member does not match turn_id")
     prompt = payload.get("prompt")
@@ -1345,6 +1455,8 @@ def plan_publication(
                 "id": task.member.member_id,
                 "profile": task.member.profile,
             }
+            if task.member.target and task.member.target.get("kind") == "peer":
+                member_actor["connection_id"] = task.member.target["peer_id"]
             if task.member.display_name:
                 member_actor["display_name"] = task.member.display_name
             effects.append(

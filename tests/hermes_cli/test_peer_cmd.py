@@ -106,6 +106,18 @@ class _FakePeer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).auth_seen.append(self.headers.get("Authorization", ""))
+        if self.path == "/v1/capabilities":
+            return self._json(
+                {
+                    "features": {
+                        "runs_idempotency": {
+                            "supported": True,
+                            "durable": True,
+                            "retention_seconds": 86400,
+                        }
+                    }
+                }
+            )
         if self.path == "/v1/runs/run_1":
             return self._json({
                 "object": "hermes.run",

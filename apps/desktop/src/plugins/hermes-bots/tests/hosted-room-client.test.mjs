@@ -11,6 +11,8 @@ import {
   reduceHostedRoomEvents,
   reduceHostedRoomOutbox,
   replayHostedRoomPages,
+  resolveAutonomousRoomPlan,
+  describeAutonomousRoomPlan,
   resolveSingleGatewayRoute
 } from '../hosted-room-client.js'
 
@@ -70,6 +72,7 @@ test('capability classification distinguishes old, disabled, transient, and driv
     connectionId: 'local-a',
     authorityId: null,
     persistentProcess: null,
+    roomLink: null,
     limits: HOSTED_ROOM_CLIENT_LIMITATIONS
   })
 
@@ -91,6 +94,19 @@ test('capability classification distinguishes old, disabled, transient, and driv
         persistent_process: true,
         authority_gateway_id: 'install:stable-home',
         max_log_limit: 250,
+        room_link: {
+          enabled: true,
+          profile: 'default',
+          catalog: {
+            installation_id: 'install:stable-home',
+            protocol_versions: [1],
+            link_modes: ['direct', 'pull'],
+            persistent_process: true,
+            text: true,
+            attachments: false,
+            catalog_digest: 'a'.repeat(64)
+          }
+        },
         features: ['typed_events', 'attachments', 'automatic_failover']
       }
     },
@@ -102,10 +118,12 @@ test('capability classification distinguishes old, disabled, transient, and driv
   assert.equal(capable.connectionId, 'machine-local-7')
   assert.equal(capable.persistentProcess, true)
   assert.equal(capable.maxLogLimit, 250)
+  assert.equal(capable.roomLink.enabled, true)
+  assert.equal(capable.roomLink.catalog.installationId, 'install:stable-home')
   assert.deepEqual(capable.limits, {
     attachments: false,
     automaticFailover: false,
-    crossGatewayMembers: false,
+    crossGatewayMembers: true,
     stagedAttachmentManifest: true
   })
 
@@ -164,6 +182,115 @@ test('single-gateway route resolution accepts 2-6 co-located bots and rejects mi
       { activeConnectionId: 'active-local' }
     ).reason,
     'unresolved-member-route'
+  )
+})
+
+test('autonomous room planning chooses a persistent home and verified remote catalogs', () => {
+  const members = [
+    { name: 'local', connectionId: 'home', sourceScoped: true },
+    { name: 'reviewer', connectionId: 'peer', sourceScoped: true }
+  ]
+  const home = classifyHostedRoomCapability({
+    driver: true,
+    persistent_process: true,
+    authority_gateway_id: 'install:home',
+    room_link: {
+      enabled: true,
+      profile: 'default',
+      catalog: {
+        installation_id: 'install:home',
+        protocol_versions: [1],
+        link_modes: ['direct'],
+        persistent_process: true,
+        text: true,
+        attachments: false,
+        catalog_digest: 'a'.repeat(64)
+      }
+    }
+  })
+  const peer = classifyHostedRoomCapability({
+    driver: true,
+    persistent_process: true,
+    authority_gateway_id: 'install:peer',
+    room_link: {
+      enabled: true,
+      profile: 'default',
+      catalog: {
+        installation_id: 'install:peer',
+        protocol_versions: [1],
+        link_modes: ['direct', 'pull'],
+        persistent_process: true,
+        text: true,
+        attachments: false,
+        catalog_digest: 'b'.repeat(64)
+      },
+      endpoint: {
+        available: true,
+        url: 'https://peer.example.test',
+        transport_security: 'tls'
+      }
+    }
+  })
+  const plan = resolveAutonomousRoomPlan(members, {
+    activeConnectionId: 'home',
+    capabilities: { home, peer }
+  })
+  assert.equal(plan.kind, 'multi-gateway')
+  assert.equal(plan.homeConnectionId, 'home')
+  assert.deepEqual(plan.remoteConnectionIds, ['peer'])
+
+  const unavailable = resolveAutonomousRoomPlan(members, {
+    activeConnectionId: 'home',
+    capabilities: { home, peer: { ...peer, roomLink: { enabled: false } } }
+  })
+  assert.equal(unavailable.kind, 'unsupported')
+  assert.equal(unavailable.reason, 'remote-needs-setup')
+
+  const noAddress = resolveAutonomousRoomPlan(members, {
+    activeConnectionId: 'home',
+    capabilities: {
+      home,
+      peer: { ...peer, roomLink: { ...peer.roomLink, endpoint: null } }
+    }
+  })
+  assert.equal(noAddress.reason, 'remote-needs-address')
+
+  const oldHome = resolveAutonomousRoomPlan(members, {
+    activeConnectionId: 'home',
+    capabilities: { home: { ...home, roomLink: null }, peer }
+  })
+  assert.equal(oldHome.homeConnectionId, 'peer')
+  assert.equal(oldHome.reason, 'remote-needs-setup')
+
+  const incompatible = resolveAutonomousRoomPlan(members, {
+    activeConnectionId: 'home',
+    capabilities: {
+      home,
+      peer: {
+        ...peer,
+        roomLink: {
+          ...peer.roomLink,
+          catalog: {
+            ...peer.roomLink.catalog,
+            protocolVersions: [99],
+            linkModes: ['desktop']
+          }
+        }
+      }
+    }
+  })
+  assert.equal(incompatible.reason, 'remote-needs-setup')
+
+  assert.deepEqual(describeAutonomousRoomPlan(plan, { homeLabel: 'Home lab' }), {
+    defaultEnabled: true,
+    level: 'distributed',
+    title: 'Continues when Desktop is closed',
+    description: 'Bots keep working together across gateways. Home lab coordinates this room.'
+  })
+  assert.equal(describeAutonomousRoomPlan(noAddress).level, 'desktop')
+  assert.equal(
+    describeAutonomousRoomPlan(noAddress, { unavailableLabel: 'Workshop' }).description,
+    'Workshop needs setup before this room can continue on its own.'
   )
 })
 

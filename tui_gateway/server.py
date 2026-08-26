@@ -17097,6 +17097,8 @@ from . import (  # noqa: E402
 # service accessor here so methods_groups handlers resolve the lifecycle-owned
 # singleton rather than starting one from an RPC call.
 get_hosted_room_service = _methods_groups.get_hosted_room_service
+_profile_name = _methods_groups._profile_name
+_api_server_key = _methods_groups._api_server_key
 
 for _m in (
     _methods_browser_control,

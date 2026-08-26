@@ -23,6 +23,13 @@ test('source contract: settings dialog edits name and picture after creation', (
   assert.match(pluginSource, /Group settings — rename \$\{group\} or set a room picture/)
 })
 
+test('source contract: settings explain the active background-work level', () => {
+  assert.match(pluginSource, /children: 'Background work'/)
+  assert.match(pluginSource, /Continues when Desktop is closed/)
+  assert.match(pluginSource, /Keep Desktop open while this room is working/)
+  assert.doesNotMatch(pluginSource, /children: 'RoomLink'/)
+})
+
 test('source contract: rename re-keys the room AND local memberships, keeps sessions', () => {
   // The room record moves wholesale under the new key (sessions included, so
   // members keep resuming their per-group sessions by stored sid).

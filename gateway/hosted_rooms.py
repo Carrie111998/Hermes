@@ -19,7 +19,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 
 PROTOCOL_VERSION = 2
@@ -57,6 +57,36 @@ _EVENT_SCHEMA_COLUMNS = frozenset({
     "authority_epoch",
     "payload_json",
     "created_at",
+})
+_LINK_SCHEMA_COLUMNS = frozenset({
+    "room_id",
+    "member_id",
+    "target_url",
+    "target_profile",
+    "grant",
+    "catalog_json",
+    "cancellation_scope_id",
+    "trace_id",
+    "transport_security",
+    "status",
+    "updated_at",
+})
+_REMOTE_RUN_SCHEMA_COLUMNS = frozenset({
+    "room_id",
+    "member_id",
+    "task_id",
+    "execution_generation",
+    "target_install_id",
+    "target_profile",
+    "run_id",
+    "session_id",
+    "created_at",
+    "updated_at",
+})
+_REVOKED_GRANT_SCHEMA_COLUMNS = frozenset({
+    "scope_key",
+    "expires_at",
+    "revoked_before",
 })
 
 _EVENT_KINDS_BY_ACTOR = {
@@ -273,6 +303,44 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id)
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_links (
+            room_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            target_profile TEXT NOT NULL,
+            grant TEXT NOT NULL,
+            catalog_json TEXT NOT NULL,
+            cancellation_scope_id TEXT NOT NULL,
+            trace_id TEXT NOT NULL,
+            transport_security TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ready',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (room_id, member_id)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_remote_runs (
+            room_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            execution_generation INTEGER NOT NULL CHECK (execution_generation >= 1),
+            target_install_id TEXT NOT NULL,
+            target_profile TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (task_id, execution_generation)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_revoked_grants (
+            scope_key TEXT PRIMARY KEY,
+            expires_at REAL NOT NULL,
+            revoked_before REAL NOT NULL
+        )"""
+    )
     room_columns = {row[1] for row in conn.execute("PRAGMA table_info(hosted_rooms)")}
     if "authority_gateway_id" not in room_columns:
         conn.execute(
@@ -321,15 +389,300 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     event_columns = frozenset(
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_events)")
     )
+    link_columns = frozenset(
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_links)")
+    )
+    remote_run_columns = frozenset(
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_remote_runs)")
+    )
+    revoked_grant_columns = frozenset(
+        row[1]
+        for row in conn.execute("PRAGMA table_info(hosted_room_revoked_grants)")
+    )
     if not _ROOM_SCHEMA_COLUMNS.issubset(room_columns):
         return False
     if not _EVENT_SCHEMA_COLUMNS.issubset(event_columns):
+        return False
+    if not _LINK_SCHEMA_COLUMNS.issubset(link_columns):
+        return False
+    if not _REMOTE_RUN_SCHEMA_COLUMNS.issubset(remote_run_columns):
+        return False
+    if not _REVOKED_GRANT_SCHEMA_COLUMNS.issubset(revoked_grant_columns):
         return False
     index = conn.execute(
         """SELECT 1 FROM sqlite_master
            WHERE type='index' AND name='idx_hosted_room_events_cursor'"""
     ).fetchone()
     return index is not None
+
+
+def list_room_link_records(db_path: Path | str) -> list[dict[str, Any]]:
+    """Return private RoomLink records without logging or formatting grants."""
+    with _transaction(db_path) as conn:
+        rows = conn.execute(
+            """SELECT room_id, member_id, target_url, target_profile, grant,
+                      catalog_json, cancellation_scope_id, trace_id,
+                      transport_security, status, updated_at
+                 FROM hosted_room_links
+             ORDER BY room_id, member_id"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_room_link_record(
+    db_path: Path | str,
+    *,
+    record: Mapping[str, Any],
+    max_links: int,
+) -> None:
+    """Atomically insert or replace one private RoomLink record."""
+    with _transaction(db_path, immediate=True) as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM hosted_room_links WHERE room_id=? AND member_id=?",
+            (record["room_id"], record["member_id"]),
+        ).fetchone()
+        if existing is None:
+            count = int(
+                conn.execute("SELECT COUNT(*) FROM hosted_room_links").fetchone()[0]
+            )
+            if count >= max_links:
+                raise HostedRoomError("too many stored room links")
+        conn.execute(
+            """INSERT INTO hosted_room_links(
+                   room_id, member_id, target_url, target_profile, grant,
+                   catalog_json, cancellation_scope_id, trace_id,
+                   transport_security, status, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(room_id, member_id) DO UPDATE SET
+                   target_url=excluded.target_url,
+                   target_profile=excluded.target_profile,
+                   grant=excluded.grant,
+                   catalog_json=excluded.catalog_json,
+                   cancellation_scope_id=excluded.cancellation_scope_id,
+                   trace_id=excluded.trace_id,
+                   transport_security=excluded.transport_security,
+                   status=excluded.status,
+                   updated_at=excluded.updated_at""",
+            (
+                record["room_id"],
+                record["member_id"],
+                record["target_url"],
+                record["target_profile"],
+                record["grant"],
+                record["catalog_json"],
+                record["cancellation_scope_id"],
+                record["trace_id"],
+                record["transport_security"],
+                record["status"],
+                record["updated_at"],
+            ),
+        )
+
+
+def update_room_link_status(
+    db_path: Path | str,
+    *,
+    room_id: str,
+    member_id: str,
+    status: str,
+    now: float | None = None,
+) -> bool:
+    """Persist a non-secret route health classification."""
+    with _transaction(db_path, immediate=True) as conn:
+        cursor = conn.execute(
+            """UPDATE hosted_room_links SET status=?, updated_at=?
+                 WHERE room_id=? AND member_id=?""",
+            (
+                status,
+                float(now if now is not None else time.time()),
+                room_id,
+                member_id,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def delete_room_link_records(db_path: Path | str, *, room_id: str) -> int:
+    """Delete persisted peer routes after their target grants are revoked."""
+    with _transaction(db_path, immediate=True) as conn:
+        cursor = conn.execute(
+            "DELETE FROM hosted_room_links WHERE room_id=?",
+            (room_id,),
+        )
+        return cursor.rowcount
+
+
+def _room_grant_scope_key(claims: Mapping[str, Any]) -> str:
+    """Return a stable non-secret key for one room/home/target/profile scope."""
+    import hashlib
+
+    fields = {
+        key: str(claims.get(key) or "")
+        for key in (
+            "room_id",
+            "home_install_id",
+            "target_install_id",
+            "target_profile",
+        )
+    }
+    if not all(fields.values()):
+        raise HostedRoomError("room grant scope is incomplete")
+    return hashlib.sha256(
+        json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def revoke_room_grant_scope(
+    db_path: Path | str,
+    *,
+    claims: Mapping[str, Any],
+    expires_at: float,
+    now: float | None = None,
+) -> None:
+    """Revoke every grant issued at or before now for one exact room scope."""
+    scope_key = _room_grant_scope_key(claims)
+    timestamp = float(now if now is not None else time.time())
+    expiry = float(expires_at)
+    if expiry <= timestamp:
+        return
+    with _transaction(db_path, immediate=True) as conn:
+        conn.execute(
+            "DELETE FROM hosted_room_revoked_grants WHERE expires_at<=?",
+            (timestamp,),
+        )
+        conn.execute(
+            """INSERT INTO hosted_room_revoked_grants(
+                   scope_key, expires_at, revoked_before
+               ) VALUES (?, ?, ?)
+               ON CONFLICT(scope_key) DO UPDATE SET
+                   expires_at=MAX(hosted_room_revoked_grants.expires_at,
+                                  excluded.expires_at),
+                   revoked_before=MAX(hosted_room_revoked_grants.revoked_before,
+                                      excluded.revoked_before)""",
+            (scope_key, expiry, timestamp),
+        )
+
+
+def room_grant_is_revoked(
+    db_path: Path | str,
+    *,
+    claims: Mapping[str, Any],
+    now: float | None = None,
+) -> bool:
+    """Return whether a grant predates its exact scope's revocation fence."""
+    timestamp = float(now if now is not None else time.time())
+    scope_key = _room_grant_scope_key(claims)
+    issued_at = float(claims.get("issued_at") or 0)
+    with _transaction(db_path) as conn:
+        row = conn.execute(
+            """SELECT revoked_before FROM hosted_room_revoked_grants
+                 WHERE scope_key=? AND expires_at>?""",
+            (scope_key, timestamp),
+        ).fetchone()
+    return row is not None and issued_at <= float(row["revoked_before"])
+
+
+def upsert_remote_run_receipt(
+    db_path: Path | str,
+    *,
+    record: Mapping[str, Any],
+    now: float | None = None,
+) -> None:
+    """Durably bind one logical peer task attempt to its remote run handle."""
+    timestamp = float(now if now is not None else time.time())
+    with _transaction(db_path, immediate=True) as conn:
+        existing = conn.execute(
+            """SELECT * FROM hosted_room_remote_runs
+                 WHERE task_id=? AND execution_generation=?""",
+            (record["task_id"], record["execution_generation"]),
+        ).fetchone()
+        immutable = (
+            record["room_id"],
+            record["member_id"],
+            record["target_install_id"],
+            record["target_profile"],
+            record["run_id"],
+            record["session_id"],
+        )
+        if existing is not None:
+            stored = (
+                existing["room_id"],
+                existing["member_id"],
+                existing["target_install_id"],
+                existing["target_profile"],
+                existing["run_id"],
+                existing["session_id"],
+            )
+            if stored != immutable:
+                raise HostedRoomError(
+                    "remote run receipt conflicts with its logical task"
+                )
+            conn.execute(
+                """UPDATE hosted_room_remote_runs SET updated_at=?
+                     WHERE task_id=? AND execution_generation=?""",
+                (timestamp, record["task_id"], record["execution_generation"]),
+            )
+            return
+        conn.execute(
+            """INSERT INTO hosted_room_remote_runs(
+                   room_id, member_id, task_id, execution_generation,
+                   target_install_id, target_profile, run_id, session_id,
+                   created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                *immutable[:2],
+                record["task_id"],
+                record["execution_generation"],
+                *immutable[2:],
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
+def list_remote_run_receipts(
+    db_path: Path | str,
+    *,
+    room_id: str | None = None,
+    target_profile: str | None = None,
+    session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return remote run handles in durable task order."""
+    conditions: list[str] = []
+    values: list[Any] = []
+    for column, value in (
+        ("room_id", room_id),
+        ("target_profile", target_profile),
+        ("session_id", session_id),
+    ):
+        if value is not None:
+            conditions.append(f"{column}=?")
+            values.append(value)
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    with _transaction(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM hosted_room_remote_runs"
+            + where
+            + " ORDER BY created_at, task_id, execution_generation",
+            values,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def remote_run_receipt(
+    db_path: Path | str,
+    *,
+    task_id: str,
+    execution_generation: int,
+) -> dict[str, Any] | None:
+    """Return the exact durable remote run handle for one task attempt."""
+    with _transaction(db_path) as conn:
+        row = conn.execute(
+            """SELECT * FROM hosted_room_remote_runs
+                 WHERE task_id=? AND execution_generation=?""",
+            (task_id, execution_generation),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def _connect(db_path: Path | str) -> sqlite3.Connection:

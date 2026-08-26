@@ -1247,9 +1247,13 @@ def _admit_api_agent_request(handler):
     """
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        room_run = request.path.endswith("/v1/runs") and bool(
+            self._room_grant_token(request)
+        )
+        if not room_run:
+            auth_err = self._check_auth(request)
+            if auth_err:
+                return auth_err
         draining = self._draining_response()
         if draining is not None:
             return draining
@@ -2278,6 +2282,26 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            (
+                "POST",
+                "/v1/room-members/invitations",
+                self._handle_room_member_invitation,
+            ),
+            (
+                "GET",
+                "/v1/room-members/capabilities",
+                self._handle_room_member_capabilities,
+            ),
+            (
+                "POST",
+                "/v1/room-members/grants/refresh",
+                self._handle_room_member_grant_refresh,
+            ),
+            (
+                "POST",
+                "/v1/room-members/grants/revoke",
+                self._handle_room_member_grant_revoke,
+            ),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -3359,6 +3383,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "runs_idempotency": {
+                    "supported": True,
+                    "durable": self._run_idempotency_store.durable,
+                    "retention_seconds": RunIdempotencyStore.RETENTION_SECONDS,
+                },
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -7624,10 +7653,377 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _run_idempotency_scope(self, request: "web.Request") -> str:
         """Opaque auth/profile namespace; never persist bearer credentials."""
+        room_token = self._room_grant_token(request)
+        if room_token:
+            claims = self._room_grant_claims(
+                request,
+                permission=(
+                    "stop"
+                    if request.path.endswith("/stop")
+                    else "status"
+                    if request.method == "GET"
+                    else "dispatch"
+                ),
+            )
+            identity = (
+                f"{claims['grant_id']}\0{claims['room_id']}\0"
+                f"{claims['target_install_id']}\0{claims['target_profile']}"
+            )
+            return hashlib.sha256(identity.encode()).hexdigest()
         profile = _api_request_profile.get() or "default"
         expected_key = self._expected_api_key()
         identity = expected_key or "unauthenticated-test-listener"
         return hashlib.sha256(f"{profile}\0{identity}".encode()).hexdigest()
+
+    @staticmethod
+    def _room_grant_token(request: "web.Request") -> str:
+        authorization = str(request.headers.get("Authorization") or "")
+        scheme, separator, token = authorization.partition(" ")
+        if not separator or scheme.lower() != "hermesroom":
+            return ""
+        return token.strip()
+
+    def _room_grant_secret(self) -> bytes:
+        from gateway.hosted_room_peer import derive_room_grant_secret
+
+        key = self._expected_api_key()
+        return derive_room_grant_secret(key or "")
+
+    def _room_grant_claims(
+        self,
+        request: "web.Request",
+        *,
+        permission: str,
+    ) -> dict[str, Any]:
+        from gateway.hosted_room_peer import decode_room_grant
+
+        token = self._room_grant_token(request)
+        if not token:
+            raise ValueError("room grant is missing")
+        claims = decode_room_grant(
+            self._room_grant_secret(),
+            token,
+            permission=permission,
+        )
+        from gateway import hosted_rooms
+
+        if hosted_rooms.room_grant_is_revoked(
+            hosted_rooms.default_db_path(),
+            claims=claims,
+        ):
+            raise ValueError("room grant is revoked")
+        return claims
+
+    def _check_run_auth(
+        self,
+        request: "web.Request",
+        *,
+        permission: str,
+    ) -> "web.Response | None":
+        if not self._room_grant_token(request):
+            return self._check_auth(request)
+        try:
+            self._room_grant_claims(request, permission=permission)
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    "Room authorization is invalid or expired.",
+                    err_type="gateway_auth_error",
+                    code="invalid_room_grant",
+                ),
+                status=401,
+            )
+        return None
+
+    async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
+        """Create or verify the target's canonical hidden group session.
+
+        Reusing the ``Group: <room_id>`` namespace is intentional: a room that
+        moves from Desktop-assisted to hosted execution keeps one transcript.
+        A conflicting title with a different session id fails closed instead
+        of merging unrelated conversations.
+        """
+        db = await self._ensure_session_db_async()
+        if db is None:
+            raise RuntimeError("session database unavailable")
+        title = f"Group: {dispatch.room_id}"
+        seed = (
+            f"{dispatch.home_install_id}\0{dispatch.room_id}\0"
+            f"{dispatch.member_id}\0{dispatch.target_profile}"
+        )
+        session_id = f"room_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
+
+        def ensure() -> str:
+            def atomic(conn):
+                row = conn.execute(
+                    "SELECT id, title, source FROM sessions WHERE id=?",
+                    (session_id,),
+                ).fetchone()
+                if row is not None:
+                    if row["title"] != title or row["source"] != "bot_room":
+                        raise RuntimeError("room session identity conflicts with existing data")
+                    return session_id
+                clean_title = db.sanitize_title(title)
+                conflict = conn.execute(
+                    "SELECT id FROM sessions WHERE title=? AND id!=?",
+                    (clean_title, session_id),
+                ).fetchone()
+                if conflict:
+                    raise RuntimeError(
+                        "Another group already uses this room title on the target gateway. "
+                        "Rename or migrate that group before retrying."
+                    )
+                conn.execute(
+                    "INSERT INTO sessions(id, source, title, hidden, started_at) "
+                    "VALUES(?, 'bot_room', ?, 1, ?)",
+                    (session_id, clean_title, time.time()),
+                )
+                return session_id
+
+            return db._execute_write(atomic)
+
+        return await asyncio.to_thread(ensure)
+
+    async def _handle_room_member_invitation(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Mint a short-lived room/profile grant for a trusted home gateway."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+        allowed = {"grant_id", "room_id", "home_install_id", "ttl_seconds"}
+        if set(body) - allowed or not {
+            "room_id",
+            "home_install_id",
+        } <= set(body):
+            return web.json_response(
+                _openai_error(
+                    "Invitation requires room_id and home_install_id only.",
+                    code="invalid_room_invitation",
+                ),
+                status=400,
+            )
+        try:
+            from gateway import hosted_rooms
+            from gateway.hosted_room_peer import catalog_mapping, issue_room_grant
+
+            profile = _api_request_profile.get() or "default"
+            target_install_id = hosted_rooms.local_authority_gateway_id()
+            ttl = float(body.get("ttl_seconds", 3600))
+            if not 60 <= ttl <= 24 * 60 * 60:
+                raise ValueError("ttl_seconds must be between 60 and 86400")
+            catalog = catalog_mapping(
+                installation_id=target_install_id,
+                protocol_versions=(1,),
+                link_modes=("direct",),
+                persistent_process=True,
+                text=True,
+                attachments=False,
+            )
+            token = issue_room_grant(
+                self._room_grant_secret(),
+                grant_id=str(body.get("grant_id") or f"grant-{uuid.uuid4().hex}"),
+                room_id=str(body["room_id"]),
+                home_install_id=str(body["home_install_id"]),
+                target_install_id=target_install_id,
+                target_profile=profile,
+                issued_at=time.time(),
+                ttl_seconds=ttl,
+            )
+        except Exception as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_room_invitation"),
+                status=400,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.room_member.invitation",
+                "grant": token,
+                "catalog": catalog,
+            },
+            status=201,
+        )
+
+    async def _handle_room_member_capabilities(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Verify a scoped grant and return this target's live room catalog."""
+        try:
+            from gateway import hosted_rooms
+            from gateway.hosted_room_peer import catalog_mapping
+
+            claims = self._room_grant_claims(request, permission="status")
+            profile = _api_request_profile.get() or "default"
+            installation_id = hosted_rooms.local_authority_gateway_id()
+            if (
+                claims["target_profile"] != profile
+                or claims["target_install_id"] != installation_id
+            ):
+                raise ValueError("room grant target does not match this profile")
+            catalog = catalog_mapping(
+                installation_id=installation_id,
+                protocol_versions=(1,),
+                link_modes=("direct",),
+                persistent_process=True,
+                text=True,
+                attachments=False,
+            )
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    "Room authorization is invalid or expired.",
+                    err_type="gateway_auth_error",
+                    code="invalid_room_grant",
+                ),
+                status=401,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.room_member.capabilities",
+                "room_id": claims["room_id"],
+                "home_install_id": claims["home_install_id"],
+                "target_profile": profile,
+                "catalog": catalog,
+            }
+        )
+
+    async def _handle_room_member_grant_refresh(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Refresh dispatch access without a Desktop or broad gateway key."""
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+        if set(body) - {"ttl_seconds"}:
+            return web.json_response(
+                _openai_error(
+                    "Grant refresh accepts only ttl_seconds.",
+                    code="invalid_room_grant_refresh",
+                ),
+                status=400,
+            )
+        try:
+            from gateway import hosted_rooms
+            from gateway.hosted_room_peer import (
+                MAX_DISPATCH_GRANT_TTL_SECONDS,
+                issue_room_grant,
+            )
+
+            claims = self._room_grant_claims(request, permission="status")
+            profile = _api_request_profile.get() or "default"
+            installation_id = hosted_rooms.local_authority_gateway_id()
+            if (
+                claims["target_profile"] != profile
+                or claims["target_install_id"] != installation_id
+            ):
+                raise ValueError("room grant target does not match this profile")
+            now = time.time()
+            hard_expiry = float(
+                claims.get("status_expires_at", claims["expires_at"])
+            )
+            remaining = hard_expiry - now
+            requested = float(
+                body.get("ttl_seconds", MAX_DISPATCH_GRANT_TTL_SECONDS)
+            )
+            if remaining <= 0 or requested <= 0:
+                raise ValueError("room grant renewal horizon expired")
+            dispatch_ttl = min(
+                requested,
+                MAX_DISPATCH_GRANT_TTL_SECONDS,
+                remaining,
+            )
+            token = issue_room_grant(
+                self._room_grant_secret(),
+                grant_id=f"grant-refresh-{uuid.uuid4().hex}",
+                room_id=claims["room_id"],
+                home_install_id=claims["home_install_id"],
+                target_install_id=installation_id,
+                target_profile=profile,
+                permissions=claims["permissions"],
+                issued_at=now,
+                ttl_seconds=dispatch_ttl,
+                status_expires_at=hard_expiry,
+            )
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    "Room authorization can no longer be renewed.",
+                    err_type="gateway_auth_error",
+                    code="invalid_room_grant",
+                ),
+                status=401,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.room_member.grant",
+                "grant": token,
+                "expires_at": now + dispatch_ttl,
+                "status_expires_at": hard_expiry,
+            }
+        )
+
+    async def _handle_room_member_grant_revoke(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Revoke exactly the scoped grant authenticating this request."""
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+        if body:
+            return web.json_response(
+                _openai_error(
+                    "Grant revoke accepts no fields.",
+                    code="invalid_room_grant_revoke",
+                ),
+                status=400,
+            )
+        try:
+            from gateway import hosted_rooms
+            from gateway.hosted_room_peer import decode_room_grant
+
+            token = self._room_grant_token(request)
+            if not token:
+                raise ValueError("room grant is missing")
+            # Revoke is idempotent: a response-lost retry may authenticate with
+            # the grant that was just added to the denylist. Verify signature,
+            # scope, and hard horizon directly, then upsert the same grant id.
+            claims = decode_room_grant(
+                self._room_grant_secret(),
+                token,
+                permission="status",
+            )
+            profile = _api_request_profile.get() or "default"
+            installation_id = hosted_rooms.local_authority_gateway_id()
+            if (
+                claims["target_profile"] != profile
+                or claims["target_install_id"] != installation_id
+            ):
+                raise ValueError("room grant target does not match this profile")
+            hosted_rooms.revoke_room_grant_scope(
+                hosted_rooms.default_db_path(),
+                claims=claims,
+                expires_at=float(
+                    claims.get("status_expires_at", claims["expires_at"])
+                ),
+            )
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    "Room authorization is invalid or expired.",
+                    err_type="gateway_auth_error",
+                    code="invalid_room_grant",
+                ),
+                status=401,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.room_member.grant.revocation",
+                "revoked": True,
+            }
+        )
 
     def _durable_run_status(
         self, request: "web.Request", run_id: str
@@ -7692,6 +8088,77 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        room_token = self._room_grant_token(request)
+        if room_token:
+            allowed_room_fields = {"input", "hosted_room_dispatch"}
+            if not isinstance(body, dict) or set(body) - allowed_room_fields:
+                return web.json_response(
+                    _openai_error(
+                        "Room dispatch accepts only input and hosted_room_dispatch.",
+                        code="invalid_room_dispatch",
+                    ),
+                    status=400,
+                )
+            try:
+                from gateway import hosted_rooms
+                from gateway.hosted_room_peer import (
+                    GatewayRoomCatalog,
+                    HostedMemberDispatch,
+                    catalog_mapping,
+                    verify_room_grant,
+                )
+
+                dispatch = HostedMemberDispatch.from_mapping(
+                    body.get("hosted_room_dispatch")
+                )
+                verify_room_grant(
+                    self._room_grant_secret(),
+                    room_token,
+                    dispatch,
+                    permission="dispatch",
+                )
+                active_profile = _api_request_profile.get() or "default"
+                local_install = hosted_rooms.local_authority_gateway_id()
+                if (
+                    dispatch.target_profile != active_profile
+                    or dispatch.target_install_id != local_install
+                ):
+                    raise ValueError("room dispatch target does not match this profile")
+                catalog = GatewayRoomCatalog.from_mapping(
+                    catalog_mapping(
+                        installation_id=local_install,
+                        protocol_versions=(1,),
+                        link_modes=("direct",),
+                        persistent_process=True,
+                        text=True,
+                        attachments=False,
+                    )
+                )
+                if not hmac.compare_digest(
+                    catalog.catalog_digest,
+                    dispatch.capability_digest,
+                ):
+                    raise ValueError("room capability catalog changed")
+                supplied_input = body.get("input")
+                if supplied_input not in {None, dispatch.prompt}:
+                    raise ValueError("room dispatch input does not match its prompt")
+                expected_key = (
+                    f"room:{dispatch.task_id}:{dispatch.execution_generation}"
+                )
+                if request.headers.get("Idempotency-Key", "").strip() != expected_key:
+                    raise ValueError("room dispatch idempotency key is invalid")
+                session_id = await self._ensure_hosted_member_session(dispatch)
+                body = {
+                    "input": dispatch.prompt,
+                    "session_id": session_id,
+                    "hosted_room_dispatch": dispatch.as_mapping(),
+                }
+            except Exception as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="invalid_room_dispatch"),
+                    status=403,
+                )
 
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
         if idempotency_key and (
@@ -8229,6 +8696,11 @@ class APIServerAdapter(BasePlatformAdapter):
     def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
         scope = self._run_idempotency_scope(request)
         owner = self._run_owners.get(run_id)
+        if self._room_grant_token(request):
+            return owner == scope or (
+                owner is None
+                and self._run_idempotency_store.owns_run(scope, run_id)
+            )
         if owner is None and (
             run_id in self._run_statuses
             or run_id in self._active_run_agents
@@ -8243,7 +8715,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-        auth_err = self._check_auth(request)
+        auth_err = self._check_run_auth(request, permission="status")
         if auth_err:
             return auth_err
 
@@ -8487,7 +8959,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
-        auth_err = self._check_auth(request)
+        auth_err = self._check_run_auth(request, permission="stop")
         if auth_err:
             return auth_err
 

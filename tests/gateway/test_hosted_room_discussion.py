@@ -251,11 +251,17 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
     assert first == repeated
     assert first.identity.thread_id == "thread-1"
     assert first.payload == {
+        "target_member_id": "member-research",
         "target_profile": "research",
         "prompt": first.payload["prompt"],
         "source_event_seq": user["seq"],
     }
-    assert set(first.payload) == {"target_profile", "prompt", "source_event_seq"}
+    assert set(first.payload) == {
+        "target_member_id",
+        "target_profile",
+        "prompt",
+        "source_event_seq",
+    }
 
     admitted = driver.admit_task(
         db,

@@ -51,6 +51,167 @@ def test_capabilities_are_honest_about_the_driver_boundary(home):
     assert "monotonic_log" in result["features"]
     assert "groups.state" in result["methods"]
     assert "groups.send" in result["methods"]
+    assert result["room_link"]["enabled"] is False
+
+
+def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch):
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    result = _result(srv._methods["groups.capabilities"](1, {}))
+    assert result["room_link"]["enabled"] is True
+    assert result["room_link"]["profile"] == "reviewer"
+    assert result["room_link"]["catalog"]["text"] is True
+    assert "groups.peer.invite" in result["methods"]
+    assert "groups.peer.register" in result["methods"]
+
+    invitation = _result(
+        srv._methods["groups.peer.invite"](
+            2,
+            {
+                "room_id": "room-1",
+                "home_install_id": "install-home",
+                "grant_id": "grant-room-1",
+            },
+        )
+    )
+    assert invitation["target_profile"] == "reviewer"
+    assert invitation["catalog"] == result["room_link"]["catalog"]
+    assert "." in invitation["grant"]
+
+
+def test_app_managed_catalog_and_self_advertised_endpoint_are_consistent(
+    home, monkeypatch
+):
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv("HERMES_ROOM_LINK_URL", "https://peer.example.test/hermes")
+    capability = _result(srv._methods["groups.capabilities"](1, {}))
+    invitation = _result(
+        srv._methods["groups.peer.invite"](
+            2,
+            {
+                "room_id": "room-1",
+                "home_install_id": "install-home",
+            },
+        )
+    )
+    assert capability["persistent_process"] is False
+    assert capability["room_link"]["catalog"] == invitation["catalog"]
+    assert capability["room_link"]["endpoint"] == {
+        "available": True,
+        "url": "https://peer.example.test/hermes",
+        "transport_security": "tls",
+    }
+    assert invitation["endpoint"] == capability["room_link"]["endpoint"]
+
+
+def test_roomlink_endpoint_absence_has_machine_reason(home, monkeypatch):
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
+    monkeypatch.delenv("HERMES_ROOM_LINK_URL", raising=False)
+    result = _result(srv._methods["groups.capabilities"](1, {}))
+    assert result["room_link"]["endpoint"] == {
+        "available": False,
+        "reason": "not_configured",
+    }
+
+
+def test_register_peer_route_probes_scope_and_persists_via_service(home, monkeypatch):
+    from gateway.hosted_room_peer import catalog_mapping
+    from gateway.hosted_rooms import local_authority_gateway_id
+
+    catalog = catalog_mapping(
+        installation_id="install-peer",
+        persistent_process=True,
+    )
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, *, base_url, api_key, **kwargs):
+            captured["base_url"] = base_url
+            captured["api_key"] = api_key
+
+        def probe(self, *, grant):
+            captured["grant"] = grant
+            return {
+                "room_id": "room-1",
+                "home_install_id": local_authority_gateway_id(),
+                "target_profile": "reviewer",
+                "catalog": catalog,
+            }
+
+    class FakeService:
+        db_path = home / "state.db"
+
+        def register_peer_route(self, **kwargs):
+            captured["registered"] = kwargs
+
+    monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
+    monkeypatch.setattr(
+        "tui_gateway.hosted_room_peer_http.PeerRunsHTTPClient",
+        FakeClient,
+    )
+    result = _result(
+        srv._methods["groups.peer.register"](
+            3,
+            {
+                "room_id": "room-1",
+                "member_id": "member-peer",
+                "target_url": "https://peer.example.test",
+                "target_profile": "reviewer",
+                "grant": "signed.room.grant",
+                "catalog": catalog,
+            },
+        )
+    )
+    assert result["registered"] is True
+    assert captured["api_key"] == ""
+    assert captured["registered"]["target_url"] == ("https://peer.example.test")
+
+
+def test_register_rejects_plaintext_non_loopback(home, monkeypatch):
+    class FakeService:
+        db_path = home / "state.db"
+
+    monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
+    response = srv._methods["groups.peer.register"](
+        4,
+        {
+            "room_id": "room-1",
+            "member_id": "member-peer",
+            "target_url": "http://peer.example.test:8377",
+            "target_profile": "reviewer",
+            "grant": "signed.room.grant",
+            "catalog": {},
+        },
+    )
+    assert response["error"]["code"] == 5120
+    assert "https outside" in response["error"]["message"]
+
+
+def test_register_requires_roomlink_protocol_v1(home, monkeypatch):
+    from gateway.hosted_room_peer import catalog_mapping
+
+    class FakeService:
+        db_path = home / "state.db"
+
+    monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
+    response = srv._methods["groups.peer.register"](
+        5,
+        {
+            "room_id": "room-1",
+            "member_id": "member-peer",
+            "target_url": "https://peer.example.test",
+            "target_profile": "reviewer",
+            "grant": "signed.room.grant",
+            "catalog": catalog_mapping(
+                installation_id="install-peer",
+                protocol_versions=(2,),
+                persistent_process=True,
+            ),
+        },
+    )
+    assert response["error"]["code"] == 5120
+    assert "protocol v1" in response["error"]["message"]
 
 
 def test_create_list_send_and_log_roundtrip(home):
@@ -173,9 +334,7 @@ def test_legacy_room_adoption_emits_one_lineage_receipt(home):
             {"room_id": "legacy-room", "name": "Legacy", "members": members},
         )
     )["room"]
-    state = _result(
-        srv._methods["groups.state"](3, {"room_id": "legacy-room"})
-    )["room"]
+    state = _result(srv._methods["groups.state"](3, {"room_id": "legacy-room"}))["room"]
 
     assert adopted["adopted"] is True
     assert adopted["authority_gateway_id"] == _server_authority()
@@ -225,9 +384,9 @@ def test_disband_tombstones_room(home):
     assert first["tombstone"]["idempotent"] is False
     assert repeated["tombstone"]["idempotent"] is True
     assert _result(srv._methods["groups.list"](5, {}))["rooms"] == []
-    deleted = _result(
-        srv._methods["groups.list"](6, {"include_disbanded": True})
-    )["rooms"]
+    deleted = _result(srv._methods["groups.list"](6, {"include_disbanded": True}))[
+        "rooms"
+    ]
     assert deleted[0]["disbanded_at"] == first["tombstone"]["disbanded_at"]
     replay = _result(
         srv._methods["groups.log"](

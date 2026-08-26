@@ -1210,6 +1210,13 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
           : existing.image || null,
       hosted: cachedHosted || null,
       hostedEpoch: cachedHostedEpoch || null,
+      continuityMode:
+        ['desktop', 'gateway', 'distributed'].includes(existing.continuityMode)
+          ? existing.continuityMode
+          : cachedHosted
+            ? 'gateway'
+            : 'desktop',
+      continuityIssue: typeof existing.continuityIssue === 'string' ? existing.continuityIssue : null,
       syncRevision: isPreserved ? localRevision : Math.max(remoteRevision, localRevision),
       epoch: Number(existing.epoch || 0),
       running: Boolean(existing.running)
@@ -1277,6 +1284,13 @@ function durableGroupChatRooms(all = $groupChats.get()) {
           ? room.hostedConnectionId
           : null,
       hostedSeq: Math.max(0, Number(room.hostedSeq || 0)),
+      continuityMode:
+        ['desktop', 'gateway', 'distributed'].includes(room.continuityMode)
+          ? room.continuityMode
+          : groupChatHostedGateway(room)
+            ? 'gateway'
+            : 'desktop',
+      continuityIssue: typeof room.continuityIssue === 'string' ? room.continuityIssue : null,
       image: room.image || null,
       syncRevision: Math.max(0, Number(room.syncRevision || 0))
     }
@@ -1317,6 +1331,13 @@ function hydratePersistedGroupChatRooms(value) {
           ? room.hostedConnectionId
           : null,
       hostedSeq: Math.max(0, Number(room.hostedSeq || 0)),
+      continuityMode:
+        ['desktop', 'gateway', 'distributed'].includes(room.continuityMode)
+          ? room.continuityMode
+          : groupChatHostedGateway(room)
+            ? 'gateway'
+            : 'desktop',
+      continuityIssue: typeof room.continuityIssue === 'string' ? room.continuityIssue : null,
       image: typeof room.image === 'string' && room.image ? room.image : null,
       syncRevision: Math.max(0, Number(room.syncRevision || 0)),
       epoch: 0,
@@ -1508,6 +1529,21 @@ async function requestHostedConnection(route, method, params = {}) {
   return host.requestProfile(route, method, params)
 }
 
+async function withHostedRoomProbeTimeout(task, timeoutMs = 3000) {
+  let timer = null
+
+  try {
+    return await Promise.race([
+      task,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Gateway check timed out')), timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+}
+
 function hostedMemberDescriptors(room, connectionId, connectionLabel) {
   return (Array.isArray(room?.members) ? room.members : []).map(member => ({
     name: String(member?.profile || member?.member_id || 'default'),
@@ -1601,6 +1637,9 @@ async function refreshHostedRooms() {
         const source = sources.get(connectionId)
         const label = source?.label || source?.connectionLabel || connectionId
         const replayState = replay.state
+        const distributed = Array.isArray(roomState.members) && roomState.members.some(
+          member => member?.target?.kind === 'peer'
+        )
 
         updateGroupChat(existingName, room => {
           const authoritative = applyHostedRoomAuthority(room, roomState)
@@ -1612,6 +1651,8 @@ async function refreshHostedRooms() {
             log: mergeGroupChatSyncEntries(room.log || [], replayState.messages || []),
             hostedConnectionId: connectionId,
             hostedSeq: replayState.cursor,
+            continuityMode: distributed ? 'distributed' : 'gateway',
+            continuityIssue: null,
             hostedStatus: client.deriveFriendlyHostedRoomStatus(replayState),
             running: replayState.lastStatusEvent?.kind === 'turn.started'
           }
@@ -7606,6 +7647,13 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
             ? room.hostedConnectionId
             : null,
         hostedSeq: Math.max(0, Number(room.hostedSeq || 0)),
+        continuityMode:
+          ['desktop', 'gateway', 'distributed'].includes(room.continuityMode)
+            ? room.continuityMode
+            : groupChatHostedGateway(room)
+              ? 'gateway'
+              : 'desktop',
+        continuityIssue: typeof room.continuityIssue === 'string' ? room.continuityIssue : null,
         // Room picture (small data URL, same normalization as bot avatars).
         image: room.image || null,
         syncRevision: Math.max(0, Number(room.syncRevision || 0))
@@ -13052,9 +13100,33 @@ function GroupImageControls({ image, onImage, seedName, seedMembers }) {
  *  the room record. Both apply on Save so a cancelled dialog changes nothing. */
 function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
   const rooms = useValue($groupChats)
-  const current = (rooms[group] || {}).image || null
+  const room = rooms[group] || {}
+  const current = room.image || null
   const [name, setName] = useState(group)
   const [image, setImage] = useState(current)
+  const continuityMode = ['distributed', 'gateway'].includes(room.continuityMode)
+    ? room.continuityMode
+    : groupChatHostedGateway(room)
+      ? 'gateway'
+      : 'desktop'
+  const coordinator = (members || []).find(
+    member => String(member?.connectionId || '') === String(room.hostedConnectionId || '')
+  )?.connectionLabel
+  const continuityCopy =
+    continuityMode === 'distributed'
+      ? {
+          title: 'Continues when Desktop is closed',
+          description: `Bots keep working together across gateways${coordinator ? `, coordinated by ${coordinator}` : ''}.`
+        }
+      : continuityMode === 'gateway'
+        ? {
+            title: 'Continues when Desktop is closed',
+            description: `Bots keep working on ${coordinator || 'their Hermes gateway'}.`
+          }
+        : {
+            title: 'Keep Desktop open while this room is working',
+            description: room.continuityIssue || 'This room currently uses Desktop to coordinate its bots.'
+          }
 
   useEffect(() => {
     if (open) {
@@ -13119,6 +13191,23 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
             onChange: event => setName(event.target.value)
           })
         }),
+        jsxs('div', {
+          className: 'border-t border-(--ui-stroke-secondary) pt-3',
+          children: [
+            jsx('div', {
+              className: 'text-xs font-medium text-foreground',
+              children: 'Background work'
+            }),
+            jsx('div', {
+              className: 'mt-1 text-[0.6875rem] leading-relaxed text-(--ui-text-tertiary)',
+              children: continuityCopy.title
+            }),
+            jsx('div', {
+              className: 'mt-0.5 text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)',
+              children: continuityCopy.description
+            })
+          ]
+        }),
         jsxs(DialogFooter, {
           children: [
             jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
@@ -13141,8 +13230,11 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const [name, setName] = useState('')
   const [image, setImage] = useState(null)
   const [keepRunning, setKeepRunning] = useState(false)
-  const [hostCapability, setHostCapability] = useState(null)
-  const [hostRoute, setHostRoute] = useState(null)
+  const keepRunningPreference = useRef('auto')
+  const [hostCapabilities, setHostCapabilities] = useState({})
+  const [hostRoutes, setHostRoutes] = useState({})
+  const [hostPlan, setHostPlan] = useState(null)
+  const [hostPlanCopy, setHostPlanCopy] = useState(null)
   const [hostProbePending, setHostProbePending] = useState(false)
   const [createPending, setCreatePending] = useState(false)
   const [createError, setCreateError] = useState('')
@@ -13155,8 +13247,11 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       setName('')
       setImage(null)
       setKeepRunning(false)
-      setHostCapability(null)
-      setHostRoute(null)
+      keepRunningPreference.current = 'auto'
+      setHostCapabilities({})
+      setHostRoutes({})
+      setHostPlan(null)
+      setHostPlanCopy(null)
       setHostProbePending(false)
       setCreatePending(false)
       setCreateError('')
@@ -13180,8 +13275,10 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
     let cancelled = false
 
     if (!open || selected.length < 2) {
-      setHostCapability(null)
-      setHostRoute(null)
+      setHostCapabilities({})
+      setHostRoutes({})
+      setHostPlan(null)
+      setHostPlanCopy(null)
       setKeepRunning(false)
       return () => {
         cancelled = true
@@ -13192,29 +13289,62 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
     void import('./hosted-room-client.js')
       .then(async client => {
         if (cancelled) return
-        const route = client.resolveSingleGatewayRoute(selected, {
-          activeConnectionId: String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
-        })
-        setHostRoute(route)
-        if (route.kind !== 'single-gateway') {
-          setHostCapability(null)
-          setKeepRunning(false)
-          return
-        }
-        const result = await requestForBot(selected[0], 'groups.capabilities', {})
+        const activeConnectionId = String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
+        const routes = await hostedDefaultRoutes()
+        const byConnection = Object.fromEntries(
+          routes.map(route => [String(route.connectionId || ''), route]).filter(([connectionId]) => connectionId)
+        )
+        const selectedConnectionIds = [...new Set(selected.map(bot => String(botConnectionRoute(bot)?.connectionId || '')))]
+          .filter(Boolean)
+        const capabilities = {}
+
+        await withHostedRoomProbeTimeout(Promise.all(
+          selectedConnectionIds.map(async connectionId => {
+            const route = byConnection[connectionId]
+            if (!route) {
+              capabilities[connectionId] = client.classifyHostedRoomCapability(
+                { ok: false, error: new Error('Gateway route unavailable') },
+                { connectionId }
+              )
+              return
+            }
+            try {
+              const result = await requestHostedConnection(route, 'groups.capabilities', {})
+              capabilities[connectionId] = client.classifyHostedRoomCapability(result, { connectionId })
+            } catch (error) {
+              capabilities[connectionId] = client.classifyHostedRoomCapability({ ok: false, error }, { connectionId })
+            }
+          })
+        ))
         if (cancelled) return
-        const capability = client.classifyHostedRoomCapability(result, {
-          connectionId: route.connectionId
+        const plan = client.resolveAutonomousRoomPlan(selected, { activeConnectionId, capabilities })
+        const homeBot = selected.find(
+          bot => String(botConnectionRoute(bot)?.connectionId || '') === String(plan.homeConnectionId || '')
+        )
+        const unavailableBot = selected.find(
+          bot => String(botConnectionRoute(bot)?.connectionId || '') === String(plan.unavailableConnectionId || '')
+        )
+        const copy = client.describeAutonomousRoomPlan(plan, {
+          homeLabel: homeBot?.connectionLabel || 'a Hermes gateway',
+          unavailableLabel: unavailableBot?.connectionLabel || 'One gateway'
         })
-        setHostCapability(capability)
-        if (capability.kind !== 'driver-capable' || capability.persistentProcess !== true) {
-          setKeepRunning(false)
-        }
+        setHostCapabilities(capabilities)
+        setHostRoutes(byConnection)
+        setHostPlan(plan)
+        setHostPlanCopy(copy)
+        setKeepRunning(copy.defaultEnabled && keepRunningPreference.current !== 'off')
       })
       .catch(error => {
         if (cancelled) return
-        setHostCapability({ kind: 'transient-failure', reason: 'probe-failed', error })
-        setHostRoute(null)
+        setHostCapabilities({})
+        setHostRoutes({})
+        setHostPlan({ kind: 'unsupported', reason: 'probe-failed' })
+        setHostPlanCopy({
+          defaultEnabled: false,
+          level: 'desktop',
+          title: 'Keep Desktop open for this room',
+          description: 'The gateways could not be checked.'
+        })
         setKeepRunning(false)
       })
       .finally(() => {
@@ -13228,10 +13358,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, selectedRouteKey])
 
-  const hostedEligible =
-    hostRoute?.kind === 'single-gateway' &&
-    hostCapability?.kind === 'driver-capable' &&
-    hostCapability?.persistentProcess === true
+  const hostedEligible = hostPlan?.kind === 'single-gateway' || hostPlan?.kind === 'multi-gateway'
 
   const create = async () => {
     const base = (name.trim() || placeholder).slice(0, 64)
@@ -13273,21 +13400,90 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
         if (!hostedEligible) {
           throw new Error('This gateway cannot keep group work running yet.')
         }
-        const created = await requestForBot(selected[0], 'groups.create', {
-          room_id: roomId,
-          name: groupName,
-          members: selected.map(bot => ({
-            member_id: bot.name === 'default' ? 'default' : bot.name,
-            profile: bot.name,
+        const homeRoute = hostRoutes[hostPlan.homeConnectionId]
+        const homeCapability = hostCapabilities[hostPlan.homeConnectionId]
+
+        if (!homeRoute || !homeCapability?.authorityId) {
+          throw new Error('The room coordinator is unavailable.')
+        }
+
+        const hostedMembers = []
+        const peerRegistrations = []
+
+        for (const [index, bot] of selected.entries()) {
+          const route = botConnectionRoute(bot)
+          const connectionId = String(route?.connectionId || '')
+          const profile = backendTargetProfile(route, bot.name)
+          const memberId = `member-${index + 1}-${String(profile || 'default')}`
+            .replace(/[^A-Za-z0-9._:-]/g, '-')
+            .slice(0, 128)
+          const descriptor = {
+            member_id: memberId,
+            profile,
             handle: botMentionTag(bot),
             ...(displayName(bot, botRosterMeta(bot, allMeta))
               ? { display_name: displayName(bot, botRosterMeta(bot, allMeta)) }
               : {})
-          }))
+          }
+
+          if (connectionId === hostPlan.homeConnectionId) {
+            hostedMembers.push(descriptor)
+            continue
+          }
+
+          const invitation = await requestForBot(bot, 'groups.peer.invite', {
+            room_id: roomId,
+            home_install_id: homeCapability.authorityId
+          })
+          const targetCapability = hostCapabilities[connectionId]
+          const targetUrl = targetCapability?.roomLink?.endpoint
+
+          if (!targetUrl || !invitation?.grant || !invitation?.catalog || !invitation?.target_profile) {
+            throw new Error('A gateway could not prepare this room.')
+          }
+
+          hostedMembers.push({
+            ...descriptor,
+            profile: invitation.target_profile,
+            target: {
+              kind: 'peer',
+              peer_id: invitation.catalog.installation_id,
+              installation_id: invitation.catalog.installation_id,
+              profile: invitation.target_profile,
+              capability_digest: invitation.catalog.catalog_digest
+            }
+          })
+          peerRegistrations.push({
+            room_id: roomId,
+            member_id: memberId,
+            target_url: targetUrl,
+            target_profile: invitation.target_profile,
+            grant: invitation.grant,
+            catalog: invitation.catalog
+          })
+        }
+
+        const created = await requestHostedConnection(homeRoute, 'groups.create', {
+          room_id: roomId,
+          name: groupName,
+          members: hostedMembers
         })
         hostedRoom = created?.room
         if (!hostedRoom?.authority_gateway_id) {
           throw new Error('The gateway did not create the group.')
+        }
+
+        try {
+          for (const registration of peerRegistrations) {
+            await requestHostedConnection(homeRoute, 'groups.peer.register', registration)
+          }
+        } catch (error) {
+          await requestHostedConnection(homeRoute, 'groups.disband', {
+            room_id: roomId,
+            cancel_id: `rollback-${roomId}`
+          }).catch(() => undefined)
+          hostedRoom = null
+          throw error
         }
       }
 
@@ -13302,7 +13498,12 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
         if (hostedRoom) {
           room.hosted = hostedRoom.authority_gateway_id
           room.hostedEpoch = hostedRoom.authority_epoch || 1
-          room.hostedConnectionId = hostRoute.connectionId
+          room.hostedConnectionId = hostPlan.homeConnectionId
+          room.continuityMode = hostPlan.kind === 'multi-gateway' ? 'distributed' : 'gateway'
+          room.continuityIssue = null
+        } else {
+          room.continuityMode = 'desktop'
+          room.continuityIssue = !hostedEligible ? hostPlanCopy?.description || null : null
         }
 
         if (image) {
@@ -13316,7 +13517,13 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       onClose()
       onCreated?.(groupName)
     } catch (error) {
-      setCreateError(error instanceof Error ? error.message : 'Could not create the group.')
+      setCreateError(
+        keepRunning
+          ? 'The gateways could not finish setting up this room. Nothing was started. Try again, or turn off background work.'
+          : error instanceof Error
+            ? error.message
+            : 'Could not create the group.'
+      )
     } finally {
       setCreatePending(false)
     }
@@ -13336,7 +13543,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
           children: [
             jsx(DialogTitle, { children: 'New Group Chat' }),
             jsx(DialogDescription, {
-              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Local memberships sync through each Bot profile; cross-machine members stay scoped to this room.`
+              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Hermes handles their gateways for you.`
             })
           ]
         }),
@@ -13442,31 +13649,50 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
             })
           ]
         }),
-        hostedEligible || hostProbePending
-          ? jsxs('div', {
-              className: 'flex items-start justify-between gap-4 py-1',
+        selected.length >= 2
+          ? jsxs('details', {
+              className: 'group rounded-md border border-(--ui-stroke-secondary) px-2.5 py-2',
               children: [
-                jsxs('div', {
-                  className: 'min-w-0',
+                jsxs('summary', {
+                  className:
+                    'flex cursor-pointer list-none items-center justify-between text-xs text-(--ui-text-secondary) marker:hidden',
                   children: [
-                    jsx('div', {
-                      className: 'text-xs font-medium text-foreground',
-                      children: 'Keep working when this app is closed'
-                    }),
-                    jsx('div', {
-                      className: 'mt-0.5 text-[0.6875rem] leading-relaxed text-(--ui-text-tertiary)',
-                      children: hostProbePending
-                        ? 'Checking this gateway…'
-                        : `Runs on ${selected[0]?.connectionLabel || 'this Hermes gateway'}.`
+                    'Advanced',
+                    jsx(Codicon, {
+                      name: 'chevron-right',
+                      className: 'text-[0.7rem] transition-transform group-open:rotate-90'
                     })
                   ]
                 }),
-                jsx(Switch, {
-                  'aria-label': 'Keep group work running when this app is closed',
-                  checked: keepRunning,
-                  disabled: hostProbePending || !hostedEligible,
-                  onCheckedChange: setKeepRunning,
-                  size: 'xs'
+                jsxs('div', {
+                  className: 'mt-2 flex items-start justify-between gap-4 border-t border-(--ui-stroke-secondary) pt-2',
+                  children: [
+                    jsxs('div', {
+                      className: 'min-w-0',
+                      children: [
+                        jsx('div', {
+                          className: 'text-xs font-medium text-foreground',
+                          children: hostPlanCopy?.title || 'Checking room continuity…'
+                        }),
+                        jsx('div', {
+                          className: 'mt-0.5 text-[0.6875rem] leading-relaxed text-(--ui-text-tertiary)',
+                          children: hostProbePending
+                            ? 'Checking the selected gateways…'
+                            : hostPlanCopy?.description || 'Keep Desktop open for this room.'
+                        })
+                      ]
+                    }),
+                    jsx(Switch, {
+                      'aria-label': 'Keep group work running when this app is closed',
+                      checked: keepRunning,
+                      disabled: hostProbePending || !hostedEligible,
+                      onCheckedChange: value => {
+                        keepRunningPreference.current = value ? 'on' : 'off'
+                        setKeepRunning(value)
+                      },
+                      size: 'xs'
+                    })
+                  ]
                 })
               ]
             })
@@ -13478,7 +13704,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
           children: [
             jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
             jsx(Button, {
-              disabled: !canCreate || createPending,
+              disabled: !canCreate || createPending || hostProbePending,
               title: selected.length < 2 ? 'Pick at least 2 bots' : undefined,
               onClick: () => void create(),
               children: createPending

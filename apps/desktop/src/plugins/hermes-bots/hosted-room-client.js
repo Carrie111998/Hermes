@@ -15,7 +15,7 @@ const MAX_STAGED_REF_CHARS = 256
 export const HOSTED_ROOM_CLIENT_LIMITATIONS = Object.freeze({
   attachments: false,
   automaticFailover: false,
-  crossGatewayMembers: false,
+  crossGatewayMembers: true,
   stagedAttachmentManifest: true
 })
 
@@ -105,6 +105,33 @@ function capabilityResult(probe) {
   return null
 }
 
+function roomLinkCapability(value) {
+  if (!value || typeof value !== 'object') return null
+  const catalog = value.catalog
+  const endpoint = value.endpoint && typeof value.endpoint === 'object' ? value.endpoint : null
+  return {
+    enabled: value.enabled === true,
+    endpoint: endpoint?.available === true ? text(endpoint.url) : null,
+    endpointReason: endpoint?.available === false ? text(endpoint.reason) : null,
+    reason: text(value.reason),
+    profile: text(value.profile),
+    catalog:
+      catalog && typeof catalog === 'object'
+        ? {
+            installationId: text(catalog.installation_id),
+            digest: text(catalog.catalog_digest),
+            persistentProcess: catalog.persistent_process === true,
+            text: catalog.text === true,
+            attachments: catalog.attachments === true,
+            linkModes: Array.isArray(catalog.link_modes) ? catalog.link_modes.filter(Boolean) : [],
+            protocolVersions: Array.isArray(catalog.protocol_versions)
+              ? catalog.protocol_versions.map(value => Number(value)).filter(Number.isSafeInteger)
+              : []
+          }
+        : null
+  }
+}
+
 /** Classify a groups.capabilities probe without turning connectivity failures
  * into a compatibility verdict. */
 export function classifyHostedRoomCapability(probe, { connectionId = null } = {}) {
@@ -118,6 +145,7 @@ export function classifyHostedRoomCapability(probe, { connectionId = null } = {}
       connectionId: localConnectionId,
       authorityId: null,
       persistentProcess: null,
+      roomLink: null,
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
   }
@@ -131,6 +159,7 @@ export function classifyHostedRoomCapability(probe, { connectionId = null } = {}
       connectionId: localConnectionId,
       authorityId: null,
       persistentProcess: null,
+      roomLink: null,
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
   }
@@ -142,6 +171,7 @@ export function classifyHostedRoomCapability(probe, { connectionId = null } = {}
       connectionId: localConnectionId,
       authorityId: null,
       persistentProcess: capabilities.persistent_process === true,
+      roomLink: roomLinkCapability(capabilities.room_link),
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
   }
@@ -155,6 +185,7 @@ export function classifyHostedRoomCapability(probe, { connectionId = null } = {}
       connectionId: localConnectionId,
       authorityId: null,
       persistentProcess: capabilities.persistent_process === true,
+      roomLink: roomLinkCapability(capabilities.room_link),
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
   }
@@ -165,6 +196,7 @@ export function classifyHostedRoomCapability(probe, { connectionId = null } = {}
     connectionId: localConnectionId,
     authorityId,
     persistentProcess: capabilities.persistent_process === true,
+    roomLink: roomLinkCapability(capabilities.room_link),
     maxLogLimit: positiveInteger(capabilities.max_log_limit, 100),
     limits: HOSTED_ROOM_CLIENT_LIMITATIONS
   }
@@ -247,6 +279,147 @@ export function resolveSingleGatewayRoute(members, { activeConnectionId = null }
     connectionId: connectionIds[0],
     memberConnectionIds,
     limits: HOSTED_ROOM_CLIENT_LIMITATIONS
+  }
+}
+
+/** Plan the simplest autonomous room across one or several gateways. The
+ * gateway catalogs are authoritative; Desktop only chooses among verified
+ * capabilities and never upgrades them. */
+export function resolveAutonomousRoomPlan(
+  members,
+  { activeConnectionId = null, capabilities = {} } = {}
+) {
+  const roster = Array.isArray(members) ? members : []
+  const route = resolveSingleGatewayRoute(roster, { activeConnectionId })
+
+  if (route.reason && route.reason !== 'cross-gateway') {
+    return { ...route, homeConnectionId: null, remoteConnectionIds: [] }
+  }
+
+  const memberConnectionIds = roster.map(member => memberConnectionId(member, activeConnectionId))
+  const connectionIds = [...new Set(memberConnectionIds.filter(Boolean))]
+  const classified = Object.fromEntries(
+    connectionIds.map(connectionId => [connectionId, capabilities[connectionId] || null])
+  )
+  const homeCandidates = connectionIds.filter(connectionId => {
+    const capability = classified[connectionId]
+    if (capability?.kind !== 'driver-capable' || capability.persistentProcess !== true) {
+      return false
+    }
+    if (connectionIds.length === 1) {
+      return true
+    }
+    const roomLink = capability.roomLink
+    return (
+      roomLink?.enabled === true &&
+      roomLink?.catalog?.persistentProcess === true &&
+      roomLink?.catalog?.protocolVersions?.includes(1) &&
+      roomLink?.catalog?.linkModes?.includes('direct')
+    )
+  })
+  const preferredHome = text(activeConnectionId)
+  const homeConnectionId = homeCandidates.includes(preferredHome)
+    ? preferredHome
+    : homeCandidates[0] || null
+
+  if (!homeConnectionId) {
+    return {
+      kind: 'unsupported',
+      reason: 'no-persistent-home',
+      connectionId: null,
+      homeConnectionId: null,
+      memberConnectionIds,
+      remoteConnectionIds: connectionIds,
+      limits: HOSTED_ROOM_CLIENT_LIMITATIONS
+    }
+  }
+
+  const remoteConnectionIds = connectionIds.filter(connectionId => connectionId !== homeConnectionId)
+  const unsupportedRemote = remoteConnectionIds.find(connectionId => {
+    const roomLink = classified[connectionId]?.roomLink
+    return (
+      roomLink?.enabled !== true ||
+      roomLink?.catalog?.persistentProcess !== true ||
+      roomLink?.catalog?.text !== true ||
+      !roomLink?.catalog?.installationId ||
+      !roomLink?.catalog?.digest ||
+      !roomLink?.catalog?.protocolVersions?.includes(1) ||
+      !roomLink?.catalog?.linkModes?.includes('direct')
+    )
+  })
+  if (unsupportedRemote) {
+    return {
+      kind: 'unsupported',
+      reason: 'remote-needs-setup',
+      connectionId: null,
+      homeConnectionId,
+      memberConnectionIds,
+      remoteConnectionIds,
+      unavailableConnectionId: unsupportedRemote,
+      limits: HOSTED_ROOM_CLIENT_LIMITATIONS
+    }
+  }
+
+  const unreachableRemote = remoteConnectionIds.find(
+    connectionId => !classified[connectionId]?.roomLink?.endpoint
+  )
+  if (unreachableRemote) {
+    return {
+      kind: 'unsupported',
+      reason: 'remote-needs-address',
+      connectionId: null,
+      homeConnectionId,
+      memberConnectionIds,
+      remoteConnectionIds,
+      unavailableConnectionId: unreachableRemote,
+      limits: HOSTED_ROOM_CLIENT_LIMITATIONS
+    }
+  }
+
+  return {
+    kind: remoteConnectionIds.length ? 'multi-gateway' : 'single-gateway',
+    reason: null,
+    connectionId: homeConnectionId,
+    homeConnectionId,
+    memberConnectionIds,
+    remoteConnectionIds,
+    limits: HOSTED_ROOM_CLIENT_LIMITATIONS
+  }
+}
+
+/** User-facing continuity summary. Architecture names stay out of the green
+ * path; settings can reveal the selected coordinator without exposing URLs,
+ * grants, or transport details. */
+export function describeAutonomousRoomPlan(
+  plan,
+  { homeLabel = 'a Hermes gateway', unavailableLabel = 'One gateway' } = {}
+) {
+  if (plan?.kind === 'multi-gateway') {
+    return {
+      defaultEnabled: true,
+      level: 'distributed',
+      title: 'Continues when Desktop is closed',
+      description: `Bots keep working together across gateways. ${homeLabel} coordinates this room.`
+    }
+  }
+
+  if (plan?.kind === 'single-gateway') {
+    return {
+      defaultEnabled: true,
+      level: 'gateway',
+      title: 'Continues when Desktop is closed',
+      description: `Bots keep working on ${homeLabel}.`
+    }
+  }
+
+  const needsSetup = ['remote-needs-address', 'remote-needs-setup'].includes(plan?.reason)
+  return {
+    defaultEnabled: false,
+    level: 'desktop',
+    title: 'Keep Desktop open for this room',
+    description: needsSetup
+      ? `${unavailableLabel} needs setup before this room can continue on its own.`
+      : 'The selected gateways cannot continue this room on their own yet.'
   }
 }
 
