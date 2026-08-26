@@ -495,6 +495,7 @@ const StatusRulePane = memo(function StatusRulePane({
         cols={composer.cols}
         cwdLabel={status.cwdLabel}
         focusView={ui.focusView}
+        hideYoloBadge={ui.info?.hide_yolo_badge}
         indicatorStyle={ui.indicatorStyle}
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
@@ -513,7 +514,6 @@ const StatusRulePane = memo(function StatusRulePane({
         voiceLabel={status.voiceLabel}
         yolo={ui.info?.yolo}
         yoloSource={ui.info?.yolo_source}
-        hideYoloBadge={ui.info?.hide_yolo_badge}
       />
     </Box>
   )
