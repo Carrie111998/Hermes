@@ -26,6 +26,7 @@ from events.bus import EventBus
 from events.noise_guards import (
     FlapGuard,
     RepeatGuard,
+    is_off_ladder_consecutive_failure,
     is_sustained_resource_repeat,
     is_noop_cron_output,
     normalize_for_fingerprint,
@@ -332,6 +333,13 @@ class TelegramNotifier(BaseSubscriber):
             return
         if is_sustained_resource_repeat(event):
             return
+        # P4 for a MONOTONE signal: a job that has failed 4 times in a row
+        # is not news 13 minutes after it had failed 3 times. Only ladder
+        # rungs (3, 6, 12, 24 ...) reach chat; the rest stay on the bus.
+        # This is what makes the producer effectively rising-edge, which is
+        # the property the v3 design already assumed it had.
+        if is_off_ladder_consecutive_failure(event):
+            return
         if event.event_type == EventType.CRON_COMPLETED:
             output = (event.payload or {}).get("output_summary", "")
             if (route.attention not in (Attention.WARN, Attention.ACT)
@@ -389,8 +397,23 @@ class TelegramNotifier(BaseSubscriber):
         # bug machine-gunned 79 near-identical tracker_partial_backlog
         # pings at the action surface; a broken producer must cost one
         # message per window, not one per fire.
+        #
+        # Two exceptions, both about signals that ESCALATE rather than flap:
+        #   * a cron_failed_consecutive that reached here already passed the
+        #     ladder gate above, which IS its rate limit. Running it through
+        #     RepeatGuard too would re-collapse the rungs onto one another
+        #     (3 and 6 normalize identically) and restore the 2026-08-25
+        #     behaviour this ladder exists to remove.
+        #   * every other WARN+CRITICAL route dedups on a NON-SLIDING window,
+        #     so a fault that persists costs one message per 30 min rather
+        #     than one message for the entire outage.
+        sustained_critical = (route.attention is Attention.WARN
+                              and route.priority is Priority.CRITICAL)
+        ladder_rung = event.event_type == EventType.CRON_FAILED_CONSECUTIVE
         if (route.wa_tier != WA_IMMEDIATE
-                and self._repeat_guard.is_repeat(thread_id, message)):
+                and not ladder_rung
+                and self._repeat_guard.is_repeat(
+                    thread_id, message, sliding=not sustained_critical)):
             return
 
         if route.batch:
