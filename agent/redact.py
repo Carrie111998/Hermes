@@ -360,6 +360,14 @@ def _key_has_secret_keyword(key: str) -> bool:
             return True
     return False
 
+
+# Public alias: other modules (e.g. the API server, to decide which per-run env
+# values to force-scrub) should not reach for the underscore-prefixed name.
+def key_has_secret_keyword(key: str) -> bool:
+    """Public wrapper for :func:`_key_has_secret_keyword`."""
+    return _key_has_secret_keyword(key)
+
+
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(

@@ -136,6 +136,58 @@ def test_validate_rejects_binding_object():
         _validate()({"BIKER_ATLAS_DB_DISABLED": {"type": "plain", "value": "true"}})
 
 
+# --- reserved / unsafe keys (review concern #1) --------------------------
+@pytest.mark.parametrize(
+    "key",
+    [
+        "PATH", "PYTHONPATH", "NODE_OPTIONS", "BASH_ENV",
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+        "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "NO_PROXY",
+        "HERMES_SESSION_ID", "HERMES_TASK_ID", "hermes_anything",
+    ],
+)
+def test_validate_rejects_reserved_or_unsafe_keys(key):
+    # A per-run env must not hijack tool subprocess execution, redirect egress,
+    # or spoof session attribution.
+    with pytest.raises(ValueError):
+        _validate()({key: "x"})
+
+
+def test_validate_accepts_ordinary_app_keys():
+    # The Biker Atlas keys are ordinary app config and must still pass.
+    env = {
+        "SITE_URL": "https://thebikeratlas.com",
+        "DIRECTORY_API_URL": "https://thebikeratlas.com/api",
+        "BIKER_ATLAS_DB_DISABLED": "true",
+        "DIRECTORY_AGENT_PASSWORD": "sup3r-s3cr3t-value",
+    }
+    assert _validate()(env) == env
+
+
+# --- run env follows the real worker-thread channel (review concern #2) ---
+def test_run_env_propagates_through_worker_thread():
+    """ContextVars (incl. _RUN_ENV) reach pool threads via the same
+    propagate_context_to_thread channel the session vars use."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tools.environments.local import _inject_session_context_env
+    from tools.thread_context import propagate_context_to_thread
+
+    def _read_env_in_thread():
+        env: dict = {}
+        _inject_session_context_env(env)
+        return env
+
+    tok = sc.set_run_env({"SITE_URL": "https://thebikeratlas.com"})
+    try:
+        wrapped = propagate_context_to_thread(_read_env_in_thread)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            child_env = pool.submit(wrapped).result()
+        assert child_env.get("SITE_URL") == "https://thebikeratlas.com"
+    finally:
+        sc.reset_run_env(tok)
+
+
 # --- api_server error redactor scrubs registered run secrets --------------
 def test_redact_api_error_text_scrubs_registered_secret():
     from agent.redact import set_extra_literal_secrets, reset_extra_literal_secrets
