@@ -940,24 +940,6 @@ export function setTreeSideCollapsed(side: TreeSide, collapsed: boolean) {
 }
 
 /**
- * Does the layout have a collapsible root side of `side`? ⌘J's normal target is
- * the right sidebar; a layout without one (e.g. a terminal-on-bottom preset)
- * lets callers fall back to the terminal so ⌘J is never a dead key. Semantic —
- * reuses `rootChildSide`, so it tracks a ⌘\ flip / drag like the toggles do.
- */
-export function layoutHasRootSide(side: TreeSide): boolean {
-  const row = rootRow()
-
-  if (!row) {
-    return false
-  }
-
-  const panes = registry.getArea('panes')
-
-  return row.children.some(child => rootChildSide(child, id => panes.find(p => p.id === id)) === side)
-}
-
-/**
  * Un-dismiss + re-adopt every registered pane whose placement maps to `side`
  * (the same semantic mapping as `rootChildSide`: 'left' panes ⇔ ⌘B, everything
  * else non-main ⇔ ⌘J). Dismissal records for core chrome panes only exist as

@@ -278,8 +278,8 @@ export interface Translations {
     search: string
     searchTitle: string
     swapSidebarSides: string
-    hideRightSidebar: string
-    showRightSidebar: string
+    hideFiles: string
+    showFiles: string
     unreadSessions: (count: number) => string
     muteHaptics: string
     unmuteHaptics: string

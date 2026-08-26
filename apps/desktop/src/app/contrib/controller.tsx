@@ -15,7 +15,6 @@ import {
   $layoutTree,
   bindPaneVisibility,
   bindToolPaneCollapse,
-  bindTreeSideVisibility,
   declareDefaultTree,
   dismissTreePane,
   isPaneVisible,
@@ -91,6 +90,7 @@ import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
 import { $workspaceIsPage } from '../routes'
 
 import { FilesPane, LogsPane, ReviewPaneContent } from './panes'
+import { wireTitlebarVisibility } from './titlebar-visibility'
 import { ContribWiring, WiredPane } from './wiring'
 
 /**
@@ -523,10 +523,9 @@ $workspaceIsPage.listen(syncWorkspaceTitle)
 registerLayoutResetHandler(stackSessionTilesIntoMain)
 
 // ---------------------------------------------------------------------------
-// Titlebar chrome toggles -> tree. The TitlebarControls buttons keep their
-// store semantics ($sidebarOpen / $fileBrowserOpen / $panesFlipped); the tree
-// reacts — a hidden pane's zone collapses (content stays mounted), the flip
-// toggle mirrors the root row.
+// Titlebar chrome visibility -> tree. Sessions remains a positional left-side
+// collapse; Files is the semantic leaf binding below, so sibling right panes
+// stay visible and mounted. The flip toggle mirrors the root row.
 // ---------------------------------------------------------------------------
 
 // HIDE-STYLE PANES (files, review, preview): the binding lives in the tree
@@ -572,11 +571,10 @@ $panesFlipped.listen(flipped => {
   }
 })
 
-// POSITIONAL side toggles (titlebar buttons, ⌘B / ⌘J): $sidebarOpen ≙ the
-// LEFT side of the main zone, $fileBrowserOpen ≙ the RIGHT — everything on
-// that side hides together, whatever panes have been rearranged there.
-bindTreeSideVisibility('left', $sidebarOpen, setSidebarOpen)
-bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
+// The Sessions titlebar control (⌘B) owns the semantic left side of the main
+// zone. Files (⌘J) is intentionally not a physical-side binding: its existing
+// bindPaneVisibility below targets only the `files` leaf by id.
+wireTitlebarVisibility()
 
 // Workspace-scoped surfaces: the file tree and git diff only mean something
 // inside a project. A detached chat (no cwd) hides them — their zones
@@ -585,9 +583,9 @@ bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
 // rode the rail's row and vanished with it), its zone stands on its own.
 const $hasWorkspace = computed($currentCwd, cwd => Boolean(cwd.trim()))
 
-// The tree pane's own presence tracks ⌘J directly, not just the column's
-// collapse — otherwise a pane revealed into that shared column would drag the
-// tree along with it.
+// The Files leaf's own presence tracks ⌘J directly. Hiding it preserves its
+// tree group while arbitrary sibling panes in the same physical side remain
+// visible and mounted.
 //
 // Both get a CLOSER and an OPENER. The closer keeps ⌘J/⌘G truthful when the
 // pane is closed from the tab menu; the opener is its mirror, so bringing the
@@ -776,11 +774,11 @@ registry.register(
   })
 )
 
-// Sessions/files Close = collapse their SIDE (⌘B/⌘J truthful, titlebar button
-// flips back) — but only while the pane actually lives in that root side
-// column. Dragged next to main, a side collapse can't hide it (the collapse
-// skips main-bearing children), so Close falls back to dismissal there —
-// otherwise ⌘W/Close silently no-op.
+// Sessions Close collapses the left side; Files Close hides only the semantic
+// Files leaf in the right side (so sibling panes stay visible). Each action
+// applies only while its pane lives in the expected root side. If either pane
+// is dragged elsewhere, Close falls back to dismissing that pane so ⌘W/Close
+// never silently no-ops.
 registerPaneCloser('sessions', () =>
   paneRootSide('sessions') === 'left' ? setSidebarOpen(false) : dismissTreePane('sessions')
 )
