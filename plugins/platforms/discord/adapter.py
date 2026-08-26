@@ -7344,13 +7344,14 @@ class DiscordAdapter(BasePlatformAdapter):
         parent_chat_id: str,
         name: str,
     ) -> Optional[str]:
-        """Create a Discord thread under a text channel for a handoff.
+        """Create a visible, message-anchored Discord handoff thread.
 
-        Falls back to a seed-message + ``message.create_thread`` path if
-        ``parent.create_thread`` is rejected (some channel types or
-        permission setups). Returns the new thread id as a string, or
-        ``None`` on failure or when the parent isn't a text channel
-        (DMs, voice channels, threads themselves can't host threads).
+        The parent anchor contains only the sanitized thread name; the caller
+        delivers the actual handoff content into the returned child thread. If
+        the anchor send or anchored thread creation fails, return ``None`` so
+        callers can deliver flat to the parent. When creation fails after the
+        send, the terse anchor remains as a deterministic orphan; never replace
+        it with an unanchored channel thread.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return None
@@ -7372,48 +7373,53 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
         # DMs, voice channels, and existing threads can't host child threads.
-        if isinstance(parent, getattr(discord, "DMChannel", ())):
+        unsupported_parent_types = tuple(
+            parent_type
+            for name in ("DMChannel", "VoiceChannel", "Thread")
+            if isinstance((parent_type := getattr(discord, name, None)), type)
+        )
+        if unsupported_parent_types and isinstance(parent, unsupported_parent_types):
             logger.info(
-                "[%s] Handoff thread: parent %s is a DM; threads not supported here",
+                "[%s] Handoff thread: parent %s cannot host a child thread",
                 self.name, parent_chat_id,
             )
             return None
 
-        thread_name = (name or "handoff").strip()[:80] or "handoff"
-        reason = "Hermes session handoff"
+        thread_name = self._derive_auto_thread_name(name or "handoff")
+        if utf16_len(thread_name) > 80:
+            thread_name = _prefix_within_utf16_limit(thread_name, 77).rstrip() + "..."
+        anchor_name = re.sub(
+            r"([\\*_`~|])",
+            lambda match: f"\\{match.group(1)}",
+            thread_name,
+        )
+        anchor = (
+            f"\U0001f9f5 **{anchor_name}** \N{EM DASH} "
+            "open this thread to continue."
+        )
 
-        # First try: create a thread directly on the channel.
-        try:
-            create = getattr(parent, "create_thread", None)
-            if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                )
-                return str(thread.id)
-        except Exception as direct_error:
-            logger.debug(
-                "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
-                self.name, direct_error,
-            )
-
-        # Fallback: post a seed message and create the thread from it.
         try:
             send = getattr(parent, "send", None)
-            if send is None:
+            if not callable(send):
                 return None
-            seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
-            thread = await seed_msg.create_thread(
+            seed_msg = await send(
+                anchor,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            create = getattr(seed_msg, "create_thread", None)
+            if not callable(create):
+                raise TypeError("anchor message cannot create a thread")
+            thread = await create(
                 name=thread_name,
                 auto_archive_duration=1440,
-                reason=reason,
+                reason="Hermes session handoff",
             )
             return str(thread.id)
-        except Exception as fallback_error:
+        except Exception as exc:
             logger.warning(
-                "[%s] Handoff thread: both create paths failed for parent %s: %s",
-                self.name, parent_chat_id, fallback_error,
+                "[%s] Handoff thread: visible anchor/thread creation failed "
+                "for parent %s; caller will fall back to flat delivery: %s",
+                self.name, parent_chat_id, exc,
             )
             return None
 
