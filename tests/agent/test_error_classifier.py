@@ -1207,6 +1207,36 @@ class TestCopilotAcpSessionLimit:
         assert result.reason == FailoverReason.billing
         assert result.should_fallback is True
 
+    def test_prose_never_resets_is_not_transient(self):
+        """The bare word "resets" in prose must not flip a hard cap to a
+        retryable rate limit: "never resets" names the ABSENCE of a reset
+        window. Only the time-shaped form ("resets 5:20pm", "resets at 9")
+        counts as a transient signal."""
+        result = classify_api_error(
+            RuntimeError("your trial quota never resets — upgrade to continue"),
+            provider="claude-acp",
+            model="claude-opus-4-8",
+        )
+        assert result.reason == FailoverReason.billing
+        assert result.reason != FailoverReason.rate_limit
+        assert result.retryable is False
+
+    def test_prose_plan_resets_monthly_is_not_transient(self):
+        """Documentation-quoting errors ("plan resets monthly") carry no
+        concrete reset moment — retrying against them burns the retry budget
+        on a cap that will not lift this session."""
+        result = classify_api_error(
+            RuntimeError(
+                "Usage limit exceeded for this API key. Note: the free plan "
+                "resets monthly; upgrade for higher limits."
+            ),
+            provider="claude-acp",
+            model="claude-opus-4-8",
+        )
+        assert result.reason == FailoverReason.billing
+        assert result.reason != FailoverReason.rate_limit
+        assert result.retryable is False
+
 
 # ── Test: multimodal_tool_content_unsupported pattern ───────────────────
 
