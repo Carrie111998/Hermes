@@ -5412,15 +5412,21 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 # (``os.getpgid`` is POSIX-only).
 _stdio_pgids: Dict[int, int] = {}  # pid -> pgid
 
-# Only the stdio process-spawn window is serialized. Sessions run concurrently
-# after their direct child PID has been attributed to the owning server.
-_stdio_spawn_lock = asyncio.Lock()
+# Only the stdio process-spawn window is serialized. A threading lock remains
+# valid when Hermes tears down and recreates the MCP asyncio event loop.
+_stdio_spawn_lock = threading.Lock()
+
+
+async def _acquire_stdio_spawn_lock() -> None:
+    """Acquire the loop-neutral spawn lock without blocking an event loop."""
+    while not _stdio_spawn_lock.acquire(blocking=False):
+        await asyncio.sleep(0.01)
 
 
 @asynccontextmanager
 async def _tracked_stdio_spawn(client_context):
     """Enter one stdio client and attribute only its own child processes."""
-    await _stdio_spawn_lock.acquire()
+    await _acquire_stdio_spawn_lock()
     try:
         pids_before = _snapshot_child_pids()
         streams = await client_context.__aenter__()

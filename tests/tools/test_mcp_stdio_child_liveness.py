@@ -175,7 +175,12 @@ def test_parallel_stdio_spawn_capture_keeps_each_server_pid_owned(monkeypatch):
         await asyncio.gather(capture(101), capture(202))
 
     asyncio.run(run_both())
+    assert captured == {101: {101}, 202: {202}}
 
+    # Hermes tears down and recreates its MCP event loop. The spawn guard must
+    # remain usable after the loop that first contended on it has closed.
+    captured.clear()
+    asyncio.run(run_both())
     assert captured == {101: {101}, 202: {202}}
 
 
