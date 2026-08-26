@@ -10,6 +10,9 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
    real one. (We do NOT also redirect HOME — that broke subprocesses in
    CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
    ``get_hermes_home()`` is a bug to fix at the callsite.)
+2b. **Isolated HERMES_DOTFILES_DIR.** Same reasoning for the dotfiles
+   root, so config-integrity seals land in a tempdir instead of the
+   operator's real ``hermes/config_integrity.jsonl``.
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
@@ -62,6 +65,20 @@ if not os.environ.get("HERMES_HOME"):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+
+# Same window, same reasoning, for the dotfiles root. The config-integrity
+# watchdog appends one JSONL row per seal to
+# ``$HERMES_DOTFILES_DIR/hermes/config_integrity.jsonl``, resolving that path
+# at call time. Sandboxing HERMES_HOME alone puts the *config* in a tempdir but
+# still writes its seal to the operator's real, git-tracked log — and because
+# the row carries the tempdir's config_path, a consumer that reads the last row
+# then compares it against the live config sees a permanent mismatch. Measured
+# on a live install: 69 of 149 rows came from pytest temp configs, and the
+# operator's infra health check reported CONFIG INTEGRITY FAIL on every run.
+if not os.environ.get("HERMES_DOTFILES_DIR"):
+    _SESSION_DOTFILES_DIR = tempfile.mkdtemp(prefix="hermes-test-dotfiles-")
+    os.environ["HERMES_DOTFILES_DIR"] = _SESSION_DOTFILES_DIR
+    atexit.register(shutil.rmtree, _SESSION_DOTFILES_DIR, True)
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in
@@ -439,6 +456,14 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+    # 3a. Redirect HERMES_DOTFILES_DIR too. The config-integrity watchdog
+    #     resolves ``$HERMES_DOTFILES_DIR/hermes/config_integrity.jsonl`` at
+    #     call time, so a test that seals a tempdir config still appends to the
+    #     operator's real, git-tracked seal log without this.
+    fake_dotfiles = tmp_path / "dotfiles_test"
+    (fake_dotfiles / "hermes").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_DOTFILES_DIR", str(fake_dotfiles))
 
     # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
     #     at import time. When the module is first imported at collection (any
