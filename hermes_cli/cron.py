@@ -472,7 +472,10 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
         job = result.get("job", {})
-        if job.get("executed"):
+        if job.get("execution_mode") == "background":
+            print("  Dispatched to background — outcome will arrive as a new")
+            print("  message when the job finishes. Do not wait or poll.")
+        elif job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")
         elif job.get("execution_skipped"):

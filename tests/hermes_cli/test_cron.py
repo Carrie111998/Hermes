@@ -213,6 +213,81 @@ def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):
     assert calls == [True]
 
 
+def test_cron_run_background_dispatch_does_not_report_failed(monkeypatch, capsys):
+    """`hermes cron run` on a background-dispatched job should report
+    'Dispatched to background', not 'Ran now: failed'.
+
+    The cronjob tool returns ``execution_mode: "background"`` when the job
+    is dispatched via async delegation. The CLI must not interpret the
+    missing ``execution_success`` (which is only set for synchronous runs)
+    as a failure.
+    """
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: {
+            "success": True,
+            "job": {
+                "id": "test-job-123",
+                "name": "test-job",
+                "next_run_at": "2026-08-27T10:00:00-04:00",
+                "executed": True,
+                "execution_mode": "background",
+                "delegation_id": "deleg_abc123",
+            },
+        },
+    )
+    rc = cron_command(Namespace(cron_command="run", job_id="test-job-123", accept_hooks=False))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Dispatched to background" in out
+    assert "failed" not in out.lower()
+
+
+def test_cron_run_sync_failure_still_reports_failed(monkeypatch, capsys):
+    """Synchronous runs that genuinely fail should still report 'failed'."""
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: {
+            "success": True,
+            "job": {
+                "id": "test-job-456",
+                "name": "test-job",
+                "next_run_at": "2026-08-27T10:00:00-04:00",
+                "executed": True,
+                "execution_success": False,
+            },
+        },
+    )
+    rc = cron_command(Namespace(cron_command="run", job_id="test-job-456", accept_hooks=False))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Ran now: failed" in out
+
+
+def test_cron_run_sync_success_reports_succeeded(monkeypatch, capsys):
+    """Synchronous runs that succeed should report 'succeeded'."""
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: {
+            "success": True,
+            "job": {
+                "id": "test-job-789",
+                "name": "test-job",
+                "next_run_at": "2026-08-27T10:00:00-04:00",
+                "executed": True,
+                "execution_success": True,
+            },
+        },
+    )
+    rc = cron_command(Namespace(cron_command="run", job_id="test-job-789", accept_hooks=False))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Ran now: succeeded" in out
+
+
 def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     monkeypatch.setattr(cron_cli, "_cron_api", lambda **kwargs: {"success": False, "error": "boom"})
 
