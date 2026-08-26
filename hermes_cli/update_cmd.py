@@ -383,14 +383,26 @@ def _preserve_local_commits_before_reset(git_cmd, cwd, remote_ref) -> str | None
     commits (the common managed-install case — no branch, no output). The
     refs are known to resolve at this point (the failed ff-only merge just
     used both), so a rev-list failure is treated as "nothing to preserve"
-    rather than aborting the update recovery. A branch-creation failure
-    (e.g. a same-second backup name collision, which already points at this
-    same HEAD) warns loudly and also returns None.
+    rather than aborting the update recovery. Every git invocation here is
+    also guarded against ``OSError`` (git briefly unresolvable on PATH, bad
+    exec format): this runs inside update recovery, where degrading to
+    today's reflog-only behavior beats dying and making things worse.
+    A branch-creation failure warns loudly and also returns None.
+
+    The branch name carries the UTC timestamp *and* HEAD's short SHA, so it
+    is self-describing and cannot collide with a second backup taken in the
+    same second. Backup branches accumulate across updates and are never
+    pruned automatically — deleting them is manual (`git branch -D`), which
+    is deliberate: nothing should silently reap the only ref pointing at a
+    user's orphaned work.
     """
-    ahead = subprocess.run(
-        git_cmd + ["rev-list", f"{remote_ref}..HEAD", "--count"],
-        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
+    try:
+        ahead = subprocess.run(
+            git_cmd + ["rev-list", f"{remote_ref}..HEAD", "--count"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
     if ahead.returncode != 0 or not ahead.stdout.strip().isdigit():
         return None
     local_count = int(ahead.stdout.strip())
@@ -400,11 +412,17 @@ def _preserve_local_commits_before_reset(git_cmd, cwd, remote_ref) -> str | None
     from datetime import timezone
 
     backup = datetime.now(timezone.utc).strftime("hermes-update-backup-%Y%m%d-%H%M%S")
-    created = subprocess.run(
-        git_cmd + ["branch", backup, "HEAD"],
-        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if created.returncode != 0:
+    head = _capture_head_sha(git_cmd, cwd)
+    if head:
+        backup = f"{backup}-{head[:7]}"
+    try:
+        created = subprocess.run(
+            git_cmd + ["branch", backup, "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        created = None
+    if created is None or created.returncode != 0:
         print(
             f"  ⚠ Could not create a backup branch for {local_count} local "
             "commit(s) before the reset — they are recoverable via `git reflog`."

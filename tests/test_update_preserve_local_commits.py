@@ -116,3 +116,49 @@ def test_no_backup_when_head_has_no_local_commits(tmp_path: Path) -> None:
 
     assert backup is None
     assert _backup_branches(clone) == []
+
+
+def test_backup_name_carries_head_sha_so_same_second_backups_never_collide(
+    diverged_clone: tuple[Path, str],
+) -> None:
+    """Two backups taken inside the same second must not fight over one name.
+
+    The timestamp alone has second resolution, so a second call would hit an
+    existing branch and lose the ref. Suffixing HEAD's short SHA makes the
+    name unique per distinct HEAD and self-describing.
+    """
+    clone, local_sha = diverged_clone
+
+    first = update_cmd._preserve_local_commits_before_reset(["git"], clone, "origin/main")
+    assert first is not None
+    assert first.endswith(f"-{local_sha[:7]}")
+
+    # A second local commit, same wall-clock second: a different HEAD, so a
+    # different branch name — both refs survive.
+    second_sha = _commit(clone, "local2.txt", "more", "more local work")
+    second = update_cmd._preserve_local_commits_before_reset(["git"], clone, "origin/main")
+
+    assert second is not None
+    assert second != first
+    assert second.endswith(f"-{second_sha[:7]}")
+    assert _git(clone, "rev-parse", first).stdout.strip() == local_sha
+    assert _git(clone, "rev-parse", second).stdout.strip() == second_sha
+
+
+def test_unresolvable_git_degrades_instead_of_killing_update_recovery(
+    diverged_clone: tuple[Path, str],
+) -> None:
+    """An OSError from git must not abort the update — this runs in recovery.
+
+    Without the guard the helper raises straight out of the diverged-reset
+    path, so a transient PATH problem turns "your commits are only in the
+    reflog" into "the updater crashed mid-recovery".
+    """
+    clone, _local_sha = diverged_clone
+
+    backup = update_cmd._preserve_local_commits_before_reset(
+        ["definitely-not-a-real-git-binary"], clone, "origin/main"
+    )
+
+    assert backup is None
+    assert _backup_branches(clone) == []
