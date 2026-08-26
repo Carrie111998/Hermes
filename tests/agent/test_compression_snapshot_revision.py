@@ -10,7 +10,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.conversation_compression import CompressionSnapshotStaleError
+from agent.conversation_compression import (
+    CompressionCommitFailedError,
+    CompressionCommitFence,
+    CompressionSnapshotStaleError,
+)
 from hermes_state import (
     CompressionSessionBusyError,
     CompressionTranscriptRevisionError,
@@ -373,7 +377,7 @@ def test_projection_length_mismatch_with_equal_revision_still_compresses(
     agent.context_compressor.compress.assert_called_once()
 
 
-def test_external_append_after_snapshot_raises_stale_without_compressing(
+def test_external_append_after_snapshot_is_preserved_without_stale(
     tmp_path: Path,
 ) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -388,21 +392,25 @@ def test_external_append_after_snapshot_raises_stale_without_compressing(
     agent = _build_compression_agent(db, session_id)
     agent._durable_transcript_revision = expected_revision
 
-    with pytest.raises(CompressionSnapshotStaleError) as caught:
-        agent._compress_context(projection, "sys", approx_tokens=120_000)
+    compressed, _ = agent._compress_context(
+        projection, "sys", approx_tokens=120_000
+    )
 
-    assert caught.value.expected_revision == expected_revision
-    assert caught.value.observed_revision == db.get_active_message_revision(session_id)
-    agent.context_compressor.compress.assert_not_called()
-    assert db.find_live_compression_child(session_id) is None
+    agent.context_compressor.compress.assert_called_once()
+    child_session_id = agent.session_id
+    assert child_session_id != session_id
+    assert [message["content"] for message in compressed] == [
+        "x",
+        "external committed row",
+    ]
     assert [
         message["content"]
-        for message in db.get_messages_as_conversation(session_id)
-    ] == ["snapshot row", "external committed row"]
+        for message in db.get_messages_as_conversation(child_session_id)
+    ] == ["x", "external committed row"]
     assert db.get_compression_lock_holder(session_id) is None
 
 
-def test_rotation_commit_fence_rejects_mutation_after_precheck(
+def test_rotation_commit_fence_rejects_prefix_mutation_after_precheck(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -415,16 +423,18 @@ def test_rotation_commit_fence_rejects_mutation_after_precheck(
     setattr(agent, "_durable_transcript_revision", expected_revision)
     original_publish = db.publish_compression_child
 
-    def _publish_after_late_write(**kwargs) -> None:
-        _append_bypassing_compression_lease(
-            db,
-            session_id,
-            role="assistant",
-            content="late durable row",
-        )
+    def _publish_after_prefix_rewrite(**kwargs) -> None:
+        def _rewrite(conn) -> None:
+            conn.execute(
+                "UPDATE messages SET api_content = ? "
+                "WHERE session_id = ? AND active = 1",
+                ("destructive API rewrite", session_id),
+            )
+
+        db._execute_write(_rewrite)
         original_publish(**kwargs)
 
-    monkeypatch.setattr(db, "publish_compression_child", _publish_after_late_write)
+    monkeypatch.setattr(db, "publish_compression_child", _publish_after_prefix_rewrite)
 
     with pytest.raises(CompressionSnapshotStaleError) as caught:
         agent._compress_context(
@@ -437,11 +447,299 @@ def test_rotation_commit_fence_rejects_mutation_after_precheck(
     assert caught.value.observed_revision == db.get_active_message_revision(session_id)
     getattr(agent, "context_compressor").compress.assert_called_once()
     assert db.find_live_compression_child(session_id) is None
+    assert db.get_active_message_revision(session_id) != expected_revision
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_rotation_commit_preserves_append_only_tail_during_slow_summary(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_session_id = "rotation-append-progress"
+    db.create_session(parent_session_id, source="webui")
+    db.append_message(parent_session_id, "user", "snapshot row")
+    agent = _build_compression_agent(db, parent_session_id)
+
+    def _compress_after_late_append(_messages, **_kwargs):
+        _append_bypassing_compression_lease(
+            db,
+            parent_session_id,
+            role="assistant",
+            content="late durable row",
+        )
+        return [{"role": "user", "content": "x"}]
+
+    agent.context_compressor.compress.side_effect = _compress_after_late_append
+
+    compressed, _ = agent._compress_context(
+        [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    child_session_id = agent.session_id
+    assert child_session_id != parent_session_id
+    assert [message["content"] for message in compressed] == [
+        "x",
+        "late durable row",
+    ]
     assert [
         message["content"]
-        for message in db.get_messages(session_id)
-    ] == ["snapshot row", "late durable row"]
-    assert db.get_compression_lock_holder(session_id) is None
+        for message in db.get_messages_as_conversation(child_session_id)
+    ] == ["x", "late durable row"]
+    live_child = db.find_live_compression_child(parent_session_id)
+    assert live_child is not None
+    assert live_child["id"] == child_session_id
+    assert db.get_compression_lock_holder(parent_session_id) is None
+
+
+def test_repeated_cancelled_fences_then_append_only_rotation_makes_progress(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_session_id = "rotation-after-cancelled-fences"
+    db.create_session(parent_session_id, source="webui")
+    db.append_message(parent_session_id, "user", "snapshot row")
+
+    cancelled_appends = []
+    for attempt in range(3):
+        agent = _build_compression_agent(db, parent_session_id)
+        fence = CompressionCommitFence()
+        assert fence.cancel_before_commit() is True
+        projection = db.get_messages_as_conversation(parent_session_id)
+
+        returned, _ = agent._compress_context(
+            projection,
+            "sys",
+            approx_tokens=120_000,
+            commit_fence=fence,
+        )
+
+        assert returned == projection
+        agent.context_compressor.compress.assert_not_called()
+        assert db.find_live_compression_child(parent_session_id) is None
+        content = f"append after cancelled fence {attempt}"
+        cancelled_appends.append(content)
+        db.append_message(parent_session_id, "assistant", content)
+
+    agent = _build_compression_agent(db, parent_session_id)
+
+    def _compress_after_final_append(_messages, **_kwargs):
+        _append_bypassing_compression_lease(
+            db,
+            parent_session_id,
+            role="assistant",
+            content="append during final slow summary",
+        )
+        return [{"role": "user", "content": "x"}]
+
+    agent.context_compressor.compress.side_effect = _compress_after_final_append
+    projection = db.get_messages_as_conversation(parent_session_id)
+    compressed, _ = agent._compress_context(
+        projection,
+        "sys",
+        approx_tokens=120_000,
+        commit_fence=CompressionCommitFence(),
+    )
+
+    child_session_id = agent.session_id
+    assert child_session_id != parent_session_id
+    assert [message["content"] for message in compressed] == [
+        "x",
+        "append during final slow summary",
+    ]
+    parent_contents = [
+        message["content"]
+        for message in db.get_messages(parent_session_id, include_inactive=True)
+    ]
+    for content in cancelled_appends:
+        assert parent_contents.count(content) == 1
+    child_contents = [
+        message["content"]
+        for message in db.get_messages_as_conversation(child_session_id)
+    ]
+    assert child_contents.count("x") == 1
+    assert child_contents.count("append during final slow summary") == 1
+    assert db.get_compression_lock_holder(parent_session_id) is None
+
+
+def test_rotation_preserves_append_after_tail_ceiling_before_flush(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_session_id = "rotation-post-ceiling-append"
+    db.create_session(parent_session_id, source="webui")
+    db.append_message(parent_session_id, "user", "snapshot row")
+    agent = _build_compression_agent(db, parent_session_id)
+    agent._durable_transcript_revision = db.get_active_message_revision(
+        parent_session_id
+    )
+    original_flush = agent._flush_messages_to_session_db
+    injected = False
+
+    def _flush_after_foreign_append(*args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            _append_bypassing_compression_lease(
+                db,
+                parent_session_id,
+                role="assistant",
+                content="late after ceiling",
+            )
+        return original_flush(*args, **kwargs)
+
+    monkeypatch.setattr(
+        agent,
+        "_flush_messages_to_session_db",
+        _flush_after_foreign_append,
+    )
+
+    compressed, _ = agent._compress_context(
+        [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    child_session_id = agent.session_id
+    child_contents = [
+        message["content"]
+        for message in db.get_messages_as_conversation(child_session_id)
+    ]
+    assert [message["content"] for message in compressed] == child_contents
+    assert child_contents == ["x", "late after ceiling"]
+    assert child_contents.count("late after ceiling") == 1
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_committed_projection_and_revision_share_one_atomic_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_place: bool,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_session_id = f"atomic-post-commit-{'in-place' if in_place else 'rotation'}"
+    db.create_session(parent_session_id, source="webui")
+    db.append_message(parent_session_id, "user", "snapshot row")
+    agent = _build_compression_agent(db, parent_session_id)
+    agent.compression_in_place = in_place
+    agent._durable_transcript_revision = db.get_active_message_revision(
+        parent_session_id
+    )
+    committed_session_id = None
+    injected = False
+    if in_place:
+        original_commit = db.archive_and_compact
+
+        def _commit_then_mark(*args, **kwargs):
+            nonlocal committed_session_id, injected
+            result = original_commit(*args, **kwargs)
+            committed_session_id = parent_session_id
+            _append_bypassing_compression_lease(
+                db,
+                committed_session_id,
+                role="assistant",
+                content="append between projection and revision",
+            )
+            injected = True
+            return result
+
+        monkeypatch.setattr(db, "archive_and_compact", _commit_then_mark)
+    else:
+        original_commit = db.publish_compression_child
+
+        def _commit_then_mark(*args, **kwargs):
+            nonlocal committed_session_id, injected
+            result = original_commit(*args, **kwargs)
+            committed_session_id = kwargs["child_session_id"]
+            _append_bypassing_compression_lease(
+                db,
+                committed_session_id,
+                role="assistant",
+                content="append between projection and revision",
+            )
+            injected = True
+            return result
+
+        monkeypatch.setattr(db, "publish_compression_child", _commit_then_mark)
+
+    compressed, _ = agent._compress_context(
+        [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    assert injected is True
+    assert "append between projection and revision" not in [
+        message["content"] for message in compressed
+    ]
+    assert agent._durable_transcript_revision != db.get_active_message_revision(
+        agent.session_id
+    )
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_committed_projection_is_returned_by_the_write_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_place: bool,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_session_id = f"post-commit-read-failure-{'in-place' if in_place else 'rotation'}"
+    db.create_session(parent_session_id, source="webui")
+    db.append_message(parent_session_id, "user", "snapshot row")
+    agent = _build_compression_agent(db, parent_session_id)
+    agent.compression_in_place = in_place
+    agent._durable_transcript_revision = db.get_active_message_revision(
+        parent_session_id
+    )
+    original_loader = db.get_messages_as_conversation
+    committed_session_id = None
+    if in_place:
+        original_commit = db.archive_and_compact
+
+        def _commit_then_mark(*args, **kwargs):
+            nonlocal committed_session_id
+            result = original_commit(*args, **kwargs)
+            committed_session_id = parent_session_id
+            return result
+
+        monkeypatch.setattr(db, "archive_and_compact", _commit_then_mark)
+    else:
+        original_commit = db.publish_compression_child
+
+        def _commit_then_mark(*args, **kwargs):
+            nonlocal committed_session_id
+            result = original_commit(*args, **kwargs)
+            committed_session_id = kwargs["child_session_id"]
+            return result
+
+        monkeypatch.setattr(db, "publish_compression_child", _commit_then_mark)
+
+    post_commit_load_attempted = False
+
+    def _fail_after_commit(session_id, *args, **kwargs):
+        nonlocal post_commit_load_attempted
+        if session_id == committed_session_id:
+            post_commit_load_attempted = True
+            raise RuntimeError("post-commit projection read failed")
+        return original_loader(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(db, "get_messages_as_conversation", _fail_after_commit)
+
+    compressed, _ = agent._compress_context(
+        [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    durable_session_id = committed_session_id or parent_session_id
+    assert post_commit_load_attempted is False
+    assert [message["content"] for message in compressed] == ["x"]
+    assert agent._durable_transcript_revision == db.get_active_message_revision(
+        durable_session_id
+    )
 
 
 def test_in_place_commit_preserves_mutation_after_precheck(
@@ -476,7 +774,10 @@ def test_in_place_commit_preserves_mutation_after_precheck(
     )
 
     getattr(agent, "context_compressor").compress.assert_called_once()
-    assert compressed[0]["content"] == "x"
+    assert [message["content"] for message in compressed] == [
+        "x",
+        "late durable row",
+    ]
     assert [
         row["content"] for row in db.get_messages_as_conversation(session_id)
     ] == ["x", "late durable row"]
@@ -564,7 +865,7 @@ def test_restore_rewound_rejects_another_writer_compression_lease(
     assert db.get_messages(session_id, include_inactive=True)[0]["active"] == 0
 
 
-def test_in_place_compaction_also_rejects_stale_revision(tmp_path: Path) -> None:
+def test_in_place_compaction_preserves_append_only_growth(tmp_path: Path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "in-place-stale"
     db.create_session(session_id, source="webui")
@@ -575,19 +876,22 @@ def test_in_place_compaction_also_rejects_stale_revision(tmp_path: Path) -> None
     agent.compression_in_place = True
     agent._durable_transcript_revision = expected_revision
 
-    with pytest.raises(CompressionSnapshotStaleError):
-        agent._compress_context(
-            [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
-            "sys",
-            approx_tokens=120_000,
-        )
+    compressed, _ = agent._compress_context(
+        [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
+        "sys",
+        approx_tokens=120_000,
+    )
 
-    agent.context_compressor.compress.assert_not_called()
+    agent.context_compressor.compress.assert_called_once()
     assert db.get_compression_lock_holder(session_id) is None
+    assert [message["content"] for message in compressed] == [
+        "x",
+        "external committed row",
+    ]
     assert [
         message["content"]
         for message in db.get_messages_as_conversation(session_id)
-    ] == ["snapshot row", "external committed row"]
+    ] == ["x", "external committed row"]
 
 
 def test_compression_rejects_projection_owned_by_another_session(
@@ -1157,7 +1461,7 @@ def test_rotation_rebinds_revision_before_child_append(tmp_path: Path) -> None:
     )
 
 
-def test_preflight_stale_revision_returns_actionable_result_without_api_call(
+def test_preflight_append_only_revision_progresses_to_provider_call(
     tmp_path: Path,
 ) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -1191,18 +1495,23 @@ def test_preflight_stale_revision_returns_actionable_result_without_api_call(
         },
     )
 
-    assert result["completed"] is False
+    assert result["completed"] is True
     assert result["failed"] is False
-    assert result["partial"] is True
-    assert result["compression_snapshot_stale"] is True
-    assert "reload" in result["final_response"].lower()
-    assert api.calls == []
-    agent.context_compressor.compress.assert_not_called()
-    assert db.find_live_compression_child(session_id) is None
-    assert [
+    assert len(api.calls) == 1
+    agent.context_compressor.compress.assert_called_once()
+    compress_input = agent.context_compressor.compress.call_args.args[0]
+    assert any(
+        message.get("content") == "new user turn"
+        for message in compress_input
+    )
+    child_session_id = result["session_id"]
+    assert child_session_id != session_id
+    child_contents = [
         message["content"]
-        for message in db.get_messages_as_conversation(session_id)
-    ] == ["snapshot user", "external answer"]
+        for message in db.get_messages_as_conversation(child_session_id)
+    ]
+    assert child_contents.count("external answer") == 1
+    assert child_contents.count("done") == 1
     assert db.get_compression_lock_holder(session_id) is None
 
 

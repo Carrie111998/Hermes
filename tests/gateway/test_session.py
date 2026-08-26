@@ -1370,8 +1370,6 @@ def test_rewind_session_supports_legacy_db_adapters(tmp_path):
 
 
 def test_rewind_session_rejects_append_after_atomic_target_load(tmp_path, monkeypatch):
-    from hermes_state import CompressionTranscriptRevisionError
-
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
     store._db.close()
@@ -1388,8 +1386,7 @@ def test_rewind_session_rejects_append_after_atomic_target_load(tmp_path, monkey
 
     monkeypatch.setattr(db, "rewind_to_message", append_then_rewind)
 
-    with pytest.raises(CompressionTranscriptRevisionError):
-        store.rewind_session("rewind-race", 1)
+    assert store.rewind_session("rewind-race", 1) is None
 
     assert [m["content"] for m in db.get_messages_as_conversation("rewind-race")] == [
         "target",

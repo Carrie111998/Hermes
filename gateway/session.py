@@ -4282,8 +4282,9 @@ class SessionStore:
                 result = self._db.rewind_to_message(
                     session_id, target_id, **rewind_kwargs
                 )
-            except CompressionTranscriptRevisionError:
-                raise
+            except CompressionTranscriptRevisionError as e:
+                logger.debug("rewind_session: stale durable revision: %s", e)
+                return None
             except ValueError as e:
                 logger.debug("rewind_session: %s", e)
                 return None

@@ -1672,6 +1672,45 @@ def _rebind_durable_transcript_revision(
         )
 
 
+def _bind_committed_projection_with_revision(
+    agent: Any,
+    committed_result: Any,
+    runtime_prefix: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Atomically bind the model projection and revision of a committed segment."""
+    if not (isinstance(committed_result, tuple) and len(committed_result) == 2):
+        raise RuntimeError("committed compression projection is not revision-aware")
+    projection, revision = committed_result
+    if not isinstance(projection, list):
+        raise RuntimeError("committed compression projection is not a message list")
+    from hermes_state import DurableTranscriptRevision
+
+    if not isinstance(revision, DurableTranscriptRevision):
+        raise RuntimeError("committed compression revision is unavailable")
+
+    runtime_projection = []
+    for index, message in enumerate(projection):
+        if not isinstance(message, dict):
+            runtime_projection.append(message)
+            continue
+        runtime_message = (
+            runtime_prefix[index]
+            if runtime_prefix is not None
+            and index < len(runtime_prefix)
+            and isinstance(runtime_prefix[index], dict)
+            else None
+        )
+        clean = runtime_message.copy() if runtime_message is not None else {}
+        clean.update(message)
+        # Rows materialized by SessionDB are born durable and carry the
+        # persistence marker. Preserve it so the next incremental flush cannot
+        # re-append the projection that the transaction just committed.
+        clean.pop("timestamp", None)
+        runtime_projection.append(clean)
+    agent._durable_transcript_revision = revision
+    return runtime_projection
+
+
 def _adopt_live_compression_child(
     agent: Any,
     session_db: Any,
@@ -3378,6 +3417,7 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
+    append_only_snapshot_growth = False
     try:
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
@@ -3396,13 +3436,19 @@ def compress_context(
                     _lock_refresher = _candidate_refresher
                     _lock_refresher.start()
 
-        # The caller's history snapshot predates lease acquisition. Reload the
-        # durable parent after the lease is live. A longer durable rotation
-        # parent is safe to adopt only together with the exact revision computed
-        # from the same SQLite read snapshot; the revision fence below then
-        # catches any append racing the adoption. Row ids are retained so later
-        # append-only marker reconciliation can identify the exact durable rows.
+        # The caller's history snapshot predates lease acquisition. A longer
+        # durable rotation parent may be adopted only with the exact revision
+        # from the same SQLite read snapshot. For a revision-bound caller, the
+        # original revision remains the fence baseline: adoption is allowed
+        # only for a proven append-only advance, and the watermark transaction
+        # still preserves those appended rows verbatim. Row ids are retained so
+        # marker reconciliation can identify exact durable rows.
+        _bound_durable_revision = getattr(
+            agent, "_durable_transcript_revision", None
+        )
         _adopted_durable_revision = None
+        _adopted_user_anchor_row_id: Optional[int] = None
+        _user_anchor_messages: Optional[list] = None
         if not in_place and _lock_db is not None and _lock_sid:
             durable_loader = getattr(
                 type(_lock_db), "get_messages_as_conversation", None
@@ -3469,8 +3515,41 @@ def compress_context(
                             include_row_ids=True,
                             with_revision=True,
                         )
+                    _adoption_revision_safe = _bound_durable_revision is None
                     if (
                         _preflush_ok
+                        and _bound_durable_revision is not None
+                        and durable_parent_revision is not None
+                    ):
+                        try:
+                            _adoption_revision_loader = getattr(
+                                type(_lock_db), "get_active_message_revision", None
+                            )
+                            _adoption_prefix_revision = (
+                                _adoption_revision_loader(
+                                    _lock_db,
+                                    _lock_sid,
+                                    max_message_id=(
+                                        _bound_durable_revision.max_active_message_id
+                                    ),
+                                )
+                                if callable(_adoption_revision_loader)
+                                else None
+                            )
+                            _adoption_revision_safe = bool(
+                                _bound_durable_revision.session_id == _lock_sid
+                                and _adoption_prefix_revision
+                                == _bound_durable_revision
+                                and durable_parent_revision.active_message_count
+                                >= _bound_durable_revision.active_message_count
+                                and durable_parent_revision.max_active_message_id
+                                >= _bound_durable_revision.max_active_message_id
+                            )
+                        except Exception:
+                            _adoption_revision_safe = False
+                    if (
+                        _preflush_ok
+                        and _adoption_revision_safe
                         and isinstance(durable_parent, list)
                         and len(durable_parent) > len(messages)
                     ):
@@ -3499,7 +3578,40 @@ def compress_context(
                         # durable snapshot; the post-publish marker sync in
                         # run_agent.py keeps both views aligned.
                         agent._persist_user_message_idx = len(messages)
-                        _adopted_durable_revision = durable_parent_revision
+                        if _bound_durable_revision is None:
+                            _adopted_durable_revision = durable_parent_revision
+                        else:
+                            _adopted_tail = [
+                                message
+                                for message in messages
+                                if isinstance(message, dict)
+                                and isinstance(message.get("_row_id"), int)
+                                and message["_row_id"]
+                                > _bound_durable_revision.max_active_message_id
+                            ]
+                            # A sole adopted user append is represented verbatim
+                            # by _ensure_compressed_has_user_turn below. Remember
+                            # its row id so publish does not clone a duplicate
+                            # standalone row beside the inserted/merged anchor.
+                            if len(_adopted_tail) == 1 and _is_real_user_message(
+                                _adopted_tail[0]
+                            ):
+                                _adopted_user_anchor_row_id = _adopted_tail[0][
+                                    "_row_id"
+                                ]
+                            elif len(_adopted_tail) > 1:
+                                # Preserve a multi-row append exactly through
+                                # the watermark transaction. Do not also merge
+                                # its latest user row into the compressed body:
+                                # that would duplicate/reorder the causal tail.
+                                _user_anchor_messages = [
+                                    message
+                                    for message in messages
+                                    if not isinstance(message, dict)
+                                    or not isinstance(message.get("_row_id"), int)
+                                    or message["_row_id"]
+                                    <= _bound_durable_revision.max_active_message_id
+                                ]
 
         # Fence the projection against the durable active-row set in both
         # rotation and in-place modes. In-place keeps archived rows recoverable,
@@ -3513,7 +3625,11 @@ def compress_context(
                 expected_revision = (
                     _adopted_durable_revision
                     if _adopted_durable_revision is not None
-                    else getattr(agent, "_durable_transcript_revision", None)
+                    else (
+                        _bound_durable_revision
+                        if _bound_durable_revision is not None
+                        else getattr(agent, "_durable_transcript_revision", None)
+                    )
                 )
                 if _adopted_durable_revision is not None:
                     agent._durable_transcript_revision = expected_revision
@@ -3538,12 +3654,40 @@ def compress_context(
                         expected_revision=expected_revision,
                         observed_revision=observed_revision,
                     )
-                if expected_revision is not None and expected_revision != observed_revision:
-                    raise CompressionSnapshotStaleError(
-                        session_id=_lock_sid,
-                        expected_revision=expected_revision,
-                        observed_revision=observed_revision,
+                if expected_revision != observed_revision:
+                    # Appends after the authenticated snapshot are safe: the
+                    # watermark transaction preserves them verbatim. Prove the
+                    # summarized prefix itself is unchanged before classifying
+                    # the drift as append-only; deletion/rewrite still fails.
+                    prefix_revision = revision_loader(
+                        _lock_db,
+                        _lock_sid,
+                        max_message_id=expected_revision.max_active_message_id,
                     )
+                    append_only_growth = (
+                        prefix_revision == expected_revision
+                        and observed_revision.active_message_count
+                        >= expected_revision.active_message_count
+                        and observed_revision.max_active_message_id
+                        >= expected_revision.max_active_message_id
+                    )
+                    if append_only_growth:
+                        append_only_snapshot_growth = True
+                        _commit_watermark = (
+                            expected_revision.max_active_message_id
+                        )
+                        logger.info(
+                            "compression snapshot advanced by append-only tail; "
+                            "preserving rows after watermark=%s (session=%s)",
+                            _commit_watermark,
+                            _lock_sid,
+                        )
+                    else:
+                        raise CompressionSnapshotStaleError(
+                            session_id=_lock_sid,
+                            expected_revision=expected_revision,
+                            observed_revision=observed_revision,
+                        )
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
@@ -3989,7 +4133,12 @@ def compress_context(
                     "_todo_snapshot_synthetic": True,
                 })
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(
-            messages, compressed
+            (
+                _user_anchor_messages
+                if _user_anchor_messages is not None
+                else messages
+            ),
+            compressed,
         )
 
         cached_system_prompt = agent._cached_system_prompt
@@ -4049,6 +4198,7 @@ def compress_context(
 
         _session_commit_succeeded = False
         _commit_started_at = time.monotonic()
+        _durable_commit_published = False
         split_status = "not_applicable"
         if agent._session_db:
             split_status = "pending"
@@ -4191,7 +4341,7 @@ def compress_context(
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
-                    agent._session_db.archive_and_compact(
+                    _committed_projection = agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
                         model_config_patch={
@@ -4204,11 +4354,13 @@ def compress_context(
                         expected_revision=getattr(
                             agent, "_durable_transcript_revision", None
                         ),
+                        with_projection_revision=True,
                     )
-                    _rebind_durable_transcript_revision(
+                    _durable_commit_published = True
+                    compressed = _bind_committed_projection_with_revision(
                         agent,
-                        agent._session_db,
-                        agent.session_id,
+                        _committed_projection,
+                        runtime_prefix=compressed,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -4289,46 +4441,50 @@ def compress_context(
                         raise RuntimeError(
                             f"Compression parent already ended: {old_session_id}"
                         )
-                    # Foreign-tail ceiling (#75316): the flush below writes OUR
-                    # OWN input transcript to the parent — those rows are
-                    # already represented in the compacted handoff and must
-                    # not be cloned into the child. Everything at or below
-                    # this MAX(id) but above the start-watermark is a foreign
-                    # concurrent append; everything above it is our flush.
-                    try:
-                        _foreign_tail_ceiling = (
-                            agent._session_db.get_active_message_watermark(
-                                agent.session_id
-                            )
-                        )
-                    except Exception:
-                        # Without a trustworthy ceiling the clone could
-                        # duplicate the handoff — fall back to historical
-                        # behavior (no tail preservation this rotation).
-                        _foreign_tail_ceiling = None
                     _expected_parent_revision = getattr(
                         agent, "_durable_transcript_revision", None
                     )
+                    if _bound_durable_revision is not None:
+                        _expected_parent_revision = _bound_durable_revision
+                    _own_flush_message_ids: Tuple[int, ...] = ()
                     try:
-                        agent._flush_messages_to_session_db(
+                        # A pre-adoption live-tail flush may have populated this
+                        # diagnostic with rows already covered by the bound
+                        # revision/watermark protocol. Capture only ids inserted
+                        # by THIS rotation-boundary flush.
+                        agent._last_flush_inserted_message_ids = ()
+                        _rotation_flush_result = agent._flush_messages_to_session_db(
                             messages,
                             conversation_history=persisted_history,
                         )
-                        _rebind_durable_transcript_revision(
-                            agent,
-                            agent._session_db,
-                            agent.session_id,
-                        )
-                        # Fence the exact parent state after our own audit flush.
-                        # The publisher compares this full revision inside the
-                        # closure/child transaction, while watermark_ceiling
-                        # still excludes those already-summarized flush rows
-                        # from the concurrent-tail clone.
-                        _expected_parent_revision = getattr(
-                            agent, "_durable_transcript_revision", None
+                        if append_only_snapshot_growth and _rotation_flush_result is True:
+                            _flushed_revision = getattr(
+                                agent, "_durable_transcript_revision", None
+                            )
+                            if _flushed_revision is not None:
+                                agent._persist_user_message_idx = (
+                                    _flushed_revision.active_message_count
+                                )
+                        _own_flush_message_ids = tuple(
+                            int(message_id)
+                            for message_id in getattr(
+                                agent, "_last_flush_inserted_message_ids", ()
+                            )
                         )
                     except Exception:
                         pass  # best-effort — don't block compression on a flush error
+                    if (
+                        _adopted_user_anchor_row_id is not None
+                        and compressed_user_turn_outcome in {"inserted", "merged"}
+                    ):
+                        _own_flush_message_ids = tuple(
+                            dict.fromkeys(
+                                (
+                                    *_own_flush_message_ids,
+                                    _adopted_user_anchor_row_id,
+                                )
+                            )
+                        )
                     # Publish parent closure + child row + compacted handoff in
                     # one transaction. No reader can observe a missing/empty child.
                     # The rotation child must stay on the parent's profile —
@@ -4350,7 +4506,7 @@ def compress_context(
                         f"{uuid.uuid4().hex[:6]}"
                     )
                     from agent.context_compressor import _DB_PERSISTED_MARKER
-                    agent._session_db.publish_compression_child(
+                    _committed_projection = agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
                         source=agent.platform
@@ -4363,14 +4519,12 @@ def compress_context(
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
-                        watermark=(
-                            _commit_watermark
-                            if _foreign_tail_ceiling is not None
-                            else None
-                        ),
-                        watermark_ceiling=_foreign_tail_ceiling,
+                        watermark=_commit_watermark,
+                        exclude_parent_message_ids=_own_flush_message_ids,
                         expected_parent_revision=_expected_parent_revision,
+                        with_projection_revision=True,
                     )
+                    _durable_commit_published = True
                     # For the `already_present` outcome the live-dict stamping is
                     # handled by the run_agent _compress_context wrapper's
                     # _sync_persisted_markers (it mirrors the handoff stamps back
@@ -4492,10 +4646,10 @@ def compress_context(
                             _handoff_message[_DB_PERSISTED_MARKER] = True
                     agent.session_id = new_session_id
                     agent._db_flush_scan_prefix = None
-                    _rebind_durable_transcript_revision(
+                    compressed = _bind_committed_projection_with_revision(
                         agent,
-                        agent._session_db,
-                        new_session_id,
+                        _committed_projection,
+                        runtime_prefix=compressed,
                     )
                     try:
                         from gateway.session_context import set_current_session_id
@@ -4599,6 +4753,24 @@ def compress_context(
                     observed_revision=e.observed_revision,
                 ) from e
             except Exception as e:
+                if _durable_commit_published:
+                    # The DB transaction is already authoritative. Returning
+                    # the old projection would fabricate a rollback and may
+                    # let a later fence archive unseen concurrent rows. Fail
+                    # closed so the next turn reloads the committed segment.
+                    agent._durable_transcript_revision = None
+                    _compression_made_progress = False
+                    split_status = "committed_projection_unavailable"
+                    logger.error(
+                        "Compression committed but its active projection could "
+                        "not be loaded (session=%s): %s",
+                        agent.session_id or "?",
+                        e,
+                    )
+                    _release_lock()
+                    raise CompressionCommitFailedError(
+                        agent.session_id or ""
+                    ) from e
                 # Any durable commit failure invalidates the generated compacted
                 # projection. Restore the exact pre-compression in-memory state
                 # in both rotation and in-place modes and stop the turn; otherwise

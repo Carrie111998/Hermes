@@ -7330,8 +7330,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        exclude_parent_message_ids: Optional[Tuple[int, ...]] = None,
         expected_parent_revision: Optional[DurableTranscriptRevision] = None,
-    ) -> None:
+        with_projection_revision: bool = False,
+    ) -> Any:
         """Atomically close a parent and publish its durable compression child.
 
         The parent closure, child row, and compacted handoff become visible in
@@ -7353,6 +7355,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        *exclude_parent_message_ids* is the stronger form used by current
+        rotation callers: clone the whole post-watermark tail except the exact
+        rows written by this compressor's own atomic audit flush. This closes
+        the race between a pre-flush ceiling read and a concurrent append.
+        ``with_projection_revision=True`` returns the committed child projection
+        and its revision from this same write transaction.
         """
         def _do(conn):
             lock_row = conn.execute(
@@ -7372,6 +7381,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 observed_revision = _active_message_revision_in_transaction(
                     conn,
                     parent_session_id,
+                    max_message_id=watermark,
                 )
                 if observed_revision != expected_parent_revision:
                     raise CompressionTranscriptRevisionError(
@@ -7436,15 +7446,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # watermark, at or below the ceiling — see docstring) into the
                 # child, after the handoff. Column-exact except id/session_id;
                 # originals stay in the (closed) parent for lineage recovery.
-                _ceiling_clause = ""
+                _tail_clauses = []
                 _params: list = [parent_session_id, int(watermark)]
                 if watermark_ceiling is not None:
-                    _ceiling_clause = " AND id <= ?"
+                    _tail_clauses.append("id <= ?")
                     _params.append(int(watermark_ceiling))
+                excluded_ids = tuple(
+                    sorted(
+                        {
+                            int(message_id)
+                            for message_id in (exclude_parent_message_ids or ())
+                            if int(message_id) > 0
+                        }
+                    )
+                )
+                if excluded_ids:
+                    placeholders = ",".join("?" for _ in excluded_ids)
+                    _tail_clauses.append(f"id NOT IN ({placeholders})")
+                    _params.extend(excluded_ids)
+                _tail_clause = (
+                    " AND " + " AND ".join(_tail_clauses)
+                    if _tail_clauses
+                    else ""
+                )
                 tail_rows = conn.execute(
                     "SELECT id, tool_calls FROM messages "
                     "WHERE session_id = ? AND active = 1 AND id > ?"
-                    f"{_ceiling_clause} ORDER BY id",
+                    f"{_tail_clause} ORDER BY id",
                     _params,
                 ).fetchall()
                 if tail_rows:
@@ -7484,7 +7512,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression parent changed during publication: {parent_session_id}"
                 )
 
-        self._execute_write(_do)
+            if with_projection_revision:
+                return self._active_projection_with_revision_in_transaction(
+                    conn, child_session_id
+                )
+            return None
+
+        return self._execute_write(_do)
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
@@ -12097,7 +12131,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         require_compression_lease: bool = False,
         expected_revision: Optional[DurableTranscriptRevision] = None,
-    ) -> int:
+        with_projection_revision: bool = False,
+    ) -> Any:
         """Non-destructive in-place compaction for a single durable session id.
 
         Soft-archives every currently-active message (``active = 0``) and
@@ -12140,7 +12175,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
         session's JSON config in the same transaction; a ``None`` value
-        removes that key. Returns the new active count.
+        removes that key. Returns the new active count, or the committed active
+        projection and revision when ``with_projection_revision=True``.
         """
 
         def _do(conn):
@@ -12271,6 +12307,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "UPDATE sessions SET system_prompt = ? WHERE id = ?",
                     (system_prompt, session_id),
+                )
+            if with_projection_revision:
+                return self._active_projection_with_revision_in_transaction(
+                    conn, session_id
                 )
             return inserted
 
@@ -12744,24 +12784,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return messages
             return messages, _durable_revision_from_rows(session_id, rows)
 
-    def get_active_message_revision(
-        self, session_id: str
-    ) -> DurableTranscriptRevision:
-        """Return the active-row revision for one current session segment."""
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT " + ", ".join(_DURABLE_REVISION_ROW_COLUMNS) + " "
-                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
-                (session_id,),
-            ).fetchall()
-        return DurableTranscriptRevision(
+    def _active_projection_with_revision_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+    ) -> Tuple[List[Dict[str, Any]], DurableTranscriptRevision]:
+        """Return one active model projection and revision on the caller's txn."""
+        rows = conn.execute(
+            f"SELECT session_id, active, {self._CONVERSATION_ROW_COLUMNS} "
+            "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        projection = self._rows_to_conversation(
+            rows,
             session_id=session_id,
-            active_message_count=len(rows),
-            max_active_message_id=max(
-                (int(row["id"]) for row in rows), default=0
-            ),
-            active_rows_digest=_active_rows_digest(rows),
+            include_ancestors=False,
+            repair_alternation=False,
+            include_row_ids=False,
         )
+        return projection, _durable_revision_from_rows(session_id, rows)
+
+    def get_active_message_revision(
+        self,
+        session_id: str,
+        *,
+        max_message_id: Optional[int] = None,
+    ) -> DurableTranscriptRevision:
+        """Return the active-row revision, optionally pinned to an id prefix."""
+        with self._read_ctx() as conn:
+            return _active_message_revision_in_transaction(
+                conn,
+                session_id,
+                max_message_id=max_message_id,
+            )
 
     def _active_message_revision_in_current_transaction(
         self, session_id: str

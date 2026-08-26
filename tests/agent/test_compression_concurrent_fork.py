@@ -672,16 +672,15 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     )
 
 
-def test_durable_message_committed_before_lease_is_adopted(
+def test_durable_message_committed_before_lease_is_preserved_as_tail(
     tmp_path: Path,
 ) -> None:
     """A durable row absent from the caller snapshot must still be compressed.
 
     Previously this path aborted and returned the stale snapshot unchanged,
-    which permanently wedged busy sessions: every compress attempt saw the
-    DB ahead of the in-memory list, logged "changed before lease
-    acquisition", and never called the compressor. Adopting the durable
-    transcript keeps the late-committed turn and lets compression proceed.
+    which permanently wedged busy sessions. The prefix fence now proves that
+    the drift is append-only and carries the late row through the watermark
+    tail while compression proceeds on the authenticated snapshot.
     """
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "PRE_LEASE_DURABLE_RACE"
@@ -696,18 +695,26 @@ def test_durable_message_committed_before_lease_is_adopted(
     agent = _build_agent_with_db(db, parent_sid)
     agent._durable_transcript_revision = expected_revision
 
-    from agent.conversation_compression import CompressionSnapshotStaleError
+    agent.context_compressor.compress.side_effect = None
+    agent.context_compressor.compress.return_value = [
+        {"role": "user", "content": "x"}
+    ]
 
-    with pytest.raises(CompressionSnapshotStaleError):
-        agent._compress_context(stale_snapshot, "sys", approx_tokens=120_000)
+    compressed, _ = agent._compress_context(
+        stale_snapshot, "sys", approx_tokens=120_000
+    )
 
-    assert agent.session_id == parent_sid
-    assert db.find_live_compression_child(parent_sid) is None
-    assert [m["content"] for m in db.get_messages_as_conversation(parent_sid)] == [
-        "old durable",
+    child_session_id = agent.session_id
+    assert child_session_id != parent_sid
+    assert [message["content"] for message in compressed] == [
+        "x",
         "late committed before lease",
     ]
-    agent.context_compressor.compress.assert_not_called()
+    assert [
+        message["content"]
+        for message in db.get_messages_as_conversation(child_session_id)
+    ] == ["x", "late committed before lease"]
+    agent.context_compressor.compress.assert_called_once()
     assert db.get_compression_lock_holder(parent_sid) is None
 
 

@@ -2408,6 +2408,7 @@ class AIAgent:
             # NO markers were stamped, so the next flush re-scans and
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
+            self._last_flush_inserted_message_ids = ()
             if _batch_rows:
                 _appended = self._session_db.append_messages_batch(
                     session_id=self.session_id,
@@ -2432,9 +2433,15 @@ class AIAgent:
                 if isinstance(_appended, tuple) and len(_appended) == 2:
                     from hermes_state import DurableTranscriptRevision
 
-                    _, durable_revision = _appended
+                    inserted_count, durable_revision = _appended
                     if isinstance(durable_revision, DurableTranscriptRevision):
                         self._durable_transcript_revision = durable_revision
+                        if inserted_count > 0:
+                            last_id = durable_revision.max_active_message_id
+                            first_id = last_id - int(inserted_count) + 1
+                            self._last_flush_inserted_message_ids = tuple(
+                                range(first_id, last_id + 1)
+                            )
 
                 from agent.transcript_repair import sync_flushed_message_markers
 
@@ -2452,6 +2459,7 @@ class AIAgent:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
+            self._last_flush_inserted_message_ids = ()
             # This is the one place the underlying SQLite error is visible
             # before it is swallowed into a bare ``False`` — classify it here
             # so the turn-end explanation can distinguish lock contention
