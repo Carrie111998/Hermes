@@ -699,3 +699,91 @@ def test_default_warmup_materialises_httpx_before_first_use(monkeypatch):
     collector_module._default_warmup()
 
     assert built == ["ctor", "close"]
+
+
+# ---------------------------------------------------------------------------
+# Warm-up headroom gate (2026-08-26)
+#
+# The warm-up shipped on the mistaken belief that it was wall-clock neutral.
+# It is not: the 90s budget is a CAP, so moving ~48s of httpx import cost out of
+# it and into the uncapped prefix adds 48s to the process rather than shrinking
+# the budget. Measured against AIUsageCollector's PT6M ExecutionTimeLimit,
+# terminations went 3.3% (16/491 over the prior 48h) -> 19.3% (17/88 after), and
+# a terminated run writes NOTHING at all -- strictly worse than the starvation
+# the warm-up cures. So it is now paid only out of genuine slack.
+
+
+def _with_finish_in(monkeypatch, seconds):
+    """Publish an absolute finish instant `seconds` from now, as the runner does."""
+    monkeypatch.setenv(collector_module.DEADLINE_EPOCH_ENV, str(1_000_000.0 + seconds))
+    monkeypatch.setattr(collector_module.time, "time", lambda: 1_000_000.0)
+
+
+def test_warmup_is_paid_when_the_task_has_slack(monkeypatch):
+    _with_finish_in(monkeypatch, 300.0)          # ample
+    assert collector_module._warmup_is_affordable() is True
+
+
+def test_warmup_is_skipped_when_the_task_is_tight(monkeypatch):
+    # 120s left: a full 90s deadline still fits, but not 90s PLUS a ~48s warm-up.
+    _with_finish_in(monkeypatch, 120.0)
+    assert collector_module._warmup_is_affordable() is False
+
+
+def test_warmup_gate_is_exactly_deadline_plus_headroom(monkeypatch):
+    boundary = (
+        collector_module.FALLBACK_DEADLINE_SECONDS
+        + collector_module.WARMUP_HEADROOM_SECONDS
+    )
+    _with_finish_in(monkeypatch, boundary)
+    assert collector_module._warmup_is_affordable() is True
+    _with_finish_in(monkeypatch, boundary - 0.5)
+    assert collector_module._warmup_is_affordable() is False
+
+
+def test_warmup_is_paid_when_no_finish_instant_is_published(monkeypatch):
+    """CLI / hand-run: no ExecutionTimeLimit exists to overrun."""
+    monkeypatch.delenv(collector_module.DEADLINE_EPOCH_ENV, raising=False)
+    assert collector_module._warmup_is_affordable() is True
+    assert collector_module._raw_remaining_seconds() is None
+
+
+def test_raw_remaining_is_uncapped_unlike_the_deadline(monkeypatch):
+    """The whole reason a second helper exists: the deadline clamps this signal away."""
+    _with_finish_in(monkeypatch, 300.0)
+    assert collector_module._raw_remaining_seconds() == pytest.approx(300.0)
+    # ...while the budgeting view saturates at the cap and cannot tell 300 from 91.
+    assert collector_module._derive_deadline_seconds() == pytest.approx(
+        collector_module.FALLBACK_DEADLINE_SECONDS
+    )
+
+
+def test_collect_skips_the_warmup_when_the_task_is_tight(tmp_path, monkeypatch):
+    """End to end: the gate must actually suppress the call, not just compute False."""
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    _with_finish_in(monkeypatch, 120.0)
+    hits = []
+
+    collect(
+        db_path=str(db), prev=None,
+        fetch_usage=lambda provider, *, budget_seconds: FakeSnap(True, ()),
+        now=NOW, warmup=lambda: hits.append(1), _monotonic=lambda: 0.0,
+    )
+
+    assert hits == []
+
+
+def test_collect_pays_the_warmup_when_the_task_has_slack(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    _with_finish_in(monkeypatch, 300.0)
+    hits = []
+
+    collect(
+        db_path=str(db), prev=None,
+        fetch_usage=lambda provider, *, budget_seconds: FakeSnap(True, ()),
+        now=NOW, warmup=lambda: hits.append(1), _monotonic=lambda: 0.0,
+    )
+
+    assert hits == [1]
