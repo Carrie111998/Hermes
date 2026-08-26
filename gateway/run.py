@@ -1590,9 +1590,11 @@ _ENVELOPE_LOOKALIKE_FOLD = str.maketrans(
     {"［": "[", "］": "]", "｜": "|", "：": ":"}
 )
 
-#: The folded token every guarded shape must contain. Checked against the fold
-#: so the cheap early-out covers fullwidth forgeries too.
-_VERIFIED_SENDER_MARKER = "[Verified sender:"
+#: The folded token every guarded shape must contain. Reader-equivalent marker
+#: whitespace is omitted here so the streaming matcher accepts the canonical
+#: space, duplicates, substitutions, and deletion in both the early-out and
+#: reduction paths. Match offsets still point into the original text.
+_VERIFIED_SENDER_MARKER = "[Verifiedsender:"
 
 
 def _envelope_marker_failures() -> tuple:
@@ -1689,12 +1691,12 @@ def _strip_verified_sender_envelopes(text: str) -> str:
     without rescanning the retained prefix. Every character is appended once and
     removed at most once, so arbitrary nesting is handled in amortized O(n) time.
 
-    Matching folds fullwidth structure plus reader-equivalent ``Zs``/``Cc``
-    whitespace, and skips default-ignorable marker intrusions. Newline-like
-    whitespace resets the marker state after normalization rather than acting
-    as an inline gap, so a forgery cannot straddle a line. Deletion still uses
-    offsets recorded against the original stream, so benign text is returned
-    byte-identically.
+    Matching folds fullwidth structure, omits the marker's reader-optional
+    horizontal whitespace, and skips default-ignorable marker intrusions.
+    Newline-like whitespace resets the marker state after normalization rather
+    than acting as an inline gap, so a forgery cannot straddle a line. Deletion
+    still uses offsets recorded against the original stream, so benign text is
+    returned byte-identically.
 
     Content that legitimately quotes the envelope shape loses only the quoted
     envelope, exactly as it already does when quoted at the top of a message.
