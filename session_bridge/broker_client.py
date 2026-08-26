@@ -6,14 +6,26 @@ import argparse
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 import json
-from pathlib import Path
 from typing import Any
 
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from .secret_paths import default_token_file
+
 BrokerCall = Callable[[str, dict[str, object]], Awaitable[dict[str, Any]]]
+
+
+def _read_bearer_token() -> str:
+    """Read the bearer secret from the one root-anchored token file.
+
+    Must stay on :func:`default_token_file` — the server validates against
+    that same file, and a hardcoded or profile-scoped path here presents a
+    stale token the moment the canonical one is rotated.
+    """
+
+    return default_token_file().read_text(encoding="utf-8").strip()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -107,11 +119,7 @@ async def dispatch(argv: Sequence[str], *, call: BrokerCall) -> dict[str, Any]:
 
 
 async def _call_tool(tool: str, payload: dict[str, object]) -> dict[str, Any]:
-    token = (
-        (Path.home() / ".hermes" / "session-bridge" / "token")
-        .read_text(encoding="utf-8")
-        .strip()
-    )
+    token = _read_bearer_token()
     timeout = httpx.Timeout(120.0)
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token}"}, timeout=timeout

@@ -18,8 +18,6 @@ import subprocess
 import time
 from typing import Any, cast
 
-from hermes_constants import get_hermes_home
-
 from .catalog import UnifiedCatalog
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
@@ -41,6 +39,7 @@ from .models import (
     encode_bridge_marker,
 )
 from .preview import build_session_preview
+from .secret_paths import default_marker_key_file, default_token_file
 from .sidebar import (
     build_registration_prompt,
     decode_hydration_marker,
@@ -99,7 +98,7 @@ def resolve_bearer_token(
         path = (
             token_file
             if token_file is not None
-            else get_hermes_home() / "session-bridge" / "token"
+            else default_token_file()
         )
         if not path.exists():
             raise RuntimeError("session bridge bearer token is missing")
@@ -114,7 +113,7 @@ def resolve_marker_key(*, marker_key_file: Path | None = None) -> bytes:
     path = Path(
         marker_key_file
         if marker_key_file is not None
-        else get_hermes_home() / "session-bridge" / "marker-key"
+        else default_marker_key_file()
     ).expanduser()
     try:
         key = _read_restricted_marker_key(path)
