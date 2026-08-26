@@ -333,7 +333,13 @@ export function reloadPersistedDrafts(): void {
 
   for (const [key, draft] of incoming) {
     const local = draftsBySession.get(key)
-    draftsBySession.set(key, local?.attachments.length ? { ...local, text: draft.text } : draft)
+    const next = local?.attachments.length ? { ...local, text: draft.text } : draft
+
+    if (!draftEqual(local, next)) {
+      bumpDraftRevision(key)
+    }
+
+    draftsBySession.set(key, next)
     publishDraftTitle(key, deriveDraftTitle(draft.text))
   }
 
@@ -341,6 +347,7 @@ export function reloadPersistedDrafts(): void {
   for (const key of [...draftsBySession.keys()]) {
     if (!incoming.has(key)) {
       draftsBySession.delete(key)
+      bumpDraftRevision(key)
       publishDraftTitle(key, '')
     }
   }

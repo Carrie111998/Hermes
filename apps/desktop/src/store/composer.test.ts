@@ -5,13 +5,16 @@ import {
   $voiceConversationStartRequest,
   addComposerAttachment,
   clearSessionDraft,
+  clearSessionDraftIfRevision,
   type ComposerAttachment,
   createComposerAttachmentOccurrenceId,
   createComposerAttachmentScope,
   migrateSessionDraft,
+  reloadPersistedDrafts,
   removeComposerAttachment,
   requestVoiceConversationStart,
   SESSION_DRAFTS_STORAGE_KEY,
+  sessionDraftRevision,
   stashSessionDraft,
   takeSessionDraft,
   takeVoiceConversationStart,
@@ -242,6 +245,19 @@ describe('session drafts', () => {
     >
 
     expect(persisted['session-a']).toBe('survives reload')
+  })
+
+  it('advances the revision when another window replaces a persisted draft', () => {
+    stashSessionDraft('session-a', 'submitted text', [])
+
+    const submittedRevision = sessionDraftRevision('session-a')
+
+    window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify({ 'session-a': 'newer other-window draft' }))
+    reloadPersistedDrafts()
+
+    expect(sessionDraftRevision('session-a')).toBeGreaterThan(submittedRevision)
+    expect(clearSessionDraftIfRevision('session-a', submittedRevision)).toBe(false)
+    expect(takeSessionDraft('session-a').text).toBe('newer other-window draft')
   })
 
   it('evicts empty drafts instead of leaving stale entries behind', () => {
