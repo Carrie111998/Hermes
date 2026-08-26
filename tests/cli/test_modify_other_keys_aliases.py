@@ -560,3 +560,53 @@ def test_lock_bits_on_cmd_backspace_alias():
     assert _parse("\x1b[127;137u") == [Keys.ControlU]  # Cmd+Backspace + NumLock
     assert _parse("\x1b[127;73u") == [Keys.ControlU]   # Cmd+Backspace + Caps
     assert _parse("\x1b[3;137~") == [Keys.ControlK]    # Cmd+FwdDel + NumLock
+
+
+# ---------------------------------------------------------------------------
+# KeyPress DATA for plain-character aliases (#95550)
+#
+# The tests above assert only ``kp.key``; that blind spot let the real bug
+# through: ``Vt100Parser._call_handler`` sets ``kp.data`` to the RAW escape
+# sequence, and prompt_toolkit's default ``self-insert`` binding inserts
+# ``event.data`` — so Shift+A typed ``^[[27;2;65~`` into the live prompt
+# while every alias test stayed green. These pins assert key == data.
+# ---------------------------------------------------------------------------
+
+def _parse_full(byte_seq: str):
+    """Feed bytes through the VT100 parser and return full KeyPress objects."""
+    out = []
+    parser = Vt100Parser(out.append)
+    for ch in byte_seq:
+        parser.feed(ch)
+    parser.flush()
+    return out
+
+
+@pytest.mark.parametrize("letter", [chr(c) for c in range(ord('a'), ord('z') + 1)])
+def test_modify_other_keys_shift_letter_data_is_the_uppercase(letter):
+    """self-insert types event.data — it must be the char, not the sequence."""
+    upper = letter.upper()
+    for seq in (f"\x1b[27;2;{ord(letter)}~", f"\x1b[{ord(letter)};2u"):
+        presses = _parse_full(seq)
+        assert [(kp.key, kp.data) for kp in presses] == [(upper, upper)], seq
+
+
+def test_shift_space_data_is_the_space():
+    """Shift+Space maps to the plain " " alias — same key==data requirement."""
+    presses = _parse_full("\x1b[27;2;32~")
+    assert [(kp.key, kp.data) for kp in presses] == [(" ", " ")]
+
+
+def test_enum_alias_data_stays_the_raw_sequence():
+    """The data rewrite is scoped to plain single-char string aliases only:
+    enum-valued aliases (c-a) keep the sequence as data — bindings act on
+    the key, and rewriting enum data would lose information."""
+    presses = _parse_full("\x1b[27;5;97~")
+    assert presses[0].key == Keys.ControlA
+    assert presses[0].data == "\x1b[27;5;97~"
+
+
+def test_plain_character_feed_data_unchanged():
+    """A normal single-char feed (no alias involved) keeps key == data == char."""
+    presses = _parse_full("x")
+    assert [(kp.key, kp.data) for kp in presses] == [("x", "x")]

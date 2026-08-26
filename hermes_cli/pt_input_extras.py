@@ -176,6 +176,48 @@ def install_cmd_backspace_alias() -> int:
     return changed
 
 
+def _patch_call_handler_data_for_char_aliases() -> None:
+    """Make plain-character aliases insert the character, not the sequence.
+
+    ``Vt100Parser._call_handler`` builds ``KeyPress(key, insert_text)`` with
+    ``insert_text`` set to the RAW escape sequence that mapped to ``key``.
+    For enum-valued aliases (``Keys.ControlA`` ...) bindings act on the key
+    and the data never reaches the buffer. The plain-string aliases
+    installed here (Shift+letter → ``"A"``, Shift+Space → ``" "``) have no
+    enum, so prompt_toolkit's default ``self-insert`` binding inserts
+    ``event.data`` — the raw sequence — and Shift+A under modifyOtherKeys=2
+    typed ``^[[27;2;65~`` into the prompt instead of ``A`` (#95550). Rewrite
+    the data to the character itself so the KeyPress matches
+    prompt_toolkit's printable-key convention (``key == data``).
+
+    Idempotent; only rewrites single-character string keys whose data is a
+    multi-char escape sequence, so enum aliases, tuple aliases, and plain
+    per-character feeds are untouched.
+    """
+    try:
+        from prompt_toolkit.input import vt100_parser as _vt100_mod
+    except Exception:
+        return
+    if getattr(_vt100_mod, "_hermes_char_alias_data_patched", False):
+        return
+
+    _orig_call_handler = _vt100_mod.Vt100Parser._call_handler
+
+    def _call_handler(self, key, insert_text):
+        if (
+            isinstance(key, str)
+            and len(key) == 1
+            and isinstance(insert_text, str)
+            and len(insert_text) > 1
+            and insert_text.startswith("\x1b")
+        ):
+            insert_text = key
+        return _orig_call_handler(self, key, insert_text)
+
+    _vt100_mod.Vt100Parser._call_handler = _call_handler
+    _vt100_mod.Vt100Parser._hermes_char_alias_data_patched = True
+
+
 def install_modify_other_keys_aliases() -> int:
     """Map Ctrl+key and Alt+key sequences emitted under ``modifyOtherKeys`` level 2
     and Kitty CSI-u to the same ``Keys``.* values that the raw control bytes
@@ -491,6 +533,11 @@ def install_modify_other_keys_aliases() -> int:
     # created before this install (or in earlier tests) can't misparse.
     if changed:
         _clear_vt100_prefix_cache()
+
+    # Plain-character aliases must insert the character, not the raw
+    # sequence (see the patch docstring). Applied even when changed == 0 so
+    # an already-populated table still gets the data fix.
+    _patch_call_handler_data_for_char_aliases()
 
     return changed
 
