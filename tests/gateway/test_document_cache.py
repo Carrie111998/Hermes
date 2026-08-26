@@ -6,8 +6,10 @@ Covers: get_document_cache_dir, cache_document_from_bytes,
 """
 
 import os
+import re
 import time
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pytest
 
@@ -62,6 +64,48 @@ class TestCacheDocumentFromBytes:
     def test_empty_filename_uses_fallback(self):
         path = cache_document_from_bytes(b"data", "")
         assert "document" in os.path.basename(path)
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "中文" * 70 + ".txt",
+            quote_plus("中文" * 70 + ".txt", safe=""),
+        ],
+    )
+    def test_long_utf8_filename_fits_component_limit(self, filename):
+        path = Path(cache_document_from_bytes(b"payload", filename))
+
+        assert len(path.name.encode("utf-8")) <= 255
+        assert path.suffix == ".txt"
+        assert path.read_bytes() == b"payload"
+
+    def test_truncation_does_not_leave_partial_percent_escape(self):
+        filename = "a" * 233 + "%E4.txt"
+
+        path = Path(cache_document_from_bytes(b"data", filename))
+        stored_name = path.name.split("_", 2)[2]
+        stored_stem = os.path.splitext(stored_name)[0]
+
+        assert not re.search(r"%(?:[0-9A-Fa-f])?$", stored_stem)
+        assert path.suffix == ".txt"
+
+    def test_filename_at_byte_limit_is_preserved(self):
+        filename = "a" * 234 + ".txt"
+
+        path = Path(cache_document_from_bytes(b"data", filename))
+
+        assert len(path.name.encode("utf-8")) == 255
+        assert path.name.endswith(filename)
+
+    def test_truncated_names_remain_collision_safe(self):
+        filename = "文" * 100 + ".pdf"
+
+        first = Path(cache_document_from_bytes(b"first", filename))
+        second = Path(cache_document_from_bytes(b"second", filename))
+
+        assert first != second
+        assert first.read_bytes() == b"first"
+        assert second.read_bytes() == b"second"
 
 
 # ---------------------------------------------------------------------------
