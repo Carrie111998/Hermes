@@ -57,6 +57,7 @@ so `truncate_message()` is deliberately not called here.
 
 import asyncio
 import base64
+import html as _html_lib
 import logging
 import mimetypes
 import os
@@ -76,6 +77,11 @@ TWILIO_EMAIL_API_BASE_DEFAULT = "https://comms.twilio.com/v1/Emails"
 # this just guards against something pathological.
 MAX_EMAIL_LENGTH = 200_000
 DEFAULT_SUBJECT = "Message from Hermes Agent"
+# Twilio's Email API returns a generic "Invalid value provided for field
+# 'from'" (masking the more specific validation error, e.g. domain
+# authorization) when `from.name` is omitted -- confirmed live. Always send
+# a name rather than treating it as truly optional per the docs.
+DEFAULT_FROM_NAME = "Hermes Agent"
 # Raw bytes, before base64 (~4/3 inflation). The API caps the whole request
 # (JSON + base64 attachments) at 10 MB; this leaves headroom for that
 # overhead rather than let a near-the-limit send 400 server-side.
@@ -186,6 +192,16 @@ def _split_subject_and_body(content: str) -> tuple:
         if first_line and rest:
             return first_line, rest
     return DEFAULT_SUBJECT, content.strip()
+
+
+def _plain_text_to_html(text: str) -> str:
+    """Minimal plain-text -> HTML so a plain-text send always has a non-empty
+    ``content.html`` -- confirmed live that the API rejects a request with
+    only ``content.text`` ("Invalid value provided for field 'content'"),
+    even though its own docs describe auto-generating ``text`` *from*
+    ``html``, not the reverse.
+    """
+    return _html_lib.escape(text).replace("\n", "<br>\n")
 
 
 def _build_attachments(
@@ -335,16 +351,23 @@ class TwilioEmailAdapter(BasePlatformAdapter):
             "Authorization": _basic_auth_header(self._account_sid, self._auth_token),
             "Content-Type": "application/json",
         }
-        content: Dict[str, Any] = {
-            "subject": subject,
-            ("html" if html else "text"): body,
-        }
+        # content.html is required by the API (confirmed live) -- Twilio's
+        # docs describe auto-generating a text fallback FROM html, not the
+        # reverse, so a plain-text send needs an auto-derived html body too.
+        if html:
+            content: Dict[str, Any] = {"subject": subject, "html": body}
+        else:
+            content = {
+                "subject": subject,
+                "text": body,
+                "html": _plain_text_to_html(body),
+            }
         if attachments:
             content["attachments"] = attachments
         payload: Dict[str, Any] = {
             "from": {
                 "address": self._from_email,
-                **({"name": self._from_name} if self._from_name else {}),
+                "name": self._from_name or DEFAULT_FROM_NAME,
             },
             "to": [{"address": chat_id}],
             "content": content,
@@ -610,13 +633,19 @@ async def _standalone_send(
             "Authorization": _basic_auth_header(account_sid, auth_token),
             "Content-Type": "application/json",
         }
-        content: Dict[str, Any] = {"subject": subject, "text": body}
+        # content.html is required by the API (confirmed live) -- see the
+        # comment in _send_email_request for why text alone isn't enough.
+        content: Dict[str, Any] = {
+            "subject": subject,
+            "text": body,
+            "html": _plain_text_to_html(body),
+        }
         if attachments:
             content["attachments"] = attachments
         payload: Dict[str, Any] = {
             "from": {
                 "address": from_email,
-                **({"name": from_name} if from_name else {}),
+                "name": from_name or DEFAULT_FROM_NAME,
             },
             "to": [{"address": chat_id}],
             "content": content,

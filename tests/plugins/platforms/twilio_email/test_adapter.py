@@ -484,6 +484,86 @@ def test_send_rejects_non_string_metadata_subject_without_crashing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Payload shape confirmed live against the real API: `from.name` and
+# `content.html` must always be present, or the API rejects with a generic
+# error that masks the actual (more specific) validation failure.
+
+
+def test_send_always_includes_from_name(monkeypatch):
+    _configure(monkeypatch)
+    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
+
+    mock_resp = _mock_response(202, json_body={"operationId": "op-name"})
+    mock_session = MagicMock()
+    captured = {}
+
+    def _capturing_post(url, json=None, headers=None):
+        captured["payload"] = json
+        return _AsyncCM(mock_resp)
+
+    mock_session.post = MagicMock(side_effect=_capturing_post)
+    mock_session.close = AsyncMock()
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        asyncio.run(adapter.send("customer@example.com", "Subject\nBody"))
+
+    assert captured["payload"]["from"]["name"]
+
+
+def test_send_always_includes_content_html_for_plain_text(monkeypatch):
+    _configure(monkeypatch)
+    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
+
+    mock_resp = _mock_response(202, json_body={"operationId": "op-html"})
+    mock_session = MagicMock()
+    captured = {}
+
+    def _capturing_post(url, json=None, headers=None):
+        captured["payload"] = json
+        return _AsyncCM(mock_resp)
+
+    mock_session.post = MagicMock(side_effect=_capturing_post)
+    mock_session.close = AsyncMock()
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        asyncio.run(adapter.send("customer@example.com", "Subject\nHello & <world>"))
+
+    content = captured["payload"]["content"]
+    assert content["html"]
+    assert "Hello &amp; &lt;world&gt;" in content["html"]
+    assert content["text"] == "Hello & <world>"
+
+
+def test_standalone_send_always_includes_from_name_and_content_html(monkeypatch):
+    _configure(monkeypatch)
+
+    mock_resp = _mock_response(202, json_body={"operationId": "op-standalone"})
+    mock_session = MagicMock()
+    captured = {}
+
+    def _capturing_post(url, json=None, headers=None, **_kwargs):
+        captured["payload"] = json
+        return _AsyncCM(mock_resp)
+
+    mock_session.post = MagicMock(side_effect=_capturing_post)
+
+    with patch("aiohttp.ClientSession", return_value=_AsyncCM(mock_session)):
+        asyncio.run(
+            twilio_email._standalone_send(None, "customer@example.com", "Subject\nBody")
+        )
+
+    assert captured["payload"]["from"]["name"]
+    assert captured["payload"]["content"]["html"]
+
+
+def test_plain_text_to_html_escapes_and_converts_newlines():
+    assert (
+        twilio_email._plain_text_to_html("Line one\nLine <two> & more")
+        == "Line one<br>\nLine &lt;two&gt; &amp; more"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Error clarity on a first real send -- exceptions like asyncio.TimeoutError
 # stringify to "", which must not surface as a blank/useless error.
 
