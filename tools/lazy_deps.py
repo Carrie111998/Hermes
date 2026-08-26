@@ -699,6 +699,43 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
+def _pip_config_candidates(env: dict[str, str]) -> list[Path]:
+    """Return pip config files in the same precedence order pip documents.
+
+    Mirrors the twin helper in ``hermes_cli.main`` (#17761); kept local
+    because this module deliberately has no CLI dependency.
+    """
+    explicit = env.get("PIP_CONFIG_FILE")
+    if explicit:
+        return [Path(explicit)]
+    return [
+        Path("/etc/pip.conf"),
+        Path.home() / ".config" / "pip" / "pip.conf",
+        Path.home() / ".pip" / "pip.conf",
+    ]
+
+
+def _pip_conf_index_url(env: dict[str, str]) -> Optional[str]:
+    """Read pip's configured index-url so uv can use the same mirror.
+
+    uv does not read ``pip.conf`` — without this bridge a user whose pip is
+    mirrored (common behind restricted networks) watches every lazy install
+    hit the default pypi.org and time out (#95608).
+    """
+    try:
+        import configparser
+
+        parser = configparser.ConfigParser()
+        found = parser.read(str(p) for p in _pip_config_candidates(env))
+        if not found or not parser.has_section("global"):
+            return None
+        value = parser.get("global", "index-url", fallback="").strip()
+        return value or None
+    except Exception as e:  # noqa: BLE001 — config reading is best-effort
+        logger.debug("Could not read pip.conf for index-url: %s", e)
+        return None
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -740,6 +777,14 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         from tools.environments.local import hermes_subprocess_env
         uv_env = hermes_subprocess_env(inherit_credentials=False)
         uv_env["VIRTUAL_ENV"] = str(venv_root)
+        # uv never reads pip.conf, so a mirrored-pip user would see every
+        # lazy install stall against the default pypi.org for the full
+        # timeout (#95608). Bridge pip's index-url unless uv is configured
+        # explicitly — same policy as the update path (#17761).
+        if not uv_env.get("UV_INDEX_URL"):
+            pip_index_url = _pip_conf_index_url(uv_env)
+            if pip_index_url:
+                uv_env["UV_INDEX_URL"] = pip_index_url
 
         # Tier 1: uv (preferred — fast, doesn't need pip in the venv)
         # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare
@@ -773,7 +818,17 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 return _InstallResult(False, r.stdout or "", r.stderr or "")
             except subprocess.TimeoutExpired as e:
                 logger.debug("uv invocation failed: %s", e)
-                return _InstallResult(False, "", f"uv pip install timed out: {e}")
+                # Actionable context for the #95608 shape: a 300s stall with
+                # no feedback, then silence. The failure string flows into
+                # FeatureUnavailable, which callers surface as warnings.
+                hint = (
+                    f"uv pip install timed out after {timeout}s: {e}. "
+                    "If your network needs a package mirror, set index-url in "
+                    "pip.conf (bridged to uv automatically) or UV_INDEX_URL "
+                    f"directly; or install manually with: "
+                    f"{sys.executable} -m pip install {' '.join(specs)}"
+                )
+                return _InstallResult(False, "", hint)
             except FileNotFoundError as e:
                 # The resolved uv path disappeared between lookup and spawn.
                 # In that narrow availability failure, the pip tier remains a
