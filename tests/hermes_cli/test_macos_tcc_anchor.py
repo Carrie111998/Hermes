@@ -10,8 +10,6 @@ macOS.
 import os
 from pathlib import Path
 
-import pytest
-
 import hermes_cli.doctor as doctor
 import hermes_cli.macos_tcc_anchor as tcc
 from hermes_constants import venv_python_path
@@ -21,13 +19,16 @@ _STORE_ROOT = "cpython-3.11.15-macos-aarch64-none"
 
 def _darwin(monkeypatch):
     monkeypatch.setattr(tcc.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(tcc, "_validate_staged_anchor", lambda _path: None)
 
 
 def _linux(monkeypatch):
     monkeypatch.setattr(tcc.platform, "system", lambda: "Linux")
 
 
-def _build_store(tmp_path, version: str = "3.11.15") -> Path:
+def _build_store(
+    tmp_path, version: str = "3.11.15", *, with_libpython: bool = False
+) -> Path:
     store = (
         tmp_path
         / "uv-store"
@@ -40,6 +41,12 @@ def _build_store(tmp_path, version: str = "3.11.15") -> Path:
     store_py = store_bin / "python3.11"
     store_py.write_bytes(f"#!fake interpreter {version}".encode())
     store_py.chmod(0o755)
+    if with_libpython:
+        store_lib = store / "lib"
+        store_lib.mkdir()
+        (store_lib / "libpython3.11.dylib").write_bytes(
+            f"fake libpython {version}".encode()
+        )
     return store_bin
 
 
@@ -107,6 +114,39 @@ class TestUvStoreDetection:
         assert not tcc._is_uv_macos_store(path)
 
 
+class TestStagingHelpers:
+    def test_finds_uv_libpython_runtime(self, tmp_path):
+        store_bin = _build_store(tmp_path, with_libpython=True)
+
+        assert tcc._runtime_libraries(store_bin / "python3.11") == (
+            store_bin.parent / "lib" / "libpython3.11.dylib",
+        )
+
+    def test_validation_executes_staged_interpreter(self, tmp_path, monkeypatch):
+        staged = tmp_path / "bin" / "python"
+        calls = []
+
+        monkeypatch.setattr(
+            tcc.subprocess,
+            "run",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+
+        tcc._validate_staged_anchor(staged)
+
+        assert calls == [
+            (
+                ([str(staged), "-V"],),
+                {
+                    "check": True,
+                    "stdout": tcc.subprocess.PIPE,
+                    "stderr": tcc.subprocess.PIPE,
+                    "timeout": 15,
+                },
+            )
+        ]
+
+
 class TestEnsureTccAnchor:
     def test_noop_on_non_macos(self, tmp_path, monkeypatch):
         _linux(monkeypatch)
@@ -140,6 +180,40 @@ class TestEnsureTccAnchor:
         alias = venv_py.parent / "python3"
         assert not tcc._is_uv_macos_store(str(alias.resolve(strict=False)))
 
+    def test_materializes_store_libpython_next_to_anchor(self, tmp_path, monkeypatch):
+        _darwin(monkeypatch)
+        store_bin = _build_store(tmp_path, with_libpython=True)
+        root = _build_checkout(tmp_path, store_bin=store_bin)
+
+        anchored = tcc.ensure_tcc_anchor(root)
+
+        assert anchored == venv_python_path(root / ".venv")
+        installed = root / ".venv" / "lib" / "libpython3.11.dylib"
+        assert (
+            installed.read_bytes()
+            == (store_bin.parent / "lib" / "libpython3.11.dylib").read_bytes()
+        )
+
+    def test_validation_failure_leaves_working_interpreter_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        _darwin(monkeypatch)
+        store_bin = _build_store(tmp_path, with_libpython=True)
+        root = _build_checkout(tmp_path, store_bin=store_bin)
+        venv_py = venv_python_path(root / ".venv")
+        original_target = os.readlink(venv_py)
+
+        def reject(_path):
+            raise RuntimeError("dyld could not load libpython")
+
+        monkeypatch.setattr(tcc, "_validate_staged_anchor", reject)
+
+        assert tcc.ensure_tcc_anchor(root) is None
+        assert venv_py.is_symlink()
+        assert os.readlink(venv_py) == original_target
+        assert not (venv_py.parent / ".tcc-anchor-source").exists()
+        assert not (root / ".venv" / "lib" / "libpython3.11.dylib").exists()
+
     def test_idempotent(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)
         store_bin = _build_store(tmp_path)
@@ -153,6 +227,18 @@ class TestEnsureTccAnchor:
         assert anchored == venv_py
         assert venv_py.is_file() and not venv_py.is_symlink()
         assert marker.read_text(encoding="utf-8") == before
+
+    def test_repairs_legacy_anchor_missing_libpython(self, tmp_path, monkeypatch):
+        _darwin(monkeypatch)
+        store_bin = _build_store(tmp_path, with_libpython=True)
+        root = _build_checkout(tmp_path, store_bin=store_bin, anchored=True)
+
+        assert tcc.tcc_anchor_state(root)[0] == "stale"
+        anchored = tcc.ensure_tcc_anchor(root)
+
+        assert anchored == venv_python_path(root / ".venv")
+        assert (root / ".venv" / "lib" / "libpython3.11.dylib").is_file()
+        assert tcc.tcc_anchor_state(root)[0] == "active"
 
     def test_reanchors_after_patch_bump(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)

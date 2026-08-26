@@ -15,8 +15,9 @@ The anchor: replace the venv's ``bin/python`` symlink with a *real-file copy*
 of the interpreter binary.  The venv path (``<checkout>/venv/bin/python``) is
 stable across ``hermes update``, and because it is a regular file there is no
 symlink for TCC to resolve — so the TCC client path stays constant across
-interpreter patch bumps.  ``pyvenv.cfg`` keeps pointing at the uv store (``home``),
-which still provides the stdlib exactly as it does today.
+interpreter patch bumps.  ``pyvenv.cfg`` keeps pointing at the uv store
+(``home``) for the stdlib, while a dynamic build's adjacent ``libpython`` is
+copied into the venv so the relocated executable's rpath remains valid.
 
 The anchor self-heals: when ``hermes update`` / ``hermes doctor`` runs and the
 venv python is a symlink again (uv re-created it) or the recorded source no
@@ -37,6 +38,7 @@ import logging
 import os
 import platform
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -174,6 +176,38 @@ def _anchor_marker(venv_bin: Path) -> Path:
     return venv_bin / _MARKER_NAME
 
 
+def _runtime_libraries(source_file: Path) -> tuple[Path, ...]:
+    """Return dynamic libpython files required by a uv interpreter, if any."""
+    store_lib = source_file.parent.parent / "lib"
+    try:
+        return tuple(
+            sorted(
+                path for path in store_lib.glob("libpython*.dylib") if path.is_file()
+            )
+        )
+    except OSError:
+        return ()
+
+
+def _has_runtime_libraries(venv_dir: Path, source_file: Path) -> bool:
+    """Return whether every uv libpython dependency is present in the venv."""
+    return all(
+        (venv_dir / "lib" / library.name).is_file()
+        for library in _runtime_libraries(source_file)
+    )
+
+
+def _validate_staged_anchor(staged_python: Path) -> None:
+    """Prove the relocated interpreter can start before replacing the venv copy."""
+    subprocess.run(
+        [str(staged_python), "-V"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+
+
 def _repoint_aliases(venv_bin: Path, anchor: Path) -> None:
     """Re-point uv alias symlinks at the stable anchor.
 
@@ -212,28 +246,38 @@ def _repoint_aliases(venv_bin: Path, anchor: Path) -> None:
 def _install_anchor(venv_dir: Path, source_file: Path) -> None:
     """Replace ``bin/python`` with a real-file copy of *source_file*.
 
-    Atomic (temp file + rename) so a crash mid-copy cannot leave the venv
-    interpreter half-written.  Writes the source marker and re-points alias
-    symlinks so the whole venv bin dir resolves to stable paths.
+    The interpreter and any adjacent uv ``libpython`` runtime are staged in a
+    complete relocatable layout and executed before the working venv interpreter
+    is replaced.  Final files are atomically renamed so a partial copy cannot
+    brick the CLI.  Writes the source marker and re-points alias symlinks.
     """
     venv_py = venv_python_path(venv_dir)
     venv_bin = venv_py.parent
     venv_bin.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".python-tcc-", dir=str(venv_bin))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        shutil.copy2(source_file, tmp_path)
-        os.chmod(tmp_path, source_file.stat().st_mode | 0o111)
-        os.replace(tmp_path, venv_py)
+    with tempfile.TemporaryDirectory(prefix=".tcc-anchor-", dir=str(venv_dir)) as tmp:
+        stage = Path(tmp)
+        staged_python = stage / "bin" / "python"
+        staged_python.parent.mkdir()
+        shutil.copy2(source_file, staged_python)
+        os.chmod(staged_python, source_file.stat().st_mode | 0o111)
+
+        staged_lib = stage / "lib"
+        runtime_libraries = _runtime_libraries(source_file)
+        if runtime_libraries:
+            staged_lib.mkdir()
+            for library in runtime_libraries:
+                shutil.copy2(library, staged_lib / library.name)
+
+        _validate_staged_anchor(staged_python)
+
+        if runtime_libraries:
+            venv_lib = venv_dir / "lib"
+            venv_lib.mkdir(parents=True, exist_ok=True)
+            for library in runtime_libraries:
+                os.replace(staged_lib / library.name, venv_lib / library.name)
+        os.replace(staged_python, venv_py)
         _anchor_marker(venv_bin).write_text(str(source_file), encoding="utf-8")
         _repoint_aliases(venv_bin, venv_py)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
 
 
 def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
@@ -263,8 +307,10 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
         # Already anchored — refresh only when the interpreter changed.
         marker = _anchor_marker(venv_py.parent)
         try:
-            if marker.is_file() and marker.read_text(encoding="utf-8").strip() == str(
-                source_file
+            if (
+                marker.is_file()
+                and marker.read_text(encoding="utf-8").strip() == str(source_file)
+                and _has_runtime_libraries(venv_dir, source_file)
             ):
                 return venv_py
         except OSError:
@@ -301,8 +347,12 @@ def tcc_anchor_state(project_root: Path | None = None) -> tuple[str, str]:
     if not venv_py.is_symlink():
         marker = _anchor_marker(venv_py.parent)
         try:
-            if marker.is_file() and marker.read_text(encoding="utf-8").strip() == str(
-                source
+            source_file = _interpreter_file(source)
+            if (
+                marker.is_file()
+                and marker.read_text(encoding="utf-8").strip() == str(source)
+                and source_file is not None
+                and _has_runtime_libraries(venv_dir, source_file)
             ):
                 return "active", str(venv_py)
         except OSError:
