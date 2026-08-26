@@ -13843,7 +13843,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     is_webhook_handoff = self._is_webhook_handoff_row(row)
                     if is_webhook_handoff:
-                        claim_owner = self._new_webhook_handoff_claim_owner(row)
+                        try:
+                            claim_owner = self._new_webhook_handoff_claim_owner(row)
+                        except Exception as owner_exc:
+                            # One unclaimable row must not starve every younger
+                            # pending handoff (the loop is oldest-first), and a
+                            # tick-level debug log would hide the cause.
+                            logger.error(
+                                "Cannot construct webhook handoff claim owner "
+                                "for %s: %s",
+                                session_id,
+                                owner_exc,
+                                exc_info=True,
+                            )
+                            continue
                         claim_token = claim_owner["token"]
                         claim_owner_json = json.dumps(
                             claim_owner, sort_keys=True, separators=(",", ":")
@@ -13916,13 +13929,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not claimed:
                         # Another tick or another gateway already claimed it.
                         continue
+                    completion_published = False
                     try:
                         await self._process_handoff(row)
                         if is_webhook_handoff:
-                            completed = await self._session_db.complete_claimed_webhook_handoff(
-                                session_id,
-                                row["_handoff_claim_token"],
+                            # Same shield/reconcile discipline as the claim
+                            # above: the completion UPDATE is offloaded, so a
+                            # shutdown cancellation here must not let the
+                            # CancelledError cleanup finalize (and retract) a
+                            # handoff whose reply was already delivered while
+                            # the completion commit was still in flight.
+                            completion_task = asyncio.create_task(
+                                self._session_db.complete_claimed_webhook_handoff(
+                                    session_id,
+                                    row["_handoff_claim_token"],
+                                )
                             )
+                            try:
+                                completed = await asyncio.shield(completion_task)
+                            except asyncio.CancelledError:
+                                try:
+                                    completed = await completion_task
+                                except Exception as completion_exc:
+                                    logger.error(
+                                        "Cancelled webhook handoff completion "
+                                        "failed for %s: %s",
+                                        session_id,
+                                        completion_exc,
+                                        exc_info=True,
+                                    )
+                                    completed = False
+                                if not completed:
+                                    state = await self._session_db.get_handoff_state(
+                                        session_id
+                                    )
+                                    completed = bool(
+                                        state
+                                        and state.get("state") == "completed"
+                                    )
+                                completion_published = bool(completed)
+                                raise
+                            completion_published = bool(completed)
                             if not completed:
                                 logger.warning(
                                     "Handoff for session %s finished after its durable "
@@ -13945,7 +13992,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # user retry from spawning a second destination thread.
                             await self._session_db.complete_handoff(session_id)
                     except asyncio.CancelledError:
-                        if is_webhook_handoff:
+                        if is_webhook_handoff and not completion_published:
                             try:
                                 await self._finalize_failed_webhook_handoff(
                                     row,
@@ -14067,10 +14114,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except psutil.AccessDenied:
                 return None
             except Exception:
+                logger.debug(
+                    "Webhook handoff claim-owner liveness probe failed for "
+                    "pid %s",
+                    pid,
+                    exc_info=True,
+                )
                 return None
         except ImportError:  # pragma: no cover - stripped/scaffold installs only
             return None
         except Exception:
+            logger.debug(
+                "Webhook handoff claim-owner liveness probe failed for pid %s",
+                pid,
+                exc_info=True,
+            )
             return None
 
         current_start = get_process_start_time(pid)
@@ -14656,8 +14714,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 origin = json.loads(raw_origin) if isinstance(raw_origin, str) else raw_origin
                 if isinstance(origin, dict) and origin.get("profile"):
                     return str(origin["profile"])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.debug(
+                    "Ignoring malformed origin_json while resolving handoff "
+                    "profile for session %s: %s",
+                    row.get("id"),
+                    exc,
+                )
         profile = row.get("profile_name")
         if profile:
             return str(profile)
@@ -21366,7 +21429,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ),
                         _admission_loop,
                     )
-                    future.result()
+                    # The hook's real work is local SQLite plus a non-blocking
+                    # flock — milliseconds. An unbounded result() would leak
+                    # this executor worker forever if the event loop stalls or
+                    # stops mid-bridge; hard interrupts cannot reach a thread
+                    # parked here. Cancel on timeout so a late completion
+                    # lands in the adapter's CancelledError rollback instead
+                    # of binding a delivery to an abandoned turn.
+                    try:
+                        future.result(timeout=120.0)
+                    except concurrent.futures.TimeoutError:
+                        future.cancel()
+                        raise RuntimeError(
+                            "webhook durable-input admission timed out"
+                        ) from None
 
                 _input_persisted_callback = _confirm_input_persisted
             _turn_started_monotonic = time.monotonic()

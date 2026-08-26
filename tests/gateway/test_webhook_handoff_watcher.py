@@ -3842,3 +3842,97 @@ async def test_released_foreign_owner_lock_recovers_without_dispatch(
     adapter.send.assert_not_awaited()
     restarted_store.close_all_db_handles()
     restarted_db.close()
+
+@pytest.mark.asyncio
+async def test_completion_cancellation_does_not_retract_delivered_handoff(
+    tmp_path, monkeypatch
+):
+    """Cancellation racing the offloaded completion must reconcile its result.
+
+    Once _process_handoff has returned, the thread exists, the route moved,
+    and the reply was delivered. A cancelled ``asyncio.to_thread`` never stops
+    the queued completion UPDATE — it always executes eventually — so the
+    CancelledError cleanup races it on commit order. This test forces the
+    adverse order (the completion commit is held until any failure finalizer
+    has fully run): the watcher must reconcile the completion result instead
+    of retracting the already-delivered handoff.
+    """
+    config = _discord_config(tmp_path)
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:route:cancel-during-completion",
+        chat_type="webhook",
+        user_id="webhook:route",
+    )
+    entry = store.get_or_create_session(source)
+    assert db.request_handoff_once(entry.session_id, "discord") is True
+    runner, adapter = _runner_with_store(config, store, db)
+    runner._running = True
+
+    processed = asyncio.Event()
+    finalize_ran = threading.Event()
+
+    real_process_handoff = GatewayRunner._process_handoff.__get__(runner)
+
+    async def _process_then_signal(row):
+        await real_process_handoff(row)
+        processed.set()
+
+    runner._process_handoff = _process_then_signal
+
+    real_completion = db.complete_claimed_webhook_handoff
+
+    def _completion_after_any_finalize(session_id, claim_token):
+        # Hold the completion commit until a failure finalizer (if any) has
+        # fully committed, deterministically producing the adverse order.
+        finalize_ran.wait(timeout=1.0)
+        return real_completion(session_id, claim_token)
+
+    monkeypatch.setattr(
+        db, "complete_claimed_webhook_handoff", _completion_after_any_finalize
+    )
+
+    real_remove_and_end = store.remove_session_route_and_end
+
+    def _marking_remove_and_end(*args, **kwargs):
+        try:
+            return real_remove_and_end(*args, **kwargs)
+        finally:
+            finalize_ran.set()
+
+    monkeypatch.setattr(
+        store, "remove_session_route_and_end", _marking_remove_and_end
+    )
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _no_sleep)
+    watcher_task = asyncio.create_task(
+        GatewayRunner._handoff_watcher(runner, interval=0)
+    )
+    await asyncio.wait_for(processed.wait(), timeout=5)
+    # Let the watcher advance from _process_handoff to the completion await.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    watcher_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(watcher_task, timeout=10)
+
+    durable = db.get_session(entry.session_id)
+    assert durable["handoff_state"] == "completed"
+    assert durable["handoff_error"] is None
+    assert durable["ended_at"] is None
+    # The delivered destination route survives; only the source moved away.
+    synthetic_event = runner._handle_message.await_args.args[0]
+    destination_key = runner._session_key_for_source(synthetic_event.source)
+    assert store.peek_session_id(destination_key) == entry.session_id
+    assert store.peek_session_id(entry.session_key) is None
+    adapter.send.assert_awaited()
+    db.close()
