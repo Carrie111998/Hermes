@@ -17,6 +17,7 @@ describe('session-scoped RPC guard', () => {
     expect(isSessionNotFoundError(new JsonRpcGatewayError('gone', { code: 4001 }))).toBe(true)
     expect(isSessionNotFoundError(new JsonRpcGatewayError('session not found', { code: 5007 }))).toBe(false)
     expect(isSessionNotFoundError(new JsonRpcGatewayError('session not found'))).toBe(true)
+    expect(isSessionNotFoundError(new Error('tool failed: upstream said session not found'))).toBe(false)
   })
 
   it('blocks only the dead runtime until that runtime is explicitly rebound', () => {

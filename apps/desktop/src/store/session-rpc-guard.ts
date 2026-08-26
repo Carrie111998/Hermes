@@ -9,9 +9,12 @@ export function isSessionNotFoundError(error: unknown): boolean {
     return error.code === GATEWAY_SESSION_NOT_FOUND_CODE
   }
 
-  const message = error instanceof Error ? error.message : String(error ?? '')
+  const message = (error instanceof Error ? error.message : String(error ?? ''))
+    .trim()
+    .replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, '')
+    .replace(/^Error:\s*/i, '')
 
-  return /session not found/i.test(message)
+  return /^(?:4001\s*[:,-]?\s*)?session not found[.!]?$/i.test(message)
 }
 
 /** Whether session-scoped RPCs should stop targeting this runtime id. */

@@ -159,9 +159,11 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
   } catch (error) {
     if (isSessionNotFoundError(error)) {
       markSessionRpcBlocked(sessionId)
+
+      return
     }
 
-    return
+    throw error
   }
 
   const result =
