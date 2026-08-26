@@ -3,6 +3,7 @@
 // and data-URL audio elements — and a settled session must never resume or
 // write stale state into a newer turn.
 
+import type * as SharedTypes from '@hermes/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $voicePlayback } from '@/store/voice-playback'
@@ -21,7 +22,8 @@ const gateway = vi.hoisted(() => {
 })
 
 vi.mock('@hermes/shared', async importOriginal => {
-  const actual = await importOriginal<typeof import('@hermes/shared')>()
+  const actual = await importOriginal<typeof SharedTypes>()
+
   return {
     ...actual,
     resolveGatewayWsUrl: async () => gateway.currentUrl()

@@ -4,6 +4,7 @@
 // must not resurrect the interrupted one, and must leave every socket/context
 // closed with no stale text feeding later turns.
 
+import type * as SharedTypes from '@hermes/shared'
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -90,7 +91,8 @@ vi.mock('@/i18n', () => ({
 }))
 
 vi.mock('@hermes/shared', async importOriginal => {
-  const actual = await importOriginal<typeof import('@hermes/shared')>()
+  const actual = await importOriginal<typeof SharedTypes>()
+
   return {
     ...actual,
     resolveGatewayWsUrl: async () => 'ws://gateway.test/api/ws'
