@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { canRecycle, registerRecycleHandler, triggerRecycle, RECYCLE_EXIT_CODE } from '../lib/recycleBridge.js'
+import { canRecycle, RECYCLE_EXIT_CODE, registerRecycleHandler, triggerRecycle } from '../lib/recycleBridge.js'
 
 describe('recycleBridge (Stage 1 recycle guard + dispatch)', () => {
   afterEach(() => {
@@ -50,9 +50,11 @@ describe('recycleBridge (Stage 1 recycle guard + dispatch)', () => {
 
     it('unregister only clears the matching handler', () => {
       let aFired = 0
+
       const offA = registerRecycleHandler(() => {
         aFired++
       })
+
       let bFired = 0
       registerRecycleHandler(() => {
         bFired++

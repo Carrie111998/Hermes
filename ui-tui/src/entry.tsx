@@ -12,8 +12,8 @@ import { startHeartbeat } from './lib/heartbeat.js'
 import { formatBytes, type HeapDumpResult, performHeapDump } from './lib/memory.js'
 import { type MemorySnapshot, startMemoryMonitor } from './lib/memoryMonitor.js'
 import { openExternalUrl } from './lib/openExternalUrl.js'
-import { triggerRecycle } from './lib/recycleBridge.js'
 import { recordParentLifecycle } from './lib/parentLog.js'
+import { triggerRecycle } from './lib/recycleBridge.js'
 import { resetTerminalModes } from './lib/terminalModes.js'
 
 if (!process.stdin.isTTY) {
@@ -162,6 +162,7 @@ const stopMemoryMonitor = startMemoryMonitor({
   // recycle: persist scroll+sid, exit 0, supervisor respawns + resumes).
   onSustainedPressure: snap => {
     recordParentLifecycle(`memory-sustained-pressure heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)} — relief insufficient, recycle candidate`)
+
     // Stage 1: attempt a SEAMLESS recycle. triggerRecycle() only fires in
     // attach mode under the orchestrator (canRecycle()): it persists scroll+sid
     // and exits 0, the supervisor respawns a fresh renderer that resumes the
@@ -173,8 +174,10 @@ const stopMemoryMonitor = startMemoryMonitor({
       process.stderr.write(
         `hermes-tui: recycling renderer to shed memory (session preserved on the gateway)\n`
       )
+
       return
     }
+
     process.stderr.write(
       `hermes-tui: sustained heap pressure (${formatBytes(snap.heapUsed)}) after prune+GC — long session may benefit from a fresh renderer (auto-recycle requires the session orchestrator)\n`
     )

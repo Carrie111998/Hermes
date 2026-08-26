@@ -1,15 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
   applyScrollState,
   persistScrollState,
   restoreScrollState,
-  scrollStatePath,
   SCROLL_STATE_TTL_MS,
-  type ScrollState
+  type ScrollState,
+  scrollStatePath
 } from '../lib/scrollPersistence.js'
 
 describe('scrollPersistence (Stage 1: recycle keeps scroll position)', () => {
@@ -64,6 +65,7 @@ describe('scrollPersistence (Stage 1: recycle keeps scroll position)', () => {
   describe('applyScrollState', () => {
     function fakeTarget() {
       const calls: string[] = []
+
       return {
         calls,
         scrollTo: (y: number) => calls.push(`scrollTo(${y})`),

@@ -36,6 +36,7 @@ export const RECYCLE_EXIT_CODE = 97
 /** The app registers its recycle implementation once on mount. */
 export function registerRecycleHandler(fn: () => void): () => void {
   _recycle = fn
+
   return () => {
     if (_recycle === fn) {
       _recycle = null
@@ -61,6 +62,8 @@ export function triggerRecycle(env: NodeJS.ProcessEnv = process.env): boolean {
   if (!_recycle || !canRecycle(env)) {
     return false
   }
+
   _recycle()
+
   return true
 }

@@ -57,6 +57,7 @@ const MB = 1024 ** 2
 function forceGcIfAvailable(): void {
   try {
     const gc = (globalThis as { gc?: () => void }).gc
+
     if (typeof gc === 'function') {
       gc()
     }
@@ -191,6 +192,7 @@ export function startMemoryMonitor({
             reliefInFlight = false
           })
       }
+
       forceGcIfAvailable()
 
       // Sustained pressure: relief didn't bring heap back under the floor for

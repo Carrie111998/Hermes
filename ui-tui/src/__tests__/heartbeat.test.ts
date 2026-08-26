@@ -49,9 +49,11 @@ describe('heartbeat (Stage 3 frozen-detection liveness)', () => {
 
   it('a throwing touch never escapes the timer (renderer must not crash on a bad fs)', () => {
     vi.useFakeTimers()
+
     const touch = vi.fn(() => {
       throw new Error('disk gone')
     })
+
     // start itself beats immediately; must not throw
     const stop = startHeartbeat('/tmp/hb', 1000, touch)
     expect(() => vi.advanceTimersByTime(2000)).not.toThrow()

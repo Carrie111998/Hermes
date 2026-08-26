@@ -19,7 +19,7 @@
  * so this can never make resume worse than today, only better.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -39,6 +39,7 @@ function stateDir(): string {
   // Prefer an explicit runtime dir (the orchestrator sets one) so the persisted
   // file lives beside the session's other runtime state; fall back to tmp.
   const base = process.env.HERMES_TUI_RUNTIME_DIR?.trim() || join(tmpdir(), 'hermes-tui-scroll')
+
   return base
 }
 
@@ -56,11 +57,13 @@ export function persistScrollState(sid: string, state: Omit<ScrollState, 'savedA
   if (!sid) {
     return false
   }
+
   try {
     const path = scrollStatePath(sid, dir)
     mkdirSync(dirname(path), { recursive: true })
     const payload: ScrollState = { ...state, savedAt: Date.now() }
     writeFileSync(path, JSON.stringify(payload), 'utf8')
+
     return true
   } catch {
     return false
@@ -77,9 +80,11 @@ export function restoreScrollState(sid: string, dir = stateDir(), now: number = 
   if (!sid) {
     return null
   }
+
   try {
     const raw = readFileSync(scrollStatePath(sid, dir), 'utf8')
     const parsed = JSON.parse(raw) as Partial<ScrollState>
+
     if (
       typeof parsed?.top !== 'number' ||
       typeof parsed?.atBottom !== 'boolean' ||
@@ -87,9 +92,11 @@ export function restoreScrollState(sid: string, dir = stateDir(), now: number = 
     ) {
       return null
     }
+
     if (now - parsed.savedAt > SCROLL_STATE_TTL_MS) {
       return null // stale — fall back to default
     }
+
     return { top: parsed.top, atBottom: parsed.atBottom, savedAt: parsed.savedAt }
   } catch {
     return null
@@ -111,8 +118,11 @@ export interface ScrollApplyTarget {
 export function applyScrollState(target: ScrollApplyTarget, state: ScrollState | null): boolean {
   if (!state || state.atBottom) {
     target.scrollToBottom()
+
     return false
   }
+
   target.scrollTo(Math.max(0, state.top))
+
   return true
 }

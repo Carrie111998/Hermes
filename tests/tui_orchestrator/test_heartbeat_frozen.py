@@ -8,6 +8,7 @@ as 'frozen' once the mtime goes stale, while poll()-based logic would miss it.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -156,5 +157,10 @@ def test_heartbeat_frozen_detect():
 
     if sys.platform.startswith("win") or not hasattr(signal, "SIGSTOP"):
         pytest.skip("SIGSTOP-based frozen-renderer harness is POSIX-only")
+    if shutil.which("bun") is None:
+        pytest.skip("real frozen-renderer integration requires bun")
+    renderer = Path(__file__).resolve().parents[2] / "ui-tui" / "dist" / "entry.js"
+    if not renderer.is_file():
+        pytest.skip("real frozen-renderer integration requires ui-tui/dist/entry.js")
     rc = main()
     assert rc == 0, f"heartbeat-frozen harness failed with rc={rc}"

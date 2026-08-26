@@ -387,9 +387,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             // so this is never worse than before, only seamless on a recycle.
             setTimeout(() => {
               const handle = scrollRef.current
+
               if (!handle) {
                 return
               }
+
               const restored = restoreScrollState(r.session_id)
               applyScrollState(handle, restored)
             }, 0)
@@ -436,8 +438,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       newSession,
       resetSession,
       resetVisibleHistory,
-      resumeById,
-      trimTail
+      resumeById
     ]
   )
 }

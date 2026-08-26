@@ -32,12 +32,11 @@ import { pruneVirtualHeightCache, useVirtualHistory } from '../hooks/useVirtualH
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage, capTranscriptHistory } from '../lib/messages.js'
 import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
+import { RECYCLE_EXIT_CODE, registerRecycleHandler } from '../lib/recycleBridge.js'
 import { createResizeCoalescer } from '../lib/resizeCoalescer.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
-import { registerRecycleHandler, RECYCLE_EXIT_CODE } from '../lib/recycleBridge.js'
 import { persistScrollState } from '../lib/scrollPersistence.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
-import { getViewportSnapshot } from '../lib/viewportStore.js'
 import {
   buildToolTrailLine,
   formatAbandonedClarify,
@@ -45,6 +44,7 @@ import {
   sameToolTrailGroup,
   toolTrailLabel
 } from '../lib/text.js'
+import { getViewportSnapshot } from '../lib/viewportStore.js'
 import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
@@ -561,6 +561,7 @@ export function useMainApp(gw: GatewayClient) {
     try {
       const sid = getUiState().sid
       const handle = scrollRef.current
+
       if (sid && handle) {
         const snap = getViewportSnapshot(handle)
         persistScrollState(sid, { top: snap.top, atBottom: snap.atBottom })
@@ -569,6 +570,7 @@ export function useMainApp(gw: GatewayClient) {
       // best-effort: a failed persist just means the fresh renderer falls back
       // to scrollToBottom — never blocks the recycle.
     }
+
     gw.kill('app.recycle')
     exit()
     process.exit(RECYCLE_EXIT_CODE)

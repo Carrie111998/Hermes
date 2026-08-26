@@ -29,6 +29,7 @@ export function startHeartbeat(
   if (!file || !file.trim()) {
     return () => {}
   }
+
   const path = file.trim()
 
   const beat = () => {
@@ -42,27 +43,32 @@ export function startHeartbeat(
 
   beat() // immediate first beat so a fresh renderer isn't briefly "stale"
   const timer = setInterval(beat, intervalMs)
+
   // Do NOT keep the event loop alive just for the heartbeat.
   if (typeof timer.unref === 'function') {
     timer.unref()
   }
+
   return () => clearInterval(timer)
 }
 
 /** Touch a file's mtime, creating it if absent. */
 export function defaultTouch(path: string): void {
   let fd: number | undefined
+
   try {
     fd = openSync(path, 'a') // create if missing, no truncate
   } finally {
     if (fd !== undefined) {
       const now = new Date()
+
       try {
         utimesSync(path, now, now)
       } catch {
         // file exists but utimes failed — opening in 'a' already bumped ctime;
         // mtime may not move, but the reaper's stale window is generous.
       }
+
       closeSync(fd)
     }
   }
