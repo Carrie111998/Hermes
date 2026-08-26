@@ -3012,3 +3012,48 @@ class TestRedirectHeaderStripper:
         asyncio.run(hook(response))
         assert next_request.headers["authorization"] == "Bearer x"
         assert next_request.headers["x-tenant"] == "t"
+
+
+class TestStdioChildrenDead:
+    """Regression for issue #95668: _stdio_children_dead() was logically
+    inverted -- a live tracked child (psutil.pid_exists returns True) hit
+    `return True` (meaning "alive" was reported as "all dead"), making
+    every stdio MCP call fast-fail against demonstrably healthy
+    subprocesses with a false "subprocess has exited" TimeoutError."""
+
+    def _make_stdio_server(self, pids):
+        server = _make_mock_server("test-stdio-server")
+        server._stdio_child_pids = pids
+        return server
+
+    def test_a_live_child_is_not_reported_dead(self):
+        """The exact reported symptom: a genuinely live child process
+        must resolve to False (not dead), not True."""
+        live_pid = os.getpid()
+        server = self._make_stdio_server([live_pid])
+
+        assert server._stdio_children_dead() is False
+
+    def test_a_dead_child_is_reported_dead(self):
+        # A PID this unlikely to exist on any real system.
+        dead_pid = 999999
+        server = self._make_stdio_server([dead_pid])
+
+        assert server._stdio_children_dead() is True
+
+    def test_one_alive_among_several_dead_is_not_reported_dead(self):
+        """At least one live child must be enough to report "not dead",
+        regardless of how many other tracked PIDs have already exited."""
+        dead_pid = 999999
+        live_pid = os.getpid()
+        server = self._make_stdio_server([dead_pid, live_pid, 999998])
+
+        assert server._stdio_children_dead() is False
+
+    def test_no_tracked_pids_returns_false_unknown(self):
+        """No captured PIDs at all (unknown liveness) must not fail fast
+        -- matches the function's own documented "unknown -> don't fail
+        fast" contract."""
+        server = self._make_stdio_server([])
+
+        assert server._stdio_children_dead() is False
