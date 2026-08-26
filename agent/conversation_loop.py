@@ -1807,6 +1807,11 @@ def _notify_context_engine_turn_complete(
     Fail-open: a missing or no-op hook, or any exception, is swallowed.
     ``messages`` is passed as a shallow copy so the engine cannot mutate the
     persisted transcript.
+
+    One exception to fail-open: under ``compression.checkpoint_required`` the
+    hook is withheld from an engine that may compact outside ``compress()``.
+    Each suppression bumps ``agent._checkpoint_gate_suppression_count``
+    (shared with the proactive tool-result prune suppression).
     """
     engine = getattr(agent, "context_compressor", None)
     hook = getattr(engine, "on_turn_complete", None)
@@ -1822,6 +1827,28 @@ def _notify_context_engine_turn_complete(
             return
     except Exception:
         pass
+
+    # The init refuse fires once, but engine slot and hook are plain attributes
+    # a later code path can rebind, so the verdict is re-resolved per turn.
+    # Withheld rather than raised: the dispatch below swallows exceptions.
+    if getattr(agent, "compression_checkpoint_required", False) is True:
+        try:
+            from agent.context_engine import engine_compacts_outside_compress
+
+            _unsafe, _reason = engine_compacts_outside_compress(engine)
+        except Exception:
+            # Fail closed: the lazy import dodges an import cycle, so a failed
+            # import must not read as "safe".
+            _unsafe = True
+        if _unsafe:
+            agent._checkpoint_gate_suppression_count = (
+                getattr(agent, "_checkpoint_gate_suppression_count", 0) + 1
+            )
+            _warn_checkpoint_gate_suppressed(
+                "the context engine's on_turn_complete hook (an engine that "
+                "only observes may declare compacts_outside_compress = False)"
+            )
+            return
 
     try:
         hook(
