@@ -245,13 +245,18 @@ def authorize_agent_sdk_kwargs(
         if isinstance(registry, SourceProvenanceRegistry)
         else ()
     )
-    sanitized_cap = int(getattr(agent, "_llm_egress_max_sanitized_bytes", 32_768))
+    sanitized_segment_cap = int(
+        getattr(agent, "_llm_egress_max_sanitized_segment_bytes", 32_768)
+    )
+    sanitized_aggregate_cap = int(
+        getattr(agent, "_llm_egress_max_sanitized_bytes", 32_768)
+    )
     used_grants: dict[str, SourceGrant] = {}
     typed_body = _typed_payload(
         body,
         _grant_texts(grants),
         used_grants,
-        sanitized_cap=sanitized_cap,
+        sanitized_cap=sanitized_segment_cap,
     )
     request = TypedOutboundRequest(
         payload=typed_body,
@@ -264,13 +269,33 @@ def authorize_agent_sdk_kwargs(
         getattr(agent, "_llm_egress_state_dir", "")
         or Path.home() / ".hermes" / "egress"
     )
+    max_serialized_bytes = int(
+        getattr(agent, "_llm_egress_max_serialized_bytes", 262_144)
+    )
+    max_conservative_tokens = int(
+        getattr(agent, "_llm_egress_max_conservative_tokens", 87_382)
+    )
     firewall = LLMEgressFirewall(
         state_dir,
         policy_digest=policy_digest,
-        max_serialized_bytes=int(
-            getattr(agent, "_llm_egress_max_serialized_bytes", 262_144)
+        max_serialized_bytes=max_serialized_bytes,
+        max_conservative_tokens=max_conservative_tokens,
+        max_granted_serialized_bytes=int(
+            getattr(
+                agent,
+                "_llm_egress_max_granted_serialized_bytes",
+                max_serialized_bytes,
+            )
         ),
-        max_sanitized_bytes=sanitized_cap,
+        max_granted_conservative_tokens=int(
+            getattr(
+                agent,
+                "_llm_egress_max_granted_conservative_tokens",
+                max_conservative_tokens,
+            )
+        ),
+        max_sanitized_bytes=sanitized_aggregate_cap,
+        max_sanitized_segment_bytes=sanitized_segment_cap,
         static_literal_hashes_by_policy={
             policy_digest: _structural_literal_hashes(body)
         },

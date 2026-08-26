@@ -72,6 +72,36 @@ def test_runtime_authorizes_mixed_exact_source_and_bounded_sanitized_text(tmp_pa
     assert "policy_digest" not in wire
 
 
+def test_runtime_granted_caps_default_to_the_configured_request_caps(tmp_path):
+    registry = SourceProvenanceRegistry()
+    path = tmp_path / "large-source.txt"
+    content = b"plain source sentence\n" * 12
+    path.write_bytes(content)
+    registry.issue_file_slice(
+        path=path,
+        line_start=1,
+        line_end=12,
+        content=content,
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest=sha256(b"policy-1").hexdigest(),
+    )
+    agent = _agent(tmp_path, registry)
+    agent._llm_egress_max_serialized_bytes = 128
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": content.decode("utf-8")}],
+            },
+        )
+
+    assert "serialized_bytes_exceeded" in exc_info.value.decision.reason_codes
+
+
 def test_runtime_keeps_sdk_controls_out_of_authorized_body(tmp_path):
     agent = _agent(tmp_path)
     timeout = object()

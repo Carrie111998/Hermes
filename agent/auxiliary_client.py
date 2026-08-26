@@ -3367,17 +3367,27 @@ def _auxiliary_egress_binding(
             else "chat_completions"
         )
     )
-    agent = SimpleNamespace(
-        provider=normalized_provider,
-        model=str(model or ""),
-        base_url=base_url,
-        api_mode=resolved_api_mode,
-        session_id=session_id,
-        _current_turn_id=turn_id,
-        _current_api_request_id=request_id,
-        _llm_egress_policy_digest=policy_digest,
-        _llm_egress_state_dir=Path(get_hermes_home()) / "egress",
-    )
+    agent_attrs = {
+        "provider": normalized_provider,
+        "model": str(model or ""),
+        "base_url": base_url,
+        "api_mode": resolved_api_mode,
+        "session_id": session_id,
+        "_current_turn_id": turn_id,
+        "_current_api_request_id": request_id,
+        "_llm_egress_policy_digest": policy_digest,
+        "_llm_egress_state_dir": Path(get_hermes_home()) / "egress",
+    }
+    if str(relay.get("task") or "") == "compression":
+        agent_attrs.update(
+            _llm_egress_max_serialized_bytes=2_000_000,
+            _llm_egress_max_conservative_tokens=666_667,
+            _llm_egress_max_sanitized_bytes=2_000_000,
+            _llm_egress_max_sanitized_segment_bytes=32_768,
+            _llm_egress_max_granted_serialized_bytes=2_000_000,
+            _llm_egress_max_granted_conservative_tokens=666_667,
+        )
+    agent = SimpleNamespace(**agent_attrs)
     route = SimpleNamespace(
         provider=normalized_provider,
         model=str(model or ""),
