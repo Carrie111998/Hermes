@@ -28,7 +28,21 @@ def _init_repo(path: Path) -> None:
 def _commit(path: Path, msg: str) -> None:
     (path / "f").write_text(msg, encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=path, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", msg], cwd=path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Hermes Test",
+            "-c",
+            "user.email=hermes-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ],
+        cwd=path,
+        check=True,
+    )
 
 
 # --- config gate ---------------------------------------------------------
@@ -162,6 +176,7 @@ def test_overlay_commits_on_latest_tag_not_flagged(tmp_path):
         ["git", "clone", "-q", str(remote), str(clone)], check=True
     )
     _commit(clone, "local overlay")
+    subprocess.run(["git", "tag", "v1.1.0-rc1"], cwd=clone, check=True)
 
     status = stable_update.stable_update_status(clone, remote="origin")
     assert status["current_tag"] == "v1.0.0"

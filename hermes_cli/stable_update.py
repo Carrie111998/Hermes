@@ -107,19 +107,25 @@ def latest_stable_tag(
 
 
 def current_stable_tag(repo_dir: Path) -> Optional[str]:
-    """Return the newest stable tag reachable from HEAD, or None."""
+    """Return the highest stable tag reachable from HEAD, or None."""
     try:
         result = _run_git(
             repo_dir,
-            ["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"],
+            ["tag", "--merged", "HEAD", "--list", "v[0-9]*"],
             timeout=5,
         )
     except Exception:
         return None
     if result.returncode != 0:
         return None
-    tag = (result.stdout or "").strip()
-    return tag if _parse_version(tag) else None
+
+    stable_tags = (
+        (version, tag)
+        for tag in (result.stdout or "").splitlines()
+        if (version := _parse_version(tag)) is not None
+    )
+    best = max(stable_tags, default=None)
+    return best[1] if best else None
 
 
 def stable_update_status(
