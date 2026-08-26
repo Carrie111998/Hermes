@@ -89,10 +89,19 @@ def test_env_loader_does_not_split_concatenated_text():
 def test_env_loader_warns_when_repair_write_fails(capsys):
     """A failed .env repair (e.g. Windows file lock during atomic_replace)
     must warn on stderr instead of silently leaving the corrupted file for
-    python-dotenv to mis-parse — the exact failure mode of #8908."""
+    python-dotenv to mis-parse — the exact failure mode of #8908.
+
+    Uses an embedded-null-byte corruption rather than a concatenated-line
+    one: per test_env_loader_does_not_split_concatenated_text /
+    test_load_env_preserves_concatenated_text_as_value_data above, a
+    concatenated line is now deliberately left untouched (ambiguous —
+    could be opaque value data), so it never reaches the write attempt
+    this test needs to exercise. A null byte is unconditionally stripped
+    regardless of that heuristic, reliably triggering the rewrite.
+    """
     from hermes_cli import env_loader
 
-    corrupted = "TELEGRAM_BOT_TOKEN=0123456789:testANTHROPIC_API_KEY=sk-ant\n"
+    corrupted = "TELEGRAM_BOT_TOKEN=my\x00token\n"
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".env", delete=False, encoding="utf-8"
     ) as f:
