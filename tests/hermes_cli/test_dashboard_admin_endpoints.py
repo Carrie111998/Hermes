@@ -209,6 +209,122 @@ class TestCredentialPoolEndpoints:
         sources = sorted(e.source for e in load_pool("openrouter").entries())
         assert sources == ["env:OPENROUTER_API_KEY", "manual"]
 
+    def test_oauth_account_rename_and_delete_keep_route_lifecycle_in_sync(self):
+        from agent.credential_pool import (
+            AUTH_TYPE_OAUTH,
+            PooledCredential,
+            SOURCE_MANUAL_DEVICE_CODE,
+            load_pool,
+        )
+        from hermes_cli.config import load_config
+        from hermes_cli.web_server import _save_credential_route
+
+        pool = load_pool("openai-codex")
+        first = PooledCredential(
+            provider="openai-codex",
+            id="acct-a",
+            label="Personal",
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=SOURCE_MANUAL_DEVICE_CODE,
+            access_token="token-a",
+            refresh_token="refresh-a",
+        )
+        second = PooledCredential(
+            provider="openai-codex",
+            id="acct-b",
+            label="Work",
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=1,
+            source=SOURCE_MANUAL_DEVICE_CODE,
+            access_token="token-b",
+            refresh_token="refresh-b",
+        )
+        pool.add_entry(first)
+        pool.add_entry(second)
+        _save_credential_route("openai-codex", first.id, first.label)
+        _save_credential_route("openai-codex", second.id, second.label)
+
+        listed = self.client.get("/api/credentials/pool")
+        assert listed.status_code == 200
+        entries = listed.json()["providers"][0]["entries"]
+        assert [entry["credential_route"] for entry in entries] == [
+            "openai-codex-acct-a",
+            "openai-codex-acct-b",
+        ]
+
+        renamed = self.client.patch(
+            "/api/credentials/pool/openai-codex/acct-b",
+            json={"label": "Client work"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        assert [entry.label for entry in load_pool("openai-codex").entries()] == [
+            "Personal",
+            "Client work",
+        ]
+        route = load_config()["credential_routes"]["openai-codex-acct-b"]
+        assert route == {
+            "provider": "openai-codex",
+            "credential": "acct-b",
+            "display_name": "Client work",
+        }
+
+        removed = self.client.delete(
+            "/api/credentials/pool/openai-codex/id/acct-a"
+        )
+        assert removed.status_code == 200, removed.text
+        assert [entry.id for entry in load_pool("openai-codex").entries()] == [
+            "acct-b"
+        ]
+        assert "openai-codex-acct-a" not in load_config().get(
+            "credential_routes", {}
+        )
+        assert "openai-codex-acct-b" in load_config()["credential_routes"]
+
+    def test_pool_strategy_is_profile_scoped_and_rejects_unknown_values(self):
+        from agent.credential_pool import (
+            AUTH_TYPE_OAUTH,
+            PooledCredential,
+            SOURCE_MANUAL_DEVICE_CODE,
+            load_pool,
+        )
+        from hermes_cli.config import load_config
+
+        pool = load_pool("openai-codex")
+        pool.add_entry(PooledCredential(
+            provider="openai-codex",
+            id="personal",
+            label="Personal",
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=SOURCE_MANUAL_DEVICE_CODE,
+            access_token="token",
+            refresh_token="refresh",
+        ))
+
+        updated = self.client.put(
+            "/api/credentials/pool/openai-codex/strategy",
+            json={"strategy": "no_failover"},
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json() == {
+            "ok": True,
+            "provider": "openai-codex",
+            "strategy": "no_failover",
+        }
+        assert load_config()["credential_pool_strategies"]["openai-codex"] == "no_failover"
+
+        listed = self.client.get("/api/credentials/pool")
+        assert listed.status_code == 200
+        assert listed.json()["strategies"]["openai-codex"] == "no_failover"
+
+        rejected = self.client.put(
+            "/api/credentials/pool/openai-codex/strategy",
+            json={"strategy": "swap_accounts"},
+        )
+        assert rejected.status_code == 400
+        assert "Unsupported pool strategy" in rejected.json()["detail"]
+
 
 
 

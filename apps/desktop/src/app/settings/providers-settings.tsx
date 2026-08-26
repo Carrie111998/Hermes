@@ -1,8 +1,6 @@
 import { useStore } from '@nanostores/react'
-import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { runInTerminal } from '@/app/right-sidebar/store'
 import {
   FEATURED_ID,
   FeaturedProviderRow,
@@ -13,37 +11,34 @@ import {
   sortProviders
 } from '@/components/onboarding'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { RowButton } from '@/components/ui/row-button'
 import { SearchField } from '@/components/ui/search-field'
-import { disconnectOAuthProvider, listOAuthProviders } from '@/hermes'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  getCredentialPool,
+  listOAuthProviders,
+  removeCredentialPoolEntry,
+  renameCredentialPoolEntry,
+  setCredentialPoolStrategy
+} from '@/hermes'
 import { useI18n } from '@/i18n'
-import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
+import { ChevronDown, ChevronRight, KeyRound, Trash2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
-import { notify, notifyError } from '@/store/notifications'
+import { notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
-import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
+import { $settingsRequestProfile } from '@/store/settings-scope'
+import type { CredentialPoolEntry, EnvVarInfo, OAuthProvider } from '@/types/hermes'
 
 import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
 import { CustomEndpointsSettings } from './custom-endpoints-settings'
 import { SettingsCategoryHeading, useEnvCredentials } from './env-credentials'
 import { providerGroup, providerMeta, providerPriority } from './helpers'
-import { SettingsContent, SettingsSkeleton } from './primitives'
+import { ListRow, SettingsContent, SettingsSkeleton } from './primitives'
+import { SettingsProfileScope } from './profile-scope'
 
-// The embedded terminal (and thus the "run disconnect command" path) only
-// exists in the Electron desktop shell, not the web dashboard.
-const canRunInTerminal = () => typeof window !== 'undefined' && Boolean(window.hermesDesktop?.terminal)
-
-// Parallel group headers ("Connected", "Other providers") so the expanded list
-// reads as its own section instead of bleeding into the connected group.
-function GroupLabel({ children }: { children: ReactNode }) {
-  return (
-    <p className="mt-3 px-0.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-tertiary)">
-      {children}
-    </p>
-  )
-}
 
 // Sub-views surfaced as a sidebar subnav: account sign-in vs raw API keys.
 export const PROVIDER_VIEWS = ['accounts', 'keys', 'custom-endpoints'] as const
@@ -125,16 +120,12 @@ function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>): ProviderKeyGr
 // provider's real sign-in flow; the key affordances open the API-key
 // catalog below.
 function OAuthPicker({
-  disconnecting,
-  onDisconnect,
-  onTerminalDisconnect,
   onWantApiKey,
+  onSelect,
   providers
 }: {
-  disconnecting: null | string
-  onDisconnect: (provider: OAuthProvider) => void
-  onTerminalDisconnect: (provider: OAuthProvider) => void
   onWantApiKey: () => void
+  onSelect: (provider: OAuthProvider) => void
   providers: OAuthProvider[]
 }) {
   const { t } = useI18n()
@@ -146,15 +137,12 @@ function OAuthPicker({
     return null
   }
 
-  const select = (p: OAuthProvider) => startManualProviderOAuth(p.id)
+  const select = onSelect
 
   const featured = ordered.find(p => p.id === FEATURED_ID && !p.status?.logged_in) ?? null
   const rest = featured ? ordered.filter(p => p.id !== FEATURED_ID) : ordered
-  // Keep connected accounts grouped and always visible; only the unconnected
-  // providers hide behind the disclosure, so the page leads with what's set up.
-  // Both lists preserve `sortProviders` order (curated priority, then name).
-  const connected = rest.filter(p => p.status?.logged_in)
   const others = rest.filter(p => !p.status?.logged_in)
+  const externallyManaged = rest.filter(p => p.status?.logged_in && p.flow === 'external')
   const collapsible = others.length > 0
   const showOthers = !collapsible || showAll
 
@@ -178,24 +166,21 @@ function OAuthPicker({
       {featured && <FeaturedProviderRow onSelect={select} provider={featured} />}
       {/* Slot #2 — always visible, matching onboarding / CANONICAL_PROVIDERS. */}
       <FireworksProviderRow onClick={onWantApiKey} />
-      {connected.length > 0 && (
-        <>
-          <GroupLabel>{p.connected}</GroupLabel>
-          {connected.map(p => (
-            <ConnectedProviderRow
-              disconnecting={disconnecting === p.id}
-              key={p.id}
-              onDisconnect={onDisconnect}
-              onSelect={select}
-              onTerminalDisconnect={onTerminalDisconnect}
-              provider={p}
-            />
+
+      {externallyManaged.length > 0 && (
+        <div className="grid gap-1">
+          <p className="mt-3 px-0.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-tertiary)">Managed externally</p>
+          {externallyManaged.map(provider => (
+            <div className="rounded-[6px] px-3 py-2.5" key={provider.id}>
+              <p className="text-[length:var(--conversation-text-font-size)] font-semibold">{providerTitle(provider)}</p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">{t.settings.providers.removeExternalGeneric(providerTitle(provider))}</p>
+            </div>
           ))}
-        </>
+        </div>
       )}
+
       {showOthers && (
         <>
-          {connected.length > 0 && <GroupLabel>{p.otherProviders}</GroupLabel>}
           {others.map(p => (
             <ProviderRow key={p.id} onSelect={select} provider={p} />
           ))}
@@ -210,7 +195,7 @@ function OAuthPicker({
           type="button"
           variant="text"
         >
-          {showAll ? p.collapse : connected.length > 0 ? p.connectAnother : p.otherProviders}
+          {showAll ? p.collapse : p.connectAnother}
           <ChevronDown className={cn('size-3.5 transition', showAll && 'rotate-180')} />
         </Button>
       )}
@@ -218,77 +203,121 @@ function OAuthPicker({
   )
 }
 
-function ConnectedProviderRow({
-  disconnecting,
-  onDisconnect,
-  onSelect,
-  onTerminalDisconnect,
-  provider
+function OAuthAccountRows({
+  accounts,
+  onAdd,
+  onRemove,
+  onRename,
+  providers
 }: {
-  disconnecting: boolean
-  onDisconnect: (provider: OAuthProvider) => void
-  onSelect: (provider: OAuthProvider) => void
-  onTerminalDisconnect: (provider: OAuthProvider) => void
-  provider: OAuthProvider
+  accounts: Array<{ entry: CredentialPoolEntry; provider: string }>
+  onAdd: (provider: OAuthProvider) => void
+  onRemove: (provider: string, entry: CredentialPoolEntry) => void
+  onRename: (provider: string, entry: CredentialPoolEntry, label: string) => void
+  providers: OAuthProvider[]
+}) {
+  const [editing, setEditing] = useState<null | { entry: CredentialPoolEntry; provider: string }>(null)
+  const [label, setLabel] = useState('')
+
+  if (accounts.length === 0) {
+    return null
+  }
+
+  return (
+    <section className="mb-5 grid gap-2">
+      <SettingsCategoryHeading icon={KeyRound} title="Subscriptions" />
+      {[...new Set(accounts.map(account => account.provider))].map(provider => {
+        const providerAccounts = accounts.filter(account => account.provider === provider)
+        const oauthProvider = providers.find(candidate => candidate.id === provider)
+
+        return <div className="grid gap-1" key={provider}>
+          <p className="px-3 pt-2 text-[length:var(--conversation-text-font-size)] font-semibold">
+            {oauthProvider ? providerTitle(oauthProvider) : provider}
+          </p>
+          {providerAccounts.map(({ entry }) => {
+        const isEditing = editing?.entry.id === entry.id && editing.provider === provider
+        const name = entry.label || entry.id || provider
+
+        return (
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-[6px] px-3 py-2.5 hover:bg-(--ui-control-hover-background)" key={`${provider}-${entry.id}`}>
+            {isEditing ? (
+              <Input aria-label="Account name" onChange={event => setLabel(event.target.value)} value={label} />
+            ) : (
+              <div className="min-w-0">
+                <p className="truncate text-[length:var(--conversation-text-font-size)] font-semibold">{name}</p>
+                <p className="text-xs text-muted-foreground">Connected to this profile</p>
+              </div>
+            )}
+            <div className="flex gap-1">
+              {isEditing ? (
+                <Button disabled={!label.trim()} onClick={() => {
+                  onRename(provider, entry, label.trim())
+                  setEditing(null)
+                }} size="xs">Save</Button>
+              ) : (
+                <Button aria-label={`Rename ${name}`} onClick={() => {
+                  setEditing({ entry, provider })
+                  setLabel(name)
+                }} size="xs" variant="text">Rename</Button>
+              )}
+              <Button aria-label={`Remove ${name}`} onClick={() => onRemove(provider, entry)} size="icon-xs" variant="ghost">
+                <Trash2 className="size-3" />
+              </Button>
+            </div>
+          </div>
+        )
+          })}
+          {oauthProvider && <Button className="justify-self-start" onClick={() => onAdd(oauthProvider)} size="xs" variant="text">Add another account</Button>}
+        </div>
+      })}
+    </section>
+  )
+}
+
+const POOL_STRATEGIES = ['fill_first', 'no_failover', 'round_robin', 'least_used', 'random'] as const
+
+function PoolStrategyRows({
+  providers,
+  strategies,
+  onChange
+}: {
+  providers: string[]
+  strategies: Record<string, string>
+  onChange: (provider: string, strategy: string) => void
 }) {
   const { t } = useI18n()
   const copy = t.settings.providers
-  const title = providerTitle(provider)
-  const Trail = provider.flow === 'external' ? Terminal : ChevronRight
-  // Hermes can clear this provider's creds via the API.
-  const canDisconnect = provider.disconnectable ?? provider.flow !== 'external'
-  // External (CLI-managed) provider Hermes can't clear via the API, but ships a
-  // command we can run in the embedded terminal (Electron shell only).
-  const terminalDisconnect = !canDisconnect && Boolean(provider.disconnect_command) && canRunInTerminal()
-  // Only fall back to a static "remove it elsewhere" hint when we offer no button.
-  const showHint = !canDisconnect && !terminalDisconnect
+
+  if (providers.length === 0) {
+    return null
+  }
 
   return (
-    <div className="group grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1 rounded-[6px] transition-colors hover:bg-(--ui-control-hover-background)">
-      <RowButton className="min-w-0 px-3 py-2.5 text-left" onClick={() => onSelect(provider)}>
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-[length:var(--conversation-text-font-size)] font-semibold">{title}</span>
-          <span className="inline-flex shrink-0 items-center gap-1 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
-            <Check className="size-3" />
-            {copy.connected}
-          </span>
-        </div>
-        <p className="mt-1 text-xs leading-5 text-muted-foreground">{t.onboarding.flowSubtitles[provider.flow]}</p>
-        {showHint && (
-          <p className="mt-0.5 truncate text-[0.68rem] leading-5 text-muted-foreground/70">
-            {provider.flow === 'external' ? copy.removeExternalGeneric(title) : copy.removeKeyManaged(title)}
-          </p>
-        )}
-      </RowButton>
-      <div className="flex items-center gap-1 pr-2">
-        <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
-        {canDisconnect && (
-          <Button
-            aria-label={`${t.common.remove} ${title}`}
-            disabled={disconnecting}
-            onClick={() => onDisconnect(provider)}
-            size="icon-xs"
-            title={`${t.common.remove} ${title}`}
-            type="button"
-            variant="ghost"
-          >
-            {disconnecting ? <Loader2 className="size-3 animate-spin" /> : <Trash2 className="size-3" />}
-          </Button>
-        )}
-        {terminalDisconnect && (
-          <Button
-            aria-label={`${copy.disconnect} ${title}`}
-            onClick={() => onTerminalDisconnect(provider)}
-            size="icon-xs"
-            title={copy.disconnectInTerminal}
-            type="button"
-            variant="ghost"
-          >
-            <Trash2 className="size-3" />
-          </Button>
-        )}
-      </div>
-    </div>
+    <section className="mb-5 grid gap-1">
+      <SettingsCategoryHeading icon={KeyRound} title={copy.poolStrategy} />
+      <p className="mb-1 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
+        {copy.poolStrategyDescription}
+      </p>
+      {providers.map(provider => (
+        <ListRow
+          action={
+            <Select onValueChange={strategy => onChange(provider, strategy)} value={strategies[provider] ?? 'fill_first'}>
+              <SelectTrigger aria-label={copy.poolStrategyLabel(provider)} className="min-w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {POOL_STRATEGIES.map(strategy => (
+                  <SelectItem key={strategy} value={strategy}>{copy.poolStrategies[strategy]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          }
+          description={provider}
+          key={provider}
+          title={provider}
+        />
+      ))}
+    </section>
   )
 }
 
@@ -340,10 +369,18 @@ export function ProvidersSettings({
   view
 }: ProvidersSettingsProps) {
   const { t } = useI18n()
-  const { rowProps, vars } = useEnvCredentials()
+  const scopeProfile = useStore($settingsRequestProfile)
+  const { rowProps, vars } = useEnvCredentials(scopeProfile)
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
+  const [accounts, setAccounts] = useState<Array<{ entry: CredentialPoolEntry; provider: string }>>([])
+  const [poolStrategies, setPoolStrategies] = useState<Record<string, string>>({})
+  const [addingProvider, setAddingProvider] = useState<OAuthProvider | null>(null)
+  const [accountLabel, setAccountLabel] = useState('')
   const [openProvider, setOpenProvider] = useState<null | string>(null)
-  const [disconnecting, setDisconnecting] = useState<null | string>(null)
+
+  const pooledProviders = [...new Set(accounts.map(({ provider }) => provider))]
+    .filter(provider => accounts.filter(account => account.provider === provider).length > 1)
+
   // Free-text filter for the API-keys view (provider name / env-var key / desc).
   const [keyQuery, setKeyQuery] = useState('')
   // The onboarding overlay owns the OAuth flow. Watch its `manual` flag so we
@@ -353,9 +390,19 @@ export function ProvidersSettings({
 
   const refreshOAuthProviders = useCallback(async () => {
     // OAuth providers are best-effort — a failure here just hides the panel.
-    const { providers } = await listOAuthProviders()
+    const [{ providers }, pool] = await Promise.all([
+      listOAuthProviders(scopeProfile),
+      getCredentialPool(scopeProfile)
+    ])
+
     setOauthProviders(providers)
-  }, [])
+    setAccounts(
+      pool.providers.flatMap(({ entries, provider }) =>
+        entries.filter(entry => entry.auth_type === 'oauth' && entry.id).map(entry => ({ entry, provider }))
+      )
+    )
+    setPoolStrategies(pool.strategies ?? {})
+  }, [scopeProfile])
 
   useEffect(() => {
     let cancelled = false
@@ -366,10 +413,19 @@ export function ProvidersSettings({
       }
 
       try {
-        const { providers } = await listOAuthProviders()
+        const [{ providers }, pool] = await Promise.all([
+          listOAuthProviders(scopeProfile),
+          getCredentialPool(scopeProfile)
+        ])
 
         if (!cancelled) {
           setOauthProviders(providers)
+          setAccounts(
+            pool.providers.flatMap(({ entries, provider }) =>
+              entries.filter(entry => entry.auth_type === 'oauth' && entry.id).map(entry => ({ entry, provider }))
+            )
+          )
+          setPoolStrategies(pool.strategies ?? {})
         }
       } catch {
         // Ignore — the OAuth panel just won't render.
@@ -377,70 +433,65 @@ export function ProvidersSettings({
     })()
 
     return () => void (cancelled = true)
-  }, [onboardingActive])
+  }, [onboardingActive, scopeProfile])
 
-  // External (CLI-managed) providers can't be cleared via the API by design —
-  // Hermes never deletes creds another tool owns behind a silent API call.
-  // Instead we run the documented removal command in the embedded terminal so
-  // the user sees exactly what executes, then return them to chat to watch it.
-  async function handleTerminalDisconnect(provider: OAuthProvider) {
-    const command = provider.disconnect_command
 
-    if (!command) {
+  async function handleRemoveAccount(provider: string, entry: CredentialPoolEntry) {
+    if (!entry.id) {
       return
     }
 
-    const name = providerTitle(provider)
+    const name = entry.label || entry.id
 
-    const ok = await confirm({
-      confirmLabel: t.settings.providers.disconnect,
-      destructive: true,
-      title: t.settings.providers.removeTerminalConfirm(name, command)
-    })
-
-    if (!ok) {
+    if (!(await confirm({ destructive: true, title: `Remove ${name}?` }))) {
       return
     }
-
-    // Leave the settings overlay so the terminal pane (chat-only) is visible.
-    onClose()
-    runInTerminal(command)
-    notify({
-      kind: 'info',
-      title: t.settings.providers.removedTitle,
-      message: t.settings.providers.removeTerminalRunning(name)
-    })
-  }
-
-  async function handleDisconnect(provider: OAuthProvider) {
-    const name = providerTitle(provider)
-
-    const ok = await confirm({
-      confirmLabel: t.settings.providers.disconnect,
-      destructive: true,
-      title: t.settings.providers.removeConfirm(name)
-    })
-
-    if (!ok) {
-      return
-    }
-
-    setDisconnecting(provider.id)
 
     try {
-      await disconnectOAuthProvider(provider.id)
-      notify({
-        durationMs: 3_000,
-        kind: 'success',
-        title: t.settings.providers.removedTitle,
-        message: t.settings.providers.removedMessage(name)
-      })
-      await refreshOAuthProviders().catch(() => undefined)
+      await removeCredentialPoolEntry(provider, entry.id, scopeProfile)
+      await refreshOAuthProviders()
     } catch (err) {
-      notifyError(err, t.settings.providers.failedRemove(name))
-    } finally {
-      setDisconnecting(null)
+      notifyError(err, `Could not remove ${name}`)
     }
+  }
+
+  async function handleRenameAccount(provider: string, entry: CredentialPoolEntry, label: string) {
+    if (!entry.id) {
+      return
+    }
+
+    try {
+      await renameCredentialPoolEntry(provider, entry.id, label, scopeProfile)
+      await refreshOAuthProviders()
+    } catch (err) {
+      notifyError(err, `Could not rename ${entry.label || entry.id}`)
+    }
+  }
+
+  async function handlePoolStrategy(provider: string, strategy: string) {
+    const previous = poolStrategies[provider] ?? 'fill_first'
+    setPoolStrategies(current => ({ ...current, [provider]: strategy }))
+
+    try {
+      await setCredentialPoolStrategy(provider, strategy, scopeProfile)
+    } catch (err) {
+      setPoolStrategies(current => ({ ...current, [provider]: previous }))
+      notifyError(err, t.settings.providers.failedPoolStrategy(provider))
+    }
+  }
+
+  function selectProviderForAccount(provider: OAuthProvider) {
+    setAddingProvider(provider)
+    setAccountLabel('')
+  }
+
+  function beginAccountOAuth() {
+    if (!addingProvider || !accountLabel.trim()) {
+      return
+    }
+
+    startManualProviderOAuth(addingProvider.id, null, scopeProfile, accountLabel.trim())
+    setAddingProvider(null)
   }
 
   if (!vars) {
@@ -467,6 +518,7 @@ export function ProvidersSettings({
 
     return (
       <SettingsContent>
+        <SettingsProfileScope className="mb-5" />
         <LocalEndpointRow onOpen={startManualLocalEndpoint} />
         {keyGroups.length > 0 ? (
           <div className="grid gap-3">
@@ -509,10 +561,31 @@ export function ProvidersSettings({
 
   return (
     <SettingsContent>
+      <SettingsProfileScope className="mb-5" />
+      <OAuthAccountRows
+        accounts={accounts}
+        onAdd={selectProviderForAccount}
+        onRemove={(provider, entry) => void handleRemoveAccount(provider, entry)}
+        onRename={(provider, entry, label) => void handleRenameAccount(provider, entry, label)}
+        providers={oauthProviders}
+      />
+      <PoolStrategyRows
+        onChange={(provider, strategy) => void handlePoolStrategy(provider, strategy)}
+        providers={pooledProviders}
+        strategies={poolStrategies}
+      />
+      {addingProvider && (
+        <section className="mb-5 grid gap-2">
+          <SettingsCategoryHeading icon={KeyRound} title={`Name your ${providerTitle(addingProvider)} account`} />
+          <div className="flex gap-2">
+            <Input aria-label="Account name" autoFocus onChange={event => setAccountLabel(event.target.value)} value={accountLabel} />
+            <Button disabled={!accountLabel.trim()} onClick={beginAccountOAuth}>Continue</Button>
+            <Button onClick={() => setAddingProvider(null)} variant="text">Cancel</Button>
+          </div>
+        </section>
+      )}
       <OAuthPicker
-        disconnecting={disconnecting}
-        onDisconnect={provider => void handleDisconnect(provider)}
-        onTerminalDisconnect={provider => void handleTerminalDisconnect(provider)}
+        onSelect={selectProviderForAccount}
         onWantApiKey={() => onViewChange('keys')}
         providers={oauthProviders}
       />

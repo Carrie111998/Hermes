@@ -17,6 +17,7 @@ export {
 } from './api/client'
 export type { ProfileScope } from './api/client'
 export * from './api/config'
+export * from './api/credentials'
 export * from './api/cron'
 export * from './api/mcp'
 export * from './api/messaging'

@@ -1017,6 +1017,17 @@ export const ja = defineLocale({
       connected: '接続済み',
       collapse: '折りたたむ',
       connectAnother: '別のプロバイダーを接続',
+      poolStrategy: 'プール戦略',
+      poolStrategyDescription: '同じプロバイダーのアカウントを Hermes が使う方法を選択します。',
+      poolStrategyLabel: provider => `${provider} のプール戦略`,
+      poolStrategies: {
+        fill_first: '順に使用',
+        no_failover: 'フェイルオーバーなし',
+        round_robin: 'ラウンドロビン',
+        least_used: '最小使用',
+        random: 'ランダム'
+      },
+      failedPoolStrategy: provider => `${provider} のプール戦略を更新できませんでした`,
       otherProviders: 'その他のプロバイダー',
       removeConfirm: provider => `${provider} を削除しますか？`,
       removeKeyManaged: provider => `${provider} は API キーで設定されています。API Keys から削除してください。`,

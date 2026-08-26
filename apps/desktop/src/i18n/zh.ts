@@ -1289,6 +1289,17 @@ export const zh: Translations = {
       connected: '已连接',
       collapse: '收起',
       connectAnother: '连接其他提供方',
+      poolStrategy: '池策略',
+      poolStrategyDescription: '选择 Hermes 如何使用同一提供方的账户。',
+      poolStrategyLabel: provider => `${provider} 的池策略`,
+      poolStrategies: {
+        fill_first: '依次使用',
+        no_failover: '不故障转移',
+        round_robin: '轮询',
+        least_used: '最少使用',
+        random: '随机'
+      },
+      failedPoolStrategy: provider => `无法更新 ${provider} 的池策略`,
       otherProviders: '其他提供方',
       disconnect: '断开连接',
       disconnectInTerminal: '断开连接（在终端中运行移除命令）',

@@ -1095,6 +1095,17 @@ export const en: Translations = {
       connected: 'Connected',
       collapse: 'Collapse',
       connectAnother: 'Connect another provider',
+      poolStrategy: 'Pool strategy',
+      poolStrategyDescription: 'Choose how Hermes uses accounts from the same provider.',
+      poolStrategyLabel: provider => `Pool strategy for ${provider}`,
+      poolStrategies: {
+        fill_first: 'Fill first',
+        no_failover: 'No failover',
+        round_robin: 'Round robin',
+        least_used: 'Least used',
+        random: 'Random'
+      },
+      failedPoolStrategy: provider => `Could not update the pool strategy for ${provider}`,
       otherProviders: 'Other providers',
       disconnect: 'Disconnect',
       disconnectInTerminal: 'Disconnect (runs the removal command in the terminal)',

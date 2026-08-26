@@ -490,6 +490,18 @@ class CredentialPoolAdd(BaseModel):
     label: Optional[str] = None
 
 
+class CredentialPoolRename(BaseModel):
+    label: str
+
+
+class CredentialPoolStrategy(BaseModel):
+    strategy: str
+
+
+class OAuthStartBody(BaseModel):
+    label: Optional[str] = None
+
+
 # --- from web_server.py (originally lines 14171-14178) ---
 
 class MemoryProviderSelect(BaseModel):
@@ -741,4 +753,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

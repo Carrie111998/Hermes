@@ -2476,6 +2476,23 @@ class CredentialPool:
                 self._current_id = None
             return removed
 
+    def rename_entry(self, credential_id: str, label: str) -> Optional[PooledCredential]:
+        with self._lock:
+            for index, entry in enumerate(self._entries):
+                if entry.id == credential_id:
+                    renamed = replace(entry, label=label)
+                    self._entries[index] = renamed
+                    self._persist()
+                    return renamed
+            return None
+
+    def remove_entry(self, credential_id: str) -> Optional[PooledCredential]:
+        with self._lock:
+            for index, entry in enumerate(self._entries, start=1):
+                if entry.id == credential_id:
+                    return self.remove_index(index)
+            return None
+
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
         if not raw:

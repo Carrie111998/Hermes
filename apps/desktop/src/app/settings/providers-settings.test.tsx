@@ -7,21 +7,32 @@ import { $confirmRequest } from '@/store/confirm'
 import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 
 const listOAuthProviders = vi.fn()
-const disconnectOAuthProvider = vi.fn()
+
 const getEnvVars = vi.fn()
+const getCredentialPool = vi.fn()
+const removeCredentialPoolEntry = vi.fn()
+const renameCredentialPoolEntry = vi.fn()
+const setCredentialPoolStrategy = vi.fn()
 const startManualProviderOAuth = vi.fn()
 const startManualLocalEndpoint = vi.fn()
 const onboarding = atom({ manual: false })
 
 vi.mock('@/hermes', () => ({
-  disconnectOAuthProvider: (providerId: string) => disconnectOAuthProvider(providerId),
+
+  getCredentialPool: () => getCredentialPool(),
   getEnvVars: () => getEnvVars(),
-  listOAuthProviders: () => listOAuthProviders()
+  getProfiles: () => Promise.resolve({ profiles: [{ id: 'default', name: 'Default', current: true }] }),
+  listOAuthProviders: () => listOAuthProviders(),
+  removeCredentialPoolEntry: (provider: string, id: string) => removeCredentialPoolEntry(provider, id),
+  renameCredentialPoolEntry: (provider: string, id: string, label: string) => renameCredentialPoolEntry(provider, id, label),
+  setCredentialPoolStrategy: (provider: string, strategy: string) => setCredentialPoolStrategy(provider, strategy),
+  setApiRequestProfile: () => {}
 }))
 
 vi.mock('@/store/onboarding', () => ({
   $desktopOnboarding: onboarding,
-  startManualProviderOAuth: (providerId: string) => startManualProviderOAuth(providerId),
+  startManualProviderOAuth: (providerId: string, reason: null | string, profile?: string, label?: string) =>
+    startManualProviderOAuth(providerId, reason, profile, label),
   startManualLocalEndpoint: (reason: null | string) => startManualLocalEndpoint(reason)
 }))
 
@@ -61,10 +72,22 @@ function keyVar(patch: Partial<EnvVarInfo> = {}): EnvVarInfo {
 
 beforeEach(() => {
   onboarding.set({ manual: false })
+  HTMLElement.prototype.scrollIntoView = vi.fn()
   getEnvVars.mockResolvedValue({})
-  disconnectOAuthProvider.mockResolvedValue({ ok: true, provider: 'nous' })
+
   listOAuthProviders.mockResolvedValue({
-    providers: [provider('nous', true), provider('minimax-oauth', false)]
+      providers: [provider('nous', true), provider('minimax-oauth', false)]
+    })
+  getCredentialPool.mockResolvedValue({
+    providers: [{
+      provider: 'nous',
+      entries: [{
+        auth_type: 'oauth', has_refresh: true, id: 'personal', index: 1,
+        label: 'Personal', last_status: null, priority: 0, request_count: 0,
+        source: 'manual:device_code', token_preview: ''
+      }]
+    }],
+    strategies: {}
   })
 })
 
@@ -93,49 +116,130 @@ async function renderProvidersSettings() {
 }
 
 describe('ProvidersSettings', () => {
-  it('disconnects a connected provider account and refreshes the accounts list', async () => {
+  it('removes a saved subscription account and refreshes the accounts list', async () => {
     await renderProvidersSettings()
 
-    const remove = await screen.findByRole('button', { name: 'Remove Nous Portal' })
+    const remove = await screen.findByRole('button', { name: 'Remove Personal' })
     await act(async () => {
       fireEvent.click(remove)
     })
 
-    // Removal is confirmed first — nothing has been disconnected yet.
+    // Removal is confirmed first — nothing has been deleted yet.
     expect(await screen.findByRole('dialog')).toBeTruthy()
-    expect(disconnectOAuthProvider).not.toHaveBeenCalled()
+    expect(removeCredentialPoolEntry).not.toHaveBeenCalled()
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
     })
 
-    await waitFor(() => expect(disconnectOAuthProvider).toHaveBeenCalledWith('nous'))
+    await waitFor(() => expect(removeCredentialPoolEntry).toHaveBeenCalledWith('nous', 'personal'))
     expect(listOAuthProviders).toHaveBeenCalledTimes(2)
   })
 
-  it('leaves the account connected when the removal prompt is dismissed', async () => {
+  it('keeps the saved subscription when the removal prompt is dismissed', async () => {
     await renderProvidersSettings()
 
     await act(async () => {
-      fireEvent.click(await screen.findByRole('button', { name: 'Remove Nous Portal' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'Remove Personal' }))
     })
 
     await act(async () => {
       fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
     })
 
-    expect(disconnectOAuthProvider).not.toHaveBeenCalled()
+    expect(removeCredentialPoolEntry).not.toHaveBeenCalled()
   })
 
-  it('keeps provider selection separate from account removal', async () => {
+  it('adds another account from the existing provider subscription group', async () => {
+    getCredentialPool.mockResolvedValue({
+      providers: [{
+        provider: 'nous',
+        entries: [{
+          auth_type: 'oauth',
+          has_refresh: true,
+          id: 'personal',
+          index: 1,
+          label: 'Personal',
+          last_status: null,
+          priority: 0,
+          request_count: 0,
+          source: 'manual:device_code',
+          token_preview: ''
+        }]
+      }],
+      strategies: {}
+    })
     await renderProvidersSettings()
 
     await act(async () => {
-      fireEvent.click(await screen.findByText('Nous Portal'))
+      fireEvent.click(await screen.findByRole('button', { name: 'Add another account' }))
     })
 
-    expect(startManualProviderOAuth).toHaveBeenCalledWith('nous')
-    expect(disconnectOAuthProvider).not.toHaveBeenCalled()
+    // Picking a provider no longer starts OAuth immediately — it opens the
+    // "name your account" prompt so multiple accounts can share one provider.
+    const nameInput = await screen.findByLabelText('Account name')
+    expect(nameInput).toBeTruthy()
+    expect(startManualProviderOAuth).not.toHaveBeenCalled()
+
+    await act(async () => {
+      fireEvent.change(nameInput, { target: { value: 'Personal' } })
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    })
+
+    expect(startManualProviderOAuth).toHaveBeenCalledTimes(1)
+    const [id, , , label] = startManualProviderOAuth.mock.calls[0]
+    expect(id).toBe('nous')
+    expect(label).toBe('Personal')
+    expect(removeCredentialPoolEntry).not.toHaveBeenCalled()
+  })
+
+  it('shows and persists the pool strategy for a provider with OAuth accounts', async () => {
+    getCredentialPool.mockResolvedValue({
+      providers: [{
+        provider: 'openai-codex',
+        entries: [{
+          auth_type: 'oauth',
+          has_refresh: true,
+          id: 'personal',
+          index: 1,
+          label: 'Personal',
+          last_status: null,
+          priority: 0,
+          request_count: 0,
+          source: 'manual:device_code',
+          token_preview: ''
+        }, {
+          auth_type: 'oauth',
+          has_refresh: true,
+          id: 'work',
+          index: 2,
+          label: 'Work',
+          last_status: null,
+          priority: 1,
+          request_count: 0,
+          source: 'manual:device_code',
+          token_preview: ''
+        }]
+      }],
+      strategies: { 'openai-codex': 'no_failover' }
+    })
+
+    await renderProvidersSettings()
+
+    expect(await screen.findByText('Pool strategy')).toBeTruthy()
+    const select = screen.getByRole('combobox', { name: 'Pool strategy for openai-codex' })
+    expect(select.textContent).toContain('No failover')
+
+    await act(async () => {
+      fireEvent.click(select)
+    })
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('option', { name: 'Round robin' }))
+    })
+
+    await waitFor(() => expect(setCredentialPoolStrategy).toHaveBeenCalledWith('openai-codex', 'round_robin'))
   })
 
   it('does not offer removal for externally managed providers', async () => {

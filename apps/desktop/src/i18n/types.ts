@@ -943,6 +943,11 @@ export interface Translations {
       connected: string
       collapse: string
       connectAnother: string
+      poolStrategy: string
+      poolStrategyDescription: string
+      poolStrategyLabel: (provider: string) => string
+      poolStrategies: Record<'fill_first' | 'no_failover' | 'round_robin' | 'least_used' | 'random', string>
+      failedPoolStrategy: (provider: string) => string
       otherProviders: string
       disconnect: string
       disconnectInTerminal: string

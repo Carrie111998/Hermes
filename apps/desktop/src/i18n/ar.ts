@@ -907,6 +907,17 @@ export const ar = defineLocale({
       connected: 'متصل',
       collapse: 'طي',
       connectAnother: 'ربط مزود آخر',
+      poolStrategy: 'استراتيجية التجمع',
+      poolStrategyDescription: 'اختر كيف يستخدم Hermes الحسابات من المزود نفسه.',
+      poolStrategyLabel: provider => `استراتيجية تجمع ${provider}`,
+      poolStrategies: {
+        fill_first: 'استخدم بالتتابع',
+        no_failover: 'بدون تحويل عند الفشل',
+        round_robin: 'تدوير',
+        least_used: 'الأقل استخدامًا',
+        random: 'عشوائي'
+      },
+      failedPoolStrategy: provider => `تعذر تحديث استراتيجية تجمع ${provider}`,
       otherProviders: 'مزودون آخرون',
       disconnect: 'قطع الاتصال',
       disconnectInTerminal: 'قطع الاتصال (يشغّل أمر الإزالة في الطرفية)',

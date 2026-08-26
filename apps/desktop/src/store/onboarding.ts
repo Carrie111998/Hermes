@@ -467,9 +467,18 @@ export function startManualLocalEndpoint(reason: null | string = null) {
 // Module-level (not store state) because it's consumed immediately on the next
 // overlay render and never needs to persist or re-render anything itself.
 let pendingProviderOAuthId: null | string = null
+let pendingProviderOAuthProfile: null | string = null
+let pendingProviderOAuthLabel: null | string = null
 
-export function startManualProviderOAuth(providerId: string, reason: null | string = null) {
+export function startManualProviderOAuth(
+  providerId: string,
+  reason: null | string = null,
+  profile?: string,
+  label?: string
+) {
   pendingProviderOAuthId = providerId
+  pendingProviderOAuthProfile = profile ?? null
+  pendingProviderOAuthLabel = label?.trim() || null
   startManualOnboarding(reason)
 }
 
@@ -481,8 +490,18 @@ export function peekPendingProviderOAuth(): null | string {
   return pendingProviderOAuthId
 }
 
+export function peekPendingProviderOAuthProfile(): null | string {
+  return pendingProviderOAuthProfile
+}
+
+export function peekPendingProviderOAuthLabel(): null | string {
+  return pendingProviderOAuthLabel
+}
+
 export function clearPendingProviderOAuth() {
   pendingProviderOAuthId = null
+  pendingProviderOAuthProfile = null
+  pendingProviderOAuthLabel = null
 }
 
 // Dismiss a manually-opened provider selector without touching the existing
@@ -601,7 +620,7 @@ async function openSignInUrl(url: string) {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
 
-export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {
+export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext, label?: string) {
   clearPoll()
 
   if (provider.flow === 'external') {
@@ -613,7 +632,7 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
   setFlow({ status: 'starting', provider })
 
   try {
-    const start = await startOAuthLogin(provider.id)
+    const start = await startOAuthLogin(provider.id, ctx.profile, { label })
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
     await openSignInUrl(browserUrl)
 
@@ -633,7 +652,7 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
 // Poll a session-backed device-code flow until it resolves.
 async function pollSession(provider: OAuthProvider, start: DeviceStart, ctx: OnboardingContext) {
   try {
-    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id)
+    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id, ctx.profile)
 
     if (status === 'approved') {
       clearPoll()
@@ -674,7 +693,7 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
   setFlow({ status: 'submitting', provider, start })
 
   try {
-    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim())
+    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim(), ctx.profile)
 
     if (resp.ok && resp.status === 'approved') {
       setFlow({ status: 'success', provider })
