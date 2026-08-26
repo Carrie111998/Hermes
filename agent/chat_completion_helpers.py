@@ -2675,6 +2675,55 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             ):
                 fb_api_mode = "bedrock_converse"
 
+        # Resolve the destination window before mutating the active runtime.
+        # The next loop pass can compact an oversized request when automatic
+        # compression is available. If compression is disabled or currently
+        # blocked by its failure cooldown, dispatching to a smaller-context
+        # fallback is guaranteed to fail and merely adds another provider
+        # error card. Skip it and continue the bounded chain instead.
+        fb_context_length = None
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is not None and fb_provider != "lmstudio":
+            from agent.model_metadata import get_model_context_length
+
+            _fb_ctx_api_key = fb_client.api_key if isinstance(fb_client.api_key, str) else ""
+            fb_context_length = get_model_context_length(
+                fb_model,
+                base_url=fb_base_url,
+                api_key=_fb_ctx_api_key,
+                provider=fb_provider,
+                config_context_length=None,
+                custom_providers=getattr(agent, "_custom_providers", None),
+            )
+            request_pressure = int(getattr(agent, "_last_request_pressure_tokens", 0) or 0)
+            compression_enabled = bool(getattr(agent, "compression_enabled", False))
+            cooldown = None
+            get_cooldown = getattr(compressor, "get_active_compression_failure_cooldown", None)
+            if callable(get_cooldown):
+                try:
+                    cooldown = get_cooldown()
+                except Exception:
+                    logger.debug("Fallback context preflight could not read compression cooldown", exc_info=True)
+
+            if (
+                request_pressure > 0
+                and isinstance(fb_context_length, int)
+                and fb_context_length > 0
+                and request_pressure > fb_context_length
+                and (not compression_enabled or bool(cooldown))
+            ):
+                block = "disabled" if not compression_enabled else "cooldown"
+                logger.warning(
+                    "Fallback skip: %s/%s context window %d is below request pressure %d "
+                    "and automatic compression is %s",
+                    fb_provider,
+                    fb_model,
+                    fb_context_length,
+                    request_pressure,
+                    block,
+                )
+                return agent._try_activate_fallback(reason)
+
         old_model = agent.model
         old_provider = agent.provider
 
@@ -2798,23 +2847,24 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Without this, compression decisions use the primary model's
         # context window (e.g. 200K) instead of the fallback's (e.g. 32K),
         # causing oversized sessions to overflow the fallback.
-        # Also pass _config_context_length so the explicit config override
-        # (model.context_length in config.yaml) is respected — without this,
-        # the fallback activation drops to 128K even when config says 204800.
-        if hasattr(agent, 'context_compressor') and agent.context_compressor:
+        # LM Studio must be loaded before its live context can be queried, so
+        # that one provider resolves here instead of in the non-mutating
+        # preflight above.
+        if compressor is not None and fb_context_length is None:
             from agent.model_metadata import get_model_context_length
-            # ``agent.api_key`` may be callable (Entra ID); the
-            # context-length resolver expects a string for live
-            # probes. Foundry typically resolves via config/static
-            # catalogs anyway, so coerce defensively.
+
             _fb_ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
             fb_context_length = get_model_context_length(
-                agent.model, base_url=agent.base_url,
-                api_key=_fb_ctx_api_key, provider=agent.provider,
+                agent.model,
+                base_url=agent.base_url,
+                api_key=_fb_ctx_api_key,
+                provider=agent.provider,
                 config_context_length=getattr(agent, "_config_context_length", None),
                 custom_providers=getattr(agent, "_custom_providers", None),
             )
-            agent.context_compressor.update_model(
+
+        if compressor is not None and fb_context_length is not None:
+            compressor.update_model(
                 model=agent.model,
                 context_length=fb_context_length,
                 base_url=agent.base_url,

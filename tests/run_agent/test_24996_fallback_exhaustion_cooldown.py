@@ -132,6 +132,41 @@ class TestExhaustionArmsCooldown:
         assert cooldown == far_future
 
 
+class TestFallbackContextPreflight:
+    def test_skips_guaranteed_overflow_and_uses_next_context_fit_candidate(self):
+        """A router must not dispatch a 300K request to a 128K fallback when
+        automatic compression is unavailable. It should continue to the next
+        compatible destination without mutating through the doomed runtime.
+        """
+        fbs = [
+            {"provider": "openai-codex", "model": "gpt-small-context"},
+            {"provider": "openai-codex", "model": "gpt-5.6-terra-900k"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._last_request_pressure_tokens = 300_000
+        agent.compression_enabled = False
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client("https://chatgpt.com/backend-api/codex"),
+                    "resolved",
+                ),
+            ) as resolve,
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                side_effect=[128_000, 900_000],
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert resolve.call_count == 2
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.6-terra-900k"
+        assert agent._fallback_index == 2
+
+
 class TestRateLimitBackoffEscalation:
     """Exponential backoff for consecutive rate-limit failures (#29702).
 
