@@ -706,3 +706,30 @@ class TestBomToleranceInMemoryFiles:
         raw, read_ok = MemoryStore._read_raw_checked(path)
         assert read_ok is False
         assert raw == ""
+
+    def test_write_preserves_file_owner(self, store, tmp_path, monkeypatch):
+        """Memory updates must preserve POSIX owner across atomic replace.
+
+        Docker / NixOS support hit this when a root-run setup wizard rewrote a
+        user-owned memory file, leaving it root-owned. The test forces a
+        preserved uid/gid so it does not need root.
+        """
+        import os
+        if os.name != "posix":
+            pytest.skip("POSIX-only")
+
+        # Patch atomic_write_text helpers to capture owner restore
+        chown_calls = []
+        monkeypatch.setattr("utils._preserve_file_owner", lambda _path: (789, 321))
+        monkeypatch.setattr(
+            "utils.os.chown",
+            lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)),
+        )
+
+        result = store.add("memory", "owner-test fact")
+        assert result["success"] is True
+
+        # The owner should have been restored on the real file path
+        assert len(chown_calls) >= 1
+        assert chown_calls[-1][1:] == (789, 321)
+
