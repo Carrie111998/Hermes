@@ -233,7 +233,7 @@ class TestHandoffStateDB:
 
         assert db.request_handoff_once(sid, "discord") is True
         assert db.claim_handoff(sid) is True
-        assert db.complete_running_handoff(sid) is True
+        db.complete_handoff(sid)
 
         # A repeated delivery cannot reopen the completed handoff or replace
         # its destination metadata.

@@ -55,7 +55,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar, Union
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -6117,12 +6117,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         scope: Optional[str] = None,
     ) -> List[Tuple[str, Dict[str, Any]]]:
+        # GLOB, not LIKE: the default case-insensitive LIKE cannot use the
+        # state_meta key PK index, and this runs inside every routing-entry
+        # save transaction. The prefix is a fixed literal with no GLOB
+        # metacharacters and every producer writes it verbatim.
         rows = conn.execute(
-            "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'",
-            (
-                _escape_like(_WEBHOOK_HANDOFF_ROUTE_BINDING_META_PREFIX)
-                + "%",
-            ),
+            "SELECT key, value FROM state_meta WHERE key GLOB ?",
+            (_WEBHOOK_HANDOFF_ROUTE_BINDING_META_PREFIX + "*",),
         ).fetchall()
         bindings: List[Tuple[str, Dict[str, Any]]] = []
         for row in rows:
@@ -6501,15 +6502,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         scope: str = "",
         handoff_claim_token: Optional[str] = None,
-    ) -> Any:
+    ) -> Union[bool, Dict[str, Any]]:
         """Atomically move one durable route while its exact owner is current.
 
-        Only the source and destination rows are touched. The source must own
-        ``expected_session_id`` and the destination must be absent or an exact
-        alias of that same session. A missing source is an idempotent success
-        only when the destination already has the expected owner. Because the
-        checks and writes run under one ``BEGIN IMMEDIATE`` transaction, a
-        stale SessionStore cannot overwrite a newer owner observed in SQLite.
+        Beyond the source and destination rows, the transaction also deletes
+        every same-scope alias row owned by ``expected_session_id`` (the
+        result's ``removed_session_keys``) and rewrites the destination-key
+        route-binding metadata. The source must own ``expected_session_id``
+        and the destination must be absent or an exact alias of that same
+        session. A missing source is an idempotent success only when the
+        destination already has the expected owner. Because the checks and
+        writes run under one ``BEGIN IMMEDIATE`` transaction, a stale
+        SessionStore cannot overwrite a newer owner observed in SQLite.
 
         When ``handoff_claim_token`` is supplied, the same transaction also
         requires that exact webhook claim and advances its active routing key.
@@ -6834,7 +6838,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         scope: str = "",
         authorize_terminal_target: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Union[bool, Dict[str, Any]]:
         """CAS-replace one route and carry any active handoff protection.
 
         Explicit resume sets ``authorize_terminal_target``: the selected key
@@ -15124,28 +15128,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
-    def compare_and_set_meta(
-        self,
-        key: str,
-        expected_value: Optional[str],
-        new_value: Optional[str],
-    ) -> bool:
-        """Replace *key* only while its durable value equals *expected_value*.
-
-        SQLite's ``IS`` comparison is intentionally used so ``None`` is a
-        valid expected/current value for callers that store nullable metadata.
-        Absence remains distinct from a present row whose value is NULL; use
-        :meth:`set_meta_if_absent` to claim an absent key.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                "UPDATE state_meta SET value = ? WHERE key = ? AND value IS ?",
-                (new_value, key, expected_value),
-            )
-            return cursor.rowcount > 0
-
-        return self._execute_write(_do)
-
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.
 
@@ -16606,19 +16588,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id or not platform:
             return False
         try:
-            row = self._conn.execute(
-                "SELECT s.handoff_platform, m.value AS producer_platform "
-                "FROM sessions s "
-                "LEFT JOIN state_meta m ON m.key = ? "
-                "WHERE s.id = ?",
-                (_webhook_handoff_request_meta_key(session_id), session_id),
-            ).fetchone()
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT s.handoff_platform, m.value AS producer_platform "
+                    "FROM sessions s "
+                    "LEFT JOIN state_meta m ON m.key = ? "
+                    "WHERE s.id = ?",
+                    (_webhook_handoff_request_meta_key(session_id), session_id),
+                ).fetchone()
             return bool(
                 row is not None
                 and row["handoff_platform"] == platform
                 and row["producer_platform"] == platform
             )
-        except Exception:
+        except sqlite3.Error as exc:
+            logger.warning(
+                "is_webhook_handoff_request failed for session %s: %s",
+                session_id,
+                exc,
+            )
             return False
 
     def list_pending_handoffs(self) -> List[Dict[str, Any]]:
@@ -16667,49 +16655,83 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._webhook_handoff_claim_locks_guard:
             if key in self._webhook_handoff_claim_locks:
                 return False
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                handle = path.open("a+b")
-            except OSError as exc:
-                logger.warning(
-                    "Could not open webhook handoff claim lock %s: %s",
-                    path,
-                    exc,
-                )
-                return None
-            acquired = False
-            try:
-                if _IS_WINDOWS:
-                    import msvcrt
-
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(
-                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+            # A concurrent owner can release-and-unlink the path between our
+            # open() and flock(): the lock then lands on an orphaned inode
+            # while another process locks a fresh file at the same path, and
+            # both would believe they own the fence. After acquiring, verify
+            # the locked handle still names the live path and retry on
+            # mismatch. Windows cannot unlink an open lock file, so the race
+            # is POSIX-only.
+            for _ in range(3):
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    handle = path.open("a+b")
+                except OSError as exc:
+                    logger.warning(
+                        "Could not open webhook handoff claim lock %s: %s",
+                        path,
+                        exc,
                     )
-                acquired = True
-            except (BlockingIOError, OSError) as exc:
-                contention_errnos = {
-                    errno.EACCES,
-                    errno.EAGAIN,
-                    getattr(errno, "EDEADLK", errno.EAGAIN),
-                }
-                if isinstance(exc, BlockingIOError) or exc.errno in contention_errnos:
-                    return False
-                logger.warning(
-                    "Could not acquire webhook handoff claim lock %s: %s",
-                    path,
-                    exc,
-                )
-                return None
-            finally:
-                if not acquired:
-                    handle.close()
-            self._webhook_handoff_claim_locks[key] = (handle, path)
-            return True
+                    return None
+                acquired = False
+                try:
+                    if _IS_WINDOWS:
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                    acquired = True
+                except (BlockingIOError, OSError) as exc:
+                    contention_errnos = {
+                        errno.EAGAIN,
+                        getattr(errno, "EDEADLK", errno.EAGAIN),
+                    }
+                    if _IS_WINDOWS:
+                        # msvcrt.locking reports contention as EACCES; POSIX
+                        # flock never does, so there EACCES is a real
+                        # permission failure and must fail closed as None.
+                        contention_errnos.add(errno.EACCES)
+                    if isinstance(exc, BlockingIOError) or exc.errno in contention_errnos:
+                        return False
+                    logger.warning(
+                        "Could not acquire webhook handoff claim lock %s: %s",
+                        path,
+                        exc,
+                    )
+                    return None
+                finally:
+                    if not acquired:
+                        handle.close()
+                if not _IS_WINDOWS:
+                    try:
+                        current_stat = os.stat(path)
+                        held_stat = os.fstat(handle.fileno())
+                    except FileNotFoundError:
+                        handle.close()
+                        continue
+                    except OSError as exc:
+                        handle.close()
+                        logger.warning(
+                            "Could not verify webhook handoff claim lock %s: %s",
+                            path,
+                            exc,
+                        )
+                        return None
+                    if (current_stat.st_dev, current_stat.st_ino) != (
+                        held_stat.st_dev,
+                        held_stat.st_ino,
+                    ):
+                        handle.close()
+                        continue
+                self._webhook_handoff_claim_locks[key] = (handle, path)
+                return True
+            return None
 
     def try_acquire_webhook_handoff_recovery_lock(
         self,
@@ -16977,22 +16999,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def list_claimed_webhook_handoffs(self) -> List[Dict[str, Any]]:
         """Return running webhook handoffs that have a durable owner record."""
-        cur = self._conn.execute(
-            "SELECT s.*, "
-            "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
-            "m.value AS _handoff_claim_owner "
-            "FROM state_meta m "
-            "JOIN sessions s ON m.key = ? || s.id "
-            "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-            "WHERE m.key LIKE ? ESCAPE '\\' "
-            "AND s.handoff_state = 'running' "
-            "ORDER BY s.started_at ASC",
-            (
-                _WEBHOOK_HANDOFF_OWNER_META_PREFIX,
-                _escape_like(_WEBHOOK_HANDOFF_OWNER_META_PREFIX) + "%",
-            ),
-        )
-        return [self._session_row_dict(r) for r in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT s.*, "
+                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
+                "m.value AS _handoff_claim_owner "
+                "FROM state_meta m "
+                "JOIN sessions s ON m.key = ? || s.id "
+                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                "WHERE s.handoff_state = 'running' "
+                "ORDER BY s.started_at ASC",
+                (_WEBHOOK_HANDOFF_OWNER_META_PREFIX,),
+            )
+            rows = cur.fetchall()
+        return [self._session_row_dict(r) for r in rows]
 
     def complete_claimed_webhook_handoff(
         self, session_id: str, claim_token: str
@@ -17064,18 +17084,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if completed:
             self.release_webhook_handoff_claim_lock(session_id, claim_token)
         return bool(completed)
-
-    def complete_running_handoff(self, session_id: str) -> bool:
-        """Atomically complete a handoff only while it remains claimed."""
-        def _do(conn):
-            cur = conn.execute(
-                "UPDATE sessions SET handoff_state = 'completed', "
-                "handoff_error = NULL "
-                "WHERE id = ? AND handoff_state = 'running'",
-                (session_id,),
-            )
-            return cur.rowcount > 0
-        return self._execute_write(_do)
 
     def complete_handoff(self, session_id: str) -> None:
         """Mark a handoff as completed."""

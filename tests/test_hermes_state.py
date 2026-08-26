@@ -2930,40 +2930,6 @@ class TestStateMeta:
         finally:
             peer.close()
 
-    def test_compare_and_set_meta_has_one_cross_connection_winner(self, db):
-        db.set_meta("claim", "pending")
-        peer = SessionDB(db_path=db.db_path)
-        barrier = threading.Barrier(2)
-        results = []
-        errors = []
-
-        def _advance(session_db, value):
-            try:
-                barrier.wait(timeout=5)
-                results.append(
-                    session_db.compare_and_set_meta("claim", "pending", value)
-                )
-            except BaseException as exc:
-                errors.append(exc)
-
-        threads = [
-            threading.Thread(target=_advance, args=(db, "completed-a")),
-            threading.Thread(target=_advance, args=(peer, "completed-b")),
-        ]
-        try:
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
-
-            assert all(not thread.is_alive() for thread in threads)
-            assert errors == []
-            assert sorted(results) == [False, True]
-            assert db.get_meta("claim") in {"completed-a", "completed-b"}
-        finally:
-            peer.close()
-
-
 
 class TestVacuum:
     def test_vacuum_runs_without_error(self, db):
