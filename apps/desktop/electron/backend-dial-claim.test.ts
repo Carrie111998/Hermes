@@ -126,18 +126,19 @@ describe('main.ts wiring for #90812', () => {
   it('routes the profile-scoped dial IPC through the single-owner claim', () => {
     const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connection', ")
     expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 900)
-
-    expect(body).toContain('backendDialClaims.run(')
+    const body = mainSource.slice(handlerStart, handlerStart + 2_200)
+    // Magnum Phase 2: supervisor is now the gate; the actual spawn still goes
+    // through backendDialClaims (inside supervisor.activateTransport or the
+    // fallback path). Either string proves the single-owner invariant.
+    expect(body).toContain('gatewaySupervisor.activate(')
     expect(body).toContain('ensureBackend(profile)')
   })
 
   it('routes the registry-scoped dial IPC through the claim keyed by backendScopeKey(connectionId, profile)', () => {
     const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connection:for', ")
     expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 1_200)
-
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(id, profile)')
+    const body = mainSource.slice(handlerStart, handlerStart + 2_200)
+    expect(body).toContain('gatewaySupervisor.activate(')
     expect(body).toContain('ensureRegistryBackend(id, profile)')
   })
 })
