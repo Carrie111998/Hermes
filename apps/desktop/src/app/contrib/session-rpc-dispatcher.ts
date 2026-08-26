@@ -39,7 +39,7 @@ import type { MutableRefObject } from 'react'
 import { resolveSessionOwner } from '@/app/session/hooks/use-session-actions/utils'
 import type { ClientSessionState } from '@/app/types'
 import { resolveNewChatOwnerRoute } from '@/store/profile'
-import { $sessions, getSessionOwnerHint, knownSessionOwner } from '@/store/session'
+import { $cronSessions, $messagingSessions, $sessions, getSessionOwnerHint, knownSessionOwner, sessionMatchesStoredId } from '@/store/session'
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
 import { $focusedStoredSessionId, sessionTileOwnerRoute, storedSessionIdForRuntimeId } from '@/store/session-states'
@@ -109,10 +109,25 @@ export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): Ambi
       // miss, so a known owner always outranks it. When even the selection
       // cannot be named (no registry identity: legacy or v1/v2 drift), the
       // fail-closed path below stays in force — never a silent primary guess.
-      const defaultOwner = resolveNewChatOwnerRoute()
+      //
+      // The rung is limited to genuinely NEW sessions: it only applies when
+      // the routing id matches no stored session row in ANY slice (recents,
+      // cron, messaging). An existing session whose owner metadata was lost
+      // (e.g. v1→v2 registry drift, or a row outside the recents slice)
+      // must keep failing closed — routing it by the new-chat selection
+      // would silently move an OLD conversation to the wrong connection.
+      const isBrandNewSession = ![
+        $sessions.get(),
+        $cronSessions.get(),
+        $messagingSessions.get()
+      ].some(rows => rows.some(row => sessionMatchesStoredId(row, routingSessionId)))
 
-      if (defaultOwner) {
-        owner = defaultOwner
+      if (isBrandNewSession) {
+        const defaultOwner = resolveNewChatOwnerRoute()
+
+        if (defaultOwner) {
+          owner = defaultOwner
+        }
       }
     }
 

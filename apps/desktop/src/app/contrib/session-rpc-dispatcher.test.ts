@@ -32,7 +32,7 @@ vi.mock('@/app/session/hooks/use-session-actions/utils', async importActual => (
 const { createSessionRpcDispatcher } = await import('./session-rpc-dispatcher')
 const { $connectionsRegistry } = await import('@/store/connection-registry-state')
 const { $newChatConnectionId, $newChatProfile, $newChatRoute, $profiles } = await import('@/store/profile')
-const { _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } = await import('@/store/session')
+const { _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions, $cronSessions } = await import('@/store/session')
 const { isSessionOwnerResolutionError } = await import('@/store/session-owner-resolution')
 const { $sessionTiles } = await import('@/store/session-states')
 const { makeSessionInfo } = await import('@/test/session-info')
@@ -62,6 +62,7 @@ beforeEach(() => {
 afterEach(() => {
   $connectionsRegistry.set(null)
   setSessions([])
+  $cronSessions.set([])
   $sessionTiles.set([])
   $profiles.set([])
   $newChatProfile.set(null)
@@ -116,6 +117,40 @@ describe('createSessionRpcDispatcher: fail closed', () => {
     expect(probe.resolveSessionOwner).toHaveBeenCalledWith('rt-brand-new')
     expect(ambientRequest).not.toHaveBeenCalled()
     expect(gatewayMocks.requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('does not re-route an EXISTING session whose row lost its owner metadata — fails closed (review: rung is brand-new-only)', async () => {
+    // An existing session row with no owner metadata (v1→v2 registry drift):
+    // tile / hint / row / probe all miss. The new-chat rung must NOT apply —
+    // routing an OLD conversation by the switcher selection would silently
+    // move it to the wrong connection. It fails closed exactly as before the
+    // rung existed.
+    gatewayMocks.activeConnectionId = 'ssh-remote'
+    $connectionsRegistry.set({ primary: 'local', connections: [{ id: 'local' }, { id: 'ssh-remote' }] } as never)
+    setSessions([makeSessionInfo({ id: 'stored-drifted' })])
+    const { ambientRequest, request } = dispatcher()
+
+    await expect(request('prompt.submit', { session_id: 'stored-drifted', text: 'hi' })).rejects.toSatisfy(
+      isSessionOwnerResolutionError
+    )
+    expect(gatewayMocks.requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  it('does not re-route an existing session that lives only in the cron/messaging slices — fails closed (review: rung is brand-new-only)', async () => {
+    // Same drift case for a session whose row lives outside the recents slice
+    // (cron/messaging): the brand-new rung consults every slice, so it still
+    // fails closed instead of silently routing an old conversation elsewhere.
+    gatewayMocks.activeConnectionId = 'ssh-remote'
+    $connectionsRegistry.set({ primary: 'local', connections: [{ id: 'local' }, { id: 'ssh-remote' }] } as never)
+    $cronSessions.set([makeSessionInfo({ id: 'stored-cron-drifted' })])
+    const { ambientRequest, request } = dispatcher()
+
+    await expect(request('prompt.submit', { session_id: 'stored-cron-drifted', text: 'hi' })).rejects.toSatisfy(
+      isSessionOwnerResolutionError
+    )
+    expect(gatewayMocks.requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(ambientRequest).not.toHaveBeenCalled()
   })
 
   it('routes to the user-selected source even when it is the single registry entry', async () => {
