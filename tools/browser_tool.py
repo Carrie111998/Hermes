@@ -1027,6 +1027,8 @@ _cached_auto_local_for_private_urls: bool = True
 
 _use_real_profile_resolved = False
 _cached_use_real_profile: bool = False
+# (args, error) from _resolve_real_profile_launch_args, or None when unresolved.
+_real_profile_args_cache: Optional[tuple] = None
 
 
 def _get_browser_engine() -> str:
@@ -1462,22 +1464,59 @@ def _real_profile_launch_args() -> tuple:
     Returns ``([], <message>)`` when the default browser is non-Chromium or its
     profile/binary cannot be located, so the caller can fail closed with a
     clear reason. Returns ``([], None)`` when consent is off (no-op).
+
+    The resolution is cached for the process: it shells out to the OS
+    default-browser query and _run_browser_command calls this for every
+    agent-browser command, and agent-browser hashes the launch flags per
+    session, so they must be identical from one command to the next. The
+    cache is dropped when consent turns off and by cleanup_all_browsers().
     """
+    global _real_profile_args_cache
     if not _use_real_profile():
+        _real_profile_args_cache = None
         return [], None
+    if _real_profile_args_cache is None:
+        _real_profile_args_cache = _resolve_real_profile_launch_args()
+    return _real_profile_args_cache
+
+
+def _real_profile_provides_executable() -> bool:
+    """True when consent is on and the resolver found the user's own browser
+    binary — the launch then uses that binary, not the bundled Chromium."""
+    args, err = _real_profile_launch_args()
+    return not err and "--executable-path" in args
+
+
+def _resolve_real_profile_launch_args() -> tuple:
+    """Uncached resolver behind _real_profile_launch_args (consent assumed)."""
     from hermes_cli.browser_connect import (
+        CHROME_DEFAULT_PROFILE_DEBUG_BLOCK_MAJOR,
         chromium_executable,
+        chromium_major_version,
+        default_browser_identifier,
         detect_default_chromium,
+        profile_lock_holder,
         real_profile_data_dir,
+        unsupported_channel,
     )
 
     browser = detect_default_chromium()
     if browser is None:
+        channel = unsupported_channel(default_browser_identifier())
+        if channel:
+            return [], (
+                f"browser.use_real_profile is on, but your default browser is "
+                f"{channel}. Real-profile browsing supports the stable channels "
+                "of Chrome, Edge, Brave and Chromium only — pre-release channels "
+                "keep separate profiles. Make a stable Chromium your default "
+                "browser, or turn the toggle off."
+            )
         return [], (
             "browser.use_real_profile is on, but your default browser is not a "
-            "supported Chromium browser (Chrome, Edge, Brave, Chromium). "
-            "Real-profile browsing requires a Chromium default; set one or turn "
-            "the toggle off."
+            "supported Chromium browser (Chrome, Edge, Brave, Chromium) or "
+            "could not be determined (no xdg-settings / LaunchServices answer, "
+            "e.g. on a headless host). Real-profile browsing requires a Chromium "
+            "default; set one or turn the toggle off."
         )
     data_dir = real_profile_data_dir(browser)
     if not data_dir or not os.path.isdir(data_dir):
@@ -1487,11 +1526,42 @@ def _real_profile_launch_args() -> tuple:
             f"({data_dir!r}). Launch that browser at least once, or turn the "
             "toggle off."
         )
-    args = ["--profile", data_dir]
+    holder = profile_lock_holder(data_dir)
+    if holder:
+        return [], (
+            f"browser.use_real_profile is on, but the {browser} profile at "
+            f"{data_dir!r} is open in another Chromium process ({holder}). "
+            "Chromium allows one process per profile directory — close your "
+            f"{browser} (and any other Hermes session using it) first, or turn "
+            "the toggle off."
+        )
     exe = chromium_executable(browser)
-    if exe:
-        args += ["--executable-path", exe]
-    return args, None
+    if not exe:
+        # Without the real binary agent-browser would open the real profile
+        # with whatever Chromium it finds (its own download, Playwright's
+        # cache) — a one-way profile migration for the user's browser, and
+        # on Windows the app-bound cookies would not decrypt anyway.
+        return [], (
+            f"browser.use_real_profile is on and your default browser is "
+            f"'{browser}', but its executable could not be located. Refusing "
+            "to open the real profile with a different Chromium build. "
+            f"Reinstall {browser} or turn the toggle off."
+        )
+    if browser == "chrome":
+        major = chromium_major_version(exe)
+        if major is not None and major >= CHROME_DEFAULT_PROFILE_DEBUG_BLOCK_MAJOR:
+            # Branded Chrome would start, refuse remote debugging on its
+            # default profile dir, and agent-browser would wait for a
+            # DevToolsActivePort that never appears — a silent hang.
+            return [], (
+                f"browser.use_real_profile is on, but Google Chrome {major} "
+                "refuses remote debugging on its default profile directory "
+                f"(since Chrome {CHROME_DEFAULT_PROFILE_DEBUG_BLOCK_MAJOR}), and "
+                "agent-browser needs remote debugging to drive it — the launch "
+                "would hang instead of failing. Make Chromium or Brave your "
+                "default browser, or turn the toggle off."
+            )
+    return ["--profile", data_dir, "--executable-path", exe], None
 
 
 def _url_is_private(url: str) -> bool:
@@ -2946,8 +3016,15 @@ def _run_browser_command(
     # Local mode with no Chromium on disk: fail fast with an actionable
     # message instead of hanging for _command_timeout seconds per call.
     # Skip when engine=lightpanda — LP doesn't need Chromium for navigation.
+    # Skip it when the real-profile consent already resolved the user's own
+    # browser binary: that launch never touches the bundled Chromium, and on
+    # macOS/Windows desktops the real Chrome/Edge/Brave lives in
+    # /Applications or Program Files, which _chromium_installed() does not
+    # probe — the gate would otherwise download ~170 MB the launch never
+    # uses, or block outright with lazy installs off.
     if (
         _is_local_mode()
+        and not _real_profile_provides_executable()
         and not _chromium_installed()
         and _get_browser_engine() != "lightpanda"
         and not _maybe_autoinstall_chromium()
@@ -2996,9 +3073,30 @@ def _run_browser_command(
         # Chromium profile so their live logins/cookies are available. Fails
         # closed (returns an error) if the default browser is non-Chromium or
         # its profile can't be located, rather than silently using a throwaway.
+        # ``close`` must still reach agent-browser: a daemon launched before
+        # the resolution started failing (toggle flipped, browser removed)
+        # would otherwise outlive the Python-side session entry.
         _profile_args, _profile_err = _real_profile_launch_args()
-        if _profile_err:
+        if _profile_err and command != "close":
             return {"success": False, "error": _profile_err}
+        if (
+            _profile_args
+            and command != "close"
+            and (_engine_override or _get_browser_engine()) == "lightpanda"
+        ):
+            # agent-browser refuses --profile for the Lightpanda engine
+            # ("Profiles are not supported with Lightpanda"); letting that
+            # error trigger the Chrome fallback would open a throwaway
+            # session without the profile the user consented to.
+            return {
+                "success": False,
+                "error": (
+                    "browser.use_real_profile needs the Chrome engine: "
+                    "agent-browser does not support profiles with "
+                    "browser.engine: lightpanda. Set browser.engine to auto "
+                    "or chrome, or turn the toggle off."
+                ),
+            }
         if _profile_args:
             backend_args += _profile_args
 
@@ -5193,6 +5291,8 @@ def cleanup_all_browsers() -> None:
     _chromium_autoinstall_attempted = False
     _cached_browser_engine = None
     _browser_engine_resolved = False
+    global _real_profile_args_cache
+    _real_profile_args_cache = None
 
 # ============================================================================
 # Requirements Check

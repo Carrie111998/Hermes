@@ -4,6 +4,9 @@ These exercise the parsers with real command output shapes instead of
 patching the detectors themselves, so a change in what macOS / xdg report is
 caught here rather than in a user's browser session.
 """
+import os
+import socket
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -215,6 +218,76 @@ class TestDetectDefaultLinux:
     def test_missing_xdg_settings_fails_closed(self):
         with patch.object(bc.subprocess, "run", side_effect=FileNotFoundError("xdg-settings")):
             assert bc._detect_default_linux() is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SingletonLock symlink is the POSIX lock")
+class TestProfileLockHolder:
+    @staticmethod
+    def _dead_pid() -> int:
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        return proc.pid
+
+    def test_no_lock_is_free(self, tmp_path):
+        assert bc.profile_lock_holder(str(tmp_path)) is None
+
+    def test_live_pid_on_this_host_is_in_use(self, tmp_path):
+        os.symlink(f"{socket.gethostname()}-{os.getpid()}", tmp_path / "SingletonLock")
+        assert bc.profile_lock_holder(str(tmp_path)) == f"pid {os.getpid()}"
+
+    def test_stale_lock_from_dead_pid_is_free(self, tmp_path):
+        os.symlink(f"{socket.gethostname()}-{self._dead_pid()}", tmp_path / "SingletonLock")
+        assert bc.profile_lock_holder(str(tmp_path)) is None
+
+    def test_lock_from_another_host_is_in_use(self, tmp_path):
+        os.symlink("elsewhere-12345", tmp_path / "SingletonLock")
+        holder = bc.profile_lock_holder(str(tmp_path))
+        assert holder and "elsewhere" in holder
+
+    def test_unparsable_lock_is_ignored(self, tmp_path):
+        os.symlink("garbage", tmp_path / "SingletonLock")
+        assert bc.profile_lock_holder(str(tmp_path)) is None
+
+
+class TestChromiumMajorVersion:
+    def _run_with(self, output: str):
+        class _Proc:
+            stdout = output
+
+        return patch.object(bc.subprocess, "run", return_value=_Proc())
+
+    @pytest.mark.skipif(os.name == "nt", reason="--version is not run on Windows")
+    @pytest.mark.parametrize(
+        "output,expected",
+        [
+            ("Google Chrome 152.0.7977.64 \n", 152),
+            ("Chromium 151.0.7900.12 snap\n", 151),
+            ("Brave Browser 141.1.85.100\n", 141),
+            ("Microsoft Edge 150.0.3200.5\n", 150),
+        ],
+    )
+    def test_parses_version_output(self, tmp_path, output, expected):
+        exe = tmp_path / "chrome"
+        exe.write_text("", encoding="utf-8")
+        with self._run_with(output):
+            assert bc.chromium_major_version(str(exe)) == expected
+
+    def test_falls_back_to_versioned_directory(self, tmp_path):
+        """Windows layout: …\\Application\\<version>\\ next to chrome.exe."""
+        app = tmp_path / "Application"
+        app.mkdir()
+        (app / "chrome.exe").write_text("", encoding="utf-8")
+        (app / "140.0.7300.10").mkdir()
+        (app / "152.0.7977.64").mkdir()
+        (app / "SetupMetrics").mkdir()
+        with patch.object(bc.subprocess, "run", side_effect=OSError("cannot run")):
+            assert bc.chromium_major_version(str(app / "chrome.exe")) == 152
+
+    def test_unknown_when_nothing_matches(self, tmp_path):
+        exe = tmp_path / "chrome"
+        exe.write_text("", encoding="utf-8")
+        with self._run_with("garbage"):
+            assert bc.chromium_major_version(str(exe)) is None
 
 
 class TestLinuxProfileDir:

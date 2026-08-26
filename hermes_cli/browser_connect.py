@@ -10,6 +10,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -198,6 +199,94 @@ def real_profile_data_dir(browser: str, system: str | None = None) -> str | None
         if os.path.isdir(candidate):
             return candidate
     return candidates[0]
+
+
+# Google Chrome refuses --remote-debugging-port/-pipe on its DEFAULT user data
+# directory since 136 (chrome/browser/devtools/remote_debugging_server.cc,
+# GOOGLE_CHROME_BRANDING only; decided by path comparison, so pointing
+# --user-data-dir at the default location does not help). agent-browser needs
+# remote debugging, so a real-profile launch on branded Chrome hangs instead
+# of failing. Chromium and Brave builds do not enforce the block.
+CHROME_DEFAULT_PROFILE_DEBUG_BLOCK_MAJOR = 136
+
+_CHROMIUM_VERSION_RE = re.compile(r"(\d+)(?:\.\d+){2,3}")
+
+
+def chromium_major_version(exe: str) -> int | None:
+    """Best-effort major version of the Chromium binary at ``exe``.
+
+    POSIX: runs ``<exe> --version`` (prints e.g. ``Google Chrome
+    152.0.7977.64`` and exits). Windows: ``chrome.exe --version`` starts the
+    browser instead of printing, so read the versioned directory Chrome keeps
+    next to the executable (``…\\Application\\152.0.7977.64\\``). None when
+    the version cannot be determined.
+    """
+    if os.name != "nt":
+        try:
+            out = subprocess.run(
+                [exe, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            ).stdout
+        except Exception:
+            out = ""
+        match = _CHROMIUM_VERSION_RE.search(out or "")
+        if match:
+            return int(match.group(1))
+    try:
+        names = os.listdir(os.path.dirname(exe))
+    except OSError:
+        return None
+    majors = [
+        int(m.group(1))
+        for m in (_CHROMIUM_VERSION_RE.fullmatch(name) for name in names)
+        if m
+    ]
+    return max(majors) if majors else None
+
+
+def profile_lock_holder(data_dir: str) -> str | None:
+    """Describe the process holding Chromium's profile lock in ``data_dir``.
+
+    Returns None when the profile is free. Chromium allows a single browser
+    process per user-data-dir: a second launch hands its command line to the
+    first one and exits, which agent-browser surfaces as a launch timeout.
+    Checking up front turns that into an actionable message.
+
+    POSIX: ``SingletonLock`` is a symlink whose target is ``<host>-<pid>``.
+    The profile counts as in use when that pid is alive on this host; a stale
+    link left by a crash is ignored (Chromium replaces it itself). A lock
+    from another host is reported as in use. Windows: Chromium keeps
+    ``lockfile`` open, so failing to open it for writing means it is held.
+    """
+    if os.name == "nt":
+        lock = os.path.join(data_dir, "lockfile")
+        if not os.path.exists(lock):
+            return None
+        try:
+            with open(lock, "ab"):
+                return None
+        except OSError:
+            return "another Chromium process holds lockfile"
+    lock = os.path.join(data_dir, "SingletonLock")
+    try:
+        target = os.readlink(lock)
+    except OSError:
+        return None
+    host, sep, pid_text = target.rpartition("-")
+    if not sep or not pid_text.isdigit():
+        return None
+    pid = int(pid_text)
+    if host and host != socket.gethostname():
+        return f"a Chromium process on host {host} (pid {pid})"
+    import psutil
+
+    if not psutil.pid_exists(pid):
+        return None
+    return f"pid {pid}"
 
 
 def chromium_executable(browser: str, system: str | None = None) -> str | None:
