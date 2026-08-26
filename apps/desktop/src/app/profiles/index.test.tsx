@@ -3,6 +3,7 @@ import type * as Nanostores from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { deleteProfile } from '@/hermes'
+import { forgetLastProfileForConnection } from '@/store/connections'
 import { retireLocalProfileGateways } from '@/store/gateway'
 import { refreshProfiles, selectProfile, setActiveProfile } from '@/store/profile'
 import type { ProfileInfo } from '@/types/hermes'
@@ -42,6 +43,11 @@ vi.mock('@/store/notifications', () => ({
 
 vi.mock('@/store/gateway', () => ({
   retireLocalProfileGateways: vi.fn()
+}))
+
+vi.mock('@/store/connections', () => ({
+  $activeConnectionId: { get: () => 'local' },
+  forgetLastProfileForConnection: vi.fn()
 }))
 
 const { $activeGatewayProfile: activeGateway, $profileColors } = vi.hoisted(() => {
@@ -154,6 +160,7 @@ describe('ProfilesView', () => {
   })
 
   it('leaves the active profile alone when a different profile is deleted', async () => {
+    vi.mocked(forgetLastProfileForConnection).mockClear()
     vi.mocked(selectProfile).mockClear()
     vi.mocked(setActiveProfile).mockClear()
     vi.mocked(refreshProfiles).mockResolvedValue([makeProfile('default', true), makeProfile(NAMED_PROFILE)])
@@ -163,6 +170,7 @@ describe('ProfilesView', () => {
     await deleteTheNamedProfile()
 
     await waitFor(() => expect(deleteProfile).toHaveBeenCalledWith(NAMED_PROFILE))
+    expect(forgetLastProfileForConnection).toHaveBeenCalledWith('local', NAMED_PROFILE)
     // The dialog closes once the delete settles; a non-active delete must not re-home.
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull())
     expect(selectProfile).not.toHaveBeenCalled()
