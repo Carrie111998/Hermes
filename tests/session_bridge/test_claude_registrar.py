@@ -8,6 +8,7 @@ import json
 from itertools import product
 import os
 from pathlib import Path
+import re
 import runpy
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from session_bridge.claude_registrar import (
     _WinPtyProcess,
     _claude_main_repl_ready,
     _known_claude_input_modal_visible,
+    _exact_registered_suffix,
     _has_exact_registered_response,
     _is_provider_limit_failure,
     _normalized_terminal_output,
@@ -4295,3 +4297,186 @@ def test_is_dead_stays_false_when_liveness_is_genuinely_unknown() -> None:
             raise OSError("handle is invalid")
 
     assert _WinPtyProcess(Opaque())._is_dead() is False
+
+# --- ConPTY line redraw (carriage return, cursor position, erase-in-line) ---
+#
+# Claude Code's TUI redraws a row by emitting a bare CR and rewriting it, and
+# addresses the next row with CUP rather than a newline. Deleting the CR (and
+# the CUP with it) welds every drawn row into one long line, so no line ever
+# equals the answer and read_until burns the whole attempt waiting for one.
+#
+# The bytes from the CR onward are the live 2026-08-25 capture, verbatim. The
+# two rows before it are RECONSTRUCTED -- the capture was recorded from the CR --
+# and test_live_redraw_frame_welds_when_the_carriage_return_is_deleted pins that
+# reconstruction against the welded line the live run actually reported, so the
+# fixture cannot drift into a strawman.
+LIVE_REDRAW_FRAME = (
+    # The REPL footer, with its inter-word spaces drawn as cursor-forward
+    # escapes the way ConPTY encodes them.
+    "\x1b[16;1H(shift+tab\x1b[1Cto\x1b[1Ccycle)\x1b[1C-\x1b[1Cesc\x1b[1Cto"
+    "\x1b[1Cinterrupt\x1b[1C-\x1b[1C<-\x1b[1Cfor\x1b[1Cagents-"
+    # The answer row, drawn once and then REDRAWN in place. The replacement is
+    # longer than the draw it covers, which is why nothing of the first draw
+    # survives the column reset.
+    "\x1b[17;1H* Gitify*"
+    "\r*\x1b[1CREGISTERED\x1b[18;1H* Baked for 1s\x1b[K\r\n"
+)
+LIVE_WELDED_LINE = (
+    "(shift+tab to cycle) - esc to interrupt - <- for agents-"
+    "* Gitify** REGISTERED* Baked for 1s"
+)
+
+
+def _deleted_carriage_return_text(output: str) -> str:
+    """The pre-fix algorithm, spelled out here so the fixture stays honest.
+
+    Written out rather than imported: this exists to pin what the DEFECT did,
+    and an import would silently start tracking the fix instead.
+    """
+
+    expanded = re.sub(
+        r"\x1b\[(\d*)C",
+        lambda match: " " * (int(match.group(1) or 1) or 1),
+        output,
+    )
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", expanded).replace("\r", "")
+
+
+def test_live_redraw_frame_welds_when_the_carriage_return_is_deleted() -> None:
+    """Fixture fidelity: reproduce the welded line the live run reported."""
+
+    welded = _deleted_carriage_return_text(LIVE_REDRAW_FRAME)
+
+    assert [line for line in welded.splitlines() if line] == [LIVE_WELDED_LINE]
+
+
+def test_carriage_return_resets_the_column_instead_of_deleting_the_row() -> None:
+    """The redrawn answer must land on its own row, not on the footer's tail."""
+
+    rendered = [
+        line for line in _stripped_terminal_text(LIVE_REDRAW_FRAME).splitlines() if line
+    ]
+
+    assert "* REGISTERED" in rendered
+
+
+def test_cursor_position_starts_a_row_instead_of_welding_the_next_one() -> None:
+    """CUP moves to another row; the row it leaves must end there."""
+
+    rendered = [
+        line for line in _stripped_terminal_text(LIVE_REDRAW_FRAME).splitlines() if line
+    ]
+
+    assert "* Baked for 1s" in rendered
+    assert rendered[0] == "(shift+tab to cycle) - esc to interrupt - <- for agents-"
+
+
+def test_registered_suffix_matches_the_live_redraw_frame() -> None:
+    """The predicate that actually gates read_until must see the answer."""
+
+    assert _exact_registered_suffix(LIVE_REDRAW_FRAME) is not None
+
+
+def test_registered_response_survives_a_bare_carriage_return_redraw() -> None:
+    """A response frame that redraws its own row still reads as REGISTERED."""
+
+    prompt = "Reply with exactly REGISTERED and nothing else."
+    output = "Thinking\r* REGISTERED\x1b[K\r\n"
+
+    assert _has_exact_registered_response(output, prompt)
+
+
+def test_redrawn_spinner_collapses_to_one_row() -> None:
+    """Why CR -> LF is wrong: overwritten text must not become its own rows.
+
+    A spinner redrawn forty times is one row of the terminal, not forty lines of
+    meaningful output. Promoting each redraw to a line trades the weld for forty
+    phantom lines, which breaks the exact-match predicates a second way.
+    """
+
+    frame = "".join("\rBaked for %ds" % second for second in range(1, 41))
+
+    rendered = [line for line in _stripped_terminal_text(frame).splitlines() if line]
+
+    assert rendered == ["Baked for 40s"]
+
+
+def test_erase_in_line_drops_the_tail_the_redraw_left_behind() -> None:
+    """A shorter redraw leaves the longer draw's tail until EL clears it."""
+
+    assert _stripped_terminal_text("Baked for 12s\rOK\x1b[K") == "OK"
+    assert _stripped_terminal_text("Baked for 12s\rOK") == "OKked for 12s"
+
+
+def test_line_feed_still_starts_a_row_at_column_zero() -> None:
+    """Regression pin: plain newline-separated output is unchanged."""
+
+    assert _stripped_terminal_text("first\r\nsecond\r\n") == "first\nsecond\n"
+    assert _stripped_terminal_text("first\nsecond") == "first\nsecond"
+    assert _stripped_terminal_text("plain") == "plain"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "\u25cf",  # BLACK CIRCLE
+        "\u23fa",  # BLACK CIRCLE FOR RECORD
+        "\u2022",  # BULLET
+        "*",
+        "\u23f5\u23f5",  # the doubled glyph the REPL footer already uses
+        ">",
+        "Claude>",
+    ],
+)
+def test_tui_marker_prefix_is_stripped_from_the_answer(marker: str) -> None:
+    """The reply is drawn as "<marker> REGISTERED", never as bare REGISTERED.
+
+    The exact glyph is deliberately not hardcoded. It could not be measured --
+    the registrar's isolation argv renders no TUI at all on the installed CLI
+    (2.1.246 against a 2.1.216 pin) -- and a wrong guess fails closed and
+    silently. Any one- or two-character symbolic marker is treated the same way,
+    which is what makes the rule survive a glyph change.
+    """
+
+    prompt = "Reply with exactly REGISTERED and nothing else."
+    output = "%s REGISTERED\r\n" % marker
+
+    assert _has_exact_registered_response(output, prompt)
+    assert _exact_registered_suffix(output) is not None
+
+
+def test_private_csi_parameters_are_dropped_rather_than_parsed() -> None:
+    """A private parameter must never reach int(), which would raise.
+
+    Added after a mutation of the drop survived the whole suite: the branch is
+    not dead, no test reached it. `_cursor_forward_columns("?2")` raises
+    ValueError, and nothing on the strip path catches it, so an unguarded
+    private-parameter CSI whose final byte happens to be a layout one would take
+    down every predicate that reads terminal output.
+    """
+
+    assert _stripped_terminal_text("a\x1b[?2Cb") == "ab"
+    assert _stripped_terminal_text("a\x1b[?2;3Hb") == "ab"
+    assert _stripped_terminal_text("ab\x1b[?1K") == "ab"
+    assert _stripped_terminal_text("a\x1b[?2004hb\x1b[?2004l") == "ab"
+
+
+def test_cursor_position_lands_on_the_column_it_names() -> None:
+    """CUP carries a column, and dropping it welds what was drawn apart.
+
+    The same hazard CSI n C expansion exists for: two runs drawn into one row at
+    different columns must read back as two words, not one token.
+    """
+
+    assert _stripped_terminal_text("\x1b[1;5HX") == "\n    X"
+    assert _stripped_terminal_text("\x1b[3;1Hleft\x1b[3;9Hright") == "\nleft\n        right"
+
+
+def test_marker_stripping_does_not_invent_an_answer() -> None:
+    """A marker in front of other text must not become the answer."""
+
+    prompt = "Reply with exactly REGISTERED and nothing else."
+
+    assert not _has_exact_registered_response("* NOT REGISTERED\r\n", prompt)
+    assert _exact_registered_suffix("* REGISTEREDX\r\n") is None
+    assert _exact_registered_suffix("*REGISTERED\r\n") is None
