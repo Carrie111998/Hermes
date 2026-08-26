@@ -1,4 +1,4 @@
-import { execFile, execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -33,6 +33,16 @@ import {
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
+import {
+  type BackendOutputTail,
+  claimDecision,
+  createBackendOutputTail,
+  execText,
+  isPidOnlyStartMarker,
+  pidOnlyStartMarker,
+  probeStartMarker,
+  processStartMarker
+} from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
@@ -66,6 +76,13 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import {
+  BROWSER_WINDOW_HEIGHT,
+  BROWSER_WINDOW_MIN_HEIGHT,
+  BROWSER_WINDOW_MIN_WIDTH,
+  BROWSER_WINDOW_WIDTH,
+  buildBrowserWindowUrl
+} from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
 import { applyConnectionChange } from './connection-apply'
 import {
@@ -195,11 +212,12 @@ import {
 import { cursorPointInWindow } from './hud-cursor'
 import { startHudGameOverlayWatch } from './hud-game-overlay'
 import { applyHudResetBounds, defaultHudBounds } from './hud-geometry'
-import { hudInputPolicy } from './hud-input-policy'
 import { registerHudIpc } from './hud-ipc'
+import { applyHudElectronOverlay, promoteHudOverlay } from './hud-overlay'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
+import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
@@ -221,11 +239,7 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
-import {
-  createParentStartMarkerResolver,
-  electronProcessStartMarker,
-  parentWatchdogEnv
-} from './parent-process-identity'
+import { createParentStartMarkerResolver, parentWatchdogEnv } from './parent-process-identity'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
 import {
   buildRegistryProfileRoutes,
@@ -275,6 +289,13 @@ import {
 } from './remote-liveness'
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import {
+  classifyStoredSecret,
+  readSecretStoragePolicy,
+  SECRET_STORAGE_POLICY_FILE,
+  type SecretStoragePolicy,
+  writeSecretStoragePolicy
+} from './secret-storage-policy'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -333,7 +354,7 @@ import {
 } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
-import { enumerateWindowsFrontToBack, readWindowBelow } from './window-below'
+import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
@@ -3160,70 +3181,9 @@ function writeBackendOwnership(contents) {
   }
 }
 
-function execText(command, args, { timeout = 3000 } = {}) {
-  return new Promise<string>((resolve, reject) => {
-    execFile(command, args, hiddenWindowsChildOptions({ encoding: 'utf8', timeout }), (error, stdout) => {
-      if (error) {
-        reject(error)
-      } else {
-        resolve(String(stdout || '').trim())
-      }
-    })
-  })
-}
-
-async function processStartMarker(pid) {
-  if (process.platform === 'linux') {
-    const stat = await fs.promises.readFile(`/proc/${pid}/stat`, 'utf8')
-
-    const fields = stat
-      .slice(stat.lastIndexOf(')') + 1)
-      .trim()
-      .split(/\s+/)
-
-    if (!/^\d+$/.test(fields[19] || '')) {
-      throw new Error(`Invalid /proc start marker for PID ${pid}`)
-    }
-
-    return `linux:${fields[19]}`
-  }
-
-  if (IS_WINDOWS) {
-    const electronMarker =
-      pid === process.pid ? electronProcessStartMarker(pid, process.pid, process.getCreationTime?.()) : null
-
-    if (electronMarker) {
-      return electronMarker
-    }
-
-    const ticks = await execText(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        `$p = Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().Ticks`
-      ],
-      // PowerShell 5.1 cold starts routinely exceed the default 3s execText
-      // budget (2.4-8s observed in #87169); give the marker probe headroom.
-      { timeout: 30_000 }
-    )
-
-    if (!/^\d+$/.test(ticks)) {
-      throw new Error(`Invalid Windows start marker for PID ${pid}`)
-    }
-
-    return `win:${ticks}`
-  }
-
-  const started = await execText('ps', ['-p', String(pid), '-o', 'lstart='])
-
-  if (!started) {
-    throw new Error(`Missing process start marker for PID ${pid}`)
-  }
-
-  return `ps:${started}`
-}
+// execText and processStartMarker moved to backend-claim.ts (#93608) so the
+// claim/probe policy is testable — including on Windows CI with real
+// PowerShell — without booting Electron. main.ts calls through the module.
 
 async function backendCommandForPid(pid) {
   try {
@@ -3245,6 +3205,22 @@ async function backendCommandForPid(pid) {
 }
 
 async function processIdentityMatches(identity) {
+  // Degraded PID-only identity (#93608): the start-marker probe failed while
+  // the child was verifiably alive, so only PID liveness can be checked here.
+  // backendIdentityMatches layers the command-line check on top before
+  // anything destructive relies on the answer.
+  if (isPidOnlyStartMarker(identity.startMarker)) {
+    try {
+      process.kill(identity.pid, 0)
+
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code
+
+      return code === 'ESRCH' || code === 'ENOENT' ? false : code === 'EPERM' ? true : undefined
+    }
+  }
+
   try {
     return (await processStartMarker(identity.pid)) === identity.startMarker
   } catch (error) {
@@ -3367,14 +3343,42 @@ const desktopParentStartMarker = createParentStartMarkerResolver({
   }
 })
 
-async function claimBackendChild(child, command, profile, nonce) {
+async function claimBackendChild(child, command, profile, nonce, outputTail: BackendOutputTail | null = null) {
+  // Probe/claim policy lives in backend-claim.ts (#93608): a marker probe
+  // that fails against a LIVE child degrades to PID-only identity — matching
+  // createParentStartMarkerResolver — instead of killing a healthy backend
+  // over a flaky Get-Process (PS 5.1 cold starts, #87169). Only a child that
+  // actually died keeps the fail-closed throw, now carrying its stderr tail.
+  const probe = await probeStartMarker(child.pid)
+  const decision = claimDecision(child.exitCode === null && !child.killed, probe)
+
+  if (decision.action === 'fail') {
+    stopBackendChild(child)
+    await waitForBackendExit(child)
+    throw new Error(
+      `Hermes backend (PID ${child.pid}) died before its identity could be recorded: ${decision.reason}${outputTail?.describe() ?? ''}`
+    )
+  }
+
+  let startMarker
+
+  if (decision.action === 'degrade') {
+    startMarker = pidOnlyStartMarker(child.pid)
+    rememberLog(
+      `WARNING: process start marker probe failed for live Hermes backend PID ${child.pid}; ` +
+        `claiming with PID-only identity instead of stopping it: ${decision.reason}`
+    )
+  } else {
+    startMarker = decision.startMarker
+  }
+
   try {
     const identity = await backendOwnership.claim({
       command,
       nonce,
       pid: child.pid,
       profile,
-      startMarker: await processStartMarker(child.pid),
+      startMarker,
       // Record the spawning Electron so reapOrphans can tell an orphaned
       // backend (parent gone) from one owned by a live instance — a live
       // parent's backend is never reaped (#87295).
@@ -3388,7 +3392,9 @@ async function claimBackendChild(child, command, profile, nonce) {
   } catch (error) {
     stopBackendChild(child)
     await waitForBackendExit(child)
-    throw new Error(`Could not persist ownership for the Hermes backend: ${error.message}`)
+    throw new Error(
+      `Could not persist ownership for the Hermes backend: ${error.message}${outputTail?.describe() ?? ''}`
+    )
   }
 }
 
@@ -6565,6 +6571,7 @@ function installPreviewShortcut(window) {
 import {
   applyZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  installZoomReassertOnNavigation,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
   ZOOM_STEP,
@@ -8292,7 +8299,248 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
   return { baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in keychain encryption (secret-storage-policy.ts owns the decision).
+// Default OFF: no safeStorage call is ever made, so a broken/locked macOS
+// login keychain can never throw its password dialog on launch. Settings →
+// Gateway exposes the toggle; flipping it re-encrypts (or decrypts) the
+// stored secrets in place.
+// ---------------------------------------------------------------------------
+const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_POLICY_FILE)
+
+const _secretStoragePolicyIo = {
+  readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
+  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' })
+}
+
+let _secretStoragePolicy: SecretStoragePolicy | null = null
+
+function secretStoragePolicy(): SecretStoragePolicy {
+  if (!_secretStoragePolicy) {
+    _secretStoragePolicy = readSecretStoragePolicy(_secretStoragePolicyIo)
+  }
+
+  return _secretStoragePolicy
+}
+
+function setSecretStoragePolicy(next: SecretStoragePolicy) {
+  _secretStoragePolicy = { on: next.on === true, migrated: next.migrated === true }
+  writeSecretStoragePolicy(_secretStoragePolicy, _secretStoragePolicyIo)
+}
+
+/**
+ * Keychain availability as the renderer should see it. With encryption
+ * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
+ * itself a keychain touch that raises the macOS dialog this feature exists
+ * to avoid. We report `true` so no plain-text warning banners fire: storing
+ * plaintext is the user's chosen (default) mode, not a degraded state.
+ */
+function probeSecureTokenStorage(): boolean {
+  if (!secretStoragePolicy().on) {
+    return true
+  }
+
+  try {
+    return Boolean(safeStorage.isEncryptionAvailable())
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Rewrite every stored desktop secret (v1 connection.json token/headers +
+ * per-profile overrides, v2 registry connections, native OAuth token store)
+ * through `reencode`. Returns true when any store was rewritten. Shared by
+ * the one-shot legacy migration and the Settings encryption toggle.
+ */
+function rewriteAllStoredSecrets(shouldRewrite: (secret: any) => boolean, reencode: (secret: any) => any): boolean {
+  let touched = false
+
+  const rewriteBlock = (block: any) => {
+    if (!block || typeof block !== 'object') {
+      return block
+    }
+
+    const next = { ...block, ...(block.token ? { token: reencode(block.token) } : {}) }
+
+    if (block.headers && typeof block.headers === 'object') {
+      next.headers = Object.fromEntries(Object.entries(block.headers).map(([k, v]) => [k, reencode(v)]))
+    }
+
+    return next
+  }
+
+  const blockNeedsRewrite = (o: any) =>
+    shouldRewrite(o?.token) ||
+    Object.values(o?.headers && typeof o.headers === 'object' ? o.headers : {}).some(shouldRewrite)
+
+  // v1 connection.json.
+  const config = readDesktopConnectionConfig()
+
+  if (blockNeedsRewrite(config.remote) || Object.values(config.profiles || {}).some(blockNeedsRewrite)) {
+    touched = true
+    writeDesktopConnectionConfig({
+      ...config,
+      remote: rewriteBlock(config.remote),
+      profiles: Object.fromEntries(Object.entries(config.profiles || {}).map(([k, v]) => [k, rewriteBlock(v)]))
+    })
+  }
+
+  // v2 connections.json registry.
+  const registry = readDesktopConnectionsRegistry()
+
+  if (registry.connections?.some(blockNeedsRewrite)) {
+    touched = true
+    writeDesktopConnectionsRegistry({ ...registry, connections: registry.connections.map(rewriteBlock) })
+  }
+
+  // Native OAuth token store: baseUrl → blob.
+  const io = _nativeTokenStoreIo()
+
+  try {
+    const store = JSON.parse(io.readStoreText())
+
+    if (store && typeof store === 'object' && !Array.isArray(store)) {
+      const entries = Object.entries(store)
+
+      if (entries.some(([, v]) => shouldRewrite(v))) {
+        touched = true
+        io.writeStoreText(JSON.stringify(Object.fromEntries(entries.map(([k, v]) => [k, reencode(v)]))))
+      }
+    }
+  } catch {
+    // Missing/corrupt native token store: nothing to rewrite.
+  }
+
+  return touched
+}
+
+/**
+ * One-shot legacy migration: builds before the opt-in policy wrote every
+ * secret as a safeStorage blob. With encryption now defaulting OFF, decrypt
+ * each stored blob once and rewrite it as plain so no future launch touches
+ * the keychain. Marked `migrated` whether or not every blob decrypts — a
+ * broken keychain costs at most ONE prompt (this pass), never one per
+ * launch; blobs that would not decrypt are left in place and simply read as
+ * absent from then on (classifyStoredSecret → 'drop'), so opting encryption
+ * back ON later can still recover them on a healthy keychain.
+ *
+ * Runs before createWindow() so every later read sees the final encodings.
+ */
+function migrateLegacyEncryptedSecretsOnce() {
+  const policy = secretStoragePolicy()
+
+  if (policy.on || policy.migrated) {
+    return
+  }
+
+  const needsMigration = (secret: any) => classifyStoredSecret(secret, policy) === 'migrate'
+
+  const reencode = (secret: any) => {
+    if (!needsMigration(secret)) {
+      return secret
+    }
+
+    const plaintext = decryptDesktopSecret(secret)
+
+    // Undecryptable now (locked/absent keychain): keep the blob for a
+    // potential future opt-in, but post-migration reads treat it as unset.
+    return plaintext ? { encoding: 'plain', value: plaintext } : secret
+  }
+
+  let touchedKeychain = false
+
+  try {
+    touchedKeychain = rewriteAllStoredSecrets(needsMigration, reencode)
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+
+    rememberLog(`[secret-storage] legacy migration pass failed: ${detail}`)
+  }
+
+  setSecretStoragePolicy({ on: false, migrated: true })
+
+  if (touchedKeychain) {
+    rememberLog('[secret-storage] migrated legacy keychain-encrypted secrets to opt-out storage (one-shot pass)')
+  }
+}
+
+/**
+ * Settings → Gateway toggle: flip keychain-backed encryption and re-encode
+ * every stored secret to match. Turning ON encrypts plain blobs through
+ * strict safeStorage (throws loudly when the keychain is unusable — the
+ * toggle stays off and the renderer shows the error). Turning OFF decrypts
+ * back to plain; this is user-initiated, so a keychain prompt here is
+ * expected and acceptable.
+ */
+function applySecretStorageEncryption(on: boolean) {
+  const enable = on === true
+
+  if (secretStoragePolicy().on === enable) {
+    return { on: enable }
+  }
+
+  if (enable) {
+    const needsEncrypt = (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
+
+    // Probe FIRST so an unusable keychain fails before any store is touched.
+    if (
+      !(() => {
+        try {
+          return Boolean(safeStorage.isEncryptionAvailable())
+        } catch {
+          return false
+        }
+      })()
+    ) {
+      throw new Error(
+        'OS keychain encryption is unavailable on this machine, so stored gateway secrets cannot be encrypted.'
+      )
+    }
+
+    setSecretStoragePolicy({ on: true, migrated: true })
+
+    try {
+      rewriteAllStoredSecrets(needsEncrypt, secret =>
+        needsEncrypt(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret
+      )
+    } catch (error) {
+      // Encryption failed midway: revert the policy so reads keep working
+      // against whatever encodings are on disk (mixed stores read fine —
+      // decryptDesktopSecret handles both encodings under either policy).
+      setSecretStoragePolicy({ on: false, migrated: true })
+      throw error
+    }
+
+    return { on: true }
+  }
+
+  // Turning OFF: decrypt everything back to plain while the keychain is
+  // still readable, then flip the policy.
+  const needsDecrypt = (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
+
+  rewriteAllStoredSecrets(needsDecrypt, (secret: any) => {
+    if (!needsDecrypt(secret)) {
+      return secret
+    }
+
+    const plaintext = decryptDesktopSecret(secret)
+
+    return plaintext ? { encoding: 'plain', value: plaintext } : secret
+  })
+
+  setSecretStoragePolicy({ on: false, migrated: true })
+
+  return { on: false }
+}
+
 function encryptDesktopSecret(value, options = {}) {
+  if (!secretStoragePolicy().on) {
+    const raw = String(value || '')
+
+    return raw ? { encoding: 'plain', value: raw } : null
+  }
+
   return encryptDesktopSecretStrict(value, safeStorage, options)
 }
 
@@ -8308,6 +8556,14 @@ function decryptDesktopSecret(secret) {
   }
 
   if (secret.encoding === SAFE_STORAGE_ENCODING) {
+    // Legacy blob under an opted-out policy: once the one-shot migration pass
+    // has run, never touch safeStorage again — a dead keychain would otherwise
+    // prompt on every read. Before that pass, decryption is allowed so the
+    // migration itself (and this launch's reads) can recover the value.
+    if (classifyStoredSecret(secret, secretStoragePolicy()) === 'drop') {
+      return ''
+    }
+
     try {
       return safeStorage.decryptString(Buffer.from(value, 'base64'))
     } catch {
@@ -8735,15 +8991,10 @@ function sanitizeRegistryConnection(entry) {
 }
 
 function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()) {
-  // Same keyring probe the v1 sanitize exposes: lets the Connections panel
+  // Same keyring signal the v1 sanitize exposes: lets the Connections panel
   // offer the plain-text opt-in on keyring-less Linux instead of failing.
-  let secureTokenStorage = false
-
-  try {
-    secureTokenStorage = Boolean(safeStorage.isEncryptionAvailable())
-  } catch {
-    secureTokenStorage = false
-  }
+  // Policy-aware: never touches safeStorage while encryption is opted out.
+  const secureTokenStorage = probeSecureTokenStorage()
 
   return {
     version: registry.version,
@@ -8867,15 +9118,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
   // Whether the OS keyring (safeStorage) can encrypt the saved token. When
   // false the renderer knows to offer the plain-text opt-in in Settings →
-  // Gateway. safeStorage.isEncryptionAvailable can throw on some platforms, so
-  // treat any failure as "not available".
-  let secureTokenStorage = false
-
-  try {
-    secureTokenStorage = Boolean(safeStorage.isEncryptionAvailable())
-  } catch {
-    secureTokenStorage = false
-  }
+  // Gateway. With keychain encryption opted out (the default) this reports
+  // true WITHOUT touching safeStorage — probing is itself a keychain touch
+  // that raises the macOS password dialog (see probeSecureTokenStorage).
+  const secureTokenStorage = probeSecureTokenStorage()
 
   // Whether the currently saved token is stored in plain text (the keyring-less
   // opt-in path). The env override supplies its token from the environment, not
@@ -10561,7 +10807,13 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   entry.process = child
   entry.token = token
-  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce)
+  // Buffer stdout+stderr from the instant of spawn (#93608): an early crash's
+  // traceback must survive into the claim error and the before-ready exit
+  // message instead of a bare exit code. rememberLog attaches later, after
+  // the claim, and would miss anything printed before it.
+  const outputTail = createBackendOutputTail()
+  outputTail.attach(child)
+  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
 
   child.stdout.on('data', rememberLog)
   child.stderr.on('data', rememberLog)
@@ -10586,13 +10838,18 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
     if (!ready) {
       rejectStart?.(
-        new Error(`Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).`)
+        new Error(
+          `Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).${outputTail.describe()}`
+        )
       )
     }
   })
 
   // Discover the ephemeral port the child bound to
-  const port = await Promise.race([waitForDashboardPortAnnouncement(child, { readyFile }), startFailed])
+  const port = await Promise.race([
+    waitForDashboardPortAnnouncement(child, { describeOutputTail: () => outputTail.describe(), readyFile }),
+    startFailed
+  ])
 
   if (readyFile) {
     fs.unlink(readyFile, () => {})
@@ -10937,7 +11194,19 @@ async function startHermes() {
       })
     )
 
-    await claimBackendChild(hermesProcess, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce)
+    // Buffer stdout+stderr from the instant of spawn (#93608): an early
+    // crash's traceback must survive into the claim error and the
+    // before-ready exit message shown by the boot UI. rememberLog attaches
+    // later, after the claim, and would miss anything printed before it.
+    const primaryOutputTail = createBackendOutputTail()
+    primaryOutputTail.attach(hermesProcess)
+    await claimBackendChild(
+      hermesProcess,
+      `${backend.command} ${backend.args.join(' ')}`,
+      profile,
+      backendNonce,
+      primaryOutputTail
+    )
     const processOwner = backendConnectionState.attachProcess(connectionAttempt, hermesProcess)
 
     if (!processOwner) {
@@ -10996,7 +11265,7 @@ async function startHermes() {
       sendBackendExit({ code, signal })
 
       if (!backendReady) {
-        const message = `Hermes backend exited before it became ready (${signal || code}).`
+        const message = `Hermes backend exited before it became ready (${signal || code}).${primaryOutputTail.describe()}`
         updateBootProgress(
           {
             error: message,
@@ -11018,7 +11287,10 @@ async function startHermes() {
 
     // Discover the ephemeral port the child bound to
     const port = await Promise.race([
-      waitForDashboardPortAnnouncement(hermesProcess, { readyFile }),
+      waitForDashboardPortAnnouncement(hermesProcess, {
+        describeOutputTail: () => primaryOutputTail.describe(),
+        readyFile
+      }),
       backendStartFailed
     ])
 
@@ -11184,13 +11456,15 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
   if (zoom) {
     installZoomShortcuts(win)
     // Re-apply persisted zoom on show/restore/resize/cross-display move
-    // (Chromium can drop webContents zoom after these window transitions) and
-    // on EVERY full load — not once. The crash-recovery path calls
-    // webContents.reload(), which fires did-finish-load again after a `once`
-    // listener is spent, so zoom was silently lost on renderer crash
-    // recovery and any in-place reload/navigation (#46429).
-    installZoomReassertOnWindowEvents(win, () => restorePersistedZoomLevel(win))
-    win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
+    // (Chromium can drop webContents zoom after these window transitions), on
+    // EVERY full load — not once, since crash recovery reloads and would
+    // outlive a spent `once` listener (#46429) — and after in-page navigation,
+    // where Chromium applies the target hash route's own per-URL zoom record
+    // (see installZoomReassertOnNavigation; #48658, #38854, #79863).
+    const reassertZoom = () => restorePersistedZoomLevel(win)
+
+    installZoomReassertOnWindowEvents(win, reassertZoom)
+    installZoomReassertOnNavigation(win.webContents, reassertZoom)
   }
 
   installContextMenuBridge(win)
@@ -11331,6 +11605,87 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 // Open (or focus) a standalone window for a single chat session.
 function createSessionWindow(sessionId, { watch = false } = {}) {
   return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+}
+
+// Popped-out in-app Browser: same webview + address bar as a docked Browser
+// tab, in its own OS window. One window per tab id (re-open focuses); closing
+// it tells the other renderers so they can dock the tab again.
+const browserWindows = createSessionWindowRegistry()
+
+function notifyBrowserPopoutClosed(tabId) {
+  if (typeof tabId !== 'string' || !tabId) {
+    return
+  }
+
+  for (const other of BrowserWindow.getAllWindows()) {
+    if (!other.isDestroyed()) {
+      other.webContents.send('hermes:browser-popout:closed', tabId)
+    }
+  }
+}
+
+function spawnBrowserWindow(tabId) {
+  const icon = getAppIconPath()
+
+  const win = new BrowserWindow({
+    width: BROWSER_WINDOW_WIDTH,
+    height: BROWSER_WINDOW_HEIGHT,
+    minWidth: BROWSER_WINDOW_MIN_WIDTH,
+    minHeight: BROWSER_WINDOW_MIN_HEIGHT,
+    title: 'Hermes',
+    titleBarStyle: 'hidden',
+    titleBarOverlay: getTitleBarOverlayOptions(),
+    trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
+    ...chatWindowSurfaceOptions(),
+    icon,
+    show: false,
+    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+  })
+
+  translucencyBackedWindows.add(win)
+
+  if (IS_MAC) {
+    win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
+  }
+
+  wireWindowReveal(win)
+
+  win.on('enter-full-screen', () => sendWindowStateChanged(true))
+  win.on('leave-full-screen', () => sendWindowStateChanged(false))
+
+  streamThrottle.register(win)
+  wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
+  attachRendererConsoleCapture(win, 'browser-window', rememberLog)
+
+  installWindowRendererLifecycle(win, {
+    kind: 'browser',
+    callbacks: {
+      log: rememberLog,
+      reload: () => {
+        win.webContents.reload()
+      }
+    },
+    reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
+    reloadMax: RENDERER_RELOAD_MAX,
+    recentReloadTimesRef: rendererReloadTimesRef
+  })
+
+  win.on('closed', () => notifyBrowserPopoutClosed(tabId))
+
+  loadWindowUrl(
+    win,
+    buildBrowserWindowUrl(tabId, {
+      devServer: DEV_SERVER,
+      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+    }),
+    'Browser window'
+  )
+
+  return win
+}
+
+function createBrowserWindow(tabId) {
+  return browserWindows.openOrFocus(tabId, () => spawnBrowserWindow(tabId))
 }
 
 // Additional full "instance" windows — peers of the primary that render the
@@ -11690,8 +12045,12 @@ const HUD_CURSOR_POLL_MS = 60
 // Snap-to-pointer — global ⌘⇧G while the HUD is open (tap, not hold).
 const HUD_SNAP_ANCHOR_Y = 48
 
+function hudWindowing() {
+  return resolveHudWindowing(process.platform, process.env, process.argv)
+}
+
 function applyHudSnapToPointer() {
-  if (!hudWindow || hudWindow.isDestroyed()) {
+  if (!hudWindow || hudWindow.isDestroyed() || !hudWindowing().clientPlacement) {
     return
   }
 
@@ -11745,20 +12104,15 @@ function registerHudSnapShortcut() {
  * the main process.
  */
 function startHudCursorFeed(win: BrowserWindow) {
-  if (process.platform !== 'linux') {
-    return
-  }
+  const windowing = hudWindowing()
 
-  // On an X11 window `setIgnoreMouseEvents(false)` does not restore the input
-  // region once the window has ignored the mouse. Ignore is a one-way door
-  // there, so the HUD is held solid for its whole life (the companion veto
-  // is in the hermes:hud:ignore-mouse handler). Native Wayland keeps the
-  // poll — that is what re-arms click-through when the pointer returns.
-  if (hudInputPolicy(process.platform, process.env, process.argv) === 'solid') {
-    try {
-      win.setIgnoreMouseEvents(false)
-    } catch {
-      // best effort
+  if (!windowing.cursorFeed) {
+    if (!windowing.ignoreMouse) {
+      try {
+        win.setIgnoreMouseEvents(false)
+      } catch {
+        // best effort
+      }
     }
 
     return
@@ -11816,8 +12170,29 @@ function startHudGameOverlayFeed(win: BrowserWindow) {
   // did-finish-load also covers HMR full reloads during development.
   win.webContents.on('did-finish-load', () => push(last))
 
+  // The watch gives up after two failed enumerations and never says so, which
+  // is how a HUD that cannot see the screen at all — no game cue, and
+  // read_window_below failing beside it — leaves nothing in the log to explain
+  // itself. Report the reason once; the null keeps the watch's contract.
+  let reported = false
+
+  const enumerate = async () => {
+    const windows = await enumerateWindowsFrontToBack(process.pid, titlesAvailable)
+
+    if (!enumerationFailed(windows)) {
+      return windows
+    }
+
+    if (!reported) {
+      reported = true
+      console.warn(`[hermes] HUD cannot enumerate windows: ${windows.reason}`)
+    }
+
+    return null
+  }
+
   const dispose = startHudGameOverlayWatch({
-    enumerate: () => enumerateWindowsFrontToBack(process.pid, titlesAvailable),
+    enumerate,
     displayBounds: () => screen.getDisplayMatching(win.getBounds()).bounds,
     selfPid: process.pid,
     send: state => {
@@ -11928,16 +12303,8 @@ function spawnHudWindow(sessionId, profile) {
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
-  win.setAlwaysOnTop(true, IS_MAC ? 'floating' : 'screen-saver')
+  applyHudElectronOverlay(win, process.platform)
   win.setHiddenInMissionControl?.(true)
-
-  if (IS_MAC) {
-    try {
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
-    } catch {
-      // Not supported everywhere — best effort.
-    }
-  }
 
   // Linux intentionally starts on ONE virtual desktop. During a renderer
   // grab, hermes:hud:workspace-transfer temporarily makes the X11 window
@@ -11966,6 +12333,10 @@ function spawnHudWindow(sessionId, profile) {
       if (hudRestoreMainWindow && mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.hide()
       }
+
+      // Compositor overlay adapters (Hyprland float+pin today). Electron
+      // alwaysOnTop is already set; this is the dialect some WMs actually hear.
+      void promoteHudOverlay({ title: HUD_WINDOW_TITLE })
     }
   })
 
@@ -12600,6 +12971,15 @@ ipcMain.handle('hermes:window:openInstance', async () => {
 
   return { ok: true }
 })
+ipcMain.handle('hermes:window:openBrowser', async (_event, tabId) => {
+  if (typeof tabId !== 'string' || !tabId.trim()) {
+    return { ok: false, error: 'invalid-tab-id' }
+  }
+
+  createBrowserWindow(tabId.trim())
+
+  return { ok: true }
+})
 
 // Hand a session to the user's OWN terminal emulator, running the TUI against
 // it (`hermes --tui --resume <id>`). Not the in-app terminal pane: the point is
@@ -12911,6 +13291,12 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
   })
 })
 ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
+
+// ── Opt-in keychain encryption for stored secrets ───────────────────────────
+// get returns the current policy without touching safeStorage; set flips it
+// and re-encodes every stored secret (see applySecretStorageEncryption).
+ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePolicy().on }))
+ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
 
 // ── v2 connection registry IPC (multi-source) ───────────────────────────────
 // Storage-level CRUD for named agent sources. Routing/pooling consumption of
@@ -15431,6 +15817,13 @@ app.whenReady().then(() => {
     passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
     safeStorageApi: safeStorage
   })
+
+  // Keychain encryption is opt-in (default OFF). One-shot: rewrite any
+  // legacy safeStorage-encrypted secrets as plain so no later launch ever
+  // touches the OS keychain unless the user turns encryption on in
+  // Settings → Gateway. Must run before createWindow() and the first
+  // connection resolution.
+  migrateLegacyEncryptedSecretsOnce()
 
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
