@@ -330,7 +330,7 @@ def test_abandoned_prepared_turn_clears_its_grants(tmp_path: Path):
 
 def test_read_file_activation_uses_the_governed_default_policy_digest():
     from agent.source_provenance import DEFAULT_POLICY_DIGEST
-    from agent.tool_executor import _source_provenance_activation
+    from agent.source_provenance_tools import source_provenance_activation
 
     agent = type(
         "Agent",
@@ -342,7 +342,7 @@ def test_read_file_activation_uses_the_governed_default_policy_digest():
         },
     )()
 
-    with _source_provenance_activation(agent, "read_file") as context:
+    with source_provenance_activation(agent, "read_file") as context:
         assert context.policy_digest == DEFAULT_POLICY_DIGEST
 
     assert hasattr(agent, "_source_provenance_registry")
@@ -350,7 +350,7 @@ def test_read_file_activation_uses_the_governed_default_policy_digest():
 
 def test_read_file_activation_binds_the_following_api_request():
     from agent.source_provenance import active_source_provenance
-    from agent.tool_executor import _source_provenance_activation
+    from agent.source_provenance_tools import source_provenance_activation
 
     agent = SimpleNamespace(
         session_id="session-1",
@@ -358,7 +358,7 @@ def test_read_file_activation_binds_the_following_api_request():
         _current_api_request_id="turn-1:api:7",
     )
 
-    with _source_provenance_activation(agent, "read_file"):
+    with source_provenance_activation(agent, "read_file"):
         assert active_source_provenance().request_id == "turn-1:api:8"
 
 
@@ -383,7 +383,7 @@ def test_registry_keeps_grants_request_scoped_and_clearable(tmp_path: Path):
 
 def test_tool_executor_records_only_opaque_trusted_read_grant_metadata(tmp_path: Path):
     from agent.source_provenance import SourceProvenanceRegistry
-    from agent.tool_executor import _attach_trusted_source_provenance_metadata
+    from agent.source_provenance_tools import attach_trusted_source_provenance_metadata
 
     source = tmp_path / "app.py"
     source.write_text("safe\n", encoding="utf-8")
@@ -394,7 +394,7 @@ def test_tool_executor_records_only_opaque_trusted_read_grant_metadata(tmp_path:
         _current_api_request_id="request-1",
     )
 
-    _attach_trusted_source_provenance_metadata(agent, "read_file")
+    attach_trusted_source_provenance_metadata(agent, "read_file")
 
     metadata = agent._source_provenance_metadata["request-1"]
     assert len(metadata["source_grant_digests"]) == 1
@@ -404,5 +404,29 @@ def test_tool_executor_records_only_opaque_trusted_read_grant_metadata(tmp_path:
         _source_provenance_registry=registry,
         _current_api_request_id="request-1",
     )
-    _attach_trusted_source_provenance_metadata(terminal_agent, "terminal")
+    attach_trusted_source_provenance_metadata(terminal_agent, "terminal")
     assert not hasattr(terminal_agent, "_source_provenance_metadata")
+
+
+def test_provenance_responsibilities_live_outside_authority_godfiles():
+    import agent.source_provenance_tools as provenance_tools
+    import agent.tool_executor as tool_executor
+    import tools.file_tools as file_tools
+
+    assert provenance_tools.source_provenance_activation
+    assert provenance_tools.attach_trusted_source_provenance_metadata
+    assert provenance_tools.issue_active_read_provenance
+    assert not hasattr(tool_executor, "_source_provenance_activation")
+    assert not hasattr(tool_executor, "_attach_trusted_source_provenance_metadata")
+    assert not hasattr(file_tools, "_issue_active_read_provenance")
+
+
+def test_mailmap_attributes_mike_demott_commits_to_pr_author():
+    mailmap = (Path(__file__).resolve().parents[2] / ".mailmap").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "Mike DeMott <25466867+mrkillbob@users.noreply.github.com> "
+        "<mikedemott@Mikes-Mac-mini.local>"
+    ) in mailmap

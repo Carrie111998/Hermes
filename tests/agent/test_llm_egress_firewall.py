@@ -6,6 +6,8 @@ import base64
 import json
 import os
 import stat
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from hashlib import sha256
@@ -1013,6 +1015,18 @@ def test_receipt_is_owner_only_and_rejects_symlink_ledger(tmp_path):
     assert "receipt_unavailable" in exc_info.value.decision.reason_codes
 
 
+def test_receipt_rejects_symlink_lock_file(tmp_path):
+    target = tmp_path / "outside.lock"
+    target.write_bytes(b"x")
+    (tmp_path / "llm-egress-receipts.lock").symlink_to(target)
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).preflight(_sanitized_request("safe request"), _route())
+
+    assert "receipt_unavailable" in exc_info.value.decision.reason_codes
+    assert target.read_bytes() == b"x"
+
+
 def test_concurrent_receipt_appends_remain_complete_json_lines(tmp_path):
     gate = firewall(tmp_path)
 
@@ -1031,6 +1045,65 @@ def test_concurrent_receipt_appends_remain_complete_json_lines(tmp_path):
     assert {receipt["request_id"] for receipt in receipts} == {
         f"req-{index}" for index in range(32)
     }
+
+
+def test_firewall_imports_when_fcntl_is_unavailable():
+    script = """
+import builtins
+real_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'fcntl':
+        raise ImportError('simulated Windows import')
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+import agent.llm_egress_firewall
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_multiprocess_receipt_appends_preserve_hash_chain(tmp_path):
+    script = """
+import sys
+from pathlib import Path
+from agent.llm_egress_firewall import LLMEgressFirewall
+gate = LLMEgressFirewall(Path(sys.argv[1]))
+index = sys.argv[2]
+gate.preflight(
+    {
+        'messages': [{'role': 'user', 'content': f'local prompt {index}'}],
+        'request_id': f'process-{index}',
+    },
+    {'provider': 'local', 'model': 'test', 'base_url': 'http://127.0.0.1:11434'},
+)
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path), str(index)],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for index in range(12)
+    ]
+    for process in processes:
+        _stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == 0, stderr
+
+    lines = (tmp_path / "llm-egress-receipts.jsonl").read_bytes().splitlines()
+    assert len(lines) == 12
+    for index, line in enumerate(lines):
+        receipt = json.loads(line)
+        expected_previous = "" if index == 0 else sha256(lines[index - 1]).hexdigest()
+        assert receipt["receipt_prev_sha256"] == expected_previous
 
 
 def test_receipts_form_a_content_free_hash_chain(tmp_path):
