@@ -53,7 +53,17 @@ vi.mock('@/lib/desktop-fs', () => ({
 vi.mock('@/store/gateway', () => ({
   $gateway: atom(null),
   activeGateway: vi.fn(),
-  ensureActiveGatewayOpen: vi.fn()
+  ensureActiveGatewayOpen: vi.fn(),
+  openGatewayForAgent: vi.fn().mockResolvedValue(undefined),
+  requestGatewayForAgent: vi.fn()
+}))
+
+vi.mock('@/store/connections', () => ({
+  $activeConnectionId: atom('local'),
+  $connectionsRegistry: atom({
+    activeId: 'local',
+    connections: [{ id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false }]
+  })
 }))
 
 vi.mock('@/lib/desktop-git', async importOriginal => ({
@@ -362,6 +372,37 @@ describe('startWorkInRepo remote capability gate (#81724)', () => {
   })
 })
 
+describe('project connection stamp', () => {
+  it('resolves connectionId from the tree, then the persisted map', async () => {
+    const {
+      $projectConnectionById,
+      $projectTree,
+      connectionIdForProjectId,
+      connectionIdForProjectPath,
+      setProjectConnection
+    } = await import('./projects')
+
+    $projectTree.set([
+      {
+        id: 'p_remote',
+        label: 'Remote',
+        path: '/mimir/app',
+        connectionId: 'mimir',
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+    $projectConnectionById.set({})
+
+    expect(connectionIdForProjectId('p_remote')).toBe('mimir')
+    expect(connectionIdForProjectPath('/mimir/app/src')).toBe('mimir')
+
+    $projectTree.set([])
+    setProjectConnection('p_map', 'surtr')
+    expect(connectionIdForProjectId('p_map')).toBe('surtr')
+  })
+})
+
 describe('pickProjectFolder', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -372,7 +413,12 @@ describe('pickProjectFolder', () => {
     selectDesktopPaths.mockResolvedValue(['/local/repo'])
 
     await expect(pickProjectFolder()).resolves.toBe('/local/repo')
-    expect(selectDesktopPaths).toHaveBeenCalledWith({ defaultPath: undefined, directories: true, multiple: false })
+    expect(selectDesktopPaths).toHaveBeenCalledWith({
+      connectionId: undefined,
+      defaultPath: undefined,
+      directories: true,
+      multiple: false
+    })
   })
 
   it('seeds the picker with the backend cwd on a remote gateway', async () => {
@@ -382,7 +428,26 @@ describe('pickProjectFolder', () => {
 
     await expect(pickProjectFolder()).resolves.toBe('/backend/work/repo')
     expect(selectDesktopPaths).toHaveBeenCalledWith({
+      connectionId: undefined,
       defaultPath: '/backend/work',
+      directories: true,
+      multiple: false
+    })
+  })
+
+  it('pins FS to a foreign connectionId without relying on ambient remote mode', async () => {
+    const gw = await import('@/store/gateway')
+    const openGatewayForAgent = vi.mocked(gw.openGatewayForAgent)
+
+    isDesktopFsRemoteMode.mockReturnValue(false)
+    desktopDefaultCwd.mockResolvedValue({ branch: 'main', cwd: '/mimir/home' })
+    selectDesktopPaths.mockResolvedValue(['/mimir/home/repo'])
+
+    await expect(pickProjectFolder('mimir')).resolves.toBe('/mimir/home/repo')
+    expect(openGatewayForAgent).toHaveBeenCalledWith('mimir', 'default')
+    expect(selectDesktopPaths).toHaveBeenCalledWith({
+      connectionId: 'mimir',
+      defaultPath: '/mimir/home',
       directories: true,
       multiple: false
     })
@@ -425,6 +490,42 @@ describe('createProject', () => {
     expect(request).toHaveBeenCalledWith('projects.create', expect.objectContaining({ name: 'Demo' }))
     expect($sidebarAgentsGrouped.get()).toBe(true)
     expect($activeProjectId.get()).toBe('p_new')
+  })
+
+  it('creates on a foreign connection via requestGatewayForAgent and stamps the tree', async () => {
+    const created = { folders: [], id: 'p_mimir', name: 'Remote', primary_path: '/mimir/demo' }
+    const gw = await import('@/store/gateway')
+    const requestGatewayForAgent = vi.mocked(gw.requestGatewayForAgent)
+    const openGatewayForAgent = vi.mocked(gw.openGatewayForAgent)
+
+    requestGatewayForAgent.mockResolvedValue({ project: created } as never)
+    activeGateway.mockReturnValue({
+      connectionState: 'open',
+      request: vi.fn(async () => ({ active_id: null, projects: [], scoped_session_ids: [] }))
+    } as never)
+
+    const { $projectConnectionById, $projectTree } = await import('./projects')
+    $projectTree.set([])
+
+    const result = await createProject({
+      connectionId: 'mimir',
+      folders: ['/mimir/demo'],
+      name: 'Remote',
+      use: true
+    })
+
+    expect(result).toEqual(created)
+    expect(openGatewayForAgent).toHaveBeenCalledWith('mimir', 'default')
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'mimir',
+      'default',
+      'projects.create',
+      expect.objectContaining({ name: 'Remote', folders: ['/mimir/demo'] })
+    )
+    expect($projectConnectionById.get().p_mimir).toBe('mimir')
+    expect($projectTree.get().find(node => node.id === 'p_mimir')?.connectionId).toBe('mimir')
+    // Foreign create must not flip chrome active-project pointer.
+    expect($activeProjectId.get()).toBeNull()
   })
 
   it('marks the backend stale and surfaces a friendly error when projects.create is missing', async () => {

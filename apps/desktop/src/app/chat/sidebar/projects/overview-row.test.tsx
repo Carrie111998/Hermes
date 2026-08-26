@@ -12,6 +12,14 @@ afterEach(cleanup)
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
+      settings: {
+        connections: {
+          kindCloud: 'Cloud',
+          kindLocal: 'Local',
+          kindRemote: 'Remote',
+          kindSsh: 'SSH'
+        }
+      },
       sidebar: {
         newSessionIn: (label: string) => `New session in ${label}`,
         projects: {
@@ -23,6 +31,22 @@ vi.mock('@/i18n', () => ({
     }
   })
 }))
+
+vi.mock('@/store/connections', () => {
+  const { atom } = require('nanostores')
+
+  return {
+    $connectionsRegistry: atom({
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device' },
+        { id: 'mimir', kind: 'ssh', label: 'mimir' }
+      ],
+      primary: 'local',
+      secureTokenStorage: true,
+      version: 2
+    })
+  }
+})
 
 vi.mock('./model', () => ({
   PROJECT_PREVIEW_COUNT: 3,
@@ -49,6 +73,22 @@ describe('ProjectOverviewRow', () => {
 
     const button = screen.getByRole('button', { name: 'New session in Test D' })
     expect(tipTrigger(button)).toBeTruthy()
+  })
+
+  it('shows a quiet gateway suffix when the project is remote', () => {
+    const remote = { id: 'p_remote', label: 'Skunkworks', connectionId: 'mimir' } as unknown as SidebarProjectTree
+
+    render(<ProjectOverviewRow project={remote} />)
+
+    expect(screen.getByText('Skunkworks')).toBeTruthy()
+    expect(screen.getByRole('img', { name: /mimir/ })).toBeTruthy()
+  })
+
+  it('does not mark a local project with a gateway suffix', () => {
+    render(<ProjectOverviewRow project={project} />)
+
+    expect(screen.queryByRole('img', { name: /mimir/ })).toBeNull()
+    expect(screen.queryByRole('img', { name: /This device/ })).toBeNull()
   })
 
   it('wraps the disclosure toggle in a Tip when there are preview sessions', () => {

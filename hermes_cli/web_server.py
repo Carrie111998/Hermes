@@ -732,7 +732,16 @@ def should_require_dashboard_auth(
     ``dashboard.public_url`` requires authentication even when a reverse proxy
     reaches a backend bound to loopback. Callers may pass the already-resolved
     host set so startup and request validation use the same snapshot.
+
+    Desktop-spawned backends (``HERMES_DESKTOP=1``, including SSH
+    ``serve --isolated``) are reached only from this machine. The operator's
+    public URL describes a different, browser-facing process; inheriting it
+    here would engage the OAuth gate and reject the desktop session token.
+    ``~/.hermes/.env`` also overrides spawn env (``override=True``), so the
+    Desktop flag is the one signal that survives dotenv.
     """
+    if os.getenv("HERMES_DESKTOP") == "1":
+        return should_require_auth(host)
     if trusted_public_hosts is None:
         trusted_public_hosts = _dashboard_public_hosts()
     return should_require_auth(host) or any(

@@ -56,6 +56,8 @@ export interface SidebarProjectTree {
   // claimed. It has no folder, so no repo/worktree structure — its one lane
   // exists only to carry the rows.
   isNoProject?: boolean
+  /** Registry connection that owns this project. Local / chrome-active omit. */
+  connectionId?: string
   repos: SidebarWorkspaceTree[]
   sessionCount: number
   // Tokens and spend over the same sessions `sessionCount` counts, summed by

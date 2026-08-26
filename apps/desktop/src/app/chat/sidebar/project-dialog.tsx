@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -18,11 +18,13 @@ import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { type ProjectIdeaTemplate, randomIdeaTemplates } from '@/lib/project-idea-templates'
 import { cn } from '@/lib/utils'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { notifyError } from '@/store/notifications'
 import {
   $projectDialog,
   addProjectFolder,
   closeProjectDialog,
+  connectionIdForProjectId,
   createProject,
   generateProjectIdea,
   pickProjectFolder,
@@ -31,13 +33,19 @@ import {
 
 // Single dialog mounted once in the sidebar; it renders create / rename /
 // add-folder flows driven by the $projectDialog atom. Folders are chosen via
-// the native directory picker (reused from the default-project-dir setting).
+// the remote-aware picker pinned to the selected gateway (create) or the
+// project's stamped connection (add-folder).
 export function ProjectDialog() {
   const { t } = useI18n()
   const p = t.sidebar.projects
   const state = useStore($projectDialog)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
   const open = state !== null
   const mode = state?.mode ?? 'create'
+
+  const gateways = useMemo(() => registry?.connections ?? [], [registry])
+  const showGatewayPicker = mode === 'create' && gateways.length > 1
 
   const [name, setName] = useState('')
   const [folders, setFolders] = useState<string[]>([])
@@ -45,6 +53,7 @@ export function ProjectDialog() {
   const [templates, setTemplates] = useState<ProjectIdeaTemplate[]>([])
   const [generatingIdea, setGeneratingIdea] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [gatewayId, setGatewayId] = useState('local')
   const nameRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -55,12 +64,13 @@ export function ProjectDialog() {
       setTemplates(randomIdeaTemplates())
       setGeneratingIdea(false)
       setSubmitting(false)
+      setGatewayId(activeConnectionId || gateways.find(conn => conn.kind === 'local')?.id || gateways[0]?.id || 'local')
 
       if (mode !== 'add-folder') {
         window.setTimeout(() => nameRef.current?.select(), 0)
       }
     }
-  }, [open, mode, state?.name])
+  }, [open, mode, state?.name, activeConnectionId, gateways])
 
   const onOpenChange = (next: boolean) => {
     if (!next) {
@@ -87,9 +97,17 @@ export function ProjectDialog() {
     }
   }
 
+  const folderConnectionId = () => {
+    if (mode === 'add-folder' && state?.projectId) {
+      return connectionIdForProjectId(state.projectId) || activeConnectionId || 'local'
+    }
+
+    return gatewayId
+  }
+
   const pickFolder = async () => {
     try {
-      const dir = await pickProjectFolder()
+      const dir = await pickProjectFolder(folderConnectionId())
 
       if (!dir) {
         return
@@ -124,7 +142,15 @@ export function ProjectDialog() {
     // A project owns sessions by folder (cwd-prefix), so creation requires at
     // least one — a folder-less project couldn't hold a session anyway.
     if (mode === 'create' && trimmed && folders.length) {
-      await runSubmit(() => createProject({ folders, idea: idea.trim() || undefined, name: trimmed, use: true }))
+      await runSubmit(() =>
+        createProject({
+          connectionId: gatewayId,
+          folders,
+          idea: idea.trim() || undefined,
+          name: trimmed,
+          use: true
+        })
+      )
     }
   }
 
@@ -173,6 +199,27 @@ export function ProjectDialog() {
             ref={nameRef}
             value={name}
           />
+        )}
+
+        {showGatewayPicker && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{p.gatewayLabel}</span>
+            <select
+              className="h-8 rounded-md border border-(--ui-stroke-tertiary) bg-transparent px-2 text-[0.8125rem]"
+              disabled={submitting}
+              onChange={event => {
+                setGatewayId(event.target.value)
+                setFolders([])
+              }}
+              value={gatewayId}
+            >
+              {gateways.map(conn => (
+                <option key={conn.id} value={conn.id}>
+                  {conn.label}
+                </option>
+              ))}
+            </select>
+          </div>
         )}
 
         {mode === 'create' && (

@@ -6,10 +6,12 @@ import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-ima
 import { parseErrorSurface } from '@/lib/error-surface'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
+import { $activeConnectionId } from '@/store/connections'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
   $cronSessions,
   $currentCwd,
+  $foreignGatewaySessions,
   $messagingSessions,
   $sessions,
   commitWorkspaceCwdForSelectedSession,
@@ -24,6 +26,7 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setForeignGatewaySessions,
   setSessions,
   setWorkspaceCwdOwner,
   setYoloActive
@@ -1243,13 +1246,16 @@ export function upsertOptimisticSession(
   title: string | null = null,
   preview: string | null = null,
   parentSessionId: string | null = null,
-  lastActive?: number
+  lastActive?: number,
+  ownerRoute?: SessionProfileRoute | null
 ) {
   const now = lastActive ?? Date.now() / 1000
-  // Stamp the profile the session was just created on (= the live gateway's
-  // profile) so the scoped sidebar shows the new row immediately instead of
-  // filtering it out as "default" until the aggregator re-fetches.
-  const profileKey = normalizeProfileKey($activeGatewayProfile.get())
+  // Stamp the profile the session was just created on so the scoped sidebar
+  // shows the new row immediately instead of filtering it out as "default"
+  // until the aggregator re-fetches. A per-session owner route wins: that
+  // session may belong to another gateway than the window chrome.
+  const profileKey = normalizeProfileKey(ownerRoute?.profile || $activeGatewayProfile.get())
+  const ownerConnectionId = ownerRoute?.connectionId?.trim() || undefined
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
@@ -1271,7 +1277,15 @@ export function upsertOptimisticSession(
     source: 'tui',
     started_at: now,
     title,
-    tool_call_count: 0
+    tool_call_count: 0,
+    ...(ownerConnectionId ? { connection_id: ownerConnectionId } : {})
+  }
+
+  if (ownerConnectionId && ownerConnectionId !== $activeConnectionId.get()) {
+    const previous = $foreignGatewaySessions.get()[ownerConnectionId] ?? []
+    setForeignGatewaySessions(ownerConnectionId, [session, ...previous.filter(existing => existing.id !== id)])
+
+    return
   }
 
   setSessions(prev => [session, ...prev.filter(s => s.id !== id)])

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 
-import { listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+import { listAllProfileSessions, listGatewayRecentSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
 import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
@@ -8,6 +8,7 @@ import {
   MESSAGING_SESSION_SOURCE_IDS,
   normalizeSessionSource
 } from '@/lib/session-source'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { gatewayActivationEpoch } from '@/store/gateway'
 import {
   $pinnedSessionIds,
@@ -21,6 +22,7 @@ import {
 import { messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
 import { $removedSessionIds } from '@/store/projects'
 import {
+  $foreignGatewaySessions,
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
@@ -28,6 +30,8 @@ import {
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
   setCronSessions,
+  setForeignGatewaySessions,
+  setForeignGatewaySessionsLoading,
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
@@ -149,6 +153,62 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       // Non-fatal: the messaging sections just stay empty/stale.
     }
   }, [profileScope])
+
+  /** Aggregate recent sessions from every OTHER registered gateway into the
+   *  active profile's sidebar. Additive: each foreign gateway's rows are stored
+   *  keyed by connectionId (never clobbering `$sessions`, the active
+   *  connection's own list) and render in a dedicated "other gateways" section,
+   *  each badged with its origin and opening routed to its owning gateway —
+   *  the local profile scope is untouched. Runs alongside the active recents
+   *  refresh so a foreign gateway's sessions stay current while you browse on
+   *  your primary connection. */
+  const refreshForeignGatewaySessions = useCallback(async () => {
+    const activeId = $activeConnectionId.get()
+    const registry = $connectionsRegistry.get()
+
+    if (!activeId || !registry?.connections.length) {
+      return
+    }
+
+    const foreign = registry.connections.filter(conn => conn.id !== activeId && conn.kind !== 'local')
+
+    // Prune slices for connections that are no longer registered.
+    const liveIds = new Set(foreign.map(conn => conn.id))
+    const staleIds = Object.keys($foreignGatewaySessions.get()).filter(id => !liveIds.has(id))
+
+    if (staleIds.length) {
+      const pruned = { ...$foreignGatewaySessions.get() }
+
+      for (const id of staleIds) {delete pruned[id]}
+      $foreignGatewaySessions.set(pruned)
+    }
+
+    for (const conn of foreign) {
+      const profile = conn.remoteProfile || 'default'
+
+      setForeignGatewaySessionsLoading(conn.id, true)
+
+      try {
+        const result = await listGatewayRecentSessions(conn.id, profile, SIDEBAR_SESSIONS_PAGE_SIZE, {
+          excludeSources: SIDEBAR_EXCLUDED_SOURCES
+        })
+
+        // A gateway switch mid-fetch must not commit a foreign slice against a
+        // connection that is no longer "other".
+        if (activeId !== $activeConnectionId.get()) {
+          return
+        }
+
+        setForeignGatewaySessions(conn.id, dropTombstoned(result.sessions))
+      } catch {
+        // Non-fatal: the foreign gateway's slice just stays stale/empty.
+      } finally {
+        if (activeId === $activeConnectionId.get()) {
+          setForeignGatewaySessionsLoading(conn.id, false)
+        }
+      }
+    }
+  }, [])
 
   /** Page one messaging platform without replacing another platform's rows. */
   const loadMoreMessagingForPlatform = useCallback(
@@ -344,7 +404,12 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     if (sidebarProfileForScope(profileScopeRef.current) === sessionProfile) {
       void refreshCronJobs()
     }
-  }, [profileScope, refreshCronJobs])
+
+    // Foreign-gateway sessions: aggregate every other registered connection's
+    // recents into the dedicated "other gateways" section alongside the active
+    // connection's own recents refresh.
+    void refreshForeignGatewaySessions()
+  }, [profileScope, refreshCronJobs, refreshForeignGatewaySessions])
 
   const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()
@@ -385,6 +450,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     loadMoreMessagingForPlatform,
     loadMoreSessions,
     refreshCronJobs,
+    refreshForeignGatewaySessions,
     refreshMessagingSessions,
     refreshSessions
   }

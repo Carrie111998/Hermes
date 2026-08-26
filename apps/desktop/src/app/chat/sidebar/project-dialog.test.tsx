@@ -18,6 +18,7 @@ vi.mock('@/i18n', () => ({
           createFailed: 'Failed to create project',
           createTitle: 'New project',
           foldersLabel: 'Folders',
+          gatewayLabel: 'Gateway',
           ideaGenerate: 'Generate',
           ideaGenerating: 'Generating…',
           ideaLabel: 'Idea',
@@ -33,11 +34,6 @@ vi.mock('@/i18n', () => ({
   })
 }))
 
-// $projectDialog is a real nanostore atom in the app; recreate it here so
-// useStore behaves identically without pulling in the rest of the projects
-// store (backend calls, project list, etc.) which is irrelevant to the Tip fix.
-// vi.mock factories are hoisted above the rest of the file, so the atom must
-// be created inside vi.hoisted to exist by the time the factory runs.
 const { $projectDialog } = vi.hoisted(() => {
   const { atom } = require('nanostores') as typeof Nanostores
 
@@ -48,15 +44,36 @@ const { $projectDialog } = vi.hoisted(() => {
   }
 })
 
+const { createProject, pickProjectFolder } = vi.hoisted(() => ({
+  createProject: vi.fn(),
+  pickProjectFolder: vi.fn(async () => '/Users/test/my-folder')
+}))
+
 vi.mock('@/store/projects', () => ({
   $projectDialog,
   addProjectFolder: vi.fn(),
   closeProjectDialog: vi.fn(),
-  createProject: vi.fn(),
+  connectionIdForProjectId: vi.fn(() => null),
+  createProject,
   generateProjectIdea: vi.fn(),
-  pickProjectFolder: vi.fn(async () => '/Users/test/my-folder'),
+  pickProjectFolder,
   renameProject: vi.fn()
 }))
+
+vi.mock('@/store/connections', () => {
+  const { atom } = require('nanostores') as typeof Nanostores
+
+  return {
+    $activeConnectionId: atom('local'),
+    $connectionsRegistry: atom({
+      activeId: 'local',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'mimir', kind: 'ssh', label: 'mimir', tokenPreview: null, tokenSet: false }
+      ]
+    })
+  }
+})
 
 vi.mock('@/store/notifications', () => ({
   notifyError: vi.fn()
@@ -83,5 +100,41 @@ describe('ProjectDialog', () => {
 
     const button = await screen.findByRole('button', { name: 'Remove folder' })
     expect(tipTrigger(button)).toBeTruthy()
+  })
+
+  it('shows a gateway selector when more than one connection is registered', () => {
+    render(<ProjectDialog />)
+
+    expect(screen.getByText('Gateway')).toBeTruthy()
+    expect(screen.getByRole('combobox')).toBeTruthy()
+  })
+
+  it('clears folders and pins pick/create to the chosen gateway', async () => {
+    render(<ProjectDialog />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add folder' }))
+    await screen.findByRole('button', { name: 'Remove folder' })
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'mimir' } })
+    expect(screen.queryByRole('button', { name: 'Remove folder' })).toBeNull()
+
+    pickProjectFolder.mockResolvedValueOnce('/mimir/work')
+    fireEvent.click(screen.getByRole('button', { name: 'Add folder' }))
+    await screen.findByRole('button', { name: 'Remove folder' })
+
+    expect(pickProjectFolder).toHaveBeenLastCalledWith('mimir')
+
+    fireEvent.change(screen.getByPlaceholderText('Project name'), { target: { value: 'Remote proj' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+
+    await vi.waitFor(() => {
+      expect(createProject).toHaveBeenCalledWith(
+        expect.objectContaining({
+          connectionId: 'mimir',
+          folders: ['/mimir/work'],
+          name: 'Remote proj'
+        })
+      )
+    })
   })
 })

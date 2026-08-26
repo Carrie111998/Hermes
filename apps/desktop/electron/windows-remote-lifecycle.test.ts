@@ -96,7 +96,7 @@ test('helper command uses the fixed remote Python entry point and quotes path da
 test('Windows lock validation is scoped and exact', () => {
   const lock = {
     schemaVersion: 2,
-    protocolVersion: 1,
+    protocolVersion: 2,
     ownershipId,
     spawnNonce: '0123456789abcdef',
     pid: 10,
@@ -121,7 +121,7 @@ test('Windows SSH reuse requires the requested remote profile to match the lock'
 
   const lock = {
     schemaVersion: 2,
-    protocolVersion: 1,
+    protocolVersion: 2,
     ownershipId,
     spawnNonce: '0123456789abcdef',
     pid: 10,

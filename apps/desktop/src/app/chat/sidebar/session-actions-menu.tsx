@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useEffect, useRef, useState } from 'react'
 
-import { openSession } from '@/app/open-session'
+import { openSession, workspaceScopeForConnection } from '@/app/open-session'
 import {
   closeAllTreeTabs,
   closeOtherTreeTabs,
@@ -29,6 +29,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
+import { $connectionsRegistry } from '@/store/connections'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $projectTree, moveSessionToProject, projectIdForCwd, projectRootCwd } from '@/store/projects'
@@ -220,6 +221,16 @@ function useSessionActions({
   // a tab): offering "Open in new tab" again is noise.
   const alreadyTabbed = sessionId === selectedStoredSessionId || tiles.some(tile => tile.storedSessionId === sessionId)
 
+  const openBeside = (intent: 'tab' | 'window') => {
+    const row = $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))
+
+    const connection = row?.connection_id
+      ? $connectionsRegistry.get()?.connections.find(c => c.id === row.connection_id)
+      : undefined
+
+    openSession(sessionId, () => undefined, intent, workspaceScopeForConnection(connection))
+  }
+
   const spec = (partial: Omit<ActionItemSpec, 'onSelect'> & { onSelect: () => void }): ActionItemSpec => partial
 
   // OPEN — where else this session can go. A tab surface IS a tab already,
@@ -236,7 +247,7 @@ function useSessionActions({
               // Stack into the MAIN zone as a tab (center dock; the strip
               // sticky-shows on gain) — the door to the tab bar. Focuses first
               // if the session is already on screen.
-              openSession(sessionId, () => undefined, 'tab')
+              openBeside('tab')
             }
           })
         ]
@@ -249,7 +260,7 @@ function useSessionActions({
             label: r.newWindow,
             onSelect: () => {
               triggerHaptic('selection')
-              openSession(sessionId, () => undefined, 'window')
+              openBeside('window')
             }
           })
         ]

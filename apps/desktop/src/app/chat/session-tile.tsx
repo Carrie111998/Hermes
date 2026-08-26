@@ -62,6 +62,7 @@ import type { SessionInfo } from '@/types/hermes'
 
 import type { SessionDragPayload } from './composer/inline-refs'
 import { type ComposerScope, ComposerScopeProvider } from './composer/scope'
+import { SessionOriginTabMark } from './connection-origin-tag'
 import { useComposerActions } from './hooks/use-composer-actions'
 import { paneMirror } from './pane-mirror'
 import { SessionDraftTitle } from './session-draft-title'
@@ -665,7 +666,10 @@ export const watchSessionTiles = paneMirror<SessionTile>({
   // two surfaces. Self-subscribing (live state + resolved color), so the strip
   // needn't re-sync when it changes.
   tabLead: storedSessionId => (
-    <SessionStatusDot session={tileStoredRow(storedSessionId)} storedSessionId={storedSessionId} />
+    <>
+      <SessionStatusDot session={tileStoredRow(storedSessionId)} storedSessionId={storedSessionId} />
+      <SessionOriginTabMark storedSessionId={storedSessionId} />
+    </>
   ),
   // Until the first turn lists a row there is no title to register, so the tab
   // takes its name from the composer instead — live, without re-registering.

@@ -5,6 +5,7 @@ import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { ConnectionOriginTag } from '@/app/chat/connection-origin-tag'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -30,7 +31,7 @@ import { resolveProfileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
-import { $activeConnectionId } from '@/store/connections'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { $cronJobs } from '@/store/cron'
 import { $bindings } from '@/store/keybinds'
 import {
@@ -324,6 +325,7 @@ export function ChatSidebar({
   const { t } = useI18n()
   const s = t.sidebar
   const { pathname } = useLocation()
+  const connectionsRegistry = useStore($connectionsRegistry)
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
   // below the built-ins with the same chrome; active = at their route.
   const navContributions = useContributions(SIDEBAR_NAV_AREA)
@@ -391,6 +393,17 @@ export function ChatSidebar({
   const profileColors = useStore($profileColors)
   const profileScope = useStore($profileScope)
   const activeConnectionId = useStore($activeConnectionId)
+
+  // The active gateway's registry row, surfaced as a per-row origin chip on
+  // the session lists when it is a foreign (remote/SSH/cloud) source. Local
+  // "This device" stays unlabelled (the normal case).
+  const activeConnectionOrigin =
+    connectionsRegistry && activeConnectionId
+      ? (connectionsRegistry.connections.find(connection => connection.id === activeConnectionId) ?? null)
+      : null
+
+  const sessionConnectionOrigin =
+    activeConnectionOrigin && activeConnectionOrigin.kind !== 'local' ? activeConnectionOrigin : null
 
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
@@ -1144,6 +1157,15 @@ export function ChatSidebar({
   const sessionsLabel =
     inProject && enteredProject ? enteredProject.label : worktreeGroupingActive ? s.projects.sectionLabel : s.sessions
 
+  const enteredProjectOrigin =
+    enteredProject?.connectionId && enteredProject.connectionId !== 'local'
+      ? (connectionsRegistry?.connections.find(connection => connection.id === enteredProject.connectionId) ?? null)
+      : null
+  const enteredProjectOriginTag =
+    enteredProjectOrigin && enteredProjectOrigin.kind !== 'local' ? (
+      <ConnectionOriginTag connection={enteredProjectOrigin} quiet />
+    ) : null
+
   // Mirror the section's skeleton gate (projectsLoading + nothing to show yet):
   // while the skeleton is up there's no point also spinning the header count.
   const projectsSkeletonVisible =
@@ -1586,6 +1608,7 @@ export function ChatSidebar({
             {trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
+                connection={sessionConnectionOrigin}
                 contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
                 emptyState={
                   searchPending ? (
@@ -1615,6 +1638,7 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
+                connection={sessionConnectionOrigin}
                 contentClassName="flex flex-col gap-px rounded-lg pb-2 pt-1"
                 dndSensors={dndSensors}
                 emptyState={<SidebarPinnedEmptyState />}
@@ -1645,6 +1669,7 @@ export function ChatSidebar({
                 // the overview previews all render the same card.
                 card={cardRows}
                 collapsible={!inProject}
+                connection={sessionConnectionOrigin}
                 contentClassName={cn(
                   'flex min-h-0 flex-1 flex-col gap-px pb-1.75',
                   // The section is the ONE authority on whether the virtual
@@ -1782,7 +1807,9 @@ export function ChatSidebar({
                 }
                 label={sessionsLabel}
                 labelMeta={
-                  worktreeGroupingActive ? (
+                  inProject && enteredProjectOriginTag ? (
+                    enteredProjectOriginTag
+                  ) : worktreeGroupingActive ? (
                     reposScanning && !projectsSkeletonVisible ? (
                       <GlyphSpinner ariaLabel={s.loading} className="text-[0.6875rem] text-(--ui-text-quaternary)" />
                     ) : undefined

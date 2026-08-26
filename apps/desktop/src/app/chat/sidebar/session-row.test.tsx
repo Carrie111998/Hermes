@@ -3,12 +3,15 @@ import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { DesktopRegistryConnection } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
+import { $connectionsRegistry } from '@/store/connections'
 import type * as SessionStore from '@/store/session'
+import { $connection } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
 import type * as WindowsStore from '@/store/windows'
@@ -38,6 +41,14 @@ vi.mock('@/i18n', () => ({
           sessionRunning: 'Running',
           todoProgress: 'Tasks completed',
           waitingForAnswer: 'Waiting for answer'
+        }
+      },
+      settings: {
+        connections: {
+          kindCloud: 'Hermes Cloud',
+          kindLocal: 'Local',
+          kindRemote: 'Remote gateway',
+          kindSsh: 'SSH'
         }
       },
       assistant: {
@@ -156,10 +167,11 @@ const handoffAvatar = (container: HTMLElement) =>
 
 const noop = vi.fn()
 
-const renderRow = (session: SessionInfo, extra?: { card?: boolean }) =>
+const renderRow = (session: SessionInfo, extra?: { card?: boolean; connection?: DesktopRegistryConnection }) =>
   render(
     <SidebarSessionRow
       card={extra?.card}
+      connection={extra?.connection}
       isPinned={false}
       isSelected={false}
       onArchive={noop}
@@ -422,5 +434,68 @@ describe('Inbox-style session card', () => {
 
     expect(workspace.className).toMatch(/\btruncate\b/)
     expect(screen.getByText('133 messages')).toBeTruthy()
+  })
+})
+
+describe('session origin tag', () => {
+  afterEach(() => {
+    $connectionsRegistry.set(null)
+    $connection.set(null)
+  })
+
+  it('labels a row that belongs to a foreign gateway', () => {
+    $connection.set({ connectionId: 'local', mode: 'local' } as never)
+    $connectionsRegistry.set({
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'mimir', kind: 'ssh', label: 'mimir', tokenPreview: null, tokenSet: false }
+      ],
+      lastUsed: 'local',
+      launchMode: 'primary',
+      primary: 'local',
+      secureTokenStorage: true,
+      version: 2
+    })
+
+    renderRow(makeSession({ connection_id: 'mimir', title: 'SSH session' }))
+
+    expect(screen.getByRole('img', { name: /mimir/ }).getAttribute('data-connection-kind')).toBe('ssh')
+  })
+
+  it('leaves a local session unlabeled', () => {
+    $connection.set({ connectionId: 'local', mode: 'local' } as never)
+    $connectionsRegistry.set({
+      connections: [{ id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false }],
+      lastUsed: 'local',
+      launchMode: 'primary',
+      primary: 'local',
+      secureTokenStorage: true,
+      version: 2
+    })
+
+    renderRow(makeSession({ title: 'Local session' }))
+
+    expect(screen.queryByRole('img', { name: /This device/ })).toBeNull()
+  })
+
+  it('skips the chip when the section header already names the gateway', () => {
+    $connection.set({ connectionId: 'local', mode: 'local' } as never)
+    $connectionsRegistry.set({
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'mimir', kind: 'ssh', label: 'mimir', tokenPreview: null, tokenSet: false }
+      ],
+      lastUsed: 'local',
+      launchMode: 'primary',
+      primary: 'local',
+      secureTokenStorage: true,
+      version: 2
+    })
+
+    renderRow(makeSession({ connection_id: 'mimir', title: 'SSH session' }), {
+      connection: { id: 'mimir', kind: 'ssh', label: 'mimir' } as DesktopRegistryConnection
+    })
+
+    expect(screen.queryByRole('img', { name: /mimir/ })).toBeNull()
   })
 })

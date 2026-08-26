@@ -60,6 +60,7 @@ export function EnteredProjectContent({
     <>
       {project.repos.map(repo => (
         <RepoFlatSection
+          connectionId={project.connectionId}
           discoveredWorktrees={repo.path ? repoWorktrees?.[repo.path] : undefined}
           key={repo.id}
           liveSessions={liveSessions}
@@ -81,7 +82,8 @@ function RepoFlatSection({
   onNewSession,
   discoveredWorktrees,
   liveSessions,
-  removedSessionIds
+  removedSessionIds,
+  connectionId
 }: {
   repo: SidebarWorkspaceTree
   showHeader: boolean
@@ -90,6 +92,7 @@ function RepoFlatSection({
   discoveredWorktrees?: HermesGitWorktree[]
   liveSessions?: SessionInfo[]
   removedSessionIds?: ReadonlySet<string>
+  connectionId?: string
 }) {
   const { t } = useI18n()
   const s = t.sidebar
@@ -161,6 +164,7 @@ function RepoFlatSection({
     <>
       {ordered.map(group => (
         <SidebarWorkspaceGroup
+          connectionId={connectionId}
           group={group}
           key={group.id}
           // The kanban bucket is read-only: it aggregates many task worktrees, so
@@ -240,8 +244,6 @@ function RepoFlatSection({
             <WorkspaceAddButton
               label={s.newSessionIn(repo.label)}
               onClick={() => {
-                // Reveal the repo the new session targets if the user had it
-                // collapsed — the session lands in one of its lanes.
                 setWorkspaceNodeOpen(repo.id, true)
                 onNewSession(repo.path)
               }}

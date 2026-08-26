@@ -12,8 +12,9 @@ import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesk
 import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRestEndpoint, isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isUnderPath } from '@/lib/path-compare'
-import { persistentAtom } from '@/lib/persisted'
-import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
+import { Codecs, persistentAtom } from '@/lib/persisted'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
+import { $gateway, activeGateway, ensureActiveGatewayOpen, openGatewayForAgent, requestGatewayForAgent } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import {
@@ -46,6 +47,109 @@ export const $activeProjectId = atom<null | string>(null)
 // source of project membership — the desktop no longer derives it.
 export const $projectTree = atom<SidebarProjectTree[]>([])
 export const $projectTreeLoading = atom(false)
+
+// Desktop overlay: projects.db has no connection column. Survives refresh so a
+// foreign project's + still knows which gateway to dial before foreign trees
+// finish merging.
+const PROJECT_CONNECTION_KEY = 'hermes.desktop.projectConnectionById'
+
+export const $projectConnectionById = persistentAtom<Record<string, string>>(
+  PROJECT_CONNECTION_KEY,
+  {},
+  Codecs.stringRecord
+)
+
+export function setProjectConnection(projectId: string, connectionId: string): void {
+  const id = projectId.trim()
+  const scope = connectionId.trim() || 'local'
+
+  if (!id) {
+    return
+  }
+
+  const current = $projectConnectionById.get()
+
+  if (current[id] === scope) {
+    return
+  }
+
+  $projectConnectionById.set({ ...current, [id]: scope })
+}
+
+/** Registry connection that owns a project, or null when unknown / chrome-local. */
+export function connectionIdForProjectId(projectId: string): null | string {
+  const id = projectId.trim()
+
+  if (!id) {
+    return null
+  }
+
+  const fromTree = $projectTree.get().find(node => node.id === id)?.connectionId?.trim()
+
+  if (fromTree) {
+    return fromTree
+  }
+
+  return $projectConnectionById.get()[id]?.trim() || null
+}
+
+/** Resolve gateway for a workspace path, or the entered project when path is null. */
+export function connectionIdForProjectPath(path: null | string): null | string {
+  const cwd = (path || '').trim()
+
+  if (cwd) {
+    const projectId = projectIdForCwd(cwd)
+
+    return projectId ? connectionIdForProjectId(projectId) : null
+  }
+
+  const scope = $projectScope.get()
+
+  if (scope && scope !== ALL_PROJECTS) {
+    return connectionIdForProjectId(scope)
+  }
+
+  return null
+}
+
+function chromeConnectionId(): string {
+  return $activeConnectionId.get()?.trim() || 'local'
+}
+
+function isChromeConnection(connectionId: string): boolean {
+  const scope = connectionId.trim() || 'local'
+  const active = chromeConnectionId()
+
+  return scope === active || (scope === 'local' && active === 'local')
+}
+
+function profileForConnectionId(connectionId: string): string {
+  if (isChromeConnection(connectionId)) {
+    return projectProfile() || 'default'
+  }
+
+  const conn = $connectionsRegistry.get()?.connections.find(entry => entry.id === connectionId)
+
+  return normalizeProfileKey(conn?.remoteProfile ?? 'default')
+}
+
+/** Stamp chrome-active tree nodes; Home stays unmarked. Persist explicit ids. */
+function stampChromeProjects(projects: SidebarProjectTree[]): SidebarProjectTree[] {
+  const activeId = chromeConnectionId()
+  const stamp = activeId === 'local' ? undefined : activeId
+
+  return projects.map(project => {
+    if (project.isNoProject) {
+      return { ...project, connectionId: undefined }
+    }
+
+    if (project.id.startsWith('p_')) {
+      setProjectConnection(project.id, activeId)
+    }
+
+    return { ...project, connectionId: stamp }
+  })
+}
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -347,6 +451,25 @@ async function gatewayRequest<T>(method: string, params: Record<string, unknown>
   return gateway.request<T>(method, params)
 }
 
+/** Route a projects.* RPC to the project's gateway without re-homing chrome. */
+async function projectRequest<T>(
+  connectionId: null | string | undefined,
+  method: string,
+  params: Record<string, unknown>
+): Promise<T> {
+  const scope = (connectionId || '').trim() || chromeConnectionId()
+
+  if (isChromeConnection(scope)) {
+    return gatewayRequest<T>(method, params)
+  }
+
+  const profile = profileForConnectionId(scope)
+
+  await openGatewayForAgent(scope, profile)
+
+  return requestGatewayForAgent<T>(scope, profile, method, params)
+}
+
 function projectProfile(): null | string {
   const profile = normalizeProfileKey($activeGatewayProfile.get())
 
@@ -453,7 +576,8 @@ let projectTreeRefreshGeneration = 0
 
 function applyProjectTreePayload(res: ProjectTreePayload): void {
   const scoped = new Set(res.scoped_session_ids ?? [])
-  $projectTree.set(res.projects ?? [])
+  const stamped = stampChromeProjects(res.projects ?? [])
+  $projectTree.set(stamped)
   $activeProjectId.set(res.active_id ?? null)
   const tombstones = $removedSessionIds.get()
 
@@ -468,6 +592,65 @@ function applyProjectTreePayload(res: ProjectTreePayload): void {
       $removedSessionIds.set(pending)
     }
   }
+
+  void mergeForeignProjectTrees(projectTreeRefreshGeneration)
+}
+
+/** Pull projects.tree from every registered non-chrome gateway and merge in. */
+async function mergeForeignProjectTrees(generation: number): Promise<void> {
+  const activeId = chromeConnectionId()
+  const registry = $connectionsRegistry.get()
+
+  if (!registry?.connections.length) {
+    return
+  }
+
+  const foreign = registry.connections.filter(conn => conn.id !== activeId && conn.kind !== 'local')
+
+  if (!foreign.length) {
+    return
+  }
+
+  const extras: SidebarProjectTree[] = []
+
+  for (const conn of foreign) {
+    try {
+      const profile = profileForConnectionId(conn.id)
+      const res = await requestGatewayForAgent<ProjectTreePayload>(conn.id, profile, 'projects.tree', {
+        preview_limit: PROJECT_TREE_PREVIEW_LIMIT,
+        profile
+      })
+
+      if (generation !== projectTreeRefreshGeneration || chromeConnectionId() !== activeId) {
+        return
+      }
+
+      for (const project of res.projects ?? []) {
+        if (project.isNoProject) {
+          continue
+        }
+
+        setProjectConnection(project.id, conn.id)
+        extras.push({ ...project, connectionId: conn.id })
+      }
+    } catch {
+      // Non-fatal: that gateway's projects stay absent until the next refresh.
+    }
+  }
+
+  if (!extras.length || generation !== projectTreeRefreshGeneration || chromeConnectionId() !== activeId) {
+    return
+  }
+
+  const chromeOnly = $projectTree.get().filter(project => {
+    const scope = project.connectionId?.trim()
+
+    return !scope || scope === activeId || scope === 'local'
+  })
+  const seen = new Set(chromeOnly.map(project => `${project.connectionId ?? activeId}:${project.id}`))
+  const toAdd = extras.filter(project => !seen.has(`${project.connectionId}:${project.id}`))
+
+  $projectTree.set([...chromeOnly, ...toAdd])
 }
 
 async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<void> {
@@ -557,21 +740,47 @@ let projectSessionsRefreshGeneration = 0
 
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
   const generation = ++projectSessionsRefreshGeneration
+  const connectionId = connectionIdForProjectId(projectId) || chromeConnectionId()
 
   try {
-    const context = await activeProjectsContext()
+    let project: SidebarProjectTree | null = null
 
-    const res = await gatewayRequestOn<{ project: SidebarProjectTree | null }>(
-      context.gateway,
-      'projects.project_sessions',
-      projectParams({ project_id: projectId }, context.profile)
-    )
+    if (isChromeConnection(connectionId)) {
+      const context = await activeProjectsContext()
+      const res = await gatewayRequestOn<{ project: SidebarProjectTree | null }>(
+        context.gateway,
+        'projects.project_sessions',
+        projectParams({ project_id: projectId }, context.profile)
+      )
 
-    if (generation !== projectSessionsRefreshGeneration || !stillOnProjectsContext(context)) {
+      if (generation !== projectSessionsRefreshGeneration || !stillOnProjectsContext(context)) {
+        return null
+      }
+
+      project = res.project ?? null
+    } else {
+      const profile = profileForConnectionId(connectionId)
+      const res = await projectRequest<{ project: SidebarProjectTree | null }>(
+        connectionId,
+        'projects.project_sessions',
+        projectParams({ project_id: projectId }, profile)
+      )
+
+      if (generation !== projectSessionsRefreshGeneration) {
+        return null
+      }
+
+      project = res.project ?? null
+    }
+
+    if (!project) {
       return null
     }
 
-    return res.project ?? null
+    return {
+      ...project,
+      connectionId: connectionId === 'local' ? undefined : connectionId
+    }
   } catch {
     return null
   }
@@ -801,6 +1010,8 @@ export interface CreateProjectInput {
   use?: boolean
   // Free-text project idea; written to IDEA.md at the primary folder on create.
   idea?: string
+  /** Registry connection that owns the new project (folder host). */
+  connectionId?: string
 }
 
 // Generate a project idea via the stateless llm.oneshot RPC (inherits the live
@@ -825,7 +1036,11 @@ export async function generateProjectIdea(name: string): Promise<string> {
 // Write IDEA.md to a project's primary folder (best-effort). Routes through the
 // remote-aware fs write, so it lands on the backend for a remote gateway and on
 // disk locally — the project is created regardless of whether the file lands.
-async function writeProjectIdea(folder: null | string | undefined, idea: string): Promise<void> {
+async function writeProjectIdea(
+  folder: null | string | undefined,
+  idea: string,
+  connectionId?: null | string
+): Promise<void> {
   const dir = (folder || '').trim()
   const body = idea.trim()
 
@@ -834,7 +1049,11 @@ async function writeProjectIdea(folder: null | string | undefined, idea: string)
   }
 
   try {
-    await writeDesktopFileText(`${dir.replace(/[/\\]+$/, '')}/IDEA.md`, body.endsWith('\n') ? body : `${body}\n`)
+    await writeDesktopFileText(
+      `${dir.replace(/[/\\]+$/, '')}/IDEA.md`,
+      body.endsWith('\n') ? body : `${body}\n`,
+      connectionId
+    )
   } catch {
     // Best-effort: the project is created regardless of whether IDEA.md lands.
   }
@@ -881,7 +1100,10 @@ const reconcileProjects = (): void => {
 // Map a ProjectInfo (list shape) onto a minimal overview tree node so a created
 // project paints instantly. The backend seeds each folder as an (empty) repo, so
 // the next tree refresh fills in repos/counts; this is just the optimistic stub.
-function projectInfoToTreeNode(project: ProjectInfo): SidebarProjectTree {
+function projectInfoToTreeNode(project: ProjectInfo, connectionId?: string): SidebarProjectTree {
+  const scope = connectionId?.trim()
+  const stamp = !scope || scope === 'local' ? undefined : scope
+
   return {
     id: project.id,
     label: project.name || project.id,
@@ -889,6 +1111,7 @@ function projectInfoToTreeNode(project: ProjectInfo): SidebarProjectTree {
     color: project.color ?? null,
     icon: project.icon ?? null,
     isAuto: false,
+    connectionId: stamp,
     repos: [],
     sessionCount: 0,
     previewSessions: []
@@ -900,23 +1123,27 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     throw projectsStaleBackendError()
   }
 
+  const connectionId = (input.connectionId || '').trim() || chromeConnectionId()
+  const profile = profileForConnectionId(connectionId)
+  const createParams = projectParams(
+    {
+      name: input.name,
+      folders: input.folders ?? [],
+      primary_path: input.primaryPath,
+      slug: input.slug,
+      description: input.description,
+      icon: input.icon,
+      color: input.color,
+      board_slug: input.boardSlug,
+      use: input.use ?? false
+    },
+    profile
+  )
+
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>(
-      'projects.create',
-      projectParams({
-        name: input.name,
-        folders: input.folders ?? [],
-        primary_path: input.primaryPath,
-        slug: input.slug,
-        description: input.description,
-        icon: input.icon,
-        color: input.color,
-        board_slug: input.boardSlug,
-        use: input.use ?? false
-      })
-    )
+    res = await projectRequest<{ project: ProjectInfo | null }>(connectionId, 'projects.create', createParams)
   } catch (err) {
     if (isMissingRpcMethod(err)) {
       $projectsRpcAvailable.set(false)
@@ -935,19 +1162,25 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
   const created = res.project
 
   if (created) {
+    setProjectConnection(created.id, connectionId)
+
     if (input.idea) {
-      void writeProjectIdea(created.primary_path ?? created.folders?.[0]?.path ?? input.primaryPath, input.idea)
+      void writeProjectIdea(
+        created.primary_path ?? created.folders?.[0]?.path ?? input.primaryPath,
+        input.idea,
+        connectionId
+      )
     }
 
-    if (!$projects.get().some(proj => proj.id === created.id)) {
+    if (isChromeConnection(connectionId) && !$projects.get().some(proj => proj.id === created.id)) {
       $projects.set([...$projects.get(), created])
     }
 
-    if (!$projectTree.get().some(node => node.id === created.id)) {
-      $projectTree.set([projectInfoToTreeNode(created), ...$projectTree.get()])
+    if (!$projectTree.get().some(node => node.id === created.id && (node.connectionId || 'local') === (connectionId === 'local' ? 'local' : connectionId))) {
+      $projectTree.set([projectInfoToTreeNode(created, connectionId), ...$projectTree.get()])
     }
 
-    if (input.use) {
+    if (input.use && isChromeConnection(connectionId)) {
       $activeProjectId.set(created.id)
     }
 
@@ -988,17 +1221,23 @@ export async function updateProject(
 
   // Backend treats null/undefined as "leave unchanged"; "" clears (stores NULL).
   // Map explicit null → "" so "no color"/"no icon" actually clear.
-  await persistOrRollback(snap, () =>
-    gatewayRequest(
+  await persistOrRollback(snap, () => {
+    const connectionId = connectionIdForProjectId(id) || chromeConnectionId()
+
+    return projectRequest(
+      connectionId,
       'projects.update',
-      projectParams({
-        id,
-        ...patch,
-        ...(patch.color === null && { color: '' }),
-        ...(patch.icon === null && { icon: '' })
-      })
+      projectParams(
+        {
+          id,
+          ...patch,
+          ...(patch.color === null && { color: '' }),
+          ...(patch.icon === null && { icon: '' })
+        },
+        profileForConnectionId(connectionId)
+      )
     )
-  )
+  })
 }
 
 // Appearance for an AUTO (inherited git-repo) project has no projects.db row to
@@ -1025,6 +1264,7 @@ export async function setProjectAppearance(
     name: project.label,
     folders: [project.path],
     primaryPath: project.path,
+    connectionId: connectionIdForProjectId(project.id) || undefined,
     // Carry any already-set look so setting one field doesn't wipe the other.
     color: (patch.color ?? project.color) || undefined,
     icon: (patch.icon ?? project.icon) || undefined
@@ -1067,12 +1307,18 @@ export async function addProjectFolder(
     }
   }
 
-  await persistOrRollback(snap, () =>
-    gatewayRequest(
+  await persistOrRollback(snap, () => {
+    const connectionId = connectionIdForProjectId(id) || chromeConnectionId()
+
+    return projectRequest(
+      connectionId,
       'projects.add_folder',
-      projectParams({ id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
+      projectParams(
+        { id, path, label: opts.label, is_primary: opts.isPrimary ?? false },
+        profileForConnectionId(connectionId)
+      )
     )
-  )
+  })
   reconcileProjects()
 }
 
@@ -1114,13 +1360,26 @@ export async function deleteProject(id: string): Promise<void> {
   }
 
   await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', projectParams({ id })))
+    const connectionId = connectionIdForProjectId(id) || chromeConnectionId()
+
+    applyPayload(
+      await projectRequest<ProjectsPayload>(
+        connectionId,
+        'projects.delete',
+        projectParams({ id }, profileForConnectionId(connectionId))
+      )
+    )
   })
   void refreshProjectTree()
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
-  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', projectParams({ id }))
+  const connectionId = (id ? connectionIdForProjectId(id) : null) || chromeConnectionId()
+  const res = await projectRequest<{ active_id: null | string }>(
+    connectionId,
+    'projects.set_active',
+    projectParams({ id }, profileForConnectionId(connectionId))
+  )
   $activeProjectId.set(res.active_id ?? null)
 }
 
@@ -1341,10 +1600,18 @@ export async function copyPath(path: null | string): Promise<void> {
 
 // Pick a project folder via the remote-aware picker: a remote gateway browses
 // the backend filesystem (seeded at its default cwd) where sessions run; local
-// mode opens the native dialog. Returns the absolute path, or null if cancelled.
-export async function pickProjectFolder(): Promise<null | string> {
+// mode opens the native dialog. Pass `connectionId` to pin the host without
+// re-homing window chrome. Returns the absolute path, or null if cancelled.
+export async function pickProjectFolder(connectionId?: null | string): Promise<null | string> {
+  const scope = (connectionId || '').trim() || undefined
+
+  if (scope && scope !== 'local') {
+    await openGatewayForAgent(scope, profileForConnectionId(scope))
+  }
+
   const [dir] = await selectDesktopPaths({
-    defaultPath: (await desktopDefaultCwd())?.cwd,
+    connectionId: scope,
+    defaultPath: (await desktopDefaultCwd(scope))?.cwd,
     directories: true,
     multiple: false
   })

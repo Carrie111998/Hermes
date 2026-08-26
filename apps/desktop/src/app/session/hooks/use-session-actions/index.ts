@@ -22,6 +22,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+import { $activeConnectionId } from '@/store/connections'
 import { openGatewayForAgent, openGatewayForProfile, requestGatewayForAgent } from '@/store/gateway'
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -59,6 +60,7 @@ import {
   $yoloActive,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
+  setSessionOwnerHint,
   resolveComposerSessionKey,
   sessionPinId,
   setActiveSessionId,
@@ -229,7 +231,10 @@ async function desktopSessionCreateParams(
   const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
 
   if (capturedRoute) {
-    await ensureGatewayAgent(capturedRoute.connectionId, profile)
+    // Warm the owning socket. ensureGatewayAgent would re-home chrome onto that
+    // connection (ConnectionSwitcher + profile rail), which is a window switch,
+    // not a per-session route.
+    await openGatewayForAgent(capturedRoute.connectionId, profile)
   } else {
     await ensureGatewayProfile(profile)
   }
@@ -394,6 +399,7 @@ export function useSessionActions({
       // rebind race, so leaving the old id here could revive it on a very fast
       // New Chat -> Enter sequence.
       onFreshDraftRouteIntent?.()
+      $newChatRoute.set(null)
 
       if (!preserveRoute) {
         navigate(NEW_CHAT_ROUTE, { replace: replaceRoute })
@@ -513,11 +519,15 @@ export function useSessionActions({
 
         if (stored) {
           createdThisRun.add(stored)
+          if (capturedRoute) {
+            setSessionOwnerHint(stored, capturedRoute)
+            setSessionOwnerHint(created.session_id, capturedRoute)
+          }
           // Seed the sidebar preview with the user's first message so the row
           // reads meaningfully while the turn is in flight, instead of flashing
           // "Untitled session" until the turn persists and auto-title runs. The
           // server later returns its own preview/title and supersedes this.
-          upsertOptimisticSession(created, stored, null, preview?.trim() || null)
+          upsertOptimisticSession(created, stored, null, preview?.trim() || null, null, undefined, capturedRoute)
           navigate(sessionRoute(stored), { replace: true })
           // Other windows (e.g. the main window when this is the pop-out) can't
           // see this session until they re-pull the shared list.
@@ -608,7 +618,10 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const capturedRoute = options?.route === undefined ? $newChatRoute.get() : options.route
-        const workspaceScope = options?.workspaceScope ?? { workspaceMode: 'sessions' }
+        const workspaceScope = options?.workspaceScope ?? {
+          workspaceMode: 'sessions' as const,
+          ...(capturedRoute ? { ownerRoute: capturedRoute } : {})
+        }
 
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
@@ -648,8 +661,13 @@ export function useSessionActions({
         // redundant resume. Only add the row to the SIDEBAR when `listed` — an
         // unlisted (draft) tab stays out of the session list until its first
         // turn persists and a refresh surfaces it.
+        if (capturedRoute) {
+          setSessionOwnerHint(stored, capturedRoute)
+          setSessionOwnerHint(created.session_id, capturedRoute)
+        }
+
         if (listed) {
-          upsertOptimisticSession(created, stored, null, null)
+          upsertOptimisticSession(created, stored, null, null, null, undefined, capturedRoute)
         }
 
         // A tile lives in its OWN worktree, so it must not run the full
@@ -807,20 +825,24 @@ export function useSessionActions({
             }
           : sessionProfile)
 
-      // All-profiles / plugin navigation must not steal chrome API-home:
-      // dial the owning backend without moving $activeGatewayProfile.
-      if ($showAllProfiles.get()) {
-        if (ownerRoute?.connectionId || storedForProfile?.connection_id) {
+      // All-profiles navigation, and a session owned by a different registered
+      // gateway, must not steal chrome: dial that backend without moving
+      // $activeGatewayProfile / $connection (Cursor-style per-session routing).
+      const ownerConnectionId = ownerRoute?.connectionId || storedForProfile?.connection_id || null
+      const foreignConnection = Boolean(ownerConnectionId) && ownerConnectionId !== $activeConnectionId.get()
+
+      if ($showAllProfiles.get() || foreignConnection) {
+        if (ownerConnectionId) {
           await openGatewayForAgent(
-            ownerRoute?.connectionId || storedForProfile?.connection_id || null,
+            ownerConnectionId,
             ownerRoute?.profile || sessionProfile || 'default'
           )
         } else if (sessionProfile) {
           await openGatewayForProfile(normalizeProfileKey(sessionProfile))
         }
-      } else if (ownerRoute?.connectionId || storedForProfile?.connection_id) {
+      } else if (ownerConnectionId) {
         await ensureGatewayAgent(
-          ownerRoute?.connectionId || storedForProfile?.connection_id || null,
+          ownerConnectionId,
           ownerRoute?.profile || sessionProfile || 'default'
         )
       } else {

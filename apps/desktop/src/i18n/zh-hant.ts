@@ -1810,6 +1810,7 @@ export const zhHant = defineLocale({
       renameTitle: '重新命名專案',
       addFolderTitle: '新增資料夾',
       namePlaceholder: '例如 Skunkworks',
+      gatewayLabel: '閘道',
       foldersLabel: '資料夾',
       ideaLabel: '想法',
       ideaPlaceholder: '這個專案是關於什麼的？（儲存到 IDEA.md）',

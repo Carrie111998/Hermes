@@ -18,26 +18,36 @@ import {
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
-import { requestGatewayForAgent } from '@/store/gateway'
-import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
+import { openGatewayForAgent, requestGatewayForAgent } from '@/store/gateway'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $newChatRoute,
+  ensureGatewayAgent,
+  ensureGatewayProfile
+} from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
+  $connection,
   $currentCwd,
   $currentFastMode,
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
+  $foreignGatewaySessions,
   $messages,
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
   $turnStartedAt,
+  getSessionOwnerHint,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
   setBusy,
+  setConnection,
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModel,
@@ -80,6 +90,7 @@ vi.mock('@/store/profile', async importOriginal => ({
 
 vi.mock('@/store/gateway', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
+  openGatewayForAgent: vi.fn().mockResolvedValue(undefined),
   requestGatewayForAgent: vi.fn()
 }))
 
@@ -529,6 +540,18 @@ describe('startFreshSessionDraft', () => {
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
     expect($terminalTakeover.get()).toBe(true)
   })
+
+  it('clears a previous per-session source pin so ⌘N stays on the window chrome', async () => {
+    $newChatRoute.set({ connectionId: 'homelab', mode: 'remote', profile: 'default' })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={async () => ({}) as never} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    act(() => handle!.startFreshSessionDraft())
+
+    expect($newChatRoute.get()).toBeNull()
+  })
 })
 
 describe('createBackendSessionForSend profile routing', () => {
@@ -537,6 +560,8 @@ describe('createBackendSessionForSend profile routing', () => {
     $newChatProfile.set(null)
     $newChatRoute.set(null)
     $activeGatewayProfile.set('default')
+    $foreignGatewaySessions.set({})
+    setConnection(null)
     $projectScope.set(ALL_PROJECTS)
     $projectTree.set([])
     $currentCwd.set('')
@@ -625,6 +650,41 @@ describe('createBackendSessionForSend profile routing', () => {
       'session.create',
       expect.objectContaining({ profile: 'backend-default', source: 'desktop' })
     )
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
+  })
+
+  it('does not re-home window chrome when creating a session pinned to another gateway', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'default'
+    }
+
+    setConnection({ connectionId: 'local', mode: 'local', profile: 'research' } as never)
+    $activeGatewayProfile.set('research')
+    $newChatRoute.set({ ...route })
+
+    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
+      session_id: RUNTIME_SESSION_ID,
+      stored_session_id: 'stored-foreign-1'
+    } as never)
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend()
+    })
+
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    expect(openGatewayForAgent).toHaveBeenCalledWith('source-a', 'default')
+    expect($connection.get()?.connectionId).toBe('local')
+    expect($activeGatewayProfile.get()).toBe('research')
+    expect(getSessionOwnerHint('stored-foreign-1')).toEqual(route)
+    expect(getSessionOwnerHint(RUNTIME_SESSION_ID)).toEqual(route)
+    expect($foreignGatewaySessions.get()['source-a']?.[0]?.id).toBe('stored-foreign-1')
     expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
   })
 

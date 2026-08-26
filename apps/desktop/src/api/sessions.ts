@@ -275,6 +275,40 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
   }
 }
 
+// Fetch a FOREIGN gateway's recent sessions for aggregation into the active
+// profile's sidebar. Where listSidebarSessions rides the active backend, this
+// pins { connectionId, profile } so Electron routes the REST call to that
+// specific registered connection and lists ITS state.db — the same sessionScoped
+// routing getSession/getSessionMessages already use. Additive by design: the
+// active profile's own recents are untouched; the returned rows render in a
+// dedicated "other gateways" section, each badged with its origin.
+export async function listGatewayRecentSessions(
+  connectionId: string,
+  profile: string,
+  limit = 20,
+  filter: SessionSourceFilter = {}
+): Promise<PaginatedSessions> {
+  const sourceParam = filter.source ? `&source=${encodeURIComponent(filter.source)}` : ''
+
+  const excludeParam = filter.excludeSources?.length
+    ? `&exclude_sources=${encodeURIComponent(filter.excludeSources.join(','))}`
+    : ''
+
+  const result = await hermesApi<PaginatedSessions>({
+    ...capabilityScoped({ connectionId, profile }),
+    path:
+      `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=1` +
+      `&archived=exclude&order=recent&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
+    timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
+  })
+
+  return {
+    ...result,
+    sessions: pageWindow(result.sessions, limit),
+    offset: 0
+  }
+}
+
 // Mutations take the owning `profile` so Electron can route them to the correct
 // remote backend or local profile scope. Omit for the current/default profile.
 export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {

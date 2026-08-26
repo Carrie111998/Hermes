@@ -29,7 +29,12 @@ vi.mock('./routes', () => ({
 
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 
-import { mainChatOccupied, openSession, openSessionIntentFromModifiers } from './open-session'
+import {
+  mainChatOccupied,
+  openSession,
+  openSessionIntentFromModifiers,
+  workspaceScopeForConnection
+} from './open-session'
 
 /**
  * The question behind both the sidebar "+" and a palette open: is there a
@@ -142,7 +147,7 @@ describe('openSession', () => {
   it('tab opens a stacked session tile when not on screen', () => {
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'tab')
-    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, { workspaceMode: 'sessions' })
     expect(navigate).not.toHaveBeenCalled()
   })
 
@@ -154,6 +159,19 @@ describe('openSession', () => {
 
     expect(setSessionTileWorkspaceScope).toHaveBeenCalledWith('s1', scope)
     expect(focusOpenSession).toHaveBeenCalledWith('s1', scope)
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, scope)
+  })
+
+  it('tab forwards ownerRoute onto the new tile', () => {
+    const scope = {
+      ownerRoute: { connectionId: 'mimir', mode: 'remote' as const, profile: 'default' },
+      workspaceMode: 'sessions' as const
+    }
+
+    focusOpenSession.mockReturnValue(null)
+
+    openSession('s1', navigate, 'tab', scope)
+
     expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, scope)
   })
 
@@ -169,7 +187,7 @@ describe('openSession', () => {
     $selectedStoredSessionId.set('s0')
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'stack')
-    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, { workspaceMode: 'sessions' })
     expect(navigate).not.toHaveBeenCalled()
   })
 
@@ -196,7 +214,7 @@ describe('openSession', () => {
     $activeSessionId.set('runtime-a')
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'stack')
-    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, { workspaceMode: 'sessions' })
   })
 
   it('stack loads into main when it holds only a blank draft', () => {
@@ -217,12 +235,30 @@ describe('openSession', () => {
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'window')
     expect(openSessionInNewWindow).not.toHaveBeenCalled()
-    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, { workspaceMode: 'sessions' })
   })
 
   it('no-ops on an empty id', () => {
     openSession('', navigate)
     expect(navigate).not.toHaveBeenCalled()
     expect(focusOpenSession).not.toHaveBeenCalled()
+  })
+})
+
+describe('workspaceScopeForConnection', () => {
+  it('keeps local chrome as a sessions tab with no owner', () => {
+    expect(workspaceScopeForConnection({ id: 'local', kind: 'local', label: 'This device' } as never)).toEqual({
+      workspaceMode: 'sessions'
+    })
+    expect(workspaceScopeForConnection(null)).toEqual({ workspaceMode: 'sessions' })
+  })
+
+  it('stamps a foreign gateway as the tile owner', () => {
+    expect(
+      workspaceScopeForConnection({ id: 'mimir', kind: 'ssh', label: 'mimir', remoteProfile: 'work' } as never)
+    ).toEqual({
+      ownerRoute: { connectionId: 'mimir', mode: 'remote', profile: 'work' },
+      workspaceMode: 'sessions'
+    })
   })
 })

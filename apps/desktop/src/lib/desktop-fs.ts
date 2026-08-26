@@ -1,4 +1,4 @@
-import { hermesApi } from '@/api/client'
+import { getApiRequestConnection, hermesApi, setApiRequestConnection } from '@/api/client'
 import type {
   HermesConnection,
   HermesReadDirResult,
@@ -65,18 +65,64 @@ function bridge() {
   return desktop
 }
 
-function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+function remoteFsApi<T>(
+  path: string,
+  body?: Record<string, unknown>,
+  connectionId?: null | string
+): Promise<T> {
+  const scope = pinnedFsConnectionId(connectionId)
+  const profile = desktopFsProfile()
+
   return hermesApi<T>(
-    body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
+    body
+      ? {
+          body,
+          method: 'POST',
+          path,
+          profile,
+          ...(scope && scope !== 'local' ? { connectionId: scope } : {})
+        }
+      : {
+          path,
+          profile,
+          ...(scope && scope !== 'local' ? { connectionId: scope } : {})
+        }
   )
 }
 
-export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {
-  if (!isDesktopFsRemoteMode()) {
+/** Explicit arg, else ambient pin from selectDesktopPaths (project create on a
+ *  foreign host without re-homing chrome). */
+function pinnedFsConnectionId(connectionId?: null | string): null | string {
+  const explicit = connectionId?.trim()
+
+  if (explicit) {
+    return explicit
+  }
+
+  return getApiRequestConnection()?.trim() || null
+}
+
+function isRemoteFs(connectionId?: null | string): boolean {
+  const scope = pinnedFsConnectionId(connectionId)
+
+  // Explicit / ambient local pin: local FS even if chrome sits on a remote.
+  if (scope === 'local') {
+    return false
+  }
+
+  if (scope) {
+    return true
+  }
+
+  return isDesktopFsRemoteMode()
+}
+
+export async function readDesktopDir(path: string, connectionId?: null | string): Promise<HermesReadDirResult> {
+  if (!isRemoteFs(connectionId)) {
     return bridge().readDir(path)
   }
 
-  return remoteFsApi<HermesReadDirResult>(fsPath('list', path))
+  return remoteFsApi<HermesReadDirResult>(fsPath('list', path), undefined, connectionId)
 }
 
 export async function readDesktopFileText(path: string): Promise<HermesReadFileTextResult> {
@@ -91,10 +137,14 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
 // IPC; remote writes hit the dashboard's POST /api/fs/write-text (same path
 // hardening, parent-must-exist, size cap) so the editor behaves identically in
 // both modes. Stale-on-disk detection is the caller's job (re-read before save).
-export async function writeDesktopFileText(path: string, content: string): Promise<{ path: string }> {
+export async function writeDesktopFileText(
+  path: string,
+  content: string,
+  connectionId?: null | string
+): Promise<{ path: string }> {
   const desktop = bridge()
 
-  if (!isDesktopFsRemoteMode()) {
+  if (!isRemoteFs(connectionId)) {
     if (!desktop.writeTextFile) {
       throw new Error('Saving is not available')
     }
@@ -102,7 +152,11 @@ export async function writeDesktopFileText(path: string, content: string): Promi
     return desktop.writeTextFile(path, content)
   }
 
-  const result = await remoteFsApi<{ ok?: boolean; path?: string }>('/api/fs/write-text', { content, path })
+  const result = await remoteFsApi<{ ok?: boolean; path?: string }>(
+    '/api/fs/write-text',
+    { content, path },
+    connectionId
+  )
 
   return { path: result.path || path }
 }
@@ -150,12 +204,14 @@ export async function desktopGitRoot(path: string): Promise<string | null> {
   return (await remoteFsApi<{ root: string | null }>(fsPath('git-root', path))).root
 }
 
-export async function desktopDefaultCwd(): Promise<{ branch: string; cwd: string } | null> {
-  if (!isDesktopFsRemoteMode()) {
+export async function desktopDefaultCwd(
+  connectionId?: null | string
+): Promise<{ branch: string; cwd: string } | null> {
+  if (!isRemoteFs(connectionId)) {
     return null
   }
 
-  return remoteFsApi<{ branch: string; cwd: string }>('/api/fs/default-cwd')
+  return remoteFsApi<{ branch: string; cwd: string }>('/api/fs/default-cwd', undefined, connectionId)
 }
 
 // Reveal a path in the OS file manager (Finder / Explorer / Files). Local only.
@@ -207,12 +263,15 @@ export async function desktopFileDiff(repoRoot: string, filePath: string): Promi
   return git?.fileDiff ? git.fileDiff(repoRoot, filePath) : ''
 }
 
-export async function selectDesktopPaths(options?: HermesSelectPathsOptions): Promise<string[]> {
+export async function selectDesktopPaths(
+  options?: HermesSelectPathsOptions & { connectionId?: null | string }
+): Promise<string[]> {
   const desktop = bridge()
   const profile = desktopFsProfile()
+  const connectionId = options?.connectionId
   const localOptions = profile ? { ...options, profile } : options
 
-  if (!isDesktopFsRemoteMode()) {
+  if (!isRemoteFs(connectionId)) {
     return desktop.selectPaths(localOptions)
   }
 
@@ -220,5 +279,19 @@ export async function selectDesktopPaths(options?: HermesSelectPathsOptions): Pr
     return desktop.selectPaths(localOptions)
   }
 
-  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }) : []
+  // RemoteFolderPicker reads via readDesktopDir (no connectionId arg); pin
+  // ambient connection for the whole browse so list calls hit the chosen host
+  // without re-homing $connection. Cleared when the dialog resolves.
+  const previous = getApiRequestConnection()
+  const scope = connectionId?.trim()
+
+  if (scope && scope !== 'local') {
+    setApiRequestConnection(scope)
+  }
+
+  try {
+    return remotePicker ? await remotePicker.selectPaths({ ...options, multiple: false }) : []
+  } finally {
+    setApiRequestConnection(previous)
+  }
 }

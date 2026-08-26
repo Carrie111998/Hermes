@@ -237,11 +237,25 @@ def test_public_url_aware_gate_requires_auth_for_loopback_proxy(monkeypatch):
     """The shared gate decision includes an external browser-facing URL."""
     from hermes_cli.web_server import should_require_dashboard_auth
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.setenv(
         "HERMES_DASHBOARD_PUBLIC_URL",
         "https://dashboard.example.test:9443",
     )
     assert should_require_dashboard_auth("127.0.0.1") is True
+
+
+def test_desktop_spawned_backend_ignores_public_url_gate(monkeypatch):
+    """SSH/local Desktop children stay in token mode even when .env has a public URL."""
+    from hermes_cli.web_server import should_require_dashboard_auth
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    assert should_require_dashboard_auth("127.0.0.1") is False
+    assert should_require_dashboard_auth("0.0.0.0") is True
 
 
 def test_public_url_aware_gate_preserves_local_only_mode(monkeypatch):
@@ -260,6 +274,7 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
     from hermes_cli.dashboard_auth import clear_providers, register_provider
     from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.setenv(
         "HERMES_DASHBOARD_PUBLIC_URL",
         "https://dashboard.example.test:9443",
@@ -293,6 +308,7 @@ def test_start_server_loopback_public_url_without_provider_fails_closed(monkeypa
     """Trusting an external Host must never expose the loopback token mode."""
     from hermes_cli.dashboard_auth import clear_providers
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.setenv(
         "HERMES_DASHBOARD_PUBLIC_URL",
         "https://dashboard.example.test:9443",
@@ -324,6 +340,7 @@ def test_loopback_public_url_fail_closed_message_is_actionable(monkeypatch):
     """
     from hermes_cli.dashboard_auth import clear_providers
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.setenv(
         "HERMES_DASHBOARD_PUBLIC_URL",
         "https://dashboard.example.test:9443",
@@ -376,6 +393,7 @@ def test_should_require_dashboard_auth_truth_table(
 ):
     from hermes_cli.web_server import should_require_dashboard_auth
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     if public_url is None:
         monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
         monkeypatch.setattr(

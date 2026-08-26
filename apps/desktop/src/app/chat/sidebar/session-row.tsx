@@ -2,15 +2,17 @@ import { useStore } from '@nanostores/react'
 import { memo } from 'react'
 import type * as React from 'react'
 
+import { ConnectionOriginTag, visibleSessionOrigin } from '@/app/chat/connection-origin-tag'
 import { PrTag } from '@/app/chat/pr-tag'
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
-import { openSession } from '@/app/open-session'
+import { openSession, workspaceScopeForConnection } from '@/app/open-session'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { OverflowTip, Tip } from '@/components/ui/tooltip'
+import type { DesktopRegistryConnection } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
@@ -24,10 +26,12 @@ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { $sidebarRowMeta } from '@/store/layout'
 import { normalizeProfileKey } from '@/store/profile'
 import { $projects } from '@/store/projects'
 import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+import { requestSessionResume } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
 import { $sessionListDensity } from '@/store/session-list-density'
 import { $openStoredSessionIds } from '@/store/session-states'
@@ -73,6 +77,10 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
    *  flat cross-profile lists — Pinned and search results in the All-profiles
    *  view — where no group header communicates ownership (#66003). */
   showProfile?: boolean
+  /** Section-level origin (foreign-gateway lists). The group header already
+   *  names that gateway, so rows skip the chip. Mixed lists (search, pins)
+   *  resolve from `session.connection_id` instead. */
+  connection?: DesktopRegistryConnection | null
   /** Inbox-style card: workspace header, title + last-message preview, and a
    *  model · size footer. The flat recents list opts in via the filter menu;
    *  dense tree surfaces (projects, messaging, pins) keep the one-line row. */
@@ -136,6 +144,7 @@ function SidebarSessionRowImpl({
   dragging = false,
   dragHandleProps,
   showProfile = false,
+  connection = null,
   card = false,
   className,
   style,
@@ -163,6 +172,23 @@ function SidebarSessionRowImpl({
   // rather than threaded as props: the subscription re-renders past the memo
   // below, and a toggle should repaint every row at once anyway.
   const rowMeta = useStore($sidebarRowMeta)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
+  const origin = connection ? null : visibleSessionOrigin(session, registry, activeConnectionId)
+
+  const openBeside = (intent: 'tab' | 'window') => {
+    const scope = workspaceScopeForConnection(
+      connection ??
+        (session.connection_id ? (registry?.connections.find(row => row.id === session.connection_id) ?? null) : null)
+    )
+
+    if (scope.ownerRoute) {
+      requestSessionResume(session.id, scope.ownerRoute)
+    }
+
+    openSession(session.id, () => undefined, intent, scope)
+  }
+
   // Pinned metadata occupies the actions slot and swaps out for the kebab on
   // hover, so the row reserves the same width either way and never reflows.
   const pinnedAge = rowMeta.includes('updated')
@@ -199,6 +225,11 @@ function SidebarSessionRowImpl({
   // thing. Chips used to render in the body instead, which left them stranded
   // to the left of the kebab's own column: never flush right, never swapping.
   const trailing: { key: string; node: React.ReactNode }[] = []
+
+  // Foreign-gateway mark leads the chips. Local "This device" stays unlabeled.
+  if (origin) {
+    trailing.push({ key: 'origin', node: <ConnectionOriginTag connection={origin} /> })
+  }
 
   if ((showProfile || pinnedProfile) && hasProfileTag) {
     trailing.push({ key: 'profile', node: <ProfileTag profile={session.profile} /> })
@@ -422,7 +453,7 @@ function SidebarSessionRowImpl({
           // Middle-click = open in a new tab (browser muscle memory).
           {...middleClickHandlers(() => {
             triggerHaptic('selection')
-            openSession(session.id, () => undefined, 'tab')
+            openBeside('tab')
           })}
           onClick={event => {
             // Modifier-click gestures on a row (see `resolveSessionRowClick`):
@@ -452,9 +483,9 @@ function SidebarSessionRowImpl({
             } else if (action === 'pin') {
               onPin()
             } else if (action === 'newTab') {
-              openSession(session.id, () => undefined, 'tab')
+              openBeside('tab')
             } else {
-              openSession(session.id, () => undefined, 'window')
+              openBeside('window')
             }
           }}
         >

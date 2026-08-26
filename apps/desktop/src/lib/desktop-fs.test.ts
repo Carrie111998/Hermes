@@ -183,6 +183,24 @@ describe('desktop filesystem facade', () => {
     }
   })
 
+  it('honors an ambient connection pin for dir list while chrome stays local', async () => {
+    // New-project flow: pick a folder on a foreign gateway without re-homing
+    // $connection. RemoteFolderPicker calls readDesktopDir with no connectionId.
+    $connection.set({ connectionId: 'local', mode: 'local', profile: 'default' } as never)
+    setApiRequestConnection('mimir')
+
+    await expect(readDesktopDir('/home/valvesss')).resolves.toMatchObject({
+      entries: [{ name: 'remote' }]
+    })
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'mimir',
+      path: '/api/fs/list?path=%2Fhome%2Fvalvesss',
+      profile: 'default'
+    })
+    expect(readDir).not.toHaveBeenCalled()
+  })
+
   it('separates filesystem cache keys for registered connections sharing a profile', () => {
     $connection.set({
       baseUrl: 'https://gateway.example',
