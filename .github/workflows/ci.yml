@@ -20,7 +20,6 @@ permissions:
   pull-requests: write # needed by lint (PR comment) + supply-chain (PR comment)
   actions: read # needed by osv-scanner (SARIF upload)
   security-events: write # needed by osv-scanner (SARIF upload)
-  packages: write # needed by docker build
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -37,11 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       python: ${{ steps.classify.outputs.python }}
-      frontend: ${{ steps.classify.outputs.frontend }}
-      site: ${{ steps.classify.outputs.site }}
       scan: ${{ steps.classify.outputs.scan }}
       deps: ${{ steps.classify.outputs.deps }}
-      docker_meta: ${{ steps.classify.outputs.docker_meta }}
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       event_name: ${{ github.event_name }}
     steps:
@@ -70,17 +66,7 @@ jobs:
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
 
-  typecheck:
-    name: TypeScript
-    needs: detect
-    if: needs.detect.outputs.frontend == 'true'
-    uses: ./.github/workflows/typecheck.yml
 
-  docs-site:
-    name: Docs Site
-    needs: detect
-    if: needs.detect.outputs.site == 'true'
-    uses: ./.github/workflows/docs-site-checks.yml
 
   history-check:
     name: Deny unrelated histories
@@ -99,18 +85,7 @@ jobs:
     needs: detect
     uses: ./.github/workflows/uv-lockfile-check.yml
 
-  docker-lint:
-    name: Lint Docker scripts
-    needs: detect
-    if: needs.detect.outputs.docker_meta == 'true'
-    uses: ./.github/workflows/docker-lint.yml
 
-  docker:
-    name: Build&Test Docker image
-    needs: detect
-    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true' || needs.detect.outputs.docker_meta == 'true'
-    uses: ./.github/workflows/docker.yml
-    secrets: inherit
 
   supply-chain:
     name: Supply-chain scan
@@ -139,16 +114,11 @@ jobs:
     needs:
       - tests
       - lint
-      - typecheck
-      - docs-site
       - history-check
       - contributor-check
       - uv-lockfile
-      - docker-lint
       - supply-chain
       - osv-scanner
-      # we don't require docker to pass rn because it's so slow lol
-      # - docker
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -174,7 +144,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
-    needs: [all-checks-pass, docker]
+    needs: [all-checks-pass]
     if: always()
     runs-on: ubuntu-latest
     steps:

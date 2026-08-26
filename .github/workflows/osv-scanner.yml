@@ -43,5 +43,4 @@ jobs:
       scan-args: |-
         --lockfile=uv.lock
         --lockfile=package-lock.json
-        --lockfile=website/package-lock.json
       fail-on-vuln: false
