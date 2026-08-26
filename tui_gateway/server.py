@@ -163,7 +163,10 @@ _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
-_session_resume_lock = threading.Lock()
+# Resume, disconnect teardown, and every client-transport rebind share this
+# lock.  Re-entrant acquisition is required because the live-payload helper is
+# called from the session.resume fast path while it already owns this lock.
+_session_resume_lock = threading.RLock()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -1374,9 +1377,8 @@ def _close_sessions_for_transport(
     transport, *, end_reason: str = "ws_disconnect"
 ) -> tuple[int, int]:
     """On transport disconnect, reap the sessions that opted into
-    close_on_disconnect (sidecar/dashboard) immediately via the unified
-    ``_close_session_by_id`` path, and re-point the rest back to stdio so later
-    emits don't hit a dead socket.
+    close_on_disconnect (sidecar/dashboard) immediately and re-point the rest
+    at the detached transport so later emits don't hit a dead socket.
 
     Non-flagged detached sessions are handed to the grace-windowed WS-orphan
     reaper (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume
@@ -1391,47 +1393,58 @@ def _close_sessions_for_transport(
     reaped = 0
     detached = 0
     for sid, session in owned:
-        if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
-        else:
-            # Point detached sessions at the drop sentinel (NOT real stdio) so
-            # _ws_session_is_orphaned recognizes them and the grace-reap can
-            # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            # UNLESS another window still shows the session: multi-window
-            # pop-outs all register as viewers, so on disconnect re-bind the
-            # session to the most recent surviving viewer instead of
-            # stranding the original window on the sentinel (#83716).
-            viewers = session.get("viewers")
-            if viewers:
-                viewers.pop(transport, None)
-            # Revalidate under the sessions lock before stomping (#77129):
-            # between the owned-sessions snapshot above and this write, a
-            # concurrent session.resume can rebind the session to a NEW live
-            # transport. Stomping it back onto the drop sentinel here would
-            # knock an attached client into detached state and arm an orphan
-            # reap against a session that has a live owner. If the transport
-            # already moved on to a different live transport, this disconnect
-            # has nothing left to tear down — skip the park AND the reap.
+        claimed_for_teardown = None
+        should_schedule_reap = False
+        # session.resume serializes its transport rebind on the resume lock.
+        # Revalidate and claim under that same lock before the disconnecting
+        # transport can act on its stale snapshot. Slow teardown stays outside
+        # both locks because it can flush SQLite, run hooks, and close workers.
+        with _session_resume_lock:
             with _sessions_lock:
-                current = session.get("transport")
-                if (
-                    current is not transport
-                    and current is not None
-                    and not _transport_is_dead(current)
-                ):
+                current = _sessions.get(sid)
+                if current is not session:
                     continue
-                remaining = [
-                    (ts, v)
-                    for v, ts in (viewers or {}).items()
-                    if v is not transport and not _transport_is_dead(v)
-                ]
-                if remaining:
-                    remaining.sort(key=lambda kv: kv[0])
-                    session["transport"] = remaining[-1][1]
+                if current.get("transport") is not transport:
+                    # The session moved to another owner after the snapshot.
+                    # Remove only the departed viewer registration; never
+                    # mutate the new owner's transport or lifecycle state.
+                    viewers = current.get("viewers")
+                    if viewers:
+                        viewers.pop(transport, None)
                     continue
-                session["transport"] = _detached_ws_transport
-                session.pop("_client_gone_interrupt_requested", None)
+                if current.get("close_on_disconnect"):
+                    claimed_for_teardown = _pop_session_by_id(sid)
+                else:
+                    # Point detached sessions at the drop sentinel (NOT real
+                    # stdio) so _ws_session_is_orphaned recognizes them and
+                    # the grace-reap can actually fire; a standalone
+                    # `hermes --tui` keeps real _stdio. UNLESS another window
+                    # still shows the session: multi-window pop-outs all
+                    # register as viewers, so on disconnect re-bind the
+                    # session to the most recent surviving viewer instead of
+                    # stranding the original window on the sentinel (#83716).
+                    viewers = current.get("viewers")
+                    if viewers:
+                        viewers.pop(transport, None)
+                    remaining = [
+                        (ts, viewer_transport)
+                        for viewer_transport, ts in (viewers or {}).items()
+                        if (
+                            viewer_transport is not transport
+                            and not _transport_is_dead(viewer_transport)
+                        )
+                    ]
+                    if remaining:
+                        remaining.sort(key=lambda item: item[0])
+                        current["transport"] = remaining[-1][1]
+                    else:
+                        current["transport"] = _detached_ws_transport
+                        current.pop("_client_gone_interrupt_requested", None)
+                        should_schedule_reap = True
+        if claimed_for_teardown is not None:
+            if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
+                reaped += 1
+        elif should_schedule_reap:
             detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
@@ -1470,6 +1483,40 @@ def _transport_is_dead(transport) -> bool:
     if transport is _detached_ws_transport:
         return True
     return getattr(transport, "_closed", None) is True
+
+
+def _bind_live_session_transport(
+    sid: str, session: dict, transport: Transport | None
+) -> bool:
+    """Bind ``session`` to a live client transport as one ownership claim.
+
+    Disconnect teardown snapshots session ids before it can act on them, so a
+    later transport assignment must use the same resume lock and confirm that
+    the exact session record is still registered.  The liveness check also
+    handles a slow ``session.resume`` whose WebSocket closed while it was
+    building history or an agent: such a worker must not publish a dead
+    transport after the disconnect cleanup has already completed.
+
+    The caller may continue with its normal response path when this returns
+    ``False``.  A closed request cannot receive that response, and leaving the
+    previous transport unchanged is safer than replacing it with a dead one.
+    """
+    if transport is None or _transport_is_dead(transport):
+        return False
+    with _session_resume_lock:
+        with _sessions_lock:
+            if _sessions.get(sid) is not session:
+                return False
+            # The transport can close while this worker waits for the locks.
+            if _transport_is_dead(transport):
+                return False
+            session["transport"] = transport
+            session.setdefault("viewers", {})[transport] = time.time()
+            # Keep timer cancellation in the same critical section as the
+            # rebind.  Otherwise a disconnect could park and schedule a reap
+            # between the bind and a later cancellation.
+            _cancel_ws_orphan_reap(sid)
+    return True
 
 
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
@@ -8957,6 +9004,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    queued_transport = None
     with session["history_lock"]:
         if session.get("_closing"):
             return False
@@ -8969,8 +9017,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        queued_transport = queued.get("transport")
+    if queued_transport is not None:
+        _bind_live_session_transport(sid, session, queued_transport)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -9273,6 +9322,7 @@ def _claim_or_reuse_live(
     """Register ``record`` as the live session for ``session_key`` under the
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
+    park_for_reap = False
     with _session_resume_lock:
         live = _find_live_session_by_key(session_key)
         if live is not None:
@@ -9283,6 +9333,14 @@ def _claim_or_reuse_live(
             # client (storm killer — see _cancel_ws_orphan_reap).
             _cancel_ws_orphan_reap(live[0])
             return live
+        # The resume worker may have spent seconds loading history or building
+        # an agent after its request WebSocket disappeared.  Its copied
+        # ContextVar still points at that now-closed transport, so quarantine
+        # the record on the normal detached sentinel before publishing it.
+        if _transport_is_dead(record.get("transport")):
+            record["transport"] = _detached_ws_transport
+            record.pop("_client_gone_interrupt_requested", None)
+            park_for_reap = True
         with _sessions_lock:
             _sessions[sid] = record
             _register_session_cwd(_sessions[sid])
@@ -9296,6 +9354,14 @@ def _claim_or_reuse_live(
     # Slow finalization work stays OUTSIDE _session_resume_lock (see
     # _pop_session_by_id) — the stale records are already claimed above.
     _finalize_superseded_runtimes(stale)
+    if park_for_reap:
+        try:
+            _schedule_ws_orphan_reap(sid)
+        except Exception:
+            logger.exception(
+                "failed to schedule orphan reap for closed resume transport sid=%s",
+                sid,
+            )
     return None
 
 
@@ -9629,22 +9695,11 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
+    if transport is not None:
+        _bind_live_session_transport(sid, session, transport)
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
-            # Track every transport that has shown this session (multi-window:
-            # pop-out windows each resume the same sid). The last viewer
-            # becomes the transport on the disconnect path so closing a
-            # pop-out re-binds the session to a still-open window instead of
-            # stranding it on the drop sentinel (#83716).
-            viewers = session.setdefault("viewers", {})
-            viewers[transport] = time.time()
-            if transport is not _detached_ws_transport:
-                # A live transport rebind means the client is back — any
-                # pending ws-orphan reap must not fire (storm killer).
-                _cancel_ws_orphan_reap(sid)
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(

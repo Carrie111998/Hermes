@@ -464,10 +464,9 @@ def _(rid, params: dict) -> dict:
                     # unpersisted sibling of the storm-killer paths (#91276).
                     transport = current_transport()
                     if transport is not None:
-                        with live.setdefault("history_lock", threading.Lock()):
-                            live["transport"] = transport
-                            live.setdefault("viewers", {})[transport] = time.time()
-                    _cancel_ws_orphan_reap(live_sid)
+                        _bind_live_session_transport(live_sid, live, transport)
+                    else:
+                        _cancel_ws_orphan_reap(live_sid)
                     history = live.get("history") or []
                     return _ok(
                         rid,

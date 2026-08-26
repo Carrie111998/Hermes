@@ -566,6 +566,29 @@ def test_busy_submit_claims_attached_image_for_queued_turn(monkeypatch):
     }
 
 
+def test_prompt_submit_does_not_bind_closed_request_transport(monkeypatch):
+    class _Transport:
+        def __init__(self, closed):
+            self._closed = closed
+
+    live_transport = _Transport(False)
+    closed_transport = _Transport(True)
+    session = _session(agent=types.SimpleNamespace(), running=True, transport=live_transport)
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    token = server.bind_transport(closed_transport)
+    try:
+        response = server._methods["prompt.submit"](
+            "r1", {"session_id": "sid", "text": "queued after close"}
+        )
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["status"] == "queued"
+    assert session["transport"] is live_transport
+
+
 def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeypatch):
     """A later paste must not replace the image already claimed by B."""
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
@@ -624,12 +647,41 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
         lambda rid, sid, session, text, **kwargs: fired.update(rid=rid, sid=sid, text=text),
     )
     session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
+    server._sessions["sid"] = session
+    try:
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
+        assert session["running"] is True
+        assert session["queued_prompt"] is None
+        assert session["transport"] == "ws-9"
+    finally:
+        server._sessions.pop("sid", None)
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
-    assert session["running"] is True
-    assert session["queued_prompt"] is None
-    assert session["transport"] == "ws-9"
+
+def test_drain_does_not_bind_closed_queued_transport(monkeypatch):
+    class _Transport:
+        def __init__(self, closed):
+            self._closed = closed
+
+    live_transport = _Transport(False)
+    closed_transport = _Transport(True)
+    fired = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda rid, sid, _session, text, **kwargs: fired.append((rid, sid, text)),
+    )
+    session = _session(
+        transport=live_transport,
+        queued_prompt={"text": "go", "transport": closed_transport},
+    )
+    server._sessions["sid"] = session
+    try:
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        assert session["transport"] is live_transport
+        assert fired == [("r1", "sid", "go")]
+    finally:
+        server._sessions.pop("sid", None)
 
 
 def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
