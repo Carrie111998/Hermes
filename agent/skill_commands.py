@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
-# Guards the (map, platform-tag, home-tag) triple so publication and the
-# freshness lookup always see a consistent snapshot. Scanning itself stays
-# outside this lock.
+_skill_commands_archived: frozenset[str] = frozenset()
+# Guards the (map, platform-tag, home-tag, archive-state) snapshot so
+# publication and the freshness lookup always see a consistent view. Scanning
+# itself stays outside this lock.
 _publish_lock = threading.Lock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
@@ -229,6 +230,20 @@ def _resolve_skill_commands_home() -> str:
     return str(get_hermes_home())
 
 
+def _archived_skill_names() -> frozenset[str]:
+    """Return profile-local skill names whose lifecycle state is archived."""
+    try:
+        from tools.skill_usage import STATE_ARCHIVED, load_usage
+
+        return frozenset(
+            name
+            for name, record in load_usage().items()
+            if isinstance(record, dict) and record.get("state") == STATE_ARCHIVED
+        )
+    except Exception:
+        return frozenset()
+
+
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
@@ -428,8 +443,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_home
+    global _skill_commands_archived
     platform = _resolve_skill_commands_platform()
     home = _resolve_skill_commands_home()
+    archived = _archived_skill_names()
     # Build into a local map and publish once, at the end. Writing straight
     # into the global made a scan's partial results visible to everything
     # else in the process: a second, overlapping scan deduped against its own
@@ -478,6 +495,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:
+                        continue
+                    # Archive state belongs to the profile-local copy only.
+                    # A same-named project skill has independent precedence and
+                    # remains available, matching tools.skills_tool discovery.
+                    if scan_dir == SKILLS_DIR and name in archived:
                         continue
                     # Respect user's disabled skills config
                     if name in disabled:
@@ -544,6 +566,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         _skill_commands = commands
         _skill_commands_platform = platform
         _skill_commands_home = home
+        _skill_commands_archived = archived
     return commands
 
 
@@ -558,6 +581,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """
     current_platform = _resolve_skill_commands_platform()
     current_home = _resolve_skill_commands_home()
+    current_archived = _archived_skill_names()
     # Read the map and its tags under the same lock that publishes them, so
     # the freshness decision is made against a consistent snapshot.
     with _publish_lock:
@@ -566,6 +590,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
             bool(commands)
             and _skill_commands_platform == current_platform
             and _skill_commands_home == current_home
+            and _skill_commands_archived == current_archived
         )
     if is_fresh:
         return commands

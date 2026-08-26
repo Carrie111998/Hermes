@@ -10587,6 +10587,37 @@ def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     assert resp["result"]["canon"]["/notes"] == "/notes"
 
 
+def test_commands_catalog_omits_archived_resurrected_skill(tmp_path, monkeypatch):
+    """The TUI/Desktop catalog must not advertise an archived local copy."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import skill_usage
+
+    home = tmp_path / "profile"
+    skills_dir = home / "skills"
+    skill_dir = skills_dir / "lifecycle-x"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: lifecycle-x\ndescription: Lifecycle test.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+
+    token = set_hermes_home_override(home)
+    try:
+        skill_usage.save_usage(
+            {"lifecycle-x": {"state": skill_usage.STATE_ARCHIVED}}
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+
+        resp = server.handle_request(
+            {"id": "1", "method": "commands.catalog", "params": {}}
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert "/lifecycle-x" not in dict(resp["result"]["pairs"])
+    assert "/lifecycle-x" not in resp["result"]["skills"]
+
+
 def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
     """Skill entries carry the usage + origin the `/` menu ranks on.
 

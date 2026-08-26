@@ -82,6 +82,98 @@ class TestScanSkillCommands:
         assert message is not None
         assert "Apply impeccable design craft." in message
 
+    def test_archived_profile_skill_is_not_scanned_as_command(self, tmp_path):
+        """A resurrected local copy must stay absent from slash discovery."""
+        import agent.skill_commands as sc_mod
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools import skill_usage
+
+        home = tmp_path / "profile"
+        skills_dir = home / "skills"
+        _make_skill(skills_dir, "lifecycle-x")
+
+        token = set_hermes_home_override(home)
+        try:
+            skill_usage.save_usage(
+                {"lifecycle-x": {"state": skill_usage.STATE_ARCHIVED}}
+            )
+            with (
+                patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+                patch.object(sc_mod, "_skill_commands", {}),
+                patch.object(sc_mod, "_skill_commands_archived", frozenset()),
+            ):
+                commands = scan_skill_commands()
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "/lifecycle-x" not in commands
+
+    def test_archived_local_record_does_not_hide_project_command(self, tmp_path):
+        """Archive lifecycle applies only to the profile-local skill copy."""
+        import agent.skill_commands as sc_mod
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools import skill_usage
+
+        home = tmp_path / "profile"
+        local_skills = home / "skills"
+        project_skills = tmp_path / "project-skills"
+        _make_skill(local_skills, "shared-name", body="Local copy.")
+        project_skill = _make_skill(project_skills, "shared-name", body="Project copy.")
+
+        token = set_hermes_home_override(home)
+        try:
+            skill_usage.save_usage(
+                {"shared-name": {"state": skill_usage.STATE_ARCHIVED}}
+            )
+            with (
+                patch("tools.skills_tool.SKILLS_DIR", local_skills),
+                patch("agent.skill_utils.get_project_skills_dirs", return_value=[project_skills]),
+                patch.object(sc_mod, "_skill_commands", {}),
+                patch.object(sc_mod, "_skill_commands_archived", frozenset()),
+            ):
+                commands = scan_skill_commands()
+        finally:
+            reset_hermes_home_override(token)
+
+        assert commands["/shared-name"]["skill_dir"] == str(project_skill)
+
+    def test_command_cache_tracks_archive_and_restore_transitions(self, tmp_path):
+        """A primed resolver must follow lifecycle state without manual reload."""
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools import skill_usage
+
+        home = tmp_path / "profile"
+        skills_dir = home / "skills"
+        _make_skill(skills_dir, "lifecycle-x")
+
+        token = set_hermes_home_override(home)
+        try:
+            skill_usage.save_usage(
+                {"lifecycle-x": {"state": skill_usage.STATE_ACTIVE}}
+            )
+            with (
+                patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+                patch.object(sc_mod, "_skill_commands", {}),
+                patch.object(sc_mod, "_skill_commands_platform", None),
+                patch.object(sc_mod, "_skill_commands_home", None),
+                patch.object(sc_mod, "_skill_commands_archived", frozenset()),
+            ):
+                assert "/lifecycle-x" in get_skill_commands()
+
+                skill_usage.save_usage(
+                    {"lifecycle-x": {"state": skill_usage.STATE_ARCHIVED}}
+                )
+                assert "/lifecycle-x" not in get_skill_commands()
+
+                skill_usage.save_usage(
+                    {"lifecycle-x": {"state": skill_usage.STATE_ACTIVE}}
+                )
+                assert "/lifecycle-x" in get_skill_commands()
+        finally:
+            reset_hermes_home_override(token)
+
     def test_get_skill_commands_rescans_when_platform_scope_changes(self, tmp_path):
         """Platform-specific disabled-skill caches must not leak across platforms.
 
