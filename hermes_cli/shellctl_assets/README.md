@@ -39,29 +39,46 @@ Your machine (Mac/Linux/WSL)     existing SSH (any transport)   Hermes host
 hermes install shellctl --ssh-host <the-host-alias-you-ssh-to>
 ```
 
-This prints a token + the exact 4 steps. Summary:
+This prints the exact setup steps. It does not print the raw token inside a
+command. The generated commands copy the `0600` token file over SSH and pass it
+to the daemon with `--token-file`, so the value does not enter shell history or
+the process argument list.
 
-1. **Save the client on your machine:**
+1. **Save the client and token on your machine:**
    ```sh
    ssh <host> 'hermes install shellctl --print-client' > ~/.hermes-shellctl
-   chmod +x ~/.hermes-shellctl
+   (umask 077; ssh <host> 'cat <profile-home>/shellctl/bridge-token' \
+       > ~/.hermes-shellctl-token)
+   chmod 700 ~/.hermes-shellctl
+   chmod 600 ~/.hermes-shellctl-token
    ```
-2. **Add ONE block to `~/.ssh/config` on your machine** (covers plain
-   `ssh` and tmux-wrapping helpers like `sshp`; **no ControlMaster
-   needed**):
+2. **Add one block to `~/.ssh/config` on your machine:**
    ```
    Host <host>
        RemoteForward 127.0.0.1:8765 127.0.0.1:8765
+       ExitOnForwardFailure yes
    ```
-3. **Run the daemon on your machine** (leave it in a tab, or add to
-   Login Items):
+3. **Run the daemon on your machine:**
    ```sh
-   HERMES_SHELLCTL_TOKEN=<token> python3 ~/.hermes-shellctl daemon --port 8765
+   python3 ~/.hermes-shellctl daemon --port 8765 \
+       --token-file ~/.hermes-shellctl-token
    ```
-4. **SSH in normally.** Verify from the host:
-   ```sh
-   <bridge> ping     # → {"ok": true, "caps": {...}}
-   ```
+4. **SSH in normally.** Load the generated `bridge.env`, then run the host
+   bridge's `ping` command. `/ping` requires the same token as every other
+   endpoint.
+
+To restrict reads from the client machine, set the following on the Hermes
+host before running the installer:
+
+```yaml
+shellctl:
+  allowed_root: ~/Documents/hermes-share
+```
+
+The path is interpreted on the SSH client machine. You can override it for one
+installation with `hermes install shellctl --allowed-root <client-path>`. The
+installer adds `--allowed-root` to the generated daemon command. Symlinks that
+resolve outside the root are rejected.
 
 ## Use (in the TUI)
 
@@ -83,13 +100,43 @@ downloads dir with a plain-path hint.
 `hermes-shellctl daemon` reports which capabilities are available at
 startup and via `/ping`.
 
-## Security
+## Security and threat boundary
 
-- The listener binds **127.0.0.1 only** and is reached solely through
-  your SSH reverse-forward — nothing on the network can reach it.
-- Every request is gated by a **shared token**
-  (`HERMES_SHELLCTL_TOKEN`), generated per-install and stored `0600`.
-- 64 MB per-transfer cap.
+The exact bearer credential is the random value in
+`<profile-home>/shellctl/bridge-token` on the Hermes host and
+`~/.hermes-shellctl-token` on the client. It is sent in the
+`X-Shellctl-Token` HTTP header. Every endpoint, including `/ping`, requires it.
+Keep both token files mode `0600` and rotate the token by deleting the host
+copy, rerunning the installer, and recopying it.
+
+Possession of that token plus access to the listener grants the ability to:
+
+* read any file readable by the user running the client daemon through `/pull`,
+  unless `shellctl.allowed_root` or `--allowed-root` restricts it;
+* read clipboard file or image content through `/clipboard`;
+* write files into the configured download directory and request that the OS
+  open them through `/push`.
+
+The listener binds to `127.0.0.1`, but the SSH `RemoteForward` deliberately
+makes it reachable from the Hermes host. A process on a compromised Hermes host
+can read `bridge.env`, obtain the token, and use the forwarded listener with
+all permissions above. The token does not protect the client from a compromised
+Hermes host. The optional allowed root limits file pulls, but it does not remove
+clipboard or push access. Do not run the bridge for an untrusted host. Stop the
+daemon and SSH session to remove access.
+
+Each transfer is capped at 64 MB. Existing destination files are never
+replaced; shellctl allocates a numbered filename instead.
+
+## RemoteForward troubleshooting
+
+With `ExitOnForwardFailure yes`, SSH exits rather than silently connecting
+without the bridge. If SSH reports `remote port forwarding failed for listen
+port 8765`, another active SSH connection usually owns that listen address.
+Close the stale connection, or choose a new port with `--port` and update both
+sides of the `RemoteForward`. Check for duplicate `RemoteForward` lines in
+included SSH config files as well. `ssh -vv <host>` shows which forwarding rule
+was applied.
 
 ## Files
 
