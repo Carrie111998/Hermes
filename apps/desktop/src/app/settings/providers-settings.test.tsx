@@ -195,40 +195,33 @@ describe('ProvidersSettings', () => {
     expect(removeCredentialPoolEntry).not.toHaveBeenCalled()
   })
 
-  it('shows and persists the pool strategy for a provider with OAuth accounts', async () => {
+  it('shows the pool strategy on the provider head, not a separate top-level section', async () => {
     getCredentialPool.mockResolvedValue({
       providers: [{
         provider: 'openai-codex',
-        entries: [{
-          auth_type: 'oauth',
-          has_refresh: true,
-          id: 'personal',
-          index: 1,
-          label: 'Personal',
-          last_status: null,
-          priority: 0,
-          request_count: 0,
-          source: 'manual:device_code',
-          token_preview: ''
-        }, {
-          auth_type: 'oauth',
-          has_refresh: true,
-          id: 'work',
-          index: 2,
-          label: 'Work',
-          last_status: null,
-          priority: 1,
-          request_count: 0,
-          source: 'manual:device_code',
-          token_preview: ''
-        }]
+        entries: [
+          {
+            auth_type: 'oauth', has_refresh: true, id: 'personal', index: 1,
+            label: 'Personal', last_status: null, priority: 0, request_count: 0,
+            source: 'manual:device_code', token_preview: ''
+          },
+          {
+            auth_type: 'oauth', has_refresh: true, id: 'work', index: 2,
+            label: 'Work', last_status: null, priority: 1, request_count: 0,
+            source: 'manual:device_code', token_preview: ''
+          }
+        ]
       }],
       strategies: { 'openai-codex': 'no_failover' }
     })
 
     await renderProvidersSettings()
 
-    expect(await screen.findByText('Pool strategy')).toBeTruthy()
+    // Two subscriptions, ONE provider → exactly one provider head with the
+    // strategy control inline (no longer a separate top-level PoolStrategyRows
+    // section). The strategy label now lives under the provider head.
+    expect(await screen.findByText('Subscriptions')).toBeTruthy()
+    expect(screen.getAllByText('openai-codex')).toHaveLength(1)
     const select = screen.getByRole('combobox', { name: 'Pool strategy for openai-codex' })
     expect(select.textContent).toContain('No failover')
 
@@ -240,6 +233,36 @@ describe('ProvidersSettings', () => {
     })
 
     await waitFor(() => expect(setCredentialPoolStrategy).toHaveBeenCalledWith('openai-codex', 'round_robin'))
+  })
+
+  it('groups multiple subscriptions under a single provider head', async () => {
+    getCredentialPool.mockResolvedValue({
+      providers: [{
+        provider: 'openai-codex',
+        entries: [
+          {
+            auth_type: 'oauth', has_refresh: true, id: 'personal', index: 1,
+            label: 'Personal', last_status: null, priority: 0, request_count: 0,
+            source: 'manual:device_code', token_preview: ''
+          },
+          {
+            auth_type: 'oauth', has_refresh: true, id: 'work', index: 2,
+            label: 'Work', last_status: null, priority: 1, request_count: 0,
+            source: 'manual:device_code', token_preview: ''
+          }
+        ]
+      }],
+      strategies: {}
+    })
+
+    await renderProvidersSettings()
+
+    // Both subscriptions render under ONE provider head, not two.
+    expect(screen.getAllByText('openai-codex')).toHaveLength(1)
+    expect(screen.getByText('Personal')).toBeTruthy()
+    expect(screen.getByText('Work')).toBeTruthy()
+    // Strategy control lives on the provider head.
+    expect(screen.getByRole('combobox', { name: 'Pool strategy for openai-codex' })).toBeTruthy()
   })
 
   it('does not offer removal for externally managed providers', async () => {

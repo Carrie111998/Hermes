@@ -208,16 +208,22 @@ function OAuthAccountRows({
   onAdd,
   onRemove,
   onRename,
-  providers
+  onStrategyChange,
+  providers,
+  strategies
 }: {
   accounts: Array<{ entry: CredentialPoolEntry; provider: string }>
   onAdd: (provider: OAuthProvider) => void
   onRemove: (provider: string, entry: CredentialPoolEntry) => void
   onRename: (provider: string, entry: CredentialPoolEntry, label: string) => void
+  onStrategyChange: (provider: string, strategy: string) => void
   providers: OAuthProvider[]
+  strategies: Record<string, string>
 }) {
   const [editing, setEditing] = useState<null | { entry: CredentialPoolEntry; provider: string }>(null)
   const [label, setLabel] = useState('')
+  const { t } = useI18n()
+  const copy = t.settings.providers
 
   if (accounts.length === 0) {
     return null
@@ -229,11 +235,31 @@ function OAuthAccountRows({
       {[...new Set(accounts.map(account => account.provider))].map(provider => {
         const providerAccounts = accounts.filter(account => account.provider === provider)
         const oauthProvider = providers.find(candidate => candidate.id === provider)
+        const strategy = strategies[provider] ?? 'fill_first'
 
         return <div className="grid gap-1" key={provider}>
           <p className="px-3 pt-2 text-[length:var(--conversation-text-font-size)] font-semibold">
             {oauthProvider ? providerTitle(oauthProvider) : provider}
           </p>
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-3 py-1">
+            <p className="text-xs text-muted-foreground">{copy.poolStrategy}</p>
+            <Select
+              onValueChange={value => onStrategyChange(provider, value)}
+              value={strategy}
+            >
+              <SelectTrigger
+                aria-label={copy.poolStrategyLabel(oauthProvider ? providerTitle(oauthProvider) : provider)}
+                className="min-w-40"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {POOL_STRATEGIES.map(strategy => (
+                  <SelectItem key={strategy} value={strategy}>{copy.poolStrategies[strategy]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
           {providerAccounts.map(({ entry }) => {
         const isEditing = editing?.entry.id === entry.id && editing.provider === provider
         const name = entry.label || entry.id || provider
@@ -275,51 +301,6 @@ function OAuthAccountRows({
 }
 
 const POOL_STRATEGIES = ['fill_first', 'no_failover', 'round_robin', 'least_used', 'random'] as const
-
-function PoolStrategyRows({
-  providers,
-  strategies,
-  onChange
-}: {
-  providers: string[]
-  strategies: Record<string, string>
-  onChange: (provider: string, strategy: string) => void
-}) {
-  const { t } = useI18n()
-  const copy = t.settings.providers
-
-  if (providers.length === 0) {
-    return null
-  }
-
-  return (
-    <section className="mb-5 grid gap-1">
-      <SettingsCategoryHeading icon={KeyRound} title={copy.poolStrategy} />
-      <p className="mb-1 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
-        {copy.poolStrategyDescription}
-      </p>
-      {providers.map(provider => (
-        <ListRow
-          action={
-            <Select onValueChange={strategy => onChange(provider, strategy)} value={strategies[provider] ?? 'fill_first'}>
-              <SelectTrigger aria-label={copy.poolStrategyLabel(provider)} className="min-w-40">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {POOL_STRATEGIES.map(strategy => (
-                  <SelectItem key={strategy} value={strategy}>{copy.poolStrategies[strategy]}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          }
-          description={provider}
-          key={provider}
-          title={provider}
-        />
-      ))}
-    </section>
-  )
-}
 
 function NoProviderKeys() {
   const { t } = useI18n()
@@ -567,11 +548,8 @@ export function ProvidersSettings({
         onAdd={selectProviderForAccount}
         onRemove={(provider, entry) => void handleRemoveAccount(provider, entry)}
         onRename={(provider, entry, label) => void handleRenameAccount(provider, entry, label)}
+        onStrategyChange={(provider, strategy) => void handlePoolStrategy(provider, strategy)}
         providers={oauthProviders}
-      />
-      <PoolStrategyRows
-        onChange={(provider, strategy) => void handlePoolStrategy(provider, strategy)}
-        providers={pooledProviders}
         strategies={poolStrategies}
       />
       {addingProvider && (
