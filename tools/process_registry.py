@@ -2139,6 +2139,34 @@ class ProcessRegistry:
             result["note"] = "Process recovered after restart -- output history unavailable"
         return result
 
+    def ack(self, session_id: str) -> dict:
+        """Acknowledge that an exited process's result (as returned by a prior
+        poll()) has been fully handled inline this turn.
+
+        poll() deliberately stays read-only so a status-only check can never
+        suppress the notify_on_complete watcher's autonomous delivery turn
+        (#10156). But that leaves no way to tell the watcher "I already acted
+        on this and reported it" once the agent genuinely has — the queued
+        completion is then delivered as a stale, redundant synthetic turn
+        (#94455). ack() is that explicit, separate acknowledgement: it marks
+        the same ``_completion_consumed`` gate wait()/read_log() use, so it
+        only takes effect on an already-exited session and never on a running
+        one, keeping poll() itself unaffected.
+        """
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        self._reconcile_local_exit(session)
+        if not session.exited:
+            return {
+                "status": "running",
+                "error": "Cannot acknowledge a still-running process; poll() again after it exits.",
+            }
+
+        self._completion_consumed.add(session_id)
+        return {"status": "acknowledged", "session_id": session.id}
+
     def read_log(self, session_id: str, offset: int | None = None, limit: int = 200) -> dict:
         """Read the full output log with optional pagination by lines."""
         from tools.ansi_strip import strip_ansi
@@ -3243,14 +3271,16 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF), "
+        "'ack' (acknowledge an exited process's result was already fully handled inline, "
+        "so a queued notify_on_complete notification is not delivered again)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"],
+                "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close", "ack"],
                 "description": "Action to perform on background processes"
             },
             "session_id": {
@@ -3330,11 +3360,13 @@ def _handle_process(args, **kw):
             },
             ensure_ascii=False,
         )
-    elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
+    elif action in {"poll", "log", "wait", "kill", "write", "submit", "close", "ack"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
+        elif action == "ack":
+            return json.dumps(process_registry.ack(session_id), ensure_ascii=False)
         elif action == "log":
             return json.dumps(_redact_process_result(process_registry.read_log(
                 session_id, offset=args.get("offset"), limit=args.get("limit", 200))), ensure_ascii=False)
@@ -3351,7 +3383,7 @@ def _handle_process(args, **kw):
             return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
         elif action == "close":
             return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
+    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, ack")
 
 
 registry.register(

@@ -265,6 +265,42 @@ class TestCompletionConsumed:
             assert registry.is_completion_consumed(sid)
         assert registry.drain_notifications() == []
 
+    def test_poll_then_ack_suppresses_stale_gateway_notification(self, registry):
+        """#94455: a status-only poll() must not suppress the gateway/tui
+        watcher's autonomous delivery turn, but once the agent has fully
+        handled the exited result inline it can call ack() to explicitly
+        suppress the now-stale queued completion."""
+        s = _make_session(sid="proc_ack", notify_on_complete=True, output="done")
+        s.exited = True
+        s.exit_code = 0
+        registry._finished[s.id] = s
+
+        registry.poll("proc_ack")
+        # Same as the read-only contract above: poll() alone never suppresses.
+        assert not registry.is_completion_consumed("proc_ack")
+
+        result = registry.ack("proc_ack")
+        assert result["status"] == "acknowledged"
+        # Now the gateway/tui watcher gate is set, so the stale synthetic
+        # completion turn is not delivered.
+        assert registry.is_completion_consumed("proc_ack")
+
+    def test_ack_on_running_process_is_a_noop(self, registry):
+        """ack() must not let a status check race ahead of actual exit —
+        a still-running session is not acknowledged."""
+        s = _make_session(sid="proc_ack_run", notify_on_complete=True, output="partial")
+        registry._running[s.id] = s
+
+        result = registry.ack("proc_ack_run")
+        assert result["status"] == "running"
+        assert not registry.is_completion_consumed("proc_ack_run")
+
+    def test_ack_on_unknown_session_is_not_found(self, registry):
+        """ack() on a session_id the registry has never seen must report
+        not_found rather than silently acknowledging."""
+        result = registry.ack("nope")
+        assert result["status"] == "not_found"
+
 
 # ---------------------------------------------------------------------------
 # Silent-background-process hint
