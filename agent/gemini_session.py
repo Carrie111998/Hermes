@@ -24,7 +24,14 @@ import logging
 import time
 from typing import Optional
 
-from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_PORT, discover_local_cdp_url
+from hermes_cli.browser_connect import (
+    DEFAULT_BROWSER_CDP_PORT,
+    close_target,
+    discover_local_cdp_url,
+    find_page_targets,
+    open_page_target,
+    target_is_responsive,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,88 +51,29 @@ _SETTLE_SECONDS = 30.0
 _RETRY_BACKOFF_SECONDS = 7.5
 
 
-#: Budget for the liveness probe below. Deliberately tiny next to
-#: _SETTLE_SECONDS: the whole point is to reject a dead tab in ~3s instead of
-#: discovering it 30s later.
-_LIVENESS_TIMEOUT = 3.0
-
-
 def _find_aistudio_targets(http_url: str) -> list[tuple[str, str]]:
-    """Return ``(target_id, webSocketDebuggerUrl)`` for every aistudio page tab.
+    """Every aistudio page tab as ``(target_id, webSocketDebuggerUrl)``.
 
     A LIST, not the first match, so a caller can step past a dead one.
     """
-    import urllib.request
-
-    found: list[tuple[str, str]] = []
-    try:
-        with urllib.request.urlopen(f"{http_url}/json", timeout=3.0) as resp:
-            targets = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return found
-    for target in targets:
-        if not isinstance(target, dict):
-            continue
-        url = str(target.get("url") or "")
-        ws = str(target.get("webSocketDebuggerUrl") or "")
-        tid = str(target.get("id") or "")
-        if url.startswith(_AISTUDIO_ORIGIN) and target.get("type") == "page" and ws and tid:
-            found.append((tid, ws))
-    return found
+    return find_page_targets(http_url, _AISTUDIO_ORIGIN)
 
 
-def _target_is_responsive(ws_url: str, *, timeout: float = _LIVENESS_TIMEOUT) -> bool:
-    """Whether the tab's renderer executes JavaScript at all right now.
-
-    NOT the same failure as the wedged tab the fresh-tab retry below was built
-    for. A WEDGED tab is alive -- it runs JS, it just never completes the lazy
-    MakerSuiteService RPC chain, which is only observable by waiting out
-    _SETTLE_SECONDS. A FROZEN tab (Chrome's background-tab freezing/discarding)
-    executes nothing, and is observable in ~3s.
-
-    Telling them apart matters twice over. Diagnosed on grok_session
-    2026-08-25: a frozen tab still appears in /json/list with a valid
-    webSocketDebuggerUrl AND the websocket still CONNECTS, because that
-    handshake is browser-level, not renderer-level. Only an evaluation
-    distinguishes them, and against a frozen tab it HANGS to the full timeout
-    rather than erroring -- so without this probe a frozen tab costs the caller
-    a whole 30s settle window. That in turn made the fresh-tab retry
-    unaffordable: it is gated on budget_seconds covering backoff + settle
-    (37.5s), which the collector's per-provider fair share does not reach.
-    Spending 3s here instead leaves the retry within budget.
-    """
-    from websocket import create_connection
-
-    try:
-        ws = create_connection(ws_url, timeout=timeout, suppress_origin=True)
-    except Exception:
-        return False
-    try:
-        ws.send(
-            json.dumps(
-                {
-                    "id": 1,
-                    "method": "Runtime.evaluate",
-                    "params": {"expression": "1", "returnByValue": True},
-                }
-            )
-        )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            frame = ws.recv()
-            if isinstance(frame, bytes):
-                frame = frame.decode("utf-8")
-            message = json.loads(frame)
-            if message.get("id") == 1:          # skip interleaved events
-                return "error" not in message
-        return False
-    except Exception:
-        return False
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+#: Whether a tab's renderer executes JavaScript at all right now -- shared with
+#: grok_session, where this was diagnosed on 2026-08-25. Full rationale on
+#: hermes_cli.browser_connect.target_is_responsive.
+#:
+#: NOT the same failure as the wedged tab the fresh-tab retry below was built
+#: for. A WEDGED tab is alive -- it runs JS, it just never completes the lazy
+#: MakerSuiteService RPC chain, which is only observable by waiting out
+#: _SETTLE_SECONDS. A FROZEN tab (Chrome's background-tab freezing/discarding)
+#: executes nothing, and is observable in ~3s. Telling them apart matters twice
+#: over here: an undetected frozen tab costs a whole 30s settle window, which
+#: then puts the fresh-tab retry over its budget gate (backoff + settle =
+#: 37.5s, which the collector's per-provider fair share never reaches) and
+#: turns a recoverable state into "unavailable". Spending 3s here instead
+#: leaves the retry within budget.
+_target_is_responsive = target_is_responsive
 
 
 def _live_aistudio_target(http_url: str) -> Optional[str]:
@@ -145,38 +93,15 @@ def _live_aistudio_target(http_url: str) -> Optional[str]:
 def _new_aistudio_target(http_url: str) -> Optional[tuple[str, str]]:
     """Open a background aistudio.google.com/apikey tab via /json/new.
 
-    Returns (ws_url, target_id); the caller closes the tab when done.
+    Returns ``(target_id, ws_url)`` -- the same order grok_session uses; the
+    caller closes the tab when done.
     """
-    import urllib.request
-
-    try:
-        # PUT: newer Chrome requires the PUT method on /json/new.
-        req = urllib.request.Request(
-            f"{http_url}/json/new?{_APIKEY_URL}", method="PUT"
-        )
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            target = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-    if not isinstance(target, dict):
-        return None
-    ws = str(target.get("webSocketDebuggerUrl") or "")
-    target_id = str(target.get("id") or "")
-    return (ws, target_id) if ws and target_id else None
+    return open_page_target(http_url, _APIKEY_URL)
 
 
 def _close_target(http_url: str, target_id: str) -> bool:
     """Close a tab we opened; best-effort -- failure is never fatal."""
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(
-            f"{http_url}/json/close/{target_id}", timeout=3.0
-        ) as resp:
-            resp.read()
-    except Exception:
-        return False
-    return True
+    return close_target(http_url, target_id, timeout=3.0)
 
 
 class _Interceptor:
@@ -384,7 +309,7 @@ def fetch_gemini_budget_usage(
             if opened is None:
                 logger.debug("gemini_session: no aistudio.google.com tab available")
                 return None
-            ws_url, fresh_target_id = opened
+            fresh_target_id, ws_url = opened
             limits = _attempt(http_url, ws_url, timeout)
             # Our tab was already fresh; a retry would just open an identical
             # second throwaway. Fall through to close it.
@@ -404,9 +329,9 @@ def fetch_gemini_budget_usage(
         if opened is None:
             logger.debug("gemini_session: fresh-tab retry could not open a tab")
             return None
-        fresh_target_id = opened[1]
+        fresh_target_id = opened[0]
         logger.debug("gemini_session: retrying on fresh tab after idle first pass")
-        return _attempt(http_url, opened[0], timeout)
+        return _attempt(http_url, opened[1], timeout)
     finally:
         if fresh_target_id is not None:
             _close_target(http_url, fresh_target_id)

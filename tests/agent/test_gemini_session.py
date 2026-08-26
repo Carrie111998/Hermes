@@ -173,9 +173,12 @@ class _OnceIdle(_FakeInterceptor):
 
 
 def _patch_fresh_tab(monkeypatch, ws="ws://fresh", tid="fresh-tab"):
-    """Stub /json/new + /json/close so no real browser is touched."""
+    """Stub /json/new + /json/close so no real browser is touched.
+
+    _new_aistudio_target yields (target_id, ws_url) -- grok_session's order.
+    """
     monkeypatch.setattr(
-        gs, "_new_aistudio_target", lambda http: (ws, tid)
+        gs, "_new_aistudio_target", lambda http: (tid, ws)
     )
     closed = []
     monkeypatch.setattr(

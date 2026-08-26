@@ -21,7 +21,15 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_PORT, discover_local_cdp_url
+from hermes_cli.browser_connect import (
+    DEFAULT_BROWSER_CDP_PORT,
+    cdp_call,
+    close_target,
+    discover_local_cdp_url,
+    find_page_targets,
+    open_page_target,
+    target_is_responsive,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +39,6 @@ _RATE_LIMITS_PATH = "/rest/rate-limits"
 _DEFAULT_MODELS = ["grok-4", "grok-4-heavy"]
 
 
-#: A frozen renderer answers the browser-level websocket handshake but never
-#: replies to Runtime.evaluate, so liveness has to be probed with a real
-#: evaluation and a short timeout rather than inferred from the connection.
-_LIVENESS_TIMEOUT = 3.0
 #: How long to wait for a tab WE opened to become evaluable. Polled, not slept:
 #: the fetch needs only the origin's cookies, not a fully painted app, so it is
 #: usually ready well before this.
@@ -42,49 +46,23 @@ _NEW_TAB_SETTLE_SECONDS = 10
 
 
 def _find_grok_targets(http_url: str) -> list[tuple[str, str]]:
-    """Return ``(target_id, webSocketDebuggerUrl)`` for every grok.com page tab.
+    """Every grok.com page tab as ``(target_id, webSocketDebuggerUrl)``.
 
     A LIST, not the first match: a long-backgrounded tab can be frozen while
     another is fine, and picking blindly is what left the xai row unavailable
     for 39h on 2026-08-25 (see ``_usable_grok_target``).
     """
-    import urllib.request
-
-    found: list[tuple[str, str]] = []
-    try:
-        with urllib.request.urlopen(f"{http_url}/json", timeout=3.0) as resp:
-            targets = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return found
-    for target in targets:
-        if not isinstance(target, dict):
-            continue
-        url = str(target.get("url") or "")
-        ws = str(target.get("webSocketDebuggerUrl") or "")
-        tid = str(target.get("id") or "")
-        if url.startswith(_GROK_ORIGIN) and target.get("type") == "page" and ws and tid:
-            found.append((tid, ws))
-    return found
+    return find_page_targets(http_url, _GROK_ORIGIN)
 
 
-def _target_is_responsive(ws_url: str, *, timeout: float = _LIVENESS_TIMEOUT) -> bool:
-    """Whether the tab's renderer actually executes JavaScript right now.
-
-    Chrome freezes and discards background tabs. A frozen tab still appears in
-    ``/json/list`` with a valid webSocketDebuggerUrl, and the websocket still
-    connects -- only the evaluation never comes back. Nothing short of running
-    an expression distinguishes the two.
-    """
-    try:
-        _cdp_call(
-            ws_url,
-            "Runtime.evaluate",
-            {"expression": "1", "returnByValue": True},
-            timeout=timeout,
-        )
-        return True
-    except Exception:
-        return False
+#: Whether a tab's renderer executes JavaScript at all right now. Shared with
+#: gemini_session because the detection is subtle and identical in both: a
+#: frozen renderer answers the browser-level websocket handshake and appears in
+#: /json/list, so only a real Runtime.evaluate under a short timeout tells --
+#: and against a frozen tab it hangs rather than errors. Full rationale on
+#: hermes_cli.browser_connect.target_is_responsive. Kept as a module-level name
+#: so callers (and their tests) have a seam here.
+_target_is_responsive = target_is_responsive
 
 
 def _new_grok_target(http_url: str) -> Optional[tuple[str, str]]:
@@ -93,35 +71,12 @@ def _new_grok_target(http_url: str) -> Optional[tuple[str, str]]:
     The id is returned so the caller can CLOSE what it opened -- a tab per
     collection would otherwise accumulate 288 grok.com tabs a day.
     """
-    import urllib.request
-
-    try:
-        # PUT: newer Chrome requires the PUT method on /json/new.
-        req = urllib.request.Request(
-            f"{http_url}/json/new?{_GROK_ORIGIN}", method="PUT"
-        )
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            target = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-    if not isinstance(target, dict):
-        return None
-    ws = str(target.get("webSocketDebuggerUrl") or "")
-    tid = str(target.get("id") or "")
-    return (tid, ws) if ws and tid else None
+    return open_page_target(http_url, _GROK_ORIGIN)
 
 
 def _close_target(http_url: str, target_id: str) -> None:
     """Close a tab we opened. Best-effort: a leaked tab must not fail a fetch."""
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(
-            f"{http_url}/json/close/{target_id}", timeout=5.0
-        ) as resp:
-            resp.read()
-    except Exception as exc:
-        logger.debug("grok_session: could not close target %s: %s", target_id, exc)
+    close_target(http_url, target_id)
 
 
 def _usable_grok_target(http_url: str) -> tuple[Optional[str], Optional[str]]:
@@ -153,31 +108,6 @@ def _usable_grok_target(http_url: str) -> tuple[Optional[str], Optional[str]]:
     return tid, ws
 
 
-def _cdp_call(ws_url: str, method: str, params: dict, *, timeout: float) -> dict:
-    """One CDP command/response round trip on a fresh connection."""
-    from websocket import create_connection
-
-    ws = create_connection(ws_url, timeout=timeout, suppress_origin=True)
-    try:
-        ws.send(json.dumps({"id": 1, "method": method, "params": params}))
-        deadline_guard = max(1, int(timeout))
-        for _ in range(deadline_guard * 10):  # skip any event frames
-            frame = ws.recv()
-            if isinstance(frame, bytes):
-                frame = frame.decode("utf-8")
-            message = json.loads(frame)
-            if message.get("id") == 1:
-                if "error" in message:
-                    raise RuntimeError(f"CDP error: {message['error']}")
-                return message.get("result") or {}
-        raise RuntimeError("CDP response timeout")
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
-
-
 def _evaluate_rate_limits(ws_url: str, *, timeout: float) -> Optional[list]:
     """Run fetch('/rest/rate-limits') inside the grok.com page context."""
     script = """
@@ -196,7 +126,7 @@ def _evaluate_rate_limits(ws_url: str, *, timeout: float) -> Optional[list]:
         json.dumps(_DEFAULT_MODELS),
         _RATE_LIMITS_PATH,
     )
-    result = _cdp_call(
+    result = cdp_call(
         ws_url,
         "Runtime.evaluate",
         {

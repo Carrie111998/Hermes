@@ -8,6 +8,7 @@ import json
 from datetime import timezone
 
 import agent.grok_session as grok_session
+import hermes_cli.browser_connect as browser_connect
 
 
 class _FakeWS:
@@ -33,8 +34,8 @@ def _patch_cdp(monkeypatch, ws, http_url="http://127.0.0.1:9222", target_ws="ws:
     )
     monkeypatch.setattr(grok_session, "_usable_grok_target", lambda http: (None, target_ws))
     monkeypatch.setattr(
-        grok_session, "_cdp_call",
-        lambda url, method, params, *, timeout: _evaluate_stub(ws),
+        browser_connect, "cdp_call",
+        lambda url, method, params=None, *, timeout: _evaluate_stub(ws),
     )
 
 
@@ -140,19 +141,26 @@ def test_fetch_none_on_exception(monkeypatch):
 
 def test_responsiveness_probe_is_false_when_evaluate_hangs(monkeypatch):
     """A frozen renderer connects fine and never answers -- only an evaluation tells."""
-    def hang(url, method, params, *, timeout):
+    def hang(url, method, params=None, *, timeout):
         raise TimeoutError("Connection timed out")
 
-    monkeypatch.setattr(grok_session, "_cdp_call", hang)
+    # The probe is shared with gemini_session and lives in browser_connect, so
+    # the round trip it stands on is patched there.
+    monkeypatch.setattr(browser_connect, "cdp_call", hang)
     assert grok_session._target_is_responsive("ws://frozen") is False
 
 
 def test_responsiveness_probe_is_true_when_evaluate_answers(monkeypatch):
-    monkeypatch.setattr(
-        grok_session, "_cdp_call",
-        lambda url, method, params, *, timeout: {"result": {"value": 1}},
-    )
+    seen = {}
+
+    def answer(url, method, params=None, *, timeout):
+        seen["method"] = method
+        return {"result": {"value": 1}}
+
+    monkeypatch.setattr(browser_connect, "cdp_call", answer)
     assert grok_session._target_is_responsive("ws://live") is True
+    # It must be a real evaluation -- a mere connection proves nothing.
+    assert seen["method"] == "Runtime.evaluate"
 
 
 def test_frozen_existing_tab_is_skipped_for_a_fresh_one(monkeypatch):
