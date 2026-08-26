@@ -867,6 +867,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = True
         self._recall_sync = False
         self._recall_max_tokens = 4096
+        self._prefer_observations = False
         # Default to observation-only recall. Observations are Hindsight's
         # consolidated knowledge layer — deduplicated, evidence-grounded
         # beliefs built from many raw facts, with proof counts and
@@ -1735,6 +1736,11 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
+        # When True and recalling observations together with raw types
+        # (world/experience), drop raw facts that an observation was
+        # consolidated from so observations supersede their sources.
+        # Requires hindsight-client 0.8+ (0.6.1 silently drops the kwarg).
+        self._prefer_observations = bool(self._config.get("prefer_observations", False))
         # On-by-default deterministic indicator: when auto-recall injects memory,
         # Hermes emits a "👁️ Hindsight — recalled N memories" status line so the
         # user SEES memory working, independent of whether the model mentions it.
@@ -1894,6 +1900,7 @@ class HindsightMemoryProvider(MemoryProvider):
             recall_kwargs: dict = {
                 "bank_id": self._bank_id, "query": query,
                 "budget": self._budget, "max_tokens": self._recall_max_tokens,
+                "prefer_observations": self._prefer_observations,
             }
             if self._recall_tags:
                 recall_kwargs["tags"] = self._recall_tags
@@ -2236,6 +2243,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs: dict = {
                     "bank_id": self._bank_id, "query": query, "budget": self._budget,
                     "max_tokens": self._recall_max_tokens,
+                    "prefer_observations": self._prefer_observations,
                 }
                 if self._recall_tags:
                     recall_kwargs["tags"] = self._recall_tags
