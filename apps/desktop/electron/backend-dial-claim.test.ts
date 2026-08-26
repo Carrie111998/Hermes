@@ -127,9 +127,10 @@ describe('main.ts wiring for #90812', () => {
     const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connection', ")
     expect(handlerStart).toBeGreaterThan(-1)
     const body = mainSource.slice(handlerStart, handlerStart + 2_200)
-    // Magnum Phase 2: supervisor is now the gate; the actual spawn still goes
-    // through backendDialClaims (inside supervisor.activateTransport or the
-    // fallback path). Either string proves the single-owner invariant.
+    // Magnum Phase 2: the supervisor is the gate, but the primary handler must
+    // still dial ensureBackend() itself — routing the primary by connectionId
+    // would drop sharedPrimary/descriptorProfile and file it under a
+    // registry-scoped pool key.
     expect(body).toContain('gatewaySupervisor.activate(')
     expect(body).toContain('ensureBackend(profile)')
   })
@@ -140,5 +141,31 @@ describe('main.ts wiring for #90812', () => {
     const body = mainSource.slice(handlerStart, handlerStart + 2_200)
     expect(body).toContain('gatewaySupervisor.activate(')
     expect(body).toContain('ensureRegistryBackend(id, profile)')
+  })
+
+  // The claim only coalesces if every dialer spells the key the same way. A
+  // hand-rolled `local::${profile}` never collides with backendScopeKey()'s
+  // bare profile key, so the supervisor would spawn a second backend for one
+  // HERMES_HOME — the regression #90812 fixed.
+  it('derives the supervisor claim key from backendScopeKey, not a hand-rolled literal', () => {
+    const dialStart = mainSource.indexOf('async function dialRouteTransport(')
+    expect(dialStart).toBeGreaterThan(-1)
+    const body = mainSource.slice(dialStart, dialStart + 1_400)
+    expect(body).toContain('backendScopeKey(')
+    expect(body).toContain('backendDialClaims.run(claimKey')
+  })
+
+  it('never spells a dial claim key by hand', () => {
+    expect(mainSource).not.toMatch(/`local::\$\{/)
+    expect(mainSource).not.toMatch(/backendDialClaims\.run\(`/)
+  })
+
+  // The descriptor must travel on the lease. A module-global hand-off lets two
+  // concurrent dials read back each other's backend — the cross-route aliasing
+  // this whole phase exists to remove.
+  it('reads the dialed descriptor off the lease rather than a shared slot', () => {
+    expect(mainSource).toContain('requireLease(receipt')
+    expect(mainSource).toMatch(/requireLease\(receipt, [^)]+\)\.descriptor/)
+    expect(mainSource).not.toContain('_lastDialedConnection')
   })
 })

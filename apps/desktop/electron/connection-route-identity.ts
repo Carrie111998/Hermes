@@ -18,12 +18,15 @@ import type { ConnectionRegistry, RegistryConnection } from './connection-regist
 // ── Branded ids — makes cross-route aliasing a type error ──────────────────
 export type ConnectionId = string & { readonly __brand: 'ConnectionId' }
 export type ProfileKey = string & { readonly __brand: 'ProfileKey' }
+
 export function asConnectionId(id: string): ConnectionId {
   return String(id).trim() as ConnectionId
 }
+
 export function asProfileKey(profile: string): ProfileKey {
   return (String(profile || '').trim() || 'default') as ProfileKey
 }
+
 export function normalizeProfileKeyBranded(profile: unknown): ProfileKey {
   return asProfileKey(String(profile ?? ''))
 }
@@ -53,12 +56,15 @@ export function makeRouteKey(connection: RegistryConnection, desktopProfile: str
   const generation = Number.isInteger((connection as { generation?: unknown }).generation)
     ? (connection as { generation: number }).generation
     : 1
+
   const desktop = asProfileKey(desktopProfile)
+
   // SSH remotes may map desktopProfile → remoteProfile (target namespace)
   const targetRaw =
     connection.kind === 'ssh' && String(connection.remoteProfile || '').trim()
       ? String(connection.remoteProfile).trim()
       : String(desktopProfile || '').trim() || 'default'
+
   return {
     connectionId: asConnectionId(connection.id),
     generation,
@@ -69,19 +75,64 @@ export function makeRouteKey(connection: RegistryConnection, desktopProfile: str
 
 export function isRouteKeyCurrent(registry: ConnectionRegistry, key: RouteKey): boolean {
   const stored = registry.connections.find(c => c.id === (key.connectionId as string))
-  if (!stored) return false
+
+  if (!stored) {
+    return false
+  }
+
   const gen = Number.isInteger((stored as { generation?: unknown }).generation)
     ? (stored as { generation: number }).generation
     : 1
+
   return gen === key.generation
 }
 
+/**
+ * Does a dialed descriptor belong to the profile scope its route asked for?
+ *
+ * Deliberately permissive about the legitimate re-scopings: a shared-primary
+ * descriptor advertises the primary's `descriptorProfile` rather than the
+ * requested key, and an SSH route maps desktopProfile → remoteProfile (this
+ * RouteKey's `targetProfile`). A descriptor carrying no profile of its own
+ * simply inherits the one that was requested. What this rejects is a descriptor
+ * scoped to some THIRD profile — which would mean a dial handed back another
+ * route's backend.
+ */
+export function descriptorScopeMatchesRoute(
+  descriptor: null | undefined | { profile?: unknown; sharedPrimary?: unknown },
+  key: RouteKey
+): boolean {
+  const advertised = String(descriptor?.profile ?? '').trim()
+
+  if (!advertised || descriptor?.sharedPrimary) {
+    return true
+  }
+
+  return advertised === String(key.desktopProfile) || advertised === String(key.targetProfile)
+}
+
 export function routeKeyScopeKey(key: RouteKey): string {
-  // Reuses the same composite language as backendScopeKey for pool/socket maps
+  // Reuses the same composite language as backendScopeKey for pool/socket maps.
+  // Deliberately generation-free: pool slots are per (connection, profile), and
+  // a generation bump re-dials into the SAME slot rather than leaking a new one.
   const conn = key.connectionId as string
   const profile = key.desktopProfile as string
-  if (!conn || conn === 'local') return profile
+
+  if (!conn || conn === 'local') {
+    return profile
+  }
+
   return `conn:${conn}::${profile}`
+}
+
+/**
+ * Partition key — unlike the pool key, this IS generation-bound. Partitioned
+ * stores hold data belonging to a specific gateway authority; a generation bump
+ * is a new authority, so it must get a fresh partition instead of inheriting
+ * the previous gateway's data (and its now-stale `partition.route`).
+ */
+export function routeKeyPartitionKey(key: RouteKey): string {
+  return `${routeKeyScopeKey(key)}@${key.generation}`
 }
 
 interface SshRouteConfig {

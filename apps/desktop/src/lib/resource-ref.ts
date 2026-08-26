@@ -11,14 +11,16 @@
  * for resource-bound operations; use ResourceRef or RouteClient.
  */
 
-import type { RouteKey, ConnectionId, ProfileKey } from '../../electron/connection-route-identity'
+import type { RouteKey } from '../../electron/connection-route-identity'
 
 // Branded resource ids (opaque)
 export type SessionId = string & { readonly __brand: 'SessionId' }
 export type CronJobId = string & { readonly __brand: 'CronJobId' }
 export type ProjectId = string & { readonly __brand: 'ProjectId' }
 export type ArtifactId = string & { readonly __brand: 'ArtifactId' }
+
 export function asSessionId(id: string): SessionId { return String(id).trim() as SessionId }
+
 export function asCronJobId(id: string): CronJobId { return String(id).trim() as CronJobId }
 
 export type ResourceRef<T> = Readonly<{

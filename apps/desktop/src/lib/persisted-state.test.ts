@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { test, describe } from 'vitest'
+
+import { describe, test } from 'vitest'
+
 import { definePersistedState } from './persisted-state'
 
 describe('persisted-state (§14)', () => {

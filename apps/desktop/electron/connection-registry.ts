@@ -1400,7 +1400,7 @@ export function reconcileAppliedGlobalConnection(
       registry.connections.map(connection => connection.label)
     )
 
-  const entry = normalizeConnectionInput(
+  let entry = normalizeConnectionInput(
     {
       id: existing?.id,
       kind,
@@ -1413,6 +1413,17 @@ export function reconcileAppliedGlobalConnection(
     },
     registry
   )
+
+  // Adopting a v1 block can rewrite url/token/headers on an existing id. That is
+  // the same "same slot, different dial material" change saveRegistryConnection()
+  // bumps for — without the bump, RouteKeys minted before the edit keep passing
+  // isRouteKeyCurrent() and stale sockets stay publishable (§3.1 §20).
+  if (existing && connectionDialFieldsChanged(existing, entry)) {
+    const priorGen = Number.isInteger((existing as { generation?: unknown }).generation)
+      ? (existing as { generation: number }).generation
+      : 1
+    entry = { ...entry, generation: priorGen + 1 }
+  }
 
   return {
     ...upsertConnection(registry, entry),
