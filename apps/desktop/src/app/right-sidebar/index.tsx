@@ -13,8 +13,10 @@ import { cn } from '@/lib/utils'
 import { $panesFlipped } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
-import { $currentCwd, $selectedStoredSessionId, $workspaceCwdOwner } from '@/store/session'
+import { $connection, $selectedStoredSessionId } from '@/store/session'
+import { $workspaceContextStoredSessionId, sessionFilesystemSharesAmbientConnection } from '@/store/session-states'
 
+import { useSessionWorkspaceCwd } from '../session/hooks/use-focused-workspace-cwd'
 import { SidebarPanelLabel } from '../shell/sidebar-label'
 
 import { ProjectTree } from './files/tree'
@@ -29,14 +31,21 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
   const { t } = useI18n()
   const r = t.rightSidebar
   const panesFlipped = useStore($panesFlipped)
-  const currentCwd = useStore($currentCwd).trim()
+  const connection = useStore($connection)
+  const workspaceStoredSessionId = useStore($workspaceContextStoredSessionId)
+  const currentCwd = useSessionWorkspaceCwd(workspaceStoredSessionId)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
-  const workspaceCwdOwner = useStore($workspaceCwdOwner)
 
-  // A transition intentionally retains the old CWD until the new session
-  // confirms its workspace. Do not issue a filesystem read against that path:
-  // under a gateway switch it may belong to a different remote machine.
-  const hasWorkspace = Boolean(currentCwd) && (workspaceCwdOwner ?? null) === (selectedStoredSessionId ?? null)
+  // Ordinary top tabs share the ambient Files bridge, so their focused CWD can
+  // re-root the tree immediately. An explicitly owner-routed remote tile can
+  // belong to another machine; fail closed until Files supports owner-routed
+  // filesystem calls rather than browsing the ambient backend by mistake.
+  const workspaceSessionUsesAmbientFilesystem =
+    !workspaceStoredSessionId ||
+    workspaceStoredSessionId === selectedStoredSessionId ||
+    sessionFilesystemSharesAmbientConnection(workspaceStoredSessionId, connection)
+
+  const hasWorkspace = Boolean(currentCwd) && workspaceSessionUsesAmbientFilesystem
 
   const {
     collapseAll,

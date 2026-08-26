@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router'
 
 import { ConnectionSwitcher } from '@/app/chat/sidebar/connection-switcher'
 import type { CommandCenterSection } from '@/app/command-center'
+import { useFocusedWorkspaceCwd } from '@/app/session/hooks/use-focused-workspace-cwd'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
@@ -27,13 +28,11 @@ import {
   $activeSessionId,
   $busy,
   $connection,
-  $currentCwd,
   $currentUsage,
   $selectedStoredSessionId,
   $sessions,
   $sessionStartedAt,
   $turnStartedAt,
-  idsShareLineage,
   sessionMatchesStoredId
 } from '@/store/session'
 import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
@@ -97,10 +96,6 @@ export function useStatusbarItems({
   const sessionsShowing = useStore($paneVisible('sessions'))
   const botsShowing = useStore($paneVisible('hermes-bots:pane'))
   const primaryBusy = useStore($busy)
-  // Draft / primary composer atom — used only while the focused surface is the
-  // primary (or a draft with no runtime slice yet). A focused TILE keeps its
-  // own cwd in `$sessionStates` and must not paint the primary's workspace.
-  const primaryCwd = useStore($currentCwd)
   const primaryUsage = useStore($currentUsage)
   const gatewayRestarting = useStore($gatewayRestarting)
   const primarySessionStartedAt = useStore($sessionStartedAt)
@@ -143,16 +138,10 @@ export function useStatusbarItems({
   // reports new usage — far rarer than a delta — so its reference is a valid
   // bail-out key on its own.
   const focusedUsage = useStoreSelector($focusedSessionState, state => state?.usage ?? null)
-  const focusedStateCwd = useStoreSelector($focusedSessionState, state => state?.cwd?.trim() || '')
-
-  // Runtime slices carry the stored id they were bound for. During a primary
-  // tab switch the runtime id can lag a frame behind the new selection — the
-  // slice still describes the PREVIOUS chat. Gate live cwd on ownership so we
-  // never paint session A's workspace while the tab already shows session B.
-  const focusedStateStoredId = useStoreSelector($focusedSessionState, state => state?.storedSessionId?.trim() || null)
 
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const primaryFocused = !focusedStoredSessionId || focusedStoredSessionId === selectedStoredSessionId
+  const currentCwd = useFocusedWorkspaceCwd()
 
   const activeSessionId = primaryFocused ? primaryActiveSessionId : (focusedRuntimeId ?? null)
   const busy = primaryFocused ? primaryBusy : focusedBusy
@@ -173,54 +162,12 @@ export function useStatusbarItems({
       : null
   )
 
-  const focusedRowCwd = useStoreSelector($sessions, sessions => {
-    if (!focusedStoredSessionId) {
-      return ''
-    }
-
-    const row = sessions.find(s => sessionMatchesStoredId(s, focusedStoredSessionId))
-
-    return row?.cwd?.trim() || ''
-  })
-
-  // Live runtime cwd is authoritative once it belongs to the focused chat
-  // (agent can relocate mid-turn). Until then — cold tabs, mid-switch lag —
-  // the stored session row is the selection's project. Primary drafts fall
-  // through to `$currentCwd`. A focused TILE must never inherit the primary's
-  // workspace — an empty tile cwd stays empty rather than lying about another
-  // project's path.
-  //
-  // Lineage match is a pure derivation of ($sessions + the two ids). Select it
-  // so a session-list write only re-renders when the answer actually flips —
-  // not on every title/archive refresh of an unrelated row.
-  const liveCwdSharesFocusLineage = useStoreSelector($sessions, sessions => {
-    if (!focusedStoredSessionId || !focusedStateStoredId) {
-      return false
-    }
-
-    return idsShareLineage(focusedStoredSessionId, focusedStateStoredId, sessions)
-  })
-
-  const liveCwdBelongsToFocus =
-    Boolean(focusedStateCwd) &&
-    (!focusedStoredSessionId ||
-      !focusedStateStoredId ||
-      focusedStateStoredId === focusedStoredSessionId ||
-      liveCwdSharesFocusLineage)
-
-  const currentCwd = (
-    (liveCwdBelongsToFocus ? focusedStateCwd : '') ||
-    focusedRowCwd ||
-    (primaryFocused ? primaryCwd : '') ||
-    ''
-  ).trim()
-
   // Derive the workspace's project name from the already-cached project tree
   // (backend truth via projects.*), so the status item labels by project without
-  // a second per-session copy of the same fact. Re-derives whenever the cwd or
-  // the tree changes; null (no named project) falls back to the cwd leaf below.
-  const projectTree = useStore($projectTree)
-  const projectName = useMemo(() => projectNameForCwd(currentCwd), [currentCwd, projectTree])
+  // a second per-session copy of the same fact. Subscribe to re-render when the
+  // tree changes; null (no named project) falls back to the cwd leaf below.
+  useStore($projectTree)
+  const projectName = projectNameForCwd(currentCwd)
 
   const sessionStartedAt = primaryFocused
     ? primarySessionStartedAt
