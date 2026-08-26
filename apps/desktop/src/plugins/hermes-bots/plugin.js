@@ -1461,9 +1461,21 @@ function scheduleGroupChatBackstopPull() {
   if (groupChatSyncBackstopTimer !== null) {
     clearTimeout(groupChatSyncBackstopTimer)
   }
+  // #94863 CI: a truthful timer host never fires BEFORE its requested
+  // delay. Test fixtures whose setTimeout answers with a positive handle
+  // but runs callbacks via setImmediate (with a no-op clearTimeout) fire
+  // instantly; re-arming on such a host turns this function into an
+  // event-loop busy-loop that OOMs long test runs. Record when the timer
+  // was armed and refuse to re-arm if it fired early — those hosts get a
+  // single pull per arm instead of an unbounded chain.
+  const armedAt = Date.now()
   groupChatSyncBackstopTimer = setTimeout(() => {
     groupChatSyncBackstopTimer = null
     if (groupChatSyncDisposed) {
+      return
+    }
+    if (Date.now() - armedAt < GROUP_CHAT_SYNC_BACKSTOP_PULL_MS) {
+      // Host does not truly defer timers — do not re-arm.
       return
     }
     void (async () => {

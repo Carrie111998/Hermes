@@ -294,3 +294,114 @@ test('scheduleGroupChatBackstopPull: declared in plugin.js and wired into the hy
   assert.ok(stopSlice.includes('groupChatSyncBackstopTimer'),
     'dispose cancels groupChatSyncBackstopTimer')
 })
+
+// ── CI OOM regression: the backstop must not busy-loop a fake timer host ──
+//
+// The group-chat.test.mjs fixture answers setTimeout with a positive
+// handle (1) but runs callbacks via setImmediate with a no-op
+// clearTimeout. The probe check passes on that shape, and re-arming from
+// an instantly-fired timer turned scheduleGroupChatBackstopPull into an
+// event-loop busy-loop that grew the heap to 4GB and killed the whole
+// `check:test:plugins` run. A truthful timer host never fires BEFORE its
+// requested delay, so the function must refuse to re-arm an early fire.
+
+function extractBackstopFunctionSource() {
+  const fnStart = pluginSource.indexOf('function scheduleGroupChatBackstopPull')
+
+  assert.notEqual(fnStart, -1, 'scheduleGroupChatBackstopPull present')
+
+  let depth = 0
+  let end = -1
+
+  for (let i = pluginSource.indexOf('{', fnStart); i < pluginSource.length; i++) {
+    if (pluginSource[i] === '{') {
+      depth++
+    } else if (pluginSource[i] === '}') {
+      depth--
+
+      if (depth === 0) {
+        end = i + 1
+
+        break
+      }
+    }
+  }
+
+  assert.notEqual(end, -1, 'scheduleGroupChatBackstopPull braces balance')
+
+  return pluginSource.slice(fnStart, end)
+}
+
+function loadBackstopFunction() {
+  // Pathological-host sandbox: positive handles, setImmediate-style firing,
+  // clearTimeout that cancels nothing, controllable clock. Entries carry
+  // their requested delay so the 0-ms probe is distinguishable from the
+  // real backstop timer.
+  const queued = []
+  const context = {
+    groupChatSyncDisposed: false,
+    groupChatSyncBackstopTimer: null,
+    GROUP_CHAT_SYNC_BACKSTOP_PULL_MS: 5000,
+    $groupChats: { get: () => ({ roomA: {} }) },
+    pullGroupChatServerState: () => Promise.resolve(false),
+    Date: { now: () => context.now },
+    setTimeout: (fn, ms) => {
+      queued.push({ fn, ms })
+
+      return queued.length
+    },
+    clearTimeout: () => undefined,
+    now: 0
+  }
+
+  vm.runInNewContext(extractBackstopFunctionSource(), context)
+
+  // Drain only what is queued at call time — a re-arm during the drain
+  // stays queued so assertions can count it without looping forever.
+  const drain = async () => {
+    const snapshot = queued.splice(0, queued.length)
+
+    for (const { fn } of snapshot) {
+      fn()
+      await new Promise(resolve => setImmediate(resolve))
+      await new Promise(resolve => setImmediate(resolve))
+    }
+  }
+
+  return {
+    context,
+    queued,
+    drain,
+
+    backstopTimers: () => queued.filter(entry => entry.ms === context.GROUP_CHAT_SYNC_BACKSTOP_PULL_MS)
+  }
+}
+
+test('scheduleGroupChatBackstopPull: early-firing host gets one pull, no re-arm loop', async () => {
+  const { context, queued, drain, backstopTimers } = loadBackstopFunction()
+
+  context.scheduleGroupChatBackstopPull()
+  assert.equal(backstopTimers().length, 1, 'arms exactly one backstop timer')
+
+  // Fire immediately (well before the 5s delay) — the shape that used to
+  // requeue forever and OOM the suite.
+  await drain()
+
+  assert.equal(backstopTimers().length, 0, 'an early fire must not re-arm the backstop')
+  assert.equal(queued.length, 0, 'nothing else was scheduled either')
+})
+
+test('scheduleGroupChatBackstopPull: truthful host fires at its delay and re-arms', async () => {
+  const { context, drain, backstopTimers } = loadBackstopFunction()
+
+  context.scheduleGroupChatBackstopPull()
+  assert.equal(backstopTimers().length, 1, 'arms exactly one backstop timer')
+
+  // Advance past the full interval before firing — what a real timer host
+  // guarantees. The pull runs and the chain continues.
+  context.now = 5000
+
+  await drain()
+
+  assert.equal(backstopTimers().length, 1, 'an on-time fire re-arms for the next cycle')
+})
