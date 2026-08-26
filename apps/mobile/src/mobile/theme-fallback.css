@@ -454,3 +454,24 @@ html:has([data-overlay-surface]) .mobile-settings-trigger {
     min-height: 2.75rem;
   }
 }
+
+/* An unfolded Fold can exceed the desktop 64rem breakpoint while remaining a
+   touch-only renderer. The early mobile marker forces the same compact overlay
+   selector and touch targets at every native-mobile width. */
+:root[data-hermes-mobile] [data-overlay-split-layout] {
+  grid-template-columns: minmax(0, 1fr) !important;
+  grid-template-rows: auto minmax(0, 1fr) !important;
+}
+:root[data-hermes-mobile] [data-overlay-split-layout] > aside[data-tour='overlay-nav'] {
+  display: none !important;
+}
+:root[data-hermes-mobile] [data-overlay-compact-nav] {
+  display: flex !important;
+}
+:root[data-hermes-mobile] [data-overlay-split-layout] > main {
+  padding-top: 0.3333rem !important;
+}
+:root[data-hermes-mobile] [data-overlay-split-layout] [data-tour^='nav-'] {
+  height: 2.75rem !important;
+  min-height: 2.75rem !important;
+}
