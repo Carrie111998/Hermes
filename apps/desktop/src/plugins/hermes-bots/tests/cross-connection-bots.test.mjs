@@ -51,7 +51,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__x = { botConnectionRoute, scopedBotParams, botBackendProfileScope, requestForBot, groupMemberKey, parseGroupChatMentions, resolveGroupResponders, formatGroupChatLine, buildGroupChatTurnPrompt };\n'
+      '\nglobalThis.__x = { botConnectionRoute, scopedBotParams, botBackendProfileScope, requestForBot, groupMemberKey, parseGroupChatMentions, resolveGroupResponders, formatGroupChatLine, buildGroupChatTurnPrompt, canCreateGroupChat, loadMultiSourceRoster };\n'
     )
   vm.runInNewContext(code, context, { filename: 'plugin.js' })
   return context
@@ -151,6 +151,63 @@ test('advanced capability scope keeps Desktop identity separate from backend tar
     connectionId: 'remote-a',
     profile: 'backend-worker'
   })
+})
+
+test('group creation is enabled for one active bot plus one bot on another connection', () => {
+  const ctx = runtime()
+
+  assert.equal(
+    ctx.__x.canCreateGroupChat([
+      { name: 'marvin', connectionId: 'house-of-marvin' },
+      { name: 'default', connectionId: 'local', remoteSource: true }
+    ]),
+    true
+  )
+})
+
+test('group creation stays disabled when the union roster has only one bot', () => {
+  const ctx = runtime()
+
+  assert.equal(ctx.__x.canCreateGroupChat([{ name: 'marvin', connectionId: 'house-of-marvin' }]), false)
+})
+
+test('group creation ignores presentation-only ghost rows', () => {
+  const ctx = runtime()
+
+  assert.equal(
+    ctx.__x.canCreateGroupChat([
+      { name: 'marvin', connectionId: 'house-of-marvin' },
+      { name: 'spark', connectionId: 'workshop', remoteSource: true, ghost: true }
+    ]),
+    false
+  )
+})
+
+test('cold Sessions roster merges This device while a remote gateway is active', async () => {
+  const ctx = runtime()
+  ctx.host.request = async (method, params) => {
+    assert.equal(method, 'profiles.list')
+    assert.deepEqual(JSON.parse(JSON.stringify(params)), { include_sessions: false })
+    return { profiles: [{ name: 'default' }] }
+  }
+  ctx.host.agents = async () => ({
+    primaryConnectionId: 'house',
+    agents: [
+      { profile: 'default', connectionId: 'house', connectionKind: 'remote', connectionLabel: 'HouseOfMarvin' },
+      { profile: 'lokay', connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', handle: 'lokay-this-device' }
+    ]
+  })
+
+  const loaded = await ctx.__x.loadMultiSourceRoster('house', { include_sessions: false })
+  const profiles = JSON.parse(JSON.stringify(loaded.profiles))
+
+  assert.equal(profiles.length, 2)
+  assert.equal(profiles[0].name, 'default')
+  assert.equal(profiles[0].connectionId, 'house')
+  assert.equal(profiles[1].name, 'lokay')
+  assert.equal(profiles[1].connectionId, 'local')
+  assert.equal(profiles[1].remoteSource, true)
+  assert.equal(profiles[1].handle, 'lokay-this-device')
 })
 
 test('groupMemberKey: local members keep bare names (persisted-room compat), remote members are source-qualified', () => {

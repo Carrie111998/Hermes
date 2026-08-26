@@ -711,7 +711,9 @@ test('resolveRosterMentions: @hermes in this chat is not a handoff to yourself',
 test('source contract: active roster queries use the SDK ambient owner route', () => {
   assert.doesNotMatch(source, /activeBotRoute/)
   assert.equal(
-    source.match(/requestForBot\(activeBot, 'profiles\.list', \{\}\)/g)?.length,
+    // Roster hydration forwards the caller's params (the mention cold path
+    // passes { include_sessions: false }); the session sweep needs none.
+    source.match(/requestForBot\(activeBot, 'profiles\.list', (?:\{\}|params)\)/g)?.length,
     2,
     'roster hydration and the session sweep must both use the upstream ambient-owner route'
   )
