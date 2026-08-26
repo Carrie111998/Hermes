@@ -15536,6 +15536,14 @@ def test_rebuild_preserves_a_keyless_row_with_no_keyed_twin(db):
     Measured on the live root state.db 2026-08-25: 18,757 keyless rows across
     66 external sessions, of which 13,062 (70%) have no keyed twin.  A
     session_id-wide delete destroyed those on every rebuild.
+
+    Those are the numbers that justify the scoping and they are left as the
+    dated measurement they were.  Live state has since moved: the other 5,695
+    -- residue with keyed twins, which this predicate deliberately leaves in
+    place -- were deleted out-of-band on 2026-08-26, so the root state.db now
+    holds 13,062 keyless rows over 60 sessions, all twinless.  The behaviour
+    pinned below is unchanged by that; see the comment on the delete in
+    session_bridge/store.py.
     """
 
     now = [100.0]
