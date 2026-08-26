@@ -1152,6 +1152,57 @@ class CredentialPool:
             logger.debug("Failed to sync xAI OAuth entry from credential pool: %s", exc)
         return entry
 
+    def _sync_anthropic_entry_from_pool_store(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        """Adopt an Anthropic token pair rotated by another pool instance.
+
+        Anthropic subscription OAuth refresh tokens are single-use — a
+        successful refresh rotates the pair and invalidates the old refresh
+        token (see ``agent/anthropic_adapter.py``).  Profiles sharing one
+        credential hold their own copy of the same pair with the same
+        ``expires_at_ms``, so they all enter the refresh window at once.
+
+        This helper is called while the shared auth-store lock is held and
+        re-reads the exact persisted row before a refresh POST is attempted,
+        so a waiter adopts the winner's rotated pair instead of POSTing a
+        token that has already been revoked.
+
+        ``claude_code`` entries keep using
+        ``_sync_anthropic_entry_from_credentials_file``: their canonical
+        store is ``~/.claude/.credentials.json``, which the Claude Code CLI
+        also writes.
+        """
+        if self.provider != "anthropic":
+            return entry
+        if entry.source == "claude_code":
+            return self._sync_anthropic_entry_from_credentials_file(entry)
+        try:
+            persisted = next(
+                (
+                    payload
+                    for payload in read_credential_pool(self.provider)
+                    if isinstance(payload, dict) and payload.get("id") == entry.id
+                ),
+                None,
+            )
+            if not isinstance(persisted, dict):
+                return entry
+            stored = PooledCredential.from_dict(self.provider, persisted)
+            if (
+                stored.access_token != entry.access_token
+                or stored.refresh_token != entry.refresh_token
+            ):
+                logger.debug(
+                    "Pool entry %s: adopting Anthropic OAuth tokens rotated by another pool instance",
+                    entry.id,
+                )
+                self._replace_entry(entry, stored)
+                return stored
+        except Exception as exc:
+            logger.debug("Failed to sync Anthropic entry from credential pool: %s", exc)
+        return entry
+
     def _sync_nous_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync a Nous pool entry from auth.json if tokens differ.
 
@@ -1373,7 +1424,7 @@ class CredentialPool:
                 self._mark_exhausted(entry, None)
             return None
 
-        # Codex and xAI OAuth refresh tokens are single-use.  The
+        # Codex, xAI, and Anthropic OAuth refresh tokens are single-use.  The
         # sync→POST→write-back sequence below must run atomically across Hermes
         # processes: otherwise two processes can both adopt the same on-disk
         # token, both POST it, and the loser gets ``refresh_token_reused``.
@@ -1382,11 +1433,20 @@ class CredentialPool:
         # resolve_codex_runtime_credentials()).  When a waiter finally acquires
         # the lock, the in-lock re-sync below picks up the rotated token the
         # winner persisted and skips the POST.
-        if self.provider in ("openai-codex", "xai-oauth"):
+        #
+        # Anthropic is included because ``anthropic_adapter`` documents the
+        # same single-use semantics ("a successful refresh rotates the pair
+        # and invalidates the old refresh token"), and profiles sharing one
+        # credential enter the refresh window simultaneously: the entries
+        # carry the same ``expires_at_ms``, so ``_entry_needs_refresh`` fires
+        # for all of them at once.
+        if self.provider in ("openai-codex", "xai-oauth", "anthropic"):
             sync_entry = (
                 self._sync_codex_entry_from_auth_store
                 if self.provider == "openai-codex"
                 else self._sync_xai_oauth_entry_from_pool_store
+                if self.provider == "xai-oauth"
+                else self._sync_anthropic_entry_from_pool_store
             )
             with _auth_store_lock(
                 timeout_seconds=self._single_use_refresh_lock_timeout()
@@ -1417,6 +1477,8 @@ class CredentialPool:
         env_var = (
             "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS"
             if self.provider == "openai-codex"
+            else "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS"
+            if self.provider == "anthropic"
             else "HERMES_XAI_REFRESH_TIMEOUT_SECONDS"
         )
         refresh_timeout_seconds = auth_mod.env_float(env_var, 20)
@@ -2019,13 +2081,15 @@ class CredentialPool:
                     entry = cleared
                     cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
-                if self.provider in ("openai-codex", "xai-oauth"):
+                if self.provider in ("openai-codex", "xai-oauth", "anthropic"):
                     # Defer single-use-token refresh to avoid holding the
                     # threading lock during cross-process flock + network I/O.
                     sync_fn = (
                         self._sync_codex_entry_from_auth_store
                         if self.provider == "openai-codex"
                         else self._sync_xai_oauth_entry_from_pool_store
+                        if self.provider == "xai-oauth"
+                        else self._sync_anthropic_entry_from_pool_store
                     )
                     pending_refresh.append((entry, sync_fn))
                     continue
