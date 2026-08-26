@@ -27,7 +27,8 @@ import {
   screen,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
@@ -219,7 +220,7 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
-import { ensureMainWindow } from './main-window-lifecycle'
+import { ensureMainWindow, focusMainWindow as focusWindow, hideMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
@@ -388,6 +389,12 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
+import {
+  shouldCreateWindowsTray,
+  shouldHideMainWindowOnClose,
+  shouldStartMainWindowHidden,
+  shouldTreatSessionEndAsFinalQuit
+} from './windows-tray-lifecycle'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -1325,6 +1332,8 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let windowsTray: Tray | null = null
+let isFinalQuitRequested = false
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -10933,6 +10942,7 @@ const backendShutdown = createBackendShutdownCoordinator(async () => {
 
 async function exitAfterBackendShutdown(code) {
   await backendShutdown.run()
+  disposeWindowsTray()
   app.exit(code)
 }
 
@@ -11514,22 +11524,6 @@ function wireWindowReveal(win, { show, onRevealed }: { show?: () => void; onReve
 // close. The primary mainWindow is never tracked here. Pure logic + the URL
 // builder live in session-windows.ts so they stay unit-testable.
 const sessionWindows = createSessionWindowRegistry()
-
-function focusWindow(win) {
-  if (!win || win.isDestroyed()) {
-    return
-  }
-
-  if (win.isMinimized()) {
-    win.restore()
-  }
-
-  if (!win.isVisible()) {
-    win.show()
-  }
-
-  win.focus()
-}
 
 function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
   const icon = getAppIconPath()
@@ -12662,7 +12656,7 @@ function closeQuickEntryWindow() {
   quickEntryWindow = null
 }
 
-function createWindow() {
+function createWindow({ startHidden = false }: { startHidden?: boolean } = {}) {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
   mainWindow = new BrowserWindow({
@@ -12722,6 +12716,10 @@ function createWindow() {
   }
 
   const revealController = wireWindowReveal(createdMainWindow, {
+    // --hidden is a Windows cold-start affordance. Mark the window's reveal
+    // lifecycle complete without showing it so ready-to-show/fallback cannot
+    // unexpectedly surface a tray-started app.
+    show: startHidden ? () => {} : undefined,
     onRevealed: () => {
       // Persist geometry as soon as the window is visible so a crash before the
       // first clean resize/move/close still captures the restored bounds (#56726).
@@ -12764,12 +12762,33 @@ function createWindow() {
   mainWindow.on('hide', () => sendWindowStateChanged())
   mainWindow.on('show', () => sendWindowStateChanged())
 
+  // Electron skips app.before-quit on Windows shutdown/restart/logout. Latch
+  // the native session-end request here so the following close event cannot be
+  // mistaken for a user clicking X and prevent the OS from ending the session.
+  if (shouldTreatSessionEndAsFinalQuit(process.platform)) {
+    mainWindow.on('query-session-end', () => {
+      isFinalQuitRequested = true
+    })
+  }
+
   // Reopen where the user left off. close is the backstop, flushed
   // synchronously before the window is gone.
   bindGeometryPersistence(mainWindow, schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
   mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', event => {
+    if (
+      shouldHideMainWindowOnClose({
+        platform: process.platform,
+        isQuitting: isFinalQuitRequested,
+        trayAvailable: Boolean(windowsTray)
+      })
+    ) {
+      event.preventDefault()
+      hideMainWindow(mainWindow)
+    }
+  })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   mainWindow.on('closed', () => {
@@ -12865,6 +12884,58 @@ function createWindow() {
     broadcastBootProgress()
     sendWindowStateChanged()
   })
+}
+
+function restoreMainWindow() {
+  ensureMainWindow(mainWindow, {
+    isReady: app.isReady(),
+    createWindow,
+    focusWindow
+  })
+}
+
+function createWindowsTray(): boolean {
+  if (!shouldCreateWindowsTray(process.platform) || windowsTray) {
+    return Boolean(windowsTray)
+  }
+
+  const icon = getAppIconPath()
+
+  if (!icon) {
+    rememberLog('[tray] app icon not found; Windows tray unavailable')
+
+    return false
+  }
+
+  let tray: Tray | null = null
+
+  try {
+    tray = new Tray(icon)
+    tray.setToolTip('Hermes')
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: 'Show Hermes', click: restoreMainWindow },
+        { label: 'Hide Hermes', click: () => hideMainWindow(mainWindow) },
+        { type: 'separator' },
+        { label: 'Quit Hermes', click: () => app.quit() }
+      ])
+    )
+    tray.on('click', restoreMainWindow)
+    tray.on('double-click', restoreMainWindow)
+    windowsTray = tray
+
+    return true
+  } catch (error) {
+    tray?.destroy()
+    rememberLog(`[tray] Windows tray creation failed: ${error?.message || error}`)
+
+    return false
+  }
+}
+
+function disposeWindowsTray() {
+  windowsTray?.destroy()
+  windowsTray = null
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => {
@@ -15707,11 +15778,7 @@ function handleDeepLink(url) {
   }
 
   try {
-    if (mainWindow.isMinimized()) {
-      mainWindow.restore()
-    }
-
-    mainWindow.focus()
+    focusWindow(mainWindow)
     mainWindow.webContents.send('hermes:deep-link', payload)
     rememberLog(`[deeplink] delivered ${kind}/${name}`)
   } catch (err) {
@@ -15864,7 +15931,14 @@ app.whenReady().then(() => {
     screen.on('display-removed', reposition)
   }
 
-  createWindow()
+  const trayAvailable = createWindowsTray()
+  createWindow({
+    startHidden: shouldStartMainWindowHidden({
+      platform: process.platform,
+      argv: process.argv,
+      trayAvailable
+    })
+  })
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
@@ -15960,6 +16034,10 @@ app.on('before-quit', event => {
     return
   }
 
+  // Main-window close events follow before-quit. Latch here so explicit quit,
+  // update/uninstall handoff, and confirmed active-work quit bypass close-to-tray.
+  isFinalQuitRequested = true
+
   if (!backendQuitTeardownDone) {
     event.preventDefault()
     void backendShutdown.run().finally(() => {
@@ -16041,6 +16119,10 @@ app.on('before-quit', event => {
   terminalIpc.disposeAllTerminalSessions()
 
   void backendShutdown.run()
+})
+
+app.on('will-quit', () => {
+  disposeWindowsTray()
 })
 
 app.on('window-all-closed', () => {

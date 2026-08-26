@@ -2,7 +2,64 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { ensureMainWindow } from './main-window-lifecycle'
+import { ensureMainWindow, focusMainWindow, hideMainWindow } from './main-window-lifecycle'
+
+test('hides only a live visible primary window', () => {
+  const calls: string[] = []
+
+  const visibleWindow = {
+    hide: () => calls.push('hide'),
+    isDestroyed: () => false,
+    isVisible: () => true
+  }
+
+  assert.equal(hideMainWindow(visibleWindow), true)
+  assert.deepEqual(calls, ['hide'])
+
+  assert.equal(
+    hideMainWindow({
+      hide: () => assert.fail('an already hidden window must not be hidden again'),
+      isDestroyed: () => false,
+      isVisible: () => false
+    }),
+    false
+  )
+  assert.equal(hideMainWindow(null), false)
+})
+
+test('reveals a tray-hidden primary window before focusing it', () => {
+  const calls: string[] = []
+
+  const hiddenWindow = {
+    focus: () => calls.push('focus'),
+    isDestroyed: () => false,
+    isMinimized: () => false,
+    isVisible: () => false,
+    restore: () => calls.push('restore'),
+    show: () => calls.push('show')
+  }
+
+  focusMainWindow(hiddenWindow)
+
+  assert.deepEqual(calls, ['show', 'focus'])
+})
+
+test('restores a minimized primary window before focusing it', () => {
+  const calls: string[] = []
+
+  const minimizedWindow = {
+    focus: () => calls.push('focus'),
+    isDestroyed: () => false,
+    isMinimized: () => true,
+    isVisible: () => true,
+    restore: () => calls.push('restore'),
+    show: () => calls.push('show')
+  }
+
+  focusMainWindow(minimizedWindow)
+
+  assert.deepEqual(calls, ['restore', 'focus'])
+})
 
 test('recreates a destroyed primary window without focusing it', () => {
   const destroyedWindow = {
