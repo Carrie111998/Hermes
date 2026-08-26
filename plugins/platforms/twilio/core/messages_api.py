@@ -1,7 +1,9 @@
 """Shared transport for Twilio's Messages.json resource. Channels build a
 list of form-field dicts (one per API call) and pass them to
-send_message_requests. Not for Voice (Calls.json) or Email (SendGrid) —
-those need their own transport module."""
+send_message_requests. Not for Voice (Calls.json) or Email
+(comms.twilio.com's JSON REST API, an entirely different request/response
+shape) — those need their own transport, built directly into their own
+channel module (see channels/email.py)."""
 
 import logging
 from typing import Any, Dict, List, Optional

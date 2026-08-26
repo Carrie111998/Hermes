@@ -1,6 +1,7 @@
 """Account SID + Auth Token resolution and Basic Auth header, shared by
-every core-Twilio (Messages API) channel. Email uses its own SendGrid
-credentials instead — see channels/email.py."""
+every channel in this plugin — including Email (its own transport is a
+different REST API, comms.twilio.com, but the same core Twilio
+credentials authenticate it; see channels/email.py)."""
 
 import base64
 import os
