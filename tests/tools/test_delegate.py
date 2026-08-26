@@ -139,6 +139,127 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
+
+class TestChildSystemPromptPersona(unittest.TestCase):
+    """Persona kwarg on _build_child_system_prompt (PR #50040).
+
+    persona is a generic authoritative role for a subagent (code-reviewer,
+    skeptic, domain-expert), not tied to any one caller.
+    """
+
+    def test_empty_persona_is_backcompat_noop(self):
+        """persona='' (and omitted) must leave the prompt byte-identical."""
+        baseline = _build_child_system_prompt("Fix the tests", "some context")
+        empty = _build_child_system_prompt(
+            "Fix the tests", "some context", persona=""
+        )
+        whitespace = _build_child_system_prompt(
+            "Fix the tests", "some context", persona="   \n  "
+        )
+        self.assertEqual(baseline, empty)
+        self.assertEqual(baseline, whitespace)
+        self.assertNotIn("AUTHORITATIVE PERSONA", baseline)
+
+    def test_persona_prepended_with_delimiter_ahead_of_goal(self):
+        """A non-empty persona rides on the system prompt with the
+        AUTHORITATIVE PERSONA delimiter, and its body appears BEFORE the
+        delegated goal (not stuffed into context)."""
+        persona_body = "You are a code-reviewer. Flag risks tersely."
+        prompt = _build_child_system_prompt(
+            "Fix the tests",
+            "some context",
+            persona=persona_body,
+        )
+        # Delimiter present.
+        self.assertIn("=== AUTHORITATIVE PERSONA ===", prompt)
+        self.assertIn("=== END PERSONA ===", prompt)
+        # The actual persona text is in the prompt (anti-tautology: not just
+        # that the kwarg was accepted, but that the body is materially there).
+        self.assertIn(persona_body, prompt)
+        # Persona body precedes the delegated goal.
+        self.assertLess(
+            prompt.index(persona_body),
+            prompt.index("Fix the tests"),
+            "persona body must appear ahead of the goal",
+        )
+        # Delimiter opens the whole prompt, before the default subagent line.
+        self.assertLess(
+            prompt.index("=== AUTHORITATIVE PERSONA ==="),
+            prompt.index("You are a focused subagent"),
+        )
+        # Goal + default guidance still present (persona augments, not
+        # replaces).
+        self.assertIn("YOUR TASK", prompt)
+        self.assertIn("some context", prompt)
+
+    def test_persona_flows_through_build_child_agent_to_prompt_builder(self):
+        """_build_child_agent forwards its persona kwarg into
+        _build_child_system_prompt (the wiring seam), so the persona lands
+        on the child's system prompt rather than being silently dropped."""
+        persona_body = "PERSONA-SENTINEL-XYZZY be brief."
+        captured = {}
+
+        real_builder = _build_child_system_prompt
+
+        class _StopBuild(Exception):
+            pass
+
+        def _spy_builder(*args, **kwargs):
+            captured["persona"] = kwargs.get("persona")
+            # Delegate to the real builder so the returned prompt is genuine.
+            prompt = real_builder(*args, **kwargs)
+            captured["prompt"] = prompt
+            # Abort the rest of _build_child_agent deterministically: we only
+            # need to prove the forward, not construct a whole AIAgent.
+            raise _StopBuild()
+
+        parent = MagicMock()
+        parent.session_id = "parent-sess"
+        parent.model = "test-model"
+        parent.api_key = "k"
+        # Depth must be a real int: _build_child_agent computes
+        # child_depth = parent._delegate_depth + 1 and compares to max_spawn.
+        parent._delegate_depth = 0
+
+        with patch(
+            "tools.delegate_tool._build_child_system_prompt",
+            side_effect=_spy_builder,
+        ):
+            with self.assertRaises(_StopBuild):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Do the thing",
+                    context=None,
+                    toolsets=None,
+                    model="test-model",
+                    max_iterations=3,
+                    task_count=1,
+                    parent_agent=parent,
+                    persona=persona_body,
+                )
+
+        # The persona kwarg was forwarded verbatim...
+        self.assertEqual(captured.get("persona"), persona_body)
+        # ...and the real builder wove it into the prompt ahead of the goal.
+        prompt = captured.get("prompt")
+        self.assertIsNotNone(prompt)
+        self.assertIn("=== AUTHORITATIVE PERSONA ===", prompt)
+        self.assertIn(persona_body, prompt)
+        self.assertLess(
+            prompt.index(persona_body), prompt.index("Do the thing")
+        )
+
+    def test_schema_exposes_persona_top_level_and_per_task(self):
+        """The model-facing schema advertises persona at both levels so the
+        LLM can actually pass it."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("persona", props)
+        self.assertEqual(props["persona"]["type"], "string")
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("persona", task_props)
+        self.assertEqual(task_props["persona"]["type"], "string")
+
+
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
@@ -263,6 +384,68 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("depth limit", result["error"].lower())
 
+    def test_single_persona_reaches_child_system_prompt(self):
+        parent = _make_mock_parent(depth=0)
+        persona = "Review security boundaries and return only findings."
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Review the authentication changes",
+                persona=persona,
+                parent_agent=parent,
+            )
+
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn(persona, prompt)
+        self.assertLess(
+            prompt.index(persona),
+            prompt.index("Review the authentication changes"),
+        )
+
+    def test_batch_persona_default_and_per_task_override_reach_children(self):
+        parent = _make_mock_parent(depth=0)
+        default_persona = "Act as a careful implementation reviewer."
+        override_persona = "Act as a skeptical test reviewer."
+
+        children = []
+        for _ in range(2):
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            children.append(child)
+
+        with patch("run_agent.AIAgent", side_effect=children) as MockAgent:
+            delegate_task(
+                tasks=[
+                    {"goal": "Review the implementation for correctness"},
+                    {
+                        "goal": "Review the test coverage for missing cases",
+                        "persona": override_persona,
+                    },
+                ],
+                persona=default_persona,
+                parent_agent=parent,
+            )
+
+        prompts = [
+            call.kwargs["ephemeral_system_prompt"]
+            for call in MockAgent.call_args_list
+        ]
+        self.assertIn(default_persona, prompts[0])
+        self.assertNotIn(override_persona, prompts[0])
+        self.assertIn(override_persona, prompts[1])
+        self.assertNotIn(default_persona, prompts[1])
 
     def test_child_inherits_runtime_credentials(self):
         parent = _make_mock_parent(depth=0)
@@ -1383,6 +1566,25 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_persona_is_forwarded_from_agent_dispatch(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "review this", "persona": "Act as a skeptic."},
+            )
+
+        self.assertEqual(captured["persona"], "Act as a skeptic.")
+
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
