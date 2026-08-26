@@ -1626,6 +1626,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Trusted caller overlay (session-approved route or credentials_cfg).
+    # Never sourced from model-facing tool arguments.
+    delegation_cfg: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1659,7 +1662,8 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
-    delegation_cfg = _load_config()
+    if delegation_cfg is None:
+        delegation_cfg = _load_config()
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -3734,12 +3738,22 @@ def delegate_task(
     # ({provider, model, base_url, api_key, api_mode}); the /review engine
     # uses it to route its reviewer subagent onto ``auxiliary.review``
     # without touching the global delegation pin.
+    from agent.delegation_session_route import (
+        consume_route,
+        overlay_delegation_cfg,
+        peek_approved_route,
+        route_metadata,
+    )
+
+    session_route = None if credentials_cfg else peek_approved_route(parent_agent)
+    spawn_cfg = overlay_delegation_cfg(
+        credentials_cfg if credentials_cfg else cfg, session_route
+    )
     try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
+        creds = _resolve_delegation_credentials(spawn_cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+    route_meta = route_metadata(session_route, creds)
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3895,6 +3909,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                delegation_cfg=spawn_cfg,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -3923,6 +3938,13 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    if session_route and children:
+        consume_route(
+            getattr(parent_agent, "_session_db", None),
+            getattr(parent_agent, "session_id", "") or "",
+            str(session_route.get("route_id") or ""),
+        )
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -4110,6 +4132,14 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        if route_meta:
+            combined["delegation_route"] = route_meta
+            for entry in results:
+                if isinstance(entry, dict):
+                    entry.setdefault("delegation_route", route_meta)
+                    effective = route_meta.get("effective") or {}
+                    if effective.get("model") and not entry.get("model"):
+                        entry["model"] = effective["model"]
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
         return combined
@@ -4341,6 +4371,8 @@ def delegate_task(
                     "task). Read or `tail -f` these paths at any time to watch "
                     "a child work while it runs."
                 )
+            if route_meta:
+                payload["delegation_route"] = route_meta
             return json.dumps(payload, ensure_ascii=False)
 
         # Pool at capacity / schedule failure — children are still attached

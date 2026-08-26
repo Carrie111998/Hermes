@@ -283,6 +283,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide|full|clamp] [--global]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
+    CommandDef("delegate-route", "Authorize a one-shot or session subagent route", "Configuration",
+               aliases=("delegate_route",),
+               args_hint="[--provider name] [--model id] [--reasoning-effort level] [--scope next|session]|clear",
+               subcommands=("clear",),
+               busy_policy="dispatch"),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status] [--global]",
                subcommands=("normal", "fast", "status", "on", "off", "--global")),
@@ -1368,7 +1373,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - delegate-route / delegate_route: one-off session delegation authorize;
+#     reached via /hermes delegate-route on Slack. A native slot would clamp
+#     /insights (or the next trailing native) off the 50-cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "delegate-route", "delegate_route"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

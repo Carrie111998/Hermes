@@ -13,9 +13,13 @@ export interface DelegateRow {
   /** Latest relayed activity, oldest → newest. The card tickers the tail. */
   activity: string[]
   durationSeconds?: number
+  /** Effective child route after clamp/resolve, when the spawn recorded one. */
+  effectiveRoute?: string
   goal: string
   id: string
   model?: string
+  /** User-authorized requested route, when it differs from or accompanies effective. */
+  requestedRoute?: string
   /** The child's own session id, when it reported one — opens its window. */
   sessionId?: string
   status: DelegateRowStatus
@@ -60,6 +64,29 @@ function settledRowStatus(status: string): DelegateRowStatus {
   return status === '' || status === 'ok' || status === 'completed' ? 'completed' : 'failed'
 }
 
+function formatRouteTuple(record: Record<string, unknown>): string {
+  const provider = field(record, 'provider')
+  const model = field(record, 'model')
+  const effort = field(record, 'reasoning_effort')
+  const pair = [provider, model].filter(Boolean).join('/')
+  return [pair, effort].filter(Boolean).join(' ')
+}
+
+function routeFromPayload(result: unknown, entry?: Record<string, unknown>): {
+  effectiveRoute?: string
+  model?: string
+  requestedRoute?: string
+} {
+  const top = parseMaybeObject(parseMaybeObject(result).delegation_route)
+  const nested = entry ? parseMaybeObject(entry.delegation_route) : {}
+  const requested = parseMaybeObject(nested.requested || top.requested)
+  const effective = parseMaybeObject(nested.effective || top.effective)
+  const requestedRoute = formatRouteTuple(requested) || undefined
+  const effectiveRoute = formatRouteTuple(effective) || undefined
+  const model = (entry && field(entry, 'model')) || field(effective, 'model') || undefined
+  return { effectiveRoute, model, requestedRoute }
+}
+
 function dispatchedGoals(result: unknown): string[] {
   const record = parseMaybeObject(result)
 
@@ -88,13 +115,16 @@ export function delegateRowsFromCall(args: unknown, result: unknown, toolCallId 
   return titles.map((goal, index) => {
     const entry = finished[index]
     const summary = entry ? field(entry, 'summary') : ''
+    const route = routeFromPayload(result, entry)
 
     return {
       activity: summary ? [summary] : [],
       durationSeconds: entry ? (numberValue(entry.duration_seconds) ?? undefined) : undefined,
+      effectiveRoute: route.effectiveRoute,
       goal,
       id: `${toolCallId}:${index}`,
-      model: entry ? field(entry, 'model') || undefined : undefined,
+      model: route.model,
+      requestedRoute: route.requestedRoute,
       status: entry ? settledRowStatus(field(entry, 'status')) : idle
     }
   })
@@ -151,7 +181,13 @@ export function mergeDelegateRows(
   return rows.map((row, index) => {
     const matched = byGoal[index] ?? (sameShape ? claim(c => c.taskIndex === index) : undefined)
 
-    return matched ? fromSubagent(matched, row.id, row.goal) : row
+    return matched
+      ? {
+          ...fromSubagent(matched, row.id, row.goal),
+          effectiveRoute: row.effectiveRoute,
+          requestedRoute: row.requestedRoute
+        }
+      : row
   })
 }
 

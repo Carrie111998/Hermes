@@ -7,6 +7,7 @@ import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
 import { parseCommandDispatch, parseSlashCommand, sessionTitle } from '@/lib/chat-runtime'
 import {
   type CommandsCatalogLike,
+  describeDelegateRouteAuthorization,
   type DesktopActionId,
   type DesktopCommandSurface,
   type DesktopPickerId,
@@ -19,6 +20,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
+import { confirm } from '@/store/confirm'
 import { applyGoalStatusText } from '@/store/goals'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
@@ -251,6 +253,24 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       // path that talks to slash.exec / command.dispatch.
       async function runExec(ctx: SlashActionCtx): Promise<void> {
         const { arg, command, name } = ctx
+
+        if (
+          (name === 'delegate-route' || name === 'delegate_route') &&
+          arg.trim() &&
+          !/^(clear|reset|off)\b/i.test(arg.trim())
+        ) {
+          const ok = await confirm({
+            title: 'Authorize subagent route',
+            description: describeDelegateRouteAuthorization(arg.trim()),
+            confirmLabel: 'Authorize',
+            cancelLabel: 'Cancel'
+          })
+
+          if (!ok) {
+            return
+          }
+        }
+
         const resolved = await withSlashOutput(ctx)
 
         if (!resolved) {

@@ -998,6 +998,25 @@ def _(rid, params: dict) -> dict:
                 },
             )
 
+    if name in {"delegate-route", "delegate_route"}:
+        from agent.delegation_session_route import (
+            DelegationRouteError,
+            handle_delegate_route_command,
+            live_session_row_id,
+        )
+
+        if session is None:
+            return _err(rid, 4004, "No live session to store a delegation route.")
+        sid_key = live_session_row_id(session)
+        try:
+            with _session_db(session) as db:
+                if db is None:
+                    return _err(rid, 4004, "Session store is unavailable.")
+                output = handle_delegate_route_command(arg, db, sid_key)
+        except DelegationRouteError as exc:
+            return _err(rid, 4004, str(exc))
+        return _ok(rid, {"type": "exec", "output": output})
+
     if name in {"compress", "compact"}:
         if not session:
             return _err(rid, 4001, "no active session to compress")

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  describeDelegateRouteAuthorization,
   desktopSkinSlashCompletions,
   desktopSlashCommandArgumentMode,
   desktopSlashDescription,
@@ -26,6 +27,21 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/approvals')).toBe(true)
     expect(isDesktopSlashCommand('/approvals')).toBe(true)
     expect(resolveDesktopCommand('/approvals')?.surface).toEqual({ kind: 'exec' })
+    expect(isDesktopSlashSuggestion('/delegate-route')).toBe(true)
+    expect(isDesktopSlashCommand('/delegate-route')).toBe(true)
+    expect(resolveDesktopCommand('/delegate-route')?.surface).toEqual({ kind: 'exec' })
+    expect(resolveDesktopCommand('/delegate_route')?.name).toBe('/delegate-route')
+  })
+
+  it('formats a confirmation card for the exact authorized tuple', () => {
+    const text = describeDelegateRouteAuthorization(
+      '--provider nous --model ox-alpha --reasoning-effort max --scope next'
+    )
+    expect(text).toContain('Provider: nous')
+    expect(text).toContain('Model: ox-alpha')
+    expect(text).toContain('Reasoning effort: max')
+    expect(text).toContain('next delegation only')
+    expect(text).toContain('parent conversation stays on its current model')
   })
 
   it('surfaces skill and quick commands (extensions) in suggestions and lets them run', () => {

@@ -17801,6 +17801,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
+        if canonical == "delegate-route":
+            return await self._handle_delegate_route_command(event)
 
         if canonical == "memory":
             return await self._handle_memory_command(event)

@@ -3775,6 +3775,24 @@ class GatewaySlashCommandsMixin:
             logger.warning("send_choice_picker failed, falling back to text: %s", e)
             return False
 
+    async def _handle_delegate_route_command(self, event: MessageEvent) -> Optional[str]:
+        """Authorize or inspect a user-owned session delegation route."""
+        from agent.delegation_session_route import (
+            DelegationRouteError,
+            handle_delegate_route_command,
+        )
+
+        raw_args = event.get_command_args().strip()
+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_id = str(getattr(session_entry, "session_id", "") or "")
+        wrapper = getattr(self, "_session_db", None)
+        db = getattr(wrapper, "_db", wrapper)
+        try:
+            return handle_delegate_route_command(raw_args, db, session_id)
+        except DelegationRouteError as exc:
+            return str(exc)
+
     async def _handle_reasoning_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 

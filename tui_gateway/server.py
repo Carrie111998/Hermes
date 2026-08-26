@@ -14557,6 +14557,8 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     {
         "clear",
         "compress",
+        "delegate-route",
+        "delegate_route",
         "effort",
         "history",
         "models",
@@ -14853,6 +14855,23 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         return "Use /title <name> to rename this session."
     if name == "effort":
         return "Use /reasoning <effort> to change reasoning effort."
+    if name in {"delegate-route", "delegate_route"}:
+        from agent.delegation_session_route import (
+            DelegationRouteError,
+            handle_delegate_route_command,
+            live_session_row_id,
+        )
+
+        if session is None:
+            return "No live session to store a delegation route."
+        sid_key = live_session_row_id(session)
+        try:
+            with _session_db(session) as db:
+                if db is None:
+                    return "Session store is unavailable."
+                return handle_delegate_route_command(arg, db, sid_key)
+        except DelegationRouteError as exc:
+            return str(exc)
     return None
 
 
