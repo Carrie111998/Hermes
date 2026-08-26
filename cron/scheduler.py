@@ -6597,6 +6597,23 @@ def run_job(
         
         logger.info("Job '%s' completed successfully", job_name)
 
+        # Persist provider-reported model identity per job. This is deliberately
+        # in the shared scheduler path, after run_conversation returns, so
+        # ticker, manual, background, and external-provider fires all use the
+        # same sink. The observer is fail-open and never changes job outcome.
+        try:
+            from cron.served_model_observability import record_served_model
+            _served_model = getattr(agent, "_last_response_model", None)
+            if not isinstance(_served_model, str) or not _served_model.strip():
+                _served_model = result.get("response_model") or result.get("model") or model
+            record_served_model(
+                job_id,
+                requested_model=model,
+                served_model=_served_model,
+            )
+        except Exception:
+            logger.warning("Job '%s': served-model observability failed", job_id, exc_info=True)
+
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
         _audit_response_silent = _is_cron_silence_response(final_response or "")

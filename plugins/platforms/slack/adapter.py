@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
 import aiohttp
+from aiohttp import WSMsgType
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -1235,6 +1236,40 @@ class SlackAdapter(BasePlatformAdapter):
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
 
+        async def _raw_socket_message_trace(message) -> None:
+            # Lowest-level Socket Mode receive trace: this callback is attached
+            # directly to the SDK client before Bolt's queue/dispatch path.
+            # Do not log payload text or secrets; never let tracing affect flow.
+            try:
+                raw_type = getattr(message, "type", None)
+                raw_data = getattr(message, "data", None)
+                envelope_type = None
+                event_type = None
+                event_id = None
+                if raw_type == WSMsgType.TEXT and isinstance(raw_data, str):
+                    try:
+                        parsed = json.loads(raw_data)
+                        if isinstance(parsed, dict):
+                            envelope_type = parsed.get("type")
+                            event_id = parsed.get("event_id")
+                            payload = parsed.get("payload")
+                            if isinstance(payload, dict):
+                                event = payload.get("event")
+                                if isinstance(event, dict):
+                                    event_type = event.get("type")
+                    except Exception:
+                        pass
+                logger.info(
+                    "[Slack][RAW_SOCKET] frame_received frame_type=%s "
+                    "envelope_type=%s event_type=%s event_id=%s",
+                    raw_type, envelope_type, event_type, event_id,
+                )
+            except Exception:
+                # Diagnostic logging must be non-interfering under all inputs.
+                return
+
+        self._handler.client.on_message_listeners.append(_raw_socket_message_trace)
+
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         self._socket_handler_started_monotonic = time.monotonic()
@@ -1997,6 +2032,18 @@ class SlackAdapter(BasePlatformAdapter):
             # Register message event handler
             @self._app.event("message")
             async def handle_message_event(event, say, body):
+                # Raw receive trace: intentionally before routing, filtering,
+                # deduplication, or handler logic. Keep payload redacted to
+                # avoid writing message contents or secrets to the log.
+                logger.info(
+                    "[Slack][RAW_EVENT] envelope_received keys=%s event_type=%s "
+                    "event_id=%s channel=%s user=%s",
+                    sorted(body.keys()) if isinstance(body, dict) else type(body).__name__,
+                    event.get("type") if isinstance(event, dict) else None,
+                    body.get("event_id") if isinstance(body, dict) else None,
+                    event.get("channel") if isinstance(event, dict) else None,
+                    event.get("user") if isinstance(event, dict) else None,
+                )
                 await self._handle_slack_message(event, body)
 
             # Handle app_mention explicitly. In some Slack app configurations,
@@ -5748,6 +5795,14 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
         """Handle an incoming Slack message event."""
+        def _trace(step: str, **fields: Any) -> None:
+            """Trace routing decisions without recording message contents."""
+            safe = {k: v for k, v in fields.items() if k not in {"text", "message"}}
+            logger.info("[Slack][TRACE] %s %s", step, safe)
+
+        _trace("handler_enter", event_type=event.get("type"), subtype=event.get("subtype"),
+               channel=event.get("channel"), user=event.get("user"),
+               has_payload=isinstance(payload, dict))
         # DEBUG entry log — fires BEFORE any filtering so users debugging
         # bot-to-bot interop, allow_bots config, or SLACK_ALLOWED_USERS
         # drops can confirm whether the event actually arrived from Slack
@@ -5771,8 +5826,10 @@ class SlackAdapter(BasePlatformAdapter):
                 event.get("thread_ts", ""),
             )
         if event.get("subtype") == "message_changed":
+            _trace("branch_message_changed")
             updated_message = event.get("message")
             if not isinstance(updated_message, dict):
+                _trace("drop_invalid_changed_message")
                 return
 
             original_message_ts = str(updated_message.get("ts") or "")
@@ -5780,6 +5837,7 @@ class SlackAdapter(BasePlatformAdapter):
                 original_message_ts
                 and original_message_ts in self._processed_message_ts
             ):
+                _trace("drop_changed_already_processed", original_message_ts=original_message_ts)
                 return
             edited = updated_message.get("edited")
             edited_ts = ""
@@ -5810,12 +5868,15 @@ class SlackAdapter(BasePlatformAdapter):
         # must not suppress each other.
         event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
         dedup_team_id = self._event_team_id(event, payload)
+        _trace("dedup_check", event_ts=event_ts, team_id=dedup_team_id)
         if event_ts and self._dedup.is_duplicate(
             self._workspace_event_id(dedup_team_id, event_ts)
         ):
+            _trace("drop_dedup_duplicate")
             return
 
         channel_id = event.get("channel", "")
+        _trace("ignored_channel_check", channel=channel_id)
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return
@@ -5835,16 +5896,28 @@ class SlackAdapter(BasePlatformAdapter):
         # real human-authored Slack messages normally carry client_msg_id;
         # bot/app-originated events that slip past the markers often do not.
         msg_user = event.get("user", "")
+        _bode_user_id = "U0BD1BUEWJD"
+        # Evaluate the verified underlying Slack identity before bot policy.
+        # Claude's relay may mark Bode's event as app/bot-authored while
+        # preserving Bode's real user ID.
+        _bode_relay = msg_user == _bode_user_id
         sender_is_bot = self._event_declares_bot_sender(event)
-        if not sender_is_bot and msg_user and not event.get("client_msg_id"):
+        _trace("bot_marker_check", user=msg_user, sender_is_bot=sender_is_bot,
+               bode_relay=_bode_relay,
+               has_client_msg_id=bool(event.get("client_msg_id")))
+        if not sender_is_bot and not _bode_relay and msg_user and not event.get("client_msg_id"):
             sender_is_bot = await self._resolve_user_is_bot(
                 msg_user,
                 chat_id=event.get("channel", ""),
                 team_id=str(event.get("team") or event.get("team_id") or ""),
             )
-        if sender_is_bot:
+            _trace("bot_user_lookup_complete", user=msg_user, sender_is_bot=sender_is_bot)
+        if sender_is_bot and not _bode_relay:
             allow_bots = self._slack_allow_bots()
+            _trace("bot_policy_check", allow_bots=allow_bots,
+                   is_self=bool(msg_user and self._bot_user_id and msg_user == self._bot_user_id))
             if allow_bots == "none":
+                _trace("drop_bot_policy_none")
                 return
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
@@ -5860,11 +5933,15 @@ class SlackAdapter(BasePlatformAdapter):
             # Always ignore our own messages to prevent echo loops
             if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
                 return
+        elif _bode_relay:
+            _trace("bot_policy_bypassed_verified_bode_identity", user=msg_user)
 
         # Ignore message deletions. Edits are normalized above so an @mention
         # added by edit can still wake the bot once.
         subtype = event.get("subtype")
+        _trace("subtype_check", subtype=subtype)
         if subtype == "message_deleted":
+            _trace("drop_message_deleted")
             return
 
         original_text = event.get("text", "")
@@ -6034,6 +6111,9 @@ class SlackAdapter(BasePlatformAdapter):
         # case earns the DM exemptions; session/thread scoping below still treats
         # both as DM-style persistent conversations.
         is_one_to_one_dm = channel_type == "im"
+        _trace("dm_policy_state", channel=channel_id, channel_type=channel_type,
+               is_dm=is_dm, is_one_to_one_dm=is_one_to_one_dm,
+               dms_disabled=self._slack_disable_dms())
 
         # Reject unauthorized users before thread lookups, name resolution,
         # or file downloads.  The final gateway runner auth check happens
@@ -6152,13 +6232,21 @@ class SlackAdapter(BasePlatformAdapter):
                     chat_id=channel_id,
                     team_id=team_id,
                 )
-            if sender_is_bot_user:
+            if sender_is_bot_user and user_id != "U0BD1BUEWJD":
                 allow_bots = self._slack_allow_bots()
+                _trace("resolved_bot_policy_check", user=user_id, allow_bots=allow_bots)
                 if allow_bots == "none":
+                    _trace("drop_resolved_bot_policy_none")
                     return
                 if allow_bots == "mentions" and not is_mentioned:
+                    _trace("drop_resolved_bot_policy_mentions")
                     return
+            elif user_id == "U0BD1BUEWJD":
+                _trace("resolved_bot_policy_bypassed_verified_bode_identity", user=user_id)
 
+        _trace("routing_policy_state", one_to_one_dm=is_one_to_one_dm,
+               bot_uid=bot_uid, is_mentioned=is_mentioned,
+               force_process=force_process)
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
@@ -6274,6 +6362,8 @@ class SlackAdapter(BasePlatformAdapter):
                 and not self._slack_thread_require_mention()
             ):
                 self._register_mentioned_thread(thread_ts, team_id=team_id)
+
+        _trace("routing_checks_passed", channel=channel_id, user=user_id)
 
         # Thread context rules:
         # - First message in a thread session (cold start): hydrate full
@@ -6700,13 +6790,16 @@ class SlackAdapter(BasePlatformAdapter):
             msg_type = MessageType.COMMAND
 
         # Resolve user display name (cached after first lookup)
+        _trace("before_user_name_resolution", user=user_id)
         user_name = await self._resolve_user_name(
             user_id, chat_id=channel_id, team_id=team_id
         )
 
         # Resolve channel display name (cached after first lookup) so logs
         # and agent context show #channel / peer names instead of raw IDs.
+        _trace("user_name_resolved", user=user_id)
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        _trace("channel_name_resolved", channel=channel_id)
 
         # Slack's AI Agent Messages tab shows visible app threads; title the
         # first DM thread turn from the user's prompt when Slack AI APIs are
@@ -6797,6 +6890,7 @@ class SlackAdapter(BasePlatformAdapter):
             text, chat_id=channel_id, team_id=team_id
         )
 
+        _trace("before_message_event_build", channel=channel_id, user=user_id)
         msg_event = MessageEvent(
             text=(command_probe_text if is_command_text else text),
             message_type=msg_type,
@@ -6860,7 +6954,9 @@ class SlackAdapter(BasePlatformAdapter):
                 )[-self._PROCESSED_MESSAGE_TS_MAX :]
                 self._processed_message_ts = dict(newest_items)
 
+        _trace("message_event_built", message_id=ts, channel=channel_id, user=user_id)
         await self.handle_message(msg_event)
+        _trace("handle_message_returned", message_id=ts)
 
     # ----- Approval button support (Block Kit) -----
 

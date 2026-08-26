@@ -6757,6 +6757,12 @@ def run_conversation(
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
+            # Retain the provider-reported model for the shared cron
+            # scheduler's post-run served-model audit. This is updated on every
+            # successful API response, including fallback responses.
+            _response_model = getattr(response, "model", None)
+            if isinstance(_response_model, str) and _response_model.strip():
+                agent._last_response_model = _response_model.strip()
             assistant_message = normalized
             finish_reason = normalized.finish_reason
             

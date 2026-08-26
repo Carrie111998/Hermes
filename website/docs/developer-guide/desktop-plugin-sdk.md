@@ -433,15 +433,13 @@ its own design. Non-HTML targets and remote gateways fall back to the
 classic preview card. Tell the agent about your directive in a skill (that's
 how it learns to emit it).
 
-Previewed widgets can also **talk back**. Inside the frame,
-`window.hermes.send('get-price eth')` (or a declarative
-`<button data-hermes-send="get-price eth">` — no script needed) hands that
-prompt to the agent as a user turn, off-screen: no bubble takes up the
-transcript, the widget updating is the visible response. The turn is still
-real — it wakes the agent, rides the composer's steer/queue rules, and
-persists (typed `hidden`) so resume and the session DB keep the full record.
-Prompts are trimmed, capped at 500 chars, and throttled to one per second
-per frame.
+Previewed widgets are display-only. They may not call into the composer, submit
+hidden prompts, or use a `window.hermes` bridge. Any action that should send a
+prompt must be implemented as a normal, visible control in the host application
+with an explicit user confirmation; `window.hermes.send` and
+`data-hermes-send` are not supported by the desktop preview sandbox. The frame
+is intentionally isolated so agent-generated HTML cannot silently wake the
+agent or create hidden user turns.
 
 ### Mount-scoped chrome (`Contribute`)
 

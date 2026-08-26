@@ -109,24 +109,17 @@ export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
   return resolveMediaDisplaySrc(path)
 }
 
-// Resolve a media path to a URL the shell can open. Remote mode rewrites
-// gateway-local paths to an authenticated /api/files/download URL (the file
-// lives on the gateway, not this disk); local mode keeps the file:// form.
+// Resolve a local/public media path to a URL the shell can open. Remote
+// gateway-local downloads use the authenticated Electron bridge instead of a
+// URL, so this helper never serializes gateway credentials.
 export function mediaExternalUrl(path: string): string {
   if (/^https?:/i.test(path)) {
     return path
   }
 
-  if (isRemoteGateway()) {
-    const conn = $connection.get()
-
-    if (conn?.baseUrl && conn.token) {
-      const file = encodeURIComponent(filePathFromMediaPath(path))
-
-      return `${conn.baseUrl}/api/files/download?path=${file}&token=${encodeURIComponent(conn.token)}`
-    }
-  }
-
+  // Never put gateway credentials in a URL. Remote downloads use the
+  // authenticated Electron saveGatewayFile bridge instead; this helper is only
+  // for local file URLs and already-public HTTP(S) URLs.
   return /^file:/i.test(path) ? path : `file://${path}`
 }
 

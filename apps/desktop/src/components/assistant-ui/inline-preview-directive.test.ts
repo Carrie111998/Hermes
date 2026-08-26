@@ -101,37 +101,18 @@ describe('frameSizeFromMessage', () => {
 })
 
 describe('intentFromMessage', () => {
-  const msg = (over: Record<string, unknown> = {}) => ({
-    type: 'hermes-inline-preview-intent',
-    token: 'tok',
-    prompt: 'get-price eth',
-    ...over
-  })
-
-  it('accepts our intent with our token, trimmed', () => {
-    expect(intentFromMessage(msg(), 'tok')).toBe('get-price eth')
-    expect(intentFromMessage(msg({ prompt: '  hi  ' }), 'tok')).toBe('hi')
-  })
-
-  it('caps runaway prompts to a sentence-sized budget', () => {
-    expect(intentFromMessage(msg({ prompt: 'x'.repeat(9000) }), 'tok')).toHaveLength(500)
-  })
-
-  it('rejects wrong token, wrong type, empty, and hostile shapes', () => {
-    expect(intentFromMessage(msg({ token: 'stolen' }), 'tok')).toBeNull()
-    expect(intentFromMessage(msg({ type: 'hermes-inline-preview-size' }), 'tok')).toBeNull()
-    expect(intentFromMessage(msg({ prompt: '   ' }), 'tok')).toBeNull()
-    expect(intentFromMessage(msg({ prompt: 42 }), 'tok')).toBeNull()
-    expect(intentFromMessage(null, 'tok')).toBeNull()
+  it('rejects every preview intent because previews are display-only', () => {
+    expect(intentFromMessage({ type: 'hermes-inline-preview-intent', token: 'tok', prompt: 'get-price eth' }, 'tok', true)).toBeNull()
+    expect(intentFromMessage({ type: 'hermes-inline-preview-intent', token: 'tok', prompt: 'get-price eth' }, 'tok')).toBeNull()
   })
 })
 
 describe('withInlineChrome intent wiring', () => {
-  it('injects hermes.send and the data-hermes-send click bridge', () => {
+  it('does not expose a prompt bridge to preview content', () => {
     const framed = withInlineChrome('<html><body><h1>w</h1></body></html>', 'tok', '')
 
-    expect(framed).toContain('window.hermes={send:send}')
-    expect(framed).toContain('data-hermes-send')
-    expect(framed).toContain('hermes-inline-preview-intent')
+    expect(framed).not.toContain('window.hermes={send:send}')
+    expect(framed).not.toContain('data-hermes-send')
+    expect(framed).not.toContain('hermes-inline-preview-intent')
   })
 })

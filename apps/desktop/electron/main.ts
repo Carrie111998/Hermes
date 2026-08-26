@@ -32,6 +32,8 @@ import {
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
+import { allowedFsRoots, assertRealPathWithinRoots, pathFromScopeInput } from './fs-scope'
+import { openExternalUrlForPlatform } from './external-url'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
   type BackendOutputTail,
@@ -1330,7 +1332,8 @@ function registerMediaProtocol() {
       })
     },
     resolveLocalFile: async filePath => {
-      const { resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' })
+      const scoped = assertRealPathWithinRoots(filePath, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'Media stream')
+      const { resolvedPath } = await resolveReadableFileForIpc(scoped, { purpose: 'Media stream' })
 
       return resolvedPath
     },
@@ -1342,6 +1345,7 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+const userSelectedAttachmentPaths = new Set<string>()
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -1629,7 +1633,11 @@ function openExternalUrl(rawUrl) {
     let localPath
 
     try {
-      localPath = resolveRequestedPathForIpc(parsed.toString(), { purpose: 'Open external file' })
+      localPath = assertRealPathWithinRoots(
+        parsed.toString(),
+        allowedFsRoots(HERMES_HOME, resolveHermesCwd()),
+        'Open external file'
+      )
     } catch {
       return false
     }
@@ -1662,20 +1670,12 @@ function openExternalUrl(rawUrl) {
 
   if (IS_WSL) {
     rememberLog(`[link] opening via WSL→Windows: ${url}`)
-
-    const proc = spawn('cmd.exe', ['/c', 'start', '""', url], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true
+    return openExternalUrlForPlatform(url, {
+      isWsl: true,
+      spawn,
+      shellOpenExternal: target => shell.openExternal(target),
+      onError: error => rememberLog(`[link] WSL opener failed: ${error instanceof Error ? error.message : String(error)}`)
     })
-
-    proc.on('error', error => {
-      rememberLog(`[link] cmd.exe start failed: ${error.message}; falling back to xdg-open`)
-      shell.openExternal(url).catch(fallback => rememberLog(`[link] xdg-open failed: ${fallback.message}`))
-    })
-    proc.unref()
-
-    return true
   }
 
   shell.openExternal(url).catch(error => rememberLog(`[link] openExternal failed: ${error.message}`))
@@ -1702,7 +1702,11 @@ async function openPreviewInBrowser(rawUrl) {
     let localPath
 
     try {
-      localPath = resolveRequestedPathForIpc(parsed.toString(), { purpose: 'Open preview in browser' })
+      localPath = assertRealPathWithinRoots(
+        parsed.toString(),
+        allowedFsRoots(HERMES_HOME, resolveHermesCwd()),
+        'Open preview in browser'
+      )
     } catch {
       return false
     }
@@ -5726,7 +5730,8 @@ async function resourceBufferFromUrl(rawUrl) {
   }
 
   if (/^file:/i.test(rawUrl)) {
-    const { resolvedPath } = await resolveReadableFileForIpc(rawUrl, { purpose: 'Image file' })
+    const scoped = assertRealPathWithinRoots(rawUrl, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'Image file')
+    const { resolvedPath } = await resolveReadableFileForIpc(scoped, { purpose: 'Image file' })
     const buffer = await fs.promises.readFile(resolvedPath)
 
     return { buffer, mimeType: mimeTypeForPath(resolvedPath) }
@@ -5838,10 +5843,13 @@ async function previewFileTarget(rawTarget, baseDir) {
     baseDir: base,
     purpose: 'Preview target'
   })
+  resolved = assertRealPathWithinRoots(resolved, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'Preview target')
 
   if (directoryExists(resolved)) {
     resolved = path.join(resolved, 'index.html')
   }
+
+  resolved = assertRealPathWithinRoots(resolved, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'Preview target')
 
   const ext = path.extname(resolved).toLowerCase()
 
@@ -5916,7 +5924,9 @@ async function normalizePreviewTarget(rawTarget, baseDir) {
 }
 
 async function filePathFromPreviewUrl(rawUrl) {
-  const { resolvedPath } = await resolveReadableFileForIpc(String(rawUrl || ''), { purpose: 'Preview file' })
+  const rawPath = String(rawUrl || '')
+  const scoped = assertRealPathWithinRoots(rawPath, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'Preview file')
+  const { resolvedPath } = await resolveReadableFileForIpc(scoped, { purpose: 'Preview file' })
 
   return resolvedPath
 }
@@ -6012,7 +6022,11 @@ function requestOptionsWithHeaders(options: any = {}, headers = {}) {
  *  (the renderer reconciles on any tick; per-file edits stay on their own
  *  watches), so stopPreviewFileWatch/closePreviewWatchers manage these too. */
 function watchDirectory(rawDir) {
-  const watchDir = path.resolve(String(rawDir || ''))
+  const watchDir = assertRealPathWithinRoots(
+    String(rawDir || ''),
+    allowedFsRoots(HERMES_HOME, resolveHermesCwd()),
+    'Directory watch'
+  )
 
   if (!fs.existsSync(watchDir) || !fs.statSync(watchDir).isDirectory()) {
     throw new Error(`Not a directory: ${watchDir}`)
@@ -15018,9 +15032,10 @@ ipcMain.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
 })
 
 ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
-  return readFileDataUrlForIpc(filePath, {
+  const scoped = assertRealPathWithinRoots(filePath, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'File preview')
+  return readFileDataUrlForIpc(scoped, {
     maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb),
-    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'File preview' })),
+    mimeType: mimeTypeForPath(scoped),
     purpose: 'File preview'
   })
 })
@@ -15030,15 +15045,33 @@ ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
 // can exceed the default 16 MiB preview ceiling (and still fit the gateway
 // WebSocket frame limit after base64 expansion).
 ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
-  return readFileDataUrlForIpc(filePath, {
+  const roots = [...allowedFsRoots(HERMES_HOME, resolveHermesCwd())]
+  const candidate = path.resolve(pathFromScopeInput(String(filePath || '')))
+  const isInRoot = roots.some(root => candidate === root || candidate.startsWith(`${root}${path.sep}`))
+  let scoped: string
+
+  if (isInRoot) {
+    scoped = assertRealPathWithinRoots(candidate, roots, 'Attachment upload')
+  } else {
+    if (!userSelectedAttachmentPaths.has(candidate)) {
+      throw new Error('Attachment upload is not an explicitly selected file')
+    }
+    const selectedStat = fs.lstatSync(candidate)
+    if (selectedStat.isSymbolicLink()) {
+      throw new Error('Attachment upload does not permit symbolic links')
+    }
+    scoped = candidate
+  }
+  return readFileDataUrlForIpc(scoped, {
     maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
-    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
+    mimeType: mimeTypeForPath(scoped),
     purpose: 'Attachment upload'
   })
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
-  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
+  const scoped = assertRealPathWithinRoots(filePath, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'Text preview')
+  const { resolvedPath, stat } = await resolveReadableFileForIpc(scoped, {
     maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
     purpose: 'Text preview'
   })
@@ -15073,7 +15106,9 @@ ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
 const PLUGIN_SOURCE_MAX_BYTES = 16 * 1024 * 1024
 
 ipcMain.handle('hermes:readPluginSource', async (_event: unknown, filePath: unknown) => {
-  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
+  const rawPath = typeof filePath === 'string' ? filePath : ''
+  const scoped = assertRealPathWithinRoots(rawPath, allowedFsRoots(HERMES_HOME, resolveHermesCwd()), 'Plugin source')
+  const { resolvedPath, stat } = await resolveReadableFileForIpc(scoped, {
     maxBytes: PLUGIN_SOURCE_MAX_BYTES,
     purpose: 'Plugin source'
   })
@@ -15118,6 +15153,16 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
 
   if (result.canceled) {
     return []
+  }
+
+  if (!options?.directories) {
+    for (const selected of result.filePaths) {
+      try {
+        userSelectedAttachmentPaths.add(path.resolve(selected))
+      } catch {
+        // Selection is still returned; the subsequent bounded read will fail closed.
+      }
+    }
   }
 
   return result.filePaths
@@ -15665,6 +15710,7 @@ ipcMain.on('hermes:logs:renderer-error', (_event, report) => {
 registerFsIpc({
   hermesHome: HERMES_HOME,
   readActiveDesktopProfile,
+  activeWorkspaceRoot: resolveHermesCwd,
   expandUserPath,
   resolveRequestedPathForIpc,
   directoryExists,
