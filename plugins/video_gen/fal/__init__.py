@@ -616,10 +616,10 @@ def _build_payload(
     # Keys the family's image-to-video endpoint rejects outright (e.g.
     # Seedance 2.5 / MiniMax H3 derive aspect_ratio from the input image).
     if image_url and not keyframes and not end_image_url:
-        for key in family.get("image_drop_keys", ()):  # type: ignore[assignment]
+        for key in family.get("image_drop_keys", ()):
             payload.pop(key, None)
     if draft:
-        for key in family.get("draft_drop_keys", ()):  # type: ignore[assignment]
+        for key in family.get("draft_drop_keys", ()):
             payload.pop(key, None)
 
     # Constant keys the endpoint requires on every request (e.g. MiniMax
@@ -881,6 +881,10 @@ class FALVideoGenProvider(VideoGenProvider):
                 "price": meta["price"],
                 "tier": meta.get("tier", "premium"),
                 "modalities": modalities,
+                # Config may store a full FAL endpoint rather than the family
+                # id. The generic dynamic schema uses these aliases to recover
+                # the active family's exact capabilities and guidance.
+                "aliases": list(_family_endpoints(meta)),
             }
             durs = meta.get("durations")
             if durs:
