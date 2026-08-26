@@ -15,6 +15,7 @@ interface ConversationOptions {
 }
 
 interface RecorderOptions {
+  focusInput: () => void
   onTranscript: (text: string) => void
 }
 
@@ -99,12 +100,14 @@ describe('useComposerVoice session-transition lifecycle', () => {
     hook.rerender({ disabled: true, submissionKey: 'session-b' })
     expect(mocks.conversationOptions?.enabled).toBe(false)
     hook.rerender({ disabled: false, submissionKey: 'session-b' })
+    expect(mocks.conversationOptions?.enabled).toBe(false)
 
     act(() => hook.result.current.startConversation())
     expect(mocks.conversationOptions?.enabled).toBe(true)
 
     await act(async () => {
       recorderA.onTranscript('dictation from A')
+      recorderA.focusInput()
       await conversationA.onSubmit('spoken turn from A')
       await conversationA.onInterrupt?.()
       conversationA.onFatalError?.()

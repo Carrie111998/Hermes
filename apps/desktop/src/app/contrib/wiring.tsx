@@ -597,7 +597,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
   }, [startSessionInWorkspace, startWorkSessionRequest])
 
-  const composer = useComposerActions({ activeSessionId, currentCwd, requestGateway })
+  const composer = useComposerActions({
+    activeSessionId,
+    composerScopeKey: routedSessionId ?? routeToken,
+    currentCwd,
+    requestGateway
+  })
 
   const branchInNewChat = useCallback(
     async (messageId?: string) => {

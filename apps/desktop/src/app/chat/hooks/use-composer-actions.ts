@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useRef } from 'react'
 
 import { requestComposerFocus, requestComposerInsert, requestComposerInsertRefs } from '@/app/chat/composer/focus'
 import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
@@ -289,6 +289,7 @@ const MAIN_ACTIONS_SCOPE: ComposerActionsScope = {
 
 interface ComposerActionsOptions {
   activeSessionId: string | null
+  composerScopeKey?: string | null
   currentCwd: string
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   scope?: ComposerActionsScope
@@ -296,28 +297,47 @@ interface ComposerActionsOptions {
 
 export function useComposerActions({
   activeSessionId,
+  composerScopeKey = activeSessionId,
   currentCwd,
   requestGateway,
   scope = MAIN_ACTIONS_SCOPE
 }: ComposerActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
+  const actionEpochRef = useRef({ key: composerScopeKey, value: 0 })
+
+  if (actionEpochRef.current.key !== composerScopeKey) {
+    actionEpochRef.current = { key: composerScopeKey, value: actionEpochRef.current.value + 1 }
+  }
+
+  const renderActionEpoch = actionEpochRef.current.value
+  const actionIsCurrent = useCallback(() => actionEpochRef.current.value === renderActionEpoch, [renderActionEpoch])
 
   /** Add to this scope's composer and focus it. All sidebar/picker/drop
    *  attach paths funnel through here. */
   const attachToMain = useCallback(
     (attachment: ComposerAttachment) => {
+      if (!actionIsCurrent()) {
+        return
+      }
+
       scope.add(attachment)
       requestComposerFocus(scope.target)
     },
-    [scope]
+    [actionIsCurrent, scope]
   )
 
   const addTextToDraft = useCallback((text: string) => {
-    requestComposerInsert(text, { mode: 'block' })
-  }, [])
+    if (actionIsCurrent()) {
+      requestComposerInsert(text, { mode: 'block' })
+    }
+  }, [actionIsCurrent])
 
   const addTerminalSelectionAttachment = useCallback((text: string, label = 'selection') => {
+    if (!actionIsCurrent()) {
+      return
+    }
+
     const trimmed = text.trim()
     const normalizedLabel = label.trim() || 'selection'
     const refText = `@terminal:${formatRefValue(normalizedLabel)}`
@@ -328,7 +348,7 @@ export function useComposerActions({
 
     setComposerTerminalSelection(normalizedLabel, trimmed)
     requestComposerInsert(refText, { mode: 'inline' })
-  }, [])
+  }, [actionIsCurrent])
 
   const addContextRefAttachment = useCallback(
     (refText: string, label?: string, detail?: string) => {
@@ -356,6 +376,10 @@ export function useComposerActions({
   // downgrades to a plain `url` attachment so the paste is never lost.
   const attachPrCommentUrl = useCallback(
     (url: string): boolean => {
+      if (!actionIsCurrent()) {
+        return false
+      }
+
       const id = attachmentId('review', url)
       const refText = `@url:${formatRefValue(url)}`
 
@@ -374,6 +398,10 @@ export function useComposerActions({
               .catch(() => null) ?? null)
           : null
 
+        if (!actionIsCurrent()) {
+          return
+        }
+
         if (comment) {
           scope.update({
             id,
@@ -391,7 +419,7 @@ export function useComposerActions({
 
       return true
     },
-    [attachToMain, currentCwd, scope]
+    [actionIsCurrent, attachToMain, currentCwd, scope]
   )
 
   const pickContextPaths = useCallback(
@@ -402,7 +430,7 @@ export function useComposerActions({
         directories: kind === 'folder'
       })
 
-      if (!paths?.length) {
+      if (!actionIsCurrent() || !paths?.length) {
         return
       }
 
@@ -419,12 +447,12 @@ export function useComposerActions({
         })
       }
     },
-    [attachToMain, currentCwd]
+    [actionIsCurrent, attachToMain, currentCwd]
   )
 
   const insertContextPathInlineRef = useCallback(
     (path: string, isDirectory = false) => {
-      if (!path) {
+      if (!actionIsCurrent() || !path) {
         return false
       }
 
@@ -439,12 +467,12 @@ export function useComposerActions({
 
       return true
     },
-    [currentCwd, scope.target]
+    [actionIsCurrent, currentCwd, scope.target]
   )
 
   const attachContextFilePath = useCallback(
     (filePath: string) => {
-      if (!filePath) {
+      if (!actionIsCurrent() || !filePath) {
         return false
       }
 
@@ -461,12 +489,12 @@ export function useComposerActions({
 
       return true
     },
-    [attachToMain, currentCwd]
+    [actionIsCurrent, attachToMain, currentCwd]
   )
 
   const attachImagePath = useCallback(
     async (filePath: string) => {
-      if (!filePath) {
+      if (!actionIsCurrent() || !filePath) {
         return false
       }
 
@@ -484,7 +512,7 @@ export function useComposerActions({
       try {
         const { previewUrl, thumbnailUrl } = await queuedAttachmentPreview(filePath)
 
-        if (previewUrl) {
+        if (actionIsCurrent() && previewUrl) {
           // Keep only the bounded thumbnail in composer state. The full source
           // is read on demand for lightbox/download and separately at submit
           // for the model, so retaining 72 multi-MB data URLs serves no purpose.
@@ -495,14 +523,14 @@ export function useComposerActions({
           scope.updateIfCurrent(baseAttachment, thumbnailUrl ? { thumbnailUrl } : { previewUrl })
         }
 
-        return true
+        return actionIsCurrent()
       } catch (err) {
         notifyError(err, copy.imagePreviewFailed)
 
-        return true
+        return actionIsCurrent()
       }
     },
-    [attachToMain, copy.imagePreviewFailed, scope]
+    [actionIsCurrent, attachToMain, copy.imagePreviewFailed, scope]
   )
 
   const attachImageBlob = useCallback(
@@ -517,8 +545,17 @@ export function useComposerActions({
 
       try {
         const buffer = await blob.arrayBuffer()
+
+        if (!actionIsCurrent()) {
+          return false
+        }
+
         const data = new Uint8Array(buffer)
         const savedPath = await window.hermesDesktop?.saveImageBuffer(data, blobExtension(blob))
+
+        if (!actionIsCurrent()) {
+          return false
+        }
 
         if (!savedPath) {
           notify({ kind: 'error', title: copy.imageAttach, message: copy.imageWriteFailed })
@@ -533,7 +570,7 @@ export function useComposerActions({
         return false
       }
     },
-    [attachImagePath, copy.imageAttach, copy.imageAttachFailed, copy.imageWriteFailed]
+    [actionIsCurrent, attachImagePath, copy.imageAttach, copy.imageAttachFailed, copy.imageWriteFailed]
   )
 
   const pickImages = useCallback(async () => {
@@ -548,19 +585,23 @@ export function useComposerActions({
       ]
     })
 
-    if (!paths?.length) {
+    if (!actionIsCurrent() || !paths?.length) {
       return
     }
 
     for (const path of paths) {
       await attachImagePath(path)
     }
-  }, [attachImagePath, copy.attachImages, currentCwd, t.composer.images])
+  }, [actionIsCurrent, attachImagePath, copy.attachImages, currentCwd, t.composer.images])
 
   const pasteClipboardImage = useCallback(
     async ({ silent = false }: { silent?: boolean } = {}) => {
       try {
         const path = await window.hermesDesktop?.saveClipboardImage()
+
+        if (!actionIsCurrent()) {
+          return false
+        }
 
         if (!path) {
           if (!silent) {
@@ -574,9 +615,7 @@ export function useComposerActions({
           return false
         }
 
-        await attachImagePath(path)
-
-        return true
+        return attachImagePath(path)
       } catch (err) {
         if (!silent) {
           notifyError(err, copy.clipboardPasteFailed)
@@ -585,12 +624,12 @@ export function useComposerActions({
         return false
       }
     },
-    [attachImagePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardImage]
+    [actionIsCurrent, attachImagePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardImage]
   )
 
   const attachContextFolderPath = useCallback(
     (folderPath: string) => {
-      if (!folderPath) {
+      if (!actionIsCurrent() || !folderPath) {
         return false
       }
 
@@ -607,12 +646,12 @@ export function useComposerActions({
 
       return true
     },
-    [attachToMain, currentCwd]
+    [actionIsCurrent, attachToMain, currentCwd]
   )
 
   const attachDroppedItems = useCallback(
     async (candidates: DroppedFile[]) => {
-      if (candidates.length === 0) {
+      if (!actionIsCurrent() || candidates.length === 0) {
         return false
       }
 
@@ -620,6 +659,10 @@ export function useComposerActions({
       let lastFailure: string | null = null
 
       for (const candidate of candidates) {
+        if (!actionIsCurrent()) {
+          return false
+        }
+
         const { file, isDirectory, path: knownPath } = candidate
 
         // Path-only entry (in-app drag from the file browser tree, etc.).
@@ -699,11 +742,15 @@ export function useComposerActions({
 
       return attached
     },
-    [attachContextFilePath, attachContextFolderPath, attachImageBlob, attachImagePath, copy.dropFiles]
+    [actionIsCurrent, attachContextFilePath, attachContextFolderPath, attachImageBlob, attachImagePath, copy.dropFiles]
   )
 
   const removeAttachment = useCallback(
     async (id: string) => {
+      if (!actionIsCurrent()) {
+        return
+      }
+
       const removed = scope.remove(id)
 
       if (
@@ -719,7 +766,7 @@ export function useComposerActions({
         }).catch(() => undefined)
       }
     },
-    [activeSessionId, requestGateway, scope]
+    [actionIsCurrent, activeSessionId, requestGateway, scope]
   )
 
   return {

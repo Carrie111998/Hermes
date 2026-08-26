@@ -322,6 +322,63 @@ describe('useComposerActions native image drops', () => {
       })
     )
   })
+
+  it('rejects an A image blob that finishes saving after the composer runtime changes to B', async () => {
+    let resolveSave: ((path: string) => void) | undefined
+
+    const pendingSave = new Promise<string>(resolve => {
+      resolveSave = resolve
+    })
+
+    const saveImageBuffer = vi.fn(() => pendingSave)
+    const readFileDataUrl = vi.fn(async () => 'data:image/png;base64,eA==')
+    const add = vi.fn<(attachment: ComposerAttachment) => void>()
+
+    const scope = {
+      add,
+      remove: vi.fn(() => null),
+      target: 'test-composer',
+      update: vi.fn(() => true),
+      updateIfCurrent: vi.fn(() => true)
+    }
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl, saveImageBuffer }
+    })
+
+    const hook = renderHook(
+      ({ composerScopeKey }: { composerScopeKey: string }) =>
+        useComposerActions({
+          activeSessionId: 'runtime-a',
+          composerScopeKey,
+          currentCwd: '/repo',
+          requestGateway: vi.fn(),
+          scope
+        }),
+      { initialProps: { composerScopeKey: 'stored-a' } }
+    )
+
+    let pending: Promise<boolean> | undefined
+
+    act(() => {
+      pending = hook.result.current.attachImageBlob(new Blob(['image'], { type: 'image/png' }))
+    })
+
+    await waitFor(() => expect(saveImageBuffer).toHaveBeenCalledOnce())
+    // Route B is authoritative before runtime A is replaced.
+    hook.rerender({ composerScopeKey: 'stored-b' })
+
+    let attached = true
+
+    await act(async () => {
+      resolveSave?.('/tmp/saved-a.png')
+      attached = (await pending) ?? false
+    })
+
+    expect(attached).toBe(false)
+    expect(add).not.toHaveBeenCalled()
+  })
 })
 
 describe('attachImagePath thumbnail separation', () => {

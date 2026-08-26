@@ -4,7 +4,12 @@ import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
-import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
+import {
+  clearSessionDraft,
+  clearSessionDraftIfRevision,
+  type ComposerAttachment,
+  sessionDraftRevision
+} from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
@@ -85,15 +90,35 @@ export function useComposerSubmit({
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
-  const dispatchSubmit = (text: string, attachments?: ComposerAttachment[], displayKind?: 'hidden') => {
+  const dispatchSubmit = (
+    text: string,
+    attachments?: ComposerAttachment[],
+    displayKind?: 'hidden',
+    clearSubmittedDraft = true
+  ) => {
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
+    const submittedRevision = clearSubmittedDraft ? clearSessionDraft(submittedScope) : sessionDraftRevision(submittedScope)
 
     const restore = () => {
+      if (!clearSubmittedDraft) {
+        return
+      }
+
+      const visibleScopeIsSubmitted = activeQueueSessionKeyRef.current === submittedScope
+
+      const visibleDraftChanged =
+        visibleScopeIsSubmitted &&
+        (draftRef.current.length > 0 || scope.attachments.$attachments.get().length > 0)
+
+      if (visibleDraftChanged || sessionDraftRevision(submittedScope) !== submittedRevision) {
+        return
+      }
+
       // The mounted composer may now be showing another route. Preserve the
       // rejected payload in A's stash, but never paint it over B's visible
       // editor or attachments after a session switch.
-      if (activeQueueSessionKeyRef.current === submittedScope) {
+      if (visibleScopeIsSubmitted) {
         loadIntoComposer(text, submittedAttachments)
       }
 
@@ -109,7 +134,13 @@ export function useComposerSubmit({
         ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
         : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
     )
-      .then(accepted => void (accepted === false ? restore() : clearSessionDraft(submittedScope)))
+      .then(accepted => {
+        if (accepted === false) {
+          restore()
+        } else if (clearSubmittedDraft) {
+          clearSessionDraftIfRevision(submittedScope, submittedRevision)
+        }
+      })
       .catch(restore)
   }
 
@@ -131,7 +162,7 @@ export function useComposerSubmit({
           !inputDisabled &&
           !actionsDisabled
         ) {
-          dispatchSubmitRef.current(text, undefined, displayKind)
+          dispatchSubmitRef.current(text, undefined, displayKind, false)
         }
       }),
     [actionsDisabled, inputDisabled, paneVisible, scope.target, surfaceId]

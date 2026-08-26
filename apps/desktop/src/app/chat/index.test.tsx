@@ -352,4 +352,52 @@ describe('ChatView render isolation', () => {
     expect(composerAfterRuntimeConverges.dataset.busy).toBe('false')
     expect(composerAfterRuntimeConverges.dataset.actionsDisabled).toBe('false')
   })
+
+  it('fences a route-first navigation from session A to New Chat until A is cleared', () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    const props = chatViewProps()
+
+    function NewChatHarness() {
+      const navigate = useNavigate()
+
+      return (
+        <>
+          <button onClick={() => navigate('/')} type="button">
+            Navigate to New Chat
+          </button>
+          <ChatView {...props} />
+        </>
+      )
+    }
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <NewChatHarness />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    const composer = screen.getByTestId('composer') as HTMLTextAreaElement
+
+    expect(composer.dataset.actionsDisabled).toBe('false')
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate to New Chat' }))
+
+    const transitioningComposer = screen.getByTestId('composer') as HTMLTextAreaElement
+
+    expect(transitioningComposer).toBe(composer)
+    expect(transitioningComposer.dataset.actionsDisabled).toBe('true')
+
+    act(() => {
+      $selectedStoredSessionId.set(null)
+      $activeSessionId.set(null)
+      $sessionStates.set({})
+      $messages.set([])
+    })
+
+    expect((screen.getByTestId('composer') as HTMLTextAreaElement).dataset.actionsDisabled).toBe('false')
+  })
 })

@@ -1,5 +1,5 @@
 import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from '@assistant-ui/core'
-import { type MutableRefObject, type RefObject, useCallback, useEffect, useRef, useState } from 'react'
+import { type MutableRefObject, type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { hermesDirectiveFormatter } from '@/components/assistant-ui/directive-text'
 import { desktopSlashCommandArgumentMode } from '@/lib/desktop-slash-commands'
@@ -91,6 +91,7 @@ interface CompletionSource {
 }
 
 interface UseComposerTriggerOptions {
+  actionsDisabled?: boolean
   at: CompletionSource
   draftRef: MutableRefObject<string>
   editorRef: RefObject<HTMLDivElement | null>
@@ -99,6 +100,7 @@ interface UseComposerTriggerOptions {
   /** Bank the pre-commit state so a popover pick is a single undo step. */
   recordUndoPoint?: () => void
   requestMainFocus: () => void
+  scopeKey?: string | null
   setComposerText: (text: string) => void
   slash: CompletionSource
 }
@@ -113,12 +115,14 @@ interface UseComposerTriggerOptions {
  * subsequent keyup skips its refresh.
  */
 export function useComposerTrigger({
+  actionsDisabled = false,
   at,
   draftRef,
   editorRef,
   emoji,
   recordUndoPoint,
   requestMainFocus,
+  scopeKey = null,
   setComposerText,
   slash
 }: UseComposerTriggerOptions) {
@@ -130,6 +134,22 @@ export function useComposerTrigger({
   // without stealing prose from everyone who never touched the arrows.
   const [triggerActiveExplicit, setTriggerActiveExplicit] = useState(false)
   const [triggerItems, setTriggerItems] = useState<readonly Unstable_TriggerItem[]>([])
+  const scopeEpochRef = useRef({ key: scopeKey, value: 0 })
+
+  if (scopeEpochRef.current.key !== scopeKey) {
+    scopeEpochRef.current = { key: scopeKey, value: scopeEpochRef.current.value + 1 }
+  }
+
+  const renderScopeEpoch = scopeEpochRef.current.value
+  const actionsDisabledRef = useRef(actionsDisabled)
+
+  actionsDisabledRef.current = actionsDisabled
+
+  const actionIsCurrent = useCallback(
+    () => scopeEpochRef.current.value === renderScopeEpoch && !actionsDisabledRef.current,
+    [renderScopeEpoch]
+  )
+
   // Set synchronously in keydown when the open trigger popover consumes a
   // navigation/control key (Arrow/Enter/Tab/Escape). The subsequent keyup must
   // NOT run refreshTrigger for that keypress: it never edits text, and for
@@ -144,7 +164,17 @@ export function useComposerTrigger({
     setTriggerActiveExplicit(false)
   }, [])
 
+  useLayoutEffect(() => {
+    setTrigger(null)
+    setTriggerItems([])
+    resetTriggerActive()
+  }, [resetTriggerActive, scopeKey])
+
   const refreshTrigger = useCallback(() => {
+    if (!actionIsCurrent()) {
+      return
+    }
+
     const editor = editorRef.current
 
     if (!editor) {
@@ -192,7 +222,7 @@ export function useComposerTrigger({
     if (detected?.kind !== trigger?.kind || detected?.query !== trigger?.query) {
       resetTriggerActive()
     }
-  }, [editorRef, resetTriggerActive, trigger])
+  }, [actionIsCurrent, editorRef, resetTriggerActive, trigger])
 
   const triggerAdapter: Unstable_TriggerAdapter | null =
     trigger?.kind === '@'
@@ -248,6 +278,10 @@ export function useComposerTrigger({
 
   /** Step the highlight, marking it as the user's own deliberate pick. */
   const moveTriggerActive = (delta: number) => {
+    if (!actionIsCurrent()) {
+      return
+    }
+
     setTriggerActiveExplicit(true)
     setTriggerActive(idx => (idx + delta + triggerItems.length) % triggerItems.length)
   }
@@ -261,7 +295,7 @@ export function useComposerTrigger({
   // backend completer drops exact matches). Reuses the chip path via a
   // synthetic item whose serialized form is the verbatim text.
   const commitTypedSlashDirective = (): boolean => {
-    if (trigger?.kind !== '/') {
+    if (!actionIsCurrent() || trigger?.kind !== '/') {
       return false
     }
 
@@ -292,6 +326,10 @@ export function useComposerTrigger({
   }
 
   const replaceTriggerWithChip = (item: Unstable_TriggerItem, options?: { descend?: boolean }) => {
+    if (!actionIsCurrent()) {
+      return
+    }
+
     const editor = editorRef.current
 
     if (!editor || !trigger) {
@@ -421,7 +459,7 @@ export function useComposerTrigger({
   const ascendTriggerPath = () => {
     const editor = editorRef.current
 
-    if (!editor || trigger?.kind !== '@') {
+    if (!actionIsCurrent() || !editor || trigger?.kind !== '@') {
       return false
     }
 

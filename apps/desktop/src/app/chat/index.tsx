@@ -53,7 +53,7 @@ import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcr
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
-import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
+import { isNewChatRoute, primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
 import { ChatDropOverlay } from './chat-drop-overlay'
@@ -516,7 +516,10 @@ const ChatViewContent = memo(function ChatViewContent({
         isRouteSessionMismatch(routedSessionId, activeRuntimeStoredId, sessions)
       : false
 
-  const sessionTransitioning = routeSessionMismatch || activeRuntimeRouteMismatch
+  const newChatRouteHasStaleSession =
+    isPrimary && isNewChatRoute(location.pathname) && Boolean(selectedSessionId || activeSessionId)
+
+  const sessionTransitioning = routeSessionMismatch || activeRuntimeRouteMismatch || newChatRouteHasStaleSession
 
   // The compact new-session pop-out skips the wordmark/tagline intro — it's a
   // scratch window, not the full-height empty state. The Appearance toggle
@@ -638,7 +641,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // The drop zone below only handles files; session drops commit through the
   // drag session itself, which routes a center/link drop to this surface's
   // composer via `data-composer-target`.
-  const { dragKind, dropHandlers } = useFileDropZone({ enabled: showChatBar, onDropFiles })
+  const { dragKind, dropHandlers } = useFileDropZone({ enabled: showChatBar && !sessionTransitioning, onDropFiles })
 
   // While a session drag targets one of this surface's EDGES or a tab strip,
   // the zone overlay/caret owns the visual — the link overlay stands down.

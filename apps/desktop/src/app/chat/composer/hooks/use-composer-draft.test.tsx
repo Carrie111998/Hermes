@@ -7,7 +7,7 @@ import { $connection } from '@/store/session'
 
 import { useComposerActions } from '../../hooks/use-composer-actions'
 import type { QueueEditState } from '../composer-utils'
-import { type ComposerTarget, getActiveComposer, markActiveComposer } from '../focus'
+import { type ComposerTarget, getActiveComposer, markActiveComposer, requestComposerInsert } from '../focus'
 import { type ComposerScope, ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
 import { useComposerDraft } from './use-composer-draft'
@@ -24,13 +24,15 @@ vi.mock('@assistant-ui/react', () => ({
 }))
 
 interface ProbeHarnessProps {
+  actionsDisabled?: boolean
   activeQueueSessionKey: string | null
   onLayoutSnapshot: (attachments: ComposerAttachment[]) => void
   sessionId: string
 }
 
-function ProbeHarness({ activeQueueSessionKey, onLayoutSnapshot, sessionId }: ProbeHarnessProps) {
+function ProbeHarness({ actionsDisabled = false, activeQueueSessionKey, onLayoutSnapshot, sessionId }: ProbeHarnessProps) {
   useComposerDraft({
+    actionsDisabled,
     activeQueueSessionKey,
     focusKey: null,
     inputDisabled: false,
@@ -58,6 +60,7 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
     clearSessionDraft('session-B')
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
     vi.unstubAllGlobals()
+    vi.useRealTimers()
     $connection.set(null)
   })
 
@@ -90,6 +93,40 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
     // By the layout phase the scope must already be B's (empty) — a submit
     // fired the instant B renders must never ship session A's attachment.
     expect(snapshots[0]).toEqual([])
+  })
+
+  it('ignores external insert requests while the route/runtime identities are fenced', () => {
+    vi.useFakeTimers()
+
+    const view = render(
+      <ProbeHarness
+        actionsDisabled
+        activeQueueSessionKey="session-A"
+        onLayoutSnapshot={() => undefined}
+        sessionId="session-A"
+      />
+    )
+
+    mockComposerApi.setText.mockClear()
+
+    act(() => {
+      requestComposerInsert('must not cross sessions', { target: 'main' })
+      vi.runAllTimers()
+    })
+
+    expect(mockComposerApi.setText).not.toHaveBeenCalled()
+
+    view.rerender(
+      <ProbeHarness activeQueueSessionKey="session-A" onLayoutSnapshot={() => undefined} sessionId="session-A" />
+    )
+
+    act(() => {
+      requestComposerInsert('allowed after convergence', { target: 'main' })
+      vi.runAllTimers()
+    })
+
+    expect(mockComposerApi.setText).toHaveBeenCalledWith('allowed after convergence')
+    vi.useRealTimers()
   })
 
   it('applies a delayed image preview when it resolves while its attachment draft is inactive', async () => {

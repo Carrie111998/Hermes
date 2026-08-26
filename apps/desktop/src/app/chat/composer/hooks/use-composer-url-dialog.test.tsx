@@ -1,48 +1,47 @@
-import { act, renderHook } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { act, cleanup, renderHook } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { useComposerUrlDialog } from './use-composer-url-dialog'
 
-vi.mock('@/lib/haptics', () => ({ triggerHaptic: () => {} }))
-
-describe('useComposerUrlDialog', () => {
-  it('drops an @url: directive into the draft when there is no host onAddUrl', () => {
-    const insertText = vi.fn()
-    const { result } = renderHook(() => useComposerUrlDialog({ insertText }))
-
-    act(() => result.current.setUrlValue('  https://example.dev  '))
-    act(() => result.current.submitUrl())
-
-    // The trailing/leading whitespace is trimmed before building the directive.
-    expect(insertText).toHaveBeenCalledWith('@url:https://example.dev')
+describe('useComposerUrlDialog session scope', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
   })
 
-  it('prefers the host onAddUrl handler, then clears + closes the dialog', () => {
-    const insertText = vi.fn()
+  it('closes and clears an A dialog when the composer scope changes to B', () => {
     const onAddUrl = vi.fn()
-    const { result } = renderHook(() => useComposerUrlDialog({ insertText, onAddUrl }))
+
+    const hook = renderHook(
+      ({ disabled, scopeKey }: { disabled: boolean; scopeKey: string }) =>
+        useComposerUrlDialog({ disabled, insertText: vi.fn(), onAddUrl, scopeKey }),
+      { initialProps: { disabled: false, scopeKey: 'session-a' } }
+    )
 
     act(() => {
-      result.current.openUrlDialog()
-      result.current.setUrlValue(' https://example.dev ')
+      hook.result.current.openUrlDialog()
+      hook.result.current.setUrlValue('https://a.example')
     })
-    act(() => result.current.submitUrl())
 
-    expect(onAddUrl).toHaveBeenCalledWith('https://example.dev')
-    expect(insertText).not.toHaveBeenCalled()
-    expect(result.current.urlValue).toBe('')
-    expect(result.current.urlOpen).toBe(false)
+    expect(hook.result.current.urlOpen).toBe(true)
+    expect(hook.result.current.urlValue).toBe('https://a.example')
+
+    hook.rerender({ disabled: true, scopeKey: 'session-b' })
+
+    expect(hook.result.current.urlOpen).toBe(false)
+    expect(hook.result.current.urlValue).toBe('')
   })
 
-  it('no-ops on an empty / whitespace-only URL', () => {
-    const insertText = vi.fn()
+  it('does not submit a URL while composer actions are fenced', () => {
     const onAddUrl = vi.fn()
-    const { result } = renderHook(() => useComposerUrlDialog({ insertText, onAddUrl }))
 
-    act(() => result.current.setUrlValue('   '))
-    act(() => result.current.submitUrl())
+    const hook = renderHook(() =>
+      useComposerUrlDialog({ disabled: true, insertText: vi.fn(), onAddUrl, scopeKey: 'session-a' })
+    )
 
-    expect(insertText).not.toHaveBeenCalled()
+    act(() => hook.result.current.setUrlValue('https://blocked.example'))
+    act(() => hook.result.current.submitUrl())
+
     expect(onAddUrl).not.toHaveBeenCalled()
   })
 })

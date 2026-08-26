@@ -49,6 +49,7 @@ import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
 interface UseComposerDraftArgs {
+  actionsDisabled?: boolean
   activeQueueSessionKey: string | null
   focusKey: ChatBarProps['focusKey']
   inputDisabled: boolean
@@ -67,6 +68,7 @@ interface UseComposerDraftArgs {
  * primitives exposed here.
  */
 export function useComposerDraft({
+  actionsDisabled = false,
   activeQueueSessionKey,
   focusKey,
   inputDisabled,
@@ -77,6 +79,9 @@ export function useComposerDraft({
   const composerRuntime = useComposerRuntime()
   // Which composer this is on the focus bus + which attachment set it owns.
   const { attachments: attachmentScope, target } = useComposerScope()
+  const actionsDisabledRef = useRef(actionsDisabled)
+
+  actionsDisabledRef.current = actionsDisabled
 
   // Coarse edges only — these flip rarely (empty↔non-empty, the `?` help sigil,
   // steerable-vs-slash), so typing within a line costs no render.
@@ -217,7 +222,7 @@ export function useComposerDraft({
     })
 
     const offInsert = onComposerInsertRequest(({ mode, target: requested, text }) => {
-      if (requested === target) {
+      if (!actionsDisabledRef.current && requested === target) {
         appendExternalText(text, mode)
       }
     })
@@ -228,8 +233,11 @@ export function useComposerDraft({
     }
   }, [appendExternalText, inputDisabled, paintDraft, target])
 
-  const stashAt = (scope: string | null, text = draftRef.current, attachments = attachmentScope.$attachments.get()) =>
-    stashSessionDraft(scope, text, attachments)
+  const stashAt = useCallback(
+    (scope: string | null, text = draftRef.current, attachments = attachmentScope.$attachments.get()) =>
+      stashSessionDraft(scope, text, attachments),
+    [attachmentScope]
+  )
 
   const loadIntoComposer = (text: string, attachments: ComposerAttachment[]) => {
     // Diagnostic breadcrumb for #59305-class reports: identifies WHAT kind of
@@ -340,7 +348,7 @@ export function useComposerDraft({
       unsubscribe()
       window.clearTimeout(draftPersistTimerRef.current)
     }
-  }, [composerRuntime, queueEditRef])
+  }, [composerRuntime, queueEditRef, stashAt])
 
   const insertText = (text: string) => {
     const base = draftRef.current
@@ -378,7 +386,7 @@ export function useComposerDraft({
 
   useEffect(() => {
     return onComposerInsertRefsRequest(({ refs, target: requested }) => {
-      if (requested === target) {
+      if (!actionsDisabledRef.current && requested === target) {
         insertInlineRefsRef.current(refs)
       }
     })
@@ -482,7 +490,7 @@ export function useComposerDraft({
       window.removeEventListener('pagehide', flushPendingDraftPersist)
       flushPendingDraftPersist()
     }
-  }, [syncDraftFromEditor])
+  }, [stashAt, syncDraftFromEditor])
 
   return {
     activeQueueSessionKeyRef,

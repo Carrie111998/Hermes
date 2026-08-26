@@ -125,13 +125,29 @@ export function ChatBar({
   // end control. Populated after useComposerVoice below (the submit wrapper
   // is created first); render-time assignment keeps the ref current.
   const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
+  const submitScopeKey = queueSessionKey || sessionId || null
+  const submitScopeEpochRef = useRef({ key: submitScopeKey, value: 0 })
+
+  if (submitScopeEpochRef.current.key !== submitScopeKey) {
+    submitScopeEpochRef.current = { key: submitScopeKey, value: submitScopeEpochRef.current.value + 1 }
+  }
+
+  const renderSubmitScopeEpoch = submitScopeEpochRef.current.value
+  const actionsDisabledRef = useRef(actionsDisabled)
+
+  actionsDisabledRef.current = actionsDisabled
+
+  const submitActionIsCurrent = useCallback(
+    () => submitScopeEpochRef.current.value === renderSubmitScopeEpoch && !actionsDisabledRef.current,
+    [renderSubmitScopeEpoch]
+  )
 
   // Every send (typed, queued, voice) passes through the contributed
   // middleware chain first — rewrite / pass-through / cancel. Empty chain =
   // exact pass-through, so surfaces without contributions are byte-identical.
   const onSubmit = useCallback<ChatBarProps['onSubmit']>(
     async (value, options) => {
-      if (actionsDisabled) {
+      if (!submitActionIsCurrent()) {
         return false
       }
 
@@ -152,13 +168,19 @@ export function ChatBar({
 
       const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments })
 
-      if (!draft) {
+      if (!draft || !submitActionIsCurrent()) {
         return false
       }
 
-      return onSubmitProp(draft.text, { ...options, attachments: draft.attachments })
+      return onSubmitProp(draft.text, {
+        ...options,
+        attachments: draft.attachments,
+        composerScope: options?.composerScope ?? submitScopeKey,
+        sessionId: options?.sessionId ?? sessionId ?? null,
+        storedSessionId: options?.storedSessionId ?? submitScopeKey
+      })
     },
-    [actionsDisabled, onSubmitProp]
+    [onSubmitProp, sessionId, submitActionIsCurrent, submitScopeKey]
   )
 
   // Which live composer this instance IS (main | tile) — its attachment set,
@@ -177,7 +199,7 @@ export function ChatBar({
   // busy submit routes text to the queue instead of a steer (which would sit
   // undelivered behind the blocked tool batch). Drives the button affordance.
   const blockingPrompt = useStore(useMemo(() => sessionBlockingPrompt(sessionId ?? null), [sessionId]))
-  const activeQueueSessionKey = queueSessionKey || sessionId || null
+  const activeQueueSessionKey = submitScopeKey
 
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the
@@ -249,7 +271,7 @@ export function ChatBar({
     setComposerText,
     stashAt,
     syncDraftFromEditor
-  } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
+  } = useComposerDraft({ actionsDisabled, activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
 
   // Undo/redo. The rich editor bypasses Chromium's editing pipeline for speed,
   // which also bypasses its undo stack — so we own the stack and every edit
@@ -268,7 +290,7 @@ export function ChatBar({
     }
 
     return onComposerAttachImagesRequest(({ blobs, target }) => {
-      if (target !== scope.target) {
+      if (actionsDisabledRef.current || target !== scope.target) {
         return
       }
 
@@ -289,9 +311,11 @@ export function ChatBar({
   // "Add URL" dialog — open/value state, autofocus, and submit (host onAddUrl or
   // an @url: directive into the draft).
   const { openUrlDialog, setUrlOpen, setUrlValue, submitUrl, urlInputRef, urlOpen, urlValue } = useComposerUrlDialog({
-    insertText,
-    onAddUrl
-  })
+   disabled: actionsDisabled,
+   insertText,
+   onAddUrl,
+   scopeKey: activeQueueSessionKey
+ })
 
   // The queue engine — queued turns, in-place editing, the shared drain lock,
   // and bounded auto-drain. Consumes the draft API and writes `queueEditRef`.
@@ -423,7 +447,18 @@ export function ChatBar({
     triggerItems,
     triggerKeyConsumedRef,
     triggerLoading
-  } = useComposerTrigger({ at, draftRef, editorRef, emoji, recordUndoPoint, requestMainFocus, setComposerText, slash })
+  } = useComposerTrigger({
+    actionsDisabled,
+    at,
+    draftRef,
+    editorRef,
+    emoji,
+    recordUndoPoint,
+    requestMainFocus,
+    scopeKey: activeQueueSessionKey,
+    setComposerText,
+    slash
+  })
 
   // Pull the live contentEditable text into draftRef + the AUI composer state
   // (which drives `hasComposerPayload` → the send button). Shared by the input
@@ -951,7 +986,7 @@ export function ChatBar({
   const handleEditorKeyUp = triggerKeyUpHandler(triggerKeyConsumedRef, refreshTrigger)
 
   const {
-    dragActive,
+    dragActive: dropDragActive,
     handleDragEnter,
     handleDragLeave,
     handleDragOver,
@@ -967,6 +1002,7 @@ export function ChatBar({
   const botChat = useStoresSelector([$botChatSessionIds, $sessionStates, $sessionTiles], () =>
     isBotChatSession(sessionId)
   )
+  const dragActive = !actionsDisabled && dropDragActive
 
   // Branch / worktree hand-offs (CodingStatusRow). Owns the worktree open +
   // branch-off/convert/list/switch actions; draft travels into the new session.
@@ -1098,8 +1134,8 @@ export function ChatBar({
           // hint would sit behind the preedit text the whole time (#75960).
           beginComposerComposition(event.currentTarget)
         }}
-        onDragOver={handleInputDragOver}
-        onDrop={handleInputDrop}
+        onDragOver={actionsDisabled ? undefined : handleInputDragOver}
+        onDrop={actionsDisabled ? undefined : handleInputDrop}
         onFocus={() => markActiveComposer(scope.target)}
         onInput={handleEditorInput}
         onKeyDown={handleEditorKeyDown}
@@ -1258,10 +1294,10 @@ export function ChatBar({
             data-thread-scrolled-up={scrolledUp ? '' : undefined}
             data-tip-region=""
             data-tour={composerTourMarker}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDragOver={handleDragOver}
-            onDrop={handleDrop}
+            onDragEnter={actionsDisabled ? undefined : handleDragEnter}
+            onDragLeave={actionsDisabled ? undefined : handleDragLeave}
+            onDragOver={actionsDisabled ? undefined : handleDragOver}
+            onDrop={actionsDisabled ? undefined : handleDrop}
             onPointerDown={!hudMode && popoutAllowed ? onComposerGesturePointerDown : undefined}
             onPointerDownCapture={hudMode ? onHudDragPointerDown : undefined}
             onSubmit={e => {
@@ -1417,19 +1453,21 @@ export function ChatBar({
               the pop-out drag region. Same px as the strip above, so the two
               bracket the composer on one vertical line. */}
           <div className={cn(composerFloatingStrip, 'px-[5px] pt-1.5 empty:hidden')}>
-            <ContribSlot area={COMPOSER_AREAS.underside} />
+            {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.underside} />}
           </div>
         </div>
       </ComposerPrimitive.Unstable_TriggerPopoverRoot>
 
-      <UrlDialog
-        inputRef={urlInputRef}
-        onChange={setUrlValue}
-        onOpenChange={setUrlOpen}
-        onSubmit={submitUrl}
-        open={urlOpen}
-        value={urlValue}
-      />
+      {!actionsDisabled && (
+        <UrlDialog
+          inputRef={urlInputRef}
+          onChange={setUrlValue}
+          onOpenChange={setUrlOpen}
+          onSubmit={submitUrl}
+          open={urlOpen}
+          value={urlValue}
+        />
+      )}
     </>
   )
 }

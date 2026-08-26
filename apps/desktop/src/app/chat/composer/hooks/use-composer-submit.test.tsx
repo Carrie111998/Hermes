@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { $clarifyRequests } from '@/store/clarify'
-import type { ComposerAttachment } from '@/store/composer'
+import { clearSessionDraft, type ComposerAttachment, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -129,6 +129,7 @@ function renderSubmitHook({
   return {
     activeQueueSessionKeyRef,
     clearDraft,
+    draftRef,
     hook,
     loadIntoComposer,
     onCancel,
@@ -151,6 +152,7 @@ describe('useComposerSubmit rejection restoration', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    clearSessionDraft('session-a')
   })
 
   it('stashes a rejected A submission without overwriting the visible B draft', async () => {
@@ -175,6 +177,52 @@ describe('useComposerSubmit rejection restoration', () => {
 
     expect(stashAt).toHaveBeenCalledWith('session-a', 'draft from A', [])
     expect(loadIntoComposer).not.toHaveBeenCalled()
+  })
+
+  it('does not repaint an older rejected A payload over a newer A draft after A → B → A', async () => {
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const { activeQueueSessionKeyRef, draftRef, hook, loadIntoComposer, onSubmit } = renderSubmitHook({
+      sessionKey: 'session-a'
+    })
+
+    onSubmit.mockImplementationOnce(() => pending)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('older submitted A')
+      activeQueueSessionKeyRef.current = 'session-b'
+      activeQueueSessionKeyRef.current = 'session-a'
+      draftRef.current = 'newer draft in A'
+    })
+
+    await act(async () => settle?.(false))
+
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+  })
+
+  it('does not clear a newer stashed A draft when an older A submission is accepted late', async () => {
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const { hook, onSubmit } = renderSubmitHook({ sessionKey: 'session-a' })
+
+    onSubmit.mockImplementationOnce(() => pending)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('older submitted A')
+      stashSessionDraft('session-a', 'newer stashed A draft', [])
+    })
+
+    await act(async () => settle?.(true))
+
+    expect(takeSessionDraft('session-a').text).toBe('newer stashed A draft')
   })
 })
 

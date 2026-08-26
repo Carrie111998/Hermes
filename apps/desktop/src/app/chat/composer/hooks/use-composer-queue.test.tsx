@@ -29,25 +29,30 @@ function renderQueueHook(
     busy?: boolean
     onCancel?: () => void
     onSteer?: ChatBarProps['onSteer']
+    onSubmit?: ChatBarProps['onSubmit']
+    sessionKey?: string
   } = {}
 ) {
-  const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
+  const onSubmit = vi.fn<ChatBarProps['onSubmit']>(overrides.onSubmit ?? (async () => true))
   const onCancel = overrides.onCancel ?? vi.fn()
   const onSteer = overrides.onSteer
   const queueEditRef: { current: QueueEditState | null } = { current: null }
   const draftRef = { current: '' }
   const loadIntoComposer = vi.fn()
 
-  const initialProps: { actionsDisabled?: boolean; busy: boolean } = {
+  const initialProps: { actionsDisabled?: boolean; busy: boolean; sessionKey?: string } = {
     actionsDisabled: overrides.actionsDisabled,
-    busy: overrides.busy ?? false
+    busy: overrides.busy ?? false,
+    sessionKey: overrides.sessionKey
   }
 
   const hook = renderHook(
-    ({ actionsDisabled, busy }: { actionsDisabled?: boolean; busy: boolean }) =>
-      useComposerQueue({
+    ({ actionsDisabled, busy, sessionKey }: { actionsDisabled?: boolean; busy: boolean; sessionKey?: string }) => {
+      const activeSessionKey = sessionKey ?? overrides.sessionKey ?? SESSION_KEY
+
+      return useComposerQueue({
         actionsDisabled: actionsDisabled ?? overrides.actionsDisabled ?? false,
-        activeQueueSessionKey: SESSION_KEY,
+        activeQueueSessionKey: activeSessionKey,
         attachments: [],
         busy,
         clearDraft: () => undefined,
@@ -58,9 +63,10 @@ function renderQueueHook(
         onSteer,
         onSubmit,
         queueEditRef,
-        queueSessionKey: SESSION_KEY,
-        sessionId: 'rt-session-queue-hook'
-      }),
+        queueSessionKey: activeSessionKey,
+        sessionId: `rt-${activeSessionKey}`
+      })
+    },
     { initialProps }
   )
 
@@ -134,6 +140,33 @@ describe('useComposerQueue park integration', () => {
     expect(getQueuedPrompts(SESSION_KEY)[0]?.text).toBe('first queued draft')
     expect(hook.result.current.queueEdit?.entryId).toBe(first.id)
     expect(loadIntoComposer).not.toHaveBeenCalled()
+  })
+
+  it('drains B after an in-flight A drain settles without requiring another B event', async () => {
+    const sessionA = 'session-a'
+    const sessionB = 'session-b'
+    let settleA: ((accepted: boolean) => void) | undefined
+
+    const pendingA = new Promise<boolean>(resolve => {
+      settleA = resolve
+    })
+
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>((text: string) =>
+      text === 'queued in A' ? pendingA : Promise.resolve(true)
+    )
+
+    enqueueQueuedPrompt(sessionA, { attachments: [], text: 'queued in A' })
+    enqueueQueuedPrompt(sessionB, { attachments: [], text: 'queued in B' })
+    const { hook } = renderQueueHook({ onSubmit, sessionKey: sessionA })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('queued in A', expect.anything()))
+
+    hook.rerender({ busy: false, sessionKey: sessionB })
+
+    await act(async () => settleA?.(true))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('queued in B', expect.anything()))
+    expect(getQueuedPrompts(sessionB)).toHaveLength(0)
   })
 
   it('holds a parked queue at the idle settle (the Stop edge)', async () => {

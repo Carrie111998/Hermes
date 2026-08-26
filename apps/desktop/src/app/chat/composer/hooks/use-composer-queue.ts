@@ -97,7 +97,7 @@ export function useComposerQueue({
   const editingQueuedPrompt = queueEdit ? (queuedPrompts.find(entry => entry.id === queueEdit.entryId) ?? null) : null
 
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
-  const drainingQueueRef = useRef(false)
+  const drainingQueueSessionsRef = useRef(new Set<string>())
   const drainFailuresRef = useRef(new Map<string, number>())
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
@@ -202,7 +202,7 @@ export function useComposerQueue({
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
     async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
-      if (actionsDisabled || drainingQueueRef.current || !activeQueueSessionKey) {
+      if (actionsDisabled || !activeQueueSessionKey || drainingQueueSessionsRef.current.has(activeQueueSessionKey)) {
         return false
       }
 
@@ -214,7 +214,7 @@ export function useComposerQueue({
         return false
       }
 
-      drainingQueueRef.current = true
+      drainingQueueSessionsRef.current.add(drainQueueSessionKey)
 
       try {
         const accepted = await Promise.resolve(
@@ -242,7 +242,7 @@ export function useComposerQueue({
 
         return true
       } finally {
-        drainingQueueRef.current = false
+        drainingQueueSessionsRef.current.delete(drainQueueSessionKey)
       }
     },
     [actionsDisabled, activeQueueSessionKey, onSubmit, sessionId]
@@ -333,7 +333,13 @@ export function useComposerQueue({
   // a stale-session 404) can't strand the entry permanently nor spin-loop. The
   // drain lock serializes sends; a remount/reconnect resets the failure counts.
   const autoDrainNext = useCallback(() => {
-    if (actionsDisabled || busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey) {
+    if (
+      actionsDisabled ||
+      busy ||
+      queueParked ||
+      !activeQueueSessionKey ||
+      drainingQueueSessionsRef.current.has(activeQueueSessionKey)
+    ) {
       return
     }
 
