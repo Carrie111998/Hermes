@@ -199,10 +199,18 @@ def register_credential_files(
 def _load_config_files() -> List[Dict[str, str]]:
     """Load ``terminal.credential_files`` from config.yaml (cached per home).
 
-    The cache is keyed by the resolved ``HERMES_HOME`` so that a later profile
-    with a different home never receives an earlier profile's cached host paths.
+    The cache is keyed by the *canonical* home identity, not the raw override
+    spelling, so that a later profile with a different home never receives an
+    earlier profile's cached host paths. ``hermes_home_key`` runs
+    ``expanduser`` + ``resolve(strict=False)`` + ``normcase``, which follows
+    symlinks: a stable alias path (e.g. ``profiles/current``) that is
+    atomically retargeted from home A to home B yields a *different* key even
+    though the active ``HERMES_HOME`` override string is unchanged, so the
+    retarget can no longer serve A's cached host paths under B.
     """
-    home_key = str(_resolve_hermes_home())
+    from hermes_constants import hermes_home_key
+
+    home_key = hermes_home_key(_resolve_hermes_home())
     cached = _config_files_by_home.get(home_key)
     if cached is not None:
         return cached

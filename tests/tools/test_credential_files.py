@@ -414,6 +414,34 @@ class TestConfigCacheProfileBoundary:
         clear_credential_files()
         assert get_credential_file_mounts() == []
 
+    def test_retargeted_alias_home_never_serves_prior_targets_token(self, tmp_path, monkeypatch):
+        """A stable alias path (e.g. ``profiles/current``) retargeted from home A
+        to home B while the active override string stays constant must NOT serve
+        A's cached host path. The cache is keyed by the *canonical* home identity
+        (symlink-resolved), so the retarget changes the key even though the raw
+        ``HERMES_HOME`` spelling does not."""
+        home_a = self._profile(tmp_path, "a", "a_token.json")
+        home_b = self._profile(tmp_path, "b", "b_token.json")
+
+        # The active HERMES_HOME is a stable alias whose *string* never changes.
+        alias = tmp_path / "profiles" / "current"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(home_a, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(alias))
+
+        mounts_a = get_credential_file_mounts()
+        assert [m["host_path"] for m in mounts_a] == [str((home_a / "a_token.json").resolve())]
+
+        # Atomically retarget the alias A -> B WITHOUT clearing the cache; the
+        # override string handed to the loader is byte-for-byte identical.
+        alias.unlink()
+        alias.symlink_to(home_b, target_is_directory=True)
+
+        mounts_b = get_credential_file_mounts()
+        host_paths_b = [m["host_path"] for m in mounts_b]
+        assert host_paths_b == [str((home_b / "b_token.json").resolve())]
+        assert str((home_a / "a_token.json").resolve()) not in host_paths_b
+
 
 # ---------------------------------------------------------------------------
 # Cache directory mounts
