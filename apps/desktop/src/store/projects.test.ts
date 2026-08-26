@@ -401,6 +401,68 @@ describe('project connection stamp', () => {
     setProjectConnection('p_map', 'surtr')
     expect(connectionIdForProjectId('p_map')).toBe('surtr')
   })
+
+  it('keeps foreign projects visible while chrome tree refresh awaits foreign merge', async () => {
+    setShowAllProfiles(false)
+    $activeGatewayProfile.set('default')
+
+    const connections = await import('@/store/connections')
+    connections.$connectionsRegistry.set({
+      activeId: 'local',
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'mimir', kind: 'ssh', label: 'mimir', tokenPreview: null, tokenSet: false }
+      ]
+    } as never)
+
+    $projectTree.set([
+      {
+        id: 'p_local',
+        label: 'Local',
+        path: '/local/app',
+        repos: [],
+        sessionCount: 0
+      },
+      {
+        id: 'p_mimir',
+        label: 'Mimir',
+        path: '/mimir/app',
+        connectionId: 'mimir',
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+
+    const { promise: foreignTree, resolve: resolveForeign } = deferred<unknown>()
+    const gw = await import('@/store/gateway')
+    vi.mocked(gw.requestGatewayForAgent).mockReturnValue(foreignTree as never)
+
+    const request = vi.fn().mockResolvedValue({
+      active_id: null,
+      projects: [{ id: 'p_local', label: 'Local', path: '/local/app', repos: [], sessionCount: 1 }],
+      scoped_session_ids: []
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+    gatewayAtom.set({ connectionState: 'open', request } as never)
+
+    const pending = refreshProjectTree()
+    await vi.waitFor(() => {
+      expect(request).toHaveBeenCalled()
+    })
+    // Chrome payload applied, foreign merge still pending — remote row must not vanish.
+    expect($projectTree.get().map(project => project.id).sort()).toEqual(['p_local', 'p_mimir'])
+
+    resolveForeign({
+      active_id: null,
+      projects: [{ id: 'p_mimir', label: 'Mimir refreshed', path: '/mimir/app', repos: [], sessionCount: 2 }],
+      scoped_session_ids: []
+    })
+    await pending
+
+    const mimir = $projectTree.get().find(project => project.id === 'p_mimir')
+    expect(mimir?.label).toBe('Mimir refreshed')
+    expect(mimir?.connectionId).toBe('mimir')
+  })
 })
 
 describe('pickProjectFolder', () => {

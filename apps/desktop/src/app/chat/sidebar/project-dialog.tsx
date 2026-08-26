@@ -15,8 +15,11 @@ import { GenerateButton } from '@/components/ui/generate-button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Tip } from '@/components/ui/tooltip'
+import type { DesktopRegistryConnection } from '@/global'
 import { useI18n } from '@/i18n'
+import { Check, Cloud, Monitor, Network, Terminal } from '@/lib/icons'
 import { type ProjectIdeaTemplate, randomIdeaTemplates } from '@/lib/project-idea-templates'
+import { selectableCardClass } from '@/lib/selectable-card'
 import { cn } from '@/lib/utils'
 import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { notifyError } from '@/store/notifications'
@@ -30,6 +33,13 @@ import {
   pickProjectFolder,
   renameProject
 } from '@/store/projects'
+
+const GATEWAY_KIND_ICON: Record<DesktopRegistryConnection['kind'], typeof Monitor> = {
+  cloud: Cloud,
+  local: Monitor,
+  remote: Network,
+  ssh: Terminal
+}
 
 // Single dialog mounted once in the sidebar; it renders create / rename /
 // add-folder flows driven by the $projectDialog atom. Folders are chosen via
@@ -46,6 +56,13 @@ export function ProjectDialog() {
 
   const gateways = useMemo(() => registry?.connections ?? [], [registry])
   const showGatewayPicker = mode === 'create' && gateways.length > 1
+
+  const kindLabels: Record<DesktopRegistryConnection['kind'], string> = {
+    cloud: t.settings.connections.kindCloud,
+    local: t.settings.connections.kindLocal,
+    remote: t.settings.connections.kindRemote,
+    ssh: t.settings.connections.kindSsh
+  }
 
   const [name, setName] = useState('')
   const [folders, setFolders] = useState<string[]>([])
@@ -172,6 +189,15 @@ export function ProjectDialog() {
     }
   }
 
+  const selectGateway = (id: string) => {
+    if (id === gatewayId) {
+      return
+    }
+
+    setGatewayId(id)
+    setFolders([])
+  }
+
   const title = mode === 'rename' ? p.renameTitle : mode === 'add-folder' ? p.addFolderTitle : p.createTitle
 
   return (
@@ -204,21 +230,35 @@ export function ProjectDialog() {
         {showGatewayPicker && (
           <div className="flex flex-col gap-1.5">
             <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{p.gatewayLabel}</span>
-            <select
-              className="h-8 rounded-md border border-(--ui-stroke-tertiary) bg-transparent px-2 text-[0.8125rem]"
-              disabled={submitting}
-              onChange={event => {
-                setGatewayId(event.target.value)
-                setFolders([])
-              }}
-              value={gatewayId}
-            >
-              {gateways.map(conn => (
-                <option key={conn.id} value={conn.id}>
-                  {conn.label}
-                </option>
-              ))}
-            </select>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {gateways.map(conn => {
+                const Icon = GATEWAY_KIND_ICON[conn.kind]
+                const active = conn.id === gatewayId
+
+                return (
+                  <button
+                    aria-pressed={active}
+                    className={cn(
+                      'flex w-full flex-col p-3 text-left disabled:cursor-not-allowed disabled:opacity-50',
+                      selectableCardClass({ active, prominent: true })
+                    )}
+                    disabled={submitting}
+                    key={conn.id}
+                    onClick={() => selectGateway(conn.id)}
+                    type="button"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+                      <span className="min-w-0 truncate text-[0.8125rem] font-medium">{conn.label}</span>
+                      {active ? <Check className="ml-auto size-3.5 shrink-0 text-primary" /> : null}
+                    </div>
+                    <p className="mt-1.5 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">
+                      {kindLabels[conn.kind]}
+                    </p>
+                  </button>
+                )
+              })}
+            </div>
           </div>
         )}
 

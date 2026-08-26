@@ -577,7 +577,16 @@ let projectTreeRefreshGeneration = 0
 function applyProjectTreePayload(res: ProjectTreePayload): void {
   const scoped = new Set(res.scoped_session_ids ?? [])
   const stamped = stampChromeProjects(res.projects ?? [])
-  $projectTree.set(stamped)
+  const activeId = chromeConnectionId()
+  // Keep previously-visible foreign nodes until mergeForeign replaces them —
+  // wiping here made remote projects flash out on every chrome tree refresh.
+  const previousForeign = $projectTree.get().filter(project => {
+    const scope = project.connectionId?.trim()
+
+    return Boolean(scope && scope !== activeId && scope !== 'local')
+  })
+
+  $projectTree.set(previousForeign.length ? [...stamped, ...previousForeign] : stamped)
   $activeProjectId.set(res.active_id ?? null)
   const tombstones = $removedSessionIds.get()
 
@@ -607,7 +616,18 @@ async function mergeForeignProjectTrees(generation: number): Promise<void> {
 
   const foreign = registry.connections.filter(conn => conn.id !== activeId && conn.kind !== 'local')
 
+  const chromeSlice = () =>
+    $projectTree.get().filter(project => {
+      const scope = project.connectionId?.trim()
+
+      return !scope || scope === activeId || scope === 'local'
+    })
+
   if (!foreign.length) {
+    if (generation === projectTreeRefreshGeneration && chromeConnectionId() === activeId) {
+      $projectTree.set(chromeSlice())
+    }
+
     return
   }
 
@@ -638,15 +658,11 @@ async function mergeForeignProjectTrees(generation: number): Promise<void> {
     }
   }
 
-  if (!extras.length || generation !== projectTreeRefreshGeneration || chromeConnectionId() !== activeId) {
+  if (generation !== projectTreeRefreshGeneration || chromeConnectionId() !== activeId) {
     return
   }
 
-  const chromeOnly = $projectTree.get().filter(project => {
-    const scope = project.connectionId?.trim()
-
-    return !scope || scope === activeId || scope === 'local'
-  })
+  const chromeOnly = chromeSlice()
   const seen = new Set(chromeOnly.map(project => `${project.connectionId ?? activeId}:${project.id}`))
   const toAdd = extras.filter(project => !seen.has(`${project.connectionId}:${project.id}`))
 

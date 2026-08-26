@@ -10,6 +10,14 @@ vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
       common: { cancel: 'Cancel', save: 'Save' },
+      settings: {
+        connections: {
+          kindCloud: 'Cloud',
+          kindLocal: 'Local',
+          kindRemote: 'Remote',
+          kindSsh: 'SSH'
+        }
+      },
       sidebar: {
         projects: {
           addFolder: 'Add folder',
@@ -102,21 +110,25 @@ describe('ProjectDialog', () => {
     expect(tipTrigger(button)).toBeTruthy()
   })
 
-  it('shows a gateway selector when more than one connection is registered', () => {
+  it('shows gateway cards when more than one connection is registered', () => {
     render(<ProjectDialog />)
 
     expect(screen.getByText('Gateway')).toBeTruthy()
-    expect(screen.getByRole('combobox')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /This device/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: /mimir/ }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByText('Local')).toBeTruthy()
+    expect(screen.getByText('SSH')).toBeTruthy()
   })
 
-  it('clears folders and pins pick/create to the chosen gateway', async () => {
+  it('clears folders and pins pick/create to the chosen gateway card', async () => {
     render(<ProjectDialog />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Add folder' }))
     await screen.findByRole('button', { name: 'Remove folder' })
 
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'mimir' } })
+    fireEvent.click(screen.getByRole('button', { name: /mimir/ }))
     expect(screen.queryByRole('button', { name: 'Remove folder' })).toBeNull()
+    expect(screen.getByRole('button', { name: /mimir/ }).getAttribute('aria-pressed')).toBe('true')
 
     pickProjectFolder.mockResolvedValueOnce('/mimir/work')
     fireEvent.click(screen.getByRole('button', { name: 'Add folder' }))
