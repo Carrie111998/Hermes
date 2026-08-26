@@ -3715,3 +3715,111 @@ class TestPruneRecheckUnderLock:
         store._has_active_processes_safe = lambda session_key, context=None: False
         assert store.prune_old_entries(1) == 1
         assert store.peek_session_id(entry.session_key) is None
+
+
+class TestRouteMoveDestinationBindingGuard:
+    @pytest.fixture()
+    def store(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        session_store = SessionStore(
+            sessions_dir=tmp_path / "sessions",
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        yield session_store
+        session_store._db.close()
+
+    def test_move_refuses_foreign_non_retired_destination_binding(self, store):
+        """A move cannot silently adopt another session's protection fence.
+
+        A non-retired binding at the destination key carries its session's
+        protection and forbidden-route history even when the route row is
+        gone. Every sibling routing writer refuses to rebind that fence to a
+        different session; the move transaction must reject it too instead
+        of transferring the orphaned protection.
+        """
+        source_a = SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:alerts:delivery-a",
+            chat_name="webhook/alerts",
+            chat_type="webhook",
+            user_id="webhook:alerts",
+        )
+        destination = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-guard",
+            chat_name="Hermes handoff",
+            chat_type="thread",
+            user_id="system:handoff",
+            user_name="Handoff",
+            thread_id="thread-guard",
+        )
+        destination_key = build_session_key(destination)
+
+        entry_a = store.get_or_create_session(source_a)
+        token = "binding-guard-token"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": entry_a.session_key,
+            "active_session_key": entry_a.session_key,
+        }
+        assert store._db.request_handoff_once(entry_a.session_id, "discord")
+        assert store._db.claim_webhook_handoff(
+            entry_a.session_id, json.dumps(owner)
+        )
+        moved = store.move_session_route(
+            entry_a.session_key,
+            destination_key,
+            entry_a.session_id,
+            destination,
+            handoff_claim_token=token,
+        )
+        assert moved is not None
+
+        # Drop the route row without retiring the binding — the orphaned
+        # non-retired fence still names session A.
+        store._db.delete_gateway_routing_entries(
+            [destination_key], scope=store._routing_scope()
+        )
+        with store._lock:
+            store._entries.pop(destination_key, None)
+
+        source_b = SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:alerts:delivery-b",
+            chat_name="webhook/alerts",
+            chat_type="webhook",
+            user_id="webhook:alerts",
+        )
+        entry_b = store.get_or_create_session(source_b)
+        assert store.move_session_route(
+            entry_b.session_key,
+            destination_key,
+            entry_b.session_id,
+            destination,
+        ) is None
+        assert store.peek_session_id(entry_b.session_key) == entry_b.session_id
+        assert store.peek_session_id(destination_key) is None
+
+        # An unfenced destination still accepts the same move.
+        clean_destination = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-clean",
+            chat_name="Hermes handoff",
+            chat_type="thread",
+            user_id="system:handoff",
+            user_name="Handoff",
+            thread_id="thread-clean",
+        )
+        assert store.move_session_route(
+            entry_b.session_key,
+            build_session_key(clean_destination),
+            entry_b.session_id,
+            clean_destination,
+        ) is not None

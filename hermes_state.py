@@ -6655,6 +6655,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if destination_row is not None
                 else None
             )
+            # A non-retired destination binding names the session whose
+            # protection (and forbidden-route history) this key still
+            # carries. Every sibling routing writer refuses to hand that
+            # protection to a different session; the move must too, instead
+            # of silently rebinding another session's fence. Checked before
+            # any mutation so a rejection commits nothing.
+            destination_binding_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (
+                    _webhook_handoff_route_binding_meta_key(
+                        scope,
+                        destination_session_key,
+                    ),
+                ),
+            ).fetchone()
+            destination_binding = _decode_webhook_handoff_route_binding(
+                destination_binding_row["value"]
+                if destination_binding_row is not None
+                else None
+            )
+            if (
+                destination_binding is not None
+                and not destination_binding.get("retired")
+                and destination_binding.get("active_session_id")
+                != expected_session_id
+            ):
+                return False
+
             route_rows = conn.execute(
                 "SELECT session_key, entry_json FROM gateway_routing "
                 "WHERE scope = ?",
