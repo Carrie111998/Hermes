@@ -121,6 +121,30 @@ describe('ProjectDialog', () => {
     await waitFor(() => expect(clearNewProjectDropPlacement).toHaveBeenCalled())
   })
 
+  it('keeps the armed placement when the create FAILS, so a retry still lands where dropped', async () => {
+    const { clearNewProjectDropPlacement, createProject } = vi.mocked(await import('@/store/projects'))
+    const placement = { anchor: 'workspace', dir: 'right' }
+
+    vi.mocked(createProject).mockClear()
+    vi.mocked(clearNewProjectDropPlacement).mockClear()
+    vi.mocked(createProject).mockRejectedValueOnce(new Error('gateway hiccup'))
+
+    $newProjectDropPlacement.set(placement)
+    render(<ProjectDialog />)
+    await fillCreateForm()
+    await waitFor(() => expect(createProject).toHaveBeenCalledOnce())
+
+    // The failed attempt consumed nothing and closed nothing — the dialog
+    // stays open for a retry with the placement intact.
+    expect(clearNewProjectDropPlacement).not.toHaveBeenCalled()
+    expect(createProject.mock.calls[0]?.[0]).toMatchObject({ dropPlacement: placement })
+
+    // Retry succeeds → forwards the SAME placement.
+    await fillCreateForm()
+    await waitFor(() => expect(createProject).toHaveBeenCalledTimes(2))
+    expect(createProject.mock.calls[1]?.[0]).toMatchObject({ dropPlacement: placement })
+  })
+
   it('sends no placement when opened by a plain click', async () => {
     const { createProject } = vi.mocked(await import('@/store/projects'))
 

@@ -328,6 +328,26 @@ describe('startNewProjectDrag', () => {
     expect(onTap).toHaveBeenCalledOnce()
   })
 
+  it('opens NOTHING on a denied drop — same language as Escape', () => {
+    const onArm = vi.fn()
+    const onTap = vi.fn()
+    const spec = engageProject(onArm, onTap)
+
+    // Released far outside any zone: the drop reads as cancelled.
+    const hint = spec.resolveMove(5000, 5000, false)
+
+    expect(hint).toBeNull()
+
+    spec.onCommit(hint)
+
+    expect(onTap).not.toHaveBeenCalled()
+
+    // Teardown still sweeps any stale arm (onEnd sees placement === null).
+    spec.onEnd()
+    expect(onArm).toHaveBeenCalledOnce()
+    expect(onArm).toHaveBeenCalledWith(null)
+  })
+
   it('carries the tab-strip slot in the armed placement', () => {
     const onArm = vi.fn()
     slotBefore.mockReturnValue({ before: 'session-tile:abc' })

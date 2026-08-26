@@ -287,10 +287,17 @@ export function startNewProjectDrag(
     },
 
     onCommit() {
-      // Arm BEFORE opening the dialog: the dialog's create path reads the armed
-      // placement when it succeeds, so the created project lands exactly here.
-      // No placement (deny-zone release) → the dialog still opens as a plain
-      // click would, and onEnd has already cleared any stale arm.
+      // A deny-zone release reads as a cancelled drop — same language as
+      // Escape and the new-session drag: nothing happens. The dialog only
+      // opens on a VALID commit (with the placement armed); a plain click
+      // still reaches it through the drag's tap path.
+      if (!placement) {
+        return
+      }
+
+      // Arm BEFORE opening the dialog: the dialog's create path reads the
+      // armed placement when it succeeds, so the created project lands
+      // exactly here.
       onArm(placement)
       opts?.onTap?.()
     }

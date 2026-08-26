@@ -88,8 +88,11 @@ export function ProjectDialog() {
   }
 
   // One submit beat for every flow: guard re-entry, run the write, close on
-  // success, surface a toast on failure. Callers pass only the write.
-  const runSubmit = async (write: () => Promise<unknown>) => {
+  // success, surface a toast on failure. Callers pass only the write, plus an
+  // optional hook that runs exactly when the write SUCCEEDS (before the close)
+  // — the New-project drop arm is consumed there, so a failed attempt keeps
+  // its placement for the retry while a successful one can't leak it forward.
+  const runSubmit = async (write: () => Promise<unknown>, onSuccess?: () => void) => {
     if (submitting) {
       return
     }
@@ -98,6 +101,7 @@ export function ProjectDialog() {
 
     try {
       await write()
+      onSuccess?.()
       closeProjectDialog()
     } catch (err) {
       notifyError(err, p.createFailed)
@@ -143,14 +147,13 @@ export function ProjectDialog() {
     // A project owns sessions by folder (cwd-prefix), so creation requires at
     // least one — a folder-less project couldn't hold a session anyway.
     if (mode === 'create' && trimmed && folders.length) {
-      await runSubmit(() =>
-        createProject({ dropPlacement, folders, idea: idea.trim() || undefined, name: trimmed, use: true })
+      // The arm is consumed exactly on SUCCESS (before the close): a failed
+      // create leaves the dialog open for a retry that still lands where it
+      // was dropped; the open-state effect discards it on cancel/teardown.
+      await runSubmit(
+        () => createProject({ dropPlacement, folders, idea: idea.trim() || undefined, name: trimmed, use: true }),
+        clearNewProjectDropPlacement
       )
-
-      // Consume the arm in the same breath as the create it fed — success or
-      // failure — so an armed placement can never outlive its own dialog
-      // flow. (Closing on cancel discards it through the open-state effect.)
-      clearNewProjectDropPlacement()
     }
   }
 
