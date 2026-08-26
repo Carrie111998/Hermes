@@ -603,6 +603,23 @@ from cron.jobs import (
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
+_cron_execution_usage: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "cron_execution_usage", default=None
+)
+
+
+@contextlib.contextmanager
+def _capture_execution_usage():
+    """Capture one run's usage without changing the run_job return contract."""
+    existing = _cron_execution_usage.get()
+    usage = existing if existing is not None else {}
+    token = _cron_execution_usage.set(usage)
+    try:
+        yield usage
+    finally:
+        _cron_execution_usage.reset(token)
+
+
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
@@ -5144,6 +5161,12 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    usage_out = _cron_execution_usage.get()
+    if usage_out is not None:
+        # Script-only, monitor-suppressed, and preflight-rejected paths make no
+        # model calls. Once an agent run starts, replace this with measured
+        # usage or None when the runtime cannot expose a real call count.
+        usage_out["api_calls"] = 0
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -6212,6 +6235,8 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
+        if usage_out is not None:
+            usage_out["api_calls"] = None
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
@@ -6293,6 +6318,12 @@ def run_job(
         if not isinstance(result, dict):
             raise RuntimeError(
                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
+            )
+        if usage_out is not None:
+            usage_out["api_calls"] = (
+                int(result.get("api_calls") or 0)
+                if result.get("api_calls_measured", True)
+                else None
             )
 
         # If the agent itself reported failure (e.g. all retries exhausted on
@@ -6821,6 +6852,14 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    execution_usage = _cron_execution_usage.get()
+    if execution_usage is None:
+        execution_usage = {}
+
+    def _finish_execution(**kwargs):
+        if "api_calls" in execution_usage:
+            kwargs["api_calls"] = execution_usage["api_calls"]
+        return finish_execution(execution_id, **kwargs)
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
@@ -6841,8 +6880,7 @@ def _run_one_job_body(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
             )
@@ -6877,19 +6915,23 @@ def _run_one_job_body(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            if fire_claim_lost is None:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                )
-            else:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                    cancel_event=fire_claim_lost,
-                )
+            token = _cron_execution_usage.set(execution_usage)
+            try:
+                if fire_claim_lost is None:
+                    success, output, final_response, error = run_job(
+                        job,
+                        defer_agent_teardown=_deferred_agents,
+                        extra_prompt=extra_prompt,
+                    )
+                else:
+                    success, output, final_response, error = run_job(
+                        job,
+                        defer_agent_teardown=_deferred_agents,
+                        extra_prompt=extra_prompt,
+                        cancel_event=fire_claim_lost,
+                    )
+            finally:
+                _cron_execution_usage.reset(token)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -6920,14 +6962,12 @@ def _run_one_job_body(
                     "Interrupted by shutdown before terminal completion.",
                     expected_fire_owner=fire_owner,
                 )
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Interrupted by shutdown before terminal completion.",
                 )
             else:
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
@@ -7106,14 +7146,12 @@ def _run_one_job_body(
                     "Interrupted by shutdown before terminal completion.",
                     expected_fire_owner=fire_owner,
                 )
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Interrupted by shutdown before terminal completion.",
                 )
             else:
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
@@ -7145,8 +7183,7 @@ def _run_one_job_body(
                         "Failed recording delivery_error for interrupted job %s: %s",
                         job["id"], _rec_err,
                     )
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error="Interrupted by gateway shutdown before terminal completion.",
             )
@@ -7159,8 +7196,7 @@ def _run_one_job_body(
             mark_kwargs["status"] = "blocked_config"
         marked = mark_job_run(job["id"], success, error, **mark_kwargs)
         if fire_owner is not None and not marked:
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error="Fire claim ownership lost before terminal completion.",
             )
@@ -7184,8 +7220,7 @@ def _run_one_job_body(
             # configured target) — record it on the incident so the CLI
             # distinguishes "failure seen" from "operator was pinged".
             _mark_incident_alerted(failure_incident_id)
-        finish_execution(
-            execution_id,
+        _finish_execution(
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
@@ -7274,8 +7309,7 @@ def _run_one_job_body(
                 job["id"], record_err,
             )
         try:
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error=_err_text,
                 delivery_outcome=delivery_outcome,

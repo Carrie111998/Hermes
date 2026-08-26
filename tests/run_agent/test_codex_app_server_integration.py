@@ -121,6 +121,7 @@ class TestRunConversationCodexPath:
         assert result["cache_write_tokens"] == 0
         assert result["reasoning_tokens"] == 5
         assert result["last_prompt_tokens"] == 100
+        assert result["api_calls_measured"] is False
 
         assert agent.session_api_calls == 1
         assert agent.session_prompt_tokens == 100

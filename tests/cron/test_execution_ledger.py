@@ -30,10 +30,13 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert running["status"] == "running"
     assert running["started_at"]
 
-    completed = executions.finish_execution(claimed["id"], success=True)
+    completed = executions.finish_execution(
+        claimed["id"], success=True, api_calls=3
+    )
     assert completed["status"] == "completed"
     assert completed["finished_at"]
     assert completed["error"] is None
+    assert completed["api_calls"] == 3
 
     persisted = executions.list_executions(job_id="job-1")
     assert persisted == [completed]
@@ -104,7 +107,68 @@ def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
     output = capsys.readouterr().out
     assert row["id"] in output
     assert "failed" in output
+    assert "api_calls=n/a" in output
     assert "boom" in output
+
+
+def test_existing_execution_database_migrates_api_calls_to_unknown(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at)
+               VALUES ('legacy', 'legacy-job', 'builtin', 'owner', 1,
+                       'completed', '2026-01-01T00:00:00')"""
+        )
+
+    records = executions.list_executions(job_id="legacy-job")
+
+    assert records[0]["api_calls"] is None
+
+
+def test_run_one_job_persists_measured_api_calls(monkeypatch):
+    import cron.scheduler as scheduler
+
+    finished = []
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _id: None)
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    def measured_run(_job, **_kwargs):
+        scheduler._cron_execution_usage.get()["api_calls"] = 4
+        return True, "output", "response", None
+
+    monkeypatch.setattr(scheduler, "run_job", measured_run)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+
+    assert scheduler.run_one_job(
+        {"id": "measured", "execution_id": "exec-measured"}
+    ) is True
+    assert finished[-1][1]["api_calls"] == 4
 
 
 def test_quick_backup_includes_execution_ledger():

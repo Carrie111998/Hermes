@@ -783,6 +783,7 @@ def _run_claimed_job(
     fire_owner = None
     try:
         from cron.scheduler import (
+            _capture_execution_usage,
             release_running_job,
             run_one_job,
             try_register_running_job,
@@ -887,10 +888,11 @@ def _run_claimed_job(
 
         try:
             try:
-                processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
-                    extra_prompt=extra_prompt,
-                )
+                with _capture_execution_usage() as usage:
+                    processed = run_one_job(
+                        job, adapters=adapters, loop=gateway_loop,
+                        extra_prompt=extra_prompt,
+                    )
             finally:
                 _heartbeat_stop.set()
                 if _heartbeat_thread is not None:
@@ -904,6 +906,7 @@ def _run_claimed_job(
             "claimed": True,
             "success": bool(processed and ok),
             "error": refreshed.get("last_error"),
+            "api_calls": usage.get("api_calls"),
         }
 
     except Exception as e:
@@ -1160,7 +1163,7 @@ def _try_dispatch_background_run(
             "status": "completed" if res.get("success") else "error",
             "summary": "\n".join(lines),
             "error": res.get("error"),
-            "api_calls": 0,
+            "api_calls": res.get("api_calls"),
             "duration_seconds": duration,
         }
 
@@ -1555,6 +1558,8 @@ def cronjob(
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
+            if "api_calls" in exec_result:
+                result["execution_api_calls"] = exec_result["api_calls"]
             if not exec_result.get("claimed", False):
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."

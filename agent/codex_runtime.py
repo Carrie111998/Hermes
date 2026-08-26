@@ -113,8 +113,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     The Codex app-server protocol does not currently expose cache-write tokens,
     so that bucket remains zero on this runtime.
 
-    Even when Codex omits usage for a turn, Hermes should still count that turn
-    as one API call for session/status accounting.
+    Even when Codex omits usage for a turn, Hermes still counts that server turn
+    for session/status accounting. The app-server protocol does not expose the
+    number of model calls performed inside the turn, so callers must not present
+    this counter as measured API-call usage.
     """
     agent.session_api_calls += 1
 
@@ -796,6 +798,7 @@ def run_codex_app_server_turn(
             ),
             "messages": messages,
             "api_calls": 0,
+            "api_calls_measured": False,
             "completed": False,
             "partial": True,
             "interrupted": _user_interrupted,
@@ -940,6 +943,7 @@ def run_codex_app_server_turn(
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
+        "api_calls_measured": False,
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
         "interrupted": _user_interrupted,
