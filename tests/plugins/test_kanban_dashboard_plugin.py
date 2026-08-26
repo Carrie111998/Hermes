@@ -116,6 +116,32 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_dashboard_filters_and_reparents_recursive_issues(client):
+    product = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Hermes", "kind": "product", "product_id": "product_hermes"},
+    ).json()["task"]
+    other = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Other", "kind": "product"},
+    ).json()["task"]
+    feature = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Hierarchy", "kind": "feature", "parent_id": product["id"], "product_id": "product_hermes"},
+    ).json()["task"]
+
+    filtered = client.get(
+        "/api/plugins/kanban/board",
+        params={"kind": "feature", "parent_id": product["id"], "product_id": "product_hermes"},
+    ).json()
+    assert [t["id"] for c in filtered["columns"] for t in c["tasks"]] == [feature["id"]]
+
+    moved = client.patch(
+        f"/api/plugins/kanban/tasks/{feature['id']}", json={"parent_id": other["id"]},
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["task"]["parent_id"] == other["id"]
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

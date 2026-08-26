@@ -389,6 +389,9 @@ def get_board(
     current_step_key: Optional[str] = Query(
         None, description="Restrict to tasks at this workflow step key",
     ),
+    kind: Optional[str] = Query(None, description="Exact issue-kind filter"),
+    parent_id: Optional[str] = Query(None, description="Exact containment-parent filter"),
+    product_id: Optional[str] = Query(None, description="Exact structured product filter"),
 ):
     """Return the full board grouped by status column.
 
@@ -408,6 +411,9 @@ def get_board(
             include_archived=include_archived,
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
+            kind=kind,
+            hierarchy_parent_id=parent_id,
+            product_id=product_id,
         )
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
@@ -469,6 +475,11 @@ def get_board(
             )
             d = _task_dict(t, latest_summary=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+            d["hierarchy_children"] = kanban_db.hierarchy_child_ids(conn, t.id)
+            d["breadcrumbs"] = [
+                {"id": item.id, "title": item.title, "kind": item.kind}
+                for item in kanban_db.issue_breadcrumbs(conn, t.id)
+            ]
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             diags = diagnostics_per_task.get(t.id)
@@ -619,6 +630,9 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    kind: str = "task"
+    parent_id: Optional[str] = None
+    product_id: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -647,6 +661,9 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            kind=payload.kind,
+            hierarchy_parent_id=payload.parent_id,
+            product_id=payload.product_id,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -852,6 +869,8 @@ class UpdateTaskBody(BaseModel):
     # override doesn't silently reset the depth the operator chose.
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    parent_id: Optional[str] = None
+    clear_parent: bool = False
 
 
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
@@ -1048,6 +1067,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 conn, task_id,
                 [f for f in ("title", "body") if getattr(payload, f) is not None],
                 board=board,
+            )
+
+        if payload.parent_id is not None or payload.clear_parent:
+            kanban_db.reparent_issue(
+                conn, task_id, None if payload.clear_parent else payload.parent_id,
             )
 
         updated = kanban_db.get_task(conn, task_id)
