@@ -118,6 +118,34 @@ async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) ->
     return await asyncio.to_thread(_run_in_fresh_context, func, *args)
 
 
+def _format_gave_up_notification(
+    *,
+    board_tag: str,
+    tag: str,
+    task_id: str,
+    payload: Optional[dict],
+) -> str:
+    """Render a truthful terminal notice for any circuit-breaker cause."""
+    payload = payload or {}
+    trigger = str(payload.get("trigger_outcome") or "")
+    error = str(payload.get("error") or "")[:200]
+    if trigger == "timed_out" and payload.get("budget_used") is not None:
+        used = payload["budget_used"]
+        maximum = payload.get("budget_max", "?")
+        return (
+            f"✖ {board_tag}{tag}Kanban {task_id} gave up: iteration budget "
+            f"exhausted ({used}/{maximum}) after repeated attempts"
+        )
+    if trigger == "spawn_failed":
+        reason = "after repeated spawn failures"
+    elif trigger:
+        reason = f"after repeated {trigger} failures"
+    else:
+        reason = "after repeated worker failures"
+    suffix = f"\n{error}" if error else ""
+    return f"✖ {board_tag}{tag}Kanban {task_id} gave up {reason}{suffix}"
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -612,12 +640,11 @@ class GatewayKanbanWatchersMixin:
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                            msg = _format_gave_up_notification(
+                                board_tag=board_tag,
+                                tag=tag,
+                                task_id=sub["task_id"],
+                                payload=ev.payload,
                             )
                         elif kind == "crashed":
                             msg = (
