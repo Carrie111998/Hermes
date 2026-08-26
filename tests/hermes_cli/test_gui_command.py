@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -80,10 +81,9 @@ def _make_packaged_executable(root: Path, monkeypatch) -> Path:
     branch, so faking the platform here only proved the test and the code
     agreed about a host neither was running on.
 
-    Note the Linux arm also lays down ``chrome-sandbox``. ``cmd_gui`` refuses to
-    launch without it (Electron's setuid sandbox helper), which the old
-    darwin-by-default fake concealed — on Linux the packaged tree genuinely has
-    to include it.
+    Note the Linux arm also lays down ``chrome-sandbox`` because packaged
+    Electron bundles it. ``cmd_gui`` only needs to configure it on hosts whose
+    policy blocks Chromium's normal user-namespace sandbox.
     """
     desktop_dir = root / "apps" / "desktop"
     if sys.platform == "darwin":
@@ -920,6 +920,41 @@ def test_relaunchable_fixup_legacy_adhoc_success_still_verifies_and_never_delete
 
 
 @pytest.mark.linux_only
+def test_desktop_linux_needs_no_sandbox_when_user_namespaces_are_disabled(monkeypatch):
+    """A disabled kernel user-namespace policy still requires the SUID helper."""
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    monkeypatch.setattr(cli_main.os, "geteuid", lambda: 1000)
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/sys/kernel/unprivileged_userns_clone":
+            return io.StringIO("0\n")
+        raise OSError(path)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    assert cli_main._desktop_linux_needs_no_sandbox() is True
+
+
+@pytest.mark.linux_only
+def test_desktop_linux_namespace_probe_allows_app_profile_exception(monkeypatch):
+    """An AppArmor-enabled executable may still be granted user namespaces."""
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    monkeypatch.setattr(cli_main.os, "geteuid", lambda: 1000)
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/sys/kernel/apparmor_restrict_unprivileged_userns":
+            return io.StringIO("1\n")
+        raise OSError(path)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: "/usr/bin/unshare" if name == "unshare" else None)
+    with patch("hermes_cli.main.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+        assert cli_main._desktop_linux_needs_no_sandbox() is False
+
+    assert run.call_args.args[0] == ["/usr/bin/unshare", "--user", "--map-root-user", "true"]
+
+
+@pytest.mark.linux_only
 def test_gui_registers_linux_desktop_entry_before_launch(tmp_path, monkeypatch):
     """`hermes desktop` gives the app a launcher presence on Linux."""
     root = _make_desktop_tree(tmp_path)
@@ -943,6 +978,26 @@ def test_gui_registers_linux_desktop_entry_before_launch(tmp_path, monkeypatch):
         cli_main.cmd_gui(_ns())
 
     assert registered == [root]
+
+
+@pytest.mark.linux_only
+def test_gui_linux_namespace_sandbox_launch_skips_suid_fixup(tmp_path, monkeypatch):
+    """Hosts with user namespaces launch without a mutable SUID helper."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup") as mock_fixup, \
+         patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True))
+
+    assert exc.value.code == 0
+    mock_fixup.assert_not_called()
+    assert mock_run.call_args.args[0] == [str(packaged_exe)]
 
 
 @pytest.mark.linux_only
