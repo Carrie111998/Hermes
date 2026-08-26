@@ -473,6 +473,7 @@ from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
+from hermes_cli.subcommands.mobile import build_mobile_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
@@ -8532,6 +8533,61 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
+def cmd_mobile(args: argparse.Namespace):
+    """Build the Android client from the current Hermes source checkout."""
+    mobile_dir = PROJECT_ROOT / "apps" / "mobile"
+    android_dir = mobile_dir / "android"
+    if not (mobile_dir / "package.json").exists() or not android_dir.exists():
+        print(f"Mobile Android source not found at: {mobile_dir}")
+        sys.exit(1)
+
+    sdk_root = (
+        getattr(args, "sdk_root", None)
+        or os.environ.get("ANDROID_SDK_ROOT")
+        or os.environ.get("ANDROID_HOME")
+    )
+    if not sdk_root or not (Path(sdk_root).expanduser() / "platform-tools").exists():
+        print("Hermes Mobile requires an Android SDK with platform-tools installed.")
+        print("Set ANDROID_SDK_ROOT or pass: hermes mobile --sdk-root /path/to/android-sdk")
+        sys.exit(1)
+
+    npm = _resolve_node_runtime_npm()
+    if not npm:
+        print("Hermes Mobile requires Node.js/npm, but npm was not found on PATH.")
+        sys.exit(1)
+
+    from hermes_constants import with_hermes_node_path
+
+    env = with_hermes_node_path()
+    env["ANDROID_HOME"] = str(Path(sdk_root).expanduser().resolve())
+    env["ANDROID_SDK_ROOT"] = env["ANDROID_HOME"]
+    build_variant = "Release" if getattr(args, "release", False) else "Debug"
+
+    install = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=env)
+    if install.returncode != 0:
+        print("Mobile dependency install failed.")
+        sys.exit(install.returncode or 1)
+
+    commands = [
+        [npm, "run", "test", "--workspace", "apps/mobile"],
+        [npm, "run", "build", "--workspace", "apps/mobile"],
+        [npm, "exec", "--", "cap", "sync", "android"],
+        ["./gradlew", f"assemble{build_variant}", "--no-daemon"],
+    ]
+    cwd = [PROJECT_ROOT, PROJECT_ROOT, mobile_dir, android_dir]
+    for command, workdir in zip(commands, cwd):
+        result = subprocess.run(command, cwd=workdir, env=env, check=False)
+        if result.returncode != 0:
+            print(f"Mobile Android build failed: {' '.join(command)}")
+            sys.exit(result.returncode or 1)
+
+    apk = android_dir / "app" / "build" / "outputs" / "apk" / build_variant.lower() / f"app-{build_variant.lower()}.apk"
+    if not apk.exists():
+        print(f"Mobile Android build completed but no APK was found at: {apk}")
+        sys.exit(1)
+    print(f"✓ Hermes Mobile {build_variant.lower()} APK ready: {apk}")
+
+
 # Dashboard process-hygiene helpers live in hermes_cli/dashboard_procs.py
 # (main.py decomposition, mechanical move). Re-exported lazily through the
 # module-level __getattr__ above so callers and test monkeypatches on
@@ -14545,6 +14601,11 @@ def main():
     # gui command  (parser built in hermes_cli/subcommands/gui.py)
     # =========================================================================
     build_gui_parser(subparsers, cmd_gui=cmd_gui)
+
+    # =========================================================================
+    # mobile command  (parser built in hermes_cli/subcommands/mobile.py)
+    # =========================================================================
+    build_mobile_parser(subparsers, cmd_mobile=cmd_mobile)
 
     # =========================================================================
     # logs command  (parser built in hermes_cli/subcommands/logs.py)

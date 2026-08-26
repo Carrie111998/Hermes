@@ -66,11 +66,21 @@ body {
   top: calc(var(--titlebar-controls-top, 0px) + env(safe-area-inset-top)) !important;
 }
 
-/* Slightly larger tap targets for touch — the desktop titlebar buttons are tuned
-   for a mouse. Bumped a little (not a lot) so they're easier to hit. */
+/* Phone chrome uses 44px hit boxes. Keep only gateway-essential titlebar actions
+   visible so the enlarged targets never collide on a 360px screen. */
 :root {
-  --titlebar-control-size: 1.6rem;
-  --titlebar-control-height: 1.7rem;
+  --titlebar-control-size: 2.75rem;
+  --titlebar-control-height: 2.75rem;
+  /* A phone must never inherit the desktop chat's rigid minimum pane width. */
+  --chat-min-width: 0px;
+}
+[data-titlebar-tool='layout'],
+[data-titlebar-tool='hud'],
+[data-titlebar-tool='haptics'],
+[data-titlebar-tool='sidebar'],
+[data-titlebar-tool='flip-panes'],
+[data-titlebar-tool='right-sidebar'] {
+  display: none !important;
 }
 [data-titlebar-cluster] .codicon {
   font-size: 1rem !important;
@@ -81,6 +91,45 @@ body {
    The drawer has its own header; SidebarBridge sets data-drawer-open on <html>. */
 [data-drawer-open] [data-titlebar-cluster] {
   display: none !important;
+}
+[data-drawer-open] .mobile-session-drawer-trigger {
+  display: none !important;
+}
+
+/* The native mobile shell has no Electron titlebar menu. Keep session navigation
+   discoverable without relying on Android Back or a hidden desktop shortcut. */
+.mobile-session-drawer-trigger {
+  position: fixed;
+  z-index: 60;
+  top: calc(env(safe-area-inset-top) + 0.5rem);
+  left: calc(env(safe-area-inset-left) + 0.5rem);
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  place-items: center;
+  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
+  border-radius: 0.75rem;
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+  color: var(--ui-text-primary, currentColor);
+  font-size: 1.35rem;
+  line-height: 1;
+}
+.mobile-session-drawer-trigger:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+
+/* The settings/command overlays own their own close/navigation chrome. Keeping
+   the session trigger above them is both redundant and visually misleading. */
+html:has([data-overlay-surface]) .mobile-session-drawer-trigger {
+  display: none !important;
+}
+
+/* A collapsed pane must be a true off-canvas drawer, never a second docked rail
+   that squeezes the chat below its readable width. */
+[data-narrow-pane-overlay] {
+  width: min(17rem, calc(100vw - 1rem)) !important;
+  max-width: calc(100vw - env(safe-area-inset-left) - env(safe-area-inset-right) - 1rem);
+  z-index: 100 !important;
 }
 
 /* Safe-area helpers usable from any screen. */
@@ -108,11 +157,10 @@ body {
   display: none !important;
 }
 
-/* Slightly taller bottom bar with larger text/icons so the items are easier to
-   tap (the desktop bar is h-5 / 0.6875rem — too small for touch). Bumped a
-   little, not a lot. */
+/* Bottom actions keep full 44px touch targets. The horizontal strip preserves
+   every action without shrinking hit areas; users can swipe to reach extras. */
 [data-statusbar] {
-  height: 1.75rem !important;
+  height: 2.75rem !important;
   /* Show every control; scroll the bar horizontally rather than cram or clip. */
   justify-content: flex-start !important;
   overflow-x: auto;
@@ -181,7 +229,7 @@ body {
  * content on narrow viewports — see overlays/overlay-split-layout.tsx), so the
  * only mobile tweak here is insetting the overlay CARD into the safe area.
  */
-@media (max-width: 47.5rem) {
+@media (max-width: 64rem) {
   /* Inset the whole overlay CARD (Settings/Skills/Profiles) into the safe area so
      the panel stops at the status bar / nav bar like the rest of the app, instead
      of sliding under the clock/battery. With the card inset, its inner panels use
@@ -191,5 +239,27 @@ body {
     padding-bottom: calc(env(safe-area-inset-bottom) + 0.5rem) !important;
     padding-left: calc(env(safe-area-inset-left) + 0.5rem) !important;
     padding-right: calc(env(safe-area-inset-right) + 0.5rem) !important;
+  }
+
+  /* Settings search is a desktop edge badge. The compact nav owns mobile
+     section selection, so leaving this second control floating creates an
+     awkward, overlapping search affordance. */
+  [data-overlay-edge-badge] {
+    display: none;
+  }
+
+  /* The compact nav is the one mobile section selector. The desktop floating
+     search pill duplicates it visually and has no stable place beside the
+     close/import/export actions, so it stays out of the touch layout. */
+  [data-overlay-compact-nav] [data-tab-dropdown-trigger],
+  [data-overlay-nav-actions] > button {
+    min-height: 2.75rem;
+    min-width: 2.75rem;
+  }
+  [data-overlay-compact-nav] [data-tab-dropdown-trigger] {
+    padding-inline: 0.75rem;
+  }
+  [data-overlay-view] [role='menuitem'] {
+    min-height: 2.75rem;
   }
 }

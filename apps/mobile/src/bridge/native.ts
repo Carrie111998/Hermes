@@ -8,6 +8,7 @@ import { Browser } from '@capacitor/browser'
 import { Clipboard } from '@capacitor/clipboard'
 import { Capacitor } from '@capacitor/core'
 import { LocalNotifications } from '@capacitor/local-notifications'
+import { Network } from '@capacitor/network'
 
 import type { HermesNotification } from '@/global'
 
@@ -20,16 +21,45 @@ export async function writeClipboard(text: string): Promise<boolean> {
   }
 }
 
-export async function openExternal(url: string): Promise<void> {
+export async function requestMicrophoneAccess(): Promise<boolean> {
   try {
-    await Browser.open({ url })
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    stream.getTracks().forEach(track => track.stop())
+
+    return true
   } catch {
-    /* ignore — nothing actionable on the mobile side */
+    return false
+  }
+}
+
+export async function openExternal(rawUrl: string): Promise<void> {
+  try {
+    const url = new URL(rawUrl)
+    if (url.protocol !== 'https:' || url.username || url.password) return
+
+    await Browser.open({ url: url.toString() })
+  } catch {
+    /* Invalid or unsupported external URLs are deliberately ignored. */
   }
 }
 
 let notifyId = 1
 let notifPermissionAsked = false
+let notificationChannelReady = false
+const NOTIFICATION_CHANNEL_ID = 'hermes_activity'
+
+async function ensureNotificationChannel(): Promise<void> {
+  if (notificationChannelReady) return
+
+  await LocalNotifications.createChannel({
+    id: NOTIFICATION_CHANNEL_ID,
+    name: 'Hermes activity',
+    description: 'Completion and attention notices from an active Hermes session.',
+    importance: 3,
+    vibration: true,
+  })
+  notificationChannelReady = true
+}
 
 export async function notify(payload: HermesNotification): Promise<boolean> {
   if (!Capacitor.isNativePlatform()) return false
@@ -41,6 +71,7 @@ export async function notify(payload: HermesNotification): Promise<boolean> {
         await LocalNotifications.requestPermissions()
       }
     }
+    await ensureNotificationChannel()
     await LocalNotifications.schedule({
       notifications: [
         {
@@ -48,6 +79,11 @@ export async function notify(payload: HermesNotification): Promise<boolean> {
           title: payload.title ?? 'Hermes',
           body: payload.body ?? '',
           silent: payload.silent,
+          channelId: NOTIFICATION_CHANNEL_ID,
+          foreground: true,
+          // This is an immediate notification, not an alarm. Avoid triggering
+          // Android's unrelated "Alarms & reminders" permission prompt.
+          isExactNotification: false,
           extra: { sessionId: payload.sessionId, kind: payload.kind },
         },
       ],
@@ -58,11 +94,19 @@ export async function notify(payload: HermesNotification): Promise<boolean> {
   }
 }
 
-/** Wire Capacitor's app-resume into a callback so the vendored reconnect-on-wake
- *  logic fires unchanged. Returns an unsubscribe. */
+/**
+ * Reconnect the gateway client when Android resumes or a foreground app regains
+ * network connectivity. The Desktop boot hook already serializes reconnects;
+ * this bridge only supplies the native lifecycle signals it cannot see itself.
+ */
 export function onPowerResume(callback: () => void): () => void {
-  const handle = App.addListener('resume', () => callback())
+  const resumeHandle = App.addListener('resume', callback)
+  const networkHandle = Network.addListener('networkStatusChange', ({ connected }) => {
+    if (connected) callback()
+  })
+
   return () => {
-    void handle.then((h) => h.remove())
+    void resumeHandle.then(handle => handle.remove())
+    void networkHandle.then(handle => handle.remove())
   }
 }

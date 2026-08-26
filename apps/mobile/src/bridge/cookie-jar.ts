@@ -4,8 +4,8 @@
  * Explicit, persisted cookie storage — the R2 mitigation. CapacitorHttp's
  * native cookie store usually auto-attaches the gateway's session cookies, but
  * rather than depend on that (and on its cross-launch persistence) we capture
- * `Set-Cookie` from every response ourselves, persist name=value to
- * @capacitor/preferences, and replay them as a `Cookie` header on each request.
+ * `Set-Cookie` from every response ourselves, persist name=value through the
+ * platform secure store, and replay them as a `Cookie` header on each request.
  *
  * Notes:
  *  - We store only `name=value` (attributes like Path/HttpOnly/Max-Age are
@@ -16,7 +16,7 @@
  *  - Keyed by host so switching between saved gateways keeps sessions separate.
  */
 
-import { Preferences } from '@capacitor/preferences'
+import { secureGet, secureRemove, secureSet } from './secure-store'
 
 const KEY_PREFIX = 'hermes.cookies.'
 
@@ -40,21 +40,17 @@ function storageKey(host: string): string {
 export async function loadCookies(url: string): Promise<void> {
   const host = hostOf(url)
   if (mem.has(host)) return
-  const { value } = await Preferences.get({ key: storageKey(host) })
-  if (value) {
-    try {
-      mem.set(host, JSON.parse(value) as CookieMap)
-    } catch {
-      mem.set(host, {})
-    }
-  } else {
+  try {
+    const value = await secureGet(storageKey(host))
+    mem.set(host, value ? (JSON.parse(value) as CookieMap) : {})
+  } catch {
     mem.set(host, {})
   }
 }
 
 async function persist(host: string): Promise<void> {
   const map = mem.get(host) ?? {}
-  await Preferences.set({ key: storageKey(host), value: JSON.stringify(map) })
+  await secureSet(storageKey(host), JSON.stringify(map))
 }
 
 /** Parse one or more Set-Cookie header values and store them for `url`'s host. */
@@ -106,7 +102,7 @@ export function hasSession(url: string): boolean {
 export async function clearCookies(url: string): Promise<void> {
   const host = hostOf(url)
   mem.delete(host)
-  await Preferences.remove({ key: storageKey(host) })
+  await secureRemove(storageKey(host))
 }
 
 /**

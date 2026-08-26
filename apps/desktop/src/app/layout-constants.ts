@@ -21,5 +21,12 @@ export const PAGE_MAX_W = 'max-w-[75rem]'
 // Below this viewport width a docked sidebar leaves no room for content, so both
 // rails auto-collapse into the hover-reveal overlay. Single source of truth for
 // the responsive collapse point.
-export const SIDEBAR_COLLAPSE_BREAKPOINT_PX = 768
-export const SIDEBAR_COLLAPSE_MEDIA_QUERY = `(max-width: ${SIDEBAR_COLLAPSE_BREAKPOINT_PX}px)`
+// A Fold-class Android WebView is commonly about 900–1000 CSS px wide when
+// unfolded. Two desktop rails still leave the chat/settings detail below its
+// usable width, so treat this as a drawer layout rather than a squeezed desktop.
+export const SIDEBAR_COLLAPSE_BREAKPOINT_PX = 1024
+// Landscape phones can be wider than 768px while offering only ~360px of
+// vertical space; collapse rails there as well so the chat/composer keeps a
+// usable touch layout rather than inheriting a cramped desktop grid.
+export const SIDEBAR_COMPACT_LANDSCAPE_MEDIA_QUERY = '(max-height: 500px) and (orientation: landscape)'
+export const SIDEBAR_COLLAPSE_MEDIA_QUERY = `(max-width: ${SIDEBAR_COLLAPSE_BREAKPOINT_PX}px), ${SIDEBAR_COMPACT_LANDSCAPE_MEDIA_QUERY}`

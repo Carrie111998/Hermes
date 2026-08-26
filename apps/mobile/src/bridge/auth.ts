@@ -8,7 +8,7 @@
  *   3. mintWsTicket()  → POST /api/auth/ws-ticket → {ticket, ttl_seconds}
  */
 
-import { authModeFromStatus, normalizeRemoteBaseUrl, type AuthMode } from './connection-config'
+import { authModeFromStatus, buildGatewayWsUrl, requireSecureRemoteBaseUrl, type AuthMode } from './connection-config'
 import { clearCookies, hasSession, loadCookies } from './cookie-jar'
 import { rawRequest } from './http'
 
@@ -34,7 +34,7 @@ export interface ProbeResult {
 export async function probeGateway(rawUrl: string): Promise<ProbeResult> {
   let baseUrl: string
   try {
-    baseUrl = normalizeRemoteBaseUrl(rawUrl)
+    baseUrl = requireSecureRemoteBaseUrl(rawUrl)
   } catch (e) {
     return blankProbe(rawUrl, (e as Error).message)
   }
@@ -92,6 +92,81 @@ export class LoginError extends Error {
     super(message)
     this.name = 'LoginError'
   }
+}
+
+const TOKEN_PREFLIGHT_TIMEOUT_MS = 10_000
+
+/**
+ * Prove a static token can make the two connections the renderer needs before
+ * leaving token entry: an authenticated REST request and the actual WSS
+ * upgrade. This prevents a rejected/stale token from booting the Desktop shell
+ * into its recovery/onboarding screens.
+ */
+export async function verifyTokenGateway(baseUrl: string, rawToken: string): Promise<void> {
+  const token = rawToken.trim()
+  if (!token) throw new Error('A session token is required for this gateway.')
+
+  // Token-only gateways intentionally have no interactive login providers, so
+  // `/api/auth/providers` correctly returns 503 even for a valid static token.
+  // Use a small, authenticated dashboard setting as the REST proof: session
+  // listing ignores its limit and can otherwise pull private metadata before
+  // the user even enters the renderer.
+  const res = await rawRequest({
+    baseUrl,
+    path: '/api/dashboard/font',
+    headers: { 'X-Hermes-Session-Token': token },
+    timeoutMs: TOKEN_PREFLIGHT_TIMEOUT_MS,
+  })
+  if (res.status === 401 || res.status === 403) {
+    throw new Error('The gateway token was rejected. Check that it is the current Hermes gateway session token.')
+  }
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`Could not verify the gateway token (HTTP ${res.status}).`)
+  }
+
+  await verifyWebSocketUpgrade(buildGatewayWsUrl(baseUrl, token))
+}
+
+function verifyWebSocketUpgrade(wsUrl: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let socket: WebSocket
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const cleanup = () => {
+      if (timer !== undefined) globalThis.clearTimeout(timer)
+      socket.removeEventListener('close', onClose)
+      socket.removeEventListener('error', onError)
+      socket.removeEventListener('open', onOpen)
+    }
+    const fail = (message: string) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      socket.close()
+      reject(new Error(message))
+    }
+    const onOpen = () => {
+      if (settled) return
+      settled = true
+      cleanup()
+      socket.close()
+      resolve()
+    }
+    const onClose = () => fail('The gateway closed the secure WebSocket before the session could start.')
+    const onError = () => fail('Could not open the secure WebSocket to the gateway.')
+
+    try {
+      socket = new WebSocket(wsUrl)
+    } catch {
+      reject(new Error('Could not create the secure WebSocket to the gateway.'))
+      return
+    }
+    socket.addEventListener('close', onClose)
+    socket.addEventListener('error', onError)
+    socket.addEventListener('open', onOpen)
+    timer = globalThis.setTimeout(() => fail('Timed out opening the secure WebSocket to the gateway.'), TOKEN_PREFLIGHT_TIMEOUT_MS)
+  })
 }
 
 /** Username/password → session cookies (captured into the jar by rawRequest). */

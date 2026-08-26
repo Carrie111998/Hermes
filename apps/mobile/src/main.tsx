@@ -17,7 +17,7 @@ import '@/store/translucency'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { HashRouter } from 'react-router-dom'
+import { HashRouter } from 'react-router'
 
 // Reuse the desktop's own providers so the mobile app shares its exact runtime:
 // query cache, i18n, theme tokens, haptics, routing.
@@ -29,6 +29,10 @@ import { queryClient } from '@/lib/query-client'
 import { ThemeProvider } from '@/themes/context'
 
 import { MobileRoot } from './app'
+
+// Reused Desktop screens consult this marker to avoid desktop-only auto-focus
+// behavior that would raise Android's IME without an explicit user tap.
+document.documentElement.setAttribute('data-hermes-mobile', '')
 
 installClipboardShim()
 

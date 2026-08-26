@@ -12,7 +12,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': r('../desktop/src'),
-      '@hermes/shared': r('../shared/src/index.ts'),
+      '@hermes/shared': r('../shared/src'),
       '~mobile': r('./src/mobile'),
       '~bridge': r('./src/bridge'),
     },

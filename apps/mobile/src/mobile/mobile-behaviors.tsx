@@ -1,18 +1,28 @@
+import { useStore } from '@nanostores/react'
 import { App } from '@capacitor/app'
 import { Keyboard } from '@capacitor/keyboard'
 import { useEffect } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation } from 'react-router'
 
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+import { $previewTabs, closeRightRail } from '@/store/preview'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
   $fileBrowserOpen,
   $panesFlipped,
   $sidebarOpen,
   CHAT_SIDEBAR_PANE_ID,
   FILE_BROWSER_PANE_ID,
-  toggleFileBrowserOpen,
-  toggleSidebarOpen,
+  setFileBrowserOpen,
+  setSidebarOpen,
 } from '@/store/layout'
+
+import {
+  mobileDrawerForPane,
+  shouldDismissDrawerAfterSessionChange,
+  shouldRevealPaneForDrawerChange,
+  shouldSuppressPreviewOnMobile,
+} from './mobile-policy'
 
 /**
  * MobileBehaviors — the touch adaptations layered over the reused desktop UI.
@@ -20,29 +30,37 @@ import {
  *  1. Sidebar drawers: the titlebar burgers flip $sidebarOpen/$fileBrowserOpen,
  *     but collapsed panes only show via PANE_TOGGLE_REVEAL_EVENT (the mod+B
  *     path). Bridge that, normalize the pane flip, and dismiss on tap-outside.
- *  2. One Android back handler: keyboard → dismiss, else drawer → closed, else
- *     default (history back / exit).
+ *  2. One Android back handler: keyboard → dismiss, then overlay → close, then
+ *     drawer → close, else history back / exit.
  *
  * Overlay screens (Settings/Skills/Profiles) get their responsive master-detail
  * from upstream now (overlays/overlay-split-layout.tsx), so nothing here.
  */
-function revealPane(id: string) {
-  window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id } }))
+function revealPane(id: string, mode: 'close' | 'open' | 'toggle' = 'toggle') {
+  window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id, mode } }))
 }
 function anyDrawerOpen() {
   return $sidebarOpen.get() || $fileBrowserOpen.get()
 }
 function closeOpenDrawer() {
-  if ($sidebarOpen.get()) toggleSidebarOpen()
-  else if ($fileBrowserOpen.get()) toggleFileBrowserOpen()
+  if ($sidebarOpen.get()) setSidebarOpen(false)
+  else if ($fileBrowserOpen.get()) setFileBrowserOpen(false)
+}
+
+function dismissTopOverlay(): boolean {
+  if (!document.querySelector('[data-overlay-surface]')) return false
+
+  window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Escape' }))
+  return true
 }
 
 export function MobileBehaviors() {
   const location = useLocation()
+  const sidebarOpen = useStore($sidebarOpen)
 
   // Navigating (selecting a session) dismisses an open chat drawer.
   useEffect(() => {
-    if (anyDrawerOpen()) closeOpenDrawer()
+    if (shouldDismissDrawerAfterSessionChange(anyDrawerOpen())) closeOpenDrawer()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname])
 
@@ -50,11 +68,9 @@ export function MobileBehaviors() {
     // Standard orientation: sessions LEFT, files RIGHT.
     $panesFlipped.set(false)
 
-    // Track keyboard visibility so the Android back button can dismiss it first
-    // (see the backButton handler). The WebView resizes above the keyboard on its
-    // own — Chromium handles that natively on Android edge-to-edge, and the
-    // SafeArea plugin is patched (patches/) so it doesn't double-count the IME
-    // inset (which collapsed the viewport to ~241px).
+    // Track keyboard visibility for Android Back only. Chromium already owns
+    // IME viewport layout; programmatic scrollIntoView on every resize creates
+    // a resize → scroll → resize feedback loop on Fold-class devices.
     let keyboardOpen = false
     const kbShow = Keyboard.addListener('keyboardWillShow', () => {
       keyboardOpen = true
@@ -63,26 +79,54 @@ export function MobileBehaviors() {
       keyboardOpen = false
     })
 
-    const offSidebar = $sidebarOpen.listen(() => revealPane(CHAT_SIDEBAR_PANE_ID))
-    const offFiles = $fileBrowserOpen.listen(() => revealPane(FILE_BROWSER_PANE_ID))
+    const offSidebar = $sidebarOpen.listen(open => {
+      revealPane(CHAT_SIDEBAR_PANE_ID, shouldRevealPaneForDrawerChange(open) ? 'open' : 'close')
+    })
+    const offFiles = $fileBrowserOpen.listen(open => {
+      revealPane(FILE_BROWSER_PANE_ID, shouldRevealPaneForDrawerChange(open) ? 'open' : 'close')
+    })
+
+    // NarrowOverlays owns the visual drawer, while layout owns the state behind
+    // titlebar buttons and Android Back. Keep both directions synchronized so
+    // the overlay's own X never leaves an invisible drawer marked as open.
+    const onPaneReveal = (event: Event) => {
+      const detail = (event as CustomEvent<{ id?: string; mode?: 'close' | 'open' | 'toggle' }>).detail
+      if (detail?.mode !== 'close') return
+
+      const drawer = mobileDrawerForPane(detail.id)
+      if (drawer === 'sessions') setSidebarOpen(false)
+      else if (drawer === 'files') setFileBrowserOpen(false)
+    }
+    window.addEventListener(PANE_TOGGLE_REVEAL_EVENT, onPaneReveal)
 
     const syncDrawerAttr = () => {
       document.documentElement.toggleAttribute('data-drawer-open', anyDrawerOpen())
     }
+    const dismissDrawerForSessionChange = () => {
+      if (shouldDismissDrawerAfterSessionChange(anyDrawerOpen())) closeOpenDrawer()
+    }
+    const dismissPhonePreview = () => {
+      if (shouldSuppressPreviewOnMobile(window.innerWidth, $previewTabs.get().length)) closeRightRail()
+    }
     const offSidebarAttr = $sidebarOpen.subscribe(syncDrawerAttr)
     const offFilesAttr = $fileBrowserOpen.subscribe(syncDrawerAttr)
+    const offActiveSession = $activeSessionId.listen(dismissDrawerForSessionChange)
+    const offStoredSession = $selectedStoredSessionId.listen(dismissDrawerForSessionChange)
+    const offPreview = $previewTabs.listen(dismissPhonePreview)
+    dismissPhonePreview()
 
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Element | null
 
       // Tap outside an open chat drawer → dismiss it.
-      if (anyDrawerOpen() && !target?.closest('[data-pane-hover-reveal="open"]')) {
+      if (anyDrawerOpen() && !target?.closest('[data-narrow-pane-overlay]')) {
         e.stopPropagation()
         closeOpenDrawer()
       }
     }
     document.addEventListener('pointerdown', onPointerDown, true)
 
+    let disposed = false
     let backHandle: { remove: () => void } | undefined
     void App.addListener('backButton', ({ canGoBack }) => {
       // Keyboard open → just dismiss it (and blur, so it doesn't auto-reopen
@@ -92,21 +136,33 @@ export function MobileBehaviors() {
         void Keyboard.hide()
         return
       }
+      if (dismissTopOverlay()) {
+        return
+      }
       if (anyDrawerOpen()) {
         closeOpenDrawer()
         return
       }
       if (canGoBack) window.history.back()
       else void App.exitApp()
-    }).then((h) => {
-      backHandle = h
+    }).then((handle) => {
+      if (disposed) {
+        void handle.remove()
+      } else {
+        backHandle = handle
+      }
     })
 
     return () => {
+      disposed = true
       offSidebar()
       offFiles()
       offSidebarAttr()
       offFilesAttr()
+      offActiveSession()
+      offStoredSession()
+      offPreview()
+      window.removeEventListener(PANE_TOGGLE_REVEAL_EVENT, onPaneReveal)
       document.removeEventListener('pointerdown', onPointerDown, true)
       backHandle?.remove()
       void kbShow.then((h) => h.remove())
@@ -115,6 +171,21 @@ export function MobileBehaviors() {
     }
   }, [])
 
-  // No UI — this component exists only for the side effects wired up above.
-  return null
+  const toggleSessionDrawer = () => {
+    setSidebarOpen(!sidebarOpen)
+  }
+
+  // Desktop titlebar controls can be intentionally absent on the native shell.
+  // Keep a permanent, thumb-sized session entry point instead of making Android
+  // Back the only way to recover the session drawer.
+  return (
+    <button
+      aria-label={sidebarOpen ? 'Close sessions' : 'Open sessions'}
+      className="mobile-session-drawer-trigger"
+      onClick={toggleSessionDrawer}
+      type="button"
+    >
+      ☰
+    </button>
+  )
 }

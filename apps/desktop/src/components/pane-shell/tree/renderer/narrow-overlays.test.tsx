@@ -91,4 +91,23 @@ describe('narrow overlay of a stacked zone', () => {
     expect(getByTestId('sessions-body')).toBeTruthy()
     expect(overlayTab('sessions')).toBeNull()
   })
+
+  it('publishes a close intent when the drawer X is pressed', () => {
+    const closed: string[] = []
+    const onReveal = (event: Event) => {
+      const detail = (event as CustomEvent<{ id?: string; mode?: string }>).detail
+      if (detail?.mode === 'close' && detail.id) closed.push(detail.id)
+    }
+    window.addEventListener(PANE_TOGGLE_REVEAL_EVENT, onReveal)
+
+    try {
+      const { getByRole } = render(<NarrowOverlays />)
+      revealPane('sessions')
+      fireEvent.click(getByRole('button', { name: 'Close sessions' }))
+
+      expect(closed).toEqual(['sessions'])
+    } finally {
+      window.removeEventListener(PANE_TOGGLE_REVEAL_EVENT, onReveal)
+    }
+  })
 })

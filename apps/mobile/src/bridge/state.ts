@@ -7,10 +7,10 @@
  * last gateway without re-entering the URL.
  */
 
-import { Preferences } from '@capacitor/preferences'
 import { atom } from 'nanostores'
 
-import type { AuthMode } from './connection-config'
+import { requireSecureRemoteBaseUrl, type AuthMode } from './connection-config'
+import { secureGet, secureRemove, secureSet } from './secure-store'
 
 export interface GatewayTarget {
   baseUrl: string
@@ -45,23 +45,41 @@ export function currentTarget(): GatewayTarget | null {
 const KEY = 'hermes.target'
 
 export async function loadTarget(): Promise<GatewayTarget | null> {
-  const { value } = await Preferences.get({ key: KEY })
-  if (value) {
-    try {
-      _target = JSON.parse(value) as GatewayTarget
+  try {
+    const value = await secureGet(KEY)
+    if (value) {
+      const restored = JSON.parse(value) as GatewayTarget
+      _target = { ...restored, baseUrl: requireSecureRemoteBaseUrl(restored.baseUrl) }
       $target.set(_target)
-    } catch {
-      _target = null
     }
+  } catch {
+    _target = null
+    $target.set(null)
+    await secureRemove(KEY).catch(() => undefined)
   }
+
   return _target
 }
 
+function normalizeTarget(t: GatewayTarget | null): GatewayTarget | null {
+  return t ? { ...t, baseUrl: requireSecureRemoteBaseUrl(t.baseUrl) } : null
+}
+
+/** Connect for this app process only when Android Keystore persistence fails.
+ * The token stays solely in memory and is discarded on process exit. */
+export function setTransientTarget(t: GatewayTarget): void {
+  _target = normalizeTarget(t)
+  $target.set(_target)
+}
+
 export async function setTarget(t: GatewayTarget | null): Promise<void> {
-  _target = t
-  $target.set(t)
-  if (t) await Preferences.set({ key: KEY, value: JSON.stringify(t) })
-  else await Preferences.remove({ key: KEY })
+  const secureTarget = normalizeTarget(t)
+  // Do not update the live target until the Keystore write has succeeded. A
+  // failed persistence attempt must not leave a half-connected secret behind.
+  if (secureTarget) await secureSet(KEY, JSON.stringify(secureTarget))
+  else await secureRemove(KEY)
+  _target = secureTarget
+  $target.set(secureTarget)
 }
 
 export function setAuthStatus(s: AuthStatus): void {

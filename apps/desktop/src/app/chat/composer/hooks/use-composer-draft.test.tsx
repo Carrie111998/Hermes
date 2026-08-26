@@ -294,3 +294,32 @@ describe('useComposerDraft — a closing composer hands the focus-bus key back',
     expect(getActiveComposer()).toBe('tile:other')
   })
 })
+
+describe('useComposerDraft — mobile IME focus policy', () => {
+  function FocusHarness() {
+    const { editorRef } = useComposerDraft({
+      activeQueueSessionKey: 'session-mobile',
+      focusKey: null,
+      inputDisabled: false,
+      queueEditRef: { current: null as QueueEditState | null },
+      sessionId: 'session-mobile'
+    })
+
+    return <div contentEditable ref={editorRef} />
+  }
+
+  afterEach(() => {
+    cleanup()
+    mainComposerScope.clear()
+    document.documentElement.removeAttribute('data-hermes-mobile')
+  })
+
+  it('does not auto-focus the composer while the mobile shell boots', () => {
+    document.documentElement.setAttribute('data-hermes-mobile', '')
+    const focus = vi.spyOn(HTMLDivElement.prototype, 'focus')
+
+    render(<FocusHarness />)
+
+    expect(focus).not.toHaveBeenCalled()
+  })
+})

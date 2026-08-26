@@ -40,7 +40,7 @@ export function ConnectScreen({
       <Card>
         <Field
           label="Gateway URL"
-          placeholder="http://100.x.y.z:9119"
+          placeholder="https://your-private-gateway.example/hermes"
           inputMode="url"
           autoCapitalize="none"
           autoCorrect="off"
@@ -56,7 +56,7 @@ export function ConnectScreen({
       </Card>
       <p className="px-1 text-center text-xs text-muted-foreground/80">
         Your Hermes agent runs on the server. This app is just the screen — point it at the same
-        gateway your desktop uses (Tailscale IP or LAN host).
+        private HTTPS gateway your desktop uses.
       </p>
     </Screen>
   )

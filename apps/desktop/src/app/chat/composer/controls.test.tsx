@@ -59,6 +59,7 @@ async function expectShortcutTooltip(label: string, shortcut: string) {
 afterEach(() => {
   cleanup()
   $hudMode.set(false)
+  document.documentElement.removeAttribute('data-hermes-mobile')
 })
 
 // The HUD is a Spotlight bar a few hundred pixels wide: the four voice
@@ -106,6 +107,15 @@ describe('HUD mode', () => {
 // folds into the same menu the HUD uses, then the model pill drops. Send is
 // the last thing standing.
 describe('narrow tiles', () => {
+  it('folds voice controls into one touch menu in the mobile renderer', () => {
+    document.documentElement.setAttribute('data-hermes-mobile', '')
+    renderControls()
+
+    expect(screen.getByLabelText('Voice')).toBeTruthy()
+    expect(screen.queryByLabelText('Voice dictation')).toBeNull()
+    expect(screen.queryByLabelText('Read replies aloud')).toBeNull()
+  })
+
   it('folds the voice controls into one menu without entering HUD mode', () => {
     renderControls({ foldVoice: true })
 

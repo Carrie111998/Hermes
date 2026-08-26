@@ -1,7 +1,7 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { bracketMatching, indentOnInput, LanguageDescription } from '@codemirror/language'
 import { languages } from '@codemirror/language-data'
-import { Compartment, EditorState } from '@codemirror/state'
+import { Compartment, EditorState, type Range } from '@codemirror/state'
 import { Decoration, drawSelection, EditorView, keymap, lineNumbers } from '@codemirror/view'
 import { type RefObject, useEffect, useRef } from 'react'
 
@@ -76,7 +76,7 @@ function blockHighlight(range: { from: number; to: number }) {
     const dimmed = Decoration.line({ attributes: { style: 'opacity:0.5;transition:opacity 120ms ease-out' } })
     const first = state.doc.lineAt(clamp(range.from)).number
     const last = state.doc.lineAt(clamp(range.to)).number
-    const marks = []
+    const marks: Range<Decoration>[] = []
 
     for (let n = 1; n <= state.doc.lines; n++) {
       marks.push((n >= first && n <= last ? active : dimmed).range(state.doc.line(n).from))
