@@ -870,8 +870,9 @@ def _load_env_file_into_environ() -> int:
     keys plainly exist — a confusing first-run papercut.
 
     Only fills names that aren't already set in the process env (an exported
-    value always wins), and only for known bearer-provider names so we don't
-    slurp unrelated secrets into the process. Returns the count of names added.
+    value always wins), and only for known provider credential names and aliases
+    so we don't slurp unrelated secrets into the process. Returns the count of
+    names added.
     """
     try:
         from hermes_cli.config import load_env
