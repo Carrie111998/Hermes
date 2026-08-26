@@ -14,6 +14,9 @@ Environment variables:
                                 when set. Legacy MATRIX_ENCRYPTION=true maps to required.
     MATRIX_DEVICE_ID            Stable device ID for E2EE persistence across restarts
     MATRIX_REFRESH_TOKEN        Refresh token for MAS (matrix.org) — rotated on use
+    MATRIX_OIDC_CLIENT_ID       Public OIDC client id for MAS OAuth2 token refresh
+                                (required for matrix.org-style deployments; the
+                                legacy /v3/refresh endpoint rejects MAS tokens)
     MATRIX_PROXY                HTTP(S) or SOCKS proxy URL for Matrix traffic
     MATRIX_ALLOWED_USERS    Comma-separated Matrix user IDs (@user:server)
     MATRIX_ALLOWED_ROOMS    Comma-separated Matrix room IDs allowed to trigger turns
@@ -1184,6 +1187,12 @@ class _CryptoStateStore:
         return list(self._joined_rooms)
 
 
+# Total access-token refresh attempts per adapter lifetime. MAS refresh
+# tokens are single-use; a server that keeps rejecting freshly-issued
+# tokens must never drive an unbounded refresh/rotate loop (#94096 review).
+_MAX_REFRESH_ATTEMPTS = 8
+
+
 class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
 
@@ -1232,16 +1241,36 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_REFRESH_TOKEN"
         )
         self._refresh_lock: asyncio.Lock = asyncio.Lock()
+        # MAS OAuth2 refresh state (#94096): OIDC discovery cache + bounded
+        # total refresh attempts so a rejecting server can't drive an
+        # endless refresh/rotate loop.
+        self._oidc_client_id: str = str(config.extra.get("oidc_client_id", "") or "")
+        self._oidc_token_endpoint: Optional[str] = None
+        self._oidc_hint_logged: bool = False
+        self._refresh_attempts: int = 0
 
         self._client: Any = None  # mautrix.client.Client
 
     async def _refresh_access_token(self, api, reason: str = "") -> bool:
         """Refresh the Matrix access token using the stored refresh token.
 
-        Calls ``POST /_matrix/client/v3/refresh`` with the current
-        ``MATRIX_REFRESH_TOKEN``. On success updates ``api.token``,
-        ``self._access_token`` and rotates ``self._refresh_token`` in
-        memory (best-effort). Returns True on success.
+        Two paths, tried in order:
+
+        1. Legacy ``POST /_matrix/client/v3/refresh`` (native MSC2918
+           homeservers - self-hosted Synapse with short-lived session
+           tokens).
+        2. MAS / OAuth2 deployments (matrix.org): those tokens are NOT
+           honored by the legacy endpoint (Synapse only knows tokens it
+           issued itself - live-verified in #94096), so we fall back to the
+           OAuth2 token endpoint from OIDC discovery with
+           ``grant_type=refresh_token`` and the public client id from
+           ``MATRIX_OIDC_CLIENT_ID``.
+
+        On success updates ``api.token``, ``self._access_token`` and rotates
+        ``self._refresh_token`` in memory (best-effort). Attempts are
+        bounded: after ``_MAX_REFRESH_ATTEMPTS`` total tries the helper
+        gives up so a rejecting server can never drive an endless
+        refresh/rotate loop. Returns True on success.
         """
         if not self._refresh_token or not self._homeserver:
             return False
@@ -1249,45 +1278,152 @@ class MatrixAdapter(BasePlatformAdapter):
             # Re-check after acquiring lock (another task may have refreshed)
             if not self._refresh_token:
                 return False
+            if self._refresh_attempts >= _MAX_REFRESH_ATTEMPTS:
+                logger.error(
+                    "Matrix: giving up token refresh after %d attempts "
+                    "(server keeps rejecting); restart required.",
+                    self._refresh_attempts,
+                )
+                return False
+            self._refresh_attempts += 1
+
+            # --- Path 1: legacy native refresh -------------------------
             try:
                 resp = await api.request(
                     "POST", "/_matrix/client/v3/refresh", {"refresh_token": self._refresh_token}
                 )
-                # mautrix may return dict or object with access_token attr
-                new_access = None
-                new_refresh = None
-                if isinstance(resp, dict):
-                    new_access = resp.get("access_token")
-                    new_refresh = resp.get("refresh_token")
-                    if not new_refresh:
-                        new_refresh = resp.get("refresh_token")
-                else:
-                    new_access = getattr(resp, "access_token", None)
-                    # mautrix LoginResponse stores unknown fields in unrecognized_
-                    new_refresh = getattr(resp, "refresh_token", None)
-                    if not new_refresh:
-                        unrec = getattr(resp, "unrecognized_", None)
-                        if isinstance(unrec, dict):
-                            new_refresh = unrec.get("refresh_token")
-                if not new_access:
-                    return False
-                self._access_token = new_access
-                try:
-                    api.token = new_access
-                except Exception:
-                    pass
-                if new_refresh and new_refresh != self._refresh_token:
-                    self._refresh_token = new_refresh
-                logger.info(
-                    "Matrix: refreshed access token via MAS (reason=%s)", reason or "unknown"
-                )
-                return True
-            except Exception as exc:
-                if _is_m_unknown_token_error(exc) or "invalid_grant" in str(exc).lower():
-                    logger.error("Matrix: refresh token rejected: %s", exc)
-                else:
-                    logger.warning("Matrix: refresh failed: %s", exc)
+                if self._apply_refresh_response(api, resp):
+                    logger.info(
+                        "Matrix: refreshed access token via legacy refresh "
+                        "(reason=%s)", reason or "unknown",
+                    )
+                    return True
                 return False
+            except Exception as legacy_exc:
+                if not _is_m_unknown_token_error(legacy_exc):
+                    logger.warning("Matrix: legacy refresh failed: %s", legacy_exc)
+                    return False
+                logger.info(
+                    "Matrix: legacy refresh rejected (%s) - trying MAS "
+                    "OAuth2 token endpoint", legacy_exc,
+                )
+
+            # --- Path 2: MAS OAuth2 token endpoint ---------------------
+            return await self._try_mas_oauth_refresh(api, reason=reason)
+
+    def _apply_refresh_response(self, api, resp) -> bool:
+        """Apply an access-token refresh response (dict or mautrix object)."""
+        new_access = None
+        new_refresh = None
+        if isinstance(resp, dict):
+            new_access = resp.get("access_token")
+            new_refresh = resp.get("refresh_token")
+        else:
+            new_access = getattr(resp, "access_token", None)
+            # mautrix LoginResponse stores unknown fields in unrecognized_
+            new_refresh = getattr(resp, "refresh_token", None)
+            if not new_refresh:
+                unrec = getattr(resp, "unrecognized_", None)
+                if isinstance(unrec, dict):
+                    new_refresh = unrec.get("refresh_token")
+        if not new_access:
+            return False
+        self._access_token = new_access
+        try:
+            api.token = new_access
+        except Exception:
+            pass
+        if new_refresh and new_refresh != self._refresh_token:
+            self._refresh_token = new_refresh
+        return True
+
+    async def _try_mas_oauth_refresh(self, api, reason: str = "") -> bool:
+        """MAS/OAuth2 refresh via OIDC discovery (matrix.org et al).
+
+        Discovers ``token_endpoint`` from
+        ``<homeserver>/.well-known/openid-configuration`` (cached), then
+        POSTs ``grant_type=refresh_token`` with the public client id from
+        ``MATRIX_OIDC_CLIENT_ID``. Rotates the refresh token per response.
+        """
+        import json as _json
+        import urllib.parse
+        import urllib.request
+
+        client_id = (
+            getattr(self, "_oidc_client_id", "")
+            or os.getenv("MATRIX_OIDC_CLIENT_ID", "")
+        ).strip()
+        if not client_id:
+            if not getattr(self, "_oidc_hint_logged", False):
+                self._oidc_hint_logged = True
+                logger.warning(
+                    "Matrix: homeserver rejected legacy refresh; MAS OAuth2 "
+                    "refresh needs MATRIX_OIDC_CLIENT_ID (public client id) "
+                    "to be set - cannot refresh automatically."
+                )
+            return False
+
+        token_endpoint = getattr(self, "_oidc_token_endpoint", None)
+        if not token_endpoint:
+            well_known = (
+                self._homeserver.rstrip("/")
+                + "/.well-known/openid-configuration"
+            )
+
+            def _discover():
+                with urllib.request.urlopen(well_known, timeout=10) as r:
+                    return _json.loads(r.read().decode("utf-8", errors="replace"))
+
+            try:
+                doc = await asyncio.to_thread(_discover)
+            except Exception as exc:
+                logger.warning(
+                    "Matrix: OIDC discovery failed for %s: %s",
+                    self._homeserver, exc,
+                )
+                return False
+            candidate = str(doc.get("token_endpoint") or "").strip()
+            if not candidate:
+                logger.warning(
+                    "Matrix: OIDC discovery returned no token_endpoint "
+                    "for %s", self._homeserver,
+                )
+                return False
+            self._oidc_token_endpoint = candidate
+            token_endpoint = candidate
+
+        def _token_request():
+            data = urllib.parse.urlencode({
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+                "client_id": client_id,
+            }).encode()
+            req = urllib.request.Request(
+                token_endpoint,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return _json.loads(r.read().decode("utf-8", errors="replace"))
+
+        try:
+            doc = await asyncio.to_thread(_token_request)
+        except Exception as exc:
+            body = str(exc)
+            if "invalid_grant" in body.lower() or _is_m_unknown_token_error(exc):
+                logger.error("Matrix: MAS refresh token rejected: %s", exc)
+            else:
+                logger.warning("Matrix: MAS OAuth2 refresh failed: %s", exc)
+            return False
+
+        if self._apply_refresh_response(api, doc):
+            logger.info(
+                "Matrix: refreshed access token via MAS OAuth2 endpoint "
+                "(reason=%s)", reason or "unknown",
+            )
+            return True
+        return False
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._sync_task: Optional[asyncio.Task] = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
