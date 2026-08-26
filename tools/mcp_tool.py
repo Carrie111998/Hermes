@@ -2994,9 +2994,8 @@ class MCPServerTask:
 
             if not psutil.pid_exists(pid):
                 continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
-            return False  # at least one child alive
-        return True
+            return False  # at least one child alive → don't fast-fail
+        return True  # every tracked child has exited
 
     async def _watch_stdio_children(self) -> None:
         """Poll child liveness while a stdio RPC is in flight (#81995).
