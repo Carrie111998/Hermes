@@ -1347,20 +1347,25 @@ def resolve_reasoning_config(
 
     Single chokepoint for reasoning-effort resolution, shared by every
     surface (CLI startup, messaging gateway, Desktop/TUI, cron, ``/model``
-    switch, fallback activation). Priority:
+    switch, fallback activation). Full precedence (highest first):
 
+    0. Session-scoped override (gateway ``/reasoning --session``) — resolved by
+       the caller BEFORE this function; it always wins when present. The active
+       skill is still atomically consumed at turn admission regardless, so a
+       session override cannot leave stale skill residue for a later turn.
     1. User override from ``agent.reasoning_by_skill`` for the active skill
-       (if supplied and the skill name matches a key).
-    2. Active skill's own suggestion (``metadata.hermes.reasoning``), when
-       ``active_skill`` carries a non-None effort.
+       (if supplied and the skill name matches a key). ``off``/``false`` here
+       disables the skill layer (fall through); an unrecognized non-off value
+       also falls through rather than activating the skill's suggestion.
+    2. Active skill's own suggestion (``metadata.hermes.reasoning``) — ONLY when
+       the user has opted in via ``agent.reasoning_by_skill_optin: true``. Inert
+       by default so installing/viewing a third-party skill cannot silently
+       raise effort/spend.
     3. Per-model override from ``agent.reasoning_overrides``
        (spelling-tolerant — see :func:`resolve_per_model_reasoning_effort`).
     4. Global ``agent.reasoning_effort`` — the raw value is passed through
        so a YAML boolean ``False`` (``reasoning_effort: false``/``off``/
        ``no``) means "thinking disabled", never silently re-enabled.
-
-    Session-scoped overrides (gateway ``/reasoning --session``) are resolved
-    by the caller BEFORE this function — they always win.
 
     Args:
         cfg: A loaded config dict (any of the three loaders' shapes — only

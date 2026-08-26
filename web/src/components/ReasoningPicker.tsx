@@ -17,6 +17,16 @@
  *
  * Profile scoping: the sidebar passes the chat profile explicitly, so this
  * reads/writes the same config the chat PTY was launched from.
+ *
+ * Per-skill row invariants (addressed in review #93378 blocker #4):
+ *   - Row identity is a STABLE local id, NOT the editable skill name, so
+ *     renaming a skill does not remount the row and drop its commit closure.
+ *   - The map is serialized to config ONLY when a valid skill name is
+ *     committed (blur / Enter), never on keystroke or on adding a blank row.
+ *   - Selecting Off persists the literal "off" sentinel (which the resolver
+ *     reads as "skip this skill's suggestion / fall through"), instead of
+ *     deleting the key — deleting would let the skill's own frontmatter
+ *     suggestion run. The trash button is the only delete.
  */
 
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
@@ -45,6 +55,16 @@ interface ReasoningPickerProps {
   onChanged?: (effort: string) => void;
 }
 
+/** A per-skill override row kept in local editor state. `skill` may be an
+ *  in-progress (uncommitted) name; only a non-empty committed name is
+ *  serialized to the config map. `id` is stable across renames so the row
+ *  never remounts mid-edit. */
+interface SkillRow {
+  id: number;
+  skill: string;
+  effort: string;
+}
+
 export function ReasoningPicker({
   currentModel,
   profile,
@@ -52,10 +72,11 @@ export function ReasoningPicker({
   onChanged,
 }: ReasoningPickerProps) {
   const [effort, setEffort] = useState("medium");
-  const [skillMap, setSkillMap] = useState<Record<string, string>>({});
+  const [skillRows, setSkillRows] = useState<SkillRow[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const lastFetchKeyRef = useRef("");
+  const nextRowIdRef = useRef(1);
 
   useEffect(() => {
     const fetchKey = `${profile ?? ""}:${currentModel}:${refreshKey}`;
@@ -67,10 +88,17 @@ export function ReasoningPicker({
         const agent = (cfg?.agent as Record<string, unknown> | undefined) ?? {};
         setEffort(normalizeEffort(agent.reasoning_effort));
         const map = agent.reasoning_by_skill;
-        setSkillMap(
+        const raw =
           map && typeof map === "object"
             ? (map as Record<string, string>)
-            : {},
+            : {};
+        // Materialize each committed entry as a stable row.
+        setSkillRows(
+          Object.entries(raw).map(([skill, eff]) => ({
+            id: nextRowIdRef.current++,
+            skill,
+            effort: normalizeSkillEffort(eff),
+          })),
         );
         setLoaded(true);
       })
@@ -80,8 +108,17 @@ export function ReasoningPicker({
       });
   }, [currentModel, profile, refreshKey]);
 
+  /** Serialize only the committed (non-empty-skill) rows to the config map,
+   *  preserving the literal "off" sentinel for disabled skills. Never called
+   *  with an uncommitted/blank row. */
   const persistSkillMap = useCallback(
-    (nextMap: Record<string, string>) => {
+    (rows: SkillRow[]) => {
+      const nextMap: Record<string, string> = {};
+      for (const row of rows) {
+        const name = row.skill.trim();
+        if (!name) continue; // never persist an empty-string key
+        nextMap[name] = row.effort;
+      }
       setSaving(true);
       void api
         .getConfig(profile)
@@ -130,64 +167,51 @@ export function ReasoningPicker({
     [effort, onChanged, profile],
   );
 
-  const skillRows = () =>
-    Object.entries(skillMap).map(([skill, eff], i) => ({
-      key: `${skill}::${i}`,
-      skill,
-      effort: eff,
-    }));
-
-  const setRowSkill = (key: string, skill: string) => {
+  const setRowSkill = (id: number, skill: string) => {
     // Update local state only. Persisting here would fire a full config
     // GET+PUT on EVERY keystroke (e.g. typing "planning" → ~8 writes of
-    // junk intermediates {p:…},{pl:…} that race concurrent writers).
-    // The name is committed to config on blur / Enter via commitRowSkill.
-    const rows = skillRows();
-    const row = rows.find((r) => r.key === key);
-    if (!row) return;
-    const next = { ...skillMap };
-    if (next[row.skill] !== undefined) delete next[row.skill];
-    if (skill.trim()) next[skill.trim()] = row.effort;
-    setSkillMap(next);
+    // junk intermediates that race concurrent writers). The name is committed
+    // to config on blur / Enter via commitRowSkill.
+    setSkillRows((rows) =>
+      rows.map((r) => (r.id === id ? { ...r, skill } : r)),
+    );
   };
 
-  const commitRowSkill = (key: string) => {
-    const rows = skillRows();
-    const row = rows.find((r) => r.key === key);
+  const commitRowSkill = (id: number) => {
+    // Commit (persist) a row only when it has a valid, non-empty skill name.
+    const row = skillRows.find((r) => r.id === id);
     if (!row) return;
     if (!row.skill.trim()) return; // empty name — leave the row, don't persist
-    persistSkillMap({ ...skillMap });
+    persistSkillMap(skillRows);
   };
 
-  const setRowEffort = (key: string, eff: string) => {
-    const rows = skillRows();
-    const row = rows.find((r) => r.key === key);
+  const setRowEffort = (id: number, eff: string) => {
+    const row = skillRows.find((r) => r.id === id);
     if (!row) return;
-    const next = { ...skillMap };
     const normalized = normalizeSkillEffort(eff);
-    if (normalized === "off") {
-      delete next[row.skill];
-    } else {
-      next[row.skill] = normalized;
-    }
-    setSkillMap(next);
-    persistSkillMap(next);
+    // Persist the literal "off" sentinel (resolver: "skip this skill's layer,
+    // fall through") rather than deleting the key, which would let the
+    // skill's own frontmatter suggestion run.
+    setSkillRows((rows) =>
+      rows.map((r) => (r.id === id ? { ...r, effort: normalized } : r)),
+    );
+    if (!row.skill.trim()) return; // don't persist an uncommitted row
+    persistSkillMap(skillRows.map((r) => (r.id === id ? { ...r, effort: normalized } : r)));
   };
 
   const addRow = () => {
-    const next = { ...skillMap, "": "xhigh" };
-    setSkillMap(next);
-    persistSkillMap(next);
+    // Add a blank row to LOCAL state only; nothing is persisted until a valid
+    // skill name is committed (fixes the old `{"": "xhigh"}` early write).
+    setSkillRows((rows) => [
+      ...rows,
+      { id: nextRowIdRef.current++, skill: "", effort: "medium" },
+    ]);
   };
 
-  const removeRow = (key: string) => {
-    const rows = skillRows();
-    const row = rows.find((r) => r.key === key);
-    if (!row) return;
-    const next = { ...skillMap };
-    if (next[row.skill] !== undefined) delete next[row.skill];
-    setSkillMap(next);
-    persistSkillMap(next);
+  const removeRow = (id: number) => {
+    const nextRows = skillRows.filter((r) => r.id !== id);
+    setSkillRows(nextRows);
+    persistSkillMap(nextRows);
   };
 
   return (
@@ -215,15 +239,15 @@ export function ReasoningPicker({
         <span className="text-display tracking-wider text-text-tertiary">
           per-skill
         </span>
-        {skillRows().map((row) => (
-          <div key={row.key} className="flex items-center gap-1.5">
+        {skillRows.map((row) => (
+          <div key={row.id} className="flex items-center gap-1.5">
             <input
               className="min-w-0 flex-1 rounded border border-line bg-transparent px-1.5 py-1"
               value={row.skill}
               disabled={saving}
               placeholder="skill name (e.g. plan)"
-              onChange={(e) => setRowSkill(row.key, e.target.value)}
-              onBlur={() => commitRowSkill(row.key)}
+              onChange={(e) => setRowSkill(row.id, e.target.value)}
+              onBlur={() => commitRowSkill(row.id)}
               onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
                 if (e.key === "Enter") {
                   e.currentTarget.blur();
@@ -233,7 +257,7 @@ export function ReasoningPicker({
             <Select
               className="min-w-0"
               disabled={saving}
-              onValueChange={(v) => setRowEffort(row.key, v)}
+              onValueChange={(v) => setRowEffort(row.id, v)}
               value={normalizeSkillEffort(row.effort)}
             >
               <SelectOption value="off">Off</SelectOption>
@@ -247,13 +271,14 @@ export function ReasoningPicker({
               className="shrink-0 text-text-tertiary hover:text-danger"
               disabled={saving}
               aria-label={`Remove ${row.skill || "skill"} override`}
-              onClick={() => removeRow(row.key)}
+              onClick={() => removeRow(row.id)}
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
           </div>
         ))}
         <button
+          data-testid="add-row"
           className="flex items-center gap-1 self-start text-text-tertiary hover:text-text-secondary"
           disabled={saving}
           onClick={addRow}
@@ -265,4 +290,3 @@ export function ReasoningPicker({
     </div>
   );
 }
-

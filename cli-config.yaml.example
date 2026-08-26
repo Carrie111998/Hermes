@@ -1104,6 +1104,25 @@ agent:
   #   "claude-opus-4.6": "high"           # bare model name also works
   #   "deepseek/deepseek-v4-pro": "xhigh" # dots and dashes are interchangeable
   reasoning_overrides: {}
+
+  # Per-skill reasoning effort overrides (optional dict)
+  # Key: skill/mode name. Value: effort level (same options as reasoning_effort),
+  #      or "off" to disable a skill's suggestion and fall through to global.
+  # Priority: explicit user value here > (if opted in) the skill's own
+  # frontmatter suggestion > per-model override > global reasoning_effort.
+  # NOTE: skill frontmatter suggestions are INERT unless you either set a value
+  # here for that skill OR enable reasoning_by_skill_optin below.
+  # reasoning_by_skill:
+  #   "plan": "xhigh"
+  #   "brainstorming": "off"
+  reasoning_by_skill: {}
+
+  # Opt-in switch for a skill's own frontmatter reasoning suggestion
+  # (`metadata.hermes.reasoning` in a skill's SKILL.md). When false (default),
+  # a skill's suggestion is treated as inert recommendation data and NEVER
+  # raises effort/spend on its own. Set true to let skill frontmatter
+  # suggestions fire (still overridable per-skill above).
+  reasoning_by_skill_optin: false
   
   # Custom personalities (use with /personality command).
   # Built-ins (helpful, concise, technical, creative, teacher, kawaii, catgirl,

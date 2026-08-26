@@ -9536,6 +9536,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active-skill suggestion for this turn, exactly once, at admission —
         before the session-override check — so no precedence rung can leave a
         stale skill record for a later turn (addresses review blocker #3).
+
+        Behavior note (review blocker #1): this is LAST-VIEW-WINS with a
+        one-turn lag. Skills viewed during turn N are recorded; they are
+        consumed at the START of turn N+1 and apply to that turn. The last
+        skill viewed during a turn is the one that applies to the NEXT turn.
+        This is NOT "per-current-skill" attribution — a turn's own effort is
+        decided by what was last viewed in the PREVIOUS turn. This is the
+        documented, intended behavior.
         """
         # Atomic consume-once at turn admission: pop the active-skill record
         # (single locked op) regardless of which precedence rung wins. If a
