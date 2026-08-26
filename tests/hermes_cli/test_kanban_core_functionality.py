@@ -273,6 +273,23 @@ def test_worker_tree_signal_uses_owned_process_group(monkeypatch):
     assert calls == [("group", 222, 15)]
 
 
+def test_worker_tree_signal_signals_orphaned_group_when_leader_dead(monkeypatch):
+    """A leader that already exited leaves its group members alive; the
+    known pgid (== original pid) must still be signalled."""
+    calls = []
+    monkeypatch.setattr(kb.os, "name", "posix")
+    def _getpgid(pid):
+        raise ProcessLookupError()
+    monkeypatch.setattr(kb.os, "getpgid", _getpgid)
+    monkeypatch.setattr(kb.os, "getpgrp", lambda: 111)
+    monkeypatch.setattr(kb.os, "killpg", lambda pgid, sig: calls.append(("group", pgid, sig)))
+    monkeypatch.setattr(kb.os, "kill", lambda pid, sig: calls.append(("pid", pid, sig)))
+
+    kb._worker_tree_signal(222, 15)
+
+    assert calls == [("group", 222, 15)]
+
+
 def test_worker_tree_signal_never_targets_own_process_group(monkeypatch):
     calls = []
     monkeypatch.setattr(kb.os, "name", "posix")
