@@ -5124,19 +5124,40 @@ def run_conversation(
                             api_messages, tools=agent.tools or None,
                         )
                         local_available_out = old_ctx - request_input_estimate
+                        # ── Converge to a workable max_tokens on the first retry ──
+                        # The old -64-per-retry approach needs ~500 attempts to
+                        # drop from 65K to 32K — far more than any configured
+                        # max_compression_attempts.  Jump straight to the
+                        # configured model.max_tokens (or the provider-reported
+                        # budget) on the FIRST retry, with a small safety margin,
+                        # so a workable output cap is reached immediately
+                        # (#43547).
+                        configured_max = getattr(agent, "max_tokens", None)
                         if local_available_out > 0:
-                            safe_out = max(1, min(available_out, local_available_out) - 64)
+                            _budget = min(available_out, local_available_out)
                         else:
                             # The rough local estimate can overshoot the real
                             # request size.  Fall back to the provider-reported
                             # budget, which is authoritative for the failed
                             # request.
-                            safe_out = max(1, available_out - 64)
+                            _budget = available_out
+                        # _budget is the authoritative provider/local-reported
+                        # available output.  Only clamp to the user-configured
+                        # max_tokens when one is actually set; when it is unset,
+                        # the provider-reported _budget is the correct ceiling
+                        # and a hard 4096 fallback would over-shrink otherwise
+                        # useful output on a modest context-pressure retry
+                        # (#89777).
+                        if configured_max is not None:
+                            safe_out = max(1, min(_budget, configured_max) - 64)
+                        else:
+                            safe_out = max(1, _budget - 64)
                         agent._ephemeral_max_output_tokens = safe_out
                         agent._buffer_vprint(
                             f"⚠️  Output cap too large for current prompt — "
                             f"retrying with max_tokens={safe_out:,} "
                             f"(provider_available={available_out:,}, "
+                            f"configured_max={configured_max if configured_max is not None else 'unset'}, "
                             f"estimated_request_tokens={request_input_estimate:,}; "
                             f"context_length unchanged at {old_ctx:,})"
                         )
