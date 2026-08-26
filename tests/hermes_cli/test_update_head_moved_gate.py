@@ -188,18 +188,23 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
 
 
 def _make_fork_sync_moves_head_side_effect(
-    sync_from="aaaaaaa", sync_to="bbbbbbb"
+    sync_from="aaaaaaa",
+    sync_to="bbbbbbb",
+    *,
+    install_files_changed=False,
 ):
     """Simulate a clean fork whose upstream-sync stage advances HEAD.
 
     rev-parse HEAD call order inside ``_cmd_update_impl``:
       1. pre-sync capture   -> sync_from
       2. post-sync capture  -> sync_to     (the sync DID move HEAD)
-      3. pre-pull capture   -> sync_to
-      4. post-pull capture  -> sync_to     (the merge is a legit zero-move)
+      3. post-pull capture  -> sync_to     (the merge is a legit zero-move)
 
     The first ``rev-list --count`` (behind vs the compare branch) returns 0
-    so the fork-sync block triggers; later counts return 3.
+    so the fork-sync block triggers; later counts return 3. When
+    ``install_files_changed`` is true, only a diff from the PRE-sync SHA sees
+    the changed ``pyproject.toml``. A post-sync baseline therefore reproduces
+    the stale-dependency skip from the live incident.
     """
     head_reads = {"n": 0}
     rev_lists = {"n": 0}
@@ -223,6 +228,11 @@ def _make_fork_sync_moves_head_side_effect(
                 )
             return SimpleNamespace(returncode=0, stdout=f"{sync_to}\n", stderr="")
 
+        if "diff --name-only" in joined:
+            changed = install_files_changed and f"{sync_from}..HEAD" in joined
+            stdout = "pyproject.toml\n" if changed else ""
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect
@@ -239,7 +249,7 @@ def test_fork_sync_advances_head_and_update_completes(monkeypatch, tmp_path, cap
     _patch_update_deps(
         monkeypatch,
         tmp_path,
-        _make_fork_sync_moves_head_side_effect(),
+        _make_fork_sync_moves_head_side_effect(install_files_changed=True),
     )
     # ``is_fork`` resolves in update_cmd's own namespace (line 6049), not
     # through _m() — patch it there.
@@ -248,6 +258,12 @@ def test_fork_sync_advances_head_and_update_completes(monkeypatch, tmp_path, cap
     # subprocess.run above is what reports HEAD movement around it.
     monkeypatch.setattr(
         hermes_main, "_sync_with_upstream_if_needed", lambda *a, **k: None
+    )
+    dependency_installs = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_install_python_dependencies_with_optional_fallback",
+        lambda *a, **k: dependency_installs.append((a, k)),
     )
     # Hermetic stop: reaching the runtime-reload step IS the proof the
     # movement guard passed and the post-update pipeline is running (same
@@ -265,26 +281,60 @@ def test_fork_sync_advances_head_and_update_completes(monkeypatch, tmp_path, cap
 
     assert exc_info.value.code == 0
     out = capsys.readouterr().out
-    # The exact point where the bug used to abort now reports success.
-    assert "Code updated by the upstream fork sync" in out
+    # The update must diff dependencies from BEFORE the fork sync. Using the
+    # post-sync SHA reports an empty diff and silently skips this install.
+    assert dependency_installs
+    assert "Updating Python dependencies" in out
+    assert "Python dependencies unchanged" not in out
     assert "Code did not move" not in out
     assert "Already up to date" not in out
 
 
-def test_already_on_target_branch_with_no_move_is_benign(monkeypatch, tmp_path, capsys):
-    """Same live incident, second variant: HEAD attached to main, already at
-    origin/main, yet a stale behind-count sent the updater through the pull
-    path. pre == post with an ATTACHED target branch means the code is
-    current — not a stuck detached checkout. Must complete, not exit 1."""
+def test_fork_sync_syntax_failure_rolls_back_before_sync(
+    monkeypatch, tmp_path, capsys
+):
+    """A bad upstream-sync commit must roll back to the pre-sync SHA."""
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    commands = []
+    fork_side_effect = _make_fork_sync_moves_head_side_effect()
+
+    def tracking_side_effect(cmd, **kwargs):
+        commands.append(list(cmd))
+        return fork_side_effect(cmd, **kwargs)
+
+    _patch_update_deps(monkeypatch, tmp_path, tracking_side_effect)
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: True)
+    monkeypatch.setattr(
+        hermes_main, "_sync_with_upstream_if_needed", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_files_syntax",
+        lambda *a, **k: (False, "hermes_cli/main.py", "SyntaxError: bad sync"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    assert any(cmd[-3:] == ["reset", "--hard", "aaaaaaa"] for cmd in commands)
+    out = capsys.readouterr().out
+    assert "Rolling back to aaaaaaa" in out
+
+
+def test_no_move_is_benign_only_at_exact_target(monkeypatch, tmp_path, capsys):
+    """A same-SHA anomaly is safe only when HEAD equals origin/main."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
-            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
         if joined.endswith("rev-parse HEAD"):
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if joined.endswith("rev-parse origin/main"):
             return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -302,3 +352,32 @@ def test_already_on_target_branch_with_no_move_is_benign(monkeypatch, tmp_path, 
     out = capsys.readouterr().out
     assert "already at origin/main" in out
     assert "Code did not move" not in out
+
+
+def test_attached_stale_branch_fails_with_safe_recovery(monkeypatch, tmp_path, capsys):
+    """Branch attachment alone is not proof that the target code landed."""
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    def side_effect(cmd, **kwargs):
+        joined = " ".join(str(c) for c in cmd)
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if "rev-list" in joined:
+            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+        if joined.endswith("rev-parse HEAD"):
+            return SimpleNamespace(returncode=0, stdout="stale123\n", stderr="")
+        if joined.endswith("rev-parse origin/main"):
+            return SimpleNamespace(returncode=0, stdout="target456\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    _patch_update_deps(monkeypatch, tmp_path, side_effect)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "Code did not move" in out
+    assert "Checkout is attached to 'main' at stale123" in out
+    assert "merge --ff-only origin/main" in out
+    assert "detached from 'main'" not in out
