@@ -1604,36 +1604,28 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
         throw new Error('Hermes source gateway unavailable')
       }
 
-      try {
-        return await (timeoutMs !== undefined || signal !== undefined
-          ? gateway.request<T>(method, params, timeoutMs, signal)
-          : gateway.request<T>(method, params))
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-
-        // Only transport failures on a socket that actually left `open` are
-        // replay-safe. Domain errors may contain the same words (for example,
-        // "model provider not connected") and must never duplicate a command.
-        if (!/not connected|connection closed/i.test(message) || isOpen(gateway)) {
-          throw error
-        }
-
+      // Recover only before handing the command to request(). Once request()
+      // has been entered, a later close is outcome-unknown: WebSocket.send may
+      // already have delivered a non-idempotent mutation (session.branch) even
+      // though the reply was lost. Blindly replaying that command can create a
+      // second branch. A socket observed closed here is provably pre-send.
+      if (!isOpen(gateway)) {
         try {
           if (!(await recover())) {
-            throw error
+            throw new Error('Hermes source gateway unavailable')
           }
         } catch (reconnectError) {
           if (isGatewayReauthRequired(reconnectError)) {
             throw reconnectError
           }
 
-          throw error
+          throw reconnectError
         }
-
-        return timeoutMs !== undefined || signal !== undefined
-          ? gateway.request<T>(method, params, timeoutMs, signal)
-          : gateway.request<T>(method, params)
       }
+
+      return timeoutMs !== undefined || signal !== undefined
+        ? gateway.request<T>(method, params, timeoutMs, signal)
+        : gateway.request<T>(method, params)
     },
     release: () => {
       if (released) {
@@ -1662,6 +1654,37 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
       }
     }
   }
+}
+
+/**
+ * Lease the exact registry route that owns a runtime. Unlike the profile-only
+ * binder, this lookup cannot confuse two connections exposing the same Desktop
+ * profile name. Foreground tiles keep their owner registered; if it is gone,
+ * fail closed instead of borrowing whichever same-named route is active.
+ */
+export function acquireGatewayRequestLeaseForAgent(connectionId: string, profile: string): GatewayRequestLease {
+  const ownerConnectionId = connectionId.trim()
+  const key = normKey(profile)
+
+  if (!ownerConnectionId) {
+    throw new Error('Hermes source gateway owner is missing connectionId')
+  }
+
+  if (isPrimaryRegistryRoute(ownerConnectionId, key)) {
+    if (!g.primaryGateway) {
+      throw new Error('Hermes source gateway unavailable')
+    }
+
+    return acquireGatewayRequestLease(g.primaryGateway, key)
+  }
+
+  const entry = g.secondaries.get(registryBackendScopeKey(ownerConnectionId, key))
+
+  if (!entry?.wantOpen) {
+    throw new Error('Hermes source gateway unavailable')
+  }
+
+  return acquireGatewayRequestLease(entry.gateway, key)
 }
 
 // Recovery signal: nudge every live secondary back open. Power-resume/network

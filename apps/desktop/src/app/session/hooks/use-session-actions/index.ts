@@ -117,6 +117,7 @@ import {
   patchSessionTile,
   publishSessionState,
   releaseSessionOwnerHold,
+  sessionTileOwnerRoute,
   type SessionTileWorkspaceScope,
   type TileDock
 } from '@/store/session-states'
@@ -169,6 +170,7 @@ interface SessionActionsOptions {
   activeSessionId: string | null
   activeSessionIdRef: MutableRefObject<string | null>
   bindGatewayRequest: (gateway: HermesGateway, profile: string) => GatewayRequestLease
+  bindGatewayRequestForOwner: (connectionId: string, profile: string) => GatewayRequestLease
   busyRef: MutableRefObject<boolean>
   creatingSessionRef: MutableRefObject<boolean>
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
@@ -321,6 +323,7 @@ export function useSessionActions({
   activeSessionId,
   activeSessionIdRef,
   bindGatewayRequest,
+  bindGatewayRequestForOwner,
   busyRef,
   creatingSessionRef,
   ensureSessionState,
@@ -2012,7 +2015,11 @@ export function useSessionActions({
         // commands back beside their invoking tile. A delayed branch may still
         // be persisted into its original profile layout, but cannot steal the
         // newer foreground selection.
-        if (uiIntentStillCurrent && parentStoredId !== null && resolvedUiIntent.selectedStoredSessionId === parentStoredId) {
+        if (
+          uiIntentStillCurrent &&
+          parentStoredId !== null &&
+          resolvedUiIntent.selectedStoredSessionId === parentStoredId
+        ) {
           await resumeSession(routedSessionId)
         } else {
           const openedInActiveProfile = openSessionTileForProfile(
@@ -2097,22 +2104,39 @@ export function useSessionActions({
       const parentStoredId = isForeground ? selectedStoredSessionIdRef.current : targetState!.storedSessionId
       const startingRouteToken = getRouteToken()
       const startingCwd = isForeground ? $currentCwd.get().trim() : targetState!.cwd.trim()
-      const sourceGateway = gatewayRef.current
       const uiIntent = captureBranchUiIntent()
       let sourceLease: GatewayRequestLease | null = null
 
       // Pin transport, source profile, and UI intent before profile resolution
       // yields. The command lease keeps a background source registered across
-      // the production profile-switch pruning policy; its requester reconnects
-      // and retries only on this exact owner.
+      // the production profile-switch pruning policy.
       try {
-        if (!sourceGateway) {
-          throw new Error('Hermes gateway unavailable')
-        }
+        let profile: string
 
-        sourceLease = bindGatewayRequest(sourceGateway, uiIntent.profile)
-        const resolvedProfile = await resolveSessionProfile(parentStoredId)
-        const profile = normalizeProfileKey(resolvedProfile ?? uiIntent.profile)
+        if (isForeground) {
+          const sourceGateway = gatewayRef.current
+
+          if (!sourceGateway) {
+            throw new Error('Hermes gateway unavailable')
+          }
+
+          sourceLease = bindGatewayRequest(sourceGateway, uiIntent.profile)
+          const resolvedProfile = await resolveSessionProfile(parentStoredId)
+          profile = normalizeProfileKey(resolvedProfile ?? uiIntent.profile)
+        } else {
+          // Runtime ids are socket-local. A tile must carry the exact registry
+          // route that resumed it; a profile string alone is ambiguous when two
+          // connections both expose (for example) "default". Resolve and lease
+          // that exact owner synchronously, or fail closed before dispatch.
+          const owner = parentStoredId ? sessionTileOwnerRoute(parentStoredId) : undefined
+
+          if (!owner?.connectionId?.trim()) {
+            throw new Error('Hermes tile source gateway owner unavailable')
+          }
+
+          profile = normalizeProfileKey(owner.profile)
+          sourceLease = bindGatewayRequestForOwner(owner.connectionId, profile)
+        }
 
         // The live atom may be a compacted model projection. Read the durable
         // display projection before choosing the branch prefix so a whole-chat
@@ -2182,6 +2206,7 @@ export function useSessionActions({
     [
       activeSessionIdRef,
       bindGatewayRequest,
+      bindGatewayRequestForOwner,
       busyRef,
       captureBranchUiIntent,
       copy,

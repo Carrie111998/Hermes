@@ -49,6 +49,7 @@ vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() })
 
 const {
   acquireGatewayRequestLease,
+  acquireGatewayRequestLeaseForAgent,
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForAgent,
@@ -105,6 +106,54 @@ async function flushUntilSecondaryRegistered(max = 20): Promise<void> {
 }
 
 describe('activation lease vs. the live-work pruner (#89622)', () => {
+  it('leases the exact connection when two sources expose the same profile', async () => {
+    await ensureGatewayForAgent('source-a', 'default')
+    await ensureGatewayForAgent('source-b', 'default')
+    expect(secondaryGateways).toHaveLength(2)
+
+    const lease = acquireGatewayRequestLeaseForAgent('source-b', 'default')
+
+    await expect(lease.request('session.branch', { session_id: 'runtime-b' })).resolves.toEqual({
+      method: 'session.branch',
+      params: { session_id: 'runtime-b' }
+    })
+    expect(secondaryGateways[0].request).not.toHaveBeenCalled()
+    expect(secondaryGateways[1].request).toHaveBeenCalledOnce()
+    lease.release()
+  })
+
+  it('recovers a leased owner only when the socket is closed before dispatch', async () => {
+    await ensureGatewayForProfile('bot')
+    const gateway = secondaryGateways[0]
+    const lease = acquireGatewayRequestLease(gateway as never, 'bot')
+    gateway.connectionState = 'closed'
+
+    await expect(lease.request('session.branch', { session_id: 'runtime-bot' })).resolves.toEqual({
+      method: 'session.branch',
+      params: { session_id: 'runtime-bot' }
+    })
+    expect(gateway.connect).toHaveBeenCalledTimes(2)
+    expect(gateway.request).toHaveBeenCalledOnce()
+    lease.release()
+  })
+
+  it('does not replay a leased mutation after a post-send connection close', async () => {
+    await ensureGatewayForProfile('bot')
+    const gateway = secondaryGateways[0]
+    const lease = acquireGatewayRequestLease(gateway as never, 'bot')
+    const outcomeUnknown = new Error('connection closed')
+
+    gateway.request.mockImplementationOnce(async () => {
+      gateway.connectionState = 'closed'
+      throw outcomeUnknown
+    })
+
+    await expect(lease.request('session.branch', { session_id: 'runtime-bot' })).rejects.toBe(outcomeUnknown)
+    expect(gateway.request).toHaveBeenCalledOnce()
+    expect(gateway.connect).toHaveBeenCalledOnce()
+    lease.release()
+  })
+
   it('a prune during the switch dial does not dispose the target and the switch lands', async () => {
     let releaseConnect: () => void = () => undefined
     connectGate = new Promise<void>(resolve => {
@@ -135,8 +184,7 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
     })
 
     const switching = ensureGatewayForAgent('homelab', 'research')
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushUntilSecondaryRegistered()
     expect(secondaryGateways).toHaveLength(1)
 
     pruneSecondaryGateways(new Set())
@@ -153,8 +201,7 @@ describe('activation lease vs. the live-work pruner (#89622)', () => {
     })
 
     const switching = ensureGatewayForProfile('bot')
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushUntilSecondaryRegistered()
     expect(secondaryGateways).toHaveLength(1)
 
     const commandLease = acquireGatewayRequestLease(secondaryGateways[0] as never, 'bot')

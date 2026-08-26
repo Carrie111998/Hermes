@@ -4,7 +4,13 @@ import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
-import { $gateway, acquireGatewayRequestLease, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
+import {
+  $gateway,
+  acquireGatewayRequestLease,
+  acquireGatewayRequestLeaseForAgent,
+  ensureActiveGatewayOpen,
+  isActivePrimary
+} from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
 
@@ -165,7 +171,12 @@ export function useGatewayRequest() {
     []
   )
 
-  return { bindGatewayRequest, connectionRef, gateway, gatewayRef, requestGateway }
+  const bindGatewayRequestForOwner = useCallback(
+    (connectionId: string, profile: string) => acquireGatewayRequestLeaseForAgent(connectionId, profile),
+    []
+  )
+
+  return { bindGatewayRequest, bindGatewayRequestForOwner, connectionRef, gateway, gatewayRef, requestGateway }
 }
 
 const GATEWAY_TRANSPORT_ERROR_CODES = new Set([

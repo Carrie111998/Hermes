@@ -308,6 +308,7 @@ function Harness({
     activeSessionId,
     activeSessionIdRef: cache.activeSessionIdRef,
     bindGatewayRequest: vi.fn() as never,
+    bindGatewayRequestForOwner: vi.fn() as never,
     busyRef,
     creatingSessionRef,
     ensureSessionState: cache.ensureSessionState,

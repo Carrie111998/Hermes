@@ -292,6 +292,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const {
     bindGatewayRequest,
+    bindGatewayRequestForOwner,
     connectionRef,
     gateway,
     gatewayRef,
@@ -495,6 +496,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionId,
     activeSessionIdRef,
     bindGatewayRequest,
+    bindGatewayRequestForOwner,
     busyRef,
     creatingSessionRef,
     ensureSessionState,
