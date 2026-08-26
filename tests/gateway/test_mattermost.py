@@ -10,6 +10,7 @@ from gateway.platforms.base import MessageType
 from gateway.run import (
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
+    _tool_progress_metadata,
 )
 
 
@@ -20,6 +21,31 @@ class TestMattermostProgressThreadRouting:
             source_thread_id=None,
             event_message_id="top_post_123",
         ) == "top_post_123"
+
+
+class TestMattermostSilentProgressMetadata:
+    def test_progress_is_silent_without_mutating_thread_metadata(self):
+        original = {"thread_id": "root-post"}
+
+        metadata = _tool_progress_metadata(
+            original, platform=Platform.MATTERMOST
+        )
+
+        assert metadata == {"thread_id": "root-post", "silent": True}
+        assert original == {"thread_id": "root-post"}
+
+    def test_threadless_progress_builds_metadata(self):
+        assert _tool_progress_metadata(None, platform="mattermost") == {
+            "silent": True
+        }
+
+    def test_other_platform_metadata_is_unchanged(self):
+        original = {"thread_id": "thread"}
+
+        metadata = _tool_progress_metadata(original, platform=Platform.SLACK)
+
+        assert metadata is original
+        assert "silent" not in metadata
 
 
 class TestMattermostDisplayHygiene:
@@ -153,9 +179,9 @@ class TestMattermostSend:
         assert result.success is True
         assert result.message_id == "post123"
 
-        # Verify post was called with correct URL
+        # Normal posts must not use Mattermost's silent notification query.
         call_args = self.adapter._session.post.call_args
-        assert "/api/v4/posts" in call_args[0][0]
+        assert call_args[0][0].endswith("/api/v4/posts")
         # Verify payload
         payload = call_args[1]["json"]
         assert payload["channel_id"] == "channel_1"
@@ -192,6 +218,62 @@ class TestMattermostSend:
 
         assert result.success is True
         payload = self.adapter._session.post.call_args[1]["json"]
+        assert payload["root_id"] == "root_post"
+
+    @pytest.mark.asyncio
+    async def test_tool_progress_uses_silent_post_query(self):
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"id": "progress_post"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Running terminal...",
+            metadata={"silent": True},
+        )
+
+        assert result.success is True
+        call_args = self.adapter._session.post.call_args
+        assert call_args.args[0].endswith("/api/v4/posts?silent=true")
+        payload = call_args.kwargs["json"]
+        assert payload["channel_id"] == "channel_1"
+        assert payload["message"] == "Running terminal..."
+        assert payload["props"]["disable_mentions"] is True
+
+    @pytest.mark.asyncio
+    async def test_notify_metadata_overrides_silent_marker(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "final_post"})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Final answer",
+            metadata={"silent": True, "notify": True},
+        )
+
+        assert result.success is True
+        assert self.adapter._api_post.call_args.args[0] == "posts"
+
+    @pytest.mark.asyncio
+    async def test_silent_thread_progress_preserves_root_id(self):
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "root_post", "root_id": ""}
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post"})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Running tool...",
+            metadata={"thread_id": "root_post", "silent": True},
+        )
+
+        assert result.success is True
+        path, payload = self.adapter._api_post.call_args.args
+        assert path == "posts?silent=true"
         assert payload["root_id"] == "root_post"
 
 
