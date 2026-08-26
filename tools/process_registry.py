@@ -2142,8 +2142,9 @@ class ProcessRegistry:
             timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config.
 
         Returns:
-            dict with status ("exited", "timeout", "interrupted", "not_found")
-            and output snapshot.
+            dict with status ("running", "exited", "interrupted", "not_found")
+            and output snapshot. A running result with wait_window_expired=true
+            is a non-terminal checkpoint, not a command timeout.
         """
         from tools.ansi_strip import strip_ansi
         from tools.interrupt import is_interrupted as _is_interrupted
@@ -2182,6 +2183,33 @@ class ProcessRegistry:
 
         deadline = time.monotonic() + effective_timeout
 
+        def exited_result(current: ProcessSession) -> dict | None:
+            if not current.exited:
+                return None
+            self._completion_consumed.add(session_id)
+            result = {
+                "status": "exited",
+                "command": current.command,
+                "exit_code": current.exit_code,
+                "completion_reason": current.completion_reason,
+                "termination_source": current.termination_source,
+                "output": strip_ansi(current.output_buffer[-2000:]),
+            }
+            if timeout_note:
+                result["timeout_note"] = timeout_note
+            return result
+
+        def interrupted_result(current: ProcessSession) -> dict:
+            result = {
+                "status": "interrupted",
+                "command": current.command,
+                "output": strip_ansi(current.output_buffer[-1000:]),
+                "note": "User sent a new message -- wait interrupted",
+            }
+            if timeout_note:
+                result["timeout_note"] = timeout_note
+            return result
+
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
             if session is None:
@@ -2190,38 +2218,34 @@ class ProcessRegistry:
             # pipe reader hangs where the reader is blocked but the direct
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
-            if session.exited:
-                self._completion_consumed.add(session_id)
-                result = {
-                    "status": "exited",
-                    "command": session.command,
-                    "exit_code": session.exit_code,
-                    "completion_reason": session.completion_reason,
-                    "termination_source": session.termination_source,
-                    "output": strip_ansi(session.output_buffer[-2000:]),
-                }
-                if timeout_note:
-                    result["timeout_note"] = timeout_note
-                return result
+            terminal_result = exited_result(session)
+            if terminal_result is not None:
+                return terminal_result
 
             if _is_interrupted():
-                result = {
-                    "status": "interrupted",
-                    "command": session.command,
-                    "output": strip_ansi(session.output_buffer[-1000:]),
-                    "note": "User sent a new message -- wait interrupted",
-                }
-                if timeout_note:
-                    result["timeout_note"] = timeout_note
-                return result
+                return interrupted_result(session)
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             session._completion_event.wait(timeout=min(1.0, remaining))
 
+        # The child can exit while the final bounded event wait returns. Check
+        # once more before emitting a live checkpoint so terminal state wins
+        # at the deadline boundary.
+        session = self._refresh_detached_session(session)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        self._reconcile_local_exit(session)
+        terminal_result = exited_result(session)
+        if terminal_result is not None:
+            return terminal_result
+        if _is_interrupted():
+            return interrupted_result(session)
+
         result = {
-            "status": "timeout",
+            "status": "running",
+            "wait_window_expired": True,
             "command": session.command,
             "output": strip_ansi(session.output_buffer[-1000:]),
             # A wait window elapsing is NOT a failure — 511 exact-duplicate
@@ -3193,7 +3217,8 @@ PROCESS_SCHEMA = {
     "description": (
         "Manage background processes started with terminal(background=true). "
         "Actions: 'list' (show all), 'poll' (check status + new output), "
-        "'log' (full output with pagination), 'wait' (block until done or timeout), "
+        "'log' (full output with pagination), 'wait' (block until done or a bounded "
+        "running checkpoint), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
         "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
     ),
@@ -3215,7 +3240,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": "Max seconds to block for 'wait'. If the child remains live, returns status='running' with wait_window_expired=true and partial output.",
                 "minimum": 1
             },
             "offset": {
