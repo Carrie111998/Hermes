@@ -159,6 +159,45 @@ class TestIsSafeBrowserUrl:
         assert _is_internal_hostname("host.local") is True
         assert _is_internal_hostname("localhost") is True
 
+    def test_wildcard_dns_match_requires_dot_boundary(self):
+        """A bare substring of a wildcard-DNS apex (mynip.io vs .nip.io) is a
+        different registrable domain — only the apex itself and real
+        subdomains qualify."""
+        assert _is_internal_hostname("nip.io") is True
+        assert _is_internal_hostname("127.0.0.1.nip.io") is True
+        assert _is_internal_hostname("foo.localtest.me") is True
+        assert _is_internal_hostname("mynip.io") is False
+        assert _is_internal_hostname("evil-nip.io") is False
+        assert _is_internal_hostname("sslip.io.example.com") is False
+
+    @pytest.mark.parametrize("url", [
+        # Wildcard-DNS services: the hostname itself encodes a
+        # private/loopback/metadata target (127.0.0.1.nip.io → 127.0.0.1,
+        # 10.0.0.5.sslip.io → 10.0.0.5, *.localtest.me → 127.0.0.1), so the
+        # shape-based public-domain allowance must NOT apply — the browser
+        # would rebind the navigation to the local machine (SSRF).
+        "http://127.0.0.1.nip.io/",
+        "http://10.0.0.5.nip.io:8080/admin",
+        "http://192.168.1.10.sslip.io/",
+        "http://169.254.169.254.nip.io/latest/meta-data/",
+        "http://10.0.0.5.xip.io/",
+        "http://localtest.me/",
+        "http://foo.localtest.me/",
+        "http://api.lvh.me/",
+        "http://10.0.0.5.vcap.me/",
+        "http://traefik.me/",
+    ])
+    def test_wildcard_dns_services_blocked(self, url):
+        # The agent resolver answers loopback — the fail-closed resolution
+        # path must reject, exactly as it does for *.local / *.internal.
+        with _resolves_to("127.0.0.1"):
+            assert is_safe_browser_url(url) is False
+        # And when the resolver is unreachable (NXDOMAIN / filtered), the
+        # wildcard-DNS shape still routes to fail-closed, not the
+        # public-domain fast path.
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("filtered")):
+            assert is_safe_browser_url(url) is False
+
     @pytest.mark.parametrize("url", [
         "ftp://example.com/file.txt",
         "example.com/path",

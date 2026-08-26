@@ -228,6 +228,23 @@ _INTERNAL_HOSTNAME_SUFFIXES = (
     ".onion",       # RFC 7686 — Tor hidden services
 )
 
+# Wildcard-DNS services: the hostname itself encodes the target address, so
+# a public-looking name can still point at the local machine
+# (``127.0.0.1.nip.io`` → 127.0.0.1, ``10.0.0.5.sslip.io`` → 10.0.0.5,
+# ``*.localtest.me`` → 127.0.0.1).  A shape-only public-domain classification
+# would let these sail through and the browser's navigation rebind to
+# private/loopback — an SSRF bypass.  They get the same treatment as
+# ``*.local`` / ``*.internal``: full fail-closed resolution check.
+_WILDCARD_DNS_APEXES = (
+    "nip.io",        # <ip>.nip.io → that IP (also <ip-with-dashes>)
+    "sslip.io",      # successor of nip.io, same scheme
+    "xip.io",        # older <ip>.xip.io wildcard
+    "localtest.me",  # *.localtest.me → 127.0.0.1
+    "lvh.me",        # *.lvh.me → 127.0.0.1
+    "vcap.me",       # *.vcap.me → 127.0.0.1
+    "traefik.me",    # *.traefik.me → 127.0.0.1
+)
+
 
 def _is_internal_hostname(hostname: str) -> bool:
     """Return True for machine-local / internal-reserved hostname shapes.
@@ -236,12 +253,20 @@ def _is_internal_hostname(hostname: str) -> bool:
     public internet names, and the special-use suffixes above never carry
     public sites.  Matching is suffix-only (leading dot), so public domains
     like ``example.com`` or ``example.net`` never match ``.example``.
+    Wildcard-DNS services (``*.nip.io`` family) encode the target address
+    in the name itself, so their apexes and real subdomains are treated the
+    same way — a bare substring (``mynip.io``) is a different registrable
+    domain and must NOT match.
     """
     if not hostname:
         return True
     if "." not in hostname:
         return True
-    return hostname.endswith(_INTERNAL_HOSTNAME_SUFFIXES)
+    if hostname.endswith(_INTERNAL_HOSTNAME_SUFFIXES):
+        return True
+    return hostname in _WILDCARD_DNS_APEXES or any(
+        hostname.endswith(f".{apex}") for apex in _WILDCARD_DNS_APEXES
+    )
 
 # ---------------------------------------------------------------------------
 # Global toggle: allow private/internal IP resolution
@@ -573,7 +598,10 @@ def is_safe_browser_url(url: str) -> bool:
       cloud-metadata IP checks (no DNS involved, fail-closed);
     * always-blocked metadata hostnames (``metadata.google.internal``, …);
     * machine-local / internal-reserved names (``localhost``, single-label
-      hosts, ``*.local``, ``*.internal``, ``*.lan``, ``*.home``, …) → full
+      hosts, ``*.local``, ``*.internal``, ``*.lan``, ``*.home``, …) and
+      wildcard-DNS services (``*.nip.io``, ``*.sslip.io``,
+      ``*.localtest.me``, … — the name itself encodes a private/loopback
+      target, so a public-looking shape must not skip the check) → full
       fail-closed resolution check;
     * any other DNS hostname (a public registrable domain) → allowed; the
       browser's own DNS resolution decides reachability.
