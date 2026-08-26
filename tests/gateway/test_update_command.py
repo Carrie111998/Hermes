@@ -172,6 +172,7 @@ class TestHandleUpdateCommand:
         assert call_args[0] == "bash"
         assert "nohup" not in call_args[2]
         assert ".update_exit_code" in call_args[2]
+        assert "marker_state" in call_args[2]
         # start_new_session=True should be in kwargs
         call_kwargs = mock_popen.call_args[1]
         assert call_kwargs.get("start_new_session") is True
@@ -288,6 +289,60 @@ class TestSendUpdateNotification:
         assert result is False
         mock_adapter.send.assert_not_called()
         assert pending_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_defers_notification_while_post_restart_health_is_pending(self, tmp_path):
+        """Code 2 is not a successful update outcome."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending_path = hermes_home / ".update_pending.json"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram", "chat_id": "67890", "user_id": "12345",
+        }))
+        exit_code_path.write_text("2")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        mock_adapter.send.assert_not_called()
+        assert pending_path.exists()
+        assert exit_code_path.read_text() == "2"
+
+    def test_post_restart_health_probe_finalizes_pending_success(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        exit_code_path = hermes_home / ".update_exit_code"
+        exit_code_path.write_text("2")
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run._post_restart_agent_health_check", return_value=(True, None)):
+            runner._finalize_pending_update_health()
+
+        assert exit_code_path.read_text() == "0"
+
+    def test_post_restart_health_probe_failure_is_terminal(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        exit_code_path = hermes_home / ".update_exit_code"
+        exit_code_path.write_text("2")
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch(
+                 "gateway.run._post_restart_agent_health_check",
+                 return_value=(False, "agent import probe exited with status 1"),
+             ):
+            runner._finalize_pending_update_health()
+
+        assert exit_code_path.read_text() == "1"
 
     @pytest.mark.asyncio
     async def test_recovers_from_claimed_pending_file(self, tmp_path):

@@ -6083,9 +6083,29 @@ class GatewaySlashCommandsMixin:
                     env["PYTHONUNBUFFERED"] = "1"
                     with open(output_path, "wb") as f:
                         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
-                        rc = proc.wait(timeout=3600)
-                    with open(exit_code_path, "w", encoding="utf-8") as f:
-                        f.write(str(rc))
+                        try:
+                            rc = proc.wait(timeout=1800)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
+                            rc = 124
+                    marker = ""
+                    try:
+                        with open(exit_code_path, encoding="utf-8") as f:
+                            marker = f.read().strip()
+                    except OSError:
+                        pass
+                    # A non-zero child result is terminal.  A successful
+                    # child must leave every existing marker alone: code 2 is
+                    # waiting for the new gateway, while 0/1 are already
+                    # terminal outcomes written by one of the two processes.
+                    if rc != 0:
+                        with open(exit_code_path, "w", encoding="utf-8") as f:
+                            f.write(str(rc))
+                    elif not marker:
+                        # No durable marker means no proof of the update path.
+                        with open(exit_code_path, "w", encoding="utf-8") as f:
+                            f.write("1")
                     """
                 ).strip()
                 subprocess.Popen(
@@ -6108,7 +6128,16 @@ class GatewaySlashCommandsMixin:
                     # in zsh, and this command string is copied/reused in macOS/zsh
                     # operator wrappers. Keep the template zsh-safe even though this
                     # specific subprocess currently runs under bash.
-                    f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}"
+                    f"rc=$?; marker_state=''; "
+                    f"if [ -f {shlex.quote(str(exit_code_path))} ]; then "
+                    f"IFS= read -r marker_state < {shlex.quote(str(exit_code_path))} || true; fi; "
+                    # Code 2 is a restart-pending outcome.  Keep it until the
+                    # new gateway completes the post-restart agent probe; a
+                    # failed child result still becomes the terminal outcome.
+                    f"if [ \"$rc\" -ne 0 ]; then "
+                    f"printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}; "
+                    f"elif [ -z \"$marker_state\" ]; then "
+                    f"printf '%s' '1' > {shlex.quote(str(exit_code_path))}; fi"
                 )
                 setsid_bin = shutil.which("setsid")
                 if setsid_bin:

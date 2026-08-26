@@ -369,6 +369,31 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
         return False
     return not result.stdout.strip()
 
+def _validate_python_files_syntax(
+    root, relpaths
+) -> tuple[bool, str | None, str | None]:
+    """Compile selected Python files without writing bytecode into the tree."""
+    import py_compile
+    import tempfile
+
+    root = Path(root)
+    with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
+        for index, relpath in enumerate(relpaths):
+            path = root / relpath
+            if not path.exists():
+                continue
+            cfile = Path(tmpdir) / (
+                f"{index}__{str(relpath).replace('/', '__')}c"
+            )
+            try:
+                py_compile.compile(str(path), cfile=str(cfile), doraise=True)
+            except py_compile.PyCompileError as exc:
+                return False, str(path), str(exc)
+            except OSError as exc:
+                return False, str(path), f"could not read: {exc}"
+    return True, None, None
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -388,27 +413,7 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
     Returns ``(ok, failing_path, error_message)``. ``ok=True`` means every
     file parsed cleanly.
     """
-    import py_compile
-    import tempfile
-
-    root = Path(root)
-    with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
-        for relpath in _UPDATE_CRITICAL_FILES:
-            path = root / relpath
-            if not path.exists():
-                # Missing file is suspicious but not necessarily fatal — a future
-                # refactor may legitimately remove one of these. Skip and move on.
-                continue
-            # Mirror the relative path under the tmpdir so two different
-            # files with the same basename don't collide on the cfile name.
-            cfile = Path(tmpdir) / (relpath.replace("/", "__") + "c")
-            try:
-                py_compile.compile(str(path), cfile=str(cfile), doraise=True)
-            except py_compile.PyCompileError as exc:
-                return False, str(path), str(exc)
-            except OSError as exc:
-                return False, str(path), f"could not read: {exc}"
-    return True, None, None
+    return _validate_python_files_syntax(root, _UPDATE_CRITICAL_FILES)
 
 
 # Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
@@ -423,54 +428,45 @@ _UPDATE_CRITICAL_MODULES = (
 )
 
 
-def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
-    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+_IMPORT_PROBE_MARKER = "__HERMES_IMPORT_PROBE__"
 
-    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
-    cross-module breakage: a partially-updated tree where ``agent/`` is new but
-    ``tools/`` is old parses perfectly and still dies at startup with
-    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
-    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
 
-    That skew is reachable on the Windows ZIP-update path, whose copy loop
-    walks top-level entries in ``os.listdir`` order and replaces each one
-    independently — ``agent/`` lands long before ``tools/``, so a failure or
-    interruption between them leaves exactly that mismatch on disk.
-
-    Runs in a subprocess because importing these modules into the running
-    updater would pollute ``sys.modules`` and execute import-time side effects
-    against the half-updated tree. Costs ~0.4s.
-
-    Uses the project venv's interpreter when there is one (matching
-    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
-    different Python than the install's own, and probing the wrong
-    interpreter would test a tree the user never runs.
-
-    Returns ``(ok, failing_module, error_message)``.
-    """
+def _critical_module_import_failures(
+    root, *, report_runtime_errors: bool = False, strict: bool = False
+) -> tuple[dict[str, str], str | None]:
+    """Return import failures plus any failure to obtain a reliable probe."""
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
 
     probe = (
-        "import importlib, sys\n"
+        "import importlib, json, sys\n"
+        "failures = []\n"
         "for name in %r:\n"
         "    try:\n"
         "        importlib.import_module(name)\n"
         "    except ModuleNotFoundError as exc:\n"
-        # A missing *third-party* module means dependencies aren't installed
-        # yet, not a skewed checkout. Only our own packages count as breakage.
-        # The root set is injected from hermes_constants so this can't drift
-        # from the hint the user is shown (they disagreed once already).
+        # A missing third-party module means dependencies are not installed
+        # yet, not that the checkout is inconsistent.
         "        missing = (getattr(exc, 'name', '') or '').split('.')[0]\n"
         "        if missing in %r or missing.startswith('hermes_'):\n"
-        "            sys.stdout.write(name + '\\n' + str(exc))\n"
-        "            raise SystemExit(3)\n"
+        "            failures.append((name, str(exc)))\n"
         "    except ImportError as exc:\n"
-        "        sys.stdout.write(name + '\\n' + str(exc))\n"
-        "        raise SystemExit(3)\n"
-        "    except Exception:\n"
-        "        pass\n"  # non-import errors (config/env) aren't update breakage
-        "raise SystemExit(0)\n"
-        % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
+        "        failures.append((name, str(exc)))\n"
+        "    except SyntaxError as exc:\n"
+        "        failures.append((name, str(exc)))\n"
+        "    except Exception as exc:\n"
+        "        if %r:\n"
+        "            failures.append((name, str(exc)))\n"
+        "    except BaseException as exc:\n"
+        "        if %r:\n"
+        "            failures.append((name, str(exc)))\n"
+        "sys.stdout.write(%r + json.dumps(failures))\n"
+        % (
+            _UPDATE_CRITICAL_MODULES,
+            tuple(sorted(FIRST_PARTY_MODULE_ROOTS)),
+            report_runtime_errors,
+            report_runtime_errors,
+            _IMPORT_PROBE_MARKER,
+        )
     )
     try:
         interpreter = sys.executable
@@ -482,6 +478,13 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
+        from tools.environments.local import build_subprocess_env
+
+        probe_env = build_subprocess_env(
+            scrub_secrets=False,
+            inherit_profile_home=False,
+            extra={"PYTHONDONTWRITEBYTECODE": "1"},
+        )
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
@@ -490,15 +493,52 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
             encoding="utf-8",
             errors="replace",
             timeout=120,
+            env=probe_env,
         )
-    except (OSError, subprocess.SubprocessError):
-        # Can't run the probe — don't block the update on our own tooling.
-        return True, None, None
-    if result.returncode == 3:
-        parts = (result.stdout or "").split("\n", 1)
-        module = parts[0].strip() or "unknown"
-        detail = parts[1].strip() if len(parts) > 1 else ""
-        return False, module, detail
+    except (OSError, subprocess.SubprocessError) as exc:
+        if strict:
+            return {}, f"could not run probe: {exc}"
+        return {}, None
+
+    output = result.stdout or ""
+    if result.returncode != 0:
+        if strict:
+            detail = (result.stderr or output).strip()
+            suffix = f": {detail[:400]}" if detail else ""
+            return {}, f"probe exited with status {result.returncode}{suffix}"
+        return {}, None
+
+    marker_at = output.rfind(_IMPORT_PROBE_MARKER)
+    if marker_at < 0:
+        if strict:
+            return {}, "probe did not emit a complete health verdict"
+        return {}, None
+    try:
+        import json
+
+        raw_failures = json.loads(output[marker_at + len(_IMPORT_PROBE_MARKER) :])
+        failures: dict[str, str] = {}
+        for item in raw_failures:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError("invalid import failure entry")
+            failures[str(item[0])] = str(item[1])
+        return failures, None
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        if strict:
+            return {}, f"probe emitted invalid health data: {exc}"
+        return {}, None
+
+
+def _validate_critical_modules_import(
+    root, *, strict: bool = False
+) -> tuple[bool, str | None, str | None]:
+    """Return the first critical-module import failure, if any."""
+    failures, probe_error = _critical_module_import_failures(root, strict=strict)
+    if probe_error:
+        return False, "critical-module-import-probe", probe_error
+    if failures:
+        module = next(iter(failures))
+        return False, module, failures[module]
     return True, None, None
 
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
@@ -1487,10 +1527,22 @@ def _print_update_summary(
         _print_update_completion(_update_complete_message(pre_update_version))
 
 
-def _write_gateway_update_exit_code(ok: bool) -> None:
+_GATEWAY_UPDATE_EXIT_PENDING = "2"
+
+
+def _write_gateway_update_exit_code(
+    ok: bool, *, pending_restart: bool = False, only_if_pending: bool = False
+) -> None:
     path = get_hermes_home() / ".update_exit_code"
     try:
-        path.write_text("0" if ok else "1", encoding="utf-8")
+        if only_if_pending and path.read_text(encoding="utf-8").strip() != _GATEWAY_UPDATE_EXIT_PENDING:
+            return
+        value = (
+            _GATEWAY_UPDATE_EXIT_PENDING
+            if pending_restart and ok
+            else ("0" if ok else "1")
+        )
+        path.write_text(value, encoding="utf-8")
     except OSError:
         pass
 
@@ -2103,6 +2155,247 @@ def _park_stashed_changes(stash_ref: str) -> None:
     print(f"  Restore manually with: git stash apply {stash_ref}")
 
 
+def _git_nul_paths(
+    git_cmd: list[str], cwd: Path, args: list[str]
+) -> tuple[tuple[str, ...], str | None]:
+    """Run a Git path query without losing filenames containing whitespace.
+
+    A failed inventory is not equivalent to an empty inventory. The updater
+    uses this distinction as a safety boundary: it must never drop a stash
+    merely because a Git query failed to prove which files were restored.
+    """
+    command = git_cmd + args
+    rendered = " ".join(str(part) for part in command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError as exc:
+        return (), f"{rendered} could not run: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        suffix = f": {detail.splitlines()[0][:400]}" if detail else ""
+        return (), f"{rendered} exited with status {result.returncode}{suffix}"
+    return tuple(path for path in (result.stdout or "").split("\0") if path), None
+
+
+def _untracked_paths(
+    git_cmd: list[str], cwd: Path
+) -> tuple[set[str], str | None]:
+    paths, error = _git_nul_paths(
+        git_cmd,
+        cwd,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    return set(paths), error
+
+
+def _stash_untracked_blob_ids(
+    git_cmd: list[str], cwd: Path, stash_ref: str
+) -> tuple[dict[str, str], str | None]:
+    """Return the paths and blob IDs captured as untracked stash content.
+
+    ``git stash push --include-untracked`` stores untracked files in the third
+    parent of the stash commit.  The parent is the authority for cleanup after
+    a failed restore; comparing only the current working-tree inventory with a
+    pre-restore snapshot would also match a file created concurrently by the
+    user and could delete data that never came from the stash.
+    """
+    command = git_cmd + ["cat-file", "-p", stash_ref]
+    try:
+        commit = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError as exc:
+        return {}, f"{command!r} could not run: {exc}"
+    if commit.returncode != 0:
+        detail = (commit.stderr or "").strip()
+        suffix = f": {detail.splitlines()[0][:400]}" if detail else ""
+        return {}, f"{command!r} exited with status {commit.returncode}{suffix}"
+
+    parents = [
+        line.split(maxsplit=1)[1]
+        for line in (commit.stdout or "").splitlines()
+        if line.startswith("parent ") and len(line.split(maxsplit=1)) == 2
+    ]
+    if len(parents) < 3:
+        return {}, None
+
+    tree_command = git_cmd + ["ls-tree", "-r", "-z", parents[2]]
+    try:
+        tree = subprocess.run(
+            tree_command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError as exc:
+        return {}, f"{tree_command!r} could not run: {exc}"
+    if tree.returncode != 0:
+        detail = (tree.stderr or "").strip()
+        suffix = f": {detail.splitlines()[0][:400]}" if detail else ""
+        return {}, f"{tree_command!r} exited with status {tree.returncode}{suffix}"
+
+    entries: dict[str, str] = {}
+    for raw_entry in (tree.stdout or "").split("\0"):
+        if not raw_entry:
+            continue
+        metadata, separator, path = raw_entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[1] != "blob" or not path:
+            return {}, "git stash untracked-file inventory contained an invalid entry"
+        entries[path] = fields[2]
+    return entries, None
+
+
+def _safe_restored_untracked_paths(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: str,
+    preexisting_untracked: set[str],
+) -> tuple[set[str], str | None]:
+    """Return only untracked paths proven to have come from ``stash_ref``.
+
+    A path is removable only when it is present in the stash's untracked tree,
+    was absent before restore, and its current content hashes to the exact blob
+    captured by the stash.  If a user or another process created or modified a
+    same-named file while the restore ran, the hash mismatch leaves it in place
+    instead of treating a name collision as ownership proof.
+    """
+    stash_entries, error = _stash_untracked_blob_ids(git_cmd, cwd, stash_ref)
+    if error:
+        return set(), error
+    if not stash_entries:
+        return set(), None
+
+    current_untracked, error = _untracked_paths(git_cmd, cwd)
+    if error:
+        return set(), error
+
+    candidates = set(stash_entries) & current_untracked - preexisting_untracked
+    removable: set[str] = set()
+    ambiguous: list[str] = []
+    for path in sorted(candidates):
+        try:
+            hash_result = subprocess.run(
+                git_cmd + ["hash-object", f"--path={path}", "--", path],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="surrogateescape",
+            )
+        except OSError:
+            ambiguous.append(path)
+            continue
+        if hash_result.returncode == 0 and hash_result.stdout.strip() == stash_entries[path]:
+            removable.add(path)
+        else:
+            ambiguous.append(path)
+
+    if ambiguous:
+        return removable, (
+            "could not prove ownership of concurrent untracked path(s): "
+            + ", ".join(ambiguous[:8])
+        )
+    return removable, None
+
+
+def _restored_python_paths(
+    git_cmd: list[str], cwd: Path
+) -> tuple[tuple[str, ...], str | None]:
+    """Find every tracked or untracked Python file visible after restore.
+
+    ``git diff`` does not report untracked files, while the update stash is
+    created with ``--include-untracked``. Both inventories are therefore part
+    of the proof. If either query fails, returning an empty list would turn a
+    tool failure into a false health verdict, so the error is propagated.
+    """
+    changed, error = _git_nul_paths(
+        git_cmd,
+        cwd,
+        ["diff", "--name-only", "-z", "HEAD", "--", "*.py"],
+    )
+    if error:
+        return (), f"could not enumerate restored Python files: {error}"
+
+    untracked, error = _untracked_paths(git_cmd, cwd)
+    if error:
+        return (), f"could not enumerate restored untracked files: {error}"
+
+    paths = set(changed)
+    paths.update(path for path in untracked if path.endswith(".py"))
+    return tuple(sorted(paths)), None
+
+
+def _reject_unsafe_stash_restore(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: str,
+    preexisting_untracked: set[str],
+    failing_target: str,
+    detail: str | None,
+) -> None:
+    """Reset to the updated tree and abort without dropping the recovery stash."""
+    print()
+    print("✗ Restored local changes failed the Hermes agent health proof.")
+    print(f"  Health check failed: {failing_target}")
+    if detail:
+        for line in str(detail).splitlines()[:6]:
+            print(f"    {line}")
+
+    restored_untracked, inventory_error = _safe_restored_untracked_paths(
+        git_cmd,
+        cwd,
+        stash_ref,
+        preexisting_untracked,
+    )
+    if inventory_error:
+        print(f"  Cleanup inventory failed: {inventory_error}")
+
+    try:
+        reset = subprocess.run(
+            git_cmd + ["reset", "--hard", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+        )
+        if reset.returncode != 0:
+            print("  Could not reset the tracked files automatically.")
+    except OSError as exc:
+        print(f"  Could not reset the tracked files automatically: {exc}")
+
+    if restored_untracked:
+        try:
+            clean = subprocess.run(
+                git_cmd + ["clean", "-fd", "--", *sorted(restored_untracked)],
+                cwd=cwd,
+                capture_output=True,
+            )
+            if clean.returncode != 0:
+                print("  Some restored untracked files could not be removed.")
+        except OSError as exc:
+            print(f"  Some restored untracked files could not be removed: {exc}")
+
+    print("  The gateway was not allowed to restart on an unproven tree.")
+    print("  Platform connectivity alone does not prove agent-turn health.")
+    print(f"  Your local changes remain preserved in stash: {stash_ref}")
+    print(f"  Inspect them with: git stash show --stat {stash_ref}")
+    print(f"  Restore manually after fixing them: git stash apply {stash_ref}")
+    raise SystemExit(1)
+
+
 def _restore_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
@@ -2111,15 +2404,19 @@ def _restore_stashed_changes(
     input_fn=None,
 ) -> bool:
     if prompt_user:
+        remote_prompt = input_fn is not None
+        prompt_suffix = "[y/N]" if remote_prompt else "[Y/n]"
         print()
         print("⚠ Local changes were stashed before updating.")
         print(
             "  Restoring them may reapply local customizations onto the updated codebase."
         )
         print("  Review the result afterward if Hermes behaves unexpectedly.")
-        print("Restore local changes now? [Y/n]")
+        print(f"Restore local changes now? {prompt_suffix}")
         if input_fn is not None:
-            response = input_fn("Restore local changes now? [Y/n]", "y")
+            response = str(
+                input_fn(f"Restore local changes now? {prompt_suffix}", "n") or ""
+            ).strip().lower()
         else:
             try:
                 response = input().strip().lower()
@@ -2130,11 +2427,30 @@ def _restore_stashed_changes(
                 # skip-restore path below, which already explains how to
                 # restore manually from git stash.
                 response = "n"
-        if response not in {"", "y", "yes"}:
+        accepted = response in {"y", "yes"} or (not remote_prompt and response == "")
+        if not accepted:
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
             print(f"Restore manually with: git stash apply {stash_ref}")
             return False
+
+    preexisting_untracked, inventory_error = _untracked_paths(git_cmd, cwd)
+    if inventory_error:
+        print("✗ Cannot safely restore local changes because the file inventory failed.")
+        print(f"  {inventory_error}")
+        print(f"  Your changes remain preserved in stash: {stash_ref}")
+        print(f"  Restore manually after checking the checkout: git stash apply {stash_ref}")
+        raise SystemExit(1)
+
+    clean_import_failures, probe_error = _critical_module_import_failures(
+        cwd, report_runtime_errors=True, strict=True
+    )
+    if probe_error:
+        print("✗ Cannot safely restore local changes without an import health verdict.")
+        print(f"  {probe_error}")
+        print(f"  Your changes remain preserved in stash: {stash_ref}")
+        print(f"  Restore manually after checking the checkout: git stash apply {stash_ref}")
+        raise SystemExit(1)
 
     print("→ Restoring local changes...")
     restore = subprocess.run(
@@ -2196,6 +2512,61 @@ def _restore_stashed_changes(
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.
         return False
+
+    restored_python, inventory_error = _restored_python_paths(git_cmd, cwd)
+    if inventory_error:
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            "restored-file inventory",
+            inventory_error,
+        )
+
+    syntax_ok, failing_path, syntax_error = _validate_python_files_syntax(
+        cwd, restored_python
+    )
+    if not syntax_ok:
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            failing_path or "restored Python source",
+            syntax_error,
+        )
+
+    restored_import_failures, probe_error = _critical_module_import_failures(
+        cwd, report_runtime_errors=True, strict=True
+    )
+    if probe_error:
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            "critical-module-import-probe",
+            probe_error,
+        )
+    changed_import_failure = next(
+        (
+            (module, error)
+            for module, error in restored_import_failures.items()
+            if clean_import_failures.get(module) != error
+        ),
+        None,
+    )
+    if changed_import_failure is not None:
+        failing_module, import_error = changed_import_failure
+        _reject_unsafe_stash_restore(
+            git_cmd,
+            cwd,
+            stash_ref,
+            preexisting_untracked,
+            f"agent import {failing_module}",
+            import_error,
+        )
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
     if stash_selector is None:
@@ -7585,7 +7956,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Desktop rebuild failure must not be reported as "0" — the gateway's
         # /update watcher (gateway/run.py) polls this file.
         if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+            _write_gateway_update_exit_code(
+                desktop_build_ok, pending_restart=True
+            )
 
         gateway_fleet_restart_incomplete = False
         # Snapshot of gateways running before we touch anything. Stays empty
@@ -8290,11 +8663,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if failed_or_stale_units:
                 gateway_fleet_restart_incomplete = True
                 if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
+                    _write_gateway_update_exit_code(False)
             _warn_incomplete_gateway_fleet_restart(failed_or_stale_units)
 
             try:
@@ -8376,11 +8745,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 gateway_fleet_restart_incomplete = True
                 _warn_gateway_restart_phase_aborted(e, _surviving)
                 if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
+                    _write_gateway_update_exit_code(False)
             try:
                 from hermes_cli.update_receipt import record_gateway_restart
 
@@ -8541,6 +8906,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as _receipt_exc:
             logger.debug("Update receipt finalize failed: %s", _receipt_exc)
 
+        if gateway_mode:
+            # The pending marker is consumed by the restarted gateway's
+            # post-start agent health probe. When no gateway was running, this
+            # process is the only verifier and can finalize the outcome here.
+            _write_gateway_update_exit_code(
+                not gateway_fleet_restart_incomplete,
+                only_if_pending=True,
+            )
+
         if gateway_fleet_restart_incomplete:
             # Code update itself succeeded, but at least one gateway still
             # runs pre-update modules — surface that as a failed update so
@@ -8584,6 +8958,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 finalize_update_receipt("failed")
             except Exception:
                 pass
+            if gateway_mode:
+                _write_gateway_update_exit_code(False)
             sys.exit(1)
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---

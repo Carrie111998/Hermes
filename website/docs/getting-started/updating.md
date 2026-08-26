@@ -27,9 +27,10 @@ When you run `hermes update`, the following steps occur:
 1. **Pre-update snapshot** — a lightweight state snapshot is saved by default (covers pairing data, cron jobs, `config.yaml`, `.env`, `auth.json`, and other state files that get modified at runtime; individual files over 1 GiB are skipped so a large sessions DB never slows the update down). Because the code swap and gateway restarts touch every profile, the same snapshot is taken for **every profile** on the install — each into its own `state-snapshots/` directory — and the post-update cron-jobs safety net checks each profile against its own snapshot. Controlled by `updates.pre_update_backup` (`quick` by default, `full` for a zip of all of `HERMES_HOME`, `off` to disable). Recoverable via the snapshot restore flow described under [Snapshots and rollback](../user-guide/checkpoints-and-rollback.md). Quick snapshots are file-loss recovery, not code-rollback insurance — for a coherent point-in-time rollback use `--backup` (full mode).
 2. **Git pull** — pulls the latest code from the `main` branch and updates submodules
 3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the nine critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
-4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
-5. **Config migration** — detects new config options added since your version and prompts you to set them
-6. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
+4. **Restored-source health proof** — when local changes are restored, Hermes compiles every restored Python file, checks the critical agent imports in the install's own interpreter, and only then drops the recovery stash. A clean Git apply is not proof that Python is valid. If Git cannot provide a complete file inventory or the proof cannot run, Hermes resets the tracked tree to the clean updated revision, keeps the stash, exits unsuccessfully, and does not restart a gateway on an unproven tree.
+5. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
+6. **Config migration** — detects new config options added since your version and prompts you to set them
+7. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
 
 ### Updating against a non-default branch: `--branch`
 
@@ -66,7 +67,7 @@ updates:
   # non_interactive_local_changes: discard  # throw local source edits away
 ```
 
-- `stash` (default) — auto-stash, pull, then auto-restore your changes on top of the updated code. Nothing is lost; if a restore hits conflicts they're preserved in a git stash for manual recovery.
+- `stash` (default) — auto-stash, pull, then ask through the gateway before restoring. The remote default is to keep the stash parked (`[y/N]`), so a timeout cannot silently re-apply a risky local edit. If an explicit restore hits conflicts or fails the restored-source health proof, Hermes keeps the stash and resets to the clean updated tree; an unproven tree is not restarted. After a restart, the new gateway runs an isolated `run_agent` import probe before the success notification is allowed.
 - `discard` — auto-stash and drop the stash after the pull, so the update always lands on a clean tree. Use this only on machines where you never intend to keep local edits to the Hermes source. It stash-drops (not `git reset --hard` + `git clean -fd`), so ignored paths like `node_modules`, `venv`, and build outputs are never touched.
 
 In the desktop app this is **Settings → Advanced → In-App Update Local Changes**.

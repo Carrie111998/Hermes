@@ -2069,6 +2069,43 @@ from hermes_constants import get_hermes_home, get_hermes_home_override
 from utils import atomic_json_write, base_url_hostname, is_truthy_value
 _hermes_home = get_hermes_home()
 
+_UPDATE_EXIT_PENDING = "2"
+_POST_RESTART_AGENT_HEALTH_TIMEOUT_SECONDS = 120
+
+
+def _post_restart_agent_health_check() -> tuple[bool, str | None]:
+    """Prove that the freshly restarted agent entrypoint can be imported.
+
+    Platform adapters can connect while ``run_agent`` is unimportable.  The
+    updater therefore leaves a pending marker before restart, and the new
+    gateway consumes it only after this isolated probe succeeds.  A subprocess
+    keeps import-time side effects out of the long-lived gateway process and
+    disables bytecode writes in the checkout.
+    """
+    from tools.environments.local import build_subprocess_env
+
+    probe_env = build_subprocess_env(
+        scrub_secrets=False,
+        inherit_profile_home=False,
+        extra={"PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import run_agent"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_POST_RESTART_AGENT_HEALTH_TIMEOUT_SECONDS,
+            env=probe_env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"could not run agent import probe: {type(exc).__name__}"
+    if result.returncode != 0:
+        return False, f"agent import probe exited with status {result.returncode}"
+    return True, None
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
@@ -13283,6 +13320,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Check if we're restarting after a /update command. If the update is
         # still running, keep watching so we notify once it actually finishes.
+        self._finalize_pending_update_health()
         notified = await self._send_update_notification()
         if not notified and any(
             path.exists()
@@ -24195,6 +24233,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    def _finalize_pending_update_health(self) -> None:
+        """Finalize a gateway update only after the new agent proves healthy."""
+        exit_code_path = _hermes_home / ".update_exit_code"
+        try:
+            if exit_code_path.read_text(encoding="utf-8").strip() != _UPDATE_EXIT_PENDING:
+                return
+        except OSError:
+            return
+
+        healthy, detail = _post_restart_agent_health_check()
+        try:
+            exit_code_path.write_text("0" if healthy else "1", encoding="utf-8")
+        except OSError as exc:
+            # Leaving the pending marker is fail-closed: the watcher will not
+            # announce success without a durable final outcome.
+            logger.warning("Could not persist post-restart update outcome: %s", exc)
+            return
+        if healthy:
+            logger.info("Post-restart agent health probe passed")
+        else:
+            logger.error("Post-restart agent health probe failed: %s", detail)
+
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
         existing_task = getattr(self, "_update_notification_task", None)
@@ -24328,6 +24388,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         while loop.time() < deadline:
             # Check for completion
             if exit_code_path.exists():
+                try:
+                    if exit_code_path.read_text(encoding="utf-8").strip() == _UPDATE_EXIT_PENDING:
+                        await asyncio.sleep(poll_interval)
+                        continue
+                except OSError:
+                    pass
                 # Read any remaining output
                 if output_path.exists():
                     try:
@@ -24507,6 +24573,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
 
             exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
+            if exit_code_raw == _UPDATE_EXIT_PENDING:
+                logger.info("Update notification deferred: post-restart health is pending")
+                cleanup = False
+                active_pending_path = pending_path
+                claimed_path.replace(pending_path)
+                return False
             exit_code = int(exit_code_raw)
 
             # Read the captured update output
