@@ -129,10 +129,30 @@ class SearchMemo:
         return json.loads(json.dumps(response))  # defensive copy
 
     def store(self, provider: str, query: str, limit: int, response: dict) -> None:
-        """Cache a SUCCESSFUL response for the bucketed key."""
+        """Cache a SUCCESSFUL, USABLE response for the bucketed key."""
         if not cache_enabled():
             return
         if not isinstance(response, dict) or not response.get("success"):
+            return
+        # A successful-but-empty search (HTTP success, zero usable results)
+        # is usually a transient upstream condition — SearXNG engines being
+        # rate-limited/suspended/challenged — and must not become sticky for
+        # a whole TTL (#95516). Require at least one dict result with a
+        # non-empty url before creating the entry. Concurrent identical
+        # searches are unaffected: single-flight coalescing happens around
+        # the flight lock, and a losing caller whose winner stored nothing
+        # simply gets its own fresh chance to succeed.
+        web = None
+        data = response.get("data")
+        if isinstance(data, dict):
+            web = data.get("web")
+        has_usable_result = isinstance(web, list) and any(
+            isinstance(item, dict)
+            and isinstance(item.get("url"), str)
+            and item.get("url").strip()
+            for item in web
+        )
+        if not has_usable_result:
             return
         key = self._key(provider, query, limit)
         with self._store_lock:
