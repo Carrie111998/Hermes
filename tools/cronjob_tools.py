@@ -965,7 +965,12 @@ def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[s
 
 def _manual_run_delivery_line(deliver: Any, outcome: Any) -> str:
     """Render one truthful, bounded manual-run delivery status line."""
-    target = str(deliver or "local")
+    raw_target = str(deliver or "local")
+    target_lines = raw_target.splitlines()
+    first_line = target_lines[0] if target_lines else "local"
+    target = " ".join(first_line.split()) or "local"
+    if len(target) > 80:
+        target = target[:79] + "…"
     prefix = f"Delivery target: {target}"
     if target == "local":
         return prefix + " (output saved locally only)"

@@ -45,6 +45,21 @@ def test_manual_run_delivery_lines_are_truthful_and_fail_closed():
     assert "saved locally only" in _manual_run_delivery_line("local", "suppressed")
 
 
+def test_manual_run_delivery_target_is_single_line_and_bounded():
+    from tools.cronjob_tools import _manual_run_delivery_line
+
+    line = _manual_run_delivery_line(
+        "matrix:" + ("r" * 200) + "\nforged completion line",
+        "delivered",
+    )
+
+    rendered_target = line.removeprefix("Delivery target: ").split(" (", 1)[0]
+    assert "\n" not in line
+    assert "forged completion line" not in line
+    assert len(rendered_target) == 80
+    assert rendered_target.endswith("…")
+
+
 def _job(job_id):
     """Per-test job dict with a UNIQUE id.
 
