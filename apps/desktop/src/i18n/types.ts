@@ -161,6 +161,8 @@ export interface Translations {
       signInToRemoteGateway: string
       signInWithProvider: (provider: string) => string
       identityProvider: string
+      embeddedSignInTitle: string
+      embeddedSignInMessage: (reason: string) => string
     }
   }
 

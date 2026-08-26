@@ -179,7 +179,19 @@ export function BootFailureOverlay() {
       const result = await window.hermesDesktop?.oauthLoginConnectionConfig(remoteReauth.url)
 
       if (result?.connected) {
-        notify({ kind: 'success', title: t.boot.failure.signedInTitle, message: t.boot.failure.signedInMessage })
+        if (result.strategy === 'embedded') {
+          // Visible downgrade (#95609): native PKCE was not used — say so
+          // instead of letting a cookie-only session masquerade as native
+          // sign-in.
+          notify({
+            kind: 'warning',
+            title: t.boot.failure.embeddedSignInTitle,
+            message: t.boot.failure.embeddedSignInMessage(result.strategyReason || '')
+          })
+        } else {
+          notify({ kind: 'success', title: t.boot.failure.signedInTitle, message: t.boot.failure.signedInMessage })
+        }
+
         window.location.reload()
 
         return
@@ -188,7 +200,7 @@ export function BootFailureOverlay() {
       notify({
         kind: 'warning',
         title: t.boot.failure.signInIncompleteTitle,
-        message: t.boot.failure.signInIncompleteMessage
+        message: result?.error || t.boot.failure.signInIncompleteMessage
       })
     } catch (err) {
       notifyError(err, t.boot.failure.signInFailed)
