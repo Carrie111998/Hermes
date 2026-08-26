@@ -25,16 +25,20 @@
  * whatever is "active" (active is presentation only). The owner ladder is
  * resolveSessionRpcOwner (tile route → exact unique owner hint → the row's
  * owner: exact when connection-tagged, else its profile), then a
- * cross-profile REST probe for a hidden/unlisted session. A request with a
- * session whose owner STILL cannot be named fails closed with an explicit
- * SessionOwnerResolutionError rather than riding the ambient socket (the one
- * exception: the legacy single-backend Desktop, where ambient IS the owner).
- * Only a request with NO session at all falls to the ambient socket.
+ * cross-profile REST probe for a hidden/unlisted session, then — NEW, for the
+ * brand-new-session gap (#95628) — the EXPLICIT user-selected source: the
+ * connection switcher's current selection / new-chat intent, the same route
+ * session.create would have used. A request with a session whose owner STILL
+ * cannot be named fails closed with an explicit SessionOwnerResolutionError
+ * rather than riding the ambient socket (the one exception: the legacy
+ * single-backend Desktop, where ambient IS the owner). Only a request with NO
+ * session at all falls to the ambient socket.
  */
 import type { MutableRefObject } from 'react'
 
 import { resolveSessionOwner } from '@/app/session/hooks/use-session-actions/utils'
 import type { ClientSessionState } from '@/app/types'
+import { resolveNewChatOwnerRoute } from '@/store/profile'
 import { $sessions, getSessionOwnerHint, knownSessionOwner } from '@/store/session'
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
@@ -89,6 +93,26 @@ export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): Ambi
 
       if (probed) {
         owner = probed
+      }
+    }
+
+    if (!owner && routingSessionId) {
+      // #95628: the brand-new-session gap. The FIRST session-scoped RPC of a
+      // fresh chat can arrive before any tile route, owner hint or session row
+      // exists for the rungs above to key off of (a create that rode the
+      // ambient socket records none of them). Falling through to the PRIMARY
+      // connection here is the bug: the user explicitly selected a source in
+      // the connection switcher, and that selection — the same route
+      // session.create would use for the next new chat (persisted across runs
+      // as the registry's last-used connection) — is the only legitimate
+      // default. It is applied ONLY after every evidence rung and the probe
+      // miss, so a known owner always outranks it. When even the selection
+      // cannot be named (no registry identity: legacy or v1/v2 drift), the
+      // fail-closed path below stays in force — never a silent primary guess.
+      const defaultOwner = resolveNewChatOwnerRoute()
+
+      if (defaultOwner) {
+        owner = defaultOwner
       }
     }
 

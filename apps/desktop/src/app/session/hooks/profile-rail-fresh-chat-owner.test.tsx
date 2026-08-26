@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vite
 
 import { createSessionRpcDispatcher } from '@/app/contrib/session-rpc-dispatcher'
 import { getSession } from '@/hermes'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
+import { _resetConnectionsForTests, selectConnection, setConnectionsRegistry } from '@/store/connections'
 import {
   activeGateway,
   activeGatewayConnectionId,
@@ -220,7 +222,17 @@ function installDesktop(): void {
             : SOURCE_DEFAULT_PORT
           : 9999
 
-      return { port, profile, token: `${connectionId}-${profile}-token`, wsUrl: `ws://127.0.0.1:${port}/ws` }
+      // The real bridge descriptor carries the registry identity; the switch
+      // commit (selectConnection) validates the published descriptor against
+      // the requested (connectionId, profile) before it repaints.
+      return {
+        connectionId,
+        port,
+        profile,
+        registryScoped: true,
+        token: `${connectionId}-${profile}-token`,
+        wsUrl: `ws://127.0.0.1:${port}/ws`
+      }
     }),
     touchBackend: vi.fn(async () => undefined)
   }
@@ -775,5 +787,168 @@ describe('profile rail: a fresh Omar chat keeps its exact registry owner across 
     expect($sessions.get().find(session => sessionMatchesStoredId(session, LEGACY_STORED_ID))).toMatchObject({
       profile: 'omar'
     })
+  })
+})
+
+// ── The #95628 connection-switcher reproduction ─────────────────────────────
+// Issue #95628: "a brand-new session created while a non-primary connection is
+// selected in the connection switcher does not reliably route to that
+// connection." Two registered connections (local primary + SSH remote), the
+// switcher selection moved to the remote at runtime, then a brand-new chat:
+// session.create and every turn must land on the REMOTE socket — the source
+// the user selected — never the primary, even though the primary's `default`
+// profile would happily serve the same-named profile.
+//
+// This suite drives the same real hook stack as the profile-rail suite above,
+// but reaches the remote through the SWITCHER path: selectConnection() (the
+// production sidebar action) instead of the profile rail.
+describe('connection switcher: a fresh chat on a non-primary source keeps its exact owner (#95628)', () => {
+  beforeEach(() => {
+    sockets.length = 0
+    runtimeOwner = null
+    ownerPort = SOURCE_DEFAULT_PORT
+    mintedRuntimeId = RUNTIME_ID
+    mintedStoredId = STORED_ID
+    clearSingleFlightSessionResumeState()
+    registryOnEvent = vi.fn()
+    configureGatewayRegistry({
+      activeConnectionId: () => $connection.get()?.connectionId ?? null,
+      onEvent: registryOnEvent
+    })
+    closeSecondaryGateways()
+    installDesktop()
+    // Two connections, local is primary — the issue's exact registry shape.
+    _resetConnectionsForTests()
+    setConnectionsRegistry({ connections: [{ id: 'local' }, { id: SOURCE_ID }], primary: 'local' } as never)
+    setSessions([])
+    setMessages([])
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setConnection(null)
+    setBusy(false)
+    setAwaitingResponse(false)
+    $newChatProfile.set(null)
+    $newChatRoute.set(null)
+    $newChatConnectionId.set(null)
+    _resetSessionOwnerHintsForTests({ storage: true })
+  })
+
+  afterEach(() => {
+    cleanup()
+    closeSecondaryGateways()
+    $connectionsRegistry.set(null)
+    setSessions([])
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setConnection(null)
+    $newChatProfile.set(null)
+    $newChatRoute.set(null)
+    $newChatConnectionId.set(null)
+    $activeGatewayProfile.set('default')
+    vi.clearAllMocks()
+    delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+  })
+
+  async function bootSwitcherOnRemote() {
+    // Primary / ambient source: the LOCAL backend ("This device").
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+
+    // The user picks the SSH remote in the connection switcher.
+    await selectConnection(SOURCE_ID)
+    expect(activeGatewayConnectionId()).toBe(SOURCE_ID)
+
+    const remoteSocket = sockets.find(socket => socket.connectUrl?.includes(`:${SOURCE_DEFAULT_PORT}`))
+    expect(
+      remoteSocket,
+      `no socket dialed port ${SOURCE_DEFAULT_PORT}; dialed: ${sockets.map(s => s.connectUrl).join(', ')}`
+    ).toBeDefined()
+    expect(activeGateway()).toBe(remoteSocket as never)
+
+    // Ambient dispatcher = whatever socket is active, as useGatewayRequest does.
+    const ambientRequest = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create' || sessionScoped(params)) {
+        throw new Error(`session traffic must not use ambient dispatcher: ${method}`)
+      }
+
+      return (activeGateway() as unknown as MockGateway).request(method, params)
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness ambientRequest={ambientRequest as never} onReady={h => (handle = h)} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    return { ambientRequest, handle: handle!, primary, remoteSocket: remoteSocket! }
+  }
+
+  /** What the gateway's stream end does: the turn settles. */
+  async function settleTurn(handle: HarnessHandle) {
+    await act(async () => {
+      handle.updateSessionState(mintedRuntimeId, state => ({
+        ...state,
+        awaitingResponse: false,
+        busy: false,
+        streamId: null,
+        turnStartedAt: null
+      }))
+      handle.busyRef.current = false
+      setBusy(false)
+      setAwaitingResponse(false)
+    })
+  }
+
+  const calls = (socket: MockGateway) => socket.request.mock.calls.map(call => call[0] as string)
+
+  it('creates the fresh chat and serves both turns on the switcher-selected remote, not the local primary', async () => {
+    const { ambientRequest, handle, primary, remoteSocket } = await bootSwitcherOnRemote()
+
+    // The switcher selection is the draft's captured source.
+    expect($newChatConnectionId.get()).toBe(SOURCE_ID)
+
+    // Turn one: no session yet → createBackendSessionForSend → prompt.submit.
+    await expect(handle.submitText('first prompt')).resolves.toBe(true)
+    await waitFor(() => expect($activeSessionId.get()).toBe(RUNTIME_ID))
+    expect(handle.bindings()).toEqual({ runtimeForStored: RUNTIME_ID, storedForRuntime: STORED_ID })
+
+    await settleTurn(handle)
+
+    // Turn two on the now-existing session.
+    await expect(handle.submitText('second prompt')).resolves.toBe(true)
+
+    // The runtime was minted by the remote socket and every session-scoped
+    // RPC (create + both submits) rode the SAME remote socket.
+    expect(runtimeOwner).toBe(remoteSocket)
+    const remoteCalls = calls(remoteSocket)
+
+    expect(remoteCalls.filter(method => method === 'session.create')).toHaveLength(1)
+    expect(remoteCalls.filter(method => method === 'prompt.submit')).toHaveLength(2)
+    expect(
+      remoteSocket.request.mock.calls
+        .filter(call => call[0] === 'prompt.submit')
+        .map(call => [(call[1] as { session_id: string }).session_id, (call[1] as { text: string }).text])
+    ).toEqual([
+      [RUNTIME_ID, 'first prompt'],
+      [RUNTIME_ID, 'second prompt']
+    ])
+
+    // NOTHING session-scoped reached the local primary — the #95628 bug.
+    expect(calls(primary).filter(method => method === 'session.create' || method === 'prompt.submit')).toEqual([])
+    expect(
+      ambientRequest.mock.calls.filter(call => call[0] === 'session.create' || sessionScoped(call[1]))
+    ).toEqual([])
+    expect(vi.mocked(getSession)).not.toHaveBeenCalled()
+    expect(getSessionOwnerHint(STORED_ID)).toEqual({ connectionId: SOURCE_ID, profile: 'default' })
+    expect($sessions.get().find(session => sessionMatchesStoredId(session, STORED_ID))).toMatchObject({
+      connection_id: SOURCE_ID,
+      profile: 'default'
+    })
+    expect(activeGatewayConnectionId()).toBe(SOURCE_ID)
+
+    for (const socket of [primary, ...sockets]) {
+      expect(socket.close).not.toHaveBeenCalled()
+      expect(
+        calls(socket).filter(method => ['session.activate', 'session.close', 'session.resume'].includes(method))
+      ).toEqual([])
+    }
   })
 })

@@ -31,7 +31,7 @@ vi.mock('@/app/session/hooks/use-session-actions/utils', async importActual => (
 
 const { createSessionRpcDispatcher } = await import('./session-rpc-dispatcher')
 const { $connectionsRegistry } = await import('@/store/connection-registry-state')
-const { $profiles } = await import('@/store/profile')
+const { $newChatConnectionId, $newChatProfile, $newChatRoute, $profiles } = await import('@/store/profile')
 const { _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } = await import('@/store/session')
 const { isSessionOwnerResolutionError } = await import('@/store/session-owner-resolution')
 const { $sessionTiles } = await import('@/store/session-states')
@@ -53,6 +53,9 @@ beforeEach(() => {
   gatewayMocks.activeConnectionId = 'local'
   $connectionsRegistry.set({ connections: [{ id: 'local' }] } as never)
   $profiles.set([{ name: 'default' }, { name: 'omar' }] as never)
+  $newChatProfile.set(null)
+  $newChatRoute.set(null)
+  $newChatConnectionId.set(null)
   probe.resolveSessionOwner.mockResolvedValue(undefined)
 })
 
@@ -61,12 +64,20 @@ afterEach(() => {
   setSessions([])
   $sessionTiles.set([])
   $profiles.set([])
+  $newChatProfile.set(null)
+  $newChatRoute.set(null)
+  $newChatConnectionId.set(null)
   _resetSessionOwnerHintsForTests({ storage: true })
   vi.clearAllMocks()
 })
 
 describe('createSessionRpcDispatcher: fail closed', () => {
-  it('rejects with an explicit owner-resolution error instead of riding the ambient socket', async () => {
+  it('rejects with an explicit owner-resolution error when NO user-selected source exists to route to', async () => {
+    // Registry topology with no resolved active connection (the v1/v2 drift
+    // window): there is nowhere explicit to send the RPC, so failing closed
+    // beats riding the ambient socket — and beats the primary by default.
+    gatewayMocks.activeConnectionId = null
+    $connectionsRegistry.set({ primary: 'local', connections: [{ id: 'local' }, { id: 'ssh-remote' }] } as never)
     const { ambientRequest, request } = dispatcher()
 
     await expect(request('prompt.submit', { session_id: 'rt-orphan', text: 'hi' })).rejects.toSatisfy(
@@ -80,6 +91,43 @@ describe('createSessionRpcDispatcher: fail closed', () => {
     expect(ambientRequest).not.toHaveBeenCalled()
     expect(gatewayMocks.requestGatewayForAgent).not.toHaveBeenCalled()
     expect(gatewayMocks.requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('routes a brand-new session to the switcher-selected connection, never the primary by default (#95628)', async () => {
+    // The issue repro: two connections (local primary + SSH remote), the
+    // switcher selection on the remote, and a brand-new session whose FIRST
+    // prompt.submit arrives before any tile route, owner hint or session row
+    // exists (the create's own records are the only thing that could name the
+    // owner, and a create that rode the ambient socket records none). The
+    // explicit user selection — the source the switcher is on — is the
+    // default route; falling to the PRIMARY connection is the bug.
+    gatewayMocks.activeConnectionId = 'ssh-remote'
+    $connectionsRegistry.set({ primary: 'local', connections: [{ id: 'local' }, { id: 'ssh-remote' }] } as never)
+    const { ambientRequest, request } = dispatcher()
+
+    await expect(request('prompt.submit', { session_id: 'rt-brand-new', text: 'hi' })).resolves.toEqual({
+      routed: true
+    })
+
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith('ssh-remote', 'default', 'prompt.submit', {
+      session_id: 'rt-brand-new',
+      text: 'hi'
+    })
+    expect(probe.resolveSessionOwner).toHaveBeenCalledWith('rt-brand-new')
+    expect(ambientRequest).not.toHaveBeenCalled()
+    expect(gatewayMocks.requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('routes to the user-selected source even when it is the single registry entry', async () => {
+    gatewayMocks.activeConnectionId = 'local'
+    $connectionsRegistry.set({ primary: 'local', connections: [{ id: 'local' }] } as never)
+    const { ambientRequest, request } = dispatcher()
+
+    await expect(request('session.resume', { session_id: 'rt-orphan' })).resolves.toEqual({ routed: true })
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith('local', 'default', 'session.resume', {
+      session_id: 'rt-orphan'
+    })
+    expect(ambientRequest).not.toHaveBeenCalled()
   })
 
   it('still lets a request with NO session (ambient chrome) reach the ambient socket', async () => {
@@ -99,7 +147,7 @@ describe('createSessionRpcDispatcher: fail closed', () => {
     expect(ambientRequest).toHaveBeenCalledWith('session.resume', { session_id: 'stored-legacy' })
   })
 
-  it('fails closed as soon as there is somewhere to misroute to: a second profile, or a live registry source', async () => {
+  it('fails closed for a second profile with no registry source, but routes by the explicit selection once one exists', async () => {
     gatewayMocks.activeConnectionId = null
     $connectionsRegistry.set(null)
     $profiles.set([{ name: 'default' }, { name: 'omar' }] as never)
@@ -110,9 +158,12 @@ describe('createSessionRpcDispatcher: fail closed', () => {
     gatewayMocks.activeConnectionId = 'local'
     $connectionsRegistry.set({ connections: [{ id: 'local' }] } as never)
     $profiles.set([{ name: 'default' }] as never)
-    await expect(dispatcher().request('session.resume', { session_id: 'stored-x' })).rejects.toSatisfy(
-      isSessionOwnerResolutionError
-    )
+    await expect(dispatcher().request('session.resume', { session_id: 'stored-x' })).resolves.toEqual({
+      routed: true
+    })
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenLastCalledWith('local', 'default', 'session.resume', {
+      session_id: 'stored-x'
+    })
   })
 })
 
