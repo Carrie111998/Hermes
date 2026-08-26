@@ -2416,6 +2416,7 @@ export const en: Translations = {
     folder: 'Folder…',
     images: 'Images…',
     pasteImage: 'Paste image',
+    capturePhoto: 'Capture photo',
     url: 'URL…',
     promptSnippets: 'Prompt snippets…',
     tipPre: 'Tip: type ',

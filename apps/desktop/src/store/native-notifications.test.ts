@@ -287,10 +287,14 @@ describe('dispatchNativeNotification throttle', () => {
 })
 
 describe('sendTestNativeNotification', () => {
-  it('fires regardless of focus or active session', () => {
+  it('asks the mobile bridge for permission before the user-requested test', async () => {
+    const requestNotificationPermission = vi.fn().mockResolvedValue(true)
+    desktopWindow.hermesDesktop = { notify, requestNotificationPermission } as unknown as Window['hermesDesktop']
     setWindowState({ focused: true, hidden: false })
     setActiveSessionId('on-screen')
-    sendTestNativeNotification('Hermes', 'works')
+
+    await expect(sendTestNativeNotification('Hermes', 'works')).resolves.toBe(true)
+    expect(requestNotificationPermission).toHaveBeenCalledOnce()
     expect(notify).toHaveBeenCalledTimes(1)
   })
 })

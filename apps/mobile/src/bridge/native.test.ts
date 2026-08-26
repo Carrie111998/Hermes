@@ -1,10 +1,20 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@capacitor/app', () => ({ App: { addListener: vi.fn() } }))
 vi.mock('@capacitor/browser', () => ({ Browser: { open: vi.fn() } }))
 vi.mock('@capacitor/clipboard', () => ({ Clipboard: { write: vi.fn() } }))
 vi.mock('@capacitor/core', () => ({ Capacitor: { isNativePlatform: () => true } }))
-vi.mock('@capacitor/network', () => ({ Network: { addListener: vi.fn() } }))
+vi.mock('@capacitor/camera', () => ({
+  Camera: {
+    checkPermissions: vi.fn(),
+    requestPermissions: vi.fn(),
+    takePhoto: vi.fn(),
+  },
+  MediaType: { Photo: 0 },
+}))
+vi.mock('@capacitor/network', () => ({
+  Network: { addListener: vi.fn() },
+}))
 vi.mock('@capacitor/local-notifications', () => ({
   LocalNotifications: {
     checkPermissions: vi.fn(),
@@ -16,9 +26,21 @@ vi.mock('@capacitor/local-notifications', () => ({
 
 import { App } from '@capacitor/app'
 import { Browser } from '@capacitor/browser'
+import { Camera, MediaType } from '@capacitor/camera'
 import { LocalNotifications } from '@capacitor/local-notifications'
 import { Network } from '@capacitor/network'
-import { notify, requestMicrophoneAccess, onPowerResume, openExternal } from './native'
+import { captureCameraPhoto, notify, onPowerResume, openExternal, requestMicrophoneAccess, requestNotificationPermission } from './native'
+
+beforeEach(() => {
+  vi.mocked(Camera.checkPermissions).mockReset()
+  vi.mocked(Camera.requestPermissions).mockReset()
+  vi.mocked(Camera.takePhoto).mockReset()
+  vi.mocked(LocalNotifications.checkPermissions).mockReset()
+  vi.mocked(LocalNotifications.createChannel).mockReset()
+  vi.mocked(LocalNotifications.requestPermissions).mockReset()
+  vi.mocked(LocalNotifications.schedule).mockReset()
+  vi.unstubAllGlobals()
+})
 
 describe('requestMicrophoneAccess', () => {
   it('requests audio capture and releases the probe stream', async () => {
@@ -41,6 +63,30 @@ describe('requestMicrophoneAccess', () => {
   })
 })
 
+describe('captureCameraPhoto', () => {
+  it('requests camera permission only after capture is invoked and returns the captured image bytes', async () => {
+    vi.mocked(Camera.checkPermissions).mockResolvedValue({ camera: 'prompt', photos: 'granted' })
+    vi.mocked(Camera.requestPermissions).mockResolvedValue({ camera: 'granted', photos: 'granted' })
+    vi.mocked(Camera.takePhoto).mockResolvedValue({ saved: false, type: MediaType.Photo, webPath: 'https://camera.example/photo.jpg' })
+    const fetchMock = vi.fn(async () => new Response(new Blob(['camera bytes'], { type: 'image/jpeg' })))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const photo = await captureCameraPhoto()
+
+    expect(Camera.requestPermissions).toHaveBeenCalledWith({ permissions: ['camera'] })
+    expect(Camera.takePhoto).toHaveBeenCalledWith(expect.objectContaining({ correctOrientation: true, quality: 85, saveToGallery: false }))
+    await expect(photo?.text()).resolves.toBe('camera bytes')
+  })
+
+  it('does not open the camera when the user declines permission', async () => {
+    vi.mocked(Camera.checkPermissions).mockResolvedValue({ camera: 'prompt', photos: 'granted' })
+    vi.mocked(Camera.requestPermissions).mockResolvedValue({ camera: 'denied', photos: 'granted' })
+
+    await expect(captureCameraPhoto()).resolves.toBeNull()
+    expect(Camera.takePhoto).not.toHaveBeenCalled()
+  })
+})
+
 describe('openExternal', () => {
   it('opens only credential-free HTTPS links', async () => {
     await openExternal('https://hermes-agent.nousresearch.com/docs')
@@ -52,14 +98,32 @@ describe('openExternal', () => {
   })
 })
 
+describe('requestNotificationPermission', () => {
+  it('opens Android notification permission only from an explicit user action', async () => {
+    vi.mocked(LocalNotifications.checkPermissions).mockResolvedValue({ display: 'prompt' })
+    vi.mocked(LocalNotifications.requestPermissions).mockResolvedValue({ display: 'granted' })
+    vi.mocked(LocalNotifications.createChannel).mockResolvedValue()
+
+    await expect(requestNotificationPermission()).resolves.toBe(true)
+    expect(LocalNotifications.requestPermissions).toHaveBeenCalledOnce()
+  })
+})
+
 describe('notify', () => {
+  it('does not surprise-prompt while dispatching an automatic notification', async () => {
+    vi.mocked(LocalNotifications.checkPermissions).mockResolvedValue({ display: 'denied' })
+
+    await expect(notify({ body: 'Turn complete', kind: 'turnDone', sessionId: 's1', title: 'Hermes' })).resolves.toBe(false)
+    expect(LocalNotifications.requestPermissions).not.toHaveBeenCalled()
+    expect(LocalNotifications.schedule).not.toHaveBeenCalled()
+  })
+
   it('posts an immediate foreground notification without asking for exact-alarm access', async () => {
     vi.mocked(LocalNotifications.checkPermissions).mockResolvedValue({ display: 'granted' })
     vi.mocked(LocalNotifications.createChannel).mockResolvedValue()
     vi.mocked(LocalNotifications.schedule).mockResolvedValue({ notifications: [] })
 
     await expect(notify({ body: 'Turn complete', kind: 'turnDone', sessionId: 's1', title: 'Hermes' })).resolves.toBe(true)
-    expect(LocalNotifications.createChannel).toHaveBeenCalledWith(expect.objectContaining({ id: 'hermes_activity' }))
     expect(LocalNotifications.schedule).toHaveBeenCalledWith({
       notifications: [
         expect.objectContaining({
@@ -69,6 +133,16 @@ describe('notify', () => {
           title: 'Hermes',
         }),
       ],
+    })
+  })
+
+  it('routes action-needed alerts to Android’s higher-priority attention channel', async () => {
+    vi.mocked(LocalNotifications.checkPermissions).mockResolvedValue({ display: 'granted' })
+    vi.mocked(LocalNotifications.schedule).mockResolvedValue({ notifications: [] })
+
+    await expect(notify({ body: 'Approve this command', kind: 'approval', sessionId: 's2', title: 'Hermes' })).resolves.toBe(true)
+    expect(LocalNotifications.schedule).toHaveBeenCalledWith({
+      notifications: [expect.objectContaining({ channelId: 'hermes_attention' })],
     })
   })
 })

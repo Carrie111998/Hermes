@@ -44,6 +44,23 @@ The bridge is deliberately explicit. Desktop-only capabilities must either map t
 - Open external links only through an allowlisted system-browser path; gateway content cannot invoke arbitrary device schemes.
 - A release will require its own reviewed package identifier, signing identity, update channel, and real-device verification.
 
+## 🤳 Android capability boundaries
+
+Every mobile capability begins with a deliberate user action. Hermes never requests broad storage, contacts, location, SMS, Accessibility, overlay, notification-reader, boot, or exact-alarm access.
+
+- **Files and images:** Android’s system document/photo chooser grants Hermes access only to the files selected in that interaction. Their bytes are held only for the current app process and are uploaded to the configured remote gateway only when the user sends the composer message.
+- **Camera:** **Capture photo** appears only in the mobile composer. It requests Android camera permission when tapped, does not write the image to the gallery, and keeps the capture as a normal draft attachment until the user sends it.
+- **Incoming shares:** Android’s Share sheet can open Hermes with text and attachments. Shared text and files are staged in the composer; Hermes does not auto-send shared content to an agent session. Each shared URI is read once through its grant and capped at 25 MiB.
+- **Microphone:** requested only when the user starts voice input; the access probe immediately releases its test track.
+- **Notifications:** the Settings test button is the explicit Android permission prompt. Hermes separates attention-needed, activity, and non-urgent background-update channels. This is local-notification support only—server-to-device push while the app is suspended is not implemented or claimed.
+
+**Device-proof gate:** these source-level paths are covered by tests and native compilation, but camera, share-sheet, Android permission prompts, notification channels, and gallery behavior remain real-device acceptance items.
+
+## 🔄 After the first published release
+
+- A future GitHub Release check may compare a signed, published release against the installed version and show a user-controlled update link. It must never silently download or install an APK.
+- A home-screen widget is deferred until the core mobile client is accepted and published. Any widget proposal must preserve the same remote-session, permission, and notification boundaries.
+
 ## 🧪 Contributor path
 
 This workspace is intentionally set up as a normal Hermes monorepo workspace. Start from the repository root:

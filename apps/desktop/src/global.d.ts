@@ -213,7 +213,11 @@ declare global {
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
+      /** Explicit settings/test action to request OS notification permission. */
+      requestNotificationPermission?: () => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
+      /** User-initiated camera capture. Unsupported desktop shells omit it. */
+      capturePhoto?: () => Promise<Blob | null>
       /** read_window_below tool: metadata for the OS window directly underneath this one (never pixels). */
       readWindowBelow?: () => Promise<{
         frontmost: { app: string; title: string } | null

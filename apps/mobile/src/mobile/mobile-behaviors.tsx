@@ -4,6 +4,7 @@ import { Keyboard } from '@capacitor/keyboard'
 import { useEffect } from 'react'
 import { useLocation } from 'react-router'
 
+import { requestComposerAttachFiles, requestComposerInsert } from '@/app/chat/composer/focus'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { $previewTabs, closeRightRail } from '@/store/preview'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
@@ -23,6 +24,7 @@ import {
   shouldRevealPaneForDrawerChange,
   shouldSuppressPreviewOnMobile,
 } from './mobile-policy'
+import { consumePendingInboundShare, listenForInboundShare } from '~bridge/inbound-share'
 
 /**
  * MobileBehaviors — the touch adaptations layered over the reused desktop UI.
@@ -63,6 +65,33 @@ export function MobileBehaviors() {
     if (shouldDismissDrawerAfterSessionChange(anyDrawerOpen())) closeOpenDrawer()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname])
+
+  // A share is an explicit Android user action. Keep its text in the draft and
+  // stage its files as ordinary composer attachments; never auto-send content
+  // into a remote agent session just because another app opened Hermes.
+  useEffect(() => {
+    let disposed = false
+    let stopListening: () => void = () => undefined
+
+    const consumeShare = async () => {
+      const share = await consumePendingInboundShare()
+      if (disposed) return
+
+      if (share.text) requestComposerInsert(share.text, { mode: 'block' })
+      if (share.files.length) requestComposerAttachFiles(share.files)
+    }
+
+    void consumeShare()
+    void listenForInboundShare(() => void consumeShare()).then(stop => {
+      if (disposed) stop()
+      else stopListening = stop
+    })
+
+    return () => {
+      disposed = true
+      stopListening()
+    }
+  }, [])
 
   useEffect(() => {
     // Standard orientation: sessions LEFT, files RIGHT.

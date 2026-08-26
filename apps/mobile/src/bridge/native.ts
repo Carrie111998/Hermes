@@ -6,6 +6,7 @@
 import { App } from '@capacitor/app'
 import { Browser } from '@capacitor/browser'
 import { Clipboard } from '@capacitor/clipboard'
+import { Camera } from '@capacitor/camera'
 import { Capacitor } from '@capacitor/core'
 import { LocalNotifications } from '@capacitor/local-notifications'
 import { Network } from '@capacitor/network'
@@ -32,6 +33,32 @@ export async function requestMicrophoneAccess(): Promise<boolean> {
   }
 }
 
+/**
+ * Open Android's camera only after the user explicitly selects Capture photo.
+ * The captured bytes stay in memory for the current composer attachment; no
+ * image is written to the gallery and no broad photo/storage permission is used.
+ */
+export async function captureCameraPhoto(): Promise<Blob | null> {
+  if (!Capacitor.isNativePlatform()) return null
+
+  try {
+    const current = await Camera.checkPermissions()
+    const permission = current.camera === 'granted' ? current : await Camera.requestPermissions({ permissions: ['camera'] })
+    if (permission.camera !== 'granted') return null
+
+    const photo = await Camera.takePhoto({ correctOrientation: true, quality: 85, saveToGallery: false })
+    if (!photo.webPath) return null
+
+    const response = await fetch(photo.webPath)
+    if (!response.ok) return null
+
+    const image = await response.blob()
+    return image.size > 0 ? image : null
+  } catch {
+    return null
+  }
+}
+
 export async function openExternal(rawUrl: string): Promise<void> {
   try {
     const url = new URL(rawUrl)
@@ -44,33 +71,68 @@ export async function openExternal(rawUrl: string): Promise<void> {
 }
 
 let notifyId = 1
-let notifPermissionAsked = false
 let notificationChannelReady = false
-const NOTIFICATION_CHANNEL_ID = 'hermes_activity'
+
+const NOTIFICATION_CHANNELS = {
+  activity: {
+    id: 'hermes_activity',
+    name: 'Hermes activity',
+    description: 'Responses and active-session updates from Hermes.',
+    importance: 3,
+  },
+  attention: {
+    id: 'hermes_attention',
+    name: 'Hermes needs you',
+    description: 'Approvals, questions, and errors that need attention.',
+    importance: 4,
+  },
+  background: {
+    id: 'hermes_background',
+    name: 'Hermes background updates',
+    description: 'Non-urgent background task, credit, and plugin updates.',
+    importance: 2,
+  },
+} as const
+
+function notificationChannelFor(kind?: string) {
+  if (kind === 'approval' || kind === 'input' || kind === 'turnError') return NOTIFICATION_CHANNELS.attention
+  if (kind === 'backgroundDone' || kind === 'credits' || kind === 'plugin') return NOTIFICATION_CHANNELS.background
+  return NOTIFICATION_CHANNELS.activity
+}
 
 async function ensureNotificationChannel(): Promise<void> {
   if (notificationChannelReady) return
 
-  await LocalNotifications.createChannel({
-    id: NOTIFICATION_CHANNEL_ID,
-    name: 'Hermes activity',
-    description: 'Completion and attention notices from an active Hermes session.',
-    importance: 3,
-    vibration: true,
-  })
+  await Promise.all(
+    Object.values(NOTIFICATION_CHANNELS).map(channel =>
+      LocalNotifications.createChannel({ ...channel, vibration: channel.id !== NOTIFICATION_CHANNELS.background.id })
+    )
+  )
   notificationChannelReady = true
+}
+
+/** Request the Android prompt only from an explicit settings/test action. */
+export async function requestNotificationPermission(): Promise<boolean> {
+  if (!Capacitor.isNativePlatform()) return false
+
+  try {
+    const current = await LocalNotifications.checkPermissions()
+    const permission = current.display === 'granted' ? current : await LocalNotifications.requestPermissions()
+    if (permission.display !== 'granted') return false
+
+    await ensureNotificationChannel()
+    return true
+  } catch {
+    return false
+  }
 }
 
 export async function notify(payload: HermesNotification): Promise<boolean> {
   if (!Capacitor.isNativePlatform()) return false
   try {
-    if (!notifPermissionAsked) {
-      notifPermissionAsked = true
-      const perm = await LocalNotifications.checkPermissions()
-      if (perm.display !== 'granted') {
-        await LocalNotifications.requestPermissions()
-      }
-    }
+    const permission = await LocalNotifications.checkPermissions()
+    if (permission.display !== 'granted') return false
+
     await ensureNotificationChannel()
     await LocalNotifications.schedule({
       notifications: [
@@ -79,7 +141,7 @@ export async function notify(payload: HermesNotification): Promise<boolean> {
           title: payload.title ?? 'Hermes',
           body: payload.body ?? '',
           silent: payload.silent,
-          channelId: NOTIFICATION_CHANNEL_ID,
+          channelId: notificationChannelFor(payload.kind).id,
           foreground: true,
           // This is an immediate notification, not an alarm. Avoid triggering
           // Android's unrelated "Alarms & reminders" permission prompt.
