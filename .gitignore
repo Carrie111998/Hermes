@@ -167,3 +167,23 @@ infographic/
 # pytest output, never a build artifact. One was committed by accident in
 # 64bff9dfe1 (2026-08-08) and untracked again here.
 .tmp-*
+
+# Windows absolute paths that lost their separators and landed in the repo root
+# as literal entries. Git Bash eats the backslashes in an UNQUOTED
+# `C:\Users\you\.hermes`, yielding `C:Usersyou.hermes` -- which is NOT a stripped
+# drive letter but the legal Windows DRIVE-RELATIVE form ("Usersyou.hermes
+# relative to the cwd on drive C:"), so os.path.abspath() silently resolves it
+# under whatever cwd the process had (os.path.isabs() returns False). On
+# 2026-08-22 that bootstrapped a whole HERMES_HOME skeleton -- ensure_hermes_home()
+# plus a real cross-process auth.lock -- into `agent-src/Usersyou.hermes/`.
+# Nothing was lost (the SOUL.md written there was the stock default template),
+# but it was untracked AND unignored: one `git add -A` from an unrelated commit.
+# The MSYS variant of the same slip maps the `:` to U+F03A and yields a single
+# `CUsers...` file instead. Ignore both shapes, anchored to the repo root so
+# nested paths are untouched.
+/Users*
+/C*Users*
+
+# Zero-byte file named `=`, created by a bash `>=` parsed as `>` plus a redirect
+# target -- e.g. `[ $x >= 5 ]` where `(( x >= 5 ))` was meant. Never an artifact.
+/=
