@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _SUBAGENT_ANTI_PROPAGATION_GUIDANCE,
 )
 from hermes_state import SessionDB
 
@@ -137,7 +138,32 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Fix the tests")
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
-        self.assertNotIn("CONTEXT", prompt)
+        # The fixed anti-propagation clause names the "CONTEXT block" as a
+        # concept regardless of whether one was supplied — check for the
+        # actual rendered block header, not the bare word.
+        self.assertNotIn("CONTEXT:\n", prompt)
+
+    def test_anti_propagation_guidance_present(self):
+        """Issue #95567 (arXiv:2608.10218 follow-up): a subagent gets no
+        SOUL.md and no platform hint, so the fixed clause provides
+        subagent-specific anti-propagation guidance in the child's system
+        prompt."""
+        prompt = _build_child_system_prompt("Fix the tests")
+        self.assertIn(_SUBAGENT_ANTI_PROPAGATION_GUIDANCE, prompt)
+
+    def test_anti_propagation_guidance_precedes_your_task(self):
+        prompt = _build_child_system_prompt("Fix the tests")
+        self.assertLess(
+            prompt.index(_SUBAGENT_ANTI_PROPAGATION_GUIDANCE),
+            prompt.index("YOUR TASK"),
+        )
+
+    def test_anti_propagation_guidance_present_for_orchestrator(self):
+        prompt = _build_child_system_prompt(
+            "Survey approaches", role="orchestrator",
+            max_spawn_depth=2, child_depth=1,
+        )
+        self.assertIn(_SUBAGENT_ANTI_PROPAGATION_GUIDANCE, prompt)
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
