@@ -87,6 +87,15 @@ def test_transient_classifier_matches_known_network_errors(exc_cls):
     assert _is_transient_network_error(exc_cls("boom")) is True
 
 
+class ConnectionClosed(Exception):
+    """Bare websockets base close — must NOT be treated as transient."""
+
+
+def test_bare_connection_closed_is_not_transient():
+    """Policy/auth/abnormal closes share this base name; keep them fatal."""
+    assert _is_transient_network_error(ConnectionClosed("1008")) is False
+
+
 # ---------------------------------------------------------------------
 # Loop handler
 # ---------------------------------------------------------------------

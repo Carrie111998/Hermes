@@ -1363,11 +1363,12 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     adapter._ws_thread_loop = loop
     # The Lark SDK schedules its own `_receive_message_loop` task on THIS
     # worker loop (lark_oapi/ws/client.py), not on the gateway loop where
-    # `_gateway_loop_exception_handler` is installed. A normal close (1000)
-    # surfacing from that task therefore reaches the worker loop's default
-    # handler and can escalate. Install the same transient classifier here so
-    # the close/reconnect path is swallowed-with-logging on the loop that
-    # actually owns the receive task (see #67358 review).
+    # `_gateway_loop_exception_handler` is installed. Unretrieved task
+    # exceptions on a normal close therefore hit this loop's default
+    # handler (the real escalation vector). start()-surfaced errors were
+    # already swallowed pre-change; we still log unexpected exits below.
+    # Install the transient classifier on the loop that owns the receive
+    # task (see #67358).
     loop.set_exception_handler(_feishu_ws_loop_exception_handler)
 
     original_connect = ws_client_module.websockets.connect
@@ -1403,10 +1404,9 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     try:
         ws_client.start()
     except Exception as exc:
-        # Normal WebSocket close frames (1000 OK) and transient disconnects
-        # must not escape the worker thread as unhandled loop task crashes
-        # (see #67358). Auto-reconnect is owned by the Lark client when
-        # enabled; we only log so gateway systemd does not see TEMPFAIL.
+        # Log unexpected start() exits (pre-change this was bare pass).
+        # Loop-level task exceptions are handled by
+        # _feishu_ws_loop_exception_handler; this path is observability only.
         logger.warning(
             "[Feishu] WebSocket client exited: %s: %s",
             type(exc).__name__,
