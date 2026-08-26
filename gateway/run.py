@@ -16767,6 +16767,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "yolo": self._handle_yolo_command,
                 "verbose": self._handle_verbose_command,
                 "footer": self._handle_footer_command,
+                "mute": self._handle_mute_command,
                 "help": self._handle_help_command,
                 "commands": self._handle_commands_command,
                 "profile": self._handle_profile_command,
@@ -18011,6 +18012,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "footer":
             return await self._handle_footer_command(event)
 
+        if canonical == "mute":
+            return await self._handle_mute_command(event)
+
         if canonical == "yolo":
             return await self._handle_yolo_command(event)
 
@@ -18469,6 +18473,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
+
+        # ── Chat-mute gate (/mute) ─────────────────────────────────────
+        # Poke/Devin-inspired harness-level silence: while a chat is muted,
+        # conversational messages are dropped deterministically — no agent
+        # turn, no tokens, no reply. This runs AFTER the slash-command
+        # dispatch above, so every command (most importantly /unmute)
+        # pierces the mute. Internal/system events bypass: they are not
+        # chat conversation and background completions must not be lost.
+        if not is_internal:
+            try:
+                from gateway.chat_mute import is_chat_muted
+                _mute_platform = source.platform.value if source.platform else "unknown"
+                if is_chat_muted(_mute_platform, source.chat_id):
+                    logger.info(
+                        "Dropping message for muted chat %s:%s (session %s)",
+                        _mute_platform, source.chat_id, _quick_key,
+                    )
+                    return None
+            except Exception:
+                # Fail-open: a broken mute store must never block chats.
+                logger.debug("chat-mute gate check failed", exc_info=True)
 
         # ── External-drain new-turn gate (Phase 2) ────────────────────
         # When NAS has engaged an external drain (.drain_request.json present,
