@@ -49,9 +49,11 @@ body {
   overflow: hidden;
 }
 
-#root > * {
+#root > [data-mobile-root-shell] {
+  position: relative;
   height: 100% !important;
   max-height: 100%;
+  min-height: 0;
 }
 
 /*
@@ -66,9 +68,10 @@ body {
   top: calc(var(--titlebar-controls-top, 0px) + env(safe-area-inset-top)) !important;
 }
 
-/* The Electron titlebar has desktop-only controls. Mobile supplies its own two
-   deliberate actions below; leaving the inherited clusters mounted created the
-   screenshot's lone floating gear and redundant invisible tap zones. */
+/* The Electron clusters remain mounted for the shared Desktop renderer but are
+   never a mobile navigation surface. Mobile owns one compact toolbar and one
+   overflow sheet; leaving the inherited clusters interactive would duplicate
+   controls and reintroduce floating tap zones. */
 [data-titlebar-cluster] {
   display: none !important;
 }
@@ -94,163 +97,6 @@ body {
 }
 [data-titlebar-cluster] .codicon {
   font-size: 1rem !important;
-}
-
-/* While a sidebar drawer is open, hide the titlebar — it's position:fixed at a
-   higher z-index than the drawer, so it would float over the drawer's content.
-   The drawer has its own header; SidebarBridge sets data-drawer-open on <html>. */
-[data-drawer-open] [data-titlebar-cluster] {
-  display: none !important;
-}
-[data-drawer-open] .mobile-session-drawer-trigger,
-[data-drawer-open] .mobile-workspace-trigger,
-[data-drawer-open] .mobile-settings-trigger {
-  display: none !important;
-}
-
-/* The native mobile shell has no Electron titlebar menu. Keep session navigation
-   discoverable without relying on Android Back or a hidden desktop shortcut. */
-.mobile-session-drawer-trigger {
-  position: fixed;
-  z-index: 60;
-  top: calc(env(safe-area-inset-top) + 0.5rem);
-  left: calc(env(safe-area-inset-left) + 0.5rem);
-  display: grid;
-  width: 2.75rem;
-  height: 2.75rem;
-  place-items: center;
-  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
-  border-radius: 0.75rem;
-  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
-  color: var(--ui-text-primary, currentColor);
-  font-size: 1.35rem;
-  line-height: 1;
-}
-.mobile-session-drawer-trigger:active {
-  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
-}
-.mobile-workspace-trigger {
-  position: fixed;
-  z-index: 60;
-  top: calc(env(safe-area-inset-top) + 0.5rem);
-  left: calc(env(safe-area-inset-left) + 3.75rem);
-  display: grid;
-  width: 2.75rem;
-  height: 2.75rem;
-  place-items: center;
-  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
-  border-radius: 0.75rem;
-  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
-  color: var(--ui-text-primary, currentColor);
-}
-.mobile-workspace-trigger:active {
-  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
-}
-[data-mobile-workspace-menu-open] .mobile-session-drawer-trigger,
-[data-mobile-workspace-menu-open] .mobile-workspace-trigger,
-[data-mobile-workspace-menu-open] .mobile-settings-trigger {
-  display: none !important;
-}
-.mobile-workspace-scrim {
-  position: fixed;
-  z-index: 80;
-  inset: 0;
-  border: 0;
-  background: rgb(0 0 0 / 0.38);
-}
-.mobile-workspace-menu {
-  position: fixed;
-  z-index: 90;
-  top: calc(env(safe-area-inset-top) + 0.5rem);
-  left: calc(env(safe-area-inset-left) + 0.5rem);
-  width: min(20rem, calc(100vw - env(safe-area-inset-left) - env(safe-area-inset-right) - 1rem));
-  max-height: min(32rem, calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 1rem));
-  overflow: auto;
-  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
-  border-radius: 1rem;
-  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
-  box-shadow: 0 1.25rem 3rem rgb(0 0 0 / 0.3);
-}
-.mobile-workspace-menu header {
-  display: flex;
-  min-height: 2.75rem;
-  align-items: center;
-  justify-content: space-between;
-  padding-inline: 0.75rem 0.25rem;
-  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.35));
-  color: var(--ui-text-primary, currentColor);
-  font-size: 0.875rem;
-  font-weight: 600;
-}
-.mobile-workspace-menu header button {
-  display: grid;
-  width: 2.75rem;
-  height: 2.75rem;
-  place-items: center;
-  border-radius: 0.625rem;
-}
-.mobile-workspace-menu [role='menu'] {
-  display: grid;
-  gap: 0.125rem;
-  padding: 0.375rem;
-}
-.mobile-workspace-menu [role='menuitem'] {
-  min-height: 2.75rem;
-  padding-inline: 0.75rem;
-  border-radius: 0.625rem;
-  color: var(--ui-text-primary, currentColor);
-  text-align: left;
-}
-.mobile-workspace-menu [role='menuitem']:active,
-.mobile-workspace-menu header button:active {
-  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
-}
-@media (prefers-reduced-motion: no-preference) {
-  .mobile-workspace-menu {
-    animation: mobile-workspace-menu-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  }
-}
-@keyframes mobile-workspace-menu-enter {
-  from { opacity: 0.01; transform: translateY(-0.5rem) scale(0.98); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-.mobile-settings-trigger {
-  position: fixed;
-  z-index: 60;
-  top: calc(env(safe-area-inset-top) + 0.5rem);
-  right: calc(env(safe-area-inset-right) + 0.5rem);
-  display: grid;
-  width: 2.75rem;
-  height: 2.75rem;
-  place-items: center;
-  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
-  border-radius: 0.75rem;
-  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
-  color: var(--ui-text-primary, currentColor);
-}
-.mobile-settings-trigger:active {
-  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
-}
-@media (prefers-reduced-motion: no-preference) {
-  .mobile-session-drawer-trigger,
-  .mobile-workspace-trigger,
-  .mobile-settings-trigger {
-    transition: background-color 160ms ease, transform 160ms ease;
-  }
-  .mobile-session-drawer-trigger:active,
-  .mobile-workspace-trigger:active,
-  .mobile-settings-trigger:active {
-    transform: scale(0.94);
-  }
-}
-
-/* The settings/command overlays own their own close/navigation chrome. Keeping
-   the session trigger above them is both redundant and visually misleading. */
-html:has([data-overlay-surface]) .mobile-session-drawer-trigger,
-html:has([data-overlay-surface]) .mobile-workspace-trigger,
-html:has([data-overlay-surface]) .mobile-settings-trigger {
-  display: none !important;
 }
 
 /* A collapsed pane must be a true off-canvas drawer, never a second docked rail
@@ -479,4 +325,129 @@ html:has([data-overlay-surface]) .mobile-settings-trigger {
 :root[data-hermes-mobile] [data-overlay-split-layout] [data-tour^='nav-'] {
   height: 2.75rem !important;
   min-height: 2.75rem !important;
+}
+
+/* One real mobile toolbar replaces the three direct fixed buttons that were
+   accidentally stretched by #root's old full-height child rule. */
+.mobile-top-toolbar {
+  position: absolute;
+  z-index: 60;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  height: 3.25rem;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem calc(env(safe-area-inset-right) + 0.5rem) 0.25rem calc(env(safe-area-inset-left) + 0.5rem);
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.3));
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+}
+.mobile-top-toolbar-center {
+  min-width: 0;
+  flex: 1;
+}
+.mobile-toolbar-button {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+}
+.mobile-toolbar-button:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+[data-drawer-open] .mobile-top-toolbar,
+html:has([data-overlay-surface]) .mobile-top-toolbar {
+  display: none !important;
+}
+.mobile-toolbar-scrim {
+  position: absolute;
+  z-index: 80;
+  inset: 0;
+  border: 0;
+  background: rgb(0 0 0 / 0.42);
+}
+.mobile-toolbar-menu {
+  position: absolute;
+  z-index: 90;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  max-height: min(72%, 36rem);
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.5));
+  border-bottom: 0;
+  border-radius: 1.125rem 1.125rem 0 0;
+  background: var(--ui-sidebar-surface-background, var(--dt-background, #0d2f86));
+  box-shadow: 0 -1.25rem 3rem rgb(0 0 0 / 0.28);
+}
+.mobile-toolbar-menu header {
+  display: flex;
+  min-height: 3.25rem;
+  align-items: center;
+  justify-content: space-between;
+  padding-inline: 1rem 0.25rem;
+  border-bottom: 1px solid var(--ui-stroke-secondary, rgb(148 163 184 / 0.3));
+  color: var(--ui-text-primary, currentColor);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.mobile-toolbar-menu header button {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  place-items: center;
+  border-radius: 0.75rem;
+}
+.mobile-toolbar-menu-scroll {
+  min-height: 0;
+  overflow: auto;
+  padding: 0.5rem;
+}
+.mobile-toolbar-menu [role='group'] {
+  display: grid;
+  gap: 0.125rem;
+}
+.mobile-toolbar-menu [role='group'] + [role='group'] {
+  margin-top: 0.75rem;
+}
+.mobile-toolbar-menu p {
+  margin: 0.5rem 0.75rem 0.25rem;
+  color: var(--ui-text-tertiary, currentColor);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.mobile-toolbar-menu [role='group'] > button {
+  min-height: 2.75rem;
+  padding-inline: 0.75rem;
+  border-radius: 0.75rem;
+  color: var(--ui-text-primary, currentColor);
+  text-align: left;
+}
+.mobile-toolbar-menu [role='group'] > button:active,
+.mobile-toolbar-menu header button:active {
+  background: var(--ui-control-active-background, rgb(148 163 184 / 0.2));
+}
+@media (prefers-reduced-motion: no-preference) {
+  .mobile-toolbar-button {
+    transition: background-color 160ms ease, transform 160ms ease;
+  }
+  .mobile-toolbar-button:active {
+    transform: scale(0.94);
+  }
+  .mobile-toolbar-menu {
+    animation: mobile-toolbar-menu-enter 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+}
+@keyframes mobile-toolbar-menu-enter {
+  from { opacity: 0.01; transform: translateY(0.75rem); }
+  to { opacity: 1; transform: translateY(0); }
 }

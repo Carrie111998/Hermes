@@ -1,17 +1,22 @@
 import { useStore } from '@nanostores/react'
 import { App } from '@capacitor/app'
 import { Keyboard } from '@capacitor/keyboard'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
-import { SETTINGS_ROUTE } from '@/app/routes'
+import { COMMAND_CENTER_ROUTE, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '@/app/routes'
+import { hudTargetSessionId } from '@/app/hud/handoff'
 import { requestComposerAttachFiles, requestComposerInsert } from '@/app/chat/composer/focus'
+import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { allPaneIds } from '@/components/pane-shell/tree/model'
 import { $hiddenTreePanes, $layoutTree } from '@/components/pane-shell/tree/store'
-import { Codicon } from '@/components/ui/codicon'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+import { useTitlebarToolContributions } from '@/app/contrib/panes'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { useI18n } from '@/i18n'
+import { openCommandPalette } from '@/store/command-palette'
+import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
+import { toggleHud } from '@/store/hud'
 import { $previewTabs, closeRightRail } from '@/store/preview'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
@@ -22,9 +27,12 @@ import {
   FILE_BROWSER_PANE_ID,
   setFileBrowserOpen,
   setSidebarOpen,
+  togglePanesFlipped,
 } from '@/store/layout'
 
 import { mobileWorkspacePanes } from './mobile-workspace-menu'
+import { MobileToolbar, type MobileToolbarAction } from './mobile-toolbar'
+import { mobileToolbarContextActions, type MobileToolbarContextAction } from './mobile-toolbar-model'
 import {
   mobileDrawerForEdgeSwipe,
   mobileDrawerForPane,
@@ -80,6 +88,55 @@ export function MobileBehaviors() {
     () => mobileWorkspacePanes(panes, new Set(tree ? allPaneIds(tree) : []), hiddenPanes),
     [hiddenPanes, panes, tree],
   )
+  const hapticsMuted = useStore($hapticsMuted)
+  const leftTitlebarTools = useTitlebarToolContributions('left')
+  const rightTitlebarTools = useTitlebarToolContributions('right')
+  const appActions = useMemo<MobileToolbarAction[]>(
+    () => [
+      { id: 'new-chat', label: t.commandCenter.nav.newChat.title, onSelect: () => navigate(NEW_CHAT_ROUTE) },
+      { id: 'command-center', label: t.commandCenter.commandCenter, onSelect: () => navigate(COMMAND_CENTER_ROUTE) },
+      { id: 'command-palette', label: t.commandCenter.paletteTitle, onSelect: openCommandPalette },
+      { id: 'settings', label: t.titlebar.openSettings, onSelect: () => navigate(SETTINGS_ROUTE) },
+      { id: 'layout', label: t.titlebar.layoutEditor, onSelect: toggleLayoutEditMode },
+      { id: 'hud', label: t.titlebar.enterHud, onSelect: () => toggleHud(hudTargetSessionId()) },
+      {
+        id: 'haptics',
+        label: hapticsMuted ? t.titlebar.unmuteHaptics : t.titlebar.muteHaptics,
+        onSelect: toggleHapticsMuted,
+      },
+      { id: 'flip-panes', label: t.titlebar.swapSidebarSides, onSelect: togglePanesFlipped },
+      {
+        id: 'keybinds',
+        label: t.settings.nav.keybinds,
+        onSelect: () => window.dispatchEvent(new CustomEvent('hermes:open-keybinds')),
+      },
+    ],
+    [hapticsMuted, navigate, t],
+  )
+  const runContributedToolbarTool = useCallback(
+    (tool: MobileToolbarContextAction) => {
+      if (tool.disabled) return
+
+      if (tool.href) {
+        void window.hermesDesktop.openExternal(tool.href)
+        return
+      }
+      if (tool.to) {
+        navigate(tool.to)
+        return
+      }
+      tool.onSelect?.()
+    },
+    [navigate],
+  )
+  const contributedToolbarTools = useMemo(
+    () =>
+      mobileToolbarContextActions([...leftTitlebarTools, ...rightTitlebarTools]).map(tool => ({
+        ...tool,
+        onSelect: () => runContributedToolbarTool(tool),
+      })),
+    [leftTitlebarTools, rightTitlebarTools, runContributedToolbarTool],
+  )
 
   // Navigating (selecting a session) dismisses an open chat drawer.
   useEffect(() => {
@@ -88,8 +145,8 @@ export function MobileBehaviors() {
   }, [location.pathname])
 
   useEffect(() => {
-    document.documentElement.toggleAttribute('data-mobile-workspace-menu-open', workspaceMenuOpen)
-    return () => document.documentElement.removeAttribute('data-mobile-workspace-menu-open')
+    document.documentElement.toggleAttribute('data-mobile-toolbar-menu-open', workspaceMenuOpen)
+    return () => document.documentElement.removeAttribute('data-mobile-toolbar-menu-open')
   }, [workspaceMenuOpen])
 
   // A share is an explicit Android user action. Keep its text in the draft and
@@ -271,7 +328,6 @@ export function MobileBehaviors() {
   }
 
   const openWorkspacePane = (id: string) => {
-    setWorkspaceMenuOpen(false)
     const drawer = mobileDrawerForPane(id)
     if (drawer === 'sessions') {
       setFileBrowserOpen(false)
@@ -288,63 +344,20 @@ export function MobileBehaviors() {
     revealPane(id, 'open')
   }
 
-  // Desktop titlebar controls can be intentionally absent on the native shell.
-  // Keep direct Sessions, Settings, and a complete workspace-pane menu rather
-  // than making Android Back or hidden desktop shortcuts the only way to reach
-  // a collapsed surface.
+  // The mobile shell owns one compact toolbar. Sessions gets a direct familiar
+  // hamburger + left-edge swipe; every other Desktop control lives in one
+  // ordered overflow sheet rather than becoming its own permanent rail.
   return (
-    <>
-      <button
-        aria-label={sidebarOpen ? t.titlebar.hideSidebar : t.titlebar.showSidebar}
-        className="mobile-session-drawer-trigger"
-        onClick={toggleSessionDrawer}
-        type="button"
-      >
-        <Codicon name="menu" size="1.35rem" />
-      </button>
-      <button
-        aria-expanded={workspaceMenuOpen}
-        aria-haspopup="dialog"
-        aria-label="Open workspace panes"
-        className="mobile-workspace-trigger"
-        onClick={() => setWorkspaceMenuOpen(open => !open)}
-        type="button"
-      >
-        <Codicon name="layout" size="1.2rem" />
-      </button>
-      <button
-        aria-label={t.titlebar.openSettings}
-        className="mobile-settings-trigger"
-        onClick={() => navigate(SETTINGS_ROUTE)}
-        type="button"
-      >
-        <Codicon name="settings-gear" size="1.35rem" />
-      </button>
-      {workspaceMenuOpen && (
-        <>
-          <button
-            aria-label="Close workspace panes"
-            className="mobile-workspace-scrim"
-            onClick={() => setWorkspaceMenuOpen(false)}
-            type="button"
-          />
-          <section aria-label="Workspace panes" className="mobile-workspace-menu" role="dialog">
-            <header>
-              <span>Workspace</span>
-              <button aria-label="Close workspace panes" onClick={() => setWorkspaceMenuOpen(false)} type="button">
-                <Codicon name="close" size="1.1rem" />
-              </button>
-            </header>
-            <div role="menu">
-              {workspacePanes.map(pane => (
-                <button key={pane.id} onClick={() => openWorkspacePane(pane.id)} role="menuitem" type="button">
-                  {pane.title}
-                </button>
-              ))}
-            </div>
-          </section>
-        </>
-      )}
-    </>
+    <MobileToolbar
+      appActions={appActions}
+      contextActions={contributedToolbarTools}
+      menuOpen={workspaceMenuOpen}
+      onClose={() => setWorkspaceMenuOpen(false)}
+      onOpenSessions={toggleSessionDrawer}
+      onToggleMenu={() => setWorkspaceMenuOpen(open => !open)}
+      onWorkspacePane={openWorkspacePane}
+      sessionsOpen={sidebarOpen}
+      workspacePanes={workspacePanes}
+    />
   )
 }
