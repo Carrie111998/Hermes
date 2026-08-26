@@ -5,6 +5,11 @@ from __future__ import annotations
 
 import pytest
 
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
+
 from hermes_cli.codex_runtime_plugin_migration import (
     MIGRATION_MARKER,
     MIGRATION_END_MARKER,
@@ -301,11 +306,52 @@ memories = true
                          expose_hermes_tools=False)
         assert report.written
         assert report.errors == []
-        import tomllib
         loaded = tomllib.loads(target.read_text())
         assert loaded["trusted_pairs"] == [["user1", "read"], ["user2", "write"]]
         assert loaded["features"]["memories"] is True
         assert loaded["mcp_servers"]["mcp1"]["command"] == "cmd1"
+
+    def test_multiline_array_with_single_element_last_line_at_top_level(self, tmp_path):
+        """Single-element last lines in multiline arrays like `['write']` must not
+        be confused with TOML table headers."""
+        target = tmp_path / "config.toml"
+        target.write_text("""\
+model = "gpt-5.6-sol"
+args = [
+    ["a"],
+    ["write"]
+]
+
+[features]
+memories = true
+""")
+        report = migrate({"mcp_servers": {"mcp1": {"command": "cmd1"}}},
+                         codex_home=tmp_path, discover_plugins=False,
+                         expose_hermes_tools=False)
+        assert report.written
+        assert report.errors == []
+        loaded = tomllib.loads(target.read_text())
+        assert loaded["args"] == [["a"], ["write"]]
+        assert loaded["features"]["memories"] is True
+
+    def test_migrate_preserves_bare_mcp_servers_with_inline_servers(self, tmp_path):
+        """Bare [mcp_servers] with user inline configs must not be swallowed."""
+        target = tmp_path / "config.toml"
+        target.write_text("""\
+[mcp_servers]
+user-inline = { command = "/bin/user-tool" }
+""")
+        report = migrate(
+            {"mcp_servers": {"hermes-mcp": {"command": "npx"}}},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+        assert report.written
+        assert report.errors == []
+        loaded = tomllib.loads(target.read_text())
+        assert loaded["mcp_servers"]["user-inline"]["command"] == "/bin/user-tool"
+        assert loaded["mcp_servers"]["hermes-mcp"]["command"] == "npx"
 
 
 # ---- Bug B: duplicate [plugins.X] tables ----
@@ -481,6 +527,17 @@ class TestParseTomlTableHeader:
         assert _parse_toml_table_header("# [commented_header]") is None
         assert _parse_toml_table_header("") is None
 
+    def test_unicode_and_escape_sequences(self):
+        assert _parse_toml_table_header(r'[mcp_servers."valid\u0020name"]') == (("mcp_servers", "valid name"), False)
+        assert _parse_toml_table_header(r'[mcp_servers."valid\U00000020name"]') == (("mcp_servers", "valid name"), False)
+        assert _parse_toml_table_header(r'[mcp_servers."invalid\uZZZZ"]') is None
+        assert _parse_toml_table_header(r'[mcp_servers."invalid\x20"]') is None
+
+    def test_trailing_dot_and_malformed(self):
+        assert _parse_toml_table_header("[mcp_servers.]") is None
+        assert _parse_toml_table_header("[mcp_servers..foo]") is None
+        assert _parse_toml_table_header("[mcp_servers. .foo]") is None
+
 
 class TestReconcileUnmanagedTables:
     def test_cascading_subtable_reconciliation(self):
@@ -528,6 +585,41 @@ command = "node"
         assert "[mcp_servers]" not in reconciled
         assert "second-brain" not in reconciled
         assert "[projects]" in reconciled
+
+    def test_bare_mcp_servers_with_inline_servers_preserved(self):
+        toml_text = """\
+[projects]
+active = true
+
+[mcp_servers]
+my-custom = { command = "node", args = ["app.js"] }
+
+[mcp_servers.second-brain]
+command = "node"
+"""
+        reconciled = _reconcile_unmanaged_tables(toml_text, {"second-brain"})
+        assert "[mcp_servers]" in reconciled
+        assert 'my-custom = { command = "node", args = ["app.js"] }' in reconciled
+        assert "second-brain" not in reconciled
+        assert "[projects]" in reconciled
+
+    def test_multiline_array_inside_table_does_not_break_swallow(self):
+        toml_text = """\
+[mcp_servers.second-brain]
+args = [
+    ["a"],
+    ["write"]
+]
+command = "node"
+
+[features]
+memories = true
+"""
+        reconciled = _reconcile_unmanaged_tables(toml_text, {"second-brain"})
+        assert "second-brain" not in reconciled
+        assert '["write"]' not in reconciled
+        assert "[features]" in reconciled
+        assert "memories = true" in reconciled
 
 
 class TestMigrateConflictPolicies:
@@ -614,6 +706,18 @@ USER_ENV = "1"
         assert loaded["mcp_servers"]["second-brain"]["command"] == "user-node"
         assert loaded["mcp_servers"]["new-server"]["command"] == "new-bin"
         assert config_path.read_text().count("[mcp_servers.second-brain]") == 1
+
+    def test_invalid_conflict_policy_fails_fast(self, tmp_path):
+        report = migrate(
+            {"mcp_servers": {"x": {"command": "y"}}},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+            conflict_policy="invalid_policy_name",
+        )
+        assert report.written is False
+        assert any("unrecognized conflict_policy" in e for e in report.errors)
+        assert not (tmp_path / "config.toml").exists()
 
 
 class TestTomlSyntaxValidationGuard:

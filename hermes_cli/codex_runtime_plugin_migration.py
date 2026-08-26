@@ -42,6 +42,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 
@@ -316,6 +324,53 @@ def render_codex_toml_section(
     return "\n".join(out) + "\n"
 
 
+def _update_bracket_depth(line: str, current_depth: int = 0) -> int:
+    """Track bracket depth across lines, ignoring brackets inside strings and comments."""
+    depth = max(0, current_depth)
+    cursor = 0
+    length = len(line)
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+
+    while cursor < length:
+        c = line[cursor]
+        if escaped:
+            escaped = False
+            cursor += 1
+            continue
+
+        if in_double_quote:
+            if c == "\\":
+                escaped = True
+            elif c == '"':
+                in_double_quote = False
+            cursor += 1
+            continue
+
+        if in_single_quote:
+            if c == "'":
+                in_single_quote = False
+            cursor += 1
+            continue
+
+        if c == '"':
+            in_double_quote = True
+        elif c == "'":
+            in_single_quote = True
+        elif c == "#":
+            # Rest of line is a comment
+            break
+        elif c in "[{":
+            depth += 1
+        elif c in "]}":
+            if depth > 0:
+                depth -= 1
+        cursor += 1
+
+    return depth
+
+
 def _insert_managed_block_at_top_level(user_text: str, managed_block: str) -> str:
     """Insert Hermes' managed Codex TOML block while keeping root keys root-scoped.
 
@@ -330,11 +385,12 @@ def _insert_managed_block_at_top_level(user_text: str, managed_block: str) -> st
 
     lines = user_text.splitlines(keepends=True)
     first_table_idx: Optional[int] = None
+    bracket_depth = 0
     for idx, line in enumerate(lines):
-        stripped = line.lstrip()
-        if _looks_like_table_header(stripped):
+        if bracket_depth == 0 and _looks_like_table_header(line):
             first_table_idx = idx
             break
+        bracket_depth = _update_bracket_depth(line, bracket_depth)
 
     if first_table_idx is None:
         prefix = user_text.rstrip("\n")
@@ -362,7 +418,6 @@ def _parse_toml_table_header(line: str) -> Optional[tuple[tuple[str, ...], bool]
     stripped = line.strip()
     if not stripped.startswith("["):
         return None
-
     is_array = stripped.startswith("[[")
     cursor = 2 if is_array else 1
     segments: list[str] = []
@@ -379,7 +434,6 @@ def _parse_toml_table_header(line: str) -> Optional[tuple[tuple[str, ...], bool]
         if char == '"':
             # Basic string
             cursor += 1
-            start = cursor
             escaped_chars: list[str] = []
             while cursor < length:
                 c = stripped[cursor]
@@ -407,15 +461,15 @@ def _parse_toml_table_header(line: str) -> Optional[tuple[tuple[str, ...], bool]
                             escaped_chars.append(chr(int(stripped[cursor + 1 : cursor + 5], 16)))
                             cursor += 4
                         except ValueError:
-                            escaped_chars.append(stripped[start : cursor + 1])
+                            return None
                     elif esc == "U" and cursor + 8 < length:
                         try:
                             escaped_chars.append(chr(int(stripped[cursor + 1 : cursor + 9], 16)))
                             cursor += 8
                         except ValueError:
-                            escaped_chars.append(stripped[start : cursor + 1])
+                            return None
                     else:
-                        escaped_chars.append(esc)
+                        return None
                     cursor += 1
                 elif c == '"':
                     break
@@ -455,6 +509,12 @@ def _parse_toml_table_header(line: str) -> Optional[tuple[tuple[str, ...], bool]
 
         if stripped[cursor] == ".":
             cursor += 1
+            # Dot must be followed by a key segment, not closing bracket or another dot
+            peek = cursor
+            while peek < length and stripped[peek] in " \t":
+                peek += 1
+            if peek >= length or stripped[peek] in ("]", "."):
+                return None
             continue
         elif is_array and stripped[cursor : cursor + 2] == "]]":
             cursor += 2
@@ -476,20 +536,43 @@ def _parse_toml_table_header(line: str) -> Optional[tuple[tuple[str, ...], bool]
     return (tuple(segments), is_array)
 
 
-def _looks_like_table_header(stripped_line: str) -> bool:
-    """Return True if ``stripped_line`` is a TOML table header."""
-    return _parse_toml_table_header(stripped_line) is not None
+def _looks_like_table_header(line: str) -> bool:
+    """Return True if ``line`` is a TOML table header."""
+    return _parse_toml_table_header(line) is not None
 
 
 def _find_unmanaged_mcp_servers(toml_text: str) -> set[str]:
     """Return the set of MCP server names defined in unmanaged tables."""
     found = set()
-    for line in toml_text.splitlines():
-        parsed = _parse_toml_table_header(line)
+    lines = toml_text.splitlines()
+    bracket_depth = 0
+    in_bare_mcp_servers = False
+
+    for line in lines:
+        parsed = None
+        if bracket_depth == 0:
+            parsed = _parse_toml_table_header(line)
+
         if parsed is not None:
             path, _is_array = parsed
             if len(path) >= 2 and path[0] == "mcp_servers":
                 found.add(path[1])
+                in_bare_mcp_servers = False
+            elif len(path) == 1 and path[0] == "mcp_servers":
+                in_bare_mcp_servers = True
+            else:
+                in_bare_mcp_servers = False
+        elif in_bare_mcp_servers and bracket_depth == 0:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key:
+                    if (key.startswith('"') and key.endswith('"')) or (key.startswith("'") and key.endswith("'")):
+                        key = key[1:-1]
+                    found.add(key.split(".")[0])
+
+        bracket_depth = _update_bracket_depth(line, bracket_depth)
+
     return found
 
 
@@ -506,10 +589,12 @@ def _reconcile_unmanaged_tables(
        [mcp_servers.<name>.*] (e.g. .env, .headers, .settings) whose server
        name is in server_names_to_reconcile.
     2. Strips legacy bare [mcp_servers] section headers outside the managed
-       block to prevent TOML table-redefinition errors when managed
-       sub-tables are placed at the top of the file.
+       block ONLY IF they contain no user key-value assignments (pure empty/
+       comment markers), preventing TOML table-redefinition errors while
+       guaranteeing no user data loss for legacy inline server definitions.
     3. If strip_plugins is True, strips all [plugins.*] tables outside the
-       managed block (because plugin/list is authoritative).
+       managed block (because plugin/list is authoritative), and strips bare
+       [plugins] headers if empty.
     4. Preserves all other user-owned tables ([projects.*], [features],
        [mcp_servers.<other>], [mcp_servers.<other>.*], comments, blanks).
     """
@@ -517,31 +602,68 @@ def _reconcile_unmanaged_tables(
         return toml_text
 
     lines = toml_text.splitlines(keepends=True)
-    out: list[str] = []
-    in_swallowed_table = False
+    sections: list[tuple[Optional[tuple[str, ...]], bool, list[str]]] = []
+
+    current_path: Optional[tuple[str, ...]] = None
+    current_is_array: bool = False
+    current_lines: list[str] = []
+    bracket_depth = 0
 
     for line in lines:
-        parsed = _parse_toml_table_header(line)
-        if parsed is not None:
-            path, _is_array = parsed
-            if len(path) >= 2 and path[0] == "mcp_servers" and path[1] in server_names_to_reconcile:
-                in_swallowed_table = True
-                continue
-            elif len(path) == 1 and path[0] == "mcp_servers":
-                in_swallowed_table = True
-                continue
-            elif strip_plugins and len(path) >= 1 and path[0] == "plugins":
-                in_swallowed_table = True
-                continue
-            else:
-                in_swallowed_table = False
+        parsed = None
+        if bracket_depth == 0:
+            parsed = _parse_toml_table_header(line)
 
-        if in_swallowed_table:
+        if parsed is not None:
+            sections.append((current_path, current_is_array, current_lines))
+            current_path, current_is_array = parsed
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+        bracket_depth = _update_bracket_depth(line, bracket_depth)
+
+    sections.append((current_path, current_is_array, current_lines))
+
+    out_lines: list[str] = []
+    for path, _is_arr, sec_lines in sections:
+        if path is None:
+            out_lines.extend(sec_lines)
             continue
 
-        out.append(line)
+        if len(path) >= 2 and path[0] == "mcp_servers" and path[1] in server_names_to_reconcile:
+            continue
 
-    return "".join(out)
+        if len(path) == 1 and path[0] == "mcp_servers":
+            body_lines = sec_lines[1:]
+            has_content = any(
+                bool(l.strip() and not l.strip().startswith("#"))
+                for l in body_lines
+            )
+            if not has_content:
+                continue
+            else:
+                out_lines.extend(sec_lines)
+                continue
+
+        if strip_plugins and len(path) >= 1 and path[0] == "plugins":
+            if len(path) >= 2:
+                continue
+            else:
+                body_lines = sec_lines[1:]
+                has_content = any(
+                    bool(l.strip() and not l.strip().startswith("#"))
+                    for l in body_lines
+                )
+                if not has_content:
+                    continue
+                else:
+                    out_lines.extend(sec_lines)
+                    continue
+
+        out_lines.extend(sec_lines)
+
+    return "".join(out_lines)
 
 
 def _strip_unmanaged_plugin_tables(toml_text: str) -> str:
@@ -800,6 +922,13 @@ def migrate(
     target = codex_home / "config.toml"
     report.target_path = target
 
+    if conflict_policy not in {"replace_with_managed", "preserve_user"}:
+        report.errors.append(
+            f"unrecognized conflict_policy {conflict_policy!r}; "
+            f"expected 'replace_with_managed' or 'preserve_user'"
+        )
+        return report
+
     hermes_servers = (hermes_config or {}).get("mcp_servers") or {}
     if not isinstance(hermes_servers, dict):
         report.errors.append(
@@ -899,12 +1028,12 @@ def migrate(
         new_text = managed_block
 
     # Pre-write validation guard: ensure generated text is strictly valid TOML
-    import tomllib
-    try:
-        tomllib.loads(new_text)
-    except Exception as exc:
-        report.errors.append(f"generated TOML failed syntax validation: {exc}")
-        return report
+    if tomllib is not None:
+        try:
+            tomllib.loads(new_text)
+        except Exception as exc:
+            report.errors.append(f"generated TOML failed syntax validation: {exc}")
+            return report
 
     if dry_run:
         return report
