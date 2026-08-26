@@ -140,6 +140,62 @@ async def test_hermes_provider_forwards_asend_values(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hermes_provider_does_not_read_ordinary_success_response(
+    tmp_path, monkeypatch
+):
+    """Issuer compatibility must not consume successful MCP payloads."""
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            issuer="https://secure.indeed.com",
+        )
+    )
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+    provider.context.auth_server_url = "https://secure.indeed.com/"
+
+    flow = provider.async_auth_flow(
+        httpx.Request("POST", "https://example.com/mcp")
+    )
+    outbound = await flow.__anext__()
+    response = httpx.Response(200, request=outbound)
+    response.aread = AsyncMock(
+        side_effect=AssertionError("ordinary MCP response body was consumed")
+    )
+
+    with pytest.raises(StopAsyncIteration):
+        await flow.asend(response)
+    response.aread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypatch):
     """A 401 response MUST flow into the inner generator and trigger the
     SDK's 401 recovery branch.
