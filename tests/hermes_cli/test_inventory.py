@@ -601,6 +601,26 @@ def test_build_models_payload_no_max_models_returns_full_list():
     assert len(kilo_row["models"]) == 100
 
 
+def test_build_models_payload_adds_named_credential_route_rows():
+    ctx = _empty_ctx()
+    ctx = ConfigContext(**{**ctx.__dict__, "credential_routes": {
+        "personal-codex": {
+            "provider": "openai-codex",
+            "credential": "personal-account",
+            "display_name": "Personal Codex",
+        }
+    }})
+    with _list_auth_returning([
+        {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5"]}
+    ]):
+        payload = build_models_payload(ctx)
+
+    route = next(row for row in payload["providers"] if row["slug"] == "credential-route:personal-codex")
+    assert route["name"] == "Personal Codex"
+    assert route["models"] == ["gpt-5"]
+    assert "credential" not in route
+
+
 # ─── refresh flag (cache-bust) ─────────────────────────────────────────
 
 
@@ -655,7 +675,6 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
 
 
 

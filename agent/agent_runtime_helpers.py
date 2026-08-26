@@ -1046,7 +1046,8 @@ def recover_with_credential_pool(
     # failing entry exactly; fall back to current()'s key only when the agent
     # carries no key at all.
     _api_key_hint = getattr(agent, "api_key", None) or None
-    _raw_credential_id = getattr(agent, "_credential_pool_entry_id", None)
+    _pinned_credential_id = getattr(agent, "_pinned_credential_pool_entry_id", None)
+    _raw_credential_id = _pinned_credential_id or getattr(agent, "_credential_pool_entry_id", None)
     _credential_id = (
         _raw_credential_id
         if isinstance(_raw_credential_id, str) and _raw_credential_id
@@ -1069,6 +1070,8 @@ def recover_with_credential_pool(
         }
         if _credential_id:
             kwargs["credential_id"] = _credential_id
+        if _pinned_credential_id:
+            kwargs["allow_failover"] = False
         # Hand the pool the classified semantics, not just the status. A
         # billing 403 (OpenRouter "key limit exceeded", xAI spending limit)
         # and an edge-throttle 403 are the same number but need opposite
@@ -1746,7 +1749,8 @@ def restore_primary_runtime(agent) -> bool:
         agent._credential_pool_entry_id = None
         pool = getattr(agent, "_credential_pool", None)
         if pool is not None and pool.has_available():
-            entry = pool.select()
+            pinned_id = getattr(agent, "_pinned_credential_pool_entry_id", None)
+            entry = pool.select_matching_id(pinned_id) if pinned_id else pool.select()
             if entry is not None:
                 entry_provider = str(getattr(entry, "provider", "") or "").strip().lower()
                 entry_matches_primary = credential_pool_matches_provider(

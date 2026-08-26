@@ -6430,6 +6430,9 @@ class AIAgent:
             self._client_kwargs["default_headers"] = merged
 
     def _swap_credential(self, entry) -> None:
+        pinned_id = getattr(self, "_pinned_credential_pool_entry_id", None)
+        if pinned_id and getattr(entry, "id", None) != pinned_id:
+            raise RuntimeError("refusing to replace a credential-pinned route with a sibling")
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         self._credential_pool_entry_id = getattr(entry, "id", None)

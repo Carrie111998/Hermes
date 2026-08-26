@@ -53,6 +53,7 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    credential_routes: dict = None
 
     def with_overrides(
         self,
@@ -97,6 +98,7 @@ def load_picker_context() -> ConfigContext:
         current_provider = ""
         current_base_url = ""
     raw = cfg.get("providers")
+    routes = cfg.get("credential_routes")
     excluded = cfg.get("model_catalog", {}).get("excluded_providers") or []
     return ConfigContext(
         current_provider=current_provider,
@@ -105,6 +107,7 @@ def load_picker_context() -> ConfigContext:
         user_providers=raw if isinstance(raw, dict) else {},
         custom_providers=get_compatible_custom_providers(cfg),
         excluded_providers=excluded if isinstance(excluded, list) else [],
+        credential_routes=routes if isinstance(routes, dict) else {},
     )
 
 
@@ -273,6 +276,7 @@ def build_models_payload(
     if featured:
         _apply_featured(rows)
     _apply_custom_aliases(rows)
+    rows = _append_credential_route_rows(rows, ctx.credential_routes)
 
     return {
         "providers": rows,
@@ -312,6 +316,32 @@ def build_model_options_payload(
         probe_custom_providers=refresh,
         probe_current_custom_provider=not refresh,
     )
+
+
+def _append_credential_route_rows(rows: list[dict], routes: Optional[dict]) -> list[dict]:
+    """Append public picker rows for routes backed by an existing provider."""
+    if not isinstance(routes, dict):
+        return rows
+    by_provider = {str(row.get("slug") or "").lower(): row for row in rows}
+    additions: list[dict] = []
+    for route_id, route in routes.items():
+        if not isinstance(route, dict):
+            continue
+        route_id = str(route_id or "").strip()
+        provider = str(route.get("provider") or "").strip()
+        credential_id = str(route.get("credential") or "").strip()
+        display_name = str(route.get("display_name") or "").strip()
+        source = by_provider.get(provider.lower())
+        if not (route_id and provider and credential_id and display_name and source):
+            continue
+        row = dict(source)
+        row.update({
+            "slug": f"credential-route:{route_id}",
+            "name": display_name,
+            "credential_route": route_id,
+        })
+        additions.append(row)
+    return rows + additions
 
 
 # ─── Public: auxiliary-task pickers ─────────────────────────────────────

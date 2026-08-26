@@ -1776,6 +1776,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    credential_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1787,6 +1788,19 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    route_requested_provider = str(requested or "").strip()
+    if route_requested_provider.lower().startswith("credential-route:"):
+        from hermes_cli.config import load_config
+
+        route_id = route_requested_provider.split(":", 1)[1].strip()
+        routes = load_config().get("credential_routes") or {}
+        route = routes.get(route_id) if isinstance(routes, dict) else None
+        if not isinstance(route, dict):
+            raise AuthError(f"Credential route {route_id!r} is not configured.")
+        requested = str(route.get("provider") or "").strip()
+        credential_id = credential_id or str(route.get("credential") or "").strip()
+        if not requested or not credential_id:
+            raise AuthError(f"Credential route {route_id!r} is incomplete.")
     requested_provider = resolve_requested_provider(requested)
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
@@ -1997,8 +2011,16 @@ def resolve_runtime_provider(
         pool = load_pool(provider) if should_use_pool else None
     except Exception:
         pool = None
+    if credential_id and (pool is None or not pool.has_credentials()):
+        raise AuthError(
+            f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+        )
     if pool and pool.has_credentials():
-        entry = pool.select()
+        entry = pool.select_matching_id(credential_id) if credential_id else pool.select()
+        if credential_id and entry is None:
+            raise AuthError(
+                f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+            )
         pool_api_key = ""
         if entry is not None:
             pool_api_key = (
@@ -2052,7 +2074,7 @@ def resolve_runtime_provider(
                 ),
             )
         ):
-            return _resolve_runtime_from_pool_entry(
+            runtime = _resolve_runtime_from_pool_entry(
                 provider=provider,
                 entry=entry,
                 requested_provider=requested_provider,
@@ -2060,6 +2082,15 @@ def resolve_runtime_provider(
                 pool=pool,
                 target_model=target_model,
             )
+            if credential_id:
+                runtime["credential_pool_entry_id"] = entry.id
+                runtime["credential_pool_pinned"] = True
+            return runtime
+
+    if credential_id:
+        raise AuthError(
+            f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+        )
 
     if provider == "nous":
         try:

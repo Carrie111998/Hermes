@@ -86,6 +86,39 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_resolve_runtime_provider_pins_an_explicit_pool_credential(monkeypatch):
+    entry = SimpleNamespace(
+        id="personal-account",
+        access_token="personal-token",
+        runtime_api_key="personal-token",
+        runtime_base_url="https://chatgpt.com/backend-api/codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        source="manual",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            raise AssertionError("a pinned runtime must not use strategy selection")
+
+        def select_matching_id(self, credential_id):
+            assert credential_id == "personal-account"
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openai-codex", credential_id="personal-account"
+    )
+
+    assert resolved["api_key"] == "personal-token"
+    assert resolved["credential_pool_entry_id"] == "personal-account"
+    assert resolved["credential_pool_pinned"] is True
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth

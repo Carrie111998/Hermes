@@ -5448,7 +5448,7 @@ def _persist_model_switch(result) -> None:
     from cli import save_config_value
 
     save_config_value("model.default", result.new_model)
-    save_config_value("model.provider", result.target_provider)
+    save_config_value("model.provider", result.route_provider or result.target_provider)
     if result.base_url:
         save_config_value("model.base_url", result.base_url)
     else:
@@ -5654,6 +5654,8 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
             )
+            agent._pinned_credential_pool_entry_id = result.credential_id or None
+            agent._credential_route_provider = result.route_provider or ""
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
             # model/client and re-raised.  Abort the commit: do NOT restart the
@@ -5695,10 +5697,11 @@ def _apply_model_switch(
     if pin_session_override and isinstance(session, dict) and not one_turn:
         session["model_override"] = {
             "model": result.new_model,
-            "provider": result.target_provider,
+            "provider": result.route_provider or result.target_provider,
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
+            "credential_id": result.credential_id,
         }
     if persist_global:
         _persist_model_switch(result)
@@ -6329,6 +6332,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
     info: dict = {
         "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
         "provider": pending_provider
+        or getattr(agent, "_credential_route_provider", "")
         or mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
@@ -7755,7 +7759,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -7802,6 +7806,13 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    agent._pinned_credential_pool_entry_id = runtime.get("credential_pool_entry_id")
+    agent._credential_route_provider = (
+        requested_provider
+        if str(requested_provider or "").lower().startswith("credential-route:")
+        else ""
+    )
+    return agent
 
 
 def _init_session(
@@ -14521,7 +14532,10 @@ def _model_picker_context(agent):
     from hermes_cli.inventory import load_picker_context
 
     ctx = load_picker_context()
-    provider = getattr(agent, "provider", "") if agent else ""
+    provider = (
+        getattr(agent, "_credential_route_provider", "")
+        or getattr(agent, "provider", "")
+    ) if agent else ""
     base_url = getattr(agent, "base_url", "") if agent else ""
     if str(provider or "").strip().lower() == "custom":
         try:

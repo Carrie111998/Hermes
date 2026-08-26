@@ -2106,6 +2106,32 @@ class CredentialPool:
         self._current_id = entry.id
         return entry, pending_refresh
 
+    def select_matching_id(self, credential_id: str) -> Optional[PooledCredential]:
+        """Select one exact available credential without pool-strategy fallback."""
+        target_id = str(credential_id or "").strip()
+        if not target_id:
+            return None
+        with self._lock:
+            available, pending_refresh = self._available_entries(clear_expired=True)
+            entry = next((candidate for candidate in available if candidate.id == target_id), None)
+            pending_refresh = [
+                pending for pending in pending_refresh if pending[0].id == target_id
+            ]
+            if entry is not None:
+                self._current_id = entry.id
+                self._unmatched_rotation_streak = 0
+                return entry
+        if pending_refresh:
+            self._refresh_pending_entries(pending_refresh)
+            with self._lock:
+                available, _ = self._available_entries(clear_expired=True)
+                entry = next((candidate for candidate in available if candidate.id == target_id), None)
+                if entry is not None:
+                    self._current_id = entry.id
+                    self._unmatched_rotation_streak = 0
+                return entry
+        return None
+
     def peek(self) -> Optional[PooledCredential]:
         # Single lock acquisition for the whole read; call the unlocked
         # helpers so we don't re-enter the non-reentrant ``self._lock``.
@@ -2124,6 +2150,7 @@ class CredentialPool:
         api_key_hint: Optional[str] = None,
         credential_id: Optional[str] = None,
         failure_reason: Optional[str] = None,
+        allow_failover: bool = True,
     ) -> Optional[PooledCredential]:
         with self._lock:
             entry = None
@@ -2248,7 +2275,7 @@ class CredentialPool:
             # Mark every entry sharing the failed key so the pool can reach the
             # "no available entries" state and let the error propagate.
             failed_runtime_key = getattr(entry, "runtime_api_key", None)
-            if identity_supplied and failed_runtime_key:
+            if allow_failover and identity_supplied and failed_runtime_key:
                 siblings_marked = False
                 for sibling in self._entries:
                     if sibling.id == entry.id:
@@ -2280,7 +2307,7 @@ class CredentialPool:
                     _label, status_code,
                 )
             self._current_id = None
-            if self._strategy == STRATEGY_NO_FAILOVER:
+            if not allow_failover or self._strategy == STRATEGY_NO_FAILOVER:
                 logger.info(
                     "credential pool: %s is configured for no failover; "
                     "surfacing the error without selecting a sibling credential",

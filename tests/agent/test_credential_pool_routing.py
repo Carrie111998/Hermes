@@ -458,6 +458,27 @@ class TestFailureAttribution:
         swapped = agent._swap_credential.call_args[0][0]
         assert swapped.id == "cred-0"
 
+    def test_pinned_credential_does_not_rotate_to_sibling_after_billing_failure(
+        self, tmp_path, monkeypatch
+    ):
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+        )
+        agent = self._agent(pool, failing_key="key-b", credential_id="cred-1")
+        agent._pinned_credential_pool_entry_id = "cred-1"
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        recovered, _ = recover_with_credential_pool(
+            agent, status_code=402, has_retried_429=False
+        )
+
+        assert recovered is False
+        assert self._statuses(pool)["cred-1"] == "exhausted"
+        assert self._statuses(pool)["cred-0"] != "exhausted"
+        agent._swap_credential.assert_not_called()
+
     def test_auth_refresh_targets_failing_key_not_pointer(self, tmp_path, monkeypatch):
         """The auth path must refresh the entry that supplied the failing key,
         not current(). With current() pointing at healthy A while key B failed,
@@ -562,4 +583,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-
