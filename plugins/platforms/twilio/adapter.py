@@ -2,16 +2,14 @@
 dispatches to whichever channel matches the target format (see
 channels/base.py, README "Architecture notes").
 
-Channels: RCS (phone number) and Email (email address) — formats are
-mutually exclusive, so dispatch is unambiguous. A channel whose target
-format collides with an existing one needs an explicit disambiguation
-scheme instead — see the README before adding one.
+Channels: RCS (phone number) today. More (SMS, MMS, WhatsApp, Email,
+Voice) are expected to land in _CHANNELS over time — see README "Adding
+a new channel" for the disambiguation concern once a second channel
+shares RCS's phone-number target format.
 
-Env vars: TWILIO_ACCOUNT_SID/AUTH_TOKEN/MESSAGING_SERVICE_SID (RCS,
-shared with the built-in sms platform), TWILIO_RCS_HOME_CHANNEL
-(optional cron target); SENDGRID_API_KEY/FROM_EMAIL/FROM_NAME (Email,
-separate credential surface), SENDGRID_HOME_CHANNEL (optional, not wired
-to cron — see README).
+Env vars: TWILIO_ACCOUNT_SID/AUTH_TOKEN/MESSAGING_SERVICE_SID (shared
+with the built-in sms platform), TWILIO_RCS_HOME_CHANNEL (optional cron
+target).
 
 No inbound channel — connect()/disconnect() are no-ops. Delivery is
 send() (live gateway) or _standalone_send() (hermes send / cron).
@@ -24,19 +22,17 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from .channels.base import Channel
-from .channels.email import EmailChannel
 from .channels.rcs import RcsChannel
 from .core.messages_api import aiohttp_available
 
 logger = logging.getLogger(__name__)
 
 # Channels this platform hosts — see README "Adding a new channel".
-_CHANNELS: List[Channel] = [RcsChannel(), EmailChannel()]
+_CHANNELS: List[Channel] = [RcsChannel()]
 
-# Largest max_message_length across channels: send_message_tool.py
-# pre-chunks by this single value before any channel sees the content, so
-# using RCS's smaller limit would silently split long emails into
-# multiple sends. RCS still enforces its own limit internally.
+# Largest max_message_length across channels — see README for why this
+# must be the max, not any individual channel's limit, once there's more
+# than one channel with different limits.
 _MAX_MESSAGE_LENGTH = max(c.max_message_length for c in _CHANNELS)
 
 
@@ -58,7 +54,7 @@ def parse_target_ref(target_ref: str):
 def validate_target_ref(chat_id: str):
     if _channel_for_target(chat_id) is not None:
         return True
-    return "not a valid E.164 phone number or email address"
+    return "not a valid E.164 phone number"
 
 
 def check_requirements() -> bool:
@@ -176,8 +172,8 @@ def _build_adapter(config):
 
 def register(ctx) -> None:
     """Plugin entry point. cron_deliver_env_var is one static var per
-    platform in Hermes core — RCS keeps the slot; SENDGRID_HOME_CHANNEL
-    isn't wired to cron yet (see README)."""
+    platform in Hermes core — a future second channel needing its own
+    cron target will need to share or contest this slot (see README)."""
     ctx.register_platform(
         name="twilio",
         label="Twilio",
@@ -195,7 +191,7 @@ def register(ctx) -> None:
         emoji="💬",
         allow_update_command=False,
         platform_hint=(
-            "You are sending via Twilio — RCS (phone numbers, with SMS/MMS "
-            "fallback) or Email (SendGrid), depending on the target's format."
+            "You are sending via Twilio RCS (with automatic SMS/MMS fallback). "
+            "Plain text only — no markdown."
         ),
     )

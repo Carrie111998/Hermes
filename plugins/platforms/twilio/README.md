@@ -1,18 +1,17 @@
 # Twilio platform plugin
 
-Outbound-only Hermes plugin for Twilio. Umbrella for multiple channels
-under one platform name (`"twilio"`), dispatched by target format:
+Outbound-only Hermes plugin for Twilio. Registered under one platform
+name (`"twilio"`), currently hosting one channel:
 
 - **RCS** — phone number target (`+15551234567`), sent via a Twilio
   **Messaging Service** (`MessagingServiceSid`); Twilio auto-falls-back
   to SMS/MMS for incapable recipients.
-- **Email** — email address target (`someone@example.com`), sent via
-  Twilio Email (SendGrid Mail Send API) — separate credentials
-  (`SENDGRID_API_KEY`, not `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`).
 
-More channels (SMS, MMS, WhatsApp, Voice) are expected later — see
-"Architecture notes" for how to add one without touching another
-channel's code.
+Built to host more channels (SMS, MMS, WhatsApp, Voice, Email) over
+time — see "Architecture notes" for how to add one without touching
+RCS's code. (Email was prototyped here and pulled back out to land as
+its own PR — the `Channel`/`MessagingChannel` split below was shaped by
+that work.)
 
 Note: the built-in `sms` platform (`plugins/platforms/sms/`) also talks
 to Twilio and is independent of this plugin; they only overlap in
@@ -39,33 +38,17 @@ accepts a `ContentSid` referencing a template created ahead of time.
 
 ## Setup
 
-Only one channel needs to be configured — RCS and Email don't share env
-vars.
-
-**RCS** (`TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN` shared with the
-built-in `sms` platform and the `telephony` skill):
-
 | Env var | Required | Notes |
 |---|---|---|
-| `TWILIO_ACCOUNT_SID` | yes | Starts with `AC` |
-| `TWILIO_AUTH_TOKEN` | yes | |
+| `TWILIO_ACCOUNT_SID` | yes | Starts with `AC` — shared with the built-in `sms` platform and `telephony` skill |
+| `TWILIO_AUTH_TOKEN` | yes | Shared with the built-in `sms` platform |
 | `TWILIO_MESSAGING_SERVICE_SID` | yes | Starts with `MG`, needs an RCS Sender attached |
 | `TWILIO_RCS_HOME_CHANNEL` | no | Destination E.164 number for cron `deliver=twilio` jobs |
 
-**Email** (separate SendGrid credentials):
+Add to `~/.hermes/.env`; verify with `hermes status` (`Twilio ✓
+configured (plugin)`).
 
-| Env var | Required | Notes |
-|---|---|---|
-| `SENDGRID_API_KEY` | yes | Starts with `SG.`, needs Mail Send permission |
-| `SENDGRID_FROM_EMAIL` | yes | Verified Sender or authenticated domain in SendGrid |
-| `SENDGRID_FROM_NAME` | no | Sender display name |
-| `SENDGRID_API_BASE` | no | Override for a staging host |
-| `SENDGRID_HOME_CHANNEL` | no | Destination address — **not wired to cron**, see "Architecture notes" |
-
-Add whichever set you need to `~/.hermes/.env`; verify with `hermes
-status` (`Twilio ✓ configured (plugin)` once one channel is ready).
-
-## Sending plain text (RCS)
+## Sending plain text
 
 ```bash
 hermes send --to "twilio:+15551234567" "hello from Hermes"
@@ -77,26 +60,6 @@ hardcoded phone-platform allowlist (`tools/send_message_tool._PHONE_PLATFORMS`).
 
 Markdown-stripped, chunked at `MAX_RCS_LENGTH` (3072 — Twilio's
 documented RCS limit; re-verify if messages start truncating).
-
-## Sending email
-
-```bash
-hermes send --to "twilio:someone@example.com" "Order shipped
-Your package is on its way — track it at https://example.com/track/123"
-```
-
-Bare email address routes to Email — no ambiguity with RCS's phone
-format. First line becomes the subject, rest is the body; single-line
-content gets a generic default subject. Never chunked (one email, one
-document).
-
-HTML or an explicit subject needs `metadata={"subject": ..., "html":
-True}` on the adapter's own `send()` — the CLI/cron `standalone_send()`
-path only has the first-line convention; there's no `hermes send` flag
-for it.
-
-SendGrid error bodies often echo the offending address — masked before
-logging/returning (`_mask_email`/`_redact_emails_in_text` in `channels/email.py`).
 
 ## Rich content (cards, carousels)
 
@@ -186,8 +149,8 @@ inbound webhook).
 Three layers so a new channel never touches another channel's code:
 
 - **`adapter.py`** — thin `BasePlatformAdapter` glue, no channel logic.
-  Holds `_CHANNELS = [RcsChannel(), EmailChannel()]`, dispatches to
-  whichever matches the target format (`_channel_for_target()`).
+  Holds `_CHANNELS = [RcsChannel()]`, dispatches to whichever matches
+  the target format (`_channel_for_target()`).
 - **`channels/`** — one file per channel. `channels/base.py` declares:
   - `Channel` — minimal shape every channel implements
     (`check_requirements`, `connect_requirements_ok`, `is_connected`,
@@ -197,58 +160,51 @@ Three layers so a new channel never touches another channel's code:
     subclasses only need `format_message()` + `build_send_requests()`.
     `channels/rcs.py` is this shape.
 
-  `channels/email.py` implements `Channel` directly, not
-  `MessagingChannel` — SendGrid, not `MessagingServiceSid`/Messages.json
-  — and owns its own transport. A future `channels/sms.py` or
-  `whatsapp.py` would extend `MessagingChannel` like RCS; none of them
-  edit each other's files.
+  A channel with its own transport (not Twilio's Messages.json resource
+  — Voice, Email) would implement `Channel` directly instead and own its
+  `send()`/`standalone_send()` from scratch, the way the prototyped
+  Email channel did before being pulled into its own PR.
 - **`core/`** — shared across Messages-API channels: `credentials.py`
-  (Account SID/Auth Token, Basic Auth header — Email also reuses
-  `get_scoped_secret` for its own vars) and `messages_api.py` (the POST
-  loop, reusable by RCS/SMS/MMS/WhatsApp; not Voice, which needs its own
-  `core/` module for Calls.json).
+  (Account SID/Auth Token, Basic Auth header) and `messages_api.py` (the
+  POST loop, reusable by RCS/SMS/MMS/WhatsApp; not Voice/Email, which
+  need their own `core/` transport module).
 
 ### Channel dispatch
 
-Dispatch is by target format:
-
-- `+15551234567` → `RcsChannel`
-- `someone@example.com` → `EmailChannel`
-
-Works because the formats can't collide. SMS/MMS/WhatsApp would all
-also be phone-number targets, so adding one requires an explicit
-disambiguation scheme (e.g. a channel prefix) instead of format-sniffing
-— decide deliberately, don't guess which channel a bare number means.
-
-**Cron limitation.** `cron_deliver_env_var` is one static env var per
-platform in Hermes core (`cron/scheduler.py._resolve_home_env_var`) — no
-per-channel hook. This plugin keeps that slot on RCS's
-`TWILIO_RCS_HOME_CHANNEL`; `SENDGRID_HOME_CHANNEL` is documented but
-**cron `deliver=twilio` can't target Email** — only `hermes send --to
-twilio:<email>` works. Fixing this needs a core change (multiple
-home-channel vars per platform) or splitting Email into its own platform
-name — not done here.
+Dispatch is by target format, decided in `adapter.py`
+(`_channel_for_target()`). Only RCS exists today, so this is a no-op in
+practice — but the design constraint to keep in mind when adding the
+next channel: SMS/MMS/WhatsApp would all *also* be phone-number
+targets, colliding with RCS's format. Format-sniffing only works while
+every channel's target shape is unique (as Email's would have been).
+Adding a same-shaped channel needs an explicit disambiguation scheme
+(e.g. a channel prefix) instead — decide deliberately, don't guess which
+channel a bare phone number "really" means.
 
 Other notes:
 
 - `connect()`/`check_requirements()`/`is_connected()` succeed if **any**
-  channel is ready — a user configuring only one channel shouldn't see
-  the platform fail to start.
+  channel is ready — with only RCS today this is equivalent to "RCS is
+  ready", but the check is written generically for when a second channel
+  lands.
 - `_standalone_send()` is the primary path in practice — `hermes send`
   and cron usually run in a separate process from any live gateway.
-- `max_message_length` is registered as the largest across channels
-  (Email's 200,000, not RCS's 3,072) because `send_message_tool.py`
-  pre-chunks by this value before any channel sees the content — RCS's
-  smaller limit would silently split long emails. RCS still chunks
-  correctly at 3,072 internally.
+- `max_message_length` is registered as the largest across channels —
+  matters once a channel with a different limit exists, since
+  `send_message_tool.py` pre-chunks by this single value before any
+  channel sees the content.
+- `cron_deliver_env_var` is one static env var per platform in Hermes
+  core (`cron/scheduler.py._resolve_home_env_var`) — no per-channel
+  hook. A future channel needing its own cron target will need to share
+  or contest RCS's `TWILIO_RCS_HOME_CHANNEL` slot; not solved generically.
 
 ### Adding a new channel
 
 1. Create `channels/<name>.py`. Messages-API-based (SMS, MMS, WhatsApp):
    extend `MessagingChannel`, implement `format_message()` +
-   `build_send_requests()`. Own-transport (Voice, etc.): extend `Channel`
-   directly like `channels/email.py`.
-2. Don't edit `rcs.py`/`email.py` to do this — shared logic belongs in `core/`.
+   `build_send_requests()`. Own-transport (Voice, Email): extend
+   `Channel` directly.
+2. Don't edit `rcs.py` to do this — shared logic belongs in `core/`.
 3. Add an instance to `_CHANNELS` in `adapter.py`. If its target format
    could collide with an existing channel's, design explicit
    disambiguation first (see "Channel dispatch").
@@ -267,7 +223,6 @@ twilio/
   channels/
     base.py                # Channel + MessagingChannel interfaces
     rcs.py                  # RCS — CONTENT: directive, E.164 targets, MAX_RCS_LENGTH
-    email.py                # Email — SendGrid Mail Send API, subject/body split, PII masking
   scripts/
     manage_content.py   # Content API template create/list/get helper
 ```

@@ -3,57 +3,31 @@ label: Twilio
 kind: platform
 version: 1.0.0
 description: >
-  Outbound-only Twilio adapter for Hermes Agent, hosting multiple
-  channels under one platform. Currently implements RCS (sends through a
-  Twilio Messaging Service with an RCS Sender attached, falling back to
-  SMS/MMS automatically) and Email (Twilio Email / SendGrid Mail Send
-  API). Target format picks the channel: a phone number routes to RCS,
-  an email address routes to Email. No inbound channel; use `hermes
-  send` or cron `deliver=twilio` to send. More channels (SMS, MMS,
-  WhatsApp, Voice) are expected to land here over time.
+  Outbound-only Twilio adapter for Hermes Agent. Sends messages through
+  a Twilio Messaging Service with an RCS Sender attached — Twilio
+  automatically selects RCS for capable recipients and falls back to
+  SMS/MMS otherwise. No inbound channel; use `hermes send` or cron
+  `deliver=twilio` to send. Built to host more channels (SMS, MMS,
+  WhatsApp, Voice, Email) over time.
 
-  RCS shares TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN with the built-in
-  SMS platform and the optional telephony skill. Email uses a completely
-  separate SendGrid credential (SENDGRID_API_KEY) — neither channel's
-  vars are required for the other to work; only one fully-configured
-  channel is needed for this plugin to be useful.
+  Shares TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN with the built-in SMS
+  platform and the optional telephony skill.
 author: Hermes user
-optional_env:
-  # RCS channel
+requires_env:
   - name: TWILIO_ACCOUNT_SID
-    description: "[RCS] Twilio Account SID (starts with AC) — shared with the SMS platform"
+    description: "Twilio Account SID (starts with AC) — shared with the SMS platform"
     prompt: "Twilio Account SID"
     password: false
   - name: TWILIO_AUTH_TOKEN
-    description: "[RCS] Twilio Auth Token — shared with the SMS platform"
+    description: "Twilio Auth Token — shared with the SMS platform"
     prompt: "Twilio Auth Token"
     password: true
   - name: TWILIO_MESSAGING_SERVICE_SID
-    description: "[RCS] Messaging Service SID (starts with MG) with an approved RCS Sender attached"
+    description: "Messaging Service SID (starts with MG) with an approved RCS Sender attached"
     prompt: "Twilio Messaging Service SID"
     password: false
+optional_env:
   - name: TWILIO_RCS_HOME_CHANNEL
-    description: "[RCS] Default destination phone number (E.164) for cron / notification delivery"
+    description: "Default destination phone number (E.164) for cron / notification delivery"
     prompt: "Home channel phone number (or empty)"
-    password: false
-  # Email channel
-  - name: SENDGRID_API_KEY
-    description: "[Email] SendGrid API key with Mail Send permission (starts with SG.)"
-    prompt: "SendGrid API key"
-    password: true
-  - name: SENDGRID_FROM_EMAIL
-    description: "[Email] Verified sender address (Single Sender or Domain Authentication in SendGrid)"
-    prompt: "SendGrid from-email address"
-    password: false
-  - name: SENDGRID_FROM_NAME
-    description: "[Email] Optional display name for the sender"
-    prompt: "SendGrid from-name (or empty)"
-    password: false
-  - name: SENDGRID_API_BASE
-    description: "[Email] Override SendGrid API base URL (e.g. a staging host); defaults to the public API"
-    prompt: "SendGrid API base URL (or empty)"
-    password: false
-  - name: SENDGRID_HOME_CHANNEL
-    description: "[Email] Default destination email address for cron / notification delivery (not yet wired to cron — see README)"
-    prompt: "Home channel email address (or empty)"
     password: false
