@@ -37,6 +37,8 @@ _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
+# Request-routing contract for the Copilot CLI API surface. Caller identity is
+# reported separately by User-Agent and Editor-Version.
 COPILOT_INTEGRATION_ID = "copilot-developer-cli"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]

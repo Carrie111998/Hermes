@@ -2671,11 +2671,11 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # reconstruct the client purely from a `_primary_runtime` snapshot and do
     # NOT re-run that wiring. If the snapshot's client_kwargs ever lacks
     # `default_headers` (older snapshot, header-less resolver result), the
-    # client goes out WITHOUT `Copilot-Integration-Id: vscode-chat`; the
-    # Copilot server then routes it to the "copilot-language-server" integrator
-    # whose model allowlist omits enterprise-only models (claude-opus-4.8) →
-    # HTTP 400 model_not_available_for_integrator on every turn. This chokepoint
-    # is the single place every primary OpenAI client passes through, so filling
+    # client goes out without the `copilot-developer-cli` API contract. The
+    # Copilot server can then select a narrower model allowlist, so a model that
+    # appeared in the CLI catalog can fail with
+    # model_not_available_for_integrator on inference. This chokepoint is the
+    # single place every primary OpenAI client passes through, so filling
     # missing Copilot headers here closes the whole class. We only ADD missing
     # keys — never override headers a caller deliberately set.
     try:

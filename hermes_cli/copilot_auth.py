@@ -54,9 +54,11 @@ COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
 
-# The API requests below intentionally use the public Copilot CLI integration
-# contract. The version and wire identity, however, must come from the CLI that
-# is installed on this machine rather than from a release snapshot in Hermes.
+# GitHub defines this integration ID as the default request-routing contract for
+# the Copilot CLI runtime. It selects that API surface and its model catalog; it
+# does not assert that a local ``copilot`` executable produced the request. The
+# User-Agent and Editor-Version below carry the concrete caller identity, so
+# they fall back to Hermes when the executable is absent.
 COPILOT_INTEGRATION_ID = "copilot-developer-cli"
 
 
@@ -819,10 +821,7 @@ def copilot_request_headers(
     is_agent_turn: bool = True,
     is_vision: bool = False,
 ) -> dict[str, str]:
-    """Build the standard headers for Copilot API requests.
-
-    Replicates the header set used by opencode and the Copilot CLI.
-    """
+    """Build Copilot CLI-contract headers with a truthful caller identity."""
     identity = resolve_copilot_client_identity()
     headers: dict[str, str] = {
         "Editor-Version": identity.editor_version,

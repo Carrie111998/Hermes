@@ -216,17 +216,23 @@ class TestCopilotClientIdentity:
         assert identity.user_agent == "copilot/1.2.3-4 (linux v24.1.0) term/tmux"
         mod.resolve_copilot_client_identity.cache_clear()
 
-    def test_fallback_is_truthfully_hermes_when_cli_is_absent(self, monkeypatch):
+    def test_fallback_keeps_api_contract_without_claiming_cli_install(
+        self, monkeypatch
+    ):
         import hermes_cli.copilot_auth as mod
 
         mod.resolve_copilot_client_identity.cache_clear()
         monkeypatch.setattr(mod, "_installed_copilot_cli_version", lambda: None)
         identity = mod.resolve_copilot_client_identity()
+        headers = mod.copilot_request_headers()
 
         assert identity.version is None
         assert identity.editor_version.startswith("hermes-cli/")
         assert identity.user_agent.startswith(identity.editor_version)
         assert "copilot/" not in identity.user_agent.lower()
+        assert headers["User-Agent"] == identity.user_agent
+        assert headers["Editor-Version"] == identity.editor_version
+        assert headers["Copilot-Integration-Id"] == "copilot-developer-cli"
         mod.resolve_copilot_client_identity.cache_clear()
 
 
