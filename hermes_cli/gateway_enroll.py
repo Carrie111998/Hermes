@@ -67,7 +67,7 @@ def _resolve_connector_url(override: Optional[str]) -> Optional[str]:
     raw = (override or os.environ.get("GATEWAY_RELAY_URL", "")).strip()
     if not raw:
         try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
+            from gateway.config_file import load_gateway_config_dict as _load_gateway_config
 
             cfg = (_load_gateway_config().get("gateway") or {})
             raw = str(cfg.get("relay_url", "") or "").strip()

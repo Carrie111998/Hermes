@@ -3658,55 +3658,11 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
     gateway honors administrator-pinned values — neither read_raw_config nor a
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
+    from gateway.config_file import load_gateway_config_dict
+
     if config_path is None:
-        config_path = _gateway_config_home() / 'config.yaml'
-    raw: dict = {}
-    used_canonical = False
-    try:
-        from hermes_cli.config import get_config_path, read_raw_config
-        # Fast path: if _hermes_home agrees with the canonical config
-        # location, reuse the shared cache. Otherwise fall through to a
-        # direct read (keeps test fixtures with a monkeypatched
-        # _hermes_home working).
-        if config_path == get_config_path():
-            raw = read_raw_config()
-            used_canonical = True
-    except Exception:
-        pass
-
-    if not used_canonical:
-        try:
-            if config_path.exists():
-                import yaml
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    raw = yaml.safe_load(f) or {}
-        except Exception:
-            logger.debug("Could not load gateway config from %s", config_path)
-            raw = {}
-
-    # Overlay managed scope. read_raw_config() returns the user's raw YAML
-    # WITHOUT the managed merge (that lives in load_config/_load_config_impl),
-    # so the overlay is required on both paths for the gateway to honor pinned
-    # values. Helper is fail-open and a no-op when no managed scope exists.
-    try:
-        from hermes_cli import managed_scope
-        raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
-    except Exception:
-        pass
-    if not isinstance(raw, dict):
-        return {}
-    # Canonicalize model-id aliases (model.name / model.model → model.default)
-    # and migrate stale root-level provider/base_url into the model section.
-    # The gateway bypasses load_config() (it reads raw YAML for speed), so the
-    # normalization that load_config() applies must be replayed here or the
-    # gateway would resolve an empty model for ``model: {name: <id>}`` configs
-    # while the CLI resolves it correctly. See issue #34500. Fail-open.
-    try:
-        from hermes_cli.config import _normalize_root_model_keys
-        raw = _normalize_root_model_keys(raw)
-    except Exception:
-        pass
-    return raw
+        config_path = _gateway_config_home() / "config.yaml"
+    return load_gateway_config_dict(config_path)
 
 
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:

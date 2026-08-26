@@ -22,6 +22,8 @@ import os
 import re
 from typing import Optional
 
+from gateway.config_file import load_gateway_config_dict
+
 # Shape gate for ambient-endpoint token bodies (mode 1b in
 # _resolve_relay_identity_token). Accepts a bearer-token-shaped string:
 # either a multi-segment dotted token (JWT: header.payload.signature) or a
@@ -45,9 +47,7 @@ def relay_url() -> Optional[str]:
     if url:
         return url.rstrip("/")
     try:
-        from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-        cfg = _load_gateway_config()
+        cfg = load_gateway_config_dict()
         url = (cfg.get("gateway") or {}).get("relay_url")
         url = (url or "").strip()
         if url:
@@ -163,9 +163,7 @@ def relay_connection_auth() -> tuple[Optional[str], Optional[str]]:
     secret = os.environ.get("GATEWAY_RELAY_SECRET", "").strip()
     if not (gateway_id and secret):
         try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-            cfg = (_load_gateway_config().get("gateway") or {})
+            cfg = (load_gateway_config_dict().get("gateway") or {})
             gateway_id = gateway_id or str(cfg.get("relay_id", "") or "").strip()
             secret = secret or str(cfg.get("relay_secret", "") or "").strip()
         except Exception:  # noqa: BLE001 - config absence/parse must never crash registration
@@ -190,9 +188,7 @@ def relay_endpoint() -> Optional[str]:
     url = os.environ.get("GATEWAY_RELAY_ENDPOINT", "").strip()
     if not url:
         try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-            cfg = (_load_gateway_config().get("gateway") or {})
+            cfg = (load_gateway_config_dict().get("gateway") or {})
             url = str(cfg.get("relay_endpoint", "") or "").strip()
         except Exception:  # noqa: BLE001 - config absence/parse must never crash boot
             url = ""
@@ -213,9 +209,7 @@ def relay_route_keys() -> list[str]:
     raw = os.environ.get("GATEWAY_RELAY_ROUTE_KEYS", "").strip()
     if not raw:
         try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-            cfg = (_load_gateway_config().get("gateway") or {})
+            cfg = (load_gateway_config_dict().get("gateway") or {})
             val = cfg.get("relay_route_keys", "")
             if isinstance(val, (list, tuple)):
                 return [str(k).strip() for k in val if str(k).strip()]
@@ -243,9 +237,7 @@ def relay_instance_id() -> Optional[str]:
     value = os.environ.get("GATEWAY_RELAY_INSTANCE_ID", "").strip()
     if not value:
         try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-            cfg = (_load_gateway_config().get("gateway") or {})
+            cfg = (load_gateway_config_dict().get("gateway") or {})
             value = str(cfg.get("relay_instance_id", "") or "").strip()
         except Exception:  # noqa: BLE001 - config absence/parse must never crash boot
             value = ""
@@ -274,9 +266,7 @@ def relay_wake_url() -> Optional[str]:
     value = os.environ.get("GATEWAY_RELAY_WAKE_URL", "").strip()
     if not value:
         try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-            cfg = (_load_gateway_config().get("gateway") or {})
+            cfg = (load_gateway_config_dict().get("gateway") or {})
             value = str(cfg.get("relay_wake_url", "") or "").strip()
         except Exception:  # noqa: BLE001 - config absence/parse must never crash boot
             value = ""
@@ -388,9 +378,7 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
     require_mention = None
     free_response: list[str] = []
     try:
-        from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-        cfg = _load_gateway_config() or {}
+        cfg = load_gateway_config_dict() or {}
         plat_cfg = cfg.get(platform)
         if not isinstance(plat_cfg, dict):
             _gw_platforms = (cfg.get("gateway") or {}).get("platforms") or {}
@@ -550,9 +538,7 @@ def _resolve_relay_identity_token() -> str:
     scope = os.environ.get("GATEWAY_RELAY_IDP_SCOPE", "").strip()
     if not token_url:
         try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
-
-            idp = ((_load_gateway_config().get("gateway") or {}).get("idp") or {})
+            idp = ((load_gateway_config_dict().get("gateway") or {}).get("idp") or {})
             token_url = str(idp.get("token_url", "") or "").strip()
             client_id = client_id or str(idp.get("client_id", "") or "").strip()
             client_secret = client_secret or str(idp.get("client_secret", "") or "").strip()
