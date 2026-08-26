@@ -2028,6 +2028,36 @@ function directoryExists(filePath) {
   }
 }
 
+// Identity markers for a real local profile. ``hermes profile create`` writes
+// config.yaml; ``ensure_hermes_home()`` writes SOUL.md on first launch; the
+// live runtime persists state.db. Any of these being on disk distinguishes a
+// genuine profile from an empty shell the desktop cron multiplex ticker
+// recreated via mkdir -p of profiles/<name>/cron/ (issue #95188 path A+C).
+//
+// We accept any of the three because the create path on older installs may
+// only have written config.yaml, while a fresh install seeds SOUL.md first
+// and config.yaml only on the next config load.
+const LOCAL_PROFILE_IDENTITY_MARKERS = ['config.yaml', 'SOUL.md', 'state.db']
+
+function hasLocalProfileIdentityMarker(hermesHome, profile) {
+  if (!hermesHome || !profile) {
+    return false
+  }
+
+  const profileDir = path.join(hermesHome, 'profiles', profile)
+  if (!directoryExists(profileDir)) {
+    return false
+  }
+
+  return LOCAL_PROFILE_IDENTITY_MARKERS.some(marker => {
+    try {
+      return fs.statSync(path.join(profileDir, marker)).isFile()
+    } catch {
+      return false
+    }
+  })
+}
+
 // --- in-app update mutual exclusion (#50238) -------------------------------
 // The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
 // duration of an `--update` run (see update.rs UpdateMarkerGuard). If the user
@@ -10766,8 +10796,18 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // here, and logging "Starting" first left an orphaned line with no READY
   // and no exit — the exact undiagnosable burst signature in remote-gateway
   // user bundles (Aug 2026, Dash's report).
-  assertLocalProfileCanStart(profile, profileDeletionGate, key =>
-    directoryExists(path.join(HERMES_HOME, 'profiles', key))
+  //
+  // #95188 path C: the bare ``directoryExists`` check accepts an empty
+  // shell, which the desktop cron multiplex ticker recreates every 60 s
+  // for a deleted profile. Reject unless a durable identity marker is on
+  // disk — without one, ``ensure_hermes_home()`` would rebuild the full
+  // profile tree (config.yaml, state.db, …) the moment we spawn a
+  // backend here.
+  assertLocalProfileCanStart(
+    profile,
+    profileDeletionGate,
+    key => directoryExists(path.join(HERMES_HOME, 'profiles', key)),
+    key => hasLocalProfileIdentityMarker(HERMES_HOME, key)
   )
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)

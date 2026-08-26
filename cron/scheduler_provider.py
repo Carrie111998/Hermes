@@ -638,8 +638,28 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        Issue #95188 path A: ``profiles_to_serve()`` snapshots the active
+        profile homes at backend startup and that list is frozen for the
+        lifetime of the dashboard. ``hermes profile delete <name>`` cleans
+        the directory tree, but the cron ticker still holds a reference to
+        it and the next ``record_ticker_heartbeat()`` call's
+        ``ensure_dirs()`` does ``mkdir -p profiles/<name>/cron/`` —
+        resurrecting an empty shell. The Electron spawn guard's bare
+        ``directoryExists`` check then passes, a stale renderer reconnect
+        spawns a backend, and ``ensure_hermes_home()`` rebuilds the full
+        profile (config.yaml, state.db, logs, …).
+
+        The fix: per tick, skip any profile whose home is no longer on
+        disk — do not enter ``use_cron_store()``, do not record a
+        heartbeat, do not run ``cron.tick()``. The user's profile list
+        update on the next ``profiles_to_serve()`` call will eventually
+        reflect the deletion, and any profile they intentionally
+        recreate gets picked up on the next gateway restart.
         """
         import logging
+        from pathlib import Path
+
         from cron.scheduler import tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
@@ -656,9 +676,27 @@ class InProcessCronScheduler(CronScheduler):
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
 
-        # Recovery + initial heartbeat for every profile.
+        def _home_alive(home) -> bool:
+            # ``Path.is_dir()`` returns False for missing or non-directory
+            # paths without raising — exactly the predicate we need to
+            # distinguish a real profile home from a ticker-resurrected
+            # shell that no longer exists or was renamed.
+            try:
+                return Path(str(home)).is_dir()
+            except OSError:
+                return False
+
+        # Recovery + initial heartbeat for every profile. Skip homes that
+        # were deleted between ``profiles_to_serve()`` and the first tick.
         for entry in profile_homes:
             home = entry[1] if isinstance(entry, tuple) else entry
+            if not _home_alive(home):
+                logger.info(
+                    "Skipping initial heartbeat for missing profile home %s "
+                    "(deleted before the ticker started; #95188)",
+                    home,
+                )
+                continue
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
@@ -683,6 +721,17 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for entry in profile_homes:
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        # Skip-and-don't-mkdir for a deleted profile home
+                        # (#95188 path A): the heartbeat's ``ensure_dirs``
+                        # would otherwise ``mkdir -p`` the parent and
+                        # resurrect the deleted profile.
+                        if not _home_alive(home):
+                            logger.debug(
+                                "Skipping tick for missing profile home %s "
+                                "(deleted since ticker startup; #95188)",
+                                home,
+                            )
+                            continue
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
@@ -703,9 +752,13 @@ class InProcessCronScheduler(CronScheduler):
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             else:
                 _tick_error = None
-            # Record per-profile heartbeat after each tick cycle.
+            # Record per-profile heartbeat after each tick cycle. The same
+            # missing-home skip applies — a deleted profile must not get
+            # any on-disk artefact.
             for entry in profile_homes:
                 home = entry[1] if isinstance(entry, tuple) else entry
+                if not _home_alive(home):
+                    continue
                 home_token = set_hermes_home_override(str(home))
                 try:
                     with use_cron_store(home):

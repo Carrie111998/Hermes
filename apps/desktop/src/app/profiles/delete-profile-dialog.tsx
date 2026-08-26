@@ -2,6 +2,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { deleteProfile } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { retireLocalProfileGateways } from '@/store/gateway'
+import { forgetLastProfileForAllConnections } from '@/store/connections'
 import { $activeGatewayProfile, normalizeProfileKey, selectProfile, setActiveProfile } from '@/store/profile'
 
 // Thin wrapper over ConfirmDialog: owns the deleteProfile call, inherits
@@ -43,6 +44,14 @@ export function DeleteProfileDialog({
         if (!profile) {
           return
         }
+
+        // Always purge the renderer-side ``lastProfileByConnection`` cache
+        // for this profile name, regardless of which workspace the user
+        // initiated the delete from (#95188 path B). Without this, the
+        // next boot's ``selectConnection()`` calls ``ensureGatewayAgent()``
+        // with the deleted profile name and the backend's
+        // ``ensure_hermes_home()`` recreates the whole profile tree.
+        forgetLastProfileForAllConnections(profile.name)
 
         // Deleting the profile the live gateway is on strands it on a dead
         // backend. Capture that before the delete; reset *after* the host's

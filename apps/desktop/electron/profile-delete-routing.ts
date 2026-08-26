@@ -180,11 +180,26 @@ export class ProfileDeletionGate {
  * Validate the final boundary before spawning a local profile backend. The
  * deletion gate closes the in-flight race; the directory check rejects a
  * delayed renderer retry after the DELETE request has already completed.
+ *
+ * The third predicate — `profileIdentityMarkerPresent` — rejects a stale
+ * shell where only an empty directory remains (issue #95188 path C). The
+ * desktop cron multiplex ticker writes a heartbeat into each profile's
+ * ``cron/`` subdir every 60 s, which silently ``mkdir -p``s the parent
+ * profile home. A bare directory-existence check then lets a delayed
+ * renderer reconnect pass the guard, spawn a real backend, and have
+ * ``ensure_hermes_home()`` rebuild the full profile tree (config.yaml,
+ * state.db, models_dev_cache.json, …). Requiring a durable identity
+ * marker (e.g. ``config.yaml``) ensures the spawn only succeeds for a
+ * profile that is genuinely on disk.
+ *
+ * The default profile is exempt from the identity check: its home is
+ * managed by the install and may legitimately lack a config.yaml.
  */
 export function assertLocalProfileCanStart(
   profile: unknown,
   gate: ProfileDeletionGate,
-  profileDirectoryExists: (profile: string) => boolean
+  profileDirectoryExists: (profile: string) => boolean,
+  profileIdentityMarkerPresent: (profile: string) => boolean = () => true
 ): void {
   const key = String(profile ?? '')
     .trim()
@@ -192,8 +207,14 @@ export function assertLocalProfileCanStart(
 
   gate.assertCanStart(key)
 
-  if (key && key !== 'default' && !profileDirectoryExists(key)) {
-    throw new Error(`Profile "${key}" no longer exists.`)
+  if (key && key !== 'default') {
+    if (!profileDirectoryExists(key)) {
+      throw new Error(`Profile "${key}" no longer exists.`)
+    }
+
+    if (!profileIdentityMarkerPresent(key)) {
+      throw new Error(`Profile "${key}" no longer exists.`)
+    }
   }
 }
 

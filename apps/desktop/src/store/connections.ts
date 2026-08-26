@@ -78,6 +78,48 @@ export function _resetConnectionsForTests(): void {
   $pendingConnectionId.set(null)
 }
 
+/**
+ * Forget the cached last-used profile for every connection when the named
+ * profile has just been deleted.
+ *
+ * Regression for issue #95188 (path B): the renderer persisted
+ * ``hermes.desktop.lastProfileByConnection`` so the next boot could dial
+ * the user's preferred profile per source. The delete dialog only reset
+ * that key when the deleted profile was the active foreground one
+ * (``if (wasActive)``); deleting from another workspace left the key
+ * pointing at the dead profile forever. On the next restart
+ * ``selectConnection()`` called ``ensureGatewayAgent()`` with the deleted
+ * profile name, which spawned a full backend whose
+ * ``ensure_hermes_home()`` rebuilt the entire profile tree.
+ *
+ * The function is best-effort and idempotent: an entry that doesn't
+ * match is left alone, and the change is persisted via the existing
+ * ``$lastProfileByConnection`` subscriber (so callers don't need to
+ * touch ``localStorage`` themselves).
+ */
+export function forgetLastProfileForAllConnections(profile: string): void {
+  const target = normalizeProfileKey(profile)
+
+  if (!target || target === 'default') {
+    return
+  }
+
+  const current = $lastProfileByConnection.get()
+  const next: Record<string, string> = {}
+
+  for (const [connectionId, lastProfile] of Object.entries(current)) {
+    if (normalizeProfileKey(lastProfile) === target) {
+      continue
+    }
+
+    next[connectionId] = lastProfile
+  }
+
+  if (Object.keys(next).length !== Object.keys(current).length) {
+    $lastProfileByConnection.set(next)
+  }
+}
+
 export function setConnectionsRegistry(registry: DesktopConnectionsRegistry): void {
   $connectionsRegistry.set(registry)
 }

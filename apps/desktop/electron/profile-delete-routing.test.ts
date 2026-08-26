@@ -144,6 +144,28 @@ test('assertLocalProfileCanStart rejects a delayed retry after the profile direc
   assert.doesNotThrow(() => assertLocalProfileCanStart('selena', gate, profile => profile === 'selena'))
 })
 
+test('assertLocalProfileCanStart rejects a cron-shell home with no durable identity marker (#95188 path C)', () => {
+  // The cron ticker in `hermes_cli/web_server._start_desktop_cron_ticker`
+  // recreates `profiles/<name>/cron/` every 60s tick. An empty shell is
+  // enough to satisfy the bare directoryExists check, so a stale backend
+  // retry after the delete can still pass the spawn guard and rebuild the
+  // full profile. The fix: the guard must also confirm a durable identity
+  // marker (config.yaml / SOUL.md / state.db etc.) is present.
+  const gate = new ProfileDeletionGate()
+  const profileDirectoryExists = () => true // shell exists
+  const profileIdentityMarkerPresent = (key: string) => key !== 'researcher' // deleted profile has no marker
+
+  assert.throws(
+    () => assertLocalProfileCanStart('researcher', gate, profileDirectoryExists, profileIdentityMarkerPresent),
+    /Profile "researcher" no longer exists/
+  )
+  assert.doesNotThrow(() =>
+    assertLocalProfileCanStart('worker', gate, profileDirectoryExists, profileIdentityMarkerPresent)
+  )
+  // Default profile is exempt from the identity check.
+  assert.doesNotThrow(() => assertLocalProfileCanStart('default', gate, profileDirectoryExists, profileIdentityMarkerPresent))
+})
+
 test('localProfilePoolKeys returns every local process scope for one profile', () => {
   assert.deepEqual(localProfilePoolKeys('Selena'), ['selena', 'conn:local::selena'])
   assert.deepEqual(localProfilePoolKeys(''), [])

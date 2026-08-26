@@ -35,6 +35,7 @@ const {
   $activeConnectionId,
   $connectionsRegistry,
   $pendingConnectionId,
+  forgetLastProfileForAllConnections,
   initializeConnectionsRegistry,
   refreshConnectionsRegistry,
   _resetConnectionsForTests,
@@ -290,5 +291,40 @@ describe('selectConnection', () => {
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
     expect(wipeSessionListsForGatewaySwitch).not.toHaveBeenCalled()
     expect($connection.get()?.mode).toBe('remote')
+  })
+})
+
+describe('lastProfileByConnection cache invalidation', () => {
+  // Regression for issue #95188 path B: deleting a named profile from a
+  // workspace other than the active one must clear its entry in the
+  // renderer localStorage cache, otherwise the next boot calls
+  // ensureGatewayAgent() with the dead profile name and spawns a real
+  // backend, whose ensure_hermes_home() rebuilds the directory tree.
+  it('forgetLastProfileForAllConnections removes the deleted profile from every connection (#95188)', async () => {
+    // Seed: the cache records 'researcher' for two separate connections.
+    // (Local was last using 'researcher'; a remote 'homelab' connection
+    // also remembers the same profile.)
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'default', registryScoped: true })
+    $activeGatewayProfile.set('researcher')
+    await selectConnection('local')
+    $activeGatewayProfile.set('researcher')
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'default', registryScoped: true })
+    await selectConnection('homelab')
+
+    // Delete the 'researcher' profile from any workspace (NOT the active one).
+    // The renderer must purge every cached entry pointing at it.
+    forgetLastProfileForAllConnections('researcher')
+
+    // Reboot: initializeConnectionsRegistry should now dial 'default' on
+    // both connections (not 'researcher'). Reset and let boot restore do it.
+    _resetConnectionsForTests()
+    $connection.set(null)
+    $activeGatewayProfile.set('default')
+    list.mockResolvedValueOnce({ ...registry, lastUsed: 'local', launchMode: 'last-used' })
+
+    await initializeConnectionsRegistry()
+
+    expect(ensureGatewayAgent).toHaveBeenLastCalledWith('local', 'default')
   })
 })

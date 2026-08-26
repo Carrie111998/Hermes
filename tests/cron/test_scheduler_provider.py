@@ -589,6 +589,87 @@ class TestGuardJobCredentialExfil:
 # ── Multiplex profiles: cron per secondary profile (issue #69377) ─────────
 
 
+def test_multiplex_ticker_skips_missing_profile_home_and_does_not_resurrect_it(tmp_path, monkeypatch):
+    """Regression for #95188 path A.
+
+    The desktop multiplex cron ticker was passing a *frozen* snapshot of
+    profile homes into ``_start_multiplex`` and unconditionally writing a
+    heartbeat file into each one. When a named profile was deleted via
+    ``hermes profile delete``, the ticker's next pass would silently
+    ``mkdir -p profiles/<name>/cron`` and recreate the empty directory
+    shell — defeating the Electron spawn guard's directoryExists check
+    and allowing a stale renderer reconnect to spawn a real backend,
+    whose ``ensure_hermes_home()`` rebuilt the full profile tree.
+
+    The fix: the ticker must verify each profile home still exists on
+    disk before writing into it, and silently skip the tick if it has
+    been deleted (no mkdir, no heartbeat, no tick() call).
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    # Two profile directories: "default" is intact, "researcher" was just
+    # deleted by the user — only an empty cron/ shell remains, the rest
+    # of the profile tree is gone (config.yaml, state.db, etc. all
+    # removed). This mirrors the post-delete state on disk.
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "researcher"
+    (p1 / "cron").mkdir(parents=True)
+    (p1 / "config.yaml").write_text("profile: default\n")
+    # NOTE: p2 has NO config.yaml and NO cron/ — this is the state right
+    # after `hermes profile delete researcher` cleaned everything up but
+    # before the cron ticker's next pass.
+
+    profile_homes = [("default", p1), ("researcher", p2)]
+
+    tick_calls: list[str] = []
+
+    def _tracking_tick(*args, **kwargs):
+        # If we get called for the deleted profile, the ticker resurrected it.
+        tick_calls.append("tick")
+        return 0
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    import cron.jobs as cron_jobs
+    heartbeat_calls: list[str] = []
+    original_record = cron_jobs.record_ticker_heartbeat
+
+    def _tracking_heartbeat(**kwargs):
+        heartbeat_calls.append("hb")
+        return None
+
+    monkeypatch.setattr(cron_jobs, "record_ticker_heartbeat", _tracking_heartbeat)
+
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick):
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={"interval": 0, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        t.start()
+        # Allow several tick cycles.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+
+    # The deleted profile's home directory MUST NOT exist — the ticker
+    # must skip it entirely rather than mkdir its cron/ shell.
+    assert not p2.exists(), (
+        f"Cron ticker resurrected the deleted profile home at {p2}; "
+        f"this is the #95188 path A regression."
+    )
+    # And no heartbeat / tick attempts for the deleted profile — only
+    # for the live default profile.
+    assert "tick" in tick_calls  # ticker ran (default profile ticked)
+    assert p1.exists()  # default profile home still alive
+
+
 def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     """The multiplex cron scheduler calls tick() once per profile home,
     scoped via use_cron_store, so secondary-profile jobs actually fire
