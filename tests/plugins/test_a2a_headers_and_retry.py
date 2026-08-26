@@ -1,10 +1,10 @@
-"""Focused coverage for per-peer headers, User-Agent, 524 retry policy,
-and destination-bound secret forwarding (PR #86322).
+"""Focused coverage for per-peer headers, User-Agent, 524 indeterminate
+handling, and destination-bound secret forwarding (PR #86322).
 
-Extracted from test_a2a_plugin.py when the 524 retry became opt-in
-(`idempotency: true`) and credential forwarding became origin-bound, per
-upstream review: keep this surface in its own module under the 2K-line
-test-file invariant.
+Extracted from test_a2a_plugin.py when credential forwarding became
+origin-bound and 524 responses became a typed indeterminate outcome
+(no automatic replay), per upstream review: keep this surface in its own
+module under the 2K-line test-file invariant.
 """
 
 from __future__ import annotations
@@ -135,110 +135,63 @@ class TestClientHttpEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# 524 retry policy: default off, opt-in per peer via `idempotency: true`
+# 524 handling: typed indeterminate, never auto-retried
 # ---------------------------------------------------------------------------
 
-class Test524RetryPolicy:
-    def test_524_not_retried_by_default(self, monkeypatch):
-        """A 524 is indeterminate (origin may have completed the task).
-        Without the peer's idempotency opt-in, exactly one attempt is made
-        and the error surfaces to the caller."""
+class Test524Indeterminate:
+    def test_524_raises_typed_indeterminate_error(self, monkeypatch):
+        """A 524 is indeterminate (origin may have completed the task) and is
+        NEVER auto-retried: it raises _A2aIndeterminateError so callers can
+        distinguish 'failed safely' from 'may have executed'."""
         attempts = {"n": 0}
 
-        def fake_open(req, timeout=None):
+        def fake_open(req, timeout, allowed=()):
             attempts["n"] += 1
             raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
 
         monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
                             lambda req, timeout, allowed=(): fake_open(req, timeout))
-        with pytest.raises(urlerr.HTTPError) as ei:
+        with pytest.raises(tools._A2aIndeterminateError):
             tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
-        assert ei.value.code == 524
         assert attempts["n"] == 1
 
-    def test_524_retried_when_peer_opts_in(self, monkeypatch):
-        """With retry_524=True the full backoff ladder runs before giving
-        up on a persistently-524-ing peer."""
-        monkeypatch.setattr(tools.time, "sleep", lambda s: None)
-        attempts = {"n": 0}
-
-        def fake_open(req, timeout=None):
-            attempts["n"] += 1
-            raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
-
-        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
-                            lambda req, timeout, allowed=(): fake_open(req, timeout))
-        with pytest.raises(urlerr.HTTPError):
-            tools._http_post_json("http://peer/", {"x": 1}, {}, 30, retry_524=True)
-        assert attempts["n"] == tools._POST_MAX_RETRIES
-
-    def test_524_backoff_is_exponential_when_opted_in(self, monkeypatch):
-        sleeps = []
-        monkeypatch.setattr(tools.time, "sleep", lambda s: sleeps.append(s))
-        attempts = {"n": 0}
-
-        class _Resp:
-            def read(self):
-                return b'{"ok": true}'
-
-        class _Ctx:
-            def __enter__(self):
-                return _Resp()
-
-            def __exit__(self, *a):
-                return False
-
-        def fake_open(req, timeout=None):
-            attempts["n"] += 1
-            if attempts["n"] < tools._POST_MAX_RETRIES:
-                raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
-            return _Ctx()
-
-        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
-                            lambda req, timeout, allowed=(): fake_open(req, timeout))
-        out = tools._http_post_json("http://peer/", {"x": 1}, {}, 30, retry_524=True)
-        assert out == {"ok": True}
-        assert attempts["n"] == tools._POST_MAX_RETRIES
-        assert sleeps == [1, 2]
-
-    def test_other_errors_never_retried(self, monkeypatch):
-        attempts = {"n": 0}
-
-        def fake_open(req, timeout=None):
-            attempts["n"] += 1
+    def test_other_errors_still_raise_httperror(self, monkeypatch):
+        def fake_open(req, timeout, allowed=()):
             raise urlerr.HTTPError(req.full_url, 502, "Bad Gateway", {}, None)
 
         monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
                             lambda req, timeout, allowed=(): fake_open(req, timeout))
         with pytest.raises(urlerr.HTTPError):
-            tools._http_post_json("http://peer/", {"x": 1}, {}, 30, retry_524=True)
-        assert attempts["n"] == 1
+            tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
 
-    def test_call_passes_idempotency_flag_to_post(self, monkeypatch):
-        """Peer config `idempotency: true` reaches the POST as retry_524."""
-        cfg = {"a2a_agents": {"mac": {
-            "url": "http://localhost:9999",
-            "idempotency": True,
-        }}}
-        monkeypatch.setattr(tools, "_load_config", lambda: cfg)
-        monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
-        captured = {}
+    def test_a2a_call_surfaces_indeterminate_advice(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"r": {
+            "url": "http://localhost:9999"}}})
 
-        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
-            captured["retry_524"] = retry_524
-            return protocol.jsonrpc_result(
-                body["id"],
-                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "ok"),
-            )
+        def fake_send(*a, **k):
+            raise tools._A2aIndeterminateError("peer origin timed out (HTTP 524)")
 
-        monkeypatch.setattr(tools, "_http_post_json", fake_post)
-        tools.a2a_call({"agent": "mac", "message": "ping"})
-        assert captured["retry_524"] is True
+        monkeypatch.setattr(tools, "_send_task", fake_send)
+        out = tools.a2a_call({"agent": "r", "message": "hello"})
+        assert "INDETERMINATE" in out
+        assert "Do not blindly retry" in out
 
+    def test_524_single_attempt_no_sleep(self, monkeypatch):
+        """No retry ladder, no backoff sleeps — exactly one request."""
+        sleeps = []
+        monkeypatch.setattr(tools.time, "sleep", lambda s: sleeps.append(s))
+        attempts = {"n": 0}
 
-# ---------------------------------------------------------------------------
-# User-Agent on the real POST path
-# ---------------------------------------------------------------------------
+        def fake_open(req, timeout, allowed=()):
+            attempts["n"] += 1
+            raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
+
+        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
+                            lambda req, timeout, allowed=(): fake_open(req, timeout))
+        with pytest.raises(tools._A2aIndeterminateError):
+            tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
+        assert attempts["n"] == 1 and sleeps == []
+
 
 class TestPostUserAgent:
     def test_post_sends_hermes_user_agent(self, monkeypatch):

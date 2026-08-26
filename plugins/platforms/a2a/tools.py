@@ -68,7 +68,6 @@ def _resolve_peer(agent: str) -> Optional[dict]:
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
         "capabilities": entry.get("capabilities", []) or [],
         "tenant": entry.get("tenant", ""),
-        "idempotency": bool(entry.get("idempotency", False)),
         "allowed_rpc_origins": entry.get("allowed_rpc_origins") or [],
     }
 
@@ -128,18 +127,15 @@ def _http_get_json(url: str, headers: dict, timeout: int,
         return json.loads(resp.read().decode("utf-8"))
 
 
-# Retry budget for Cloudflare 524 (origin timeout) on blocking POST, when the
-# peer has opted in. A 524 means the proxy gave up on the response, NOT that
-# the origin failed — the peer may have already executed the task. Retrying a
-# mutating send on a 524 is only safe when the peer deduplicates requests
-# (the retry re-sends the identical task id and message), which the operator
-# asserts per peer via `idempotency: true` in the peer config.
-# Default: no retry — the indeterminate outcome propagates to the caller.
-_POST_MAX_RETRIES = 3
+class _A2aIndeterminateError(Exception):
+    """A 524 (origin timeout) — the peer may have executed the task, but the
+    response was lost. Mutating sends are NEVER auto-retried on this class:
+    without a proven server-side idempotency contract a replay could execute
+    the task twice. The caller surfaces the indeterminate outcome; recovery
+    composes with explicit task-identity polling (upstream #94880) instead."""
 
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int,
-                    retry_524: bool = False,
                     allowed_origins: tuple[str, ...] = ()) -> dict:
     data = json.dumps(body).encode("utf-8")
     # Custom peer headers are operator-controlled but Content-Type and
@@ -154,25 +150,16 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int,
     }
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
 
-    attempts = _POST_MAX_RETRIES if retry_524 else 1
-    for attempt in range(attempts):
-        try:
-            with _open_url_no_redirect_leak(req, timeout, allowed_origins) as resp:  # noqa: S310 (configured peers)
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if (retry_524 and e.code == 524 and attempt < attempts - 1):
-                # Exponential backoff: 1s, 2s, 4s. Safe as a blocking sleep:
-                # plugin tools run on worker threads (orchestrate uses a
-                # ThreadPoolExecutor; handlers never touch the gateway's
-                # event loop).
-                logger.warning(
-                    "A2A: 524 from %s (origin may have completed the task); "
-                    "peer opted into idempotent retry, backing off %.0fs",
-                    url, 2 ** attempt)
-                time.sleep(2 ** attempt)
-                continue
-            raise
-    raise RuntimeError("A2A retry loop exited without a result")  # pragma: no cover
+    try:
+        with _open_url_no_redirect_leak(req, timeout, allowed_origins) as resp:  # noqa: S310 (configured peers)
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 524:
+            raise _A2aIndeterminateError(
+                f"peer origin timed out behind its proxy (HTTP 524); the task "
+                f"may have executed — outcome indeterminate, not retried"
+            ) from e
+        raise
 
 
 def _card_url(base_url: str) -> str:
@@ -294,10 +281,6 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     base_url = peer.get("url", "")
     headers = {**_auth_header(peer.get("auth", {}) or {}), **(peer.get("headers", {}) or {})}
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
-    # Operator asserts this peer dedupes on message identity (Hermes peers
-    # do), making 524 retries and stream-fallback resends safe. Without it, a
-    # 524 (origin may have completed the task) is surfaced, never retried.
-    idempotency = bool(peer.get("idempotency", False))
     auth = peer.get("auth", {}) or {}
     if auth and any(k.lower() == "authorization" for k in (peer.get("headers", {}) or {})):
         logger.warning(
@@ -350,7 +333,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
-    resp = _http_post_json(rpc_url, rpc_body, headers, timeout, retry_524=idempotency, allowed_origins=allowed)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout, allowed_origins=allowed)
     if "error" in resp:
         err = resp["error"]
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
@@ -445,6 +428,11 @@ def a2a_call(args: dict, **_: Any) -> str:
 
     try:
         reply, reply_ctx, state = _send_task(agent, peer, message, context_id)
+    except _A2aIndeterminateError as e:
+        return (f"Error: call to '{agent}' is INDETERMINATE — {e}. "
+                f"Do not blindly retry a mutating request; check with the peer "
+                f"(task id {getattr(e, 'task_id', 'unknown')}) or retry only "
+                f"if the operation is safe to repeat.")
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."
@@ -555,9 +543,8 @@ def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id:
             "headers": peer_entry.get("headers", {}) or {},
             "tenant": peer_entry.get("tenant", ""),
             "timeout": int(peer_entry.get("timeout", _DEFAULT_TIMEOUT)),
-            # Forwarded so fan-out peers keep their 524-retry opt-in and
-            # cross-origin RPC allowlist (same semantics as a2a_call).
-            "idempotency": bool(peer_entry.get("idempotency", False)),
+            # Forwarded so fan-out peers keep their cross-origin RPC
+            # allowlist (same semantics as a2a_call).
             "allowed_rpc_origins": peer_entry.get("allowed_rpc_origins") or [],
         }
         reply, _ctx, _state = _send_task(agent_name, peer, message, context_id)
