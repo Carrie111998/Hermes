@@ -173,6 +173,7 @@ import {
 } from './external-terminal'
 import { type FaviconIo, resolveFavicon } from './favicon'
 import { findGitBash as _findGitBash } from './find-git-bash'
+import { installStdioEpipeGuard } from './stdio-epipe-guard'
 import {
   installFindShortcut,
   installFoundInPageForwarder,
@@ -1587,6 +1588,7 @@ function rememberLog(chunk) {
 }
 
 installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
+installStdioEpipeGuard()
 
 // A rejected loadURL leaves a blank window and, unhandled, no trace anywhere
 // the user can send us. `label` names the surface so the log says which one.
