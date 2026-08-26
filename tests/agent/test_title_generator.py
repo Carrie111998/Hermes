@@ -12,6 +12,8 @@ from agent.title_generator import (
     _retitle_config,
     _retitle_enabled,
     _condense_history,
+    _looks_like_title,
+    regenerate_title,
     MAX_TITLE_INPUT_CHARS,
 )
 from hermes_state import SessionDB
@@ -795,3 +797,155 @@ class TestCondenseHistory:
         assert "User:" in result
         assert "Here's a screenshot," in result
         assert "fix the login." in result
+
+
+class TestLooksLikeTitle:
+    """Unit tests for _looks_like_title() quality gate."""
+
+    def test_rejects_empty(self):
+        assert _looks_like_title("") is False
+
+    def test_rejects_none(self):
+        assert _looks_like_title(None) is False
+
+    def test_rejects_single_word(self):
+        assert _looks_like_title("Hello") is False
+
+    def test_rejects_thirteen_word_prose(self):
+        text = "one two three four five six seven eight nine ten eleven twelve thirteen"
+        assert _looks_like_title(text) is False
+
+    def test_rejects_here_is_prefix(self):
+        assert _looks_like_title("Here is a summary") is False
+
+    def test_rejects_about_prefix(self):
+        assert _looks_like_title("about databases and connection pools") is False
+
+    def test_rejects_this_conversation_prefix(self):
+        assert _looks_like_title("This conversation is about Postgres") is False
+
+    def test_rejects_the_conversation_prefix(self):
+        assert _looks_like_title("The conversation covers Postgres") is False
+
+    def test_accepts_concise_two_words(self):
+        assert _looks_like_title("Friendly greeting") is True
+
+    def test_accepts_seven_words(self):
+        assert (
+            _looks_like_title(
+                "Debugging Postgres connection pool exhaustion during migration"
+            )
+            is True
+        )
+
+    def test_accepts_the_prefix_when_not_conversation(self):
+        assert _looks_like_title("The Postgres pool issue") is True
+
+
+class TestRegenerateTitle:
+    """Unit tests for regenerate_title()."""
+
+    def test_returns_none_for_empty_condensed(self):
+        assert regenerate_title("") is None
+        assert regenerate_title(None) is None
+        assert regenerate_title("   \n  ") is None
+
+    def test_returns_none_when_retitle_disabled(self):
+        with patch("agent.title_generator._retitle_enabled", return_value=False):
+            assert regenerate_title("User: hi\nAssistant: hello") is None
+
+    def test_calls_call_llm_with_condensed_and_title_generation_task(self):
+        captured = {}
+
+        def mock_call_llm(**kwargs):
+            captured.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Debugging Postgres pool"}'
+            return resp
+
+        condensed = "User: Postgres pool is exhausted\nAssistant: Let's check settings"
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), \
+             patch("agent.title_generator._retitle_enabled", return_value=True):
+            title = regenerate_title(condensed)
+
+        assert title == "Debugging Postgres pool"
+        assert captured["task"] == "title_generation"
+        assert captured["max_tokens"] == 64
+        assert captured["temperature"] == 0.3
+        messages = captured["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"] == condensed
+        # response_format schema is passed through
+        assert "response_format" in captured["extra_body"]
+
+    def test_extracts_json_response_via_extract_title_text(self):
+        def mock_call_llm(**kwargs):
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix login button on mobile"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), \
+             patch("agent.title_generator._retitle_enabled", return_value=True):
+            assert regenerate_title("User: fix mobile login") == "Fix login button on mobile"
+
+    def test_rejects_prose_via_looks_like_title(self):
+        def mock_call_llm(**kwargs):
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            # 15 words of prose — should be rejected by _looks_like_title
+            resp.choices[0].message.content = (
+                "This conversation is a long summary about postgres and how the "
+                "user tried to fix it eventually."
+            )
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), \
+             patch("agent.title_generator._retitle_enabled", return_value=True):
+            assert regenerate_title("User: pg\nAssistant: ok") is None
+
+    def test_returns_none_on_call_llm_exception(self):
+        def mock_call_llm(**kwargs):
+            raise RuntimeError("upstream 500")
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), \
+             patch("agent.title_generator._retitle_enabled", return_value=True):
+            assert regenerate_title("User: hi\nAssistant: hey") is None
+
+    def test_respects_pinned_language(self):
+        captured = {}
+
+        def mock_call_llm(**kwargs):
+            captured.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "ポストグレス プール修正"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), \
+             patch("agent.title_generator._retitle_enabled", return_value=True), \
+             patch("agent.title_generator._title_language", return_value="Japanese"):
+            regenerate_title("User: pg\nAssistant: hai")
+
+        system_prompt = captured["messages"][0]["content"]
+        assert "Japanese" in system_prompt
+
+    def test_truncates_condensed_to_max_title_input_chars(self):
+        captured = {}
+
+        def mock_call_llm(**kwargs):
+            captured.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Long convo title"}'
+            return resp
+
+        big = "x" * 5000
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), \
+             patch("agent.title_generator._retitle_enabled", return_value=True):
+            regenerate_title(big)
+
+        user_content = captured["messages"][1]["content"]
+        assert len(user_content) == MAX_TITLE_INPUT_CHARS

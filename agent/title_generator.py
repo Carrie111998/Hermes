@@ -92,6 +92,25 @@ _TITLE_PROMPT_TEMPLATE = (
     'Reply with JSON only: {"title": "..."}'
 )
 
+# Prompt for regenerate_title() — feeds condensed conversation history instead of opening message.
+_RETITLE_PROMPT = (
+    "You name chat sessions. Given the conversation so far, write a title "
+    "that lets the user find this conversation again in a list.\n\n"
+    "Rules:\n"
+    "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n"
+    "- Name what the conversation is actually about or what the user wants DONE.\n"
+    "- Keep technical terms, filenames, numbers, and error codes exact.\n"
+    "- Drop filler words: the, this, my, a, an.\n"
+    "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
+    "- Never summarize the conversation. Name it.\n"
+    "- Always produce something, even if the conversation opened with a greeting.\n"
+    "__LANGUAGE_RULE__\n"
+    'Good: {"title": "Debugging Postgres connection pool"}\n'
+    'Good: {"title": "Hermes session auto-titling explained"}\n'
+    'Too vague: {"title": "Conversation about databases"}\n'
+    'Reply with JSON only: {"title": "..."}'
+)
+
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
 
@@ -397,6 +416,33 @@ def _clean_title(text: str) -> Optional[str]:
     return title
 
 
+def _looks_like_title(text: Optional[str]) -> bool:
+    """Quality gate: accept a concise 2..12 word phrase, reject verbose prose.
+
+    Used by ``regenerate_title`` to filter chatty small-model output — when
+    handed a whole conversation instead of a single opening message, a
+    tiny-model tier will sometimes answer with a summary sentence ("Here is
+    a summary of the conversation...") instead of a title. This guard drops
+    those before they land as the session name.
+    """
+    if not text:
+        return False
+    words = text.split()
+    if len(words) < 2 or len(words) > 12:
+        return False
+    lowered = text.lower()
+    _BAD_PREFIXES = (
+        "here",
+        "this conversation",
+        "the conversation",
+        "about ",
+    )
+    for bad in _BAD_PREFIXES:
+        if lowered.startswith(bad):
+            return False
+    return True
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -497,6 +543,70 @@ def generate_title(
                 failure_callback("title generation", e)
             except Exception:
                 logger.debug("Title generation failure_callback raised", exc_info=True)
+        return None
+
+
+def regenerate_title(
+    condensed: str,
+    timeout: Optional[float] = None,
+) -> Optional[str]:
+    """Regenerate a session title from condensed conversation history.
+
+    Structural mirror of :func:`generate_title`, but takes an already-condensed
+    conversation string (see :func:`_condense_history`) instead of a single
+    opening user message. Runs on the same ``title_generation`` auxiliary
+    task, so it inherits the small/fast tier, concurrency cap, and timeout
+    floor configured for auto-titling.
+
+    Returns ``None`` when:
+    - ``condensed`` is empty/whitespace,
+    - the retitle feature is disabled,
+    - the LLM call raises (logged at WARNING),
+    - the response fails the ``_looks_like_title`` quality gate.
+
+    Callers (Task 5+) handle failure surfacing and persistence — this function
+    only produces a title candidate, it does not invoke a failure callback and
+    does not touch storage.
+    """
+    if not condensed or not condensed.strip():
+        return None
+    if not _retitle_enabled():
+        logger.debug("Retitle skipped: auxiliary.title_generation.retitle.enabled=false")
+        return None
+
+    language = _title_language()
+    language_rule = (
+        _LANGUAGE_RULE_PINNED.format(language=language)
+        if language
+        else _LANGUAGE_RULE_MATCH_USER
+    )
+    # Placeholder substitution, not str.format: the prompt embeds literal JSON
+    # braces as few-shot examples, which format() would try to interpolate.
+    prompt = _RETITLE_PROMPT.replace("__LANGUAGE_RULE__", language_rule)
+
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": condensed[:MAX_TITLE_INPUT_CHARS]},
+    ]
+
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=messages,
+            max_tokens=64,
+            temperature=0.3,
+            timeout=timeout,
+            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+        )
+        content = response.choices[0].message.content or ""
+        title = _clean_title(_extract_title_text(content))
+        if not _looks_like_title(title):
+            logger.debug("Retitle rejected by _looks_like_title: %r", title)
+            return None
+        return title
+    except Exception as e:
+        logger.warning("Retitle generation failed: %s", e)
+        logger.debug("Retitle generation traceback", exc_info=True)
         return None
 
 
