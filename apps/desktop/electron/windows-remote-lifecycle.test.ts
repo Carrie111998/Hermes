@@ -366,6 +366,7 @@ test('managed update drain rechecks Windows PID/create-time ownership before exa
     false
   )
 
+})
 test('listWindowsRemoteProfiles inventories named profiles via the canonical runtime helper', async () => {
   const probe = JSON.stringify({
     os: 'Windows',

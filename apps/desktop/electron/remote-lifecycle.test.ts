@@ -270,7 +270,7 @@ test('listRemoteHermesProfiles rejects a hostile HERMES_HOME', async () => {
 test('listSshRemoteHermesProfiles keeps the POSIX listing on Linux/macOS remotes', async () => {
   const ssh = fakeSsh([
     [/uname/, 'Linux\nx86_64\n'],
-    [/HERMES_HOME/, '/Users/z\.hermes\n'],
+    [/HERMES_HOME/, '/Users/z/.hermes\n'],
     [/ls -1/, 'bob\ndixie\n']
   ])
 
