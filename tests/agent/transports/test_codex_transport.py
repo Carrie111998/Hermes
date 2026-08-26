@@ -39,14 +39,23 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
-    def test_custom_endpoint_reasoning_replay_is_scoped_to_model(self):
+    @pytest.mark.parametrize(
+        ("capture_model", "replay_model"),
+        [
+            ("gpt-5.6-sol-900k", "gpt-5.6-sol"),
+            ("gpt-5.6-sol", "gpt-5.6-sol-900k"),
+        ],
+    )
+    def test_custom_endpoint_reasoning_replay_is_scoped_to_model(
+        self, capture_model, replay_model
+    ):
         """Encrypted reasoning from one routed model must not reach another."""
         from agent.transports.codex import ResponsesApiTransport
 
         transport = ResponsesApiTransport()
         base_url = "http://localhost:20129/v1"
         transport.build_kwargs(
-            model="gemini/gemini-3.6-flash",
+            model=capture_model,
             messages=[{"role": "user", "content": "first"}],
             tools=[],
             base_url=base_url,
@@ -70,7 +79,7 @@ class TestCodexBuildKwargs:
             ],
         ))
         captured_reasoning = normalized.provider_data["codex_reasoning_items"]
-        assert captured_reasoning[0]["_issuer_model"] == "gemini/gemini-3.6-flash"
+        assert captured_reasoning[0]["_issuer_model"] == "gpt-5.6-sol"
         history = [
             {"role": "user", "content": "first"},
             {
@@ -82,13 +91,13 @@ class TestCodexBuildKwargs:
         ]
 
         same_model = transport.build_kwargs(
-            model="gemini/gemini-3.6-flash",
+            model=replay_model,
             messages=history,
             tools=[],
             base_url=base_url,
         )
         other_model = transport.build_kwargs(
-            model="gemini/gemini-3.7-flash",
+            model="gpt-5.7-sol",
             messages=history,
             tools=[],
             base_url=base_url,
@@ -97,7 +106,17 @@ class TestCodexBuildKwargs:
         same_model_reasoning = [
             item for item in same_model["input"] if item.get("type") == "reasoning"
         ]
+        converted = transport.convert_messages(
+            history, model=replay_model, base_url=base_url
+        )
+        converted_reasoning = [
+            item for item in converted if item.get("type") == "reasoning"
+        ]
+        assert same_model["model"] == "gpt-5.6-sol"
         assert [item["encrypted_content"] for item in same_model_reasoning] == [
+            "model-a-blob"
+        ]
+        assert [item["encrypted_content"] for item in converted_reasoning] == [
             "model-a-blob"
         ]
         assert "_issuer_model" not in same_model_reasoning[0]

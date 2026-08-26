@@ -377,8 +377,13 @@ class ResponsesApiTransport(ProviderTransport):
     def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
         """Convert OpenAI chat messages to Responses API input items."""
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
+        from agent.model_metadata import strip_codex_context_variant_suffix
+
         issuer = self._resolve_issuer_kind(kwargs)
-        issuer_model = str(kwargs.get("model") or "").strip() or None
+        issuer_model = (
+            str(strip_codex_context_variant_suffix(kwargs.get("model") or "")).strip()
+            or None
+        )
         self._last_issuer_kind = issuer
         self._last_issuer_model = issuer_model
         return _chat_messages_to_responses_input(
@@ -485,8 +490,12 @@ class ResponsesApiTransport(ProviderTransport):
         # items captured from the response, and passed to the input
         # converter so foreign-issuer reasoning blocks in history are
         # dropped before the API rejects them.
+        from agent.model_metadata import (
+            strip_codex_context_variant_suffix as _strip_ctx_variant,
+        )
+
         issuer_kind = self._resolve_issuer_kind(params)
-        issuer_model = str(model or "").strip() or None
+        issuer_model = str(_strip_ctx_variant(model or "")).strip() or None
         self._last_issuer_kind = issuer_kind
         self._last_issuer_model = issuer_model
 
@@ -578,12 +587,6 @@ class ResponsesApiTransport(ProviderTransport):
         # request is issued (openai==2.24.0).  Reported for the
         # ``openai-codex`` / ``gpt-5.5`` combo on chatgpt.com/backend-api/codex
         # (#32892) when the agent runs without external tools registered.
-        # Function-level import: agent.model_metadata is imported lazily
-        # because provider plugins import this transport during
-        # model_metadata's own module init (circular otherwise).
-        from agent.model_metadata import (
-            strip_codex_context_variant_suffix as _strip_ctx_variant,
-        )
         kwargs = {
             # ``-900k`` large-context picker variants are Hermes-side aliases
             # (gpt-5.6-sol-900k etc.) — the Codex/OpenAI backend only knows
