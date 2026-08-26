@@ -8,6 +8,7 @@ import { getEnvVars, getHermesConfigSchema } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Package, Palette, Settings2, Wrench } from '@/lib/icons'
 import { $agentPlugins, isDesktopRelevantPlugin, loadAgentPlugins } from '@/store/agent-plugins'
+import { $profiles } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
 import { TRANSLUCENCY_SUPPORTED } from '@/store/translucency'
 
@@ -64,6 +65,7 @@ export function useSettingsSearchCatalog(enabled: boolean) {
   const gatewayState = useStore($gatewayState)
   const desktopPluginRecords = useStore($pluginRecords)
   const agentPlugins = useStore($agentPlugins)
+  const profiles = useStore($profiles)
 
   useEffect(() => {
     if (enabled && gatewayState === 'open') {
@@ -169,6 +171,22 @@ export function useSettingsSearchCatalog(enabled: boolean) {
       label: appearance.introSplashTitle,
       target: { setting: APPEARANCE_SETTING_IDS.introSplash, view: 'config:appearance' }
     },
+    ...(profiles.length > 1
+      ? [
+          {
+            context: appearanceContext,
+            description: appearance.profileSwitchDesc,
+            icon: Palette,
+            id: `setting:${APPEARANCE_SETTING_IDS.profileSwitch}`,
+            keywords: ['profile', 'switch', 'session', 'restore', 'fresh draft'],
+            label: appearance.profileSwitchTitle,
+            target: {
+              setting: APPEARANCE_SETTING_IDS.profileSwitch,
+              view: 'config:appearance' as const
+            }
+          }
+        ]
+      : []),
     {
       context: appearanceContext,
       description: appearance.toolViewDesc,

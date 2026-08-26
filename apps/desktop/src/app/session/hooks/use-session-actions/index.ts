@@ -37,6 +37,7 @@ import {
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
+import { supersedeProfileSwitchRestoreForFreshDraft } from '@/store/profile-switch-behavior'
 import {
   $activeGatewayProfile,
   $gatewaySwapTarget,
@@ -274,6 +275,7 @@ async function desktopSessionCreateParams(
 
 interface FreshSessionDraftOptions {
   preserveRoute?: boolean
+  profileSwitchRequestSequence?: number
   replaceRoute?: boolean
   workspaceTarget?: NewChatWorkspaceTarget
 }
@@ -390,6 +392,8 @@ export function useSessionActions({
       const draftOptions = typeof options === 'boolean' ? { replaceRoute: options } : options
       const preserveRoute = draftOptions.preserveRoute ?? false
       const replaceRoute = draftOptions.replaceRoute ?? false
+
+      supersedeProfileSwitchRestoreForFreshDraft(draftOptions.profileSwitchRequestSequence)
 
       const hasWorkspaceTarget =
         Object.hasOwn(draftOptions, 'workspaceTarget') && draftOptions.workspaceTarget !== undefined

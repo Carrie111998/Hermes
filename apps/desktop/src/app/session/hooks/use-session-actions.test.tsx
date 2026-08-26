@@ -26,6 +26,11 @@ import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gatewa
 import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute, $profiles, ensureGatewayProfile } from '@/store/profile'
 import {
+  $profileSwitchRestoreToken,
+  _resetProfileSwitchBehaviorForTests,
+  requestProfileSwitchRestore
+} from '@/store/profile-switch-behavior'
+import {
   $projectScope,
   $projectTree,
   $removedSessionIds,
@@ -513,7 +518,23 @@ async function createWith(
 }
 
 describe('startFreshSessionDraft', () => {
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    _resetProfileSwitchBehaviorForTests()
+  })
+
+  it('supersedes a pending profile restore even when route and focus are already fresh', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    requestProfileSwitchRestore('beta', null, 1)
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    act(() => handle!.startFreshSessionDraft())
+
+    expect($profileSwitchRestoreToken.get()).toBeNull()
+  })
 
   it('can reset machine-bound session state without closing the current overlay route', async () => {
     const navigate = vi.fn()

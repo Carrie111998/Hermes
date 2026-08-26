@@ -20,12 +20,22 @@ import {
   activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
+  gatewayActivationEpoch,
   openGatewayForAgent,
   openGatewayForProfile
 } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
-import { setConnection } from '@/store/session'
+import {
+  $profileSwitchRestoreToken,
+  bindProfileSwitchRestore,
+  clearProfileSwitchRestore,
+  getProfileSwitchBehavior,
+  isCurrentProfileSwitchGeneration,
+  requestProfileSwitchRestore,
+  supersedeProfileSwitchRestore
+} from '@/store/profile-switch-behavior'
+import { $connection, setConnection } from '@/store/session'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
@@ -288,7 +298,7 @@ export function captureNewChatSource(connectionId: null | string = activeGateway
  * dials — capturing `local` for a pick would mint the session on the registry
  * entry local::x while the window shows the override's socket.
  */
-function profilePickConnectionId(): null | string {
+export function profilePickConnectionId(): null | string {
   const connectionId = activeGatewayConnectionId()
 
   return connectionId && connectionId !== LOCAL_CONNECTION_ID ? connectionId : null
@@ -333,8 +343,19 @@ export function resolveNewChatOwnerRoute(): AgentProfileRoute | null {
 // resets to the intro draft, so we never strand the user in an orphaned view.
 export const $freshSessionRequest = atom(0)
 
-export function requestFreshSession(): void {
-  $freshSessionRequest.set($freshSessionRequest.get() + 1)
+export function requestFreshSession(profileSwitchGeneration?: number): number {
+  if (profileSwitchGeneration !== undefined && !isCurrentProfileSwitchGeneration(profileSwitchGeneration)) {
+    return $freshSessionRequest.get()
+  }
+
+  if (profileSwitchGeneration === undefined) {
+    supersedeProfileSwitchRestore()
+  }
+
+  const sequence = $freshSessionRequest.get() + 1
+  $freshSessionRequest.set(sequence)
+
+  return sequence
 }
 
 // Route profile-scoped REST settings (config/env/skills/tools/model/…) to the
@@ -461,7 +482,15 @@ async function resolveConnectionForProfile(profile: string): Promise<HermesConne
 // their sockets — so their sessions keep streaming concurrently. A null/empty
 // target means "no explicit profile" → keep the current gateway (a plain new
 // chat stays put; single-profile users never leave the primary).
-export async function ensureGatewayProfile(profile: string | null | undefined): Promise<void> {
+export interface EnsureGatewayProfileOptions {
+  /** Wait out a pending profile activation before reasserting the current profile. */
+  reassertAfterPending?: boolean
+}
+
+export async function ensureGatewayProfile(
+  profile: string | null | undefined,
+  { reassertAfterPending = false }: EnsureGatewayProfileOptions = {}
+): Promise<void> {
   if (profile == null || !String(profile).trim()) {
     // "No explicit profile" = use the current gateway. But if an explicit swap
     // (e.g. the user just picked a profile in the switcher) is still in flight,
@@ -475,8 +504,9 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   }
 
   const target = normalizeProfileKey(profile)
+  const waitForPendingReassertion = reassertAfterPending && gatewaySwitch !== null
 
-  if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+  if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get() && !waitForPendingReassertion) {
     return
   }
 
@@ -753,9 +783,20 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 // $activeGatewayProfile → name, so $profileScope follows).
 export function selectProfile(name: string): void {
   const target = normalizeProfileKey(name)
+  const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+  const pendingRestore = $profileSwitchRestoreToken.get()
+  const reversingPendingRestore =
+    getProfileSwitchBehavior() === 'restore_last_session' &&
+    pendingRestore !== null &&
+    pendingRestore.requestedProfile !== target &&
+    target === activeProfile
   // Switching profiles (or coming back from the all-profiles browse view) starts
   // fresh; re-tapping the profile you're already in leaves your session be.
-  const switching = $showAllProfiles.get() || target !== normalizeProfileKey($activeGatewayProfile.get())
+  // The one exception is reversing THIS feature's pending restore intent: A
+  // clicked during A -> B must queue a newer A activation behind B, not let B
+  // become the final published route. Unrelated same-profile activations remain
+  // ordinary no-ops.
+  const switching = $showAllProfiles.get() || target !== activeProfile || reversingPendingRestore
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
   $newChatRoute.set(null)
@@ -763,10 +804,21 @@ export function selectProfile(name: string): void {
   // is made on the source the user is looking at (activateOnCurrentSource
   // dials exactly that pair), so the draft's exact owner is that pair — or the
   // legacy profile-only path when that is the door the pick takes.
-  captureNewChatSource(profilePickConnectionId())
+  const sourceConnectionId = profilePickConnectionId()
+  captureNewChatSource(sourceConnectionId)
 
-  if (switching) {
-    requestFreshSession()
+  const freshSessionRequestSequence = $freshSessionRequest.get() + 1
+  const restoreToken =
+    switching && getProfileSwitchBehavior() === 'restore_last_session'
+      ? requestProfileSwitchRestore(target, sourceConnectionId, freshSessionRequestSequence)
+      : null
+  const generation = switching ? (restoreToken?.generation ?? supersedeProfileSwitchRestore()) : null
+
+  // Every real profile switch crosses the same fresh-draft barrier. Restore
+  // happens only after exact activation + a committed target-list refresh, so
+  // the departing transcript cannot flash while the target wakes up.
+  if (generation !== null) {
+    requestFreshSession(generation)
   }
 
   // A profile with a remote override can fail to activate because the remote
@@ -783,11 +835,41 @@ export function selectProfile(name: string): void {
   // profiles, so only a primary-backend activation updates the startup
   // preference.
   const onPrimary = activeGatewayConnectionId() == null
-
   const shouldRememberStartupProfile = onPrimary ? isLocalDesktopProfile(target) : Promise.resolve(false)
+  const activation =
+    reversingPendingRestore && sourceConnectionId === null
+      ? activateOnCurrentSource(target, sourceConnectionId, { reassertAfterPending: true })
+      : activateOnCurrentSource(target, sourceConnectionId)
 
-  void Promise.all([activateOnCurrentSource(target), shouldRememberStartupProfile])
+  void Promise.all([activation, shouldRememberStartupProfile])
     .then(([, shouldRemember]) => {
+      if (generation !== null && !isCurrentProfileSwitchGeneration(generation)) {
+        return undefined
+      }
+
+      const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+      const activeConnection = activeGatewayConnectionId()
+
+      const explicitSourceMismatch = sourceConnectionId !== null && activeConnection !== sourceConnectionId
+
+      if (generation !== null && (activeProfile !== target || explicitSourceMismatch)) {
+        clearProfileSwitchRestore(generation)
+
+        return undefined
+      }
+
+      if (restoreToken) {
+        const descriptor = $connection.get()
+
+        bindProfileSwitchRestore(restoreToken.generation, {
+          activationEpoch: gatewayActivationEpoch(),
+          descriptorConnectionId: descriptor?.connectionId ?? null,
+          descriptorProfile: descriptor?.profile ?? null,
+          liveGatewayConnectionId: activeConnection,
+          profile: activeProfile
+        })
+      }
+
       if (shouldRemember) {
         return window.hermesDesktop?.profile?.remember(target)
       }
@@ -795,6 +877,14 @@ export function selectProfile(name: string): void {
       return undefined
     })
     .catch((error: unknown) => {
+      if (generation !== null && !isCurrentProfileSwitchGeneration(generation)) {
+        return
+      }
+
+      if (generation !== null) {
+        clearProfileSwitchRestore(generation)
+      }
+
       if (!notifyRemoteOverrideAuthFailure(target, error)) {
         notifyError(error, `Failed to switch to profile "${target}"`)
       }
@@ -829,10 +919,12 @@ async function isLocalDesktopProfile(target: string): Promise<boolean> {
 // primary and explicit "local" source stay on the legacy profile-only path so
 // the main process can resolve a per-profile remote override before falling
 // back to a local backend.
-function activateOnCurrentSource(target: string): Promise<void> {
-  const connectionId = profilePickConnectionId()
-
-  return connectionId ? ensureGatewayAgent(connectionId, target) : ensureGatewayProfile(target)
+function activateOnCurrentSource(
+  target: string,
+  connectionId: null | string = profilePickConnectionId(),
+  profileOptions?: EnsureGatewayProfileOptions
+): Promise<void> {
+  return connectionId ? ensureGatewayAgent(connectionId, target) : ensureGatewayProfile(target, profileOptions)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse

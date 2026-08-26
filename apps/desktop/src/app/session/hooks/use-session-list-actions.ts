@@ -9,6 +9,7 @@ import {
   normalizeSessionSource
 } from '@/lib/session-source'
 import { gatewayActivationEpoch } from '@/store/gateway'
+import { $gatewaySwitching } from '@/store/gateway-switch'
 import {
   $pinnedSessionIds,
   $sessionsLimit,
@@ -225,16 +226,17 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
   /** Refresh every sidebar session slice without committing an obsolete profile response. */
   const refreshSessions = useCallback(
-    async (shouldPublish: () => boolean = () => true) => {
+    async (shouldPublish: () => boolean = () => true): Promise<boolean> => {
       const sessionProfile = sidebarProfileForScope(profileScope)
       const activationEpoch = gatewayActivationEpoch()
 
       if (!shouldPublish() || sidebarProfileForScope(profileScopeRef.current) !== sessionProfile) {
-        return
+        return false
       }
 
       const requestId = refreshSessionsRequestRef.current + 1
       refreshSessionsRequestRef.current = requestId
+      let committed = false
       // The loading flag exists to drive the initial skeletons (they only render
       // while the list is empty). Turn-complete / reconnect refreshes over a
       // populated list used to flip it true→false anyway, churning every
@@ -332,12 +334,14 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
           setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
           // Hit the cap → at least one platform may have more on disk than loaded.
           setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
+          committed = true
         }
       } finally {
-        // Request identity preserves the zero-argument refresh contract across a
-        // failed activation epoch; an explicit owner predicate is stronger and
-        // must never release a newer switch's loading barrier.
-        if (showLoading && shouldPublish() && refreshSessionsRequestRef.current === requestId) {
+        // Publication freshness and loading ownership are separate. A newer
+        // request takes loading ownership by request id; a connection switch
+        // takes it through the shared switch barrier. An activation epoch bump
+        // only makes this request's data stale.
+        if (showLoading && refreshSessionsRequestRef.current === requestId && !$gatewaySwitching.get()) {
           setSessionsLoading(false)
         }
       }
@@ -346,6 +350,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       if (shouldPublish() && sidebarProfileForScope(profileScopeRef.current) === sessionProfile) {
         void refreshCronJobs()
       }
+
+      return committed
     },
     [profileScope, refreshCronJobs]
   )

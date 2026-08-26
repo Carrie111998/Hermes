@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
 import { $cronJobs, setCronJobs } from '@/store/cron'
 import {
+  $gatewaySwitching,
   beginGatewaySwitch,
   endGatewaySwitch,
   recoverActiveSourceAfterFailedGatewaySwitch,
@@ -265,7 +266,7 @@ describe('refreshSessions identity + loading hygiene', () => {
     expect(loadingStates).toEqual([false, true, false])
   })
 
-  it('does not let a superseded owner publish or release a newer switch loading barrier', async () => {
+  it('releases its loading barrier when a guarded refresh is cancelled without a successor', async () => {
     const pending = deferred<SidebarSessionsResponse>()
     let ownsRefresh = true
 
@@ -277,47 +278,76 @@ describe('refreshSessions identity + loading hygiene', () => {
     expect($sessionsLoading.get()).toBe(true)
 
     ownsRefresh = false
-    setSessions([row('winner')])
-    setCronSessions([row('winner-cron', { source: 'cron' })])
-    setMessagingSessions([row('winner-message', { source: 'signal' })])
-    setMessagingTruncated(true)
-    setSessionProfilesTruncated({ winner: true })
-    setSessionProfilesUsage({ winner: { cost_usd: 2, tokens: 20 } })
-    setSessionsLoading(true)
+
+    let committed: boolean | undefined
 
     await act(async () => {
-      pending.resolve({
-        recents: {
-          profiles_truncated: { stale: true },
-          profiles_usage: { stale: { cost_usd: 1, tokens: 10 } },
-          sessions: [row('stale')]
-        },
-        cron: { sessions: [row('stale-cron', { source: 'cron' })] },
-        messaging: { sessions: [row('stale-message', { source: 'telegram' })] }
-      })
-      await refresh
+      pending.resolve(sidebar({ sessions: [] }))
+      committed = await refresh
     })
 
-    expect($sessions.get().map(session => session.id)).toEqual(['winner'])
-    expect($cronSessions.get().map(session => session.id)).toEqual(['winner-cron'])
-    expect($messagingSessions.get().map(session => session.id)).toEqual(['winner-message'])
-    expect($messagingTruncated.get()).toBe(true)
-    expect($sessionProfilesTruncated.get()).toEqual({ winner: true })
-    expect($sessionProfilesUsage.get()).toEqual({ winner: { cost_usd: 2, tokens: 20 } })
-    expect($sessionsLoading.get()).toBe(true)
+    expect(committed).toBe(false)
+    expect($sessions.get()).toEqual([])
+    expect($sessionsLoading.get()).toBe(false)
     expect(getCronJobs).not.toHaveBeenCalled()
   })
 
-  it('keeps failed-switch recovery from publishing through a newer switch', async () => {
-    const pending = deferred<SidebarSessionsResponse>()
+  it('does not let a superseded request publish or release a newer refresh loading barrier', async () => {
+    const stale = deferred<SidebarSessionsResponse>()
+    const successor = deferred<SidebarSessionsResponse>()
+    let ownsStaleRefresh = true
 
-    listSidebarSessions.mockReturnValue(pending.promise)
+    listSidebarSessions.mockReturnValueOnce(stale.promise).mockReturnValueOnce(successor.promise)
 
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+    const staleRefresh = result.current.refreshSessions(() => ownsStaleRefresh)
+
+    expect($sessionsLoading.get()).toBe(true)
+
+    ownsStaleRefresh = false
+    const successorRefresh = result.current.refreshSessions()
+
+    expect(listSidebarSessions).toHaveBeenCalledTimes(2)
+
+    let staleCommitted: boolean | undefined
+
+    await act(async () => {
+      stale.resolve(sidebar({ sessions: [row('stale')] }))
+      staleCommitted = await staleRefresh
+    })
+
+    expect(staleCommitted).toBe(false)
+    expect($sessions.get()).toEqual([])
+    expect($sessionsLoading.get()).toBe(true)
+    expect(getCronJobs).not.toHaveBeenCalled()
+
+    let successorCommitted: boolean | undefined
+
+    await act(async () => {
+      successor.resolve(sidebar({ sessions: [row('winner')] }))
+      successorCommitted = await successorRefresh
+    })
+
+    expect(successorCommitted).toBe(true)
+    expect($sessions.get().map(session => session.id)).toEqual(['winner'])
+    expect($sessionsLoading.get()).toBe(false)
+  })
+
+  it('keeps failed-switch recovery from publishing through a newer switch', async () => {
+    const recovery = deferred<SidebarSessionsResponse>()
+    const successor = deferred<SidebarSessionsResponse>()
+
+    listSidebarSessions.mockReturnValueOnce(recovery.promise).mockReturnValueOnce(successor.promise)
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+    let recoveryRefresh!: Promise<boolean>
 
     const off = registerGatewaySwitchLifecycle({
       beforeConnectionSwitch: () => undefined,
-      refreshSessions: result.current.refreshSessions
+      refreshSessions: async shouldPublish => {
+        recoveryRefresh = result.current.refreshSessions(shouldPublish)
+        await recoveryRefresh
+      }
     })
 
     let newer: number | undefined
@@ -332,9 +362,10 @@ describe('refreshSessions identity + loading hygiene', () => {
       // A newer switch owns the freshly wiped lists and loading barrier while
       // the failed switch's real sidebar publisher is still in flight.
       newer = beginGatewaySwitch()
+      const successorRefresh = result.current.refreshSessions()
 
       await act(async () => {
-        pending.resolve({
+        recovery.resolve({
           recents: {
             profiles_truncated: { stale: true },
             profiles_usage: { stale: { cost_usd: 1, tokens: 10 } },
@@ -343,7 +374,7 @@ describe('refreshSessions identity + loading hygiene', () => {
           cron: { sessions: [row('stale-cron', { source: 'cron' })] },
           messaging: { sessions: [row('stale-message', { source: 'telegram' })] }
         })
-        await pending.promise
+        await recoveryRefresh
       })
 
       expect($sessions.get()).toEqual([])
@@ -355,8 +386,72 @@ describe('refreshSessions identity + loading hygiene', () => {
       expect($sessionsLoading.get()).toBe(true)
       expect($cronJobs.get()).toEqual([])
       expect(getCronJobs).not.toHaveBeenCalled()
+
+      endGatewaySwitch(newer)
+      expect($gatewaySwitching.get()).toBe(false)
+
+      await act(async () => {
+        successor.resolve(sidebar({ sessions: [row('winner')] }))
+        await successorRefresh
+      })
+
+      expect($sessions.get().map(session => session.id)).toEqual(['winner'])
+      expect($sessionsLoading.get()).toBe(false)
     } finally {
       endGatewaySwitch(newer)
+      off()
+    }
+  })
+
+  it('does not let a stale pre-switch request lower the real gateway-switch barrier', async () => {
+    const stale = deferred<SidebarSessionsResponse>()
+    const recovery = deferred<SidebarSessionsResponse>()
+
+    listSidebarSessions.mockReturnValueOnce(stale.promise).mockReturnValueOnce(recovery.promise)
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+    const staleRefresh = result.current.refreshSessions()
+    let recoveryRefresh!: Promise<boolean>
+
+    const off = registerGatewaySwitchLifecycle({
+      beforeConnectionSwitch: () => undefined,
+      refreshSessions: async shouldPublish => {
+        recoveryRefresh = result.current.refreshSessions(shouldPublish)
+        await recoveryRefresh
+      }
+    })
+
+    let switchToken: number | undefined
+
+    try {
+      switchToken = beginGatewaySwitch()
+      gatewayScope.epoch += 1
+
+      expect($gatewaySwitching.get()).toBe(true)
+
+      await act(async () => {
+        stale.resolve(sidebar({ sessions: [row('stale')] }))
+        await staleRefresh
+      })
+
+      // The activation epoch rejects the pre-switch data, while the canonical
+      // switch barrier retains loading ownership until lifecycle recovery.
+      expect($sessions.get()).toEqual([])
+      expect($sessionsLoading.get()).toBe(true)
+
+      endGatewaySwitch(switchToken)
+      recoverActiveSourceAfterFailedGatewaySwitch(switchToken)
+      await vi.waitFor(() => expect(listSidebarSessions).toHaveBeenCalledTimes(2))
+
+      await act(async () => {
+        recovery.resolve(sidebar({ sessions: [row('winner')] }))
+        await recoveryRefresh
+      })
+
+      expect($sessions.get().map(session => session.id)).toEqual(['winner'])
+      expect($sessionsLoading.get()).toBe(false)
+    } finally {
+      endGatewaySwitch(switchToken)
       off()
     }
   })
@@ -365,25 +460,24 @@ describe('refreshSessions identity + loading hygiene', () => {
     const pending = deferred<SidebarSessionsResponse>()
     listSidebarSessions.mockReturnValue(pending.promise)
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
-
-    let refresh!: Promise<void>
-
-    act(() => {
-      refresh = result.current.refreshSessions()
-    })
+    const refresh = result.current.refreshSessions()
 
     expect($sessionsLoading.get()).toBe(true)
 
     // A source dial owns a new activation epoch even when it fails and leaves
     // the previous source active. Its in-flight session response is stale, but
-    // it still owns the initial loading state and must release that state.
+    // no connection switch took ownership of the initial loading state.
     gatewayScope.epoch += 1
+    expect($gatewaySwitching.get()).toBe(false)
+
+    let committed: boolean | undefined
 
     await act(async () => {
       pending.resolve(sidebar({ sessions: [row('stale')] }))
-      await refresh
+      committed = await refresh
     })
 
+    expect(committed).toBe(false)
     expect($sessions.get()).toEqual([])
     expect($sessionsLoading.get()).toBe(false)
   })
@@ -399,11 +493,14 @@ describe('refreshSessions batches slices into one request', () => {
 
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
+    let committed: boolean | undefined
+
     await act(async () => {
-      await result.current.refreshSessions()
+      committed = await result.current.refreshSessions()
     })
 
     // One batched call, not three separate listAllProfileSessions reads.
+    expect(committed).toBe(true)
     expect(listSidebarSessions).toHaveBeenCalledTimes(1)
     expect(listAllProfileSessions).not.toHaveBeenCalled()
 
@@ -441,16 +538,19 @@ describe('refreshSessions batches slices into one request', () => {
 
     rerender({ profileScope: 'personal' })
 
+    let committed: boolean | undefined
+
     await act(async () => {
-      await staleRefresh()
+      committed = await staleRefresh()
     })
 
+    expect(committed).toBe(false)
     expect(listSidebarSessions).not.toHaveBeenCalled()
   })
 
   it('keeps the committed profile active when a later render is discarded', async () => {
     const never = new Promise<never>(() => undefined)
-    let committedRefresh: (() => Promise<void>) | undefined
+    let committedRefresh: (() => Promise<boolean>) | undefined
 
     /** Expose only callbacks from committed renders; suspended renders are discarded. */
     function Harness({ profileScope, suspend }: { profileScope: string; suspend: boolean }) {

@@ -1,11 +1,13 @@
 import { type GatewayEvent, registryBackendScopeKey } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vitest'
 
 import { createSessionRpcDispatcher } from '@/app/contrib/session-rpc-dispatcher'
-import { getSession } from '@/hermes'
+import { useProfileSwitchContinuity } from '@/app/contrib/hooks/use-profile-switch-continuity'
+import { sessionRoute } from '@/app/routes'
+import { getSession, type SidebarSessionsRequest, type SidebarSessionsResponse } from '@/hermes'
 import {
   activeGateway,
   activeGatewayConnectionId,
@@ -19,10 +21,16 @@ import {
   $newChatConnectionId,
   $newChatProfile,
   $newChatRoute,
+  $freshSessionRequest,
   ensureGatewayAgent,
   newSessionInProfile,
   selectProfile
 } from '@/store/profile'
+import {
+  $profileSwitchRestoreToken,
+  _resetProfileSwitchBehaviorForTests,
+  setProfileSwitchBehavior
+} from '@/store/profile-switch-behavior'
 import {
   $activeSessionId,
   $connection,
@@ -37,11 +45,13 @@ import {
   setBusy,
   setConnection,
   setMessages,
+  setRememberedSessionId,
   setSelectedStoredSessionId,
   setSessions
 } from '@/store/session'
 import { foregroundSessionScopes } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
+import { makeSessionInfo } from '@/test/session-info'
 
 import type { ClientSessionState } from '../../types'
 
@@ -49,6 +59,7 @@ import { usePromptActions } from './use-prompt-actions'
 import { clearSingleFlightSessionResumeState } from './use-prompt-actions/single-flight-resume'
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 import { useSessionActions } from './use-session-actions'
+import { useSessionListActions } from './use-session-list-actions'
 import { useSessionStateCache } from './use-session-state-cache'
 
 // ── The real profile-rail reproduction (#94071, Sessions mode) ───────────────
@@ -109,6 +120,9 @@ let ownerPort = OMAR_PORT
  *  (the hint map is module state) can never satisfy another's assertions. */
 let mintedRuntimeId = RUNTIME_ID
 let mintedStoredId = STORED_ID
+const listSidebarSessions = vi.hoisted(() =>
+  vi.fn<(request: SidebarSessionsRequest) => Promise<SidebarSessionsResponse>>()
+)
 
 const sessionScoped = (params: unknown) =>
   typeof (params as { session_id?: unknown } | undefined)?.session_id === 'string'
@@ -199,6 +213,8 @@ vi.mock('@/hermes', async importOriginal => ({
   getSession: vi.fn(async () => {
     throw new Error('REST cross-profile probe must not be needed: the owner is known')
   }),
+  getCronJobs: vi.fn(async () => []),
+  listSidebarSessions: (request: SidebarSessionsRequest) => listSidebarSessions(request),
   setApiRequestConnection: vi.fn(),
   setApiRequestProfile: vi.fn()
 }))
@@ -265,19 +281,38 @@ interface HarnessHandle {
   ) => ClientSessionState
 }
 
+interface ContinuityHarnessOptions {
+  initialPathname: string
+  onNavigate: (pathname: string) => void
+}
+
 /** The window's real hook stack, wired the way contrib/wiring wires it. */
 function Harness({
   ambientRequest,
+  continuity,
   onReady
 }: {
   ambientRequest: MockGateway['request']
+  continuity?: ContinuityHarnessOptions
   onReady: (h: HarnessHandle) => void
 }) {
   const activeSessionId = useStore($activeSessionId)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const connection = useStore($connection)
+  const freshSessionRequest = useStore($freshSessionRequest)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const [locationPathname, setLocationPathname] = useState(continuity?.initialPathname ?? '/')
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
-
+  const lastFreshSessionRequestRef = useRef(freshSessionRequest)
+  const { refreshSessions: refreshContinuitySessions } = useSessionListActions({ profileScope: activeGatewayProfile })
+  const navigate = useCallback(
+    (pathname: string) => {
+      setLocationPathname(pathname)
+      continuity?.onNavigate(pathname)
+    },
+    [continuity]
+  )
   const cache = useSessionStateCache({
     activeSessionId,
     busyRef,
@@ -311,7 +346,7 @@ function Harness({
     ensureSessionState: cache.ensureSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
-    navigate: vi.fn() as never,
+    navigate: navigate as never,
     requestGateway,
     resetViewSync: cache.resetViewSync,
     runtimeIdByStoredSessionIdRef: cache.runtimeIdByStoredSessionIdRef,
@@ -346,6 +381,25 @@ function Harness({
   const { submitText } = promptActions
 
   useEffect(() => {
+    if (freshSessionRequest === lastFreshSessionRequestRef.current) {
+      return
+    }
+
+    lastFreshSessionRequestRef.current = freshSessionRequest
+    sessionActions.startFreshSessionDraft({ profileSwitchRequestSequence: freshSessionRequest })
+  }, [freshSessionRequest, sessionActions.startFreshSessionDraft])
+
+  useProfileSwitchContinuity({
+    activeProfile: activeGatewayProfile,
+    descriptorConnectionId: connection?.connectionId ?? null,
+    descriptorProfile: connection?.profile ?? null,
+    locationPathname,
+    navigate,
+    profileReady: true,
+    refreshSessions: refreshContinuitySessions
+  })
+
+  useEffect(() => {
     onReady({
       busyRef,
       bindings: () => ({
@@ -375,6 +429,12 @@ describe('profile rail: a fresh Omar chat keeps its exact registry owner across 
     ownerPort = OMAR_PORT
     mintedRuntimeId = RUNTIME_ID
     mintedStoredId = STORED_ID
+    listSidebarSessions.mockReset()
+    listSidebarSessions.mockResolvedValue({
+      cron: { sessions: [] },
+      messaging: { sessions: [] },
+      recents: { sessions: [] }
+    })
     clearSingleFlightSessionResumeState()
     // Wired exactly as useGatewayBoot: the published active descriptor carries
     // a registry-backed primary's source identity across a renderer reload.
@@ -395,6 +455,7 @@ describe('profile rail: a fresh Omar chat keeps its exact registry owner across 
     $newChatProfile.set(null)
     $newChatRoute.set(null)
     $newChatConnectionId.set(null)
+    _resetProfileSwitchBehaviorForTests()
     _resetSessionOwnerHintsForTests({ storage: true })
   })
 
@@ -408,9 +469,77 @@ describe('profile rail: a fresh Omar chat keeps its exact registry owner across 
     $newChatProfile.set(null)
     $newChatRoute.set(null)
     $newChatConnectionId.set(null)
+    setRememberedSessionId(null, 'omar')
+    _resetProfileSwitchBehaviorForTests()
     $activeGatewayProfile.set('default')
     vi.clearAllMocks()
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+  })
+
+  it('drives selectProfile through fresh publication, exact activation, guarded refresh, and native restore', async () => {
+    const sourceSessionId = 'source-session'
+    const targetSessionId = 'omar-restored-session'
+    const navigation: string[] = []
+    const primary = makePrimary()
+    const desktop = window.hermesDesktop!
+    const getConnectionFor = desktop.getConnectionFor!
+
+    desktop.getConnectionFor = vi.fn(async (route: { connectionId: string; profile: string }) => ({
+      ...(await getConnectionFor(route)),
+      connectionId: route.connectionId,
+      mode: 'remote' as const,
+      profile: route.profile,
+      registryScoped: true
+    }))
+
+    setPrimaryGateway(primary as never, 'default')
+    setConnection({ connectionId: SOURCE_ID, mode: 'remote', profile: 'default' } as never)
+    setSessions([makeSessionInfo({ connection_id: SOURCE_ID, id: sourceSessionId, profile: 'default' })])
+    listSidebarSessions.mockResolvedValue({
+      cron: { sessions: [] },
+      messaging: { sessions: [] },
+      recents: {
+        profiles_truncated: { omar: false },
+        profiles_usage: { omar: { cost_usd: 0, tokens: 0 } },
+        sessions: [makeSessionInfo({ connection_id: SOURCE_ID, id: targetSessionId, profile: 'omar' })]
+      }
+    })
+    setSelectedStoredSessionId(sourceSessionId)
+    setRememberedSessionId(targetSessionId, 'omar')
+    setProfileSwitchBehavior('restore_last_session')
+
+    render(
+      <Harness
+        ambientRequest={primary.request}
+        continuity={{
+          initialPathname: sessionRoute(sourceSessionId),
+          onNavigate: pathname => navigation.push(pathname)
+        }}
+        onReady={() => undefined}
+      />
+    )
+
+    await act(async () => undefined)
+    selectProfile('omar')
+
+    await waitFor(() => expect(activeGatewayProfileKey()).toBe('omar'))
+    await waitFor(() => expect(navigation).toContain(sessionRoute(targetSessionId)))
+
+    expect(navigation[0]).toBe('/')
+    expect(navigation.at(-1)).toBe(sessionRoute(targetSessionId))
+    expect(listSidebarSessions).toHaveBeenCalledOnce()
+    expect(listSidebarSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recentsProfile: 'omar'
+      })
+    )
+    expect($sessions.get().find(session => session.id === targetSessionId)).toMatchObject({
+      connection_id: SOURCE_ID,
+      profile: 'omar'
+    })
+    expect($profileSwitchRestoreToken.get()).toBeNull()
+    expect(activeGatewayConnectionId()).toBe(SOURCE_ID)
+    expect($connection.get()?.connectionId).toBe(SOURCE_ID)
   })
 
   /** Boot the exact field state: remote primary on `default`, `homelab` as

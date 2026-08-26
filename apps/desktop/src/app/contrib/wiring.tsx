@@ -225,6 +225,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const messagingSessions = useStore($messagingSessions)
   const sessions = useStore($sessions)
   const activeConnectionId = useStore($activeConnectionId)
+  const connection = useStore($connection)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
   const boot = useStore($desktopBoot)
@@ -310,6 +311,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
     useSessionListActions({ profileScope })
+  const refreshSessionsLegacy = useCallback(
+    async (shouldPublish?: () => boolean): Promise<void> => {
+      await refreshSessions(shouldPublish)
+    },
+    [refreshSessions]
+  )
 
   const updateActiveSessionRuntimeInfo = useCallback(
     (info: { branch?: string; cwd?: string }) => {
@@ -444,7 +451,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     hydrateFromStoredSession,
     queryClient,
     refreshHermesConfig,
-    refreshSessions,
+    refreshSessions: refreshSessionsLegacy,
     sessionStateByRuntimeIdRef,
     updateSessionState
   })
@@ -517,7 +524,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastFreshRef.current = freshSessionRequest
-    startFreshSessionDraft()
+    startFreshSessionDraft({ profileSwitchRequestSequence: freshSessionRequest })
   }, [freshSessionRequest, startFreshSessionDraft])
 
   // Swapping the live gateway to another source or profile must re-pull that
@@ -599,12 +606,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       const branched = await branchCurrentSession(messageId)
 
       if (branched) {
-        await refreshSessions().catch(() => undefined)
+        await refreshSessionsLegacy().catch(() => undefined)
       }
 
       return branched
     },
-    [branchCurrentSession, refreshSessions]
+    [branchCurrentSession, refreshSessionsLegacy]
   )
 
   const handleSkinCommand = useSkinCommand()
@@ -630,7 +637,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     getRouteToken,
     handleSkinCommand,
     openMemoryGraph: openStarmap,
-    refreshSessions,
+    refreshSessions: refreshSessionsLegacy,
     requestGateway,
     resumeStoredSession: resumeSession,
     runtimeIdByStoredSessionIdRef,
@@ -793,7 +800,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       gatewayRef.current = g
     },
     refreshHermesConfig,
-    refreshSessions
+    refreshSessions: refreshSessionsLegacy
   })
 
   useEffect(() => {
@@ -838,6 +845,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   useDesktopIntegrations({
     activeProfile: normalizeProfileKey(activeGatewayProfile),
     chatOpen,
+    descriptorConnectionId: activeConnectionId,
+    descriptorProfile: connection?.profile ?? null,
     hasPreview: Boolean(previewTarget),
     locationPathname: location.pathname,
     navigate,
@@ -1084,7 +1093,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // (preview's monitor/devtools cluster, …) arrive as registry contributions.
   const leftTitlebarTools = useTitlebarToolContributions('left')
   const rightTitlebarTools = useTitlebarToolContributions('right')
-  const connection = useStore($connection)
   const controlsPos = titlebarControlsPosition(connection?.windowButtonPosition, Boolean(connection?.isFullscreen))
   // Windows/WSLg reserve native min/max/close on the right (AppShell parity:
   // prefer the live WCO measurement, fall back to the static reservation).
