@@ -232,6 +232,35 @@ describe("ChatVoiceControl browser speech input", () => {
     expect(bridge.messages.at(-1)).toBe(JSON.stringify({ version: 1, command: "cancel" }));
   });
 
+  it("rejects every retained native callback after timeout fallback", async () => {
+    const bridge = new FakeNativeBridge();
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { submit, surface } = await render();
+    await act(async () => surface.click());
+    const staleHandler = bridge.onmessage;
+
+    await act(async () => vi.advanceTimersByTime(1_000));
+    expect(FakeRecognition.instances).toHaveLength(1);
+    const displayAfterFallback = host.textContent;
+
+    for (const [event, text] of [
+      ["availability", "on-device"],
+      ["ready", undefined],
+      ["partial", "stale partial"],
+      ["final", "stale final"],
+      ["error", "stale error"],
+    ] as const) {
+      await act(async () => staleHandler?.(new MessageEvent("message", {
+        data: JSON.stringify({ version: 1, event, ...(text === undefined ? {} : { text }) }),
+      })));
+    }
+
+    expect(host.textContent).toBe(displayAfterFallback);
+    expect(submit).not.toHaveBeenCalled();
+    expect(FakeRecognition.instances).toHaveLength(1);
+    expect(FakeRecognition.instances[0].start).toHaveBeenCalledOnce();
+  });
+
   it.each(["ended", "error"])("falls back when native emits %s while listening", async (event) => {
     const bridge = new FakeNativeBridge();
     Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });

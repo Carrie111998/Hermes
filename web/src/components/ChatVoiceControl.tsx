@@ -189,7 +189,7 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     nativeAvailableRef.current = false;
     nativeSelectedRef.current = false;
     bridge.onmessage = (message) => {
-      if (generation !== generationRef.current || !listeningRef.current) return;
+      if (nativeRef.current !== bridge || generation !== generationRef.current || !listeningRef.current) return;
       let event: NativeVoiceEvent;
       try {
         event = JSON.parse(message.data) as NativeVoiceEvent;
