@@ -27,10 +27,10 @@ export function transcriptBackfillAvailable(
   return Boolean(transcriptTailState(storedSessionId, profile)?.possiblyTruncated)
 }
 
-/** Strip renderer-only timing before deterministic semantic serialization. */
-function durablePartValue(value: unknown): unknown {
+/** Strip renderer-only timing from each part before deterministic semantic serialization. */
+function durablePartValue(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) {
-    return value.map(durablePartValue)
+    return value.map(entry => durablePartValue(entry, depth + 1))
   }
 
   if (!value || typeof value !== 'object') {
@@ -39,9 +39,9 @@ function durablePartValue(value: unknown): unknown {
 
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
-      .filter(([key]) => key !== 'timestamp' && key !== 'completedAt')
+      .filter(([key]) => depth !== 1 || (key !== 'timestamp' && key !== 'completedAt'))
       .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, durablePartValue(entry)])
+      .map(([key, entry]) => [key, durablePartValue(entry, depth + 1)])
   )
 }
 
@@ -170,8 +170,19 @@ export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], pre
   // Align the longest previous suffix segment with the refreshed prefix. A
   // first-row reverse match duplicates repeated runs; sequence alignment maps
   // all N refreshed copies onto the corresponding N previous occurrences.
-  for (let index = 0; index < previous.length; index += 1) {
-    let overlap = 0
+  const refreshedHead = refreshedTail[0]!
+
+  // Newest-first preserves the existing tie-break while making the common
+  // exact-tail anchor an early exit. Non-candidates never enter the overlap
+  // scan, so unrelated long transcripts remain linear.
+  for (let index = previous.length - 1; index >= 0; index -= 1) {
+    const previousHead = previous[index]!
+
+    if (!sameTranscriptOccurrence(previousHead, refreshedHead)) {
+      continue
+    }
+
+    let overlap = 1
 
     while (
       index + overlap < previous.length &&
@@ -182,20 +193,23 @@ export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], pre
     }
 
     const startsExact =
-      overlap > 0 &&
-      ((previous[index]!.rowId !== undefined &&
-        refreshedTail[0]!.rowId !== undefined &&
-        previous[index]!.rowId === refreshedTail[0]!.rowId) ||
-        previous[index]!.id === refreshedTail[0]!.id)
+      (previousHead.rowId !== undefined &&
+        refreshedHead.rowId !== undefined &&
+        previousHead.rowId === refreshedHead.rowId) ||
+      previousHead.id === refreshedHead.id
 
     if (
       overlap > longestOverlap ||
-      (overlap > 0 && overlap === longestOverlap && startsExact && !bestStartsExact) ||
-      (overlap > 0 && overlap === longestOverlap && startsExact === bestStartsExact && index > anchor)
+      (overlap === longestOverlap && startsExact && !bestStartsExact) ||
+      (overlap === longestOverlap && startsExact === bestStartsExact && index > anchor)
     ) {
       anchor = index
       longestOverlap = overlap
       bestStartsExact = startsExact
+    }
+
+    if (longestOverlap === refreshedTail.length && bestStartsExact) {
+      break
     }
   }
 

@@ -202,6 +202,20 @@ describe('mergeOlderTranscriptPage', () => {
 
     expect(mergeOlderTranscriptPage(existing, older)).toHaveLength(2)
   })
+  it('keeps timestamp-like keys inside tool arguments as semantic payload', () => {
+    const toolPart = (timestamp: number, completedAt: number) =>
+      ({
+        args: { timestamp, nested: { completedAt } },
+        toolCallId: 'same-call',
+        toolName: 'terminal',
+        type: 'tool-call'
+      }) as ChatMessage['parts'][number]
+
+    const existing = [{ ...chat('tool-new', 20), timestamp: 1_700_000_000, parts: [toolPart(10, 20)] }]
+    const older = [{ ...chat('tool-old', 2), timestamp: 1_700_000_000, parts: [toolPart(11, 21)] }]
+
+    expect(mergeOlderTranscriptPage(existing, older)).toHaveLength(2)
+  })
 
   it('keeps reference identity when every older row is already present', () => {
     const existing = [chat('a', 1), chat('b', 2)]
