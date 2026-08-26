@@ -34,6 +34,7 @@ import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { newSessionTitle, sessionTitle } from '@/lib/chat-runtime'
+import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -390,15 +391,17 @@ export function tileStoredRow(storedSessionId: string): SessionInfo | undefined 
  *  skipping the re-register that hands the tab back to this string. */
 function tileTitle(storedSessionId: string): string {
   const stored = tileStoredRow(storedSessionId)
+  const explicit = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.workspaceTabTitle
 
-  return stored ? sessionTitle(stored) : newSessionTitle()
+  return stored ? sessionTitle(stored) : explicit || newSessionTitle()
 }
 
 /** The `@session` link payload for a tile tab drag — id + owning profile + title.
  *  Resolved at drag time, so an unsent tab drags under its draft name. */
 function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = tileStoredRow(storedSessionId)
-  const title = stored ? sessionTitle(stored) : draftTitleFor(storedSessionId) || newSessionTitle()
+  const explicit = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.workspaceTabTitle
+  const title = stored ? sessionTitle(stored) : explicit || draftTitleFor(storedSessionId) || newSessionTitle()
 
   return { id: storedSessionId, profile: stored?.profile ?? '', title }
 }
