@@ -1770,7 +1770,29 @@ def _open_continuable_cron_thread(
         if future is None:
             return None
         new_thread_id = future.result(timeout=30)
-        return str(new_thread_id) if new_thread_id else None
+        if not new_thread_id:
+            return None
+
+        # Discord public threads remain visible in the parent channel, but their
+        # creator is the bot. Explicitly add the user who scheduled a briefing
+        # so it also appears in that user's thread membership list.
+        origin = job.get("origin") or {}
+        origin_user_id = origin.get("user_id") if isinstance(origin, dict) else None
+        add_member = getattr(adapter, "add_thread_member", None)
+        if origin_user_id and callable(add_member) and asyncio.iscoroutinefunction(add_member):
+            try:
+                member_coro = add_member(str(new_thread_id), str(origin_user_id))
+                member_future = safe_schedule_threadsafe(member_coro, loop)  # type: ignore[arg-type]
+                if member_future is not None:
+                    member_future.result(timeout=30)
+            except Exception as member_error:
+                # Membership is a usability enhancement, not a reason to lose
+                # an otherwise valid briefing delivery.
+                logger.warning(
+                    "Job '%s': could not add origin user to briefing thread %s: %s",
+                    job.get("id", "?"), new_thread_id, member_error,
+                )
+        return str(new_thread_id)
     except Exception as e:
         logger.debug(
             "Job '%s': create_handoff_thread failed on %s — falling back to "

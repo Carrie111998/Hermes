@@ -104,6 +104,18 @@ def resolve_delivery_transport(
     live_adapters = adapters or {}
     native = live_adapters.get(platform)
     native_config = config.platforms.get(platform)
+
+    # Platform enums can be reconstructed while a gateway stays alive (notably
+    # after an in-place update or plugin reload). Dict lookup then misses the
+    # connected native adapter although it is present under an equivalent enum
+    # instance. Resolve by the stable platform value as a compatibility fallback
+    # so cron keeps using the live adapter — required for per-run Discord threads.
+    if native is None:
+        for adapter_platform, candidate in live_adapters.items():
+            if str(getattr(adapter_platform, "value", adapter_platform)).lower() == platform.value.lower():
+                native = candidate
+                break
+
     # Preserve DeliveryRouter's historical support for explicitly supplied live
     # adapters with no config block, but never let an explicitly disabled native
     # adapter shadow an enabled Relay transport.

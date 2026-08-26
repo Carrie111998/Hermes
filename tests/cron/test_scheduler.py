@@ -2311,6 +2311,33 @@ class TestCronDeliveryMirror:
         assert tid == "9001"
 
 
+    def test_open_thread_adds_origin_user_as_member(self):
+        """A Discord briefing thread explicitly includes the scheduling user."""
+        from cron.scheduler import _open_continuable_cron_thread
+        from concurrent.futures import Future
+        import asyncio
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value="9001")
+        adapter.add_thread_member = AsyncMock(return_value=True)
+
+        def _run_now(coro, _loop):
+            future = Future()
+            future.set_result(asyncio.run(coro))
+            return future
+
+        job = {
+            "id": "j1",
+            "name": "Brief",
+            "origin": {"user_id": "1505552312561832006"},
+        }
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_run_now):
+            tid = _open_continuable_cron_thread(job, adapter, "123", loop=MagicMock())
+
+        assert tid == "9001"
+        adapter.add_thread_member.assert_awaited_once_with("9001", "1505552312561832006")
+
+
     def test_seed_thread_session_creates_session_and_mirrors(self):
         """Seeding a freshly-opened thread creates the thread-keyed session via
         the adapter's live store and appends the brief via mirror_to_session."""

@@ -7417,6 +7417,26 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
+    async def add_thread_member(self, thread_id: str, user_id: str) -> bool:
+        """Add a user to a public Discord thread created by Hermes."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        try:
+            thread = self._client.get_channel(int(thread_id))
+            if thread is None:
+                thread = await self._client.fetch_channel(int(thread_id))
+            add_user = getattr(thread, "add_user", None)
+            if not callable(add_user):
+                return False
+            await add_user(discord.Object(id=int(user_id)))
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Could not add user %s to thread %s: %s",
+                self.name, user_id, thread_id, exc,
+            )
+            return False
+
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
     ) -> str:
