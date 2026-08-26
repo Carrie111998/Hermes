@@ -92,6 +92,51 @@ class TestMaybeApplyCodexAppServerRuntime:
 class TestCodexAppServerModule:
     """Module-surface tests for the JSON-RPC speaker. Don't require codex CLI."""
 
+    def test_initialize_default_client_info_uses_hermes_version(self, monkeypatch):
+        from agent.transports import codex_app_server as cas
+
+        calls = []
+        client = object.__new__(cas.CodexAppServerClient)
+        client._initialized = False
+        monkeypatch.setattr(
+            client,
+            "request",
+            lambda method, params, timeout: (
+                calls.append((method, params, timeout))
+                or {"userAgent": "codex_cli_rs/0.229.2"}
+            ),
+        )
+        monkeypatch.setattr(
+            client, "notify", lambda method: calls.append((method,))
+        )
+        monkeypatch.setattr(cas, "_get_hermes_client_version", lambda: "0.20.5")
+
+        result = client.initialize()
+
+        assert result == {"userAgent": "codex_cli_rs/0.229.2"}
+        assert calls == [
+            (
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "hermes",
+                        "title": "Hermes Agent",
+                        "version": "0.20.5",
+                    },
+                    "capabilities": {},
+                },
+                10.0,
+            ),
+            ("initialized",),
+        ]
+        assert client._initialized is True
+
+    def test_client_version_comes_from_hermes_package_constant(self, monkeypatch):
+        import hermes_cli
+        from agent.transports import codex_app_server as cas
+
+        monkeypatch.setattr(hermes_cli, "__version__", "9.8.7")
+        assert cas._get_hermes_client_version() == "9.8.7"
 
 
 

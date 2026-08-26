@@ -32,6 +32,21 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+def _get_hermes_client_version() -> str:
+    """Return the Hermes version advertised by the app-server client.
+
+    ``clientInfo`` identifies the process connecting to Codex, which is Hermes,
+    rather than the Codex server executable. Use the CLI package constant first
+    because source and editable installs can retain stale distribution metadata.
+    """
+    try:
+        from hermes_cli import __version__
+
+        return __version__
+    except Exception:  # pragma: no cover - defensive import boundary
+        return "0.0.0"
+
+
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -70,11 +85,14 @@ class CodexAppServerClient:
 
     def __init__(
         self,
-        codex_bin: str = "codex",
+        codex_bin: Optional[str] = None,
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
     ) -> None:
+        from agent.codex_version import resolve_codex_executable
+
+        codex_bin = resolve_codex_executable(codex_bin)
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
@@ -161,7 +179,7 @@ class CodexAppServerClient:
         self,
         client_name: str = "hermes",
         client_title: str = "Hermes Agent",
-        client_version: str = "0.1",
+        client_version: Optional[str] = None,
         capabilities: Optional[dict] = None,
         timeout: float = 10.0,
     ) -> dict:
@@ -169,6 +187,8 @@ class CodexAppServerClient:
         InitializeResponse (userAgent, codexHome, platformFamily, platformOs)."""
         if self._initialized:
             raise RuntimeError("already initialized")
+        if client_version is None:
+            client_version = _get_hermes_client_version()
         params = {
             "clientInfo": {
                 "name": client_name,
@@ -385,11 +405,15 @@ def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:
 
 
 def check_codex_binary(
-    codex_bin: str = "codex", min_version: tuple[int, int, int] = MIN_CODEX_VERSION
+    codex_bin: Optional[str] = None,
+    min_version: tuple[int, int, int] = MIN_CODEX_VERSION,
 ) -> tuple[bool, str]:
     """Verify codex CLI is installed and meets minimum version.
 
     Returns (ok, message). Used by setup wizard and runtime startup."""
+    from agent.codex_version import resolve_codex_executable
+
+    codex_bin = resolve_codex_executable(codex_bin)
     try:
         proc = subprocess.run(
             [codex_bin, "--version"],

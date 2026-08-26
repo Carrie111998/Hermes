@@ -2716,8 +2716,16 @@ def _fetch_codex_oauth_context_lengths_with_source(
 
     try:
         _ensure_requests()
+        from urllib.parse import quote
+
+        from agent.codex_version import get_codex_cli_version
+
+        client_version = quote(get_codex_cli_version(), safe=".-")
         resp = requests.get(
-            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+            (
+                "https://chatgpt.com/backend-api/codex/models"
+                f"?client_version={client_version}"
+            ),
             headers=headers,
             timeout=(5, 10),
             verify=_resolve_requests_verify(),

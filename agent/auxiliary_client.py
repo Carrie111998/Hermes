@@ -1238,30 +1238,32 @@ def _is_official_codex_base_url(base_url: str) -> bool:
         return False
 
 
-def _codex_cloudflare_headers(
-    access_token: str, *, base_url: str = _CODEX_AUX_BASE_URL,
+def _codex_backend_headers(
+    access_token: str,
+    *,
+    base_url: str = _CODEX_AUX_BASE_URL,
 ) -> Dict[str, str]:
     """Identity and account headers for chatgpt.com/backend-api/codex.
 
     OpenAI requires third-party harnesses to identify themselves. Requests to
-    the official endpoint always send Hermes' originator and version. Custom
+    the official endpoint retain Hermes' originator while advertising the exact
+    installed Codex executable version in the CLI-shaped user agent. Custom
     endpoints retain the existing compatibility identity. In either case,
     preserve ``ChatGPT-Account-ID`` from the OAuth JWT's
     ``chatgpt_account_id`` claim.
 
-    Malformed tokens are tolerated — we drop the account-ID header rather than
-    raise, so a bad token still surfaces as an auth error (401) instead of a
-    crash at client construction.
+    Malformed tokens are tolerated. We drop the account-ID header rather than
+    raise, so a bad token still surfaces as an auth error at request time.
     """
     headers = {
         "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
         "originator": "codex_cli_rs",
     }
     if _is_official_codex_base_url(base_url):
-        from hermes_cli import __version__
+        from agent.codex_version import get_codex_cli_version
 
         headers.update({
-            "User-Agent": f"HermesAgent/{__version__}",
+            "User-Agent": f"codex_cli_rs/{get_codex_cli_version()} (Hermes Agent)",
             "originator": "hermes-agent",
         })
     if not isinstance(access_token, str) or not access_token.strip():
@@ -1281,13 +1283,20 @@ def _codex_cloudflare_headers(
     return headers
 
 
+def _codex_cloudflare_headers(
+    access_token: str, *, base_url: str = _CODEX_AUX_BASE_URL,
+) -> Dict[str, str]:
+    """Compatibility alias for the centralized Codex backend headers."""
+    return _codex_backend_headers(access_token, base_url=base_url)
+
+
 def _apply_required_codex_headers(
     client_kwargs: Dict[str, Any], *, access_token: str, base_url: str,
 ) -> None:
     """Keep required Codex identity after user/provider header overrides."""
     if not _is_official_codex_base_url(base_url):
         return
-    required = _codex_cloudflare_headers(access_token, base_url=base_url)
+    required = _codex_backend_headers(access_token, base_url=base_url)
     required_names = {name.lower() for name in required}
     existing = client_kwargs.get("default_headers") or {}
     client_kwargs["default_headers"] = {

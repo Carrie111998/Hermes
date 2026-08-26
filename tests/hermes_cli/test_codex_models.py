@@ -98,14 +98,22 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
                 ]
             }
 
+    captured = {}
+
     class _FakeHttpx:
         @staticmethod
         def get(url, headers=None, timeout=None):
+            captured["url"] = url
             return _FakeResp()
 
     monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    monkeypatch.setattr(
+        "agent.codex_version.get_codex_cli_version", lambda: "0.231.4"
+    )
 
     models = codex_models._fetch_models_from_api(access_token="tok")
+
+    assert captured["url"].endswith("?client_version=0.231.4")
 
     assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
