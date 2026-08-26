@@ -371,7 +371,7 @@ export const ru = defineLocale({
 
   language: {
     label: 'Язык',
-    description: 'Выберите язык интерфейса рабочего стола.',
+    description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.',
     saving: 'Сохранение…',
     saveError: 'Не удалось обновить язык',
     switchTo: 'Сменить язык',
@@ -432,7 +432,7 @@ export const ru = defineLocale({
       },
       installModal: {
         title: 'Отправить диагностику в Nous',
-        description: 'Выберите язык интерфейса рабочего стола.',
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.',
         repoLabel: 'Репозиторий',
         includesHeading: 'Этот пакет включает',
         agentLabel: 'Плагин агента',
@@ -473,31 +473,31 @@ export const ru = defineLocale({
       kinds: {
         approval: {
           label: 'Требуется подтверждение',
-          description: 'Выберите язык интерфейса рабочего стола.'
+          description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
         },
         input: {
           label: 'Требуется ввод',
-          description: 'Выберите язык интерфейса рабочего стола.'
+          description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
         },
         turnDone: {
           label: 'Ответ готов',
-          description: 'Выберите язык интерфейса рабочего стола.'
+          description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
         },
         turnError: {
           label: 'Ход не удался',
-          description: 'Выберите язык интерфейса рабочего стола.'
+          description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
         },
         backgroundDone: {
           label: 'Фоновая задача завершена',
-          description: 'Выберите язык интерфейса рабочего стола.'
+          description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
         },
         credits: {
           label: 'Оповещения о кредитах',
-          description: 'Выберите язык интерфейса рабочего стола.'
+          description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
         },
         plugin: {
           label: 'Уведомления плагинов',
-          description: 'Выберите язык интерфейса рабочего стола.'
+          description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
         }
       },
       test: 'Отправить тестовое уведомление',
@@ -1111,7 +1111,7 @@ export const ru = defineLocale({
       noKeysMatch: 'Нет провайдеров по вашему запросу.',
       localEndpoint: {
         title: 'Отправить диагностику в Nous',
-        description: 'Выберите язык интерфейса рабочего стола.'
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
       },
       loading: 'Загрузка провайдеров…'
     },
@@ -1819,21 +1819,29 @@ export const ru = defineLocale({
     failedExport: 'Не удалось экспортировать профиль',
     allProfiles: 'Все профили',
     showAllProfiles: 'Показать все профили',
-    switchToProfile: name => `Переключить to ${name}`,
-    switchToConnection: name => `Переключить to ${name}`,
+    switchToProfile: name => `Переключиться на ${name}`,
+    switchToConnection: name => `Переключиться на ${name}`,
     switchConnectionFailed: name => `Не удалось подключиться к ${name}`,
     manageProfiles: 'Управление профилями…',
     connectGateway: 'Управление шлюзами…',
+    fleet: {
+      allOnGateway: 'Все профили на этом шлюзе',
+      gateway: gateway => `Профили на ${gateway}`,
+      gatewayUnreachable: gateway => `${gateway} · недоступен`,
+      onGateway: (name, gateway) => `${name} · ${gateway}`,
+      switchTo: (name, gateway) => `Переключиться на ${name} на ${gateway}`,
+      deleteOn: gateway => ` на ${gateway}`
+    },
     remoteOverride: {
       menuItem: 'Подключиться к удалённому хосту…',
       badge: (host: string) => `Работает на ${host}`,
-      title: (profile: string) => `Connect ${profile} to a remote host`,
-      description: 'Выберите язык интерфейса рабочего стола.',
+      title: (profile: string) => `Подключить ${profile} к удалённому хосту`,
+      description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.',
       urlLabel: 'Удалённый адрес',
       urlPlaceholder: 'https://hermes.example.com',
       urlInvalid: 'Введите полный адрес, начинающийся с http:// или https://',
       tokenLabel: 'Токен доступа',
-      tokenPlaceholder: 'Вставить the remote сессия token',
+      tokenPlaceholder: 'Вставьте токен удалённой сессии',
       tokenSavedHint: 'Токен уже сохранён. Оставьте пустым, чтобы сохранить.',
       plainTextOptIn:
         'На этом компьютере нет защищённого хранилища ключей, поэтому токен будет сохранён незашифрованным на диске. Сохранить всё равно?',
@@ -2449,17 +2457,17 @@ export const ru = defineLocale({
     snippets: {
       codeReview: {
         label: 'Ревью кода',
-        description: 'Выберите язык интерфейса рабочего стола.',
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.',
         text: 'Пожалуйста, проверьте это на баги, регрессии и отсутствующие тесты.'
       },
       implementationPlan: {
         label: 'План реализации',
-        description: 'Выберите язык интерфейса рабочего стола.',
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.',
         text: 'Пожалуйста, составьте краткий план реализации перед изменением кода.'
       },
       explainThis: {
         label: 'Объясни это',
-        description: 'Выберите язык интерфейса рабочего стола.',
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.',
         text: 'Пожалуйста, объясните, как это работает, и укажите ключевые файлы.'
       }
     }
@@ -2698,18 +2706,18 @@ export const ru = defineLocale({
     apiKeyOptions: {
       fireworks: {
         short: 'direct модель API',
-        description: 'Выберите язык интерфейса рабочего стола.'
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
       },
       openrouter: {
         short: 'один ключ, много моделей',
-        description: 'Выберите язык интерфейса рабочего стола.'
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
       },
       openai: { short: 'модели класса GPT', description: 'Прямой доступ к моделям OpenAI.' },
       gemini: { short: 'модели Gemini', description: 'Прямой доступ к моделям Google Gemini.' },
       xai: { short: 'модели Grok', description: 'Прямой доступ к моделям xAI Grok.' },
       local: {
         short: 'самостоятельный хостинг',
-        description: 'Выберите язык интерфейса рабочего стола.'
+        description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.'
       }
     },
     backToSignIn: 'Назад к входу',
@@ -3393,6 +3401,7 @@ export const ru = defineLocale({
     cwdStagedTitle: 'Рабочая директория подготовлена',
     cwdStagedMessage: 'Перезапустите бэкенд рабочего стола, чтобы применить изменения cwd к активной сессии.',
     modelSwitchFailed: 'Не удалось переключить модель',
+    hydrationSyncing: (profile: string) => `Синхронизация ${profile}\u2026`,
     sessionExported: 'Сессия экспортирована',
     sessionExportFailed: 'Не удалось экспортировать сессию',
     imageSaved: 'Изображение сохранено',
@@ -3442,7 +3451,7 @@ export const ru = defineLocale({
     },
     sidebar: {
       title: 'Отправить диагностику в Nous',
-      description: 'Выберите язык интерфейса рабочего стола.',
+      description: 'Сессии этого профиля будут выполняться на удалённом Hermes, а не на этом компьютере.',
       toggle: open => `${open ? 'Показать' : 'Скрыть'} боковую панель`
     }
   }
