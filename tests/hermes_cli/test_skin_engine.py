@@ -100,6 +100,20 @@ class TestBuiltinSkins:
         assert skin.get_color("banner_text") == "#2C1810"
         assert skin.get_color("completion_menu_bg") == "#F5EFE0"
 
+    @pytest.mark.parametrize(
+        ("name", "status_bar_bg"),
+        [("digitalocean-dark", "#000C2A"), ("digitalocean-light", "#E3E8F4")],
+    )
+    def test_digitalocean_skins_load(self, name, status_bar_bg):
+        from hermes_cli.skin_engine import load_skin
+
+        skin = load_skin(name)
+        assert skin.name == name
+        assert skin.get_color("ui_accent") == "#0069FF"
+        assert skin.get_color("status_bar_bg") == status_bar_bg
+        assert skin.get_branding("agent_name") == "DigitalOcean Sammy"
+        assert "DIGITALOCEAN" in skin.banner_logo
+
     def test_unknown_skin_falls_back_to_default(self):
         from hermes_cli.skin_engine import load_skin
         skin = load_skin("nonexistent_skin_xyz")
