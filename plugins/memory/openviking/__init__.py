@@ -2245,8 +2245,6 @@ def _mirror_manual_config_to_openviking_store(
 
 def _run_quick_local_setup(
     *,
-    select,
-    cancelled,
     config: dict,
     provider_config: dict,
     env_path: Path,
@@ -2264,28 +2262,9 @@ def _run_quick_local_setup(
         print(f"  Quick Local preflight failed: {exc}")
         return False
 
-    allow_ollama_install = not preflight.ollama_install_required
-    if preflight.ollama_install_required:
-        install_choice = select(
-            "  Ollama is required",
-            [
-                (
-                    "Install Ollama and continue",
-                    "also downloads qwen3-embedding:0.6b (approximately 639 MB)",
-                ),
-                ("Cancel setup", "make no configuration changes"),
-            ],
-            default=0,
-            cancel_returns=cancelled,
-        )
-        if install_choice != 0:
-            return _SETUP_CANCELLED
-        allow_ollama_install = True
-
     try:
         result = setup.provision(
             hermes_home=env_path.parent,
-            allow_ollama_install=allow_ollama_install,
             preflight=preflight,
         )
     except quick_local.QuickLocalSetupError as exc:
@@ -2327,7 +2306,7 @@ def _run_create_profile_setup(
             ),
             (
                 "Quick Local Setup",
-                "Set up OpenViking and Ollama on this device",
+                "Set up OpenViking with built-in local embeddings",
             ),
             (
                 "Connect to an existing server",
@@ -2342,8 +2321,6 @@ def _run_create_profile_setup(
 
     if source_choice == 1:
         return _run_quick_local_setup(
-            select=select,
-            cancelled=cancelled,
             config=config,
             provider_config=provider_config,
             env_path=env_path,
