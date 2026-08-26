@@ -107,11 +107,13 @@ SOURCE_MANUAL = "manual"
 SOURCE_MANUAL_DEVICE_CODE = f"{SOURCE_MANUAL}:device_code"
 
 STRATEGY_FILL_FIRST = "fill_first"
+STRATEGY_NO_FAILOVER = "no_failover"
 STRATEGY_ROUND_ROBIN = "round_robin"
 STRATEGY_RANDOM = "random"
 STRATEGY_LEAST_USED = "least_used"
 SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_FILL_FIRST,
+    STRATEGY_NO_FAILOVER,
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
     STRATEGY_LEAST_USED,
@@ -752,6 +754,9 @@ class CredentialPool:
         # rotation and tear ``self._entries`` or double-write auth.json.
         with self._lock:
             available, _pending = self._available_entries()
+            if self._strategy == STRATEGY_NO_FAILOVER and self._entries:
+                primary_id = self._entries[0].id
+                return any(entry.id == primary_id for entry in available)
             return bool(available)
 
     def next_available_at(self) -> Optional[float]:
@@ -2062,6 +2067,9 @@ class CredentialPool:
         single-use-token entries that must be refreshed outside the lock.
         """
         available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
+        if self._strategy == STRATEGY_NO_FAILOVER and self._entries:
+            primary_id = self._entries[0].id
+            available = [entry for entry in available if entry.id == primary_id]
         if not available:
             self._current_id = None
             self._log_no_available_entries()
@@ -2272,6 +2280,13 @@ class CredentialPool:
                     _label, status_code,
                 )
             self._current_id = None
+            if self._strategy == STRATEGY_NO_FAILOVER:
+                logger.info(
+                    "credential pool: %s is configured for no failover; "
+                    "surfacing the error without selecting a sibling credential",
+                    self.provider,
+                )
+                return None
             next_entry, _pending = self._select_unlocked(refresh=False)
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]

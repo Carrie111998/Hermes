@@ -1774,6 +1774,61 @@ def _codex_auth_store(access_token: str, refresh_token: str) -> dict:
 
 
 
+def test_no_failover_strategy_does_not_select_a_sibling_after_quota_exhaustion(tmp_path, monkeypatch):
+    """An explicitly pinned account must never silently fail over to a sibling."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "work-account",
+                        "label": "work",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "work-key",
+                    },
+                    {
+                        "id": "personal-account",
+                        "label": "personal",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "personal-key",
+                    },
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy", lambda _provider: "no_failover"
+    )
+
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+
+    pool = load_pool("anthropic")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "work-account"
+
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=402,
+        credential_id=selected.id,
+        api_key_hint=selected.runtime_api_key,
+        failure_reason="billing",
+    )
+
+    assert next_entry is None
+    assert pool.has_available() is False
+    assert pool.select() is None
+    statuses = {entry.id: entry.last_status for entry in pool.entries()}
+    assert statuses["work-account"] == STATUS_EXHAUSTED
+    assert statuses["personal-account"] is None
+
+
 def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     """Regression for #19566: stale rotation writes keep concurrent entries."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

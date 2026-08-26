@@ -23,7 +23,7 @@ Credential pools are mainly for API-key providers (OpenRouter, Anthropic). A sin
 
 ```
 Your request
-  → Pick key from pool (round_robin / least_used / fill_first / random)
+  → Pick key from pool (round_robin / least_used / fill_first / random / no_failover)
   → Send to provider
   → 429 rate limit?
       → Plan/usage limit reached (e.g. ChatGPT/Codex "usage limit reached")?
@@ -133,6 +133,11 @@ credential_pool_strategies:
 | `round_robin` | Cycle through keys evenly, rotating after each selection |
 | `least_used` | Always pick the key with the lowest request count |
 | `random` | Random selection among healthy keys |
+| `no_failover` | Use only the first credential. Quota, billing, and refresh failures surface without selecting a sibling credential. |
+
+Use `no_failover` when credentials represent distinct accounts and an automatic
+account switch would be surprising or unsafe. It still permits refresh of the
+selected OAuth credential; it never selects a second credential from that pool.
 
 ## Error Recovery
 
