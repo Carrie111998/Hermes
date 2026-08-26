@@ -14,7 +14,6 @@ import asyncio
 import os
 import sys
 import threading
-import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -193,28 +192,45 @@ def test_missing_all_stable_identity_does_not_collapse_messages():
     assert adapter._message_dedup_id(event) == ""
 
 
+def test_missing_workspace_identity_skips_cross_tenant_dedup():
+    """Unknown workspace scope must fail open rather than share a sentinel."""
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._team_clients = {}
+    event = {"channel": "C_ONE", "ts": "1787682677.049629"}
+
+    assert adapter._message_dedup_id(event) == ""
+    assert adapter._processed_message_key(event, {}, event["ts"]) == ""
+
+
+@pytest.mark.asyncio
+async def test_file_shared_client_routing_does_not_use_dedup_canonicalizer():
+    """A foreign event scope must fall back instead of guessing one workspace."""
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._app = MagicMock()
+    primary_client = MagicMock()
+    primary_client.files_info = AsyncMock(
+        return_value={"ok": True, "file": {"mimetype": "text/plain"}}
+    )
+    guessed_client = MagicMock()
+    guessed_client.files_info = AsyncMock()
+    adapter._app.client = primary_client
+    adapter._team_clients = {"T_HOME": guessed_client}
+
+    await adapter._handle_slack_file_shared(
+        {
+            "team": "E_PARTNER_ORG",
+            "channel_id": "C_SHARED",
+            "file_id": "F_SHARED",
+        }
+    )
+
+    primary_client.files_info.assert_awaited_once_with(file="F_SHARED")
+    guessed_client.files_info.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_concurrent_duplicate_event_runs_one_downstream_turn():
     """Concurrent scope variants must atomically claim one Slack message."""
-
-    class SlowLookupDict(dict):
-        """Widen the check-then-set race without changing lookup results."""
-
-        @staticmethod
-        def _pause_if_missing(present):
-            if not present:
-                time.sleep(0.05)
-
-        def __contains__(self, key):
-            present = super().__contains__(key)
-            self._pause_if_missing(present)
-            return present
-
-        def get(self, key, default=None):
-            value = super().get(key, default)
-            self._pause_if_missing(value is not default)
-            return value
-
     adapter = SlackAdapter(
         PlatformConfig(enabled=True, token="xoxb-test", extra={"require_mention": True})
     )
@@ -223,7 +239,6 @@ async def test_concurrent_duplicate_event_runs_one_downstream_turn():
     adapter._bot_user_id = "U_BOT"
     adapter._team_bot_user_ids = {"T_TEAM": "U_BOT"}
     adapter._team_clients = {"T079QU5LX36": MagicMock()}
-    adapter._dedup._seen = SlowLookupDict()
 
     callback_count = 0
     callback_lock = threading.Lock()
@@ -261,14 +276,20 @@ async def test_concurrent_duplicate_event_runs_one_downstream_turn():
         "event": workspace_event,
     }
 
+    start_barrier = threading.Barrier(2)
+
+    async def start_together(event, payload):
+        start_barrier.wait(timeout=2)
+        await adapter._handle_slack_message(event, payload)
+
     await asyncio.gather(
         asyncio.to_thread(
             asyncio.run,
-            adapter._handle_slack_message(enterprise_event, enterprise_payload),
+            start_together(enterprise_event, enterprise_payload),
         ),
         asyncio.to_thread(
             asyncio.run,
-            adapter._handle_slack_message(workspace_event, workspace_payload),
+            start_together(workspace_event, workspace_payload),
         ),
     )
 

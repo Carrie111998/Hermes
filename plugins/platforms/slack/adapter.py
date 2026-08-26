@@ -5187,8 +5187,10 @@ class SlackAdapter(BasePlatformAdapter):
         event_ts = changed_event_ts or str(event.get("ts") or "")
         if not event_ts:
             return ""
-        team_id = self._canonical_event_team_id(event, body) or "unknown-workspace"
-        channel_id = str(event.get("channel") or "unknown-channel")
+        team_id = self._canonical_event_team_id(event, body)
+        channel_id = str(event.get("channel") or "")
+        if not team_id or not channel_id:
+            return ""
         return f"slack:channel-message:{team_id}:{channel_id}:{event_ts}"
 
     def _processed_message_key(
@@ -5196,8 +5198,10 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> str:
         if not message_ts:
             return ""
-        team_id = self._canonical_event_team_id(event, body) or "unknown-workspace"
-        channel_id = str(event.get("channel") or "unknown-channel")
+        team_id = self._canonical_event_team_id(event, body)
+        channel_id = str(event.get("channel") or "")
+        if not team_id or not channel_id:
+            return ""
         return f"{team_id}:{channel_id}:{message_ts}"
 
     @staticmethod
@@ -5847,7 +5851,10 @@ class SlackAdapter(BasePlatformAdapter):
         if not channel_id or not file_id:
             return
 
-        team_id = self._canonical_event_team_id(event, body)
+        # Canonical team normalization exists for dedup identity only. Client
+        # routing must preserve Slack's actual event scope and then use the
+        # channel map/primary-client fallback rather than guessing a tenant.
+        team_id = self._event_team_id(event, body)
         try:
             client = self._team_clients.get(team_id) if team_id else None
             info_resp = await (client or self._get_client(channel_id)).files_info(

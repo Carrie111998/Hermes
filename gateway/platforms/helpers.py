@@ -74,7 +74,7 @@ class MessageDeduplicator:
             return False
 
     def contains(self, msg_id: str) -> bool:
-        """Return whether *msg_id* is live in the cache without inserting it."""
+        """Return whether *msg_id* is live, evicting it when it has expired."""
         if not msg_id:
             return False
         with self._lock:
