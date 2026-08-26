@@ -187,3 +187,8 @@ infographic/
 # Zero-byte file named `=`, created by a bash `>=` parsed as `>` plus a redirect
 # target -- e.g. `[ $x >= 5 ]` where `(( x >= 5 ))` was meant. Never an artifact.
 /=
+
+# Testing the three root-anchored patterns above (/Users*, /C*Users*, /=) does not
+# require creating the artifacts: `git check-ignore -v --no-index <path>` evaluates
+# a hypothetical path and mutates nothing. That is the only safe verifier in a
+# checkout other sessions are working in.
