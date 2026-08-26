@@ -1819,13 +1819,25 @@ def run_doctor(args):
         memory_file = memories_dir / "MEMORY.md"
         user_file = memories_dir / "USER.md"
         if memory_file.exists():
-            size = len(memory_file.read_text(encoding="utf-8").strip())
-            check_ok(f"MEMORY.md exists ({size} chars)")
+            try:
+                size = len(memory_file.read_text(encoding="utf-8").strip())
+            except (OSError, UnicodeDecodeError) as exc:
+                # read_text(encoding="utf-8") raises UnicodeDecodeError (a
+                # ValueError subclass, not OSError) on corrupt/binary content;
+                # both must warn instead of crashing run_doctor. UnicodeDecodeError
+                # has no .strerror, so fall back to its message.
+                check_warn("MEMORY.md exists but is unreadable", f"({getattr(exc, 'strerror', None) or exc})")
+            else:
+                check_ok(f"MEMORY.md exists ({size} chars)")
         else:
             check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
         if user_file.exists():
-            size = len(user_file.read_text(encoding="utf-8").strip())
-            check_ok(f"USER.md exists ({size} chars)")
+            try:
+                size = len(user_file.read_text(encoding="utf-8").strip())
+            except (OSError, UnicodeDecodeError) as exc:
+                check_warn("USER.md exists but is unreadable", f"({getattr(exc, 'strerror', None) or exc})")
+            else:
+                check_ok(f"USER.md exists ({size} chars)")
         else:
             check_info("USER.md not created yet (will be created when the agent first writes a memory)")
     else:
