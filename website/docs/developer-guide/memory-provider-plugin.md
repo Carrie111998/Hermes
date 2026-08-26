@@ -196,8 +196,15 @@ configured provider, initialized with `agent_context="subagent"` (plus
 
 - **One `initialize()` per fork** — a round trip per spawn for a
   network-backed store.
-- **Fork transcripts reach the archive.** Providers that should not keep them
-  drop them on `agent_context`.
+- **Fork transcripts do not reach the archive.** A fork reuses the provider
+  only for the checkpoint contract (`initialize()` + `on_pre_compress`). The
+  host (`MemoryManager`) suppresses the ordinary per-turn write/recall
+  fan-outs — `on_turn_start`, `sync_all`/`sync_turn`, `prefetch_all` and
+  `queue_prefetch_all` — for any non-primary `agent_context`, so the fork's
+  harness prompt and output never land in the user's memory. This holds
+  regardless of whether the provider itself honours `agent_context`. The
+  checkpoint path (`on_pre_compress`) is deliberately exempt — it must run in
+  the fork, which is the whole point of arming the gate.
 
 What your provider receives depends on its declared API version. Version 1
 providers (the implicit default — every pre-existing provider) keep the
