@@ -2129,15 +2129,6 @@ def switch_model(
                 error_message=msg,
             )
 
-    # Apply auto-correction if validation found a closer match.
-    # Skip when the model was explicitly declared in provider config — the
-    # remote /v1/models roster may omit aliased/legacy slugs (e.g. the SG
-    # router does not advertise muse-spark-1.2-contributor-free, so Hermes
-    # would silently "correct" the free model to the PAID
-    # muse-spark-1.2-contributor; verified 2026-08-26).
-    if validation.get("corrected_model") and not declared_in_config:
-        new_model = validation["corrected_model"]
-
     # --- Copilot api_mode override ---
     if target_provider in {"copilot", "github-copilot"}:
         api_mode = copilot_model_api_mode(new_model, api_key=api_key)
@@ -2187,10 +2178,7 @@ def switch_model(
     # --- Collect warnings ---
     warnings: list[str] = []
     if validation.get("message"):
-        # When a declared model skips auto-correction, the "Auto-corrected X → Y"
-        # message is misleading (nothing was corrected) — drop it.
-        if not (declared_in_config and str(validation["message"]).startswith("Auto-corrected")):
-            warnings.append(validation["message"])
+        warnings.append(validation["message"])
     hermes_warn = _check_hermes_model_warning(new_model)
     if hermes_warn:
         warnings.append(hermes_warn)
