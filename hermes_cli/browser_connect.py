@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
 import platform
 import posixpath
+import re
 import shlex
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
@@ -74,6 +77,662 @@ _LINUX_BROWSER_GROUPS = (
 
 _LINUX_BIN_NAMES = tuple(name for names, _ in _LINUX_BROWSER_GROUPS for name in names)
 _LINUX_INSTALL_PATHS = tuple(path for _, paths in _LINUX_BROWSER_GROUPS for path in paths)
+
+
+# ---------------------------------------------------------------------------
+# Real-profile (default Chromium) resolution
+#
+# Used by the browser tool's ``browser.use_real_profile`` consent path: when a
+# local Chromium is launched, point agent-browser at the user's REAL default
+# browser profile (``--profile <user-data-dir>`` + ``--executable-path``) so
+# their live logins/cookies are available. Only Chromium-family browsers are
+# supported; a non-Chromium default (Firefox, Safari) resolves to None and the
+# caller fails closed with a clear message.
+# ---------------------------------------------------------------------------
+
+# Canonical Chromium browser keys we support for real-profile driving.
+_CHROMIUM_BROWSERS = ("chrome", "edge", "brave", "chromium")
+
+# Windows UserChoice ProgId prefixes → canonical browser key. Matched
+# case-insensitively by prefix so version suffixes (e.g. ``ChromeHTML.X``)
+# still resolve to STABLE. Pre-release channels have their own ProgIds and
+# MUST be matched first (see _WINDOWS_CHANNEL_PROGIDS) so they are never
+# swallowed into the stable family — driving the wrong profile is a
+# wrong-principal bug (#95549 invariant).
+_WINDOWS_PROGID_MAP = (
+    ("chromehtml", "chrome"),
+    ("msedgehtm", "edge"),
+    ("bravehtml", "brave"),
+    ("chromiumhtm", "chromium"),
+)
+
+# Pre-release ProgId prefixes we recognize but do NOT support (their profiles
+# live in channel-specific dirs the resolver tables don't carry). Matched
+# BEFORE the stable map; a hit fails closed rather than resolving to stable.
+# ``ChromeBHTML`` = Beta, ``ChromeDHTML`` = Dev, ``ChromeSSHTML`` = Canary
+# (SxS); ``MSEdgeBHTML`` / ``MSEdgeDHTML`` / ``MSEdgeCHTML`` = Edge channels.
+_WINDOWS_CHANNEL_PROGIDS = (
+    "chromebhtml", "chromedhtml", "chromesshtml", "chromecanaryhtml",
+    "msedgebhtml", "msedgedhtml", "msedgechtml",
+    "bravebetahtml", "bravenightlyhtml",
+)
+
+# Linux xdg default-web-browser .desktop name fragments → canonical STABLE key.
+# Includes the Flatpak application ids (``com.google.Chrome.desktop`` etc.),
+# which share none of the native package name fragments. Anchored so a channel
+# .desktop (``google-chrome-beta``, ``com.google.chrome.beta``) does NOT match
+# the stable fragment — channels are caught by _LINUX_CHANNEL_FRAGMENTS first.
+_LINUX_DESKTOP_MAP = (
+    ("google-chrome", "chrome"),
+    ("com.google.chrome", "chrome"),
+    ("chromium", "chromium"),
+    ("brave", "brave"),
+    ("microsoft-edge", "edge"),
+    ("com.microsoft.edge", "edge"),
+    ("msedge", "edge"),
+)
+
+# Non-stable Linux channel .desktop fragments — recognized, unsupported.
+# Checked before the stable map; a hit fails closed.
+_LINUX_CHANNEL_FRAGMENTS = (
+    "google-chrome-beta", "google-chrome-unstable", "google-chrome-canary",
+    "com.google.chrome.beta", "com.google.chrome.dev", "com.google.chrome.canary",
+    "microsoft-edge-beta", "microsoft-edge-dev", "microsoft-edge-canary",
+    "brave-browser-beta", "brave-browser-nightly", "brave-browser-dev",
+)
+
+# Where sandboxed Linux packages keep the profile instead of $XDG_CONFIG_HOME.
+_LINUX_FLATPAK_IDS = {
+    "chrome": "com.google.Chrome",
+    "chromium": "org.chromium.Chromium",
+    "brave": "com.brave.Browser",
+    "edge": "com.microsoft.Edge",
+}
+_LINUX_SNAP_PROFILE_PARTS = {
+    "chromium": ("snap", "chromium", "common", "chromium"),
+    "brave": ("snap", "brave", "current", ".config", "BraveSoftware", "Brave-Browser"),
+}
+
+# macOS LaunchServices bundle-id → canonical STABLE key. EXACT match (not
+# prefix): ``com.google.chrome.beta`` must not be read as ``com.google.chrome``.
+_DARWIN_BUNDLE_MAP = (
+    ("com.google.chrome", "chrome"),
+    ("com.microsoft.edgemac", "edge"),
+    ("com.brave.browser", "brave"),
+    ("org.chromium.chromium", "chromium"),
+)
+
+# Non-stable macOS channel bundle ids — recognized, unsupported. Checked first.
+_DARWIN_CHANNEL_BUNDLES = (
+    "com.google.chrome.beta", "com.google.chrome.dev", "com.google.chrome.canary",
+    "com.microsoft.edgemac.beta", "com.microsoft.edgemac.dev", "com.microsoft.edgemac.canary",
+    "com.brave.browser.beta", "com.brave.browser.nightly",
+)
+
+# Sentinel returned when the OS default is a recognized-but-unsupported
+# Chromium CHANNEL (Beta/Dev/Canary). Distinct from None (non-Chromium) so the
+# caller fails closed with a channel-specific message instead of driving the
+# stable profile of a different account.
+UNSUPPORTED_CHANNEL = "__unsupported_channel__"
+
+
+def _real_profile_relparts(browser: str) -> tuple:
+    """(mac_support_subdir, windows_localappdata_parts, linux_config_name)."""
+    return {
+        "chrome": (
+            ("Google", "Chrome"),
+            ("Google", "Chrome", "User Data"),
+            "google-chrome",
+        ),
+        "edge": (
+            ("Microsoft Edge",),
+            ("Microsoft", "Edge", "User Data"),
+            "microsoft-edge",
+        ),
+        "brave": (
+            ("BraveSoftware", "Brave-Browser"),
+            ("BraveSoftware", "Brave-Browser", "User Data"),
+            "BraveSoftware/Brave-Browser",
+        ),
+        "chromium": (
+            ("Chromium",),
+            ("Chromium", "User Data"),
+            "chromium",
+        ),
+    }[browser]
+
+
+def real_profile_data_dir(browser: str, system: str | None = None) -> str | None:
+    """Return the default user-data-dir for a Chromium ``browser`` on ``system``.
+
+    Returns None for unknown browsers. On Linux the native ($XDG_CONFIG_HOME),
+    snap and Flatpak locations are tried and the first existing one wins; the
+    native path is returned when none exists so the caller's error names it.
+    Darwin/Windows paths are not stat'ed. Paths are built with the TARGET
+    system's separator (posix for Darwin/Linux, backslash for Windows) so an
+    explicit ``system`` argument resolves correctly regardless of the host OS.
+    """
+    if browser not in _CHROMIUM_BROWSERS:
+        return None
+    system = system or platform.system()
+    mac_parts, win_parts, linux_name = _real_profile_relparts(browser)
+    home = os.path.expanduser("~")
+    if system == "Darwin":
+        return posixpath.join(home, "Library", "Application Support", *mac_parts)
+    if system == "Windows":
+        local = os.environ.get("LOCALAPPDATA") or ntpath.join(home, "AppData", "Local")
+        return ntpath.join(local, *win_parts)
+    # Linux / other POSIX
+    config = os.environ.get("XDG_CONFIG_HOME") or posixpath.join(home, ".config")
+    candidates = [posixpath.join(config, *linux_name.split("/"))]
+    snap_parts = _LINUX_SNAP_PROFILE_PARTS.get(browser)
+    if snap_parts:
+        candidates.append(posixpath.join(home, *snap_parts))
+    flatpak_id = _LINUX_FLATPAK_IDS.get(browser)
+    if flatpak_id:
+        candidates.append(
+            posixpath.join(home, ".var", "app", flatpak_id, "config", *linux_name.split("/"))
+        )
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+
+def chromium_executable(browser: str, system: str | None = None) -> str | None:
+    """Return the first present executable for a Chromium ``browser``."""
+    if browser not in _CHROMIUM_BROWSERS:
+        return None
+    system = system or platform.system()
+
+    def first_present(paths: tuple) -> str | None:
+        for p in paths:
+            if p and os.path.isfile(p):
+                return p
+        return None
+
+    if system == "Darwin":
+        app = {
+            "chrome": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "chromium": "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "brave": "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "edge": "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        }[browser]
+        return app if os.path.isfile(app) else None
+    if system == "Windows":
+        groups = {
+            "chrome": (("Google", "Chrome", "Application", "chrome.exe"),),
+            "chromium": (("Chromium", "Application", "chrome.exe"), ("Chromium", "Application", "chromium.exe")),
+            "brave": (("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),),
+            "edge": (("Microsoft", "Edge", "Application", "msedge.exe"),),
+        }[browser]
+        bases = [
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")),
+        ]
+        cands = tuple(os.path.join(base, *parts) for base in bases for parts in groups)
+        return first_present(cands)
+    # Linux
+    linux = {
+        "chrome": ("google-chrome", "google-chrome-stable"),
+        "chromium": ("chromium-browser", "chromium"),
+        "brave": ("brave-browser", "brave-browser-stable", "brave"),
+        "edge": ("microsoft-edge", "microsoft-edge-stable"),
+    }[browser]
+    for name in linux:
+        found = shutil.which(name)
+        if found:
+            return found
+    # fall back to the known absolute paths from the launch tables
+    for names, paths in _LINUX_BROWSER_GROUPS:
+        if any(n in linux for n in names):
+            hit = first_present(tuple(paths))
+            if hit:
+                return hit
+    return None
+
+
+def _detect_default_windows() -> str | None:
+    try:
+        import winreg  # type: ignore
+    except Exception:
+        return None
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+        )
+        prog_id, _ = winreg.QueryValueEx(key, "ProgId")
+        winreg.CloseKey(key)
+    except Exception:
+        return None
+    low = str(prog_id or "").lower()
+    # Channels first: a recognized Beta/Dev/Canary ProgId must fail closed, not
+    # fall through to a stable prefix match and drive the stable profile.
+    for chan in _WINDOWS_CHANNEL_PROGIDS:
+        if low.startswith(chan):
+            return UNSUPPORTED_CHANNEL
+    for prefix, browser in _WINDOWS_PROGID_MAP:
+        if low.startswith(prefix):
+            return browser
+    return None
+
+
+_LS_HANDLERS_READER = (
+    "defaults",
+    "read",
+    "com.apple.LaunchServices/com.apple.launchservices.secure",
+    "LSHandlers",
+)
+
+
+def _launchservices_https_handler(dump: str) -> str | None:
+    """Return the bundle id registered for the ``https`` URL scheme.
+
+    ``dump`` is the ``defaults read … LSHandlers`` output: an array of
+    ``{ … }`` dictionaries, one per handler. Only the entry whose
+    ``LSHandlerURLScheme`` is ``https`` counts — a browser registered for
+    another scheme or a file type must not be mistaken for the default.
+    Returns None when no https handler is recorded, which is what macOS
+    stores while Safari (the implicit default) has never been replaced.
+    """
+    entries: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in dump:
+        if ch == "{":
+            depth += 1
+            if depth == 1:
+                buf = []
+                continue
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                entries.append("".join(buf))
+                continue
+        if depth >= 1:
+            buf.append(ch)
+    for entry in entries:
+        low = entry.lower()
+        if not re.search(r'lshandlerurlscheme\s*=\s*"?https"?\s*;', low):
+            continue
+        # The nested LSHandlerPreferredVersions block carries "-" placeholders
+        # under the same key names; the real bundle id is the first non-"-".
+        for role in re.findall(r'lshandlerrole(?:all|viewer)\s*=\s*"?([a-z0-9.\-]+)"?\s*;', low):
+            if role != "-":
+                return role
+        return None
+    return None
+
+
+def _detect_default_darwin() -> str | None:
+    try:
+        out = subprocess.run(
+            list(_LS_HANDLERS_READER),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    bundle = _launchservices_https_handler(out)
+    if not bundle:
+        return None
+    b = bundle.lower()
+    # Channels first (exact): a Beta/Dev/Canary bundle must fail closed.
+    if b in _DARWIN_CHANNEL_BUNDLES:
+        return UNSUPPORTED_CHANNEL
+    for frag, browser in _DARWIN_BUNDLE_MAP:
+        if b == frag:
+            return browser
+    # A non-Chromium https handler (Safari, Firefox, Arc, …) or an unknown
+    # channel bundle: fail closed. No "first installed Chromium wins" fallback
+    # — that would drive a browser the user never made their default.
+    return None
+
+
+def _detect_default_linux() -> str | None:
+    try:
+        out = subprocess.run(
+            ["xdg-settings", "get", "default-web-browser"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        ).stdout.strip().lower()
+    except Exception:
+        out = ""
+    # Channels first: ``google-chrome-beta.desktop`` contains the stable
+    # ``google-chrome`` fragment, so a substring match would drive stable.
+    # Catch recognized channels and fail closed instead.
+    for frag in _LINUX_CHANNEL_FRAGMENTS:
+        if frag in out:
+            return UNSUPPORTED_CHANNEL
+    for frag, browser in _LINUX_DESKTOP_MAP:
+        if frag in out:
+            return browser
+    return None
+
+
+def detect_default_chromium(system: str | None = None) -> str | None:
+    """Return the canonical key of the default Chromium browser, or None.
+
+    None means the default browser is non-Chromium (Firefox, Safari) or could
+    not be determined — the caller fails closed rather than guessing.
+    """
+    system = system or platform.system()
+    if system == "Windows":
+        return _detect_default_windows()
+    if system == "Darwin":
+        return _detect_default_darwin()
+    return _detect_default_linux()
+
+
+# ---------------------------------------------------------------------------
+# Real-profile SNAPSHOT launch
+#
+# The consent path (``browser.use_real_profile``) never drives the live
+# default user-data-dir. Chromium ≥136 (Google-branded builds) refuses
+# remote debugging on the default dir no matter who launches it, and the
+# live dir is usually held by the user's running browser (SingletonLock).
+# Instead we snapshot the real profile into ``~/.hermes/browser-profile/``
+# — a non-default dir Chrome will happily debug, that never contends with
+# the user's browser — launch the user's real binary on the copy with a
+# devtools port, and hand the CDP URL to whichever browser lane is active
+# (Browser Use CLI or the built-in tools). We launch the browser ourselves
+# precisely so NO mock-keychain/basic-store switches are added: cookies
+# encrypted with the OS keyring (gnome-keyring / kwallet / macOS Keychain)
+# decrypt exactly like they do in the user's own browser.
+# ---------------------------------------------------------------------------
+
+# Directory names excluded from the profile snapshot: caches/telemetry AND the
+# heavy, replay-prone state that hangs a fresh Chromium's renderer (extensions
+# and their service workers spin up on launch and wedge JS eval; IndexedDB /
+# GPUCache add hundreds of MB for nothing). We keep ONLY auth/login state
+# (cookies, Login Data, Web Data, Preferences, Local State) — the point of the
+# feature — which turns a multi-hundred-MB profile into a few MB.
+_SNAPSHOT_IGNORES = (
+    "*Cache*",          # Cache, Code Cache, GPUCache, GrShaderCache, ShaderCache, GraphiteDawnCache, component_crx_cache, ...
+    "Extensions",       # wallets/etc.: 100s of MB, and hang the renderer headless
+    "Extension*",       # Extension State, Extension Rules, Extension Scripts
+    "Local Extension Settings",
+    "Service Worker",   # replays on launch → wedges the renderer
+    "IndexedDB",
+    "Crash Reports",
+    "Crashpad",
+    "BrowserMetrics*",
+    "Snapshots",
+    "OptimizationGuide*",
+    "optimization_guide_model_store",
+    "Safe Browsing",
+    "SafetyTips",
+    "OnDeviceHeadSuggestModel",
+    "segmentation_platform",
+    "Sync Data",
+    "Shared Dictionary",
+    "History*",         # large; not needed for auth
+    "Favicons*",
+    "Singleton*",       # live-instance symlinks; never valid in a copy
+    "RunningChromeVersion",
+    "SingletonSocket",
+    "*.tmp",
+    "BrowserMetrics-spare.pma",
+)
+
+# Small, auth-bearing files re-synced from the live profile on EVERY consented
+# launch (the full tree is only copied when the snapshot doesn't exist yet).
+# Paths are relative to the user-data-dir; <profile> expands per profile dir.
+_AUTH_REFRESH_FILES = (
+    "Local State",
+    "<profile>/Cookies",
+    "<profile>/Cookies-journal",
+    "<profile>/Network/Cookies",
+    "<profile>/Network/Cookies-journal",
+    "<profile>/Login Data",
+    "<profile>/Login Data-journal",
+    "<profile>/Login Data For Account",
+    "<profile>/Web Data",
+    "<profile>/Web Data-journal",
+    "<profile>/Preferences",
+)
+
+def real_profile_copy_dir(browser: str) -> str:
+    """Return the hermes-owned snapshot dir for ``browser``'s real profile."""
+    return str(get_hermes_home() / "browser-profile" / browser)
+
+
+def _secure_snapshot_root(path: str) -> None:
+    """Lock down the snapshot dir through Hermes' canonical secret-store policy.
+
+    The snapshot holds copies of the user's Cookies / Login Data, so it is a
+    credential store and must get the same owner-only permissions (and
+    managed-mode / NixOS group-share carve-out, HERMES_UID/GID ownership) as
+    every other Hermes secret dir — via ``hermes_cli.config._secure_dir``,
+    not a bespoke chmod. Deferred import avoids a config↔browser import cycle.
+    """
+    try:
+        from hermes_cli.config import _secure_dir
+
+        _secure_dir(path)
+    except Exception as e:  # never block a launch on a permissions best-effort
+        logger.debug("could not secure real-profile snapshot dir %s: %s", path, e)
+
+
+def _profile_subdirs(src: str) -> list[str]:
+    """Names of per-profile dirs (Default, Profile 1, ...) inside a data dir."""
+    out = []
+    try:
+        for name in os.listdir(src):
+            if name == "Default" or name.startswith("Profile "):
+                if os.path.isdir(os.path.join(src, name)):
+                    out.append(name)
+    except OSError:
+        pass
+    return out or ["Default"]
+
+
+def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | None, str | None]:
+    """Snapshot ``browser``'s real profile into the hermes copy dir.
+
+    Full copy (minus caches) when the copy doesn't exist; otherwise only the
+    auth-bearing files (cookies, login data, preferences) are re-synced so
+    fresh logins from the user's own browsing show up in the agent session.
+    Locked-file copy errors are tolerated best-effort: SQLite journals make a
+    mid-write copy readable, and a stale cookie jar beats a failed launch.
+
+    Returns ``(copy_dir, None)`` on success, ``(None, error)`` on failure.
+    """
+    src = src or real_profile_data_dir(browser)
+    if not src or not os.path.isdir(src):
+        return None, (
+            f"profile directory for '{browser}' was not found ({src!r}). "
+            "Launch that browser at least once, or turn browser.use_real_profile off."
+        )
+    dst = real_profile_copy_dir(browser)
+    fresh = not os.path.isdir(os.path.join(dst, "Default"))
+    try:
+        if fresh:
+            os.makedirs(dst, exist_ok=True)
+            _secure_snapshot_root(dst)
+            try:
+                shutil.copytree(
+                    src,
+                    dst,
+                    dirs_exist_ok=True,
+                    symlinks=False,
+                    ignore=shutil.ignore_patterns(*_SNAPSHOT_IGNORES),
+                    ignore_dangling_symlinks=True,
+                )
+            except shutil.Error as multi:
+                # Per-file failures (browser mid-write) are non-fatal.
+                logger.info(
+                    "real-profile snapshot: %d file(s) skipped while copying %s",
+                    len(multi.args[0]) if multi.args else 0, src,
+                )
+        else:
+            profiles = _profile_subdirs(src)
+            for rel in _AUTH_REFRESH_FILES:
+                rels = (
+                    [rel.replace("<profile>", p) for p in profiles]
+                    if "<profile>" in rel else [rel]
+                )
+                for r in rels:
+                    s = os.path.join(src, r)
+                    if not os.path.isfile(s):
+                        continue
+                    d = os.path.join(dst, r)
+                    try:
+                        os.makedirs(os.path.dirname(d), exist_ok=True)
+                        shutil.copy2(s, d)
+                    except OSError as e:
+                        logger.debug("real-profile refresh: skipped %s: %s", r, e)
+        # Never carry live-instance leftovers into the copy.
+        for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            try:
+                os.unlink(os.path.join(dst, leftover))
+            except OSError:
+                pass
+    except OSError as e:
+        return None, f"could not snapshot the '{browser}' profile into {dst}: {e}"
+    # A running browser can hold the cookie DB under an exclusive lock (the
+    # norm on Windows), so the copy above can silently produce an empty jar and
+    # the agent would then browse logged-out. If the source profile has a
+    # cookie DB but none of non-zero size reached the copy, fail closed rather
+    # than launch an authless profile.
+    _cookie_rels = ("<profile>/Network/Cookies", "<profile>/Cookies")
+    _profiles = _profile_subdirs(src)
+
+    def _has_cookies(root: str) -> bool:
+        for prof in _profiles:
+            for rel in _cookie_rels:
+                p = os.path.join(root, rel.replace("<profile>", prof))
+                try:
+                    if os.path.isfile(p) and os.path.getsize(p) > 0:
+                        return True
+                except OSError:
+                    continue
+        return False
+
+    if _has_cookies(src) and not _has_cookies(dst):
+        return None, (
+            f"could not copy the '{browser}' cookie database into the snapshot "
+            "— it is likely locked by a running browser (common on Windows). "
+            "Close the browser and retry, or turn browser.use_real_profile off."
+        )
+    return dst, None
+
+
+# ---------------------------------------------------------------------------
+# Live-profile enablement (opt-in alternative to the profile copy)
+#
+# Ported from @kshitijk4poor's ``browser-real-profile-fix``. The
+# ``RemoteDebuggingAllowed`` enterprise policy overrides Chrome 136+'s block on
+# ``--remote-debugging-port`` for the default user-data-dir, letting the agent
+# attach to the user's LIVE profile — which decrypts cookies natively (the real
+# browser decrypts its own store in place), unlike a copy. Each setter returns
+# True on success; callers fall back to the copy path on False. Note: on
+# Windows the policy write lives under ``HKCU\\Software\\Policies`` and needs an
+# elevated (UAC) process, which a non-elevated agent does not have.
+# ---------------------------------------------------------------------------
+def _ensure_policy_darwin(browser: str) -> bool:
+    """Set RemoteDebuggingAllowed via ``defaults write`` on macOS."""
+    domain = {
+        "chrome": "com.google.Chrome",
+        "chromium": "org.chromium.Chromium",
+        "brave": "com.brave.Browser",
+        "edge": "com.microsoft.edgemac",
+    }.get(browser, "com.google.Chrome")
+    try:
+        subprocess.run(
+            ["defaults", "write", domain, "RemoteDebuggingAllowed", "-bool", "true"],
+            capture_output=True, timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_policy_windows(browser: str) -> bool:
+    """Set RemoteDebuggingAllowed via registry on Windows (needs elevation)."""
+    try:
+        import winreg  # type: ignore
+    except Exception:
+        return False
+    root_map = {
+        "chrome": r"Software\Policies\Google\Chrome",
+        "edge": r"Software\Policies\Microsoft\Edge",
+        "brave": r"Software\Policies\BraveSoftware\Brave",
+        "chromium": r"Software\Policies\Chromium",
+    }
+    subkey = root_map.get(browser, root_map["chrome"])
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "RemoteDebuggingAllowed", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        # HKCU\Software\Policies is ACL-protected; the write needs an elevated
+        # process (a UAC secure-desktop consent), which a non-elevated agent
+        # cannot obtain. Fall back to the copy path.
+        return False
+
+
+def _ensure_policy_linux(browser: str) -> bool:
+    """Drop a RemoteDebuggingAllowed managed-policy JSON on Linux (needs root)."""
+    paths = {
+        "chrome": "/etc/opt/chrome/policies/managed/hermes-real-profile.json",
+        "edge": "/etc/opt/edge/policies/managed/hermes-real-profile.json",
+        "brave": "/etc/brave/policies/managed/hermes-real-profile.json",
+        "chromium": "/etc/chromium/policies/managed/hermes-real-profile.json",
+    }
+    target = paths.get(browser, paths["chrome"])
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        import json
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump({"RemoteDebuggingAllowed": True}, f)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_remote_debugging_policy(browser: str, system: str | None = None) -> bool:
+    """Set the RemoteDebuggingAllowed policy for ``browser``; True on success.
+
+    Ported from @kshitijk4poor (#95520 / browser-real-profile-fix). On failure
+    the caller falls back to the profile-copy path.
+    """
+    system = system or platform.system()
+    if system == "Darwin":
+        return _ensure_policy_darwin(browser)
+    if system == "Windows":
+        return _ensure_policy_windows(browser)
+    return _ensure_policy_linux(browser)
+
+
+def active_profile_directory(data_dir: str) -> str:
+    """Return the profile sub-directory the browser was last using.
+
+    agent-browser's ``--profile`` sets the user-data-dir, but Chrome then opens
+    ``Default``; a user whose daily profile is e.g. ``Profile 6`` would get an
+    empty ``Default`` with none of their session cookies. ``Local State``'s
+    ``profile.last_used`` names the profile they actually browse in. Defaults to
+    ``Default`` when it can't be read.
+
+    Profile-selection finding: @kshitijk4poor (#95620).
+    """
+    try:
+        import json
+        with open(os.path.join(data_dir, "Local State"), encoding="utf-8") as fh:
+            ls = json.load(fh)
+        last = (ls.get("profile") or {}).get("last_used")
+        return last if isinstance(last, str) and last else "Default"
+    except (OSError, ValueError, AttributeError):
+        return "Default"
 
 
 def get_chrome_debug_candidates(system: str) -> list[str]:
