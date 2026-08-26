@@ -1,4 +1,4 @@
-"""Tests for the twilio_email platform plugin adapter."""
+"""Tests for the Twilio plugin's Email channel (plugins/platforms/twilio/channels/email.py)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
-from plugins.platforms.twilio_email import adapter as twilio_email
+from plugins.platforms.twilio.channels import email as twilio_email
 
 
 class _AsyncCM:
@@ -47,27 +46,32 @@ def _clean_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture
+def channel():
+    return twilio_email.EmailChannel()
+
+
 # ---------------------------------------------------------------------------
 # Target parsing / validation
 
 
-def test_parse_target_ref_accepts_email():
-    assert twilio_email.parse_target_ref("customer@example.com") == (
+def test_parse_target_ref_accepts_email(channel):
+    assert channel.parse_target_ref("customer@example.com") == (
         "customer@example.com",
         None,
     )
 
 
-def test_parse_target_ref_rejects_phone_number():
-    assert twilio_email.parse_target_ref("+15551234567") is None
+def test_parse_target_ref_rejects_phone_number(channel):
+    assert channel.parse_target_ref("+15551234567") is None
 
 
-def test_validate_target_ref_accepts_email():
-    assert twilio_email.validate_target_ref("customer@example.com") is True
+def test_validate_target_ref_accepts_email(channel):
+    assert channel.validate_target_ref("customer@example.com") is True
 
 
-def test_validate_target_ref_rejects_garbage():
-    result = twilio_email.validate_target_ref("not-an-email")
+def test_validate_target_ref_rejects_garbage(channel):
+    result = channel.validate_target_ref("not-an-email")
     assert result != True  # noqa: E712 -- explicitly checking for the string diagnostic
     assert "not a valid email address" in result
 
@@ -115,90 +119,88 @@ def test_mask_email_short_local_part():
 # API base override
 
 
-def test_sendgrid_api_base_defaults_to_public(monkeypatch):
+def test_sendgrid_api_base_defaults_to_public(monkeypatch, channel):
     monkeypatch.delenv("SENDGRID_API_BASE", raising=False)
-    assert twilio_email._sendgrid_api_base() == "https://api.sendgrid.com/v3"
+    assert channel._api_base() == "https://api.sendgrid.com/v3"
 
 
-def test_sendgrid_api_base_honors_override(monkeypatch):
+def test_sendgrid_api_base_honors_override(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_BASE", "https://api.staging.sendgrid.com/v3/")
-    assert twilio_email._sendgrid_api_base() == "https://api.staging.sendgrid.com/v3"
+    assert channel._api_base() == "https://api.staging.sendgrid.com/v3"
 
 
 # ---------------------------------------------------------------------------
 # Readiness probes
 
 
-def test_check_email_requirements_false_when_unconfigured(monkeypatch):
+def test_check_requirements_false_when_unconfigured(monkeypatch, channel):
     monkeypatch.delenv("SENDGRID_API_KEY", raising=False)
     monkeypatch.delenv("SENDGRID_FROM_EMAIL", raising=False)
-    assert twilio_email.check_email_requirements() is False
+    assert channel.check_requirements() is False
 
 
-def test_check_email_requirements_true_when_configured(monkeypatch):
+def test_check_requirements_true_when_configured(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
-    assert twilio_email.check_email_requirements() is True
+    assert channel.check_requirements() is True
 
 
-def test_is_connected_requires_both_key_and_sender(monkeypatch):
+def test_is_connected_requires_both_key_and_sender(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.delenv("SENDGRID_FROM_EMAIL", raising=False)
-    assert twilio_email._is_connected(None) is False
+    assert channel.is_connected() is False
 
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
-    assert twilio_email._is_connected(None) is True
+    assert channel.is_connected() is True
 
 
 # ---------------------------------------------------------------------------
-# connect() readiness gate (no network -- fails before any HTTP call)
+# connect_requirements_ok() readiness gate (no network -- fails before any
+# HTTP call)
 
 
-def test_connect_fails_fast_without_from_email(monkeypatch):
+def test_connect_requirements_fail_fast_without_from_email(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.delenv("SENDGRID_FROM_EMAIL", raising=False)
-    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
 
-    connected = asyncio.run(adapter.connect())
+    ready, error = channel.connect_requirements_ok()
 
-    assert connected is False
+    assert ready is False
+    assert error
 
 
-def test_connect_succeeds_when_from_email_set(monkeypatch):
+def test_connect_requirements_succeed_when_from_email_set(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
-    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
 
-    connected = asyncio.run(adapter.connect())
+    ready, error = channel.connect_requirements_ok()
 
-    assert connected is True
+    assert ready is True
+    assert error is None
 
 
 # ---------------------------------------------------------------------------
 # Empty-body guard -- refuse before ever making an HTTP call, not after.
 
 
-def test_send_refuses_empty_body_without_any_network_call(monkeypatch):
+def test_send_refuses_empty_body_without_any_network_call(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
-    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
 
     # Single-line, all-whitespace content: default subject kicks in, body
     # after stripping is empty -- must be refused rather than silently
     # sending a blank email.
-    result = asyncio.run(adapter.send("customer@example.com", "   "))
+    result = asyncio.run(channel.send("customer@example.com", "   "))
 
-    assert result.success is False
-    assert "empty body" in (result.error or "")
+    assert result["success"] is False
+    assert "empty body" in (result.get("error") or "")
 
 
-def test_standalone_send_refuses_empty_body(monkeypatch):
+def test_standalone_send_refuses_empty_body(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
 
-    result = asyncio.run(
-        twilio_email._standalone_send(None, "customer@example.com", "   ")
-    )
+    result = asyncio.run(channel.standalone_send(None, "customer@example.com", "   "))
 
     assert "error" in result
     assert "empty body" in result["error"]
@@ -210,10 +212,9 @@ def test_standalone_send_refuses_empty_body(monkeypatch):
 # aiohttp.ClientSession rather than hitting the network).
 
 
-def test_send_masks_email_in_error_body(monkeypatch):
+def test_send_masks_email_in_error_body(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
-    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
 
     mock_resp = _mock_error_response(
         400, '{"errors":[{"message":"customer@example.com is not a valid address"}]}'
@@ -224,15 +225,15 @@ def test_send_masks_email_in_error_body(monkeypatch):
 
     with patch("aiohttp.ClientSession", return_value=mock_session):
         result = asyncio.run(
-            adapter.send("customer@example.com", "Test subject\nTest body")
+            channel.send("customer@example.com", "Test subject\nTest body")
         )
 
-    assert result.success is False
-    assert "customer@example.com" not in (result.error or "")
-    assert "c******r@example.com" in (result.error or "")
+    assert result["success"] is False
+    assert "customer@example.com" not in (result.get("error") or "")
+    assert "c******r@example.com" in (result.get("error") or "")
 
 
-def test_standalone_send_masks_email_in_error_body(monkeypatch):
+def test_standalone_send_masks_email_in_error_body(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
 
@@ -244,9 +245,7 @@ def test_standalone_send_masks_email_in_error_body(monkeypatch):
 
     with patch("aiohttp.ClientSession", return_value=_AsyncCM(mock_session)):
         result = asyncio.run(
-            twilio_email._standalone_send(
-                None, "customer@example.com", "Test subject\nTest body"
-            )
+            channel.standalone_send(None, "customer@example.com", "Test subject\nTest body")
         )
 
     assert "error" in result
@@ -254,13 +253,12 @@ def test_standalone_send_masks_email_in_error_body(monkeypatch):
     assert "c******r@example.com" in result["error"]
 
 
-def test_send_rejects_non_string_metadata_subject_without_crashing(monkeypatch):
+def test_send_rejects_non_string_metadata_subject_without_crashing(monkeypatch, channel):
     # Regression test: a non-string metadata["subject"] (e.g. a caller bug
     # passing an int) must not crash _sanitize_subject() with a TypeError --
     # it should fall back to the first-line convention instead.
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.testkey")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
-    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
 
     mock_resp = MagicMock()
     mock_resp.status = 200
@@ -271,14 +269,14 @@ def test_send_rejects_non_string_metadata_subject_without_crashing(monkeypatch):
 
     with patch("aiohttp.ClientSession", return_value=mock_session):
         result = asyncio.run(
-            adapter.send(
+            channel.send(
                 "customer@example.com",
                 "Order shipped\nYour package is on its way.",
                 metadata={"subject": 12345},
             )
         )
 
-    assert result.success is True
+    assert result["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -288,28 +286,23 @@ def test_send_rejects_non_string_metadata_subject_without_crashing(monkeypatch):
 
 
 @pytest.mark.integration
-def test_send_reaches_sendgrid_and_gets_clean_auth_rejection(monkeypatch):
+def test_send_reaches_sendgrid_and_gets_clean_auth_rejection(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.not-a-real-key-for-shape-test-only")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
-    adapter = twilio_email.TwilioEmailAdapter(PlatformConfig())
 
-    result = asyncio.run(
-        adapter.send("customer@example.com", "Test subject\nTest body")
-    )
+    result = asyncio.run(channel.send("customer@example.com", "Test subject\nTest body"))
 
-    assert result.success is False
-    assert "401" in (result.error or "") or "Unauthorized" in (result.error or "")
+    assert result["success"] is False
+    assert "401" in (result.get("error") or "") or "Unauthorized" in (result.get("error") or "")
 
 
 @pytest.mark.integration
-def test_standalone_send_reaches_sendgrid_and_gets_clean_auth_rejection(monkeypatch):
+def test_standalone_send_reaches_sendgrid_and_gets_clean_auth_rejection(monkeypatch, channel):
     monkeypatch.setenv("SENDGRID_API_KEY", "SG.not-a-real-key-for-shape-test-only")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "sender@example.com")
 
     result = asyncio.run(
-        twilio_email._standalone_send(
-            None, "customer@example.com", "Test subject\nTest body"
-        )
+        channel.standalone_send(None, "customer@example.com", "Test subject\nTest body")
     )
 
     assert "error" in result
