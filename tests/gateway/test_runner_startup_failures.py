@@ -1,11 +1,28 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
 from gateway.run import GatewayRunner
 from gateway.status import read_runtime_status
+
+
+@pytest.mark.asyncio
+async def test_pending_internal_recovery_uses_live_startup_adapters(monkeypatch):
+    replay = AsyncMock(return_value=(1, 0))
+    monkeypatch.setattr(
+        "gateway.shutdown_flush.recover_pending_internal_events", replay
+    )
+    adapters = {Platform.TELEGRAM: object()}
+
+    await gateway_run._recover_pending_internal_events_after_startup(
+        SimpleNamespace(adapters=adapters)
+    )
+
+    replay.assert_awaited_once_with(adapters)
 
 
 class _RetryableFailureAdapter(BasePlatformAdapter):

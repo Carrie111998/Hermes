@@ -30695,6 +30695,21 @@ def _looks_like_profile_conflict_from_cmdline(command: str, our_home) -> bool:
 
 
 
+async def _recover_pending_internal_events_after_startup(runner) -> None:
+    """Resume shutdown-flushed synthetic events on a fully running gateway."""
+    from gateway.shutdown_flush import recover_pending_internal_events
+
+    replayed, remaining = await recover_pending_internal_events(runner.adapters)
+    if remaining:
+        logger.warning(
+            "%d pending internal event(s) remain queued for a future "
+            "gateway startup",
+            remaining,
+        )
+    elif replayed:
+        logger.info("Re-injected %d pending internal event(s)", replayed)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -31246,6 +31261,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             return True
         finally:
             _shutdown_gateway_health_export(runner)
+
+    # Synthetic completion wakes must resume as real gateway turns, not merely
+    # appear as inert user rows in the session transcript. Replay only after a
+    # fully running startup; clean-exit and aborted-startup paths above must not
+    # start new work.
+    try:
+        await _recover_pending_internal_events_after_startup(runner)
+    except Exception:
+        logger.warning("Pending internal event recovery failed", exc_info=True)
 
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the
