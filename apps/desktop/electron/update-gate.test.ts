@@ -156,7 +156,10 @@ test('a live marker remains authoritative past the wait deadline', async () => {
       sleep: async ms => {
         clock += ms
         ticks += 1
-        if (ticks === 8) marker = false
+
+        if (ticks === 8) {
+          marker = false
+        }
       },
       timeoutMs: 50
     }
