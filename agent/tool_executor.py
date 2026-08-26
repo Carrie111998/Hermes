@@ -64,17 +64,22 @@ def _source_provenance_activation(agent, function_name: str):
         return nullcontext()
     try:
         from agent.source_provenance import (
+            DEFAULT_POLICY_DIGEST,
             SourceProvenanceRegistry,
             activate_source_provenance,
+            following_api_request_id,
         )
 
         session_id = str(getattr(agent, "session_id", "") or "")
         turn_id = str(getattr(agent, "_current_turn_id", "") or "")
-        request_id = str(getattr(agent, "_current_api_request_id", "") or "")
+        request_id = following_api_request_id(
+            str(getattr(agent, "_current_api_request_id", "") or ""),
+            turn_id,
+        )
         policy_digest = str(
             getattr(agent, "_llm_egress_policy_digest", "")
             or getattr(agent, "llm_egress_policy_digest", "")
-            or ""
+            or DEFAULT_POLICY_DIGEST
         )
         if not all((session_id, turn_id, request_id, policy_digest)):
             return nullcontext()
@@ -107,7 +112,13 @@ def _attach_trusted_source_provenance_metadata(agent, function_name: str) -> Non
         from agent.source_provenance import SourceProvenanceRegistry
 
         registry = getattr(agent, "_source_provenance_registry", None)
-        request_id = str(getattr(agent, "_current_api_request_id", "") or "")
+        from agent.source_provenance import following_api_request_id
+
+        turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+        request_id = following_api_request_id(
+            str(getattr(agent, "_current_api_request_id", "") or ""),
+            turn_id,
+        )
         if not isinstance(registry, SourceProvenanceRegistry) or not request_id:
             return
         digests = tuple(source_grant_digest(grant) for grant in registry.grants_for_request(request_id))

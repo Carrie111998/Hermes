@@ -263,12 +263,103 @@ def test_provenance_kwargs_for_live_agent_bind_registry_and_request_identity():
     assert kwargs["policy_digest"] == DEFAULT_POLICY_DIGEST
 
 
-def test_cli_and_tui_file_reference_callers_pass_authenticated_provenance():
-    cli_source = Path("cli.py").read_text(encoding="utf-8")
-    tui_source = Path("tui_gateway/server.py").read_text(encoding="utf-8")
+def test_provenance_kwargs_can_prepare_and_adopt_the_next_turn_identity(tmp_path: Path):
+    from agent.source_provenance import (
+        SourceProvenanceRegistry,
+        provenance_kwargs_for_agent,
+    )
 
-    assert "**provenance_kwargs_for_agent(agent)" in cli_source
-    assert "**provenance_kwargs_for_agent(agent)" in tui_source
+    source = tmp_path / "source.py"
+    source.write_text("safe\n", encoding="utf-8")
+    registry = SourceProvenanceRegistry()
+    registry.issue_file_slice(
+        path=source,
+        line_start=1,
+        line_end=1,
+        content=b"safe\n",
+        **_identity(),
+    )
+    agent = type(
+        "Agent",
+        (),
+        {
+            "session_id": "session-1",
+            "_current_turn_id": "turn-1",
+            "_current_api_request_id": "request-1",
+            "_source_provenance_registry": registry,
+        },
+    )()
+
+    kwargs = provenance_kwargs_for_agent(agent, establish_turn=True)
+
+    assert kwargs["turn_id"] != "turn-1"
+    assert kwargs["request_id"] == f"{kwargs['turn_id']}:api:1"
+    assert agent._source_provenance_pending_turn_id == kwargs["turn_id"]
+    assert registry.grants_for_request("request-1") == ()
+
+
+def test_abandoned_prepared_turn_clears_its_grants(tmp_path: Path):
+    from agent.source_provenance import (
+        SourceProvenanceRegistry,
+        clear_agent_source_provenance,
+        provenance_kwargs_for_agent,
+    )
+
+    source = tmp_path / "source.py"
+    source.write_text("safe\n", encoding="utf-8")
+    agent = SimpleNamespace(session_id="session-1")
+    kwargs = provenance_kwargs_for_agent(agent, establish_turn=True)
+    registry = kwargs["source_provenance_registry"]
+    assert isinstance(registry, SourceProvenanceRegistry)
+    registry.issue_file_slice(
+        path=source,
+        line_start=1,
+        line_end=1,
+        content=b"safe\n",
+        session_id=kwargs["session_id"],
+        turn_id=kwargs["turn_id"],
+        request_id=kwargs["request_id"],
+        policy_digest=kwargs["policy_digest"],
+    )
+
+    clear_agent_source_provenance(agent)
+
+    assert registry.grants_for_request(kwargs["request_id"]) == ()
+    assert agent._source_provenance_pending_turn_id is None
+
+
+def test_read_file_activation_uses_the_governed_default_policy_digest():
+    from agent.source_provenance import DEFAULT_POLICY_DIGEST
+    from agent.tool_executor import _source_provenance_activation
+
+    agent = type(
+        "Agent",
+        (),
+        {
+            "session_id": "session-1",
+            "_current_turn_id": "turn-1",
+            "_current_api_request_id": "turn-1:api:1",
+        },
+    )()
+
+    with _source_provenance_activation(agent, "read_file") as context:
+        assert context.policy_digest == DEFAULT_POLICY_DIGEST
+
+    assert hasattr(agent, "_source_provenance_registry")
+
+
+def test_read_file_activation_binds_the_following_api_request():
+    from agent.source_provenance import active_source_provenance
+    from agent.tool_executor import _source_provenance_activation
+
+    agent = SimpleNamespace(
+        session_id="session-1",
+        _current_turn_id="turn-1",
+        _current_api_request_id="turn-1:api:7",
+    )
+
+    with _source_provenance_activation(agent, "read_file"):
+        assert active_source_provenance().request_id == "turn-1:api:8"
 
 
 def test_registry_keeps_grants_request_scoped_and_clearable(tmp_path: Path):

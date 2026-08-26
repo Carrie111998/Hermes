@@ -365,6 +365,7 @@ class LLMEgressFirewall:
         max_serialized_bytes: int = 262_144,
         max_conservative_tokens: int = 87_382,
         conservative_chars_per_token: int = 3,
+        policy_digest: str | None = None,
         static_literal_hashes_by_policy: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         if max_serialized_bytes <= 0:
@@ -378,6 +379,7 @@ class LLMEgressFirewall:
         self._max_serialized_bytes = max_serialized_bytes
         self._max_conservative_tokens = max_conservative_tokens
         self._conservative_chars_per_token = conservative_chars_per_token
+        self._policy_digest = str(policy_digest or "")
         self._static_literal_hashes_by_policy = {
             str(policy_digest): frozenset(
                 digest
@@ -439,6 +441,8 @@ class LLMEgressFirewall:
 
         if destination == DestinationClass.UNKNOWN:
             reasons.append("unknown_destination")
+        if self._policy_digest and policy_digest != self._policy_digest:
+            reasons.append("policy_digest_mismatch")
         if destination in {DestinationClass.REMOTE, DestinationClass.UNKNOWN}:
             if typed_request is None:
                 reasons.append("typed_request_required")
