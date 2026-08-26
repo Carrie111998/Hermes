@@ -71,6 +71,18 @@ test('processStartMarker rejects for a PID that does not exist', async () => {
   await assert.rejects(processStartMarker(2 ** 30 + 12345))
 })
 
+test('a missing PID is classified as gone, never left unknown (ESRCH on Windows)', async () => {
+  // Windows: the locale-independent sentinel answer maps to a synthetic ESRCH
+  // so reapOrphans() can drop the record. Linux: /proc read fails with ENOENT,
+  // which matchers already treat as gone.
+  const code = await processStartMarker(2 ** 30 + 12345).then(
+    () => null,
+    (error: NodeJS.ErrnoException | null | undefined) => error?.code ?? null
+  )
+
+  assert.equal(code, process.platform === 'win32' ? 'ESRCH' : 'ENOENT')
+})
+
 // --- PID-only marker helpers --------------------------------------------------
 
 test('pidOnlyStartMarker round-trips through isPidOnlyStartMarker', () => {

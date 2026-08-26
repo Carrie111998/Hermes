@@ -23,6 +23,14 @@ import fs from 'node:fs'
 import { electronProcessStartMarker } from './parent-process-identity'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
+/**
+ * Locale-independent answer for "Get-Process found nothing": PowerShell error
+ * text is localized (an English-only stderr match breaks on non-English
+ * Windows), so the probe asks PowerShell to emit this sentinel when the PID is
+ * absent and classifies it as ESRCH below.
+ */
+const WINDOWS_MISSING_PROCESS_SENTINEL = 'HERMES_PID_NOT_FOUND'
+
 export function execText(command: string, args: string[], { timeout = 3000 } = {}): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     execFile(command, args, hiddenWindowsChildOptions({ encoding: 'utf8', timeout }), (error, stdout) => {
@@ -65,24 +73,33 @@ export async function processStartMarker(pid: number): Promise<string> {
       return electronMarker
     }
 
-    const ticks = await execText(
+    // SilentlyContinue + sentinel keeps the script exit-neutral: a dead PID
+    // must be distinguishable from a flaky probe. The sentinel is rethrown as
+    // ESRCH — the errno shape main.ts identity/parent matchers already map to
+    // "process is gone" — so reapOrphans() drops dead ownership records
+    // instead of keeping them as permanent survivors.
+    const output = await execText(
       'powershell.exe',
       [
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `$p = Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().Ticks`
+        `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -eq $p) { '${WINDOWS_MISSING_PROCESS_SENTINEL}' } else { $p.StartTime.ToUniversalTime().Ticks }`
       ],
       // PowerShell 5.1 cold starts routinely exceed the default 3s execText
       // budget (2.4-8s observed in #87169); give the marker probe headroom.
       { timeout: 30_000 }
     )
 
-    if (!/^\d+$/.test(ticks)) {
+    if (output === WINDOWS_MISSING_PROCESS_SENTINEL) {
+      throw Object.assign(new Error(`Process ${pid} does not exist (Windows start marker)`), { code: 'ESRCH' })
+    }
+
+    if (!/^\d+$/.test(output)) {
       throw new Error(`Invalid Windows start marker for PID ${pid}`)
     }
 
-    return `win:${ticks}`
+    return `win:${output}`
   }
 
   const started = await execText('ps', ['-p', String(pid), '-o', 'lstart='])
