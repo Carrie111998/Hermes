@@ -362,6 +362,132 @@ class TestRedirectPolicy:
 
 
 # ---------------------------------------------------------------------------
+# End-to-end: allowed_rpc_origins governs the task POST redirect path
+# ---------------------------------------------------------------------------
+
+class TestSendTaskRedirectAllowlist:
+    """Real _send_task against live loopback servers: a configured-origin
+    POST that 302s to a PINNED origin must be followed with credentials;
+    the same redirect to an UNPINNED origin must be refused with nothing
+    delivered to the foreign host. Pins the wiring the maintainer flagged
+    (the allowlist reached the card fetch but not the task POST)."""
+
+    def _spin(self, handler):
+        import http.server
+        import threading
+        s = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        return s, f"http://127.0.0.1:{s.server_address[1]}"
+
+    def test_pinned_origin_redirect_followed_with_credentials(self):
+        """Through the REAL _send_task path (wiring under test): the peer's
+        configured origin 302s the task POST to a PINNED origin. The pinned
+        server must receive the credential-bearing request. Fails if
+        _send_task drops allowed_origins on the POST call."""
+        import http.server
+        import json as _json
+
+        seen = {}
+
+        def rpc_ok(req_id):
+            return _json.dumps(protocol.jsonrpc_result(
+                req_id,
+                protocol.build_task("t1", "c1", protocol.STATE_COMPLETED, "ok"))).encode()
+
+        class Pinned(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen["pinned_path"] = self.path
+                seen["pinned_auth"] = self.headers.get("Authorization")
+                seen["pinned_cf"] = self.headers.get("CF-Access-Client-Id")
+                b = rpc_ok(1)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            pinned_url = None
+
+            def do_GET(self):
+                b = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", self.pinned_url + "/rpc")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        ps, pinned = self._spin(Pinned)
+        Redirector.pinned_url = pinned
+        rs, redir = self._spin(Redirector)
+        peer = {"url": redir, "timeout": 10,
+                "auth": {"type": "bearer", "token": "tok-pin"},
+                "headers": {"CF-Access-Client-Id": "cf-pin"},
+                "allowed_rpc_origins": [pinned]}
+        reply, _ctx, _state = tools._send_task("pin-peer", peer, "hello", "")
+        assert "ok" in (reply or "")
+        assert seen.get("pinned_auth") == "Bearer tok-pin", "credentials must reach pinned origin"
+        assert seen.get("pinned_cf") == "cf-pin"
+        ps.shutdown()
+        rs.shutdown()
+
+    def test_full_send_task_unpinned_redirect_refused_no_delivery(self):
+        import http.server
+
+        foreign_hits = {"n": 0, "auth": None}
+
+        class Foreign(http.server.BaseHTTPRequestHandler):
+            def _r(self):
+                foreign_hits["n"] += 1
+                foreign_hits["auth"] = self.headers.get("Authorization")
+                b = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b)
+
+            do_GET = do_POST = _r
+
+            def log_message(self, *a):
+                pass
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            foreign_url = None
+
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", self.foreign_url + "/steal")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        fs, foreign = self._spin(Foreign)
+        Redirector.foreign_url = foreign
+        rs, redir = self._spin(Redirector)
+        peer = {"url": redir, "timeout": 10,
+                "auth": {"type": "bearer", "token": "tok-x"},
+                "headers": {"CF-Access-Client-Id": "cf-x"}}
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            tools._send_task("redir-peer", peer, "hello", "")
+        assert foreign_hits["n"] == 0, "foreign host must never be contacted"
+        assert "refused" in str(ei.value.reason)
+        fs.shutdown()
+        rs.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Origin-level allowlist matching
 # ---------------------------------------------------------------------------
 
