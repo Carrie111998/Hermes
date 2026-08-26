@@ -1165,15 +1165,24 @@ function Test-Python {
     # Let uv find or install Python
     try {
         $pythonPath = $null
-        $qualifiedVer = $null
+        $emulatedPath = $null
         if ($script:WindowsPythonArch -eq 'arm64') {
             # Native ARM64 first: a bare request resolves to the emulated
             # x64 build on Windows-on-ARM (astral-sh/uv#12906).
             $pythonPath = & $UvCmd python find "$PythonVersion-aarch64" 2>$null
-            if ($pythonPath) { $qualifiedVer = $PythonVersion }
         }
         if (-not $pythonPath) {
-            $pythonPath = & $UvCmd python find $PythonVersion 2>$null
+            $found = & $UvCmd python find $PythonVersion 2>$null
+            if ($found) {
+                if ($script:WindowsPythonArch -eq 'arm64') {
+                    # An emulated interpreter alone is not a final answer on
+                    # ARM64 hosts: fall through to the install phase, which
+                    # prefers a native build when one is available.
+                    $emulatedPath = $found
+                } else {
+                    $pythonPath = $found
+                }
+            }
         }
         if ($pythonPath) {
             $ver = & $pythonPath --version 2>$null
@@ -1183,15 +1192,17 @@ function Test-Python {
     } catch { }
     
     # Python not found -- use uv to install it (no admin needed!)
+    # On ARM64 hosts an emulated interpreter found above ($emulatedPath) does
+    # not stop the install: a native build is preferred when available.
     Write-Info "Python $PythonVersion not found, installing via uv..."
-    if (-not $qualifiedVer -and $script:WindowsPythonArch -eq 'arm64') {
+    $installTarget = $PythonVersion
+    if ($script:WindowsPythonArch -eq 'arm64') {
         if (Test-NativeArm64PythonAvailable -Ver $PythonVersion) {
-            $qualifiedVer = $PythonVersion
+            $installTarget = "$PythonVersion-aarch64"
         } else {
             Write-Warn "No native ARM64 build of Python $PythonVersion; falling back to x64 (emulated)"
         }
     }
-    $installTarget = if ($qualifiedVer) { "$qualifiedVer-aarch64" } else { $PythonVersion }
     # Capture EAP outside the try block so the catch's restore call always
     # has a meaningful value (see Install-Uv for the full rationale).
     $prevEAP = $ErrorActionPreference
