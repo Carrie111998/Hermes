@@ -2824,9 +2824,112 @@ function Restore-VenvBackup {
     }
 }
 
+function Find-OpenSslLayout {
+    # SLP layouts vary by version (flat lib\/include\ vs per-runtime
+    # lib\UCRT\<arch>\), so locate the import lib and header roots by
+    # scanning instead of assuming paths.
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return $null }
+    $libFile = Get-ChildItem -LiteralPath $Root -Recurse -Filter "libssl.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $libFile) { return $null }
+    $sslHeader = Get-ChildItem -LiteralPath $Root -Recurse -Filter "ssl.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $sslHeader) { return $null }
+    # ssl.h sits in an openssl\ subdir; its parent is the include root
+    return @{ Root = $Root; LibDir = $libFile.DirectoryName; IncludeDir = $sslHeader.Directory.Parent.FullName }
+}
+
+function Install-WoaOpenSsl {
+    # cryptography is pinned at 50.x for CVE fixes and has no win_arm64
+    # wheel (last one: 46.0.3; native builds tracked in
+    # pyca/cryptography#15350), so on Windows-on-ARM uv builds it from
+    # source and the cargo build (openssl-sys) needs a native OpenSSL on
+    # disk.  SLP's ARM SKUs are Full and Light only (no Dev); Light is
+    # runtime DLLs, so the Full build is required for headers + import
+    # libs.  Its MSI installs to C:\Program Files\OpenSSL-Win64-ARM
+    # regardless of INSTALLDIR, then we export OPENSSL_DIR (plus the
+    # lib/include roots) so the build finds it.  Drop this once 50.x
+    # ships a win_arm64 wheel.
+    # Non-fatal by design: a failure here defers to the cargo build step,
+    # which fails with its own (clear) error.
+    if ($env:OS -ne "Windows_NT" -or $script:WindowsPythonArch -ne "arm64") { return }
+
+    # Honor an existing OpenSSL: OPENSSL_DIR set by the user, a previous
+    # install of ours, or a system-wide install.  SLP's MSI ignores
+    # INSTALLDIR and defaults to C:\Program Files\OpenSSL-Win64-ARM on
+    # this arch, so that root is searched too.
+    foreach ($candidate in @($env:OPENSSL_DIR, (Join-Path $HermesHome "openssl"), "C:\Program Files\OpenSSL-Win64-ARM", "C:\Program Files\OpenSSL")) {
+        if (-not $candidate) { continue }
+        $layout = Find-OpenSslLayout -Root $candidate
+        if ($layout) {
+            $env:OPENSSL_DIR = $candidate
+            $env:OPENSSL_LIB_DIR = $layout.LibDir
+            $env:OPENSSL_INCLUDE_DIR = $layout.IncludeDir
+            Write-Info "OpenSSL found at $candidate (needed to build cryptography from source)"
+            return
+        }
+    }
+
+    $msiName = "Win64ARMOpenSSL-3_6_4.msi"
+    $downloadUrl = "https://slproweb.com/download/$msiName"
+    $expectedSha256 = "a39997d97d1255e6ac427d6d82e7367ae33fc7c6451ba0256573a5ec78a18cb2"
+    $msiDir = Join-Path $HermesHome "openssl"
+    $msiPath = "$env:TEMP\$msiName"
+
+    Write-Info "cryptography has no win_arm64 wheel; installing OpenSSL 3.6.4 (Full, ~220 MB) for the source build..."
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $msiPath -UseBasicParsing
+    } catch {
+        Write-Warn "Could not download $msiName ($downloadUrl): $($_.Exception.Message)"
+        Write-Warn "Install OpenSSL for ARM64 from https://slproweb.com/products/Win32OpenSSL.html, set OPENSSL_DIR to its folder, then re-run"
+        return
+    }
+    $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $msiPath).Hash.ToLowerInvariant()
+    if ($actualSha256 -ne $expectedSha256) {
+        Write-Warn "SHA256 mismatch for $msiName (got $actualSha256); not installing"
+        Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    # SLP's MSI ignores INSTALLDIR and installs to its own default
+    # (C:\Program Files\OpenSSL-Win64-ARM on this arch); no admin rights
+    # needed in practice.  msiexec exit 3010 is success + pending reboot.
+    $proc = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -NoNewWindow -Wait -PassThru
+    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+        Write-Warn "OpenSSL installer exited with $($proc.ExitCode). Install it manually from https://slproweb.com/products/Win32OpenSSL.html, set OPENSSL_DIR to its folder, then re-run"
+        Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+    Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+    if ($proc.ExitCode -eq 3010) {
+        Write-Warn "OpenSSL installed; a reboot is pending before it will work"
+    }
+
+    # The MSI installs to its own default root; search the likely ones.
+    $layout = $null
+    $searchRoots = @("C:\Program Files\OpenSSL-Win64-ARM", "C:\Program Files\OpenSSL", (Join-Path $HermesHome "openssl"), (Join-Path $env:LOCALAPPDATA "Program Files\OpenSSL"))
+    foreach ($root in $searchRoots) {
+        if (-not $root) { continue }
+        $layout = Find-OpenSslLayout -Root $root
+        if ($layout) { $msiDir = $root; break }
+    }
+    if (-not $layout) {
+        Write-Warn "OpenSSL installed but libssl.lib / ssl.h could not be located (searched: $($searchRoots -join ', ')); the cryptography build will still fail until a usable OpenSSL is on disk (list with: Get-ChildItem -Recurse <install dir>)"
+        return
+    }
+    $env:OPENSSL_DIR = $msiDir
+    $env:OPENSSL_LIB_DIR = $layout.LibDir
+    $env:OPENSSL_INCLUDE_DIR = $layout.IncludeDir
+    Write-Success "OpenSSL ready at $msiDir (lib: $($layout.LibDir), include: $($layout.IncludeDir))"
+}
+
 function Install-Dependencies {
     Write-Info "Installing dependencies..."
-    
+
+    # WoA: cryptography's source build needs OPENSSL_DIR in THIS process.
+    # Stages can run as separate powershell.exe invocations, so an export
+    # from an earlier stage would not reach uv's build environment.
+    Install-WoaOpenSsl
+
     Push-Location $InstallDir
     
     if (-not $NoVenv) {
