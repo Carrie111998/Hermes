@@ -3310,7 +3310,7 @@ _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_relay_call", default=None)
 )
 
-_AUX_EGRESS_PROVIDERS = frozenset({"openai-codex", "nous"})
+_AUX_EGRESS_PROVIDERS = frozenset({"anthropic", "openai-codex", "nous"})
 
 
 def _auxiliary_egress_binding(
@@ -3352,11 +3352,12 @@ def _auxiliary_egress_binding(
     if not isinstance(candidate_base_url, str) or not candidate_base_url.startswith(
         ("http://", "https://")
     ):
-        candidate_base_url = (
-            "https://chatgpt.com/backend-api/codex"
-            if normalized_provider == "openai-codex"
-            else _NOUS_DEFAULT_BASE_URL
-        )
+        if normalized_provider == "openai-codex":
+            candidate_base_url = "https://chatgpt.com/backend-api/codex"
+        elif normalized_provider == "anthropic":
+            candidate_base_url = "https://api.anthropic.com/v1"
+        else:
+            candidate_base_url = _NOUS_DEFAULT_BASE_URL
     base_url = candidate_base_url
     resolved_api_mode = str(
         api_mode

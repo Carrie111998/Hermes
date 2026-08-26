@@ -161,6 +161,21 @@ def test_nous_anthropic_messages_auxiliary_egress_blocks_secret(monkeypatch, tmp
     assert clients[0].chat.completions.create.call_count == 0
 
 
+def test_direct_anthropic_auxiliary_egress_blocks_secret(monkeypatch, tmp_path):
+    clients = []
+    with pytest.raises(EgressBlocked):
+        _run_aux_codex_call(
+            monkeypatch,
+            tmp_path,
+            content="token=super-secret-value",
+            provider="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            api_mode="anthropic_messages",
+            client_out=clients,
+        )
+    assert clients[0].chat.completions.create.call_count == 0
+
+
 def test_local_auxiliary_route_bypasses_remote_egress(monkeypatch, tmp_path):
     dispatch = MagicMock(side_effect=AssertionError("local route must not use remote egress"))
     monkeypatch.setattr("agent.llm_egress_runtime.dispatch_authorized_agent_request", dispatch)

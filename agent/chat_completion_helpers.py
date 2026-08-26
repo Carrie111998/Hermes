@@ -924,7 +924,7 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
 
 
 _EGRESS_PROTECTED_PROVIDERS = frozenset(
-    {"openai-codex", "nous", "nous-portal", "nousresearch"}
+    {"anthropic", "openai-codex", "nous", "nous-portal", "nousresearch"}
 )
 
 

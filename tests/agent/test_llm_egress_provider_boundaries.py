@@ -14,14 +14,16 @@ from agent.llm_egress_firewall import EgressBlocked
 
 
 def _agent(tmp_path, *, provider="nous", api_mode="chat_completions"):
+    if provider == "openai-codex":
+        base_url = "https://chatgpt.com/backend-api/codex"
+    elif provider == "anthropic":
+        base_url = "https://api.anthropic.com/v1"
+    else:
+        base_url = "https://inference-api.nousresearch.com/v1"
     return SimpleNamespace(
         provider=provider,
         model="test-model",
-        base_url=(
-            "https://chatgpt.com/backend-api/codex"
-            if provider == "openai-codex"
-            else "https://inference-api.nousresearch.com/v1"
-        ),
+        base_url=base_url,
         api_mode=api_mode,
         session_id="session-1",
         _current_turn_id="turn-1",
@@ -32,7 +34,7 @@ def _agent(tmp_path, *, provider="nous", api_mode="chat_completions"):
 
 
 @pytest.mark.parametrize(
-    "provider", ["openai-codex", "nous", "nous-portal", "nousresearch"]
+    "provider", ["openai-codex", "nous", "nous-portal", "nousresearch", "anthropic"]
 )
 def test_protected_main_provider_denies_before_callback(tmp_path, provider):
     agent = _agent(tmp_path, provider=provider)
