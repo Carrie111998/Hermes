@@ -92,6 +92,7 @@ def _request(
     timeout: int = LIST_TIMEOUT_S,
     headers: dict[str, str] | None = None,
 ) -> dict:
+    from hermes_cli.urllib_security import open_credentialed_url
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request_headers = {
         "Authorization": f"Bearer {key}",
@@ -106,7 +107,11 @@ def _request(
         method=method,
         headers=request_headers,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — user-registered peer URL
+    # The peer URL is user-registered (``hermes peer add``); a redirect to a
+    # different origin must not carry the Authorization: Bearer key with it —
+    # a compromised/MITM'd peer could otherwise harvest it. open_credentialed_url
+    # strips non-safelisted headers across a cross-origin redirect.
+    with open_credentialed_url(req, timeout=timeout) as resp:
         payload = resp.read().decode("utf-8", "replace")
     try:
         parsed = json.loads(payload)
