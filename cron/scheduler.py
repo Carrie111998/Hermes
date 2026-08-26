@@ -5144,7 +5144,10 @@ def run_job(
     this attempt (see ``_run_one_job_body``), bound task-locally to
     ``HERMES_CRON_EXECUTION_ID`` alongside ``HERMES_CRON_SESSION`` for the
     duration of the run. Lets in-process trusted code (native plugins) join
-    a cron-triggered tool call back to this exact execution record.
+    a cron-triggered tool call back to this exact execution record. When
+    ``None`` (the default), the ContextVar is left at its ``_UNSET`` default
+    rather than bound to ``""`` -- same fallback semantics as
+    ``HERMES_CRON_SESSION``, and distinguishable from "bound but empty".
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5629,9 +5632,14 @@ def run_job(
         # which would suppress the legacy os.environ fallback used by standalone
         # cron entrypoints and tests.
         _cron_session_token = _cron_session_var.set("1")
-        _cron_execution_id_token = _cron_execution_id_var.set(
-            str(execution_id) if execution_id else ""
-        )
+        # Leave the ContextVar at its _UNSET default when no execution_id was
+        # supplied, rather than binding "" -- an explicit "" would be
+        # indistinguishable from "no execution id" to a reader, when it
+        # actually means "not provided by this caller". Every call site in
+        # this module always has a real id in scope by this point; only a
+        # caller outside cron/scheduler.py omitting it would hit this branch.
+        if execution_id is not None:
+            _cron_execution_id_token = _cron_execution_id_var.set(str(execution_id))
 
         # Mark this job as NOT the dispatcher-owned kanban worker.
         #
