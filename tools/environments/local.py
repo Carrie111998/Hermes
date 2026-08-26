@@ -517,6 +517,14 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
 
+    # Gate dangerous commands for spawned worker subprocesses (cron jobs,
+    # delegate_task children, PTY spawns) even when the spawning scheduler was
+    # not started via start_gateway() (e.g. systemd/Cron services). Without this,
+    # worker subprocesses inherit the parent env verbatim and fall open (R1).
+    # start_gateway() sets os.environ["HERMES_EXEC_ASK"]; honor an explicit parent
+    # value, otherwise default workers to ask-mode. Non-secret, so safe to inject.
+    sanitized.setdefault("HERMES_EXEC_ASK", "1")
+
     # Filter PYTHONPATH before removing VIRTUAL_ENV: legacy Windows launchers
     # can run the gateway under a base interpreter while VIRTUAL_ENV identifies
     # the separate Hermes runtime venv.  The filter validates that relationship
