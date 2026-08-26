@@ -611,6 +611,38 @@ interface RosterSnapshot {
   primaryConnectionId?: string
   profiles?: RosterRow[]
   sources?: GatewaySource[]
+  spectator?: boolean
+}
+
+export function isSpectatorMode(): boolean {
+  return typeof window !== 'undefined' && window.__HERMES_SPECTATOR__ === true && !window.hermesDesktop
+}
+
+export async function spectatorRoster(): Promise<RosterSnapshot> {
+  const token = typeof window !== 'undefined' ? window.__HERMES_SPECTATOR_TOKEN__ : ''
+
+  if (!token) throw new Error('spectator credential unavailable')
+
+  const base = String(window.__HERMES_BASE_PATH__ || '').replace(/\/$/, '')
+  const response = await fetch(`${base}/api/profiles`, {
+    headers: { 'X-Hermes-Spectator-Token': token }
+  })
+
+  if (!response.ok) throw new Error(`profile roster request failed (${response.status})`)
+
+  const payload = await response.json()
+  const profiles = (Array.isArray(payload?.profiles) ? payload.profiles : [])
+    .map((profile: Record<string, unknown>) => ({
+      name: String(profile?.name || '').trim(),
+      display_name: String(profile?.display_name || '').trim(),
+      description: String(profile?.description || '').trim(),
+      model: String(profile?.model || '').trim(),
+      provider: String(profile?.provider || '').trim(),
+      gateway_running: Boolean(profile?.gateway_running)
+    }))
+    .filter((profile: RosterRow) => profile.name)
+
+  return { profiles, spectator: true }
 }
 
 /** One row of the desktop-wide union agent roster (`host.agents`). */
@@ -637,6 +669,10 @@ export function useRoster() {
   return useQuery({
     queryKey: [...ROSTER_KEY, activeConnectionId],
     queryFn: async () => {
+      if (isSpectatorMode()) {
+        return spectatorRoster()
+      }
+
       // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
       // against each bot's last local meta write, and a fetch issued before
       // a write can only carry pre-write ui_meta. (Issue time is the

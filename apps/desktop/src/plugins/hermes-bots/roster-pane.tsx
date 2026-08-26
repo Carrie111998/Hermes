@@ -241,6 +241,7 @@ export function BotsPane() {
   const { t } = useI18n()
   const b = useBots()
   const { data, error, isLoading, refetch } = useRoster()
+  const spectator = Boolean(data?.spectator)
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
@@ -358,7 +359,7 @@ export function BotsPane() {
       )
   )
 
-  const groupNames = groupChatNames(allMeta, groupRooms)
+  const groupNames = spectator ? [] : groupChatNames(allMeta, groupRooms)
 
   const groupRows = groupNames
     .map(name => ({
@@ -483,10 +484,12 @@ export function BotsPane() {
       $lastSources.set(data.sources)
     }
 
-    mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
-    pullServerAvatars(activeSourceRoster)
-    trackInboundActivity(roster)
-    backfillMessagingProtocol(activeSourceRoster)
+    if (!spectator) {
+      mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
+      pullServerAvatars(activeSourceRoster)
+      trackInboundActivity(roster)
+      backfillMessagingProtocol(activeSourceRoster)
+    }
     // React Query owns the stable server snapshot; derived arrays intentionally
     // follow that snapshot rather than retriggering on their own atom writes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -534,6 +537,7 @@ export function BotsPane() {
       onEdit={setEditing}
       onGroup={setGrouping}
       showHandle={botNeedsHandleLabel(bot, roster, allMeta)}
+      spectator={spectator}
     />
   )
 
@@ -606,7 +610,8 @@ export function BotsPane() {
         <span className="text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)">
           Bots
         </span>
-        <div className="flex items-center gap-0.5">
+        {spectator ? null : (
+          <div className="flex items-center gap-0.5">
           <Tip
             label={activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable'}
           >
@@ -643,8 +648,12 @@ export function BotsPane() {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-        </div>
+          </div>
+        )}
       </div>
+      {spectator ? (
+        <div className="px-2.5 pb-1.5 text-[0.6875rem] text-(--ui-text-quaternary)">Read-only bot roster</div>
+      ) : null}
       {showRosterTools ? (
         <div className="flex min-w-0 items-center gap-1 px-2.5 pb-1.5">
           {showRosterSearch ? (

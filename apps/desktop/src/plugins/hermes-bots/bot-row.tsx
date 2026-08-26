@@ -82,9 +82,10 @@ interface BotRowProps {
   onEdit: (bot: RosterRow) => void
   onGroup: (bot: RosterRow) => void
   showHandle?: boolean
+  spectator?: boolean
 }
 
-export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowProps) {
+export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator = false }: BotRowProps) {
   const { t } = useI18n()
   const b = useBots()
   const activeProfile = useValue(host.state.profile)
@@ -168,9 +169,13 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
   const { fromBot } = previewKind(previewSession?.preview)
 
   // DM previews read like DMs: strip the delivery prefix, keep the message.
-  const displayPreview = stripPreviewMarkdown(
-    fromBot ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…' : previewSession?.preview || ''
-  )
+  const spectatorPreview =
+    bot.description || [bot.provider, bot.model].filter(Boolean).join(' · ') || 'Configured Hermes profile'
+  const displayPreview = spectator
+    ? spectatorPreview
+    : stripPreviewMarkdown(
+        fromBot ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…' : previewSession?.preview || ''
+      )
 
   const handle = botHandle(bot.name, bot)
   const gatewayLabel = bot.connectionLabel || (bot.connectionId === 'local' ? 'This device' : '')
@@ -181,6 +186,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
     .join(' · ')
 
   const warm = () => {
+    if (spectator) return
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
     if (bot.sourceScoped && typeof host.warmAgent === 'function') {
       try {
@@ -205,18 +211,21 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
 
   // Rows and Active Now share the exact-owner open path; only that path may
   // activate a source and resolve the canonical Bot Chat.
-  const open = () => void openRosterBot(bot)
+  const open = () => {
+    if (!spectator) void openRosterBot(bot)
+  }
 
   const row = (
     <RowButton
       aria-label={rowTooltip}
+      aria-disabled={spectator || undefined}
       className={cn(
         'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
-        'hover:bg-(--chrome-action-hover)',
+        !spectator && 'hover:bg-(--chrome-action-hover)',
         isActive && 'bg-(--ui-row-active-background)'
       )}
       onClick={open}
-      onPointerEnter={warm}
+      onPointerEnter={spectator ? undefined : warm}
     >
       <div className={cn('shrink-0', !sourceStatus.available && 'grayscale opacity-60')}>
         <BotFace
@@ -279,6 +288,8 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
       </div>
     </RowButton>
   )
+
+  if (spectator) return row
 
   return (
     <ContextMenu>
