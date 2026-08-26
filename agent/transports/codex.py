@@ -494,8 +494,15 @@ class ResponsesApiTransport(ProviderTransport):
             strip_codex_context_variant_suffix as _strip_ctx_variant,
         )
 
+        request_overrides = params.get("request_overrides")
+        override_model = (
+            request_overrides.get("model", model)
+            if request_overrides
+            else model
+        )
+        wire_model = _strip_ctx_variant(override_model)
         issuer_kind = self._resolve_issuer_kind(params)
-        issuer_model = str(_strip_ctx_variant(model or "")).strip() or None
+        issuer_model = str(wire_model or "").strip() or None
         self._last_issuer_kind = issuer_kind
         self._last_issuer_model = issuer_model
 
@@ -591,7 +598,7 @@ class ResponsesApiTransport(ProviderTransport):
             # ``-900k`` large-context picker variants are Hermes-side aliases
             # (gpt-5.6-sol-900k etc.) — the Codex/OpenAI backend only knows
             # the base slug, so strip the suffix before it hits the wire.
-            "model": _strip_ctx_variant(model),
+            "model": wire_model,
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(
                 payload_messages,
@@ -674,9 +681,11 @@ class ResponsesApiTransport(ProviderTransport):
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
 
-        request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+            # The canonical model governs both the outgoing request and the
+            # provenance used to decide which encrypted reasoning can replay.
+            kwargs["model"] = wire_model
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
