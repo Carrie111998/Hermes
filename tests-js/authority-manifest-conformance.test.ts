@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   type AdmissionRequest,
+  AuthorityManifestArtifactValidationError,
   CANONICAL_AUTHORITY_MANIFEST,
   compileAuthorityManifest,
   evaluateAuthorityOperation,
@@ -144,13 +145,8 @@ describe("authority manifest cross-language conformance", () => {
     }
   });
 
-  it("binds every decision to the supplied packaged policy identity", () => {
+  it("rejects forged packaged policy identity", async () => {
     const artifact = CANONICAL_AUTHORITY_MANIFEST;
-    const alternateDigest = "a".repeat(64);
-    const alternateArtifact = Object.freeze({
-      ...artifact,
-      manifest_sha256: alternateDigest,
-    });
     const request: AdmissionRequest = {
       domain: "github.operation",
       operation_class: "github.comment.write",
@@ -166,13 +162,47 @@ describe("authority manifest cross-language conformance", () => {
       ],
     };
 
-    const canonicalDecision = evaluateAuthorityOperation(artifact, request);
-    const alternateDecision = evaluateAuthorityOperation(alternateArtifact, request);
+    const forgedDigestArtifact = Object.freeze({
+      ...artifact,
+      manifest_sha256: "a".repeat(64),
+    });
+    expect(() => evaluateAuthorityOperation(forgedDigestArtifact, request)).toThrow(
+      AuthorityManifestArtifactValidationError,
+    );
 
-    expect(canonicalDecision.policy_version).toBe(alternateDecision.policy_version);
-    expect(canonicalDecision.manifest_sha256).toBe(artifact.manifest_sha256);
-    expect(alternateDecision.manifest_sha256).toBe(alternateDigest);
-    expect(alternateDecision).not.toEqual(canonicalDecision);
+    const widenedRaw = (await readJson("authority/manifest.v1.json")) as {
+      domains: {
+        "github.operation": {
+          operation_classes: {
+            "github.comment.write": {
+              allowed_actor_classes: string[];
+            };
+          };
+        };
+      };
+    };
+    widenedRaw.domains["github.operation"].operation_classes[
+      "github.comment.write"
+    ].allowed_actor_classes.push("external_bot");
+    const widenedArtifact = Object.freeze({
+      ...artifact,
+      manifest: compileAuthorityManifest(widenedRaw),
+    });
+    const widenedRequest: AdmissionRequest = {
+      ...request,
+      actor_class: "external_bot",
+      capabilities: [
+        {
+          capability: "comments:write",
+          granted: true,
+          source: "external_installation",
+          generation: "installation-1",
+        },
+      ],
+    };
+    expect(() => evaluateAuthorityOperation(widenedArtifact, widenedRequest)).toThrow(
+      AuthorityManifestArtifactValidationError,
+    );
   });
 
   it("runs the shared accepted/rejected mutation corpus through the compiler", async () => {

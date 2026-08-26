@@ -209,6 +209,14 @@ export class AdmissionRequestValidationError extends Error {
   }
 }
 
+export class AuthorityManifestArtifactValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+
+    this.name = "AuthorityManifestArtifactValidationError";
+  }
+}
+
 export type CapabilityGrant = Readonly<{
   capability: string;
   granted: boolean;
@@ -525,6 +533,17 @@ export function parseAdmissionRequest(rawValue: unknown): AdmissionRequest {
   });
 }
 
+function requireCanonicalManifestArtifact(
+  artifact: AuthorityManifestArtifact,
+): AuthorityManifestArtifact {
+  if (artifact !== CANONICAL_AUTHORITY_MANIFEST) {
+    throw new AuthorityManifestArtifactValidationError(
+      "authority admission requires CANONICAL_AUTHORITY_MANIFEST",
+    );
+  }
+  return artifact;
+}
+
 function decision(
   artifact: AuthorityManifestArtifact,
   request: AdmissionRequest,
@@ -547,9 +566,10 @@ function decision(
 }
 
 export function evaluateAuthorityOperation(
-  artifact: AuthorityManifestArtifact,
+  artifactValue: AuthorityManifestArtifact,
   requestValue: AdmissionRequest,
 ): AuthorityDecision {
+  const artifact = requireCanonicalManifestArtifact(artifactValue);
   const manifest = artifact.manifest;
   const request = parseAdmissionRequest(requestValue);
   const domain = manifest.domains[request.domain];
