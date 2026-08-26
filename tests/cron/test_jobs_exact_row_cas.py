@@ -87,6 +87,7 @@ def test_raw_pause_and_restore_refuse_without_retained_barrier(store):
             _digest([alpha]),
             reason="containment",
             dispatch_barrier=None,
+            caller="test:containment",
         )
 
     _seed([paused])
@@ -96,6 +97,7 @@ def test_raw_pause_and_restore_refuse_without_retained_barrier(store):
             target_rows=[alpha],
             dependency_order=["alpha"],
             dispatch_barrier=None,
+            caller="test:containment",
         )
 
 
@@ -165,7 +167,7 @@ def test_pause_jobs_cas_is_one_locked_save_and_returns_exact_digest_proof(
         jobs, "_hermes_now", lambda: datetime(2026, 8, 21, 12, tzinfo=timezone.utc)
     )
 
-    result = jobs.pause_jobs_cas(names, _digest(before), reason="containment", dispatch_barrier=dispatch_barrier)
+    result = jobs.pause_jobs_cas(names, _digest(before), reason="containment", dispatch_barrier=dispatch_barrier, caller="test:containment")
 
     expected_after = _sorted([_paused(alpha), disabled, _paused(matcher)])
     assert enters == 1
@@ -205,11 +207,11 @@ def test_pause_jobs_cas_refuses_digest_or_resolution_drift_without_writing(
 
     monkeypatch.setattr(jobs, "_save_jobs_unlocked", counted_save)
     with pytest.raises(ValueError, match="digest"):
-        jobs.pause_jobs_cas(["alpha"], "0" * 64, reason="containment", dispatch_barrier=dispatch_barrier)
+        jobs.pause_jobs_cas(["alpha"], "0" * 64, reason="containment", dispatch_barrier=dispatch_barrier, caller="test:containment")
     with pytest.raises(ValueError):
-        jobs.pause_jobs_cas(["alpha", "alpha"], _digest([alpha]), reason="containment", dispatch_barrier=dispatch_barrier)
+        jobs.pause_jobs_cas(["alpha", "alpha"], _digest([alpha]), reason="containment", dispatch_barrier=dispatch_barrier, caller="test:containment")
     with pytest.raises(ValueError):
-        jobs.pause_jobs_cas(["missing"], _digest([alpha]), reason="containment", dispatch_barrier=dispatch_barrier)
+        jobs.pause_jobs_cas(["missing"], _digest([alpha]), reason="containment", dispatch_barrier=dispatch_barrier, caller="test:containment")
     assert saves == 0
     assert jobs.snapshot_jobs_by_name(("alpha",)) == [alpha]
 
@@ -249,6 +251,7 @@ def test_restore_jobs_cas_exactly_restores_changed_rows_in_dependency_order(
         target_rows=[matcher, alpha],
         dependency_order=["alpha", "jobflow-matcher"],
         dispatch_barrier=dispatch_barrier,
+        caller="test:containment",
     )
 
     expected_scope = _sorted([alpha, disabled, matcher])
@@ -320,6 +323,7 @@ def test_restore_jobs_cas_refuses_nonexact_cas_scope_or_order_without_writing(
             target_rows=targets,
             dependency_order=order,
             dispatch_barrier=dispatch_barrier,
+            caller="test:containment",
         )
     assert saves == 0
     assert jobs.snapshot_jobs_by_name(("alpha", "jobflow-matcher")) == _sorted(stored)

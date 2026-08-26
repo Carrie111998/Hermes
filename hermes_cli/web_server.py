@@ -12092,7 +12092,9 @@ def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "pause_job", job_id)
+    job = _call_cron_for_profile(
+        selected, "pause_job", job_id, caller="http_api:web_server"
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -12107,7 +12109,9 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "resume_job", job_id)
+    job = _call_cron_for_profile(
+        selected, "resume_job", job_id, caller="http_api:web_server"
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job

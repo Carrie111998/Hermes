@@ -93,6 +93,28 @@ class EventType(Enum):
     # attributed in postmortems. LOW priority => audit-logger captures it
     # but Telegram/WhatsApp routing leaves it out by default.
     CRON_TRIGGERED = ("cron_triggered", Priority.LOW, "👆")
+    # Added 2026-08-25: the pause/resume half of the cron audit trail. Until
+    # now ONLY trigger_job emitted anything — pause_job and resume_job both
+    # routed through update_job, which has no emit path, so a paused job left
+    # no record of the transition anywhere. Two independent investigations of
+    # the 2026-08-24/25 jobflow/jaum/tracker pause churn (eight rows paused and
+    # resumed repeatedly) tried to attribute it from audit.jsonl and from agent
+    # transcripts and both failed, for the simple reason that there was nothing
+    # to find. The job RECORD gained the WHY in cfe15649ad (paused_reason,
+    # archived to paused_history on resume); these two carry the TRANSITION.
+    #
+    # Payload (both): job_id, job_name, caller, reason, paused_at,
+    # previous_state, new_state — plus next_run_at on resume. ``reason`` is the
+    # PAUSE's why in both directions: on resume it is the reason being retired,
+    # which is what makes a pause/resume span readable from either end.
+    # ``previous_state`` is what separates a real transition from a repeat
+    # pause of an already-paused job — the shape the churn investigation
+    # needed and could not get. LOW priority, same as CRON_TRIGGERED: the
+    # audit logger captures it, Telegram/WhatsApp leave it out by default.
+    CRON_PAUSED = ("cron_paused", Priority.LOW, "⏸️")
+    # ⏯️ (play/pause) rather than ▶️, which CRON_STARTED already owns in this
+    # same cron_firehose topic — the disjointness standard is per-topic.
+    CRON_RESUMED = ("cron_resumed", Priority.LOW, "⏯️")
     CRON_COMPLETED = ("cron_completed", Priority.NORMAL, "✔️")
     CRON_FAILED = ("cron_failed", Priority.HIGH, "💥")
     CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL, "🔥")

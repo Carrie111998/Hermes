@@ -873,12 +873,17 @@ def cronjob(
             )
 
         if normalized == "pause":
-            updated = pause_job(job_id, reason=reason)
+            # Same caller default as the run path below: no explicit caller
+            # means the model invoked the tool itself, while the CLI, console
+            # and both HTTP surfaces always pass their own string.
+            updated = pause_job(
+                job_id, reason=reason, caller=caller or "llm:cronjob_tool"
+            )
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "resume":
-            updated = resume_job(job_id)
+            updated = resume_job(job_id, caller=caller or "llm:cronjob_tool")
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 

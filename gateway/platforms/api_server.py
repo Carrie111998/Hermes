@@ -4644,7 +4644,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = _cron_pause(job_id)
+            job = _cron_pause(job_id, caller="http_api:api_server")
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
@@ -4664,7 +4664,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = _cron_resume(job_id)
+            job = _cron_resume(job_id, caller="http_api:api_server")
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
