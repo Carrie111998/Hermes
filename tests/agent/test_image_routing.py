@@ -457,9 +457,9 @@ class TestFormatCompatibility:
         assert _sniff_mime_from_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>') == "image/svg+xml"
         assert _sniff_mime_from_bytes(b'<?xml version="1.0"?><svg/>') == "image/svg+xml"
 
-    def test_bmp_transcoded_to_png(self, tmp_path: Path):
-        """BMP file should land as image/png in the data URL, not image/bmp,
-        because not every provider (Anthropic) accepts BMP."""
+    def test_bmp_transcoded_to_jpeg_when_opaque(self, tmp_path: Path):
+        """Opaque BMP file should land as image/jpeg in the data URL,
+        because it is universally accepted and more compact than PNG."""
         import pytest
         Image = pytest.importorskip("PIL.Image", reason="Pillow not installed; transcode is best-effort")
         from agent.image_routing import _file_to_data_url
@@ -468,9 +468,26 @@ class TestFormatCompatibility:
         Image.new("RGB", (4, 4), (255, 0, 0)).save(img_path, format="BMP")
         url = _file_to_data_url(img_path)
         assert url is not None
-        assert url.startswith("data:image/png;base64,"), (
-            f"BMP must be transcoded to PNG for cross-provider compatibility, got: {url[:60]}"
+        assert url.startswith("data:image/jpeg;base64,"), (
+            f"Opaque BMP must be transcoded to JPEG for cross-provider compatibility and size, got: {url[:60]}"
         )
+
+    def test_bmp_transcoded_to_png_when_transparent(self, tmp_path: Path):
+        """BMP/RGBA file with transparency should land as image/png in the data URL."""
+        import pytest
+        Image = pytest.importorskip("PIL.Image", reason="Pillow not installed; transcode is best-effort")
+        from agent.image_routing import _file_to_data_url
+
+        img_path = tmp_path / "scan_alpha.png"
+        # Create a non-universal format or simulate alpha transcode
+        from agent.image_routing import _transcode_to_supported_format
+        import io
+        buf = io.BytesIO()
+        Image.new("RGBA", (4, 4), (255, 0, 0, 128)).save(buf, format="PNG")
+        res = _transcode_to_supported_format(buf.getvalue())
+        assert res is not None
+        _, out_mime = res
+        assert out_mime == "image/png"
 
 
     def test_png_passes_through_no_transcode(self, tmp_path: Path):

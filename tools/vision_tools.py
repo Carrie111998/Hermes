@@ -249,18 +249,8 @@ def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
     SVG, which has no magic bytes. The resolver special-cases SVG (sniffs
     ``<svg``) and passes it through for rasterization at the call sites.
     """
-    header = data[:64]
-    if header.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if header.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if header.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if header.startswith(b"BM"):
-        return "image/bmp"
-    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-        return "image/webp"
-    return None
+    from tools.image_formats import sniff_image_mime
+    return sniff_image_mime(data)
 
 
 # Media types the major vision providers (Anthropic in particular) accept for
@@ -358,18 +348,53 @@ def _normalize_to_supported_image(
             "(`pip install cairosvg`) — then re-run vision_analyze on the PNG.",
         )
 
-    # Other non-supported raster formats (BMP, TIFF, ...): re-encode via Pillow.
+    # Register HEIF/AVIF support before Pillow opens an iPhone or modern mobile image.
+    # WebUI uploads may carry HEIC bytes under a .jpg filename. The codec is
+    # lazy-installed only when needed, so ordinary PNG/JPEG vision calls do not incur
+    # a setup cost; prompt=False prevents an interactive install prompt mid-session.
+    if detected_mime in {"image/heic", "image/avif"}:
+        try:
+            import pillow_heif  # type: ignore
+            pillow_heif.register_heif_opener()
+        except Exception:
+            try:
+                from tools.lazy_deps import ensure as _ensure_dep
+                _ensure_dep("tool.vision", prompt=False)
+                import pillow_heif  # type: ignore
+                pillow_heif.register_heif_opener()
+            except Exception as _codec_err:
+                logger.warning(
+                    "Detected %s image but failed to initialize pillow-heif codec: %s. "
+                    "Install with `pip install pillow-heif` for HEIC/AVIF image support.",
+                    detected_mime, _codec_err,
+                )
     try:
         from PIL import Image as _PILImage
         with _PILImage.open(image_path) as _img:
-            if _img.mode not in ("RGB", "RGBA", "L"):
-                _img = _img.convert("RGBA")
-            _img.save(out_path, format="PNG")
+            # Re-encode opaque images as JPEG (quality 85) to avoid blowing up
+            # camera photos (e.g. 48MP iPhone HEIC -> 30MB+ PNG -> 413 error).
+            # Keep PNG for images with alpha transparency.
+            has_alpha = _img.mode in ("RGBA", "LA", "PA") or (
+                _img.mode == "P" and "transparency" in _img.info
+            )
+            if has_alpha:
+                if _img.mode not in ("RGB", "RGBA", "L"):
+                    _img = _img.convert("RGBA")
+                out_path = out_dir / f"converted_{uuid.uuid4()}.png"
+                _img.save(out_path, format="PNG")
+                out_mime = "image/png"
+            else:
+                if _img.mode not in ("RGB", "L"):
+                    _img = _img.convert("RGB")
+                out_path = out_dir / f"converted_{uuid.uuid4()}.jpg"
+                _img.save(out_path, format="JPEG", quality=85)
+                out_mime = "image/jpeg"
+
         if out_path.exists() and out_path.stat().st_size > 0:
-            return out_path, "image/png", None
+            return out_path, out_mime, None
     except Exception as _exc:
-        logger.warning("Failed to normalize %s image to PNG: %s",
-                       detected_mime, _exc)
+        logger.warning("Failed to normalize %s image to %s: %s",
+                       detected_mime, out_mime if 'out_mime' in locals() else 'PNG/JPEG', _exc)
     return (
         None,
         None,

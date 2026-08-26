@@ -2639,14 +2639,10 @@ def _decode_data_url(data_url: str) -> tuple[bytes, str]:
 
 
 _CHAT_IMAGE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
-_CHAT_IMAGE_ALLOWED_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
-_CHAT_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", ".png"),
-    (b"\xff\xd8\xff", ".jpg"),
-    (b"GIF87a", ".gif"),
-    (b"GIF89a", ".gif"),
-    (b"BM", ".bmp"),
-)
+_CHAT_IMAGE_ALLOWED_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+    ".heic", ".heif", ".avif",
+})
 
 
 def _sanitize_chat_image_filename(filename: str | None) -> str:
@@ -2657,13 +2653,8 @@ def _sanitize_chat_image_filename(filename: str | None) -> str:
 
 
 def _chat_image_extension(data: bytes) -> str | None:
-    head = data[:16]
-    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
-        return ".webp"
-    for sig, ext in _CHAT_IMAGE_MAGIC:
-        if head.startswith(sig):
-            return ext
-    return None
+    from tools.image_formats import sniff_image_extension
+    return sniff_image_extension(data)
 
 
 def _decode_chat_image_upload(payload: ChatImageUpload) -> tuple[bytes, str, str]:

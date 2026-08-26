@@ -1037,7 +1037,18 @@ class TestWebServerEndpoints:
 
     # ── POST /api/chat/image-upload (browser clipboard/drop images) ─────
 
+    def test_chat_image_sniffs_heic_bytes_over_misleading_filename(self):
+        from hermes_cli.web_server import _chat_image_extension
 
+        # ISO-BMFF with a generic HEIF major brand and HEIC compatible brand.
+        heic = b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00heic" + b"\x00" * 32
+        assert _chat_image_extension(heic) == ".heic"
+
+    def test_chat_image_sniffs_avif_bytes(self):
+        from hermes_cli.web_server import _chat_image_extension
+
+        avif = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00" + b"\x00" * 32
+        assert _chat_image_extension(avif) == ".avif"
 
 
 

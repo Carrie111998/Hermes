@@ -650,16 +650,13 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     # BMP: "BM"
     if raw.startswith(b"BM"):
         return "image/bmp"
-    # ISO-BMFF family (HEIC/HEIF/AVIF): bytes 4..8 == 'ftyp', major brand at 8..12
-    if len(raw) >= 12 and raw[4:8] == b"ftyp":
-        brand = raw[8:12]
-        if brand in {b"avif", b"avis"}:
-            return "image/avif"
-        if brand in {
-            b"heic", b"heix", b"hevc", b"hevx",
-            b"mif1", b"msf1", b"heim", b"heis",
-        }:
-            return "image/heic"
+    # ISO-BMFF family (HEIC/HEIF/AVIF): scan ftyp brands
+    from tools.image_formats import sniff_isobmff_image_brand
+    isobmff_brand = sniff_isobmff_image_brand(raw)
+    if isobmff_brand == "avif":
+        return "image/avif"
+    if isobmff_brand == "heic":
+        return "image/heic"
     # TIFF: II*\0 (little-endian) or MM\0* (big-endian)
     if raw[:4] in {b"II*\x00", b"MM\x00*"}:
         return "image/tiff"
@@ -690,10 +687,10 @@ _UNIVERSALLY_SUPPORTED_MIMES = frozenset({
 })
 
 
-def _transcode_to_png(raw: bytes) -> Optional[bytes]:
-    """Decode arbitrary image bytes with Pillow and re-encode as PNG.
+def _transcode_to_supported_format(raw: bytes) -> Optional[tuple[bytes, str]]:
+    """Decode arbitrary image bytes with Pillow and re-encode to JPEG/PNG.
 
-    Returns None if Pillow isn't installed or can't decode the input
+    Returns (bytes, mime) tuple or None if Pillow isn't installed or can't decode the input
     (rare formats, corrupted bytes, missing optional decoder plugin for
     HEIC/AVIF, or vector formats like SVG). Caller falls back to skipping
     the image so the rest of the turn still works.
@@ -723,21 +720,30 @@ def _transcode_to_png(raw: bytes) -> Optional[bytes]:
         import pillow_avif  # type: ignore  # noqa: F401  -- registers AVIF on import
     except Exception:
         pass
+    # Strategy: if opaque (no alpha), transcode to JPEG (quality 85) to avoid
+    # massive PNG explosion on camera photos (e.g. 48MP iPhone HEIC -> 30MB+ PNG).
+    # If transparent or exotic palette, transcode to PNG.
     try:
         from io import BytesIO
 
         with Image.open(BytesIO(raw)) as im:
-            # Pick an output mode PNG can serialise. Anything other than
-            # the standard set gets normalised to RGBA so transparency is
-            # preserved where the source had it.
-            if im.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
-                im = im.convert("RGBA")
+            has_alpha = im.mode in ("RGBA", "LA", "PA") or (
+                im.mode == "P" and "transparency" in im.info
+            )
             buf = BytesIO()
-            im.save(buf, format="PNG", optimize=False)
-            return buf.getvalue()
+            if has_alpha:
+                if im.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
+                    im = im.convert("RGBA")
+                im.save(buf, format="PNG", optimize=False)
+                return buf.getvalue(), "image/png"
+            else:
+                if im.mode not in {"RGB", "L"}:
+                    im = im.convert("RGB")
+                im.save(buf, format="JPEG", quality=85)
+                return buf.getvalue(), "image/jpeg"
     except Exception as exc:
         logger.info(
-            "image_routing: Pillow could not transcode image to PNG -- %s", exc
+            "image_routing: Pillow could not transcode image -- %s", exc
         )
         return None
 
@@ -808,21 +814,22 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         return None
     mime = _guess_mime(path, raw=raw)
     if mime not in _UNIVERSALLY_SUPPORTED_MIMES:
-        transcoded = _transcode_to_png(raw)
-        if transcoded is None:
+        transcode_res = _transcode_to_supported_format(raw)
+        if transcode_res is None:
             logger.warning(
                 "image_routing: %s is %s which is not accepted by all major "
-                "vision providers and could not be transcoded to PNG; "
+                "vision providers and could not be transcoded; "
                 "skipping this attachment.",
                 path, mime,
             )
             return None
+        transcoded, out_mime = transcode_res
         logger.info(
-            "image_routing: transcoded %s (%s) -> image/png for provider compatibility",
-            path.name, mime,
+            "image_routing: transcoded %s (%s) -> %s for provider compatibility",
+            path.name, mime, out_mime,
         )
         raw = transcoded
-        mime = "image/png"
+        mime = out_mime
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
