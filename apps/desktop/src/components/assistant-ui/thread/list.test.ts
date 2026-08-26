@@ -9,6 +9,7 @@ import {
   liveTailStart,
   type MessageGroup,
   resolveThreadScrollTarget,
+  shouldRestoreResumeAnchor,
   subscribeToThreadForeground,
   transcriptPaneBudget
 } from './list'
@@ -188,6 +189,15 @@ describe('resolveThreadScrollTarget', () => {
 
     expect(resolveThreadScrollTarget(899, context(scrollElement))).toBe(898.875)
     expect(resolveThreadScrollTarget(999, context(scrollElement))).toBe(999)
+  })
+})
+
+describe('shouldRestoreResumeAnchor', () => {
+  it('restores only for a newer authority revision while still following the bottom', () => {
+    expect(shouldRestoreResumeAnchor(2, 3, true)).toBe(true)
+    expect(shouldRestoreResumeAnchor(2, 2, true)).toBe(false)
+    expect(shouldRestoreResumeAnchor(3, 2, true)).toBe(false)
+    expect(shouldRestoreResumeAnchor(2, 3, false)).toBe(false)
   })
 })
 

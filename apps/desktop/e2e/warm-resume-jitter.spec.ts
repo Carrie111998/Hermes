@@ -1,31 +1,11 @@
 /**
- * E2E regression: warm-route resume must not re-render the transcript more
- * than once.
+ * E2E regression: publishing persisted authority during a warm-route resume
+ * must keep a settled, bottom-following transcript anchored to the bottom.
  *
- * When a session is already in the runtime-id cache (the "warm" path in
- * `resumeSession()`), clicking its sidebar row should paint the transcript
- * exactly once. Before the fix, the warm cache painted via
- * `syncSessionStateToView`, then the `session.activate` RPC returned a
- * reconciled message list with different message object references, causing
- * `syncSessionStateToView` to fire a second `setMessages` — a visual
- * flicker as the transcript DOM was updated.
- *
- * This test pre-seeds a 32-message session into state.db, boots the app,
- * clicks the session (cold resume — populates the warm cache), navigates
- * away to a new chat, then clicks back (warm resume). Two detectors run:
- *
- * 1. A MutationObserver counts additive DOM mutation bursts (childList
- *    additions). More than 1 burst = the transcript was repainted.
- *
- * 2. A 2ms innerHTML-length poll counts "reconciles" — DOM content changes
- *    that happen AFTER the initial paint, while messages are already on
- *    screen. This catches the case where React reconciles by key without
- *    adding/removing nodes (same keys → in-place prop update → no
- *    MutationObserver burst), but `$messages` was still set twice.
- *
- * The test passes when bursts === 1 AND reconciles === 0.
- * The sidebar "+" keeps the session warm in another tab. Its reactivation
- * follows the same contract: one additive paint and zero reconciles.
+ * The test deliberately delays the real session-messages response, lets the
+ * cached viewport settle, then publishes a non-equivalent persisted message
+ * list. A requestAnimationFrame observer fails if a rendered frame exposes a
+ * stale scroll offset.
  *
  * Prerequisite: `npm run build` must have been run so dist/ exists.
  */
@@ -39,7 +19,7 @@ import {
   writeMockProviderConfig,
   writeEnvFile,
   buildAppEnv,
-  launchDesktop,
+  launchDesktop
 } from './fixtures'
 import { startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
@@ -49,9 +29,13 @@ const SESSION_TITLE = 'E2E Warm Resume Jitter Test'
 // Inactive tabs stay mounted under a data-pane-hidden ancestor. Match the
 // renderer's keep-alive visibility policy instead of relying on DOM order.
 const SURFACE = '[data-composer-target]:not([data-pane-hidden] [data-composer-target])'
-const ALL_SURFACES = '[data-composer-target]'
 /** 32 messages (16 user/assistant pairs) — enough DOM churn for detection. */
 const MESSAGE_COUNT = 32
+const AUTHORITY_ONLY_TEXT = Array.from(
+  { length: 8 },
+  (_, index) => `E2E delayed persisted authority row ${index + 1}`
+).join('\n')
+const COMPLETED_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
 /** Seeded PRNG so the generated content is deterministic across runs. */
 const RNG_SEED = 42
 
@@ -135,7 +119,7 @@ async function setupSeededMockBackend(): Promise<MockBackendFixture> {
       await app.close().catch(() => undefined)
       await mock.close()
       sandbox.cleanup()
-    },
+    }
   }
 }
 
@@ -151,108 +135,11 @@ test.afterAll(async () => {
   fixture = null
 })
 
-/**
- * Install a MutationObserver + text-content poll on the thread viewport
- * to detect re-renders after the initial paint. Returns nothing — call
- * `readRenderCount` to stop and collect results.
- *
- * - MutationObserver: counts additive childList bursts (5ms coalescing).
- * - Text-content poll: counts "reconciles" — first-message text changes
- *   after the initial paint, catching key-based reconciles that don't
- *   add/remove nodes.
- */
-async function installRenderCounter(
-  page: import('@playwright/test').Page,
-  transcriptText?: string,
-): Promise<void> {
-  await page.evaluate(([visibleSelector, allSelector, expected]: [string, string, string | undefined]) => {
-    const surfaces = [...document.querySelectorAll(expected ? allSelector : visibleSelector)]
-    const surface = expected
-      ? surfaces.find(candidate =>
-          (candidate.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-        )
-      : surfaces.at(-1)
-    const viewport = surface?.querySelector('[data-slot="aui_thread-viewport"]')
-    if (!viewport) {
-      throw new Error('Thread viewport not found before warm resume')
-    }
-
-    const state = { bursts: 0, mutations: 0, timeline: [] as number[], stopped: false, reconciles: 0 }
-    const debugWindow = window as unknown as {
-      __RENDER_COUNT__: typeof state
-      __RENDER_VIEWPORT__: Element
-    }
-    debugWindow.__RENDER_COUNT__ = state
-    debugWindow.__RENDER_VIEWPORT__ = viewport
-
-    let currentBatch = 0
-    let flushTimer: ReturnType<typeof setTimeout> | null = null
-
-    const flush = () => {
-      flushTimer = null
-      if (currentBatch > 0 && !state.stopped) {
-        state.bursts += 1
-        state.timeline.push(currentBatch)
-        currentBatch = 0
-      }
-    }
-
-    const observer = new MutationObserver(records => {
-      if (state.stopped) return
-      let batchAdded = 0
-      for (const record of records) {
-        state.mutations += 1
-        if (record.type === 'childList' && record.addedNodes.length > 0) {
-          batchAdded += 1
-        }
-      }
-      if (batchAdded > 0) {
-        currentBatch += batchAdded
-        if (flushTimer) clearTimeout(flushTimer)
-        flushTimer = setTimeout(flush, 5)
-      }
-    })
-
-    observer.observe(viewport, {
-      childList: true,
-      subtree: true,
-      attributes: false,
-      characterData: false,
-    })
-
-    // Poll the first message's text content every 2ms. The MutationObserver
-    // only catches childList additions; React may reconcile by key without
-    // adding/removing nodes (same keys → in-place prop update → no childList
-    // mutation). The poll catches this by detecting text content changes in
-    // the first message after the initial paint. Metadata-only changes (model
-    // name, busy indicator) don't affect message text, so they don't produce
-    // false positives.
-    const contentEl = viewport.querySelector('[data-slot="aui_thread-content"]') ?? viewport
-    let lastFirstMsgText = ''
-    let hasMessages = false
-    const pollInterval = setInterval(() => {
-      if (state.stopped) {
-        clearInterval(pollInterval)
-        return
-      }
-      const firstMsg = contentEl.querySelector('[data-role="message"], [data-message-id]')
-      const firstMsgText = firstMsg?.textContent ?? ''
-      if (firstMsgText && firstMsgText !== lastFirstMsgText) {
-        if (hasMessages) {
-          state.reconciles = (state.reconciles ?? 0) + 1
-        }
-        lastFirstMsgText = firstMsgText
-        hasMessages = true
-      }
-    }, 2)
-  }, [SURFACE, ALL_SURFACES, transcriptText] as [string, string, string | undefined])
-}
-
 /** Wait until the ACTIVE chat surface's transcript contains `text`. */
 async function waitForActiveTranscriptText(
   page: import('@playwright/test').Page,
   text: string,
-  timeout = 30_000,
+  timeout = 30_000
 ): Promise<void> {
   await page.waitForFunction(
     ([expected, surfaceSelector]: [string, string]) => {
@@ -262,14 +149,11 @@ async function waitForActiveTranscriptText(
       return (active?.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected)
     },
     [text, SURFACE] as [string, string],
-    { timeout },
+    { timeout }
   )
 }
 
-async function waitForActiveTranscriptWithoutText(
-  page: import('@playwright/test').Page,
-  text: string,
-): Promise<void> {
+async function waitForActiveTranscriptWithoutText(page: import('@playwright/test').Page, text: string): Promise<void> {
   await page.waitForFunction(
     ([expected, surfaceSelector]: [string, string]) => {
       const surfaces = document.querySelectorAll(surfaceSelector)
@@ -278,7 +162,7 @@ async function waitForActiveTranscriptWithoutText(
       return !(active?.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected)
     },
     [text, SURFACE] as [string, string],
-    { timeout: 15_000 },
+    { timeout: 15_000 }
   )
 }
 
@@ -288,125 +172,259 @@ async function openFreshDraft(page: import('@playwright/test').Page, priorText: 
   await waitForActiveTranscriptWithoutText(page, priorText)
 }
 
-/** Stack an empty tab while leaving the current transcript mounted and warm. */
-async function openNewSessionTab(page: import('@playwright/test').Page, priorText: string): Promise<void> {
-  await page.locator('[data-slot="sidebar"] button[aria-label="New session"]').first().click()
-  await waitForActiveTranscriptWithoutText(page, priorText)
+type MainAuthorityGate = {
+  hit: boolean
+  release: () => void
+  released: boolean
 }
 
-/** Stop the render counter and return the recorded burst/reconcile counts. */
-async function readRenderCount(page: import('@playwright/test').Page): Promise<{
-  bursts: number
-  mutations: number
-  timeline: number[]
-  reconciles: number
-} | null> {
-  return page.evaluate(() => {
-    type RenderCount = { bursts: number; mutations: number; timeline: number[]; stopped: boolean; reconciles: number }
-    const w = window as unknown as { __RENDER_COUNT__?: RenderCount }
-    const rc = w.__RENDER_COUNT__
-    if (rc) {
-      rc.stopped = true
+async function armDelayedPersistedAuthority(app: MockBackendFixture['app']): Promise<void> {
+  await app.evaluate(({ ipcMain }, marker) => {
+    type InvokeHandler = (...args: unknown[]) => unknown
+    const handlers = (ipcMain as unknown as { _invokeHandlers?: Map<string, InvokeHandler> })._invokeHandlers
+    const original = handlers?.get('hermes:api')
+
+    if (!handlers || !original) {
+      throw new Error('Electron hermes:api invoke handler is unavailable')
     }
-    return rc ? { bursts: rc.bursts, mutations: rc.mutations, timeline: rc.timeline, reconciles: rc.reconciles } : null
+
+    let releaseResponse!: () => void
+    const held = new Promise<void>(resolve => {
+      releaseResponse = resolve
+    })
+    const gate: MainAuthorityGate = {
+      hit: false,
+      released: false,
+      release: () => {
+        if (!gate.released) {
+          gate.released = true
+          releaseResponse()
+        }
+      }
+    }
+    const mainGlobal = globalThis as typeof globalThis & { __E2E_AUTHORITY_GATE__?: MainAuthorityGate }
+    mainGlobal.__E2E_AUTHORITY_GATE__ = gate
+
+    handlers.set('hermes:api', async (...args: unknown[]) => {
+      const result = await original(...args)
+      const request = args[1] as { method?: string; path?: string } | undefined
+      const isTargetRead =
+        (!request?.method || request.method === 'GET') &&
+        /^\/api\/sessions\/[^/]+\/messages(?:\?|$)/.test(request?.path ?? '')
+
+      if (!gate.hit && isTargetRead) {
+        gate.hit = true
+        handlers.set('hermes:api', original)
+        await held
+
+        const response = result as { messages?: unknown[] }
+
+        if (!Array.isArray(response?.messages)) {
+          throw new Error('Target session-messages response has no messages array')
+        }
+
+        const maxId = response.messages.reduce<number>((current, row) => {
+          const record = row && typeof row === 'object' ? (row as { id?: unknown; row_id?: unknown }) : null
+          const candidate = Number(record?.id ?? record?.row_id)
+
+          return Number.isFinite(candidate) ? Math.max(current, candidate) : current
+        }, 0)
+
+        return {
+          ...response,
+          messages: [
+            ...response.messages,
+            {
+              content: marker,
+              id: maxId + 1000,
+              role: 'user',
+              timestamp: Date.now() / 1000
+            }
+          ]
+        }
+      }
+
+      return result
+    })
+  }, AUTHORITY_ONLY_TEXT)
+}
+
+async function persistedAuthorityRequestIsWaiting(app: MockBackendFixture['app']): Promise<boolean> {
+  return app.evaluate(() => {
+    const mainGlobal = globalThis as typeof globalThis & { __E2E_AUTHORITY_GATE__?: MainAuthorityGate }
+
+    return Boolean(mainGlobal.__E2E_AUTHORITY_GATE__?.hit && !mainGlobal.__E2E_AUTHORITY_GATE__?.released)
   })
 }
 
-async function observedViewportIsActive(page: import('@playwright/test').Page): Promise<boolean> {
-  return page.evaluate((surfaceSelector: string) => {
-    const surfaces = document.querySelectorAll(surfaceSelector)
-    const activeViewport = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')
-    const observedViewport = (window as unknown as { __RENDER_VIEWPORT__?: Element }).__RENDER_VIEWPORT__
+async function releasePersistedAuthority(app: MockBackendFixture['app']): Promise<void> {
+  await app.evaluate(() => {
+    const mainGlobal = globalThis as typeof globalThis & { __E2E_AUTHORITY_GATE__?: MainAuthorityGate }
+    const gate = mainGlobal.__E2E_AUTHORITY_GATE__
 
-    return activeViewport === observedViewport
-  }, SURFACE)
+    if (!gate?.hit) {
+      throw new Error('Persisted-authority request was not waiting at release time')
+    }
+
+    gate.release()
+  })
 }
 
-/** A kept-alive tab must become visible without rebuilding its transcript. */
-function assertNoRepaint(result: { bursts: number; mutations: number; timeline: number[]; reconciles: number } | null): void {
-  expect(result, 'MutationObserver should have recorded render data').toBeTruthy()
-  expect(
-    result!.bursts,
-    `Expected no additive render bursts for a kept-alive tab, but got ${result!.bursts}. ` +
-      `Mutation timeline: ${JSON.stringify(result!.timeline)}.`,
-  ).toBe(0)
-  expect(
-    result!.reconciles,
-    `Expected no transcript reconciles for a kept-alive tab, but got ${result!.reconciles}.`,
-  ).toBe(0)
+interface ViewportAnchorReport {
+  authorityReleaseFrame: number
+  maxDistanceFromBottom: number
+  samples: Array<{
+    authorityVisible: boolean
+    clientHeight: number
+    distanceFromBottom: number
+    following: string | undefined
+    frame: number
+    messageCount: number
+    mutation: number
+    scrollHeight: number
+    scrollTop: number
+  }>
+  settled: boolean
+  settledFrame: number
+  worstFrame: number
 }
 
-/** Assert the render counter shows exactly one paint with no re-renders. */
-function assertNoJitter(result: { bursts: number; mutations: number; timeline: number[]; reconciles: number } | null): void {
-  expect(result, 'MutationObserver should have recorded render data').toBeTruthy()
-  expect(
-    result!.bursts,
-    `Expected 1 additive render burst (single paint), but got ${result!.bursts} bursts. ` +
-      `Mutation timeline: ${JSON.stringify(result!.timeline)}.`,
-  ).toBe(1)
-  expect(
-    result!.reconciles,
-    `Expected 0 reconciles (no re-render after initial paint), but got ${result!.reconciles}. ` +
-      `This means the warm-route resume re-rendered the transcript after the initial paint ` +
-      `— the "warm resume jitter" bug is present.`,
-  ).toBe(0)
-}
+async function installViewportAnchorObserver(
+  page: import('@playwright/test').Page,
+  expectedCachedMessageCount: number
+): Promise<void> {
+  await page.evaluate(
+    ([surfaceSelector, authorityMarker, expectedCount]: [string, string, number]) => {
+      const surfaces = [...document.querySelectorAll(surfaceSelector)]
+      const viewport = surfaces.at(-1)?.querySelector<HTMLElement>('[data-slot="aui_thread-viewport"]')
 
-test('tab reactivation preserves the mounted transcript without repainting', async ({}, testInfo) => {
-  const page = fixture!.page
+      if (!viewport) {
+        throw new Error('Active draft thread viewport not found before warm resume')
+      }
 
-  // Wait for the sidebar to populate with our seeded session.
-  const sessionRow = page
-    .locator('[data-slot="sidebar"] button')
-    .filter({ hasText: SESSION_TITLE })
-    .first()
-  await sessionRow.waitFor({ state: 'visible', timeout: 60_000 })
+      const state = {
+        authorityReleaseFrame: -1,
+        bottomStreak: 0,
+        frame: 0,
+        lastMutation: 0,
+        maxDistanceFromBottom: 0,
+        mutation: 0,
+        quietStreak: 0,
+        samples: [] as ViewportAnchorReport['samples'],
+        settled: false,
+        settledFrame: -1,
+        stopped: false,
+        worstFrame: -1
+      }
+      const debugWindow = window as unknown as {
+        __ANCHOR_OBSERVER__: typeof state
+        __ANCHOR_VIEWPORT__: Element
+      }
+      debugWindow.__ANCHOR_OBSERVER__ = state
+      debugWindow.__ANCHOR_VIEWPORT__ = viewport
 
-  // Step 1: Cold resume — click the session row to load it.
-  // This populates the warm cache (runtimeIdByStoredSessionId + sessionStateByRuntimeId).
-  await sessionRow.click()
+      const observer = new MutationObserver(() => {
+        state.mutation += 1
+      })
+      observer.observe(viewport, { childList: true, subtree: true })
 
-  // Wait for the transcript to appear — the first user message text confirms
-  // the cold-path prefetch painted.
-  await waitForActiveTranscriptText(page, FIRST_USER_MSG)
+      const tick = () => {
+        if (state.stopped) {
+          observer.disconnect()
+          return
+        }
 
-  // Wait for the session to fully settle (cold-path RPC + reconciliation).
-  await page.waitForTimeout(2_000)
+        state.frame += 1
+        const distance = Math.max(0, viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop)
+        const messageCount = viewport.querySelectorAll('[data-role="user"], [data-role="assistant"]').length
+        const cachedTranscriptComplete = messageCount >= expectedCount
+        const quiet = state.mutation === state.lastMutation
+        state.lastMutation = state.mutation
 
-  // Stack a new tab, then observe the seeded transcript while it is hidden.
-  // Installing after the switch isolates reactivation from mutations caused
-  // while the new tab was being created.
-  await openNewSessionTab(page, FIRST_USER_MSG)
-  await page.waitForTimeout(500)
-  await installRenderCounter(page, FIRST_USER_MSG)
+        if (!state.settled) {
+          const atBottom = cachedTranscriptComplete && distance <= 2
+          state.bottomStreak = atBottom ? state.bottomStreak + 1 : 0
+          state.quietStreak = atBottom && quiet ? state.quietStreak + 1 : 0
 
-  // Step 3: Click back and verify the same kept-alive viewport becomes active
-  // without rebuilding or reconciling its transcript.
-  await sessionRow.click()
+          if (state.bottomStreak >= 4 && state.quietStreak >= 3) {
+            state.settled = true
+            state.settledFrame = state.frame
+          }
+        } else {
+          if (distance > 4 && state.samples.length < 50) {
+            state.samples.push({
+              authorityVisible: (viewport.textContent ?? '').includes(authorityMarker),
+              clientHeight: viewport.clientHeight,
+              distanceFromBottom: distance,
+              following: viewport.dataset.following,
+              frame: state.frame,
+              messageCount,
+              mutation: state.mutation,
+              scrollHeight: viewport.scrollHeight,
+              scrollTop: viewport.scrollTop
+            })
+          }
 
-  await waitForActiveTranscriptText(page, FIRST_USER_MSG)
-  await page.waitForTimeout(2_000)
-  expect(await observedViewportIsActive(page), 'Reactivation should reveal the observed kept-alive viewport').toBe(true)
+          if (distance > state.maxDistanceFromBottom) {
+            state.maxDistanceFromBottom = distance
+            state.worstFrame = state.frame
+          }
+        }
 
-  const result = await readRenderCount(page)
-  await page.screenshot({ path: testInfo.outputPath('warm-resume-idle.png') })
-  assertNoRepaint(result)
-})
+        requestAnimationFrame(tick)
+      }
 
-test('warm-route resume after background inference completes (no jitter)', async ({}, testInfo) => {
-  test.fixme(
-    true,
-    'Warm resume repaints after inference: expected one additive burst, got two ([18,1]).',
+      requestAnimationFrame(tick)
+    },
+    [SURFACE, AUTHORITY_ONLY_TEXT, expectedCachedMessageCount] as [string, string, number]
   )
+}
 
+async function markAuthorityRelease(page: import('@playwright/test').Page): Promise<void> {
+  await page.evaluate(() => {
+    const state = (
+      window as unknown as {
+        __ANCHOR_OBSERVER__?: ViewportAnchorReport & { frame: number; stopped: boolean }
+      }
+    ).__ANCHOR_OBSERVER__
+
+    if (state) {
+      state.authorityReleaseFrame = state.frame
+    }
+  })
+}
+
+async function readViewportAnchorReport(page: import('@playwright/test').Page): Promise<ViewportAnchorReport | null> {
+  return page.evaluate(() => {
+    const state = (
+      window as unknown as {
+        __ANCHOR_OBSERVER__?: ViewportAnchorReport & { stopped: boolean }
+      }
+    ).__ANCHOR_OBSERVER__
+
+    if (!state) {
+      return null
+    }
+
+    state.stopped = true
+
+    return {
+      authorityReleaseFrame: state.authorityReleaseFrame,
+      maxDistanceFromBottom: state.maxDistanceFromBottom,
+      samples: state.samples,
+      settled: state.settled,
+      settledFrame: state.settledFrame,
+      worstFrame: state.worstFrame
+    }
+  })
+}
+
+test('warm-route resume keeps the settled viewport anchored across persisted authority publication', async ({}, testInfo) => {
   const page = fixture!.page
   const { mock } = fixture!
 
   // Wait for the sidebar to populate with our seeded session.
-  const sessionRow = page
-    .locator('[data-slot="sidebar"] button')
-    .filter({ hasText: SESSION_TITLE })
-    .first()
+  const sessionRow = page.locator('[data-slot="sidebar"] button').filter({ hasText: SESSION_TITLE }).first()
   await sessionRow.waitFor({ state: 'visible', timeout: 60_000 })
 
   // Step 1: Cold resume — populate the warm cache.
@@ -416,6 +434,7 @@ test('warm-route resume after background inference completes (no jitter)', async
 
   // Step 2: Send a message — triggers inference via the mock server.
   const PROMPT = 'E2E post-inference warm resume test prompt'
+  const replyCountBefore = await page.getByText(COMPLETED_REPLY, { exact: true }).count()
   const composer = page.locator('[contenteditable="true"]').first()
   await composer.click()
   await composer.type(PROMPT, { delay: 10 })
@@ -424,7 +443,10 @@ test('warm-route resume after background inference completes (no jitter)', async
   // Wait for the mock response to appear in the transcript, confirming
   // the turn completed and message.complete fired (which updates the warm
   // cache via updateSessionState).
-  await waitForActiveTranscriptText(page, 'mock inference server', 60_000)
+  await expect.poll(() => mock.receivedPrompts.filter(prompt => prompt === PROMPT).length, { timeout: 60_000 }).toBe(1)
+  await expect
+    .poll(() => page.getByText(COMPLETED_REPLY, { exact: true }).count(), { timeout: 60_000 })
+    .toBeGreaterThan(replyCountBefore)
   // Extra settle for message.complete → updateSessionState → cache write.
   await page.waitForTimeout(2_000)
 
@@ -435,26 +457,42 @@ test('warm-route resume after background inference completes (no jitter)', async
   await openFreshDraft(page, PROMPT)
   await page.waitForTimeout(500)
 
-  // Step 4: Install render counter, click back (warm resume), wait, assert.
-  await installRenderCounter(page)
+  // Step 4: Delay a deliberately non-equivalent persisted response until the
+  // cached viewport has settled, then assert that publication never exposes a
+  // stale scroll offset to a rendered frame.
+  await armDelayedPersistedAuthority(fixture!.app)
+  await installViewportAnchorObserver(page, MESSAGE_COUNT + 2)
   await sessionRow.click()
 
   // Wait for the transcript to reappear — the warm cache should already
   // have the completed turn (updated by message.complete events).
   await waitForActiveTranscriptText(page, FIRST_USER_MSG)
 
-  // Wait for at least 1 burst, then settle.
   await page.waitForFunction(
     () => {
-      const w = window as unknown as { __RENDER_COUNT__?: { bursts: number } }
-      return Boolean(w.__RENDER_COUNT__ && w.__RENDER_COUNT__.bursts > 0)
+      const w = window as unknown as { __ANCHOR_OBSERVER__?: { settled: boolean } }
+
+      return Boolean(w.__ANCHOR_OBSERVER__?.settled)
     },
     undefined,
-    { timeout: 10_000 },
+    { timeout: 15_000 }
   )
-  await page.waitForTimeout(2_000)
 
-  const result = await readRenderCount(page)
+  await expect.poll(() => persistedAuthorityRequestIsWaiting(fixture!.app), { timeout: 10_000 }).toBe(true)
+  await markAuthorityRelease(page)
+  await releasePersistedAuthority(fixture!.app)
+  await waitForActiveTranscriptText(page, AUTHORITY_ONLY_TEXT, 15_000)
+  await page.waitForTimeout(500)
+
+  const report = await readViewportAnchorReport(page)
+  await testInfo.attach('viewport-anchor-report.json', {
+    body: Buffer.from(JSON.stringify(report, null, 2)),
+    contentType: 'application/json'
+  })
   await page.screenshot({ path: testInfo.outputPath('warm-resume-post-inference.png') })
-  assertNoJitter(result)
+  expect(report?.settled).toBe(true)
+  expect(
+    report?.maxDistanceFromBottom,
+    `Persisted authority exposed a stale scroll offset at frame ${report?.worstFrame} after settling at frame ${report?.settledFrame}.`
+  ).toBeLessThanOrEqual(4)
 })

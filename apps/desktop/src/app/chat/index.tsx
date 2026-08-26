@@ -1,7 +1,7 @@
 import { type AppendMessage, AssistantRuntimeProvider, type ThreadMessage } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
-import type { ReadableAtom } from 'nanostores'
+import { atom, type ReadableAtom } from 'nanostores'
 import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
@@ -192,6 +192,7 @@ interface ChatRuntimeBoundaryProps {
 }
 
 const NO_MESSAGES: ChatMessage[] = []
+const ZERO_RESUME_PUBLICATION_REVISION = atom(0)
 
 /**
  * The view's $messages, live only while this surface is the VISIBLE tab.
@@ -215,6 +216,17 @@ function useMessagesWhileVisible($messages: ReadableAtom<ChatMessage[]>): ChatMe
   )
 
   return messages
+}
+
+/** Keep the resume publication signal in lockstep with the visible transcript.
+ * Hidden keep-alive panes catch up when revealed instead of consuming it early. */
+function useResumePublicationRevisionWhileVisible($revision: ReadableAtom<number>): number {
+  const visible = usePaneVisible()
+  const [revision, setRevision] = useState(() => $revision.get())
+
+  useEffect(() => (visible ? $revision.subscribe(setRevision) : undefined), [$revision, visible])
+
+  return revision
 }
 
 /**
@@ -405,6 +417,11 @@ const ChatViewContent = memo(function ChatViewContent({
   const sessionAnchor = isPrimary ? 'workspace' : `session-tile:${storedId ?? ''}`
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
+
+  const resumePublicationRevision = useResumePublicationRevisionWhileVisible(
+    view.$resumePublicationRevision ?? ZERO_RESUME_PUBLICATION_REVISION,
+  )
+
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
@@ -650,6 +667,7 @@ const ChatViewContent = memo(function ChatViewContent({
             onCancel={haltRun}
             onDismissError={onDismissError}
             onRestoreToMessage={onRestoreToMessage}
+            resumePublicationRevision={resumePublicationRevision}
             sessionId={activeSessionId}
             sessionKey={threadKey}
           />

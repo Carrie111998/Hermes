@@ -1007,6 +1007,8 @@ export function useSessionActions({
                   ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
                   : cachedViewState.messages
 
+              let resumePublicationRevision = cachedViewState.resumePublicationRevision ?? 0
+
               // #70449: never let the activate snapshot's stale running:false
               // rewind a turn that started while the RPC was in flight — read
               // the freshest cache entry, not the pre-await cachedViewState.
@@ -1120,11 +1122,17 @@ export function useSessionActions({
                     activated
                   )
 
-                  activatedMessages = reconcileAuthoritativeChatMessages(
+                  const persistedAuthorityMessages = reconcileAuthoritativeChatMessages(
                     persistedMessages,
                     previousMessages,
                     liveProjection
                   )
+
+                  if (!chatMessageArraysEquivalent(persistedAuthorityMessages, activatedMessages)) {
+                    resumePublicationRevision += 1
+                  }
+
+                  activatedMessages = persistedAuthorityMessages
                 }
               }
 
@@ -1158,6 +1166,7 @@ export function useSessionActions({
                 state => ({
                   ...state,
                   messages: visibleActivatedMessages,
+                  resumePublicationRevision,
                   ...(pendingClarifyProjection
                     ? {
                         awaitingResponse: false,

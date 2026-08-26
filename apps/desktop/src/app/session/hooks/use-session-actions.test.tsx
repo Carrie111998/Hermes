@@ -2335,8 +2335,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
       current: new Map([['stored-A', 'rt-A']])
     }
 
+    const state = clientState('stored-A')
+    state.resumePublicationRevision = 2
+
     const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
-      current: new Map([['rt-A', clientState('stored-A')]])
+      current: new Map([['rt-A', state]])
     }
 
     const requestGateway = vi.fn(async (method: string) => {
@@ -2357,10 +2360,12 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
 
+    let resumedState: ClientSessionState | undefined
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
     render(
       <ResumeHarness
         onReady={r => (resume = r)}
+        onStateUpdate={(_sessionId, next) => (resumedState = next)}
         requestGateway={requestGateway}
         runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
         sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
@@ -2381,6 +2386,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
     )
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+    expect(resumedState?.resumePublicationRevision).toBe(2)
   })
 
   it('re-arms a pending clarify in place on the warm session.activate path', async () => {
@@ -2990,6 +2996,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     }
 
     const state = clientState('stored-A')
+    state.resumePublicationRevision = 4
     state.messages = [
       {
         id: 'cached-user',
@@ -3057,6 +3064,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(renderedMessages).toContain('prompt saved after compression')
     expect(renderedMessages).toContain('answer saved after compression')
     expect(renderedMessages).not.toContain('stale runtime answer')
+    expect(resumedState?.resumePublicationRevision).toBe(5)
   })
 
   it('keeps the activated transcript when a persisted transcript refresh returns empty rows', async () => {
