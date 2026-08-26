@@ -537,6 +537,7 @@ export const $revealInTreeRequest = atom<null | string>(null)
 
 export function revealFileInTree(path: string): void {
   setFileBrowserOpen(true)
+  revealTreePane(FILES_PANE_ID)
   $revealInTreeRequest.set(path)
 }
 

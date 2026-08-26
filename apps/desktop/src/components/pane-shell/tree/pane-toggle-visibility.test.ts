@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { registry } from '@/contrib/registry'
+import { $fileBrowserOpen, $revealInTreeRequest, revealFileInTree, setFileBrowserOpen } from '@/store/layout'
 
 import { group, split } from './model'
 import {
@@ -40,6 +41,7 @@ beforeEach(() => {
   window.localStorage.clear()
   $dismissedPanes.set(new Set())
   $hiddenTreePanes.set(new Set())
+  $revealInTreeRequest.set(null)
 
   for (const [id, data] of [
     ['workspace', { placement: 'main', uncloseable: true }],
@@ -73,6 +75,27 @@ describe('a hide-style pane stacked behind a sibling tab', () => {
     togglePaneVisible('review')
 
     expect(isPaneVisible('review')).toBe(true)
+  })
+})
+
+describe('an explicit file-tree reveal', () => {
+  it('fronts the tree when its open flag is already true', () => {
+    $layoutTree.set(
+      split('row', [
+        group(['workspace'], { active: 'workspace', id: 'g-main' }),
+        group(['files', 'review'], { active: 'review', id: 'g-right' })
+      ])
+    )
+
+    setFileBrowserOpen(true)
+
+    expect($fileBrowserOpen.get()).toBe(true)
+    expect(isPaneVisible('files')).toBe(false)
+
+    revealFileInTree('/work/file.ts')
+
+    expect(isPaneVisible('files')).toBe(true)
+    expect($revealInTreeRequest.get()).toBe('/work/file.ts')
   })
 })
 
