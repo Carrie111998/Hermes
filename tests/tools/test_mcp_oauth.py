@@ -1040,25 +1040,37 @@ class TestWaitForCallbackSkipIntegration:
 # ---------------------------------------------------------------------------
 
 class TestPoisonClientRegistration:
-    def test_poison_backs_up_and_removes_client_and_meta(self, tmp_path, monkeypatch):
+    def test_r3_cand_004_red_1_no_legacy_backup_survives_lifecycle(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("srv")
         d = tmp_path / "mcp-tokens"
         d.mkdir(parents=True)
         (d / "srv.json").write_text('{"access_token": "keep-me"}')
         (d / "srv.client.json").write_text('{"client_id": "dead"}')
+        (d / "srv.client.json.bak").write_text('{"client_id": "stale"}')
         (d / "srv.meta.json").write_text('{"token_endpoint": "https://idp/token"}')
 
         removed = storage.poison_client_registration()
 
         assert removed is True
-        # Client + metadata gone, forcing re-registration on the next flow.
         assert not (d / "srv.client.json").exists()
+        assert not (d / "srv.client.json.bak").exists()
         assert not (d / "srv.meta.json").exists()
-        # Backup of the client file kept for recovery.
-        assert (d / "srv.client.json.bak").read_text() == '{"client_id": "dead"}'
-        # Tokens are intentionally preserved.
         assert (d / "srv.json").read_text() == '{"access_token": "keep-me"}'
+
+        # Explicit logout/remove must not leave recoverable state behind.
+        storage.remove()
+        assert not any(d.glob("srv*"))
+
+        # Rollback is limited to the three primary files and cannot resurrect .bak.
+        (d / "srv.client.json").write_text('{"client_id": "new"}')
+        (d / "srv.client.json.bak").write_text('{"client_id": "legacy"}')
+        snapshot = storage.snapshot()
+        assert set(snapshot) <= {"srv.json", "srv.client.json", "srv.meta.json"}
+        storage.remove()
+        storage.restore(snapshot)
+        assert not (d / "srv.client.json.bak").exists()
+        assert (d / "srv.client.json").read_text() == '{"client_id": "new"}'
 
 
 def test_wait_for_callback_port_in_use_reports_clear_error(monkeypatch):

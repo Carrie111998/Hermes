@@ -636,13 +636,15 @@ class HermesTokenStorage:
             self._client_info_path(),
             self._meta_path(),
             self._cimd_rejected_path(),
+            self._client_info_path().with_name(self._client_info_path().name + ".bak"),
         ):
             p.unlink(missing_ok=True)
 
     def snapshot(self) -> dict[str, bytes]:
         """Capture on-disk OAuth state so a failed re-auth can restore it.
 
-        Maps filename -> bytes for whichever of the three state files exist.
+        Maps filename -> bytes for whichever of the three primary state files
+        exist. Legacy client backups are deliberately excluded from rollback.
         Feed back to ``restore()`` to undo an intervening ``remove()`` when a
         re-authentication attempt fails, so a still-valid token isn't destroyed.
         """
@@ -693,28 +695,26 @@ class HermesTokenStorage:
         ``if not client_info`` branch and re-run RFC 7591 dynamic client
         registration on the next flow. The stale ``meta.json`` is dropped
         too so discovery re-runs against a freshly fetched document.
-
         Tokens are intentionally left in place — the subsequent
         re-authorization overwrites them, and keeping them avoids losing a
         still-valid refresh token if the re-registration never completes.
 
-        A single ``.bak`` copy of the client file is kept for recovery.
+        Legacy backups are removed; cleanup errors propagate before callers
+        clear in-memory state while secret-bearing files remain on disk.
         Returns True if a client file was present and removed.
         """
         client_path = self._client_info_path()
-        if not client_path.exists():
-            return False
         backup = client_path.with_name(client_path.name + ".bak")
-        try:
-            backup.write_bytes(client_path.read_bytes())
-        except OSError as exc:  # non-fatal — proceed with the removal anyway
-            logger.warning("Could not back up client info at %s: %s", client_path, exc)
+        if not client_path.exists():
+            backup.unlink(missing_ok=True)
+            return False
+        backup.unlink(missing_ok=True)
         client_path.unlink(missing_ok=True)
         self._meta_path().unlink(missing_ok=True)
         logger.warning(
             "MCP OAuth '%s': cached client registration rejected as invalid_client; "
-            "removed client.json + meta.json (backup at %s) to force re-registration",
-            self._server_name, backup.name,
+            "removed client.json + meta.json and legacy backup to force re-registration",
+            self._server_name,
         )
         return True
 
