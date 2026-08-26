@@ -9,6 +9,7 @@ export {
   getApiRequestProfile,
   hermesApi,
   HermesGateway,
+  HermesSpectatorGateway,
   profileScopeKey,
   PROMPT_SUBMIT_REQUEST_TIMEOUT_MS,
   setApiRequestConnection,

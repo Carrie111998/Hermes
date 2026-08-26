@@ -25,6 +25,7 @@ import { NEW_SESSION_TITLE, quickModelOptions, sessionTitle } from '@/lib/chat-r
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
@@ -127,6 +128,7 @@ function ChatHeader({
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
+  const spectator = isBrowserSpectator()
 
   const activeStoredSession =
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
@@ -164,17 +166,21 @@ function ChatHeader({
         }}
       >
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
-        <SessionActionsMenu
-          align="start"
-          onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
-          onPin={selectedSessionId ? onToggleSelectedPin : undefined}
-          pinned={selectedIsPinned}
-          sessionId={selectedSessionId || activeSessionId || ''}
-          sideOffset={8}
-          title={title}
-        >
-          <TitleMenuTrigger>{title}</TitleMenuTrigger>
-        </SessionActionsMenu>
+        {spectator ? (
+          <span className="truncate">{title}</span>
+        ) : (
+          <SessionActionsMenu
+            align="start"
+            onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
+            onPin={selectedSessionId ? onToggleSelectedPin : undefined}
+            pinned={selectedIsPinned}
+            sessionId={selectedSessionId || activeSessionId || ''}
+            sideOffset={8}
+            title={title}
+          >
+            <TitleMenuTrigger>{title}</TitleMenuTrigger>
+          </SessionActionsMenu>
+        )}
       </div>
     </header>
   )
@@ -534,7 +540,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // Hide the composer in the exhausted error state too: there's no live runtime
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
-  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
+  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow() && !isBrowserSpectator()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({

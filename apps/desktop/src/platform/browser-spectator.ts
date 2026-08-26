@@ -17,6 +17,7 @@ declare global {
     __HERMES_BASE_PATH__?: string
     __HERMES_SESSION_TOKEN__?: string
     __HERMES_SPECTATOR__?: boolean
+    __HERMES_SPECTATOR_BASE_PATH__?: string
   }
 }
 

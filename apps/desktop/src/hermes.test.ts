@@ -21,6 +21,7 @@ import {
   getSession,
   getSessionMessages,
   getStatus,
+  HermesSpectatorGateway,
   LATEST_SESSION_MESSAGES_LIMIT,
   listAllProfileSessions,
   listSessions,
@@ -42,6 +43,18 @@ const emptySessionsResponse = {
   sessions: [],
   total: 0
 }
+
+describe('Hermes spectator gateway', () => {
+  it.each(['prompt.submit', 'session.resume', 'session.activate', 'approval.respond', 'terminal.open'])(
+    'rejects outbound %s before a socket or backend can receive it',
+    async method => {
+      const gateway = new HermesSpectatorGateway()
+      await expect(gateway.request(method, { session_id: 'session-1' })).rejects.toThrow(
+        `Hermes iPad spectator is read-only: ${method}`
+      )
+    }
+  )
+})
 
 describe('Hermes REST helpers', () => {
   let api: ReturnType<typeof vi.fn>

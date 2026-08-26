@@ -3,7 +3,7 @@ import { useEffect, useRef } from 'react'
 
 import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reauth'
 import type { HermesConnection } from '@/global'
-import { HermesGateway } from '@/hermes'
+import { HermesGateway, HermesSpectatorGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { decideLivenessForceClose, LIVENESS_REPROBE_DELAY_MS } from '@/lib/gateway-liveness-policy'
@@ -180,7 +180,7 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
-    const gateway = new HermesGateway()
+    const gateway = new HermesSpectatorGateway()
 
     const publish = (connection: HermesConnection | null) => {
       callbacksRef.current.onConnectionReady(connection)

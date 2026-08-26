@@ -38,6 +38,19 @@ export class HermesGateway extends JsonRpcGatewayClient {
   }
 }
 
+/** Receive-only gateway used by the browser spectator. Event delivery remains
+ * identical to Desktop, but no JSON-RPC request may leave the browser. */
+export class HermesSpectatorGateway extends HermesGateway {
+  override request<T>(
+    method: string,
+    _params: Record<string, unknown> = {},
+    _timeoutMs?: number,
+    _signal?: AbortSignal
+  ): Promise<T> {
+    return Promise.reject(new Error(`Hermes iPad spectator is read-only: ${method}`))
+  }
+}
+
 // Profile that profile-scoped REST settings (config/env/skills/tools/model/…)
 // should target. Mirrors $activeGatewayProfile, pushed in from the store via
 // setApiRequestProfile so this module needs no store import (avoids a cycle).

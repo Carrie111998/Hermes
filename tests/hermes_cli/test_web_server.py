@@ -5115,7 +5115,19 @@ class TestHashedAssetCacheHeaders:
             "font-family:url(/fonts-terminal/x.woff2)}",
             encoding="utf-8",
         )
+        spectator = tmp_path / "spectator_dist"
+        (spectator / "assets").mkdir(parents=True)
+        (spectator / "index.html").write_text(
+            '<html><head></head><body>SPECTATOR<script src="./assets/index-spec123.js"></script></body></html>',
+            encoding="utf-8",
+        )
+        (spectator / "assets" / "index-spec123.js").write_text(
+            "console.log('spectator');", encoding="utf-8"
+        )
+        (spectator / "spectator-sw.js").write_text("// service worker", encoding="utf-8")
+        (spectator / "spectator-version.json").write_text('{"commit":"abc123"}', encoding="utf-8")
         monkeypatch.setattr(ws, "WEB_DIST", dist)
+        monkeypatch.setattr(ws, "SPECTATOR_DIST", spectator)
         monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
         spa_app = FastAPI()
         ws.mount_spa(spa_app)
@@ -5162,6 +5174,33 @@ class TestHashedAssetCacheHeaders:
         resp = client.get("/assets/nope-000000.js")
         assert resp.status_code == 404
         assert "immutable" not in resp.headers.get("cache-control", "")
+
+    def test_spectator_index_is_no_store_and_explicitly_activates_read_only_mode(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/spectator/")
+        assert resp.status_code == 200
+        assert "no-store" in resp.headers["cache-control"]
+        assert "window.__HERMES_SPECTATOR__=true" in resp.text
+        assert 'window.__HERMES_BASE_PATH__=""' in resp.text
+        assert 'window.__HERMES_SPECTATOR_BASE_PATH__="/spectator"' in resp.text
+        assert "window.__HERMES_SESSION_TOKEN__=" in resp.text
+
+    def test_spectator_prefix_separates_api_and_static_scopes(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/spectator/", headers={"X-Forwarded-Prefix": "/hermes"})
+        assert resp.status_code == 200
+        assert 'window.__HERMES_BASE_PATH__="/hermes"' in resp.text
+        assert 'window.__HERMES_SPECTATOR_BASE_PATH__="/hermes/spectator"' in resp.text
+
+    def test_spectator_assets_are_immutable_but_worker_and_version_are_not(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        asset = client.get("/spectator/assets/index-spec123.js")
+        worker = client.get("/spectator/spectator-sw.js")
+        version = client.get("/spectator/spectator-version.json")
+        assert asset.status_code == worker.status_code == version.status_code == 200
+        assert asset.headers["cache-control"] == self._IMMUTABLE
+        assert "no-store" in worker.headers["cache-control"]
+        assert "no-store" in version.headers["cache-control"]
 
 
 class TestDashboardComponentHealth:

@@ -141,6 +141,7 @@ except ImportError:
         )
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
+SPECTATOR_DIST = Path(__file__).resolve().parent.parent / "apps" / "desktop" / "dist"
 _log = logging.getLogger(__name__)
 
 
@@ -17997,6 +17998,64 @@ def mount_spa(application: FastAPI):
             if response.status_code == 200:
                 response.headers["Cache-Control"] = _IMMUTABLE_ASSET_CACHE_CONTROL
             return response
+
+    # Phase-1 iPad spectator: serve the Desktop renderer from the SAME
+    # authenticated origin, but under an isolated static scope so it cannot
+    # collide with the dashboard's own /assets bundle. The injected spectator
+    # flag is the only way browser read-only mode activates; merely loading the
+    # renderer without Electron is not sufficient.
+    if SPECTATOR_DIST.is_dir() and (SPECTATOR_DIST / "index.html").is_file():
+        _spectator_index_path = SPECTATOR_DIST / "index.html"
+
+        def _serve_spectator_index(prefix: str = ""):
+            try:
+                html = _spectator_index_path.read_text(encoding="utf-8")
+            except OSError:
+                return JSONResponse({"error": "Spectator frontend is unavailable"}, status_code=404)
+
+            gated = bool(getattr(app.state, "auth_required", False))
+            spectator_prefix = f"{prefix}/spectator"
+            assignments = [
+                f'window.__HERMES_BASE_PATH__={json.dumps(prefix)};',
+                f'window.__HERMES_SPECTATOR_BASE_PATH__={json.dumps(spectator_prefix)};',
+                "window.__HERMES_SPECTATOR__=true;",
+                f"window.__HERMES_AUTH_REQUIRED__={'true' if gated else 'false'};",
+            ]
+            if not gated:
+                assignments.insert(0, f'window.__HERMES_SESSION_TOKEN__={json.dumps(_SESSION_TOKEN)};')
+            bootstrap = f"<script>{''.join(assignments)}</script>"
+            html = html.replace("</head>", f"{bootstrap}</head>", 1)
+            return HTMLResponse(
+                html,
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+            )
+
+        application.mount(
+            "/spectator/assets",
+            _ImmutableAssetFiles(directory=SPECTATOR_DIST / "assets"),
+            name="spectator-assets",
+        )
+
+        @application.get("/spectator")
+        @application.get("/spectator/")
+        async def serve_spectator(request: Request):
+            prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+            return _serve_spectator_index(prefix)
+
+        @application.get("/spectator/{full_path:path}")
+        async def serve_spectator_file(full_path: str, request: Request):
+            prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+            file_path = SPECTATOR_DIST / full_path
+            if (
+                full_path
+                and file_path.resolve().is_relative_to(SPECTATOR_DIST.resolve())
+                and file_path.is_file()
+            ):
+                headers = {}
+                if full_path == "spectator-sw.js" or full_path == "spectator-version.json":
+                    headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+                return FileResponse(file_path, headers=headers)
+            return _serve_spectator_index(prefix)
 
     application.mount(
         "/assets",
