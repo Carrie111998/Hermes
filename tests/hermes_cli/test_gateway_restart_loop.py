@@ -1734,6 +1734,110 @@ class TestCreateJobBlocksLifecycleCommands:
         assert "#30719" in result.get("error", "")
 
 
+class TestUpdateJobBlocksLifecycleCommands:
+    """Sibling gap left by TestCreateJobBlocksLifecycleCommands's own fix:
+    create_job() enforces the guard, but update_job() — the only other
+    write path for prompt/script, used by both `hermes cron edit` and the
+    agent's `cronjob(action="update", ...)` tool — never re-validated them.
+    A job created with a harmless prompt/script could be updated afterward
+    to embed a gateway-restart command with no guard in between."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_update_job_blocks_prompt_command(self):
+        from cron.jobs import create_job, update_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        job = create_job(prompt="summarize the logs", schedule="30m")
+        with pytest.raises(GatewayLifecycleBlocked):
+            update_job(job["id"], {"prompt": "then run hermes gateway restart"})
+
+    def test_update_job_blocks_script_command(self, tmp_path):
+        from cron.jobs import create_job, update_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        noop = tmp_path / "noop.sh"
+        noop.write_text("#!/bin/bash\necho noop\n")
+        job = create_job(
+            prompt="run the collector", schedule="30m", no_agent=True, script=str(noop)
+        )
+
+        evil = tmp_path / "evil.sh"
+        evil.write_text("#!/bin/bash\nhermes gateway restart\n")
+        with pytest.raises(GatewayLifecycleBlocked):
+            update_job(job["id"], {"script": str(evil)})
+
+    def test_update_job_scans_merged_record_not_just_changed_field(self, tmp_path):
+        """Updating only the script must still be caught even though the
+        job's stored prompt is unrelated — the merged (prompt + script)
+        record is what gets scanned, matching create_job's own contract
+        that both fields are considered together."""
+        from cron.jobs import create_job, update_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        job = create_job(prompt="totally unrelated benign prompt", schedule="30m")
+        evil = tmp_path / "evil.sh"
+        evil.write_text("#!/bin/bash\nsystemctl restart hermes-gateway\n")
+        with pytest.raises(GatewayLifecycleBlocked):
+            update_job(job["id"], {"script": str(evil)})
+
+    def test_update_job_allows_benign_changes(self, tmp_path):
+        from cron.jobs import create_job, update_job
+
+        job = create_job(prompt="summarize the logs", schedule="30m")
+
+        renamed = update_job(job["id"], {"name": "renamed"})
+        assert renamed["name"] == "renamed"
+
+        reprompted = update_job(job["id"], {"prompt": "summarize the API logs instead"})
+        assert reprompted["prompt"] == "summarize the API logs instead"
+
+    def test_update_job_unrelated_field_does_not_rescan(self, tmp_path):
+        """A job whose EXISTING script is dangerous (a legacy record from
+        before this guard existed, or a hand-edited jobs.json — create_job()
+        itself would refuse to create this record) must not have an
+        unrelated field update (name/model/schedule) suddenly start
+        raising — only touching prompt/script re-triggers the scan."""
+        from cron.jobs import create_job, load_jobs, save_jobs, update_job
+
+        job = create_job(prompt="noop job", schedule="30m")
+        # Hand-edit the stored record to point at a dangerous script,
+        # bypassing create_job()'s own guard entirely (simulating a legacy
+        # record or a direct jobs.json edit).
+        evil = tmp_path / "evil.sh"
+        evil.write_text("#!/bin/bash\nhermes gateway restart\n")
+        jobs = load_jobs()
+        jobs[0]["script"] = str(evil)
+        save_jobs(jobs)
+
+        updated = update_job(job["id"], {"name": "renamed-only"})
+        assert updated["name"] == "renamed-only"
+
+    def test_cronjob_tool_update_surfaces_block_as_error(self, tmp_path, monkeypatch):
+        """End-to-end through the model tool's update action, mirroring the
+        create-path coverage above."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes").mkdir(parents=True)
+        from tools.cronjob_tools import cronjob
+
+        created = json.loads(cronjob(
+            action="create", schedule="0 9 * * *", prompt="summarize the logs",
+        ))
+        assert created.get("success") is True
+        job_id = created["job_id"]
+
+        result = json.loads(cronjob(
+            action="update", job_id=job_id,
+            prompt="please run hermes gateway restart nightly",
+        ))
+        assert result.get("success") is False
+        assert "#30719" in result.get("error", "")
+
+
 # ---------------------------------------------------------------------------
 # Defense 3: auto-resume restart-loop breaker
 # ---------------------------------------------------------------------------
