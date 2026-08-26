@@ -473,6 +473,41 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
+def test_create_task_idempotency_guard_is_status_blind(kanban_home):
+    """create_task's idempotency guard must match ARCHIVED rows too.
+
+    Admitted-once means admitted-forever: a retried webhook / automation
+    replaying an ``idempotency_key`` whose task was since archived must get
+    the archived task's id back, never a fresh duplicate row (the #64
+    double-admission mechanism). Mirrors the hermes-scripts gate ledger
+    semantics (fa05180).
+    """
+    key = "issue-ben/cv-7"
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="original", idempotency_key=key)
+
+        # Second create with the same key while non-archived → same id.
+        again = kb.create_task(conn, title="replayed", idempotency_key=key)
+        assert again == first
+
+        # Archive it, then replay the key once more — must STILL return the
+        # archived row's id and must NOT insert a new row.
+        kb.complete_task(conn, first, result="done")
+        assert kb.archive_task(conn, first)
+        assert kb.get_task(conn, first).status == "archived"
+
+        replay = kb.create_task(conn, title="replayed-after-archive", idempotency_key=key)
+        assert replay == first, (
+            "create_task with a key whose task is archived must return the "
+            "archived task's id, not create a duplicate"
+        )
+
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchone()[0]
+        assert rows == 1, f"expected exactly one row for key {key!r}, found {rows}"
+
+
 def test_delete_task_removes_task_and_cascades(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")
