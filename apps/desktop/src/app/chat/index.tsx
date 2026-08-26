@@ -517,10 +517,17 @@ const ChatViewContent = memo(function ChatViewContent({
     !resumeExhausted && isRoutedSessionView && (routeSessionMismatch || (messagesEmpty && !activeSessionId))
 
   const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
-  // Hide the composer in the exhausted error state too: there's no live runtime
-  // to send to until a retry rebinds one. Watch windows are pure spectators of a
-  // subagent run driven elsewhere — no composer, transcript is read-only.
-  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
+  // The composer mount deliberately does NOT follow `routeSessionMismatch`.
+  // That flag is a transient split-write flicker during session switches (the
+  // routed id and the active id land in two separate store writes), and
+  // unmounting the composer mid-typing destroys DOM focus and the caret — the
+  // #88621 class of "it stopped letting me type" bugs. The transcript still
+  // shows the loader; the composer stays mounted and the draft-swap layout
+  // effect handles the session transition. Hide it only when there is
+  // genuinely no session yet (route not resumed), the resume gave up (no live
+  // runtime to send to), or the window is a read-only watch spectator.
+  const showChatBar =
+    !(isRoutedSessionView && messagesEmpty && !activeSessionId) && !resumeExhausted && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
