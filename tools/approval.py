@@ -2452,18 +2452,38 @@ def _command_detection_variants(command: str):
 def _is_verification_artifact_cleanup(command: str) -> bool:
     """Return whether *command* only removes one Hermes ad-hoc temp script."""
     try:
-        argv = shlex.split(command, posix=True)
+        # posix=True treats backslash as an escape character, which destroys
+        # native Windows paths ("C:\\Users\\..." -> "C:Users..."), so the
+        # operand could never match the temp dir there (#95456).
+        argv = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
         return False
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
         return False
 
+    # Windows shlex keeps the surrounding quotes; POSIX mode already removed them.
     operand = argv[2]
+    if os.name == "nt" and len(operand) >= 2 and operand[0] == operand[-1] and operand[0] in "\"'":
+        operand = operand[1:-1]
+
     temp_dir = os.path.realpath(tempfile.gettempdir())
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    # Compare against the literal joined path, NOT a normalised one: keeping
+    # this a raw string comparison is what rejects traversal operands like
+    # "/tmp/nested/../hermes-verify-example.py". Only fold what is unsafe to
+    # compare literally across platforms — separator style and drive-letter
+    # case on Windows. On POSIX normcase() is the identity function, so the
+    # existing behaviour is untouched.
+    expected = os.path.join(temp_dir, basename)
+    if os.name == "nt":
+        matches = os.path.normcase(operand.replace("/", os.sep)) == os.path.normcase(expected)
+    else:
+        matches = operand == expected
+    if not matches:
         return False
 
+    # Canonical-only, fail closed: a symlinked path into the temp dir must not
+    # be exempted even though it resolves there.
     target = os.path.realpath(operand)
     if os.path.dirname(target) != temp_dir:
         return False

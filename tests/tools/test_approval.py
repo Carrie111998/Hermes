@@ -99,15 +99,25 @@ class TestDetectDangerousRm:
             assert "delete" in desc.lower()
 
 
-    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self, tmp_path):
+        # Build the operand from a real directory rather than a hardcoded
+        # "/tmp": on Windows there is no /tmp (realpath("/tmp") is "C:\\tmp")
+        # and on macOS /tmp is a symlink to /private/tmp, so a literal operand
+        # can never equal the canonical temp dir the exemption compares
+        # against (#70797, #95456).
+        temp_dir = os.path.realpath(tmp_path)
+        with mock_patch("tempfile.gettempdir", return_value=temp_dir):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                operand = os.path.join(temp_dir, f"{prefix}example.py")
+                assert detect_dangerous_command(f"rm -f {operand}") == (
                     False,
                     None,
                     None,
                 )
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="creating a directory symlink needs elevation on Windows"
+    )
     def test_symlinked_temp_dir_only_exempts_canonical_target(self, tmp_path):
         real_temp = tmp_path / "real-temp"
         real_temp.mkdir()
@@ -122,6 +132,21 @@ class TestDetectDangerousRm:
                 None,
                 None,
             )
+
+    def test_temp_exemption_matches_native_separator_and_case(self, tmp_path):
+        # Regression for #95456. Assert on the helper directly rather than on
+        # detect_dangerous_command: a mangled operand also fails to match the
+        # dangerous-rm patterns, so the outer call returns False either way
+        # and would pass even while the exemption is broken.
+        temp_dir = os.path.realpath(tmp_path)
+        basename = "hermes-verify-example.py"
+        native = os.path.join(temp_dir, basename)
+        slashed = native.replace(os.sep, "/")
+
+        with mock_patch("tempfile.gettempdir", return_value=temp_dir):
+            assert approval_module._is_verification_artifact_cleanup(f"rm -f {native}") is True
+            assert approval_module._is_verification_artifact_cleanup(f"rm -f {slashed}") is True
+            assert detect_dangerous_command(f"rm -f {native}") == (False, None, None)
 
     def test_verification_cleanup_exemption_rejects_broader_deletions(self):
         commands = (
