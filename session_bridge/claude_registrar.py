@@ -237,6 +237,53 @@ def _strip_line_marker(line: str) -> str:
     return line if marker is None else line[marker.end() :].strip()
 
 
+# The reply marker HAS now been measured: it is U+25CF, drawn at column zero
+# with two-space continuation rows under it, on two frames captured from the
+# live TUI on 2026-08-25 and 2026-08-26 using this module's own isolation argv.
+# (The note above says it could not be measured; it can -- spawn through
+# WindowsConPtyFactory and read _process.read_with_timeout directly, because
+# read_until raises on timeout and discards the buffer holding the answer.)
+# _strip_line_marker's general regex stays as the fail-open fallback; this
+# constant is used only where the ANSWER must be told apart from the frame.
+#
+# That distinction is the whole difficulty. A capture is the WHOLE SCREEN --
+# echoed prompt, spinner, separator and title bars, input line, footer -- so
+# scoring it against "exactly REGISTERED" can only ever fail, and the chrome
+# cannot be filtered by enumeration because the title bar carries the session's
+# own --name, which is arbitrary text. Keeping what was drawn AS A MESSAGE
+# reduces the screen where removing what is not a message cannot.
+_CLAUDE_RESPONSE_BULLET = "●"
+
+
+def _drawn_response_lines(cleaned: str) -> list[str] | None:
+    """The rows Claude drew as its own messages, or ``None`` if it drew none.
+
+    ``None`` means this is not a drawn screen -- a plain capture, or one taken
+    before the answer was painted -- and the caller keeps its whole-buffer rule.
+    """
+
+    lines = cleaned.splitlines()
+    drawn: list[str] = []
+    bullet_seen = False
+    index = 0
+    while index < len(lines):
+        if not lines[index].startswith(_CLAUDE_RESPONSE_BULLET):
+            index += 1
+            continue
+        bullet_seen = True
+        body = lines[index][len(_CLAUDE_RESPONSE_BULLET) :].strip()
+        if body:
+            drawn.append(body)
+        index += 1
+        while index < len(lines) and lines[index].startswith("  "):
+            continuation = lines[index].strip()
+            if not continuation:
+                break
+            drawn.append(continuation)
+            index += 1
+    return drawn if bullet_seen else None
+
+
 _CLAUDE_PROVIDER_LIMIT_BANNER_RE = re.compile(
     r"you've hit your (?:(?:session|weekly) )?limit[ \t]*"
     r"\u00b7[ \t]*resets[ \t]+\S[^\r\n]{0,159}"
@@ -2517,6 +2564,14 @@ def _normalized_terminal_output(output: str, prompt: str | None) -> str:
         line = raw.strip()
         if _pasted_input_indicator(line):
             continue
+        if line.startswith(_CLAUDE_RESPONSE_BULLET):
+            # Keep the reply marker. read_until hands this function's result
+            # straight back to _has_exact_registered_response, so the bullet is
+            # the only thing left separating the answer from the frame drawn
+            # around it; _strip_line_marker would erase that boundary along
+            # with the spinner and separator glyphs it is meant to remove.
+            meaningful.append(line)
+            continue
         line = _strip_line_marker(line)
         if not line or line in prompt_lines:
             continue
@@ -2541,6 +2596,12 @@ def _has_exact_registered_response(output: str, prompt: str) -> bool:
     if not isinstance(output, str) or len(output) > _MAX_RESPONSE_CHARS:
         return False
     cleaned = _stripped_terminal_text(output)
+    drawn = _drawn_response_lines(cleaned)
+    if drawn is not None:
+        # Unwelding the rows is not enough on its own: the answer still shares
+        # the capture with the whole screen, so the check below could only ever
+        # fail on a drawn frame. Score what Claude drew as its message instead.
+        return drawn == ["REGISTERED"]
     prompt_lines = {line.strip() for line in prompt.splitlines()}
     meaningful: list[str] = []
     for raw in cleaned.splitlines():
@@ -2572,13 +2633,26 @@ def _exact_registered_suffix(output: str) -> str | None:
 
 
 def _registered_suffix(output: str, *, require_complete: bool) -> str | None:
-    if require_complete and not output.endswith(("\r", "\n")):
-        return None
     cleaned = _stripped_terminal_text(output)
     lines = cleaned.splitlines()
+    # A drawn screen almost never ends on a line break -- the frame carrying the
+    # live answer ended "\x1b[120C", a cursor move -- so demanding one of the raw
+    # stream rejected every real frame. This is what left the read loop timing
+    # out and discarding the buffer holding the answer even once the rows were
+    # unwelded. A row the terminal has already drawn past cannot grow, so being
+    # followed by another drawn row settles just as well. Latching early is safe
+    # either way: the caller only opens a settle window on it, every later chunk
+    # restarts that window, and _launch re-scores the settled buffer with
+    # _has_exact_registered_response before committing anything.
+    stream_ended_on_a_line_break = output.endswith(("\r", "\n"))
     for index, raw in enumerate(lines):
         line = _strip_line_marker(raw.strip())
         if line == "REGISTERED":
+            if require_complete and not (
+                stream_ended_on_a_line_break
+                or any(remainder.strip() for remainder in lines[index + 1 :])
+            ):
+                return None
             suffix = ["REGISTERED"]
             suffix.extend(
                 remainder.strip()

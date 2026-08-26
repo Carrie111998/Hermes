@@ -4125,6 +4125,175 @@ def _as_cursor_forward_echo(text: str) -> str:
     return "\x1b[1C".join(text.split(" "))
 
 
+# --- the reply, told apart from the screen it is drawn on -------------------
+#
+# CONPTY_REGISTERED_FRAME is raw pty output captured from the live TUI on
+# 2026-08-25, in which the model answered REGISTERED. It is the frame the reply
+# marker above was said to be unmeasurable from; it can be captured by spawning
+# through WindowsConPtyFactory and reading _process.read_with_timeout directly,
+# because read_until raises on timeout and throws away the buffer holding the
+# answer. A second capture on 2026-08-26 agrees with it in every respect used
+# here. Unwelding its rows is necessary but NOT sufficient: it is a whole
+# screen, and it does not end on a line break.
+
+CONPTY_REGISTERED_FRAME = (
+    '\x1b[m\x1b]0;⠂ [Codex] probe: capture the REGISTERED frame\x07\x1b[38;'
+    '2;80;80;80m\x1b[48;2;55;55;55m\x1b[6;1H❯ \x1b[38;2;255;255;255mThis'
+    ' is a Hermes Session Bridge Claude visibility registration'
+    '.                                                       \x1b['
+    '39m  \x1b[38;2;255;255;255mDo not perform project work or use'
+    ' tools.                                                   '
+    '                          \x1b[39m  \x1b[38;2;255;255;255mSigned'
+    ' marker: HERMES_SESSION_BRIDGE_V1:eyJicmlkZ2VfaWQiOiJjbGF1'
+    'ZGUtdmlzaWJpbGl0eTpmNzY4YTM3ZGEyMTE1YjBjMjA0YWY0MmZjO \x1b[39'
+    'm  \x1b[38;2;255;255;255mDRhOWM0MThjY2M1OThmOTJlOTlhYTMzNTEzN'
+    'mFhYjBkYjg4OWZhIiwicG9saWN5X2dlbmVyYXRpb24iOjEsInNvdXJjZV9'
+    'zZXNzaW9uX2lkIjoiY29kZX \x1b[39m\n  \x1b[38;2;255;255;255mg6cHJvY'
+    'mUtY3ItZnJhbWUiLCJ0YXJnZXRfcHJvdmlkZXIiOiJjbGF1ZGUifQ.UCRW'
+    '3JzKh0WHXWgYBmIG4fsQRdgHKbqQaeyC-xLjWnw\x1b[K\x1b[39m\n  \x1b[38;2;2'
+    '55;255;255mBounded metadata: {"bridge_id":"claude-visibili'
+    'ty:f768a37da2115b0c204af42fc84a9c418ccc598f92e99aa335136aa'
+    'b0db889fa"," \x1b[39m\n  \x1b[38;2;255;255;255mgit_branch":null,"'
+    'git_head":null,"git_root":null,"source_cwd":"C:\\\\Users\\\\di'
+    'ego","source_provider":"codex","source_se \x1b[39m\n  \x1b[38;2;2'
+    '55;255;255mssion_id":"codex:probe-cr-frame","worktree_id":'
+    'null}\x1b[K\x1b[39m\n  \x1b[38;2;255;255;255mYou must reply exactly '
+    'REGISTERED.\x1b[K\x1b[39m\n  \x1b[38;2;255;255;255mAfter the first s'
+    'ubsequent substantive user request, call session_continue\x1b'
+    '[K\x1b[39m\n  \x1b[38;2;255;255;255mwith the canonical source ses'
+    'sion identity before performing project work.\x1b[K\x1b[38;2;215'
+    ';119;87m\x1b[49m\x1b[18;1H✢\x1b[1CWib\x1b[38;2;235;159;127mbli\x1b[38;2;2'
+    '15;119;87mng…\x1b[38;2;8;145;178m\x1b[20;1H─────────────────────'
+    '────────────────────────────────────────────────────\x1b[38;2'
+    ';0;0;0m\x1b[48;2;8;145;178m [Codex] probe: capture the REGIST'
+    'ERED frame \x1b[38;2;8;145;178m\x1b[49m──\x1b[38;2;153;153;153m\n❯\xa0\x1b'
+    '[m\x1b[7m \x1b[38;2;8;145;178m\x1b[27m\n────────────────────────────'
+    '──────────────────────────────────────────────────────────'
+    '──────────────────────────────────\x1b[38;2;153;153;153m\x1b[23;'
+    '3Hpaste\x1b[1Cagain\x1b[1Cto\x1b[1Cexpand\x1b[m\x1b[38;2;215;119;87m\x1b[18;'
+    '1H✽\x1b[1CGarnishing\x1b[38;2;235;159;127m… \x1b[m\x1b]0;⠐ [Codex] pro'
+    'be: capture the REGISTERED frame\x07\x1b[38;2;235;159;127m\x1b[18;1'
+    '2Hg\x1b[38;2;153;153;153m\x1b[2C(1s · \x1b[38;2;173;173;173mthinkin'
+    'g\x1b[38;2;153;153;153m)\x1b[m\x1b]0;✳ [Codex] probe: capture the R'
+    'EGISTERED frame\x07\x1b[38;2;255;255;255m\n●\x1b[m\x1b[1CREGISTERED\x1b[K\x1b'
+    '[38;2;153;153;153m\x1b[20;1H✻ Churned for 3s\x1b[K\x1b[m\n\x1b[K\x1b[38;2;'
+    '0;0;0m\x1b[48;2;8;145;178m\x1b[22;74H [Codex] probe: capture the'
+    ' REGISTERED frame \x1b[m\n❯\xa0\x1b[7m \x1b[27m\x1b[K\x1b[38;2;8;145;178m\n───'
+    '──────────────────────────────────────────────────────────'
+    '──────────────────────────────────────────────────────────'
+    "─\x1b[m\n  \x1b[38;2;255;107;128m⏵⏵ don't ask on \x1b[38;2;153;153;1"
+    '53m(shift+tab to cycle) · ← for agents\x1b[K\x1b[67C\x1b[m\n\x1b[120C'
+)
+
+
+CONPTY_REGISTERED_PROMPT_LINE = "You must reply exactly REGISTERED."
+
+
+def test_captured_registered_frame_carries_no_carriage_return() -> None:
+    """Pins the measurement, because the frame contradicts the obvious story.
+
+    The weld this module unwelds is caused by CUP being deleted, not by "\\r".
+    The frame that actually carries the answer holds 8 CUP, 10 EL and 9 CUF and
+    no carriage return at all, bare or paired.
+    """
+
+    assert "\r" not in CONPTY_REGISTERED_FRAME
+    assert "\x1b[20;1H" in CONPTY_REGISTERED_FRAME  # the CUP that did the welding
+
+
+def test_cursor_position_escape_does_not_weld_two_screen_rows() -> None:
+    """The unwelding, checked against a real frame rather than a built one."""
+
+    lines = _stripped_terminal_text(CONPTY_REGISTERED_FRAME).splitlines()
+
+    assert "● REGISTERED" in lines
+    assert not any(
+        line != "● REGISTERED" and "REGISTERED" in line and "Churned" in line
+        for line in lines
+    )
+
+
+def test_live_registered_frame_is_recognized_as_the_exact_answer() -> None:
+    """Unwelding alone does not do this: the answer shares the frame with the
+    whole screen, so the capture must be reduced to what Claude drew."""
+
+    assert _has_exact_registered_response(
+        CONPTY_REGISTERED_FRAME, CONPTY_REGISTERED_PROMPT_LINE
+    )
+
+
+def test_live_registered_frame_arms_the_read_loop_candidate() -> None:
+    """Without this the read loop times out and discards the answer.
+
+    The frame is passed exactly as captured. It ends "\\x1b[120C", a cursor move
+    -- a drawn screen almost never ends on a line break -- so an earlier draft
+    of this test appended a newline, passed, and left the live path still
+    broken. Padding the evidence here puts the defect back out of reach.
+    """
+
+    assert not CONPTY_REGISTERED_FRAME.endswith(("\r", "\n"))
+    assert _exact_registered_suffix(CONPTY_REGISTERED_FRAME) is not None
+
+
+def test_answer_still_being_drawn_is_not_latched_as_complete() -> None:
+    """Nothing drawn below it yet, so the row can still grow."""
+
+    assert _exact_registered_suffix("\x1b[9;1H● REGISTERED") is None
+    assert _exact_registered_suffix("\x1b[9;1H● REGISTERED\r\n") is not None
+    assert (
+        _exact_registered_suffix("\x1b[9;1H● REGISTERED\x1b[10;1H✻ Churned for 3s")
+        is not None
+    )
+
+
+def test_live_registered_frame_survives_the_normalized_round_trip() -> None:
+    """The production route: read_until normalizes before _launch scores it.
+
+    The reply marker must therefore survive normalization -- it is the only
+    boundary left between the answer and the frame drawn around it, and
+    _strip_line_marker would remove it along with the spinner glyph.
+    """
+
+    normalized = _normalized_terminal_output(
+        CONPTY_REGISTERED_FRAME, CONPTY_REGISTERED_PROMPT_LINE
+    )
+
+    assert "● REGISTERED" in normalized.splitlines()
+    assert _has_exact_registered_response(normalized, CONPTY_REGISTERED_PROMPT_LINE)
+
+
+def test_drawn_screen_rejects_an_answer_that_is_not_exactly_registered() -> None:
+    """Reducing the screen to the reply must not become accepting any reply."""
+
+    chatty = CONPTY_REGISTERED_FRAME.replace("REGISTERED\x1b[K", "Sure thing\x1b[K")
+
+    assert "● Sure thing" in _stripped_terminal_text(chatty).splitlines()
+    assert not _has_exact_registered_response(
+        chatty, CONPTY_REGISTERED_PROMPT_LINE
+    )
+
+
+def test_drawn_screen_before_the_answer_is_not_a_registration() -> None:
+    """The same screen one redraw earlier is still pending, not registered."""
+
+    pending = CONPTY_REGISTERED_FRAME[: CONPTY_REGISTERED_FRAME.rfind("\n●")]
+
+    assert not _has_exact_registered_response(
+        pending, CONPTY_REGISTERED_PROMPT_LINE
+    )
+
+
+def test_plain_output_without_a_drawn_screen_keeps_the_whole_buffer_rule() -> None:
+    """A capture Claude never bulleted is still scored in full, as before."""
+
+    assert _has_exact_registered_response(
+        "REGISTERED\r\n", CONPTY_REGISTERED_PROMPT_LINE
+    )
+    assert not _has_exact_registered_response(
+        "REGISTERED\r\nand one more thing\r\n", CONPTY_REGISTERED_PROMPT_LINE
+    )
+
+
 def test_launch_reads_out_a_response_seen_but_not_yet_captured() -> None:
     """An observed-but-uncaptured response must be read, not scored as empty.
 
