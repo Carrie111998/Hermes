@@ -947,7 +947,15 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     path = request.url.path
     is_mcp_oauth_callback = path.startswith("/api/mcp/oauth/callback/")
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not is_mcp_oauth_callback:
+    is_ssh_ownership_challenge = (
+        path == "/api/ssh/ownership" and "challenge" in request.query_params
+    )
+    if (
+        path.startswith("/api/")
+        and path not in _PUBLIC_API_PATHS
+        and not is_mcp_oauth_callback
+        and not is_ssh_ownership_challenge
+    ):
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
             return JSONResponse(
                 status_code=401,
@@ -3575,16 +3583,33 @@ def _load_configured_gateway_platforms() -> set[str]:
 
 @app.get("/api/ssh/ownership")
 async def get_ssh_ownership(request: Request):
-    _require_token(request)
     if not _SSH_OWNER_NONCE:
         raise HTTPException(status_code=404, detail="SSH ownership is not active")
-    return {
+    challenge = request.query_params.get("challenge")
+    if challenge is None:
+        _require_token(request)
+    elif not re.fullmatch(r"[0-9a-f]{64}", challenge):
+        raise HTTPException(status_code=400, detail="Invalid SSH ownership challenge")
+
+    pid = os.getpid()
+    protocol_version = 2
+    proof = None
+    if challenge is not None:
+        canonical = f"{challenge}:{_SSH_OWNER_NONCE}:{pid}:{protocol_version}"
+        proof = hmac.new(
+            _SESSION_TOKEN.encode(), canonical.encode(), hashlib.sha256
+        ).hexdigest()
+
+    response = {
         "ok": True,
         "sshOwnerNonce": _SSH_OWNER_NONCE,
-        "protocolVersion": 1,
+        "protocolVersion": protocol_version,
         "runtimeIntact": _ssh_runtime_intact(),
-        "pid": os.getpid(),
+        "pid": pid,
     }
+    if proof is not None:
+        response["proof"] = proof
+    return response
 
 
 @app.get("/api/health")

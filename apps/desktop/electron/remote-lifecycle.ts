@@ -33,8 +33,9 @@ import { assertBootstrapNotSuperseded } from './ssh-connection'
 const LOCKFILE_SCHEMA_VERSION = 2
 // Bumped when the desktop<->dashboard reuse contract changes in a way that makes
 // an old running dashboard unsafe to reattach to (token handling, readiness/spawn
-// args, served-token reconciliation). A mismatch forces a clean respawn.
-const PROTOCOL_VERSION = 1
+// args, served-token reconciliation). Legacy records remain readable for safe
+// process handling, but only the current protocol is eligible for reuse.
+const PROTOCOL_VERSION = 2
 const READY_RE = /^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/m
 const REMOTE_LOCK_DIR = '~/.hermes/desktop-ssh'
 const SUPPORTED_REMOTE_OS = new Set(['Linux', 'Darwin'])
@@ -63,6 +64,53 @@ function classifySshReuseProof(proof, spawnNonce) {
 
 function mintToken() {
   return crypto.randomBytes(32).toString('hex')
+}
+
+function mintOwnershipChallenge() {
+  return crypto.randomBytes(32).toString('hex')
+}
+
+function ownershipChallengePayload(challenge, spawnNonce, pid, protocolVersion) {
+  return `${challenge}:${spawnNonce}:${pid}:${protocolVersion}`
+}
+
+function verifyOwnershipChallengeProof(proof, token, challenge, spawnNonce, pid) {
+  if (
+    proof?.ok !== true ||
+    proof.sshOwnerNonce !== spawnNonce ||
+    proof.pid !== pid ||
+    proof.protocolVersion !== PROTOCOL_VERSION ||
+    !/^[0-9a-f]{64}$/.test(String(proof.proof || ''))
+  ) {
+    return false
+  }
+
+  const expected = crypto
+    .createHmac('sha256', token)
+    .update(ownershipChallengePayload(challenge, spawnNonce, pid, PROTOCOL_VERSION))
+    .digest()
+
+  const received = Buffer.from(proof.proof, 'hex')
+
+  return received.length === expected.length && crypto.timingSafeEqual(received, expected)
+}
+
+async function proveOwnershipWithChallenge(
+  probeOwnershipChallenge,
+  baseUrl,
+  token,
+  spawnNonce,
+  pid,
+  mintChallenge = mintOwnershipChallenge
+) {
+  if (typeof probeOwnershipChallenge !== 'function') {
+    return false
+  }
+
+  const challenge = mintChallenge()
+  const proof = await probeOwnershipChallenge(baseUrl, challenge)
+
+  return verifyOwnershipChallengeProof(proof, token, challenge, spawnNonce, pid)
 }
 
 // Fingerprint a token for the lockfile — never store the raw secret on the
@@ -357,7 +405,7 @@ async function readLockfile(ssh, ownershipId) {
     return null
   }
 
-  if (parsed.protocolVersion !== PROTOCOL_VERSION) {
+  if (parsed.protocolVersion !== 1 && parsed.protocolVersion !== PROTOCOL_VERSION) {
     return null
   }
 
@@ -837,7 +885,7 @@ async function connect(deps) {
     forward,
     pickLocalPort,
     waitForHermes,
-    probeOwnershipProof,
+    probeOwnershipChallenge,
     probeReuseProof,
     adoptServedToken,
     rememberLog = () => {},
@@ -906,10 +954,26 @@ async function connect(deps) {
 
         if (!owned) {
           try {
-            authenticatedOwnership =
-              typeof probeOwnershipProof === 'function' &&
-              (await probeOwnershipProof(baseUrl, reuseToken, lock.spawnNonce, lock.pid)) === true
+            authenticatedOwnership = await proveOwnershipWithChallenge(
+              probeOwnershipChallenge,
+              baseUrl,
+              reuseToken,
+              lock.spawnNonce,
+              lock.pid,
+              deps.mintOwnershipChallenge || mintOwnershipChallenge
+            )
           } catch (cause) {
+            if ((cause as any)?.kind === 'ssh-update-required') {
+              const error: any = new Error(
+                'The remote Hermes backend does not support the secure SSH ownership challenge. ' +
+                  'Update Hermes on the remote host, then reconnect.'
+              )
+
+              error.kind = 'ssh-update-required'
+              error.cause = cause
+              throw error
+            }
+
             const error: any = new Error('Could not verify ownership of the existing SSH backend.')
 
             error.kind = 'transient-transport-error'
@@ -929,64 +993,58 @@ async function connect(deps) {
                 'Refusing to replace it without a safe teardown.'
             )
 
-            error.kind = 'foreign-backend'
+            error.kind = 'ownership-challenge-failed'
             throw error
           }
         } else {
-        let reuseClassification
+          let reuseClassification
 
-        try {
-          reuseClassification = await probeReuseProof(baseUrl, reuseToken, lock.spawnNonce)
-        } catch (cause) {
-          const error: any = new Error('Could not verify the existing SSH backend.')
-          error.kind = 'transient-transport-error'
-          error.cause = cause
-          throw error
-        }
-
-        if (reuseClassification === 'authenticated-stale') {
-          assertBootstrapNotSuperseded(signal)
-          await closeForward()
-          await cleanupStale(
-            ssh,
-            ownershipId,
-            lock,
-            pidAlive,
-            authenticatedOwnership ? async () => true : undefined
-          )
-        } else if (reuseClassification === 'authenticated-ok') {
-          const token = await adoptOwnedServedToken(
-            adoptServedToken,
-            baseUrl,
-            reuseToken,
-            ssh,
-            lock.pid,
-            'reused remote dashboard'
-          )
-
-          assertBootstrapNotSuperseded(signal)
-          log(`reusing remote dashboard pid=${lock.pid} port=${lock.port}`)
-
-          return {
-            baseUrl,
-            token,
-            tokenFingerprint: fingerprintToken(token),
-            remotePort: lock.port,
-            localPort,
-            pid: lock.pid,
-            reused: true,
-            platform,
-            hermesPath,
-            hermesVersion,
-            ownershipId,
-            spawnNonce: lock.spawnNonce,
-            logPath: lock.logPath
+          try {
+            reuseClassification = await probeReuseProof(baseUrl, reuseToken, lock.spawnNonce)
+          } catch (cause) {
+            const error: any = new Error('Could not verify the existing SSH backend.')
+            error.kind = 'transient-transport-error'
+            error.cause = cause
+            throw error
           }
-        } else {
-          const error: any = new Error('SSH reuse proof returned an invalid classification.')
-          error.kind = 'transient-transport-error'
-          throw error
-        }
+
+          if (reuseClassification === 'authenticated-stale') {
+            assertBootstrapNotSuperseded(signal)
+            await closeForward()
+            await cleanupStale(ssh, ownershipId, lock, pidAlive, authenticatedOwnership ? async () => true : undefined)
+          } else if (reuseClassification === 'authenticated-ok') {
+            const token = await adoptOwnedServedToken(
+              adoptServedToken,
+              baseUrl,
+              reuseToken,
+              ssh,
+              lock.pid,
+              'reused remote dashboard'
+            )
+
+            assertBootstrapNotSuperseded(signal)
+            log(`reusing remote dashboard pid=${lock.pid} port=${lock.port}`)
+
+            return {
+              baseUrl,
+              token,
+              tokenFingerprint: fingerprintToken(token),
+              remotePort: lock.port,
+              localPort,
+              pid: lock.pid,
+              reused: true,
+              platform,
+              hermesPath,
+              hermesVersion,
+              ownershipId,
+              spawnNonce: lock.spawnNonce,
+              logPath: lock.logPath
+            }
+          } else {
+            const error: any = new Error('SSH reuse proof returned an invalid classification.')
+            error.kind = 'transient-transport-error'
+            throw error
+          }
         }
       } catch (error) {
         await closeForward()
@@ -1110,6 +1168,7 @@ export {
   locateHermes,
   LOCKFILE_SCHEMA_VERSION,
   lockfilePath,
+  mintOwnershipChallenge,
   mintToken,
   openForward,
   ownershipDirectory,
@@ -1118,6 +1177,7 @@ export {
   probeRemoteHermesHome,
   probeRemotePlatform,
   PROTOCOL_VERSION,
+  proveOwnershipWithChallenge,
   readLockfile,
   READY_RE,
   REMOTE_LOCK_DIR,
@@ -1131,5 +1191,6 @@ export {
   spawnTokenPath,
   SUPPORTED_REMOTE_OS,
   validateRemotePath,
+  verifyOwnershipChallengeProof,
   writeLockfile
 }

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, execFile, spawn } from 'node:child_process'
+import crypto from 'node:crypto'
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -25,6 +26,7 @@ import {
   pidIsOurDashboard,
   probeRemotePlatform,
   PROTOCOL_VERSION,
+  proveOwnershipWithChallenge,
   readLockfile,
   READY_RE,
   remotePidAlive,
@@ -41,10 +43,45 @@ const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
 
+test('ownership challenge probe receives no reuse credential and verifies the keyed proof', async () => {
+  const token = 'stored-token'
+  const challenge = 'c'.repeat(64)
+  const pid = 333
+
+  const proof = crypto
+    .createHmac('sha256', token)
+    .update(`${challenge}:${SPAWN_NONCE}:${pid}:${PROTOCOL_VERSION}`)
+    .digest('hex')
+
+  let probeArguments: unknown[] = []
+
+  const verified = await proveOwnershipWithChallenge(
+    (...args) => {
+      probeArguments = args
+
+      return Promise.resolve({
+        ok: true,
+        sshOwnerNonce: SPAWN_NONCE,
+        pid,
+        protocolVersion: PROTOCOL_VERSION,
+        proof
+      })
+    },
+    'http://127.0.0.1:50001',
+    token,
+    SPAWN_NONCE,
+    pid,
+    () => challenge
+  )
+
+  assert.equal(verified, true)
+  assert.deepEqual(probeArguments, ['http://127.0.0.1:50001', challenge])
+})
+
 test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
   assert.equal(
     classifySshReuseProof(
-      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, runtimeIntact: false },
+      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION, runtimeIntact: false },
       SPAWN_NONCE
     ),
     'authenticated-stale'
@@ -54,30 +91,44 @@ test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
 test('SSH ownership proof remains valid when the owned backend runtime was replaced', () => {
   assert.equal(
     isSshOwnershipProof(
-      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, runtimeIntact: false },
+      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION, runtimeIntact: false },
       SPAWN_NONCE
     ),
     true
   )
   assert.equal(
-    isSshOwnershipProof({ ok: true, sshOwnerNonce: 'fedcba9876543210', protocolVersion: 1 }, SPAWN_NONCE),
+    isSshOwnershipProof(
+      { ok: true, sshOwnerNonce: 'fedcba9876543210', protocolVersion: PROTOCOL_VERSION },
+      SPAWN_NONCE
+    ),
     false
   )
-  assert.equal(isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 2 }, SPAWN_NONCE), false)
+  assert.equal(isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1 }, SPAWN_NONCE), false)
   assert.equal(
-    isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, pid: 333 }, SPAWN_NONCE, 333),
+    isSshOwnershipProof(
+      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION, pid: 333 },
+      SPAWN_NONCE,
+      333
+    ),
     true
   )
   assert.equal(
-    isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, pid: 333 }, SPAWN_NONCE, 334),
+    isSshOwnershipProof(
+      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION, pid: 333 },
+      SPAWN_NONCE,
+      334
+    ),
     false
   )
-  assert.equal(isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1 }, SPAWN_NONCE, 333), false)
+  assert.equal(
+    isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION }, SPAWN_NONCE, 333),
+    false
+  )
 })
 
 test('SSH reuse proof remains compatible when runtime state is absent', () => {
   assert.equal(
-    classifySshReuseProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1 }, SPAWN_NONCE),
+    classifySshReuseProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: PROTOCOL_VERSION }, SPAWN_NONCE),
     'authenticated-ok'
   )
 })
@@ -301,6 +352,12 @@ test('readLockfile returns null for missing, empty, malformed, or wrong-schema',
   assert.equal(await readLockfile(fakeSsh([[/cat/, JSON.stringify({ schemaVersion: 999 })]]), OWNERSHIP_ID), null)
   const good = ownedLock({ pid: 1, port: 2 })
   assert.deepEqual(await readLockfile(fakeSsh([[/cat/, JSON.stringify(good)]]), OWNERSHIP_ID), good)
+})
+
+test('readLockfile preserves a valid legacy protocol-1 process record after the protocol bump', async () => {
+  const legacy = ownedLock({ protocolVersion: 1 })
+
+  assert.deepEqual(await readLockfile(fakeSsh([[/cat/, JSON.stringify(legacy)]]), OWNERSHIP_ID), legacy)
 })
 
 test('writeLockfile mkdir -ps and stamps the schema version', async () => {
@@ -656,10 +713,12 @@ test.skipIf(process.platform !== 'linux')(
   }
 )
 
-test.skipIf(process.platform === 'win32')('pidIsOurDashboard never authorizes wrapper ownership from flattened ps', async () => {
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes flattened ps '))
+test.skipIf(process.platform === 'win32')(
+  'pidIsOurDashboard never authorizes wrapper ownership from flattened ps',
+  async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes flattened ps '))
 
-  const sitecustomize = `
+    const sitecustomize = `
 import builtins, os, subprocess
 real_open = builtins.open
 def fallback_open(name, *args, **kwargs):
@@ -670,31 +729,29 @@ builtins.open = fallback_open
 subprocess.check_output = lambda *args, **kwargs: os.environ['HERMES_TEST_PS_LINE']
 `
 
-  await writeFile(path.join(temp, 'sitecustomize.py'), sitecustomize, 'utf8')
-  const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
-  const line = `/x/venv/bin/hermes --profile ops serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file ${tokenPath} --ssh-owner-nonce ${SPAWN_NONCE}`
+    await writeFile(path.join(temp, 'sitecustomize.py'), sitecustomize, 'utf8')
+    const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
+    const line = `/x/venv/bin/hermes --profile ops serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file ${tokenPath} --ssh-owner-nonce ${SPAWN_NONCE}`
 
-  const ssh = {
-    exec: (command: string) =>
-      new Promise<string>((resolve, reject) => {
-        execFile(
-          '/bin/sh',
-          ['-c', command],
-          { encoding: 'utf8', env: { ...process.env, PYTHONPATH: temp, HERMES_TEST_PS_LINE: line } },
-          (error, stdout) => (error ? reject(error) : resolve(String(stdout)))
-        )
-      })
-  }
+    const ssh = {
+      exec: (command: string) =>
+        new Promise<string>((resolve, reject) => {
+          execFile(
+            '/bin/sh',
+            ['-c', command],
+            { encoding: 'utf8', env: { ...process.env, PYTHONPATH: temp, HERMES_TEST_PS_LINE: line } },
+            (error, stdout) => (error ? reject(error) : resolve(String(stdout)))
+          )
+        })
+    }
 
-  try {
-    assert.equal(
-      await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/launcher', '/x/home', OWNERSHIP_ID, 'ops'),
-      false
-    )
-  } finally {
-    await rm(temp, { force: true, recursive: true })
+    try {
+      assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/launcher', '/x/home', OWNERSHIP_ID, 'ops'), false)
+    } finally {
+      await rm(temp, { force: true, recursive: true })
+    }
   }
-})
+)
 
 test.skipIf(process.platform === 'win32')(
   'pidIsOurDashboard accepts the known HERMES_HOME entrypoint from flattened ps',
@@ -729,10 +786,7 @@ subprocess.check_output = lambda *args, **kwargs: os.environ['HERMES_TEST_PS_LIN
     }
 
     try {
-      assert.equal(
-        await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/launcher', '/x/home', OWNERSHIP_ID, 'ops'),
-        true
-      )
+      assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/launcher', '/x/home', OWNERSHIP_ID, 'ops'), true)
     } finally {
       await rm(temp, { force: true, recursive: true })
     }
@@ -756,6 +810,7 @@ test('disconnect reaps the backend recorded for this desktop ownership', async (
 
 test('disconnect reaps a wrapper when the live backend proves authenticated ownership', async () => {
   const lock = ownedLock()
+
   const ssh = fakeSsh([
     [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE\n'],
@@ -770,6 +825,7 @@ test('disconnect reaps a wrapper when the live backend proves authenticated owne
 
 test('disconnect preserves the lock when an alive process cannot prove ownership', async () => {
   const lock = ownedLock()
+
   const ssh = fakeSsh([
     [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
     [/kill -0 333/, 'ALIVE\n'],
@@ -936,7 +992,7 @@ function connectDeps(ssh, over: any = {}) {
     cancelForward: async () => {},
     pickLocalPort: async () => 50001,
     waitForHermes: async () => {},
-    probeOwnershipProof: async () => false,
+    probeOwnershipChallenge: async () => null,
     probeReuseProof: async () => 'authenticated-ok',
     adoptServedToken: async (_baseUrl, spawn) => spawn || 'served-token',
     rememberLog: () => {},
@@ -1036,6 +1092,12 @@ test('connect() reuses a healthy dashboard when fingerprint + probe pass', async
 test('connect reuses a live wrapper after authenticated nonce and pid ownership proof', async () => {
   const reuseToken = 'stored-token'
   const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+  const challenge = 'a'.repeat(64)
+
+  const proof = crypto.createHmac('sha256', reuseToken).update(`${challenge}:${SPAWN_NONCE}:333:2`).digest('hex')
+
+  let authenticatedProbeCalled = false
+
   const ssh = fakeSsh([
     [/uname/, 'Darwin\narm64'],
     [/\[ -x/, 'OK'],
@@ -1047,25 +1109,172 @@ test('connect reuses a live wrapper after authenticated nonce and pid ownership 
   const result = await connect(
     connectDeps(ssh, {
       reuseToken,
-      probeOwnershipProof: async (baseUrl, token, nonce, pid) => {
+      mintOwnershipChallenge: () => challenge,
+      probeOwnershipChallenge: async (baseUrl, sentChallenge) => {
         assert.equal(baseUrl, 'http://127.0.0.1:50001')
-        assert.equal(token, reuseToken)
-        assert.equal(nonce, SPAWN_NONCE)
-        assert.equal(pid, 333)
+        assert.equal(sentChallenge, challenge)
 
-        return true
+        return {
+          ok: true,
+          sshOwnerNonce: SPAWN_NONCE,
+          pid: 333,
+          protocolVersion: 2,
+          proof
+        }
+      },
+      probeReuseProof: async () => {
+        authenticatedProbeCalled = true
+
+        return 'authenticated-ok'
       },
       adoptServedToken: async (_baseUrl, token) => token
     })
   )
 
   assert.equal(result.reused, true)
+  assert.equal(authenticatedProbeCalled, true)
   assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
   assert.ok(!ssh.calls.some(command => /setsid|nohup/.test(command)))
 })
 
+test.each([
+  ['HMAC', { proof: '0'.repeat(64) }],
+  ['nonce', { sshOwnerNonce: 'fedcba9876543210' }],
+  ['pid', { pid: 334 }],
+  ['protocol', { protocolVersion: PROTOCOL_VERSION + 1 }]
+])('connect fails closed on a forged wrapper ownership %s', async (_field, override) => {
+  const reuseToken = 'stored-token'
+  const challenge = 'b'.repeat(64)
+  const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+
+  const validProof = crypto
+    .createHmac('sha256', reuseToken)
+    .update(`${challenge}:${SPAWN_NONCE}:333:${PROTOCOL_VERSION}`)
+    .digest('hex')
+
+  let authenticatedProbeCalled = false
+
+  const ssh = fakeSsh([
+    [/uname/, 'Darwin\narm64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'FOREIGN\n']
+  ])
+
+  await assert.rejects(
+    () =>
+      connect(
+        connectDeps(ssh, {
+          reuseToken,
+          mintOwnershipChallenge: () => challenge,
+          probeOwnershipChallenge: async () => ({
+            ok: true,
+            sshOwnerNonce: SPAWN_NONCE,
+            pid: 333,
+            protocolVersion: PROTOCOL_VERSION,
+            proof: validProof,
+            ...override
+          }),
+          probeReuseProof: async () => {
+            authenticatedProbeCalled = true
+
+            return 'authenticated-ok'
+          }
+        })
+      ),
+    (error: any) => {
+      assert.equal(error.kind, 'ownership-challenge-failed')
+
+      return true
+    }
+  )
+
+  assert.equal(authenticatedProbeCalled, false)
+  assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+test.each([401, 403, 404])(
+  'connect maps a legacy ownership challenge HTTP %s to update-required and preserves its lock',
+  async status => {
+    const reuseToken = 'stored-token'
+    const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+
+    const ssh = fakeSsh([
+      [/uname/, 'Darwin\narm64'],
+      [/\[ -x/, 'OK'],
+      [/cat .*lock\.json/, JSON.stringify(lock)],
+      [/kill -0 333/, 'ALIVE'],
+      [/print\("OWNED"/, 'FOREIGN\n']
+    ])
+
+    await assert.rejects(
+      () =>
+        connect(
+          connectDeps(ssh, {
+            reuseToken,
+            probeOwnershipChallenge: async () => {
+              const error: any = new Error(`ownership challenge HTTP ${status}`)
+              error.kind = 'ssh-update-required'
+              throw error
+            }
+          })
+        ),
+      (error: any) => {
+        assert.equal(error.kind, 'ssh-update-required')
+        assert.match(error.message, /update/i)
+
+        return true
+      }
+    )
+
+    assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
+    assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+  }
+)
+
+test('connect challenges a live unverified legacy lock before reporting update-required', async () => {
+  const reuseToken = 'stored-token'
+  const lock = ownedLock({ protocolVersion: 1, tokenFingerprint: fingerprintToken(reuseToken) })
+  let challengeCalled = false
+
+  const ssh = fakeSsh([
+    [/uname/, 'Darwin\narm64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'FOREIGN\n']
+  ])
+
+  await assert.rejects(
+    () =>
+      connect(
+        connectDeps(ssh, {
+          reuseToken,
+          probeOwnershipChallenge: async () => {
+            challengeCalled = true
+            const error: any = new Error('legacy endpoint requires authentication')
+            error.kind = 'ssh-update-required'
+            throw error
+          }
+        })
+      ),
+    (error: any) => {
+      assert.equal(error.kind, 'ssh-update-required')
+
+      return true
+    }
+  )
+
+  assert.equal(challengeCalled, true)
+  assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
 test('connect refuses to replace an alive process whose ownership cannot be proved', async () => {
   const lock = ownedLock({ tokenFingerprint: fingerprintToken('stored-token') })
+
   const ssh = fakeSsh([
     [/uname/, 'Linux\nx86_64'],
     [/\[ -x/, 'OK'],
@@ -1077,7 +1286,7 @@ test('connect refuses to replace an alive process whose ownership cannot be prov
   await assert.rejects(
     () => connect(connectDeps(ssh, { reuseToken: 'stored-token' })),
     (error: any) => {
-      assert.equal(error.kind, 'foreign-backend')
+      assert.equal(error.kind, 'ownership-challenge-failed')
 
       return true
     }

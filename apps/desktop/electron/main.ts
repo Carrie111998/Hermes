@@ -4915,7 +4915,7 @@ function fetchJson(url, token, options: any = {}) {
               ...headersForRemoteRequest(url),
               ...(options.headers || {}),
               'Content-Type': contentType,
-              'X-Hermes-Session-Token': token,
+              ...(token ? { 'X-Hermes-Session-Token': token } : {}),
               // RFC 8252 native flow authenticates the gated gateway with a bearer
               // token instead of the loopback session-token header. When
               // ``options.bearer`` is set we send Authorization: Bearer <token>;
@@ -9485,14 +9485,15 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
   }
 }
 
-async function sshProbeOwnershipProof(baseUrl, token, spawnNonce, pid) {
+async function sshProbeOwnershipChallenge(baseUrl, challenge) {
   try {
-    const proof: any = await fetchJson(`${baseUrl}/api/ssh/ownership`, token)
-
-    return remoteLifecycle.isSshOwnershipProof(proof, spawnNonce, pid)
+    return await fetchJson(`${baseUrl}/api/ssh/ownership?challenge=${encodeURIComponent(challenge)}`, '')
   } catch (error: any) {
     if (/^(401|403|404):/.test(String(error?.message || ''))) {
-      return false
+      const updateError: any = new Error('The remote Hermes backend must be updated for secure SSH reuse.')
+      updateError.kind = 'ssh-update-required'
+      updateError.cause = error
+      throw updateError
     }
 
     throw error
@@ -9535,16 +9536,12 @@ async function teardownSshConnection(profile) {
                 // The active tunnel already points at the backend this state
                 // adopted. Its token + owner nonce are the exact ownership
                 // proof when macOS ps cannot preserve argv boundaries.
-                if (
-                  !state.localPort ||
-                  !state.token ||
-                  state.pid !== lock.pid ||
-                  state.remotePort !== lock.port
-                ) {
+                if (!state.localPort || !state.token || state.pid !== lock.pid || state.remotePort !== lock.port) {
                   return false
                 }
 
-                return sshProbeOwnershipProof(
+                return remoteLifecycle.proveOwnershipWithChallenge(
+                  sshProbeOwnershipChallenge,
                   `http://127.0.0.1:${state.localPort}`,
                   state.token,
                   lock.spawnNonce,
@@ -9730,7 +9727,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
       pickLocalPort,
       waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token'),
-      probeOwnershipProof: sshProbeOwnershipProof,
+      probeOwnershipChallenge: sshProbeOwnershipChallenge,
       probeReuseProof: sshProbeReuseProof,
       adoptServedToken: adoptServedDashboardToken,
       rememberLog: sshRememberLog,
