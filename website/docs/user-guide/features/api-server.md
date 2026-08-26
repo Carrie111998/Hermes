@@ -553,12 +553,14 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 ```bash
 # fork a session and run one turn
 curl -X POST http://localhost:8642/api/sessions/$ID/fork \
-  -H "Authorization: Bearer ***
+  -H "Authorization: Bearer ***" \
+  -H "Content-Type: application/json" \
   -d '{"title": "explore alt path"}'
 
 # stream a turn over SSE
 curl -N -X POST http://localhost:8642/api/sessions/$ID/chat/stream \
-  -H "Authorization: Bearer ***
+  -H "Authorization: Bearer ***" \
+  -H "Content-Type: application/json" \
   -d '{"input": "what files changed in the last hour?"}'
 ```
 
@@ -580,9 +582,12 @@ gateway:
     enabled: true
     key: your-secret-key
     admin_config_rw: true   # Default false. Opt-in requirement for /v1/admin/*
+    admin_inventory_ro: true # Default false. Independent read-only observed inventory
 ```
 
-When `admin_config_rw` is false (default), `/v1/capabilities` advertises `"admin_config_rw": false` and all `/v1/admin/*` endpoints fail closed with **HTTP 403** without leaking profile or filesystem existence.
+The two gates are independent. `admin_config_rw` controls managed mutation routes. `admin_inventory_ro` controls only the observed inventory routes. When either gate is false (the default), its capability is false, its endpoint entries are omitted, and its routes fail closed with **HTTP 403** without leaking profile or filesystem existence.
+
+The inventory surface never adopts profiles and never grants mutation authority. It returns only unmanaged/default profile identity data: profile name, `SOUL.md`, direct profile-scoped `skills/{slug}/SKILL.md` entries, SHA-256 digests, and counts. It never reads or returns `.env`, `config.yaml`, auth/credential files, sessions/history/state databases, `memories/USER.md`, `memories/MEMORY.md`, workspace/source trees, hidden files, or symlink targets. Profiles carrying any control-plane manifest marker remain exclusively on the managed surface.
 
 ### Ownership Model
 
@@ -631,6 +636,10 @@ The caller identifies ownership via headers (`X-Hermes-Owner-Managed-By`, `X-Her
 | `PUT` | `/v1/admin/profiles/{profile}/files/{path}` | Create or update a managed file |
 | `GET` | `/v1/admin/profiles/{profile}/files/{path}` | Read a managed context file |
 | `DELETE` | `/v1/admin/profiles/{profile}/files/{path}` | Delete a managed context file |
+| `GET` | `/v1/admin/inventory/profiles` | List unmanaged/default profiles as read-only `observed` resources |
+| `GET` | `/v1/admin/inventory/profiles/{profile}/skills` | List direct profile-scoped skills for one observed profile |
+
+Inventory collections use deterministic cursor pagination. Pass `limit` from 1 to 10 (default 10) and, when `pagination.has_more` is true, pass the returned `pagination.next_cursor` as `after` on the next request. Every profile includes `digest`, `soul_digest`, and a content-addressed `skills_digest` when it has at most 50 direct skills. Larger profiles return `skills_digest: null`, `skill_count: null`, and `skills_digest_complete: false`; callers can page the profile-scoped skills route and use each skill's content digest instead. Oversized, unreadable, malformed, or symlinked identity resources are omitted rather than partially exposed.
 
 ### Request / Response Examples
 
@@ -710,11 +719,11 @@ curl -X PUT http://localhost:8642/v1/admin/profiles/coder/files/SOUL.md \
 
 ```bash
 curl http://localhost:8642/v1/skills \
-  -H "Authorization: Bearer ***
+  -H "Authorization: Bearer ***"
 # → [{"name": "github-pr-workflow", "description": "...", "category": "..."}, ...]
 
 curl http://localhost:8642/v1/toolsets \
-  -H "Authorization: Bearer ***
+  -H "Authorization: Bearer ***"
 # → [{"name": "core", "label": "...", "description": "...", "enabled": true,
 #     "configured": true, "tools": ["read_file", "write_file", ...]}, ...]
 ```

@@ -33,10 +33,15 @@ async def create_api_client(temp_hermes_home):
     """Helper to spin up an APIServerAdapter TestClient with given config."""
     clients = []
 
-    async def _make_client(admin_config_rw=True, key="test-secret-key"):
+    async def _make_client(
+        admin_config_rw=True,
+        admin_inventory_ro=False,
+        key="test-secret-key",
+    ):
         extra = {
             "key": key,
             "admin_config_rw": admin_config_rw,
+            "admin_inventory_ro": admin_inventory_ro,
         }
         config = PlatformConfig(enabled=True, extra=extra)
         adapter = APIServerAdapter(config)
@@ -107,6 +112,251 @@ async def test_admin_config_rw_off_by_default_and_capabilities(create_api_client
 
 
 @pytest.mark.asyncio
+async def test_unmanaged_profile_inventory_is_opt_in_read_only_and_paginated(
+    create_api_client, temp_hermes_home
+):
+    """Inventory observes safe unmanaged identity content without adopting it."""
+    client_off, key = await create_api_client(
+        admin_config_rw=False, admin_inventory_ro=False
+    )
+    bearer = {"Authorization": f"Bearer {key}"}
+
+    off = await client_off.get("/v1/admin/inventory/profiles", headers=bearer)
+    assert off.status == 403
+    caps_off = await (await client_off.get("/v1/capabilities", headers=bearer)).json()
+    assert caps_off["features"]["admin_inventory_ro"] is False
+    assert "admin_inventory_profiles" not in caps_off["endpoints"]
+
+    unmanaged = temp_hermes_home / "profiles" / "unmanaged-agent"
+    unmanaged.mkdir(parents=True)
+    (unmanaged / "SOUL.md").write_text("Safe unmanaged soul", encoding="utf-8")
+    skill = unmanaged / "skills" / "profile-skill" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: profile-skill\ndescription: scoped\n---\n# Safe skill\n",
+        encoding="utf-8",
+    )
+    malformed = unmanaged / "skills" / "malformed-skill" / "SKILL.md"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text(
+        "---\nname: malformed-skill\n---\nmissing description",
+        encoding="utf-8",
+    )
+    (unmanaged / ".env").write_text("SECRET=never-return", encoding="utf-8")
+    (unmanaged / "auth.json").write_text('{"token":"never-return"}', encoding="utf-8")
+    (unmanaged / "state.db").write_bytes(b"session-history-never-return")
+    (unmanaged / "memories").mkdir()
+    (unmanaged / "memories" / "MEMORY.md").write_text(
+        "raw-memory-never-return", encoding="utf-8"
+    )
+    (unmanaged / "workspace").mkdir()
+    (unmanaged / "workspace" / "source.py").write_text(
+        "workspace-source-never-return", encoding="utf-8"
+    )
+    outside_soul = temp_hermes_home / "outside-soul.md"
+    outside_soul.write_text("symlink-soul-never-return", encoding="utf-8")
+    symlinked = temp_hermes_home / "profiles" / "symlinked-agent"
+    symlinked.mkdir()
+    (symlinked / "SOUL.md").symlink_to(outside_soul)
+    outside_skill = temp_hermes_home / "outside-skill"
+    outside_skill.mkdir()
+    (outside_skill / "SKILL.md").write_text(
+        "---\nname: escaped\ndescription: escaped\n---\nsymlink-skill-never-return",
+        encoding="utf-8",
+    )
+    (symlinked / "skills").symlink_to(outside_skill, target_is_directory=True)
+
+    client, key = await create_api_client(
+        admin_config_rw=False, admin_inventory_ro=True
+    )
+    bearer = {"Authorization": f"Bearer {key}"}
+    caps = await (await client.get("/v1/capabilities", headers=bearer)).json()
+    assert caps["features"]["admin_inventory_ro"] is True
+    assert caps["endpoints"]["admin_inventory_profiles"]["path"] == (
+        "/v1/admin/inventory/profiles"
+    )
+
+    first = await client.get(
+        "/v1/admin/inventory/profiles?limit=1", headers=bearer
+    )
+    assert first.status == 200
+    first_data = await first.json()
+    assert len(first_data["data"]) == 1
+    assert first_data["pagination"]["limit"] == 1
+    assert first_data["pagination"]["has_more"] is True
+    assert first_data["pagination"]["next_cursor"]
+
+    second = await client.get(
+        "/v1/admin/inventory/profiles",
+        headers=bearer,
+        params={"limit": "10", "after": first_data["pagination"]["next_cursor"]},
+    )
+    all_profiles = first_data["data"] + (await second.json())["data"]
+    observed = next(item for item in all_profiles if item["name"] == "unmanaged-agent")
+    assert observed["management"] == "observed"
+    assert observed["soul"] == "Safe unmanaged soul"
+    assert observed["soul_digest"].startswith("sha256:")
+    assert observed["skills_digest"].startswith("sha256:")
+    serialized = json.dumps(observed)
+    for forbidden in (
+        "never-return",
+        "session-history-never-return",
+        "raw-memory-never-return",
+        "workspace-source-never-return",
+    ):
+        assert forbidden not in serialized
+    assert not (unmanaged / ".control_plane_manifest.json").exists()
+    symlinked_data = next(item for item in all_profiles if item["name"] == "symlinked-agent")
+    assert symlinked_data["soul"] == ""
+    assert symlinked_data["skill_count"] == 0
+    assert "symlink-soul-never-return" not in json.dumps(all_profiles)
+    assert "symlink-skill-never-return" not in json.dumps(all_profiles)
+
+    skills = await client.get(
+        "/v1/admin/inventory/profiles/unmanaged-agent/skills?limit=10",
+        headers=bearer,
+    )
+    assert skills.status == 200
+    skills_data = await skills.json()
+    assert [item["skill_slug"] for item in skills_data["data"]] == [
+        "profile-skill"
+    ]
+    assert skills_data["data"][0]["content"].endswith("# Safe skill\n")
+    assert skills_data["data"][0]["digest"].startswith("sha256:")
+
+    too_large = await client.get(
+        "/v1/admin/inventory/profiles?limit=101", headers=bearer
+    )
+    assert too_large.status == 400
+
+    mutation = await client.put(
+        "/v1/admin/profiles/unmanaged-agent",
+        headers={**bearer, **OWNER_HEADERS},
+        json={"soul": "adopted"},
+    )
+    assert mutation.status == 403
+    assert (unmanaged / "SOUL.md").read_text(encoding="utf-8") == "Safe unmanaged soul"
+
+
+@pytest.mark.asyncio
+async def test_inventory_read_rejects_symlink_swap_after_resolution(
+    create_api_client, temp_hermes_home, monkeypatch
+):
+    """Inventory pins file descriptors so a post-check swap cannot escape."""
+    profile = temp_hermes_home / "profiles" / "race-agent"
+    profile.mkdir()
+    soul = profile / "SOUL.md"
+    soul.write_text("safe-before-swap", encoding="utf-8")
+    outside = temp_hermes_home / "outside-race.md"
+    outside.write_text("outside-secret-must-not-return", encoding="utf-8")
+
+    original_resolve = Path.resolve
+    swapped = False
+
+    def resolve_then_swap(self, *args, **kwargs):
+        nonlocal swapped
+        result = original_resolve(self, *args, **kwargs)
+        if self == soul and not swapped:
+            swapped = True
+            soul.unlink()
+            soul.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_swap)
+    client, key = await create_api_client(
+        admin_config_rw=False, admin_inventory_ro=True
+    )
+    response = await client.get(
+        "/v1/admin/inventory/profiles", headers={"Authorization": f"Bearer {key}"}
+    )
+    assert response.status == 200
+    payload = await response.json()
+    observed = next(item for item in payload["data"] if item["name"] == "race-agent")
+    assert observed["soul"] in ("", "safe-before-swap")
+    assert "outside-secret-must-not-return" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_inventory_rejects_manifest_race_and_avoids_broad_profile_discovery(
+    create_api_client, temp_hermes_home, monkeypatch
+):
+    """An ownership marker appearing mid-read omits the profile without broad reads."""
+    profile = temp_hermes_home / "profiles" / "ownership-race"
+    profile.mkdir()
+    (profile / "SOUL.md").write_text("identity", encoding="utf-8")
+
+    import gateway.admin as admin
+
+    monkeypatch.setattr(
+        admin,
+        "list_profiles",
+        lambda: (_ for _ in ()).throw(AssertionError("broad discovery forbidden")),
+    )
+    original_read = admin._safe_inventory_text
+    inserted = False
+
+    def read_then_manage(*args, **kwargs):
+        nonlocal inserted
+        result = original_read(*args, **kwargs)
+        if not inserted and args[0] == profile:
+            inserted = True
+            (profile / ".control_plane_manifest.json").write_text(
+                '{"managed_by":"other"}', encoding="utf-8"
+            )
+        return result
+
+    monkeypatch.setattr(admin, "_safe_inventory_text", read_then_manage)
+    client, key = await create_api_client(
+        admin_config_rw=False, admin_inventory_ro=True
+    )
+    response = await client.get(
+        "/v1/admin/inventory/profiles", headers={"Authorization": f"Bearer {key}"}
+    )
+    assert response.status == 200
+    names = [item["name"] for item in (await response.json())["data"]]
+    assert "ownership-race" not in names
+
+
+@pytest.mark.asyncio
+async def test_skill_inventory_reads_only_the_requested_page(
+    create_api_client, temp_hermes_home, monkeypatch
+):
+    """Pagination is applied to skill names before bounded body reads."""
+    profile = temp_hermes_home / "profiles" / "bounded-skills"
+    for index in range(5):
+        slug = f"skill-{index}"
+        skill_md = profile / "skills" / slug / "SKILL.md"
+        skill_md.parent.mkdir(parents=True, exist_ok=True)
+        skill_md.write_text(
+            f"---\nname: {slug}\ndescription: bounded\n---\nbody {index}",
+            encoding="utf-8",
+        )
+
+    import gateway.admin as admin
+
+    original_read = admin._safe_inventory_text
+    skill_reads = 0
+
+    def count_reads(*args, **kwargs):
+        nonlocal skill_reads
+        if str(args[1]).endswith("SKILL.md"):
+            skill_reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(admin, "_safe_inventory_text", count_reads)
+    client, key = await create_api_client(
+        admin_config_rw=False, admin_inventory_ro=True
+    )
+    response = await client.get(
+        "/v1/admin/inventory/profiles/bounded-skills/skills?limit=1",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response.status == 200
+    assert len((await response.json())["data"]) == 1
+    assert skill_reads == 1
+
+
+@pytest.mark.asyncio
 async def test_bearer_auth_on_every_admin_route(create_api_client):
     """Verify bearer auth is enforced on all admin routes."""
     client, key = await create_api_client(admin_config_rw=True)
@@ -124,6 +374,8 @@ async def test_bearer_auth_on_every_admin_route(create_api_client):
         ("PUT", "/v1/admin/profiles/test-profile/files/SOUL.md"),
         ("GET", "/v1/admin/profiles/test-profile/files/SOUL.md"),
         ("DELETE", "/v1/admin/profiles/test-profile/files/SOUL.md"),
+        ("GET", "/v1/admin/inventory/profiles"),
+        ("GET", "/v1/admin/inventory/profiles/test-profile/skills"),
     ]
 
     for method, path in routes:
@@ -713,6 +965,94 @@ async def test_path_safety_strict_codes(create_api_client):
     # 5. Allowed path -> 200/201
     r_ok = await client.put("/v1/admin/profiles/pathtest/files/context/notes.txt", headers=headers, json={"content": "x"})
     assert r_ok.status in (200, 201)
+
+    # A double dot inside a filename is not a traversal segment.
+    r_versioned = await client.put(
+        "/v1/admin/profiles/pathtest/files/context/v1..2.md",
+        headers=headers,
+        json={"content": "safe"},
+    )
+    assert r_versioned.status in (200, 201)
+
+
+@pytest.mark.asyncio
+async def test_atomic_write_rejects_parent_symlink_swap(
+    create_api_client, temp_hermes_home, monkeypatch
+):
+    """A parent swapped to a symlink after validation cannot redirect a write."""
+    client, key = await create_api_client(admin_config_rw=True)
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        **OWNER_HEADERS,
+    }
+    await client.put("/v1/admin/profiles/toctou", headers=headers, json={})
+    profile_dir = temp_hermes_home / "profiles" / "toctou"
+    context_dir = profile_dir / "context"
+    context_dir.mkdir()
+    outside = temp_hermes_home / "outside"
+    outside.mkdir()
+
+    import gateway.admin as admin
+
+    original = admin._atomic_write_file
+    swapped = False
+
+    def swap_then_write(path, content, mode=0o600, **kwargs):
+        nonlocal swapped
+        if not swapped and path.name == "redirected.md":
+            swapped = True
+            context_dir.rmdir()
+            context_dir.symlink_to(outside, target_is_directory=True)
+        return original(path, content, mode, **kwargs)
+
+    monkeypatch.setattr(admin, "_atomic_write_file", swap_then_write)
+    response = await client.put(
+        "/v1/admin/profiles/toctou/files/context/redirected.md",
+        headers=headers,
+        json={"content": "must-not-escape"},
+    )
+    assert response.status == 500
+    assert not (outside / "redirected.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_atomic_write_rejects_profile_directory_rename_swap(
+    create_api_client, temp_hermes_home, monkeypatch
+):
+    """Ownership verification remains bound to the same profile inode."""
+    client, key = await create_api_client(admin_config_rw=True)
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        **OWNER_HEADERS,
+    }
+    await client.put("/v1/admin/profiles/inode-guard", headers=headers, json={})
+    profile = temp_hermes_home / "profiles" / "inode-guard"
+    moved = temp_hermes_home / "profiles" / "inode-guard-original"
+
+    import gateway.admin as admin
+
+    original = admin._atomic_write_file
+    swapped = False
+
+    def swap_then_write(path, content, mode=0o600, **kwargs):
+        nonlocal swapped
+        if not swapped and path.name == "guarded.md":
+            swapped = True
+            profile.rename(moved)
+            profile.mkdir()
+        return original(path, content, mode, **kwargs)
+
+    monkeypatch.setattr(admin, "_atomic_write_file", swap_then_write)
+    response = await client.put(
+        "/v1/admin/profiles/inode-guard/files/context/guarded.md",
+        headers=headers,
+        json={"content": "must-not-land"},
+    )
+    assert response.status == 500
+    assert not (profile / "context" / "guarded.md").exists()
+    assert not (moved / "context" / "guarded.md").exists()
 
 
 @pytest.mark.asyncio

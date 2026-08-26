@@ -6,10 +6,11 @@ and context files under `/v1/admin`.
 """
 
 import hashlib
+import heapq
 import json
 import os
 import re
-import shutil
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -32,8 +33,8 @@ from hermes_cli.profiles import (
     normalize_profile_name,
     read_profile_meta,
     validate_profile_name,
-    write_profile_meta,
 )
+from hermes_constants import get_default_hermes_root
 
 MANIFEST_FILENAME = ".control_plane_manifest.json"
 MAX_ADMIN_PAYLOAD_BYTES = 5_000_000  # 5 MB limit for admin payloads
@@ -47,6 +48,11 @@ MAX_SOUL_LEN = 100_000
 MAX_USER_CONTEXT_LEN = 100_000
 MAX_SKILL_CONTENT_LEN = 1_000_000
 MAX_FILE_CONTENT_LEN = 2_000_000
+MAX_INVENTORY_PAGE_SIZE = 10
+DEFAULT_INVENTORY_PAGE_SIZE = 10
+MAX_INVENTORY_SKILL_CONTENT_LEN = 50_000
+MAX_INVENTORY_PROFILE_SKILLS = 50
+MAX_INVENTORY_SCAN_ENTRIES = 5_000
 
 # File security allowlists and forbidden sets
 ALLOWED_EXACT_FILES = frozenset({"SOUL.md", "memories/USER.md", "memories/MEMORY.md"})
@@ -104,37 +110,237 @@ def _sha256_digest(data: Union[str, bytes]) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _atomic_write_file(file_path: Path, content: Union[str, bytes], mode: int = 0o600) -> None:
-    """Write content to file_path atomically with owner-only permissions."""
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = f".{file_path.name}.tmp.{uuid.uuid4().hex}"
-    tmp_path = file_path.with_name(tmp_name)
-    if isinstance(content, str):
-        tmp_path.write_text(content, encoding="utf-8")
+def _atomic_write_file(
+    file_path: Path,
+    content: Union[str, bytes],
+    mode: int = 0o600,
+    *,
+    expected_profile_dir: Optional[Path] = None,
+    expected_profile_identity: Optional[Tuple[int, int]] = None,
+) -> None:
+    """Write atomically through pinned no-follow directory descriptors."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("secure admin writes are unsupported on this platform")
+    absolute = Path(os.path.abspath(file_path))
+    tmp_name = f".{absolute.name}.tmp.{uuid.uuid4().hex}"
+    payload = content.encode("utf-8") if isinstance(content, str) else content
+    if expected_profile_dir is not None and expected_profile_identity is not None:
+        profile_root = Path(os.path.abspath(expected_profile_dir))
+        try:
+            relative = absolute.relative_to(profile_root)
+        except ValueError as exc:
+            raise OSError("managed write target is outside the verified profile") from exc
+        parent_fd = _open_inventory_directory(profile_root)
+        _assert_profile_fd_identity(parent_fd, expected_profile_identity)
+        parent_parts = relative.parts[:-1]
     else:
-        tmp_path.write_bytes(content)
+        parent_fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY)
+        parent_parts = absolute.parts[1:-1]
     try:
-        os.chmod(str(tmp_path), mode)
-    except OSError:
-        pass
-    os.replace(str(tmp_path), str(file_path))
+        for part in parent_parts:
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=parent_fd)
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            os.close(parent_fd)
+            parent_fd = next_fd
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        tmp_fd = os.open(tmp_name, flags, mode, dir_fd=parent_fd)
+        try:
+            with os.fdopen(tmp_fd, "wb", closefd=False) as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(tmp_fd)
+        os.replace(
+            tmp_name,
+            absolute.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(parent_fd)
 
 
-def read_ownership_manifest(profile_dir: Path) -> Optional[dict]:
-    """Read ownership manifest file inside profile root."""
-    manifest_path = profile_dir / MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        return None
+def _assert_profile_fd_identity(profile_fd: int, expected: Tuple[int, int]) -> None:
+    profile_stat = os.fstat(profile_fd)
+    if (profile_stat.st_dev, profile_stat.st_ino) != expected:
+        raise OSError("profile directory changed during managed operation")
+
+
+def _clear_directory_fd(directory_fd: int) -> None:
+    """Recursively clear only the directory pinned by directory_fd."""
+    with os.scandir(directory_fd) as entries:
+        names = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
+    for name, is_directory in names:
+        if is_directory:
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                _clear_directory_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _secure_delete_file(
+    profile_dir: Path, relative_path: str, expected_identity: Tuple[int, int]
+) -> None:
+    profile_fd = _open_inventory_directory(profile_dir)
+    parent_fd = None
     try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        _assert_profile_fd_identity(profile_fd, expected_identity)
+        parts = Path(relative_path).parts
+        parent_fd = os.dup(profile_fd)
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+        os.unlink(parts[-1], dir_fd=parent_fd)
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(profile_fd)
+
+
+def _secure_delete_tree(
+    profile_dir: Path,
+    relative_parts: Tuple[str, ...],
+    expected_identity: Tuple[int, int],
+) -> None:
+    profile_fd = _open_inventory_directory(profile_dir)
+    parent_fd = None
+    target_fd = None
+    try:
+        _assert_profile_fd_identity(profile_fd, expected_identity)
+        parent_fd = os.dup(profile_fd)
+        for part in relative_parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+        target_fd = os.open(
+            relative_parts[-1],
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        target_identity = (os.fstat(target_fd).st_dev, os.fstat(target_fd).st_ino)
+        _clear_directory_fd(target_fd)
+        named_stat = os.stat(
+            relative_parts[-1], dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (named_stat.st_dev, named_stat.st_ino) != target_identity:
+            raise OSError("managed directory changed during delete")
+        os.rmdir(relative_parts[-1], dir_fd=parent_fd)
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(profile_fd)
+
+
+def _secure_delete_profile(
+    profile_dir: Path, expected_identity: Tuple[int, int]
+) -> None:
+    profile_fd = _open_inventory_directory(profile_dir)
+    parent_fd = _open_inventory_directory(profile_dir.parent)
+    try:
+        _assert_profile_fd_identity(profile_fd, expected_identity)
+        _clear_directory_fd(profile_fd)
+        named_stat = os.stat(
+            profile_dir.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (named_stat.st_dev, named_stat.st_ino) != expected_identity:
+            raise OSError("profile directory changed during delete")
+        os.rmdir(profile_dir.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+        os.close(profile_fd)
+
+
+def _read_ownership_manifest_fd(profile_dir: Path, profile_fd: int) -> Optional[dict]:
+    manifest_fd = None
+    try:
+        try:
+            manifest_fd = os.open(
+                MANIFEST_FILENAME,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=profile_fd,
+            )
+        except FileNotFoundError:
+            return None
+        before = os.fstat(manifest_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_ADMIN_PAYLOAD_BYTES:
+            raise ValueError("Malformed control plane manifest file")
+        with os.fdopen(manifest_fd, "r", encoding="utf-8", closefd=False) as stream:
+            data = json.load(stream)
+        after = os.fstat(manifest_fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ValueError("Control plane manifest changed during read")
         if not isinstance(data, dict):
             raise ValueError("Malformed control plane manifest JSON")
         return data
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Malformed control plane manifest in {profile_dir}: {exc}") from exc
+    finally:
+        if manifest_fd is not None:
+            os.close(manifest_fd)
+
+
+def read_ownership_manifest(profile_dir: Path) -> Optional[dict]:
+    """Read a regular ownership manifest through a pinned profile fd."""
+    profile_fd = None
+    try:
+        profile_fd = _open_inventory_directory(profile_dir)
+        return _read_ownership_manifest_fd(profile_dir, profile_fd)
+    except ValueError:
+        raise
     except Exception:
         return None
+    finally:
+        if profile_fd is not None:
+            os.close(profile_fd)
 
 
 def write_ownership_manifest(profile_dir: Path, manifest_data: dict) -> dict:
@@ -167,7 +373,12 @@ def write_ownership_manifest(profile_dir: Path, manifest_data: dict) -> dict:
         "files": manifest_data.get("files") if manifest_data.get("files") is not None else existing.get("files", {}),
         "baseline_files": manifest_data.get("baseline_files") if manifest_data.get("baseline_files") is not None else existing.get("baseline_files", []),
     }
-    _atomic_write_file(profile_dir / MANIFEST_FILENAME, json.dumps(manifest, indent=2))
+    _atomic_write_file(
+        profile_dir / MANIFEST_FILENAME,
+        json.dumps(manifest, indent=2),
+        expected_profile_dir=profile_dir,
+        expected_profile_identity=manifest_data.get("_profile_identity"),
+    )
     return manifest
 
 
@@ -237,13 +448,23 @@ def verify_profile_ownership(
     if not profile_dir.is_dir():
         return False, "profile_not_found", None
 
+    profile_fd = None
     try:
-        manifest = read_ownership_manifest(profile_dir)
+        profile_fd = _open_inventory_directory(profile_dir)
+        profile_stat = os.fstat(profile_fd)
+        manifest = _read_ownership_manifest_fd(profile_dir, profile_fd)
     except ValueError:
         return False, "corrupt_manifest", None
+    except OSError:
+        return False, "profile_changed", None
+    finally:
+        if profile_fd is not None:
+            os.close(profile_fd)
 
     if not manifest:
         return False, "unmanaged_profile", None
+
+    manifest["_profile_identity"] = (profile_stat.st_dev, profile_stat.st_ino)
 
     for field in ("managed_by", "tenant_id", "resource_id"):
         if caller_ownership.get(field) != manifest.get(field):
@@ -269,7 +490,7 @@ def validate_file_relative_path(profile_dir: Path, rel_path_str: str) -> Tuple[b
         return False, "Absolute paths and null bytes are forbidden", None, 400
 
     parts = Path(unquoted).parts
-    if ".." in parts or "." in parts or ".." in rel_path_str or "%2e%2e" in rel_path_str.lower():
+    if ".." in parts or "." in parts:
         return False, "Path traversal forbidden", None, 403
 
     profile_resolved = profile_dir.resolve()
@@ -335,6 +556,515 @@ def _check_admin_request(adapter: Any, request: Any) -> Optional[Any]:
     return None
 
 
+def _check_inventory_request(adapter: Any, request: Any) -> Optional[Any]:
+    """Validate bearer auth and the independent read-only inventory gate."""
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+    if not getattr(adapter, "_admin_inventory_ro", False):
+        return _admin_error(
+            "Admin inventory is disabled. Opt in via gateway.api_server.admin_inventory_ro: true in config.yaml.",
+            code="admin_inventory_disabled",
+            status=403,
+        )
+    return None
+
+
+def _inventory_pagination(request: Any) -> Tuple[Optional[int], str, Optional[Any]]:
+    """Parse cursor pagination before filesystem content reads."""
+    raw_limit = request.query.get("limit", str(DEFAULT_INVENTORY_PAGE_SIZE))
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        return None, "", _admin_error("limit must be an integer", param="limit")
+    if limit < 1 or limit > MAX_INVENTORY_PAGE_SIZE:
+        return None, "", _admin_error(
+            f"limit must be between 1 and {MAX_INVENTORY_PAGE_SIZE}",
+            param="limit",
+        )
+    return limit, request.query.get("after", ""), None
+
+
+def _inventory_response(
+    items: List[dict],
+    key: str,
+    limit: int,
+    *,
+    has_more: Optional[bool] = None,
+    next_cursor: Optional[str] = None,
+) -> dict:
+    """Serialize an already bounded page."""
+    if has_more is None:
+        has_more = len(items) > limit
+    page = items[:limit]
+    if next_cursor is None and has_more and page:
+        next_cursor = page[-1][key]
+    return {
+        "object": "list",
+        "data": page,
+        "pagination": {
+            "limit": limit,
+            "has_more": has_more,
+            "next_cursor": next_cursor if has_more else None,
+        },
+    }
+
+
+def _open_inventory_directory(path: Path) -> int:
+    """Open an absolute directory by walking components without symlinks."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("secure inventory is unsupported on this platform")
+    directory_fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in Path(os.path.abspath(path)).parts[1:]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _entry_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _snapshot_stable(directory_fd: int, before: os.stat_result) -> bool:
+    """Reject observations whose ownership marker or root membership changed."""
+    after = os.fstat(directory_fd)
+    return not _entry_exists(directory_fd, MANIFEST_FILENAME) and (
+        before.st_dev,
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+
+
+def _bounded_names(directory_fd: int, predicate: Any) -> List[str]:
+    """List direct child names with a hard authenticated-work bound."""
+    names = []
+    with os.scandir(directory_fd) as entries:
+        for count, entry in enumerate(entries, start=1):
+            if count > MAX_INVENTORY_SCAN_ENTRIES:
+                raise ValueError("inventory scan entry limit exceeded")
+            if predicate(entry):
+                names.append(entry.name)
+    return heapq.nsmallest(len(names), names)
+
+
+def _safe_inventory_text(
+    profile_dir: Path,
+    relative_path: str,
+    max_chars: int,
+    *,
+    profile_fd: Optional[int] = None,
+) -> Optional[str]:
+    """Read one allowlisted identity file through pinned no-follow fds."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        return None
+    relative_parts = Path(relative_path).parts
+    if not relative_parts or any(part in ("", ".", "..") for part in relative_parts):
+        return None
+    directory_fd = None
+    file_fd = None
+    try:
+        directory_fd = (
+            os.dup(profile_fd)
+            if profile_fd is not None
+            else _open_inventory_directory(profile_dir)
+        )
+        for part in relative_parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(
+            relative_parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd
+        )
+        file_stat = os.fstat(file_fd)
+        max_bytes = max_chars * 4
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_bytes:
+            return None
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > max_bytes:
+            return None
+        content = raw.decode("utf-8")
+        after_stat = os.fstat(file_fd)
+        if (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+        ) != (
+            after_stat.st_dev,
+            after_stat.st_ino,
+            after_stat.st_size,
+            after_stat.st_mtime_ns,
+            after_stat.st_ctime_ns,
+        ):
+            return None
+    except (OSError, UnicodeError, ValueError):
+        return None
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+    return content if len(content) <= max_chars else None
+
+
+def _read_managed_text(
+    profile_dir: Path,
+    relative_path: str,
+    max_chars: int,
+    expected_identity: Tuple[int, int],
+    *,
+    allow_missing: bool = False,
+) -> str:
+    profile_fd = _open_inventory_directory(profile_dir)
+    existence_fd = None
+    try:
+        _assert_profile_fd_identity(profile_fd, expected_identity)
+        exists = True
+        try:
+            existence_fd = os.dup(profile_fd)
+            parts = Path(relative_path).parts
+            for part in parts[:-1]:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=existence_fd,
+                )
+                os.close(existence_fd)
+                existence_fd = next_fd
+            target_stat = os.stat(
+                parts[-1], dir_fd=existence_fd, follow_symlinks=False
+            )
+            exists = stat.S_ISREG(target_stat.st_mode)
+        except FileNotFoundError:
+            exists = False
+        finally:
+            if existence_fd is not None:
+                os.close(existence_fd)
+                existence_fd = None
+        content = _safe_inventory_text(
+            profile_dir,
+            relative_path,
+            max_chars,
+            profile_fd=profile_fd,
+        )
+        if content is None:
+            if allow_missing and not exists:
+                return ""
+            raise OSError("managed file could not be read safely")
+        return content
+    finally:
+        if existence_fd is not None:
+            os.close(existence_fd)
+        os.close(profile_fd)
+
+
+def _open_skills_directory(profile_fd: int) -> Optional[int]:
+    try:
+        return os.open(
+            "skills",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=profile_fd,
+        )
+    except OSError:
+        return None
+
+
+def _inventory_skill_names(skills_fd: Optional[int]) -> List[str]:
+    """List bounded direct profile-scoped skill slugs without reading bodies."""
+    if skills_fd is None:
+        return []
+    return _bounded_names(
+        skills_fd,
+        lambda entry: bool(SLUG_RE.fullmatch(entry.name))
+        and entry.is_dir(follow_symlinks=False),
+    )
+
+
+def _strict_skill_frontmatter(content: str) -> Optional[dict]:
+    """Parse YAML frontmatter strictly for the external inventory boundary."""
+    lines = content.splitlines()
+    if not lines or lines[0] != "---":
+        return None
+    try:
+        closing = lines.index("---", 1)
+    except ValueError:
+        return None
+    try:
+        import yaml
+
+        parsed = yaml.safe_load("\n".join(lines[1:closing]))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _inventory_skill_repr(
+    profile_name: str, profile_dir: Path, profile_fd: int, slug: str
+) -> Optional[dict]:
+    """Read and validate one direct profile-scoped skill."""
+    content = _safe_inventory_text(
+        profile_dir,
+        f"skills/{slug}/SKILL.md",
+        MAX_INVENTORY_SKILL_CONTENT_LEN,
+        profile_fd=profile_fd,
+    )
+    if not content:
+        return None
+    frontmatter = _strict_skill_frontmatter(content)
+    if frontmatter is None:
+        return None
+    raw_name = frontmatter.get("name")
+    raw_description = frontmatter.get("description")
+    if not isinstance(raw_name, str) or not isinstance(raw_description, str):
+        return None
+    name = raw_name.strip()
+    description = raw_description.strip()
+    if name != slug or not description:
+        return None
+    return {
+        "object": "hermes.admin.inventory.skill",
+        "profile": profile_name,
+        "skill_slug": slug,
+        "digest": _sha256_digest(content),
+        "metadata": {"name": name, "description": description},
+        "content": content,
+        "management": "observed",
+    }
+
+
+def _skills_content_digest(
+    profile_name: str,
+    profile_dir: Path,
+    profile_fd: int,
+    slugs: List[str],
+) -> Tuple[Optional[str], Optional[int], bool]:
+    """Content-address a bounded valid-skill set or report it incomplete."""
+    if len(slugs) > MAX_INVENTORY_PROFILE_SKILLS:
+        return None, None, False
+    rows = []
+    for slug in slugs:
+        item = _inventory_skill_repr(profile_name, profile_dir, profile_fd, slug)
+        if item is not None:
+            rows.append((slug, item["digest"]))
+    return _sha256_digest(json.dumps(rows, separators=(",", ":"))), len(rows), True
+
+
+def _inventory_profile_repr(profile_name: str, profile_dir: Path) -> Optional[dict]:
+    """Build one stable observed representation from pinned directories."""
+    profile_fd = None
+    skills_fd = None
+    try:
+        profile_fd = _open_inventory_directory(profile_dir)
+        before = os.fstat(profile_fd)
+        if _entry_exists(profile_fd, MANIFEST_FILENAME):
+            return None
+        soul = _safe_inventory_text(
+            profile_dir, "SOUL.md", MAX_SOUL_LEN, profile_fd=profile_fd
+        ) or ""
+        skills_fd = _open_skills_directory(profile_fd)
+        skills_before = os.fstat(skills_fd) if skills_fd is not None else None
+        skill_slugs = _inventory_skill_names(skills_fd)
+        soul_digest = _sha256_digest(soul)
+        skills_digest, skill_count, skills_digest_complete = _skills_content_digest(
+            profile_name, profile_dir, profile_fd, skill_slugs
+        )
+        digest = _sha256_digest(
+            json.dumps(
+                {"name": profile_name, "soul_digest": soul_digest, "skills_digest": skills_digest},
+                sort_keys=True,
+            )
+        )
+        if not _snapshot_stable(profile_fd, before):
+            return None
+        if skills_fd is not None and not _snapshot_stable(skills_fd, skills_before):
+            return None
+        return {
+            "object": "hermes.admin.inventory.profile",
+            "name": profile_name,
+            "display_name": profile_name,
+            "is_default": profile_name == "default",
+            "management": "observed",
+            "digest": digest,
+            "soul": soul,
+            "soul_digest": soul_digest,
+            "skills_digest": skills_digest,
+            "skills_digest_complete": skills_digest_complete,
+            "skill_count": skill_count,
+        }
+    except (OSError, ValueError):
+        return None
+    finally:
+        if skills_fd is not None:
+            os.close(skills_fd)
+        if profile_fd is not None:
+            os.close(profile_fd)
+
+
+def _valid_inventory_profile_entry(entry: Any, after: str) -> bool:
+    name = entry.name
+    if name == "default" or name.startswith(".") or name <= after:
+        return False
+    if not entry.is_dir(follow_symlinks=False):
+        return False
+    try:
+        canon = normalize_profile_name(name)
+        validate_profile_name(canon)
+    except ValueError:
+        return False
+    return canon == name and canon != "default"
+
+
+def _inventory_profile_candidates(after: str) -> List[Tuple[str, Path]]:
+    """Discover names only; never read profile config/runtime state."""
+    root = get_default_hermes_root()
+    candidates = [("default", root)] if "default" > after else []
+    profiles_fd = None
+    try:
+        profiles_fd = _open_inventory_directory(root / "profiles")
+        names = _bounded_names(
+            profiles_fd,
+            lambda entry: _valid_inventory_profile_entry(entry, after),
+        )
+        candidates.extend((name, root / "profiles" / name) for name in names)
+    except (OSError, ValueError):
+        pass
+    finally:
+        if profiles_fd is not None:
+            os.close(profiles_fd)
+    return sorted(candidates, key=lambda item: item[0])
+
+
+async def handle_inventory_profiles(adapter: Any, request: Any) -> Any:
+    """GET /v1/admin/inventory/profiles — list safe unmanaged profiles."""
+    guard = _check_inventory_request(adapter, request)
+    if guard:
+        return guard
+    limit, after, error = _inventory_pagination(request)
+    if error:
+        return error
+    candidates = _inventory_profile_candidates(after)
+    window = candidates[:limit]
+    has_more = len(candidates) > limit
+    profiles = []
+    for profile_name, profile_path in window:
+        item = _inventory_profile_repr(profile_name, profile_path)
+        if item is not None:
+            profiles.append(item)
+    cursor = window[-1][0] if has_more and window else None
+    return _admin_json_response(
+        _inventory_response(
+            profiles, "name", limit, has_more=has_more, next_cursor=cursor
+        )
+    )
+
+
+async def handle_inventory_profile_skills(adapter: Any, request: Any) -> Any:
+    """GET /v1/admin/inventory/profiles/{profile}/skills — safe skill inventory."""
+    guard = _check_inventory_request(adapter, request)
+    if guard:
+        return guard
+    profile_name = _get_profile_param(request)
+    try:
+        canon = normalize_profile_name(profile_name)
+        validate_profile_name(canon)
+    except ValueError as exc:
+        return _admin_error(str(exc), param="profile")
+    limit, after, error = _inventory_pagination(request)
+    if error:
+        return error
+    profile_dir = get_profile_dir(canon)
+    profile_fd = None
+    skills_fd = None
+    try:
+        profile_fd = _open_inventory_directory(profile_dir)
+        before = os.fstat(profile_fd)
+        if _entry_exists(profile_fd, MANIFEST_FILENAME):
+            return _admin_error(
+                f"Unmanaged profile '{canon}' was not found",
+                code="profile_not_found",
+                status=404,
+            )
+        skills_fd = _open_skills_directory(profile_fd)
+        skills_before = os.fstat(skills_fd) if skills_fd is not None else None
+        candidates = [slug for slug in _inventory_skill_names(skills_fd) if slug > after]
+        window = candidates[:limit]
+        has_more = len(candidates) > limit
+        skills = []
+        for slug in window:
+            item = _inventory_skill_repr(canon, profile_dir, profile_fd, slug)
+            if item is not None:
+                skills.append(item)
+        if not _snapshot_stable(profile_fd, before):
+            return _admin_error(
+                "Profile inventory changed during read; retry the request",
+                code="inventory_changed_retry",
+                status=409,
+            )
+        if skills_fd is not None and not _snapshot_stable(skills_fd, skills_before):
+            return _admin_error(
+                "Skill inventory changed during read; retry the request",
+                code="inventory_changed_retry",
+                status=409,
+            )
+        cursor = window[-1] if has_more and window else None
+        return _admin_json_response(
+            _inventory_response(
+                skills,
+                "skill_slug",
+                limit,
+                has_more=has_more,
+                next_cursor=cursor,
+            )
+        )
+    except FileNotFoundError:
+        return _admin_error(
+            f"Unmanaged profile '{canon}' was not found",
+            code="profile_not_found",
+            status=404,
+        )
+    except ValueError as exc:
+        return _admin_error(str(exc), code="inventory_limit_exceeded", status=413)
+    except OSError:
+        return _admin_error("Profile inventory is unavailable", code="inventory_unavailable", status=503)
+    finally:
+        if skills_fd is not None:
+            os.close(skills_fd)
+        if profile_fd is not None:
+            os.close(profile_fd)
+
+
 async def _parse_admin_body(request: Any) -> Tuple[Optional[dict], Optional[Any]]:
     """Read request body safely and enforce size bounds."""
     if not request.can_read_body:
@@ -398,11 +1128,23 @@ def _canonical_profile_repr(profile_name: str, profile_dir: Path, manifest: dict
 
     description = meta.get("description", "")
 
-    soul_path = profile_dir / "SOUL.md"
-    soul = soul_path.read_text(encoding="utf-8") if soul_path.is_file() else ""
-
-    user_mem_path = profile_dir / "memories" / "USER.md"
-    user_context = user_mem_path.read_text(encoding="utf-8") if user_mem_path.is_file() else ""
+    identity = manifest.get("_profile_identity")
+    if identity:
+        soul = _read_managed_text(
+            profile_dir, "SOUL.md", MAX_SOUL_LEN, identity, allow_missing=True
+        )
+        user_context = _read_managed_text(
+            profile_dir,
+            "memories/USER.md",
+            MAX_USER_CONTEXT_LEN,
+            identity,
+            allow_missing=True,
+        )
+    else:
+        soul_path = profile_dir / "SOUL.md"
+        soul = soul_path.read_text(encoding="utf-8") if soul_path.is_file() else ""
+        user_mem_path = profile_dir / "memories" / "USER.md"
+        user_context = user_mem_path.read_text(encoding="utf-8") if user_mem_path.is_file() else ""
 
     digest_input = json.dumps(
         {
@@ -606,24 +1348,34 @@ async def handle_create_update_profile(adapter: Any, request: Any) -> Any:
         if not changed and not current_repr["drifted"]:
             return _admin_json_response(_canonical_profile_repr(canon, profile_dir, manifest), status=200)
 
-        # Apply profile updates - do not swallow errors
-        write_profile_meta(profile_dir, description=desired_desc, description_auto=False)
-
+        # Apply profile metadata through the same identity-pinned writer.
         meta_path = profile_dir / "profile.yaml"
-        if meta_path.is_file() or desired_disp != canon:
+        if meta_path.is_file() or desired_disp != canon or desired_desc:
             import yaml
             loaded = yaml.safe_load(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
             if not isinstance(loaded, dict):
                 loaded = {}
             loaded["display_name"] = desired_disp
-            from utils import atomic_yaml_write
-            atomic_yaml_write(meta_path, loaded, sort_keys=False)
+            loaded["description"] = desired_desc
+            loaded["description_auto"] = False
+            _atomic_write_file(
+                meta_path,
+                yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),
+                expected_profile_dir=profile_dir,
+                expected_profile_identity=manifest.get("_profile_identity"),
+            )
 
         files_map = dict(manifest.get("files", {}))
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         if soul is not None or desired_soul != current_repr["soul"]:
-            _atomic_write_file(profile_dir / "SOUL.md", desired_soul, mode=0o600)
+            _atomic_write_file(
+                profile_dir / "SOUL.md",
+                desired_soul,
+                mode=0o600,
+                expected_profile_dir=profile_dir,
+                expected_profile_identity=manifest.get("_profile_identity"),
+            )
             files_map["SOUL.md"] = {
                 "managed": True,
                 "revision": files_map.get("SOUL.md", {}).get("revision", 0) + 1,
@@ -632,7 +1384,13 @@ async def handle_create_update_profile(adapter: Any, request: Any) -> Any:
             }
 
         if user_context is not None or desired_user_ctx != current_repr["user_context"]:
-            _atomic_write_file(profile_dir / "memories" / "USER.md", desired_user_ctx, mode=0o600)
+            _atomic_write_file(
+                profile_dir / "memories" / "USER.md",
+                desired_user_ctx,
+                mode=0o600,
+                expected_profile_dir=profile_dir,
+                expected_profile_identity=manifest.get("_profile_identity"),
+            )
             files_map["memories/USER.md"] = {
                 "managed": True,
                 "revision": files_map.get("memories/USER.md", {}).get("revision", 0) + 1,
@@ -672,6 +1430,8 @@ async def handle_create_update_profile(adapter: Any, request: Any) -> Any:
         desired_desc = description or ""
         desired_soul = soul or ""
         desired_user_ctx = user_context or ""
+        created_stat = created_dir.stat(follow_symlinks=False)
+        created_identity = (created_stat.st_dev, created_stat.st_ino)
 
         baseline_files = [p.relative_to(created_dir).as_posix() for p in created_dir.rglob("*") if p.is_file()]
 
@@ -682,18 +1442,34 @@ async def handle_create_update_profile(adapter: Any, request: Any) -> Any:
             if not isinstance(loaded, dict):
                 loaded = {}
             loaded["display_name"] = desired_disp
-            from utils import atomic_yaml_write
-            atomic_yaml_write(meta_path, loaded, sort_keys=False)
+            _atomic_write_file(
+                meta_path,
+                yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),
+                expected_profile_dir=created_dir,
+                expected_profile_identity=created_identity,
+            )
 
         files_map = {}
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         if soul is not None or desired_soul:
-            _atomic_write_file(created_dir / "SOUL.md", desired_soul, mode=0o600)
+            _atomic_write_file(
+                created_dir / "SOUL.md",
+                desired_soul,
+                mode=0o600,
+                expected_profile_dir=created_dir,
+                expected_profile_identity=created_identity,
+            )
             files_map["SOUL.md"] = {"managed": True, "revision": 1, "digest": _sha256_digest(desired_soul), "updated_at": now_iso}
 
         if user_context is not None or desired_user_ctx:
-            _atomic_write_file(created_dir / "memories" / "USER.md", desired_user_ctx, mode=0o600)
+            _atomic_write_file(
+                created_dir / "memories" / "USER.md",
+                desired_user_ctx,
+                mode=0o600,
+                expected_profile_dir=created_dir,
+                expected_profile_identity=created_identity,
+            )
             files_map["memories/USER.md"] = {"managed": True, "revision": 1, "digest": _sha256_digest(desired_user_ctx), "updated_at": now_iso}
 
         for auto_file in ("SOUL.md", "memories/USER.md"):
@@ -715,6 +1491,7 @@ async def handle_create_update_profile(adapter: Any, request: Any) -> Any:
             "skills": {},
             "files": files_map,
             "baseline_files": baseline_files,
+            "_profile_identity": created_identity,
         }
         readback_repr = _canonical_profile_repr(canon, created_dir, temp_manifest)
         spec_digest = readback_repr["digest"]
@@ -835,10 +1612,7 @@ async def handle_delete_profile(adapter: Any, request: Any) -> Any:
         if item.is_dir():
             continue
 
-        try:
-            rel = item.relative_to(profile_dir).as_posix()
-        except ValueError:
-            rel = item.relative_to(profile_dir).as_posix()
+        rel = item.relative_to(profile_dir).as_posix()
 
         if rel in managed_file_paths or rel in baseline_files or rel in known_baselines:
             continue
@@ -853,15 +1627,17 @@ async def handle_delete_profile(adapter: Any, request: Any) -> Any:
             code="profile_not_empty",
         )
 
-    # Safe deletion
+    # Safe inode-bound deletion
     try:
-        shutil.rmtree(profile_dir)
+        _secure_delete_profile(profile_dir, manifest["_profile_identity"])
     except Exception as exc:
         return _admin_error(f"Failed to delete profile directory '{canon}': {exc}", status=500, code="profile_deletion_failed")
 
     if profile_dir.exists():
         return _admin_error(f"Failed to fully delete profile directory '{canon}'", status=500, code="profile_deletion_failed")
 
+    if managed_skill_slugs:
+        _invalidate_skills_prompt_cache()
     return _admin_json_response({"object": "hermes.admin.profile.deleted", "name": canon, "deleted": True})
 
 
@@ -960,9 +1736,23 @@ async def handle_create_update_skill(adapter: Any, request: Any) -> Any:
         return _admin_error("content must be a string", status=400)
 
     # Frontmatter validation
-    frontmatter, body_text = parse_frontmatter(content)
-    fm_name = str(frontmatter.get("name") or "").strip()
-    fm_desc = str(frontmatter.get("description") or "").strip()
+    frontmatter = _strict_skill_frontmatter(content)
+    if frontmatter is None:
+        return _admin_error(
+            "Skill frontmatter must be strict YAML between exact --- delimiters",
+            status=400,
+            code="invalid_skill",
+        )
+    raw_name = frontmatter.get("name")
+    raw_desc = frontmatter.get("description")
+    if not isinstance(raw_name, str) or not isinstance(raw_desc, str):
+        return _admin_error(
+            "Skill frontmatter name and description must be strings",
+            status=400,
+            code="invalid_skill",
+        )
+    fm_name = raw_name.strip()
+    fm_desc = raw_desc.strip()
     if not fm_name or not fm_desc:
         return _admin_error(
             "Skill frontmatter must include a non-empty name and description",
@@ -993,7 +1783,14 @@ async def handle_create_update_skill(adapter: Any, request: Any) -> Any:
         )
 
     desired_digest = _sha256_digest(content)
-    current_digest = skill_meta.get("digest") or (_sha256_digest(skill_md_path.read_text(encoding="utf-8")) if skill_md_path.is_file() else "")
+    current_content = _read_managed_text(
+        profile_dir,
+        f"skills/{skill_slug}/SKILL.md",
+        MAX_SKILL_CONTENT_LEN,
+        manifest["_profile_identity"],
+        allow_missing=True,
+    )
+    current_digest = _sha256_digest(current_content) if skill_md_path.is_file() else ""
 
     if skill_md_path.is_file() and skill_meta.get("managed"):
         if_match_err = _check_if_match(request, current_digest)
@@ -1011,7 +1808,13 @@ async def handle_create_update_skill(adapter: Any, request: Any) -> Any:
         next_rev = 1
         is_new = True
 
-    _atomic_write_file(skill_md_path, content, mode=0o600)
+    _atomic_write_file(
+        skill_md_path,
+        content,
+        mode=0o600,
+        expected_profile_dir=profile_dir,
+        expected_profile_identity=manifest.get("_profile_identity"),
+    )
 
     skills_meta[skill_slug] = {
         "managed": True,
@@ -1056,7 +1859,12 @@ async def handle_get_skill(adapter: Any, request: Any) -> Any:
     if not skill_md_path.is_file():
         return _admin_error(f"Skill '{skill_slug}' not found under profile '{profile_name}'", status=404, code="skill_not_found")
 
-    content = skill_md_path.read_text(encoding="utf-8")
+    content = _read_managed_text(
+        profile_dir,
+        f"skills/{skill_slug}/SKILL.md",
+        MAX_SKILL_CONTENT_LEN,
+        manifest["_profile_identity"],
+    )
     rev = skill_meta.get("revision", 1)
     return _admin_json_response(_canonical_skill_repr(profile_name, skill_slug, skill_md_path, content, revision=rev))
 
@@ -1090,16 +1898,26 @@ async def handle_delete_skill(adapter: Any, request: Any) -> Any:
     skill_md_path = skill_dir / "SKILL.md"
     if not skill_md_path.is_file():
         return _admin_error(f"Skill '{skill_slug}' not found under profile '{profile_name}'", status=404, code="skill_not_found")
-    current_digest = _sha256_digest(skill_md_path.read_text(encoding="utf-8"))
+    current_digest = _sha256_digest(
+        _read_managed_text(
+            profile_dir,
+            f"skills/{skill_slug}/SKILL.md",
+            MAX_SKILL_CONTENT_LEN,
+            manifest["_profile_identity"],
+        )
+    )
     if_match_err = _check_if_match(request, current_digest)
     if if_match_err:
         return if_match_err
 
-    if skill_dir.is_dir():
-        try:
-            shutil.rmtree(skill_dir)
-        except Exception as exc:
-            return _admin_error(f"Failed to delete skill '{skill_slug}': {exc}", status=500)
+    try:
+        _secure_delete_tree(
+            profile_dir,
+            ("skills", skill_slug),
+            manifest["_profile_identity"],
+        )
+    except Exception as exc:
+        return _admin_error(f"Failed to delete skill '{skill_slug}': {exc}", status=500)
 
     skills_meta.pop(skill_slug, None)
     manifest["skills"] = skills_meta
@@ -1216,7 +2034,14 @@ async def handle_create_update_file(adapter: Any, request: Any) -> Any:
         )
 
     desired_digest = _sha256_digest(content)
-    current_digest = file_meta.get("digest") or (_sha256_digest(target_path.read_text(encoding="utf-8")) if target_path.is_file() else "")
+    current_content = _read_managed_text(
+        profile_dir,
+        rel_posix,
+        MAX_FILE_CONTENT_LEN,
+        manifest["_profile_identity"],
+        allow_missing=True,
+    )
+    current_digest = _sha256_digest(current_content) if target_path.is_file() else ""
 
     if target_path.is_file() and file_meta.get("managed"):
         if_match_err = _check_if_match(request, current_digest)
@@ -1234,7 +2059,13 @@ async def handle_create_update_file(adapter: Any, request: Any) -> Any:
         next_rev = 1
         is_new = True
 
-    _atomic_write_file(target_path, content, mode=0o600)
+    _atomic_write_file(
+        target_path,
+        content,
+        mode=0o600,
+        expected_profile_dir=profile_dir,
+        expected_profile_identity=manifest.get("_profile_identity"),
+    )
 
     files_meta[rel_posix] = {
         "managed": True,
@@ -1283,7 +2114,12 @@ async def handle_get_file(adapter: Any, request: Any) -> Any:
     if not file_meta or not file_meta.get("managed") or not target_path.is_file():
         return _admin_error(f"File '{rel_path_str}' not found", status=404, code="file_not_found")
 
-    content = target_path.read_text(encoding="utf-8")
+    content = _read_managed_text(
+        profile_dir,
+        rel_posix,
+        MAX_FILE_CONTENT_LEN,
+        manifest["_profile_identity"],
+    )
     rev = file_meta.get("revision", 1)
     return _admin_json_response(_canonical_file_repr(profile_name, rel_posix, target_path, content, revision=rev))
 
@@ -1319,16 +2155,24 @@ async def handle_delete_file(adapter: Any, request: Any) -> Any:
 
     if not target_path.is_file():
         return _admin_error(f"File '{rel_path_str}' not found", status=404, code="file_not_found")
-    current_digest = _sha256_digest(target_path.read_text(encoding="utf-8"))
+    current_digest = _sha256_digest(
+        _read_managed_text(
+            profile_dir,
+            rel_posix,
+            MAX_FILE_CONTENT_LEN,
+            manifest["_profile_identity"],
+        )
+    )
     if_match_err = _check_if_match(request, current_digest)
     if if_match_err:
         return if_match_err
 
-    if target_path.is_file():
-        try:
-            target_path.unlink()
-        except Exception as exc:
-            return _admin_error(f"Failed to delete file '{rel_posix}': {exc}", status=500)
+    try:
+        _secure_delete_file(
+            profile_dir, rel_posix, manifest["_profile_identity"]
+        )
+    except Exception as exc:
+        return _admin_error(f"Failed to delete file '{rel_posix}': {exc}", status=500)
 
     files_meta.pop(rel_posix, None)
     manifest["files"] = files_meta

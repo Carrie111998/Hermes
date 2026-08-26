@@ -177,6 +177,8 @@ from gateway.admin import (
     handle_get_file,
     handle_get_profile,
     handle_get_skill,
+    handle_inventory_profile_skills,
+    handle_inventory_profiles,
     handle_list_files,
     handle_list_profiles,
     handle_list_skills,
@@ -1556,6 +1558,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._admin_config_rw: bool = _coerce_request_bool(
             extra.get("admin_config_rw"), default=False
         )
+        self._admin_inventory_ro: bool = _coerce_request_bool(
+            extra.get("admin_inventory_ro"), default=False
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2298,6 +2303,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PUT", "/v1/admin/profiles/{target_profile}/files/{path:.*}", self._handle_admin_create_update_file),
             ("GET", "/v1/admin/profiles/{target_profile}/files/{path:.*}", self._handle_admin_get_file),
             ("DELETE", "/v1/admin/profiles/{target_profile}/files/{path:.*}", self._handle_admin_delete_file),
+            ("GET", "/v1/admin/inventory/profiles", self._handle_admin_inventory_profiles),
+            ("GET", "/v1/admin/inventory/profiles/{target_profile}/skills", self._handle_admin_inventory_profile_skills),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -3387,6 +3394,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": True,
                 "session_model_lock": True,
                 "admin_config_rw": self._admin_config_rw,
+                "admin_inventory_ro": self._admin_inventory_ro,
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
@@ -3468,6 +3476,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "admin_file_get": {"method": "GET", "path": "/v1/admin/profiles/{profile}/files/{path:.*}"},
                     "admin_file_delete": {"method": "DELETE", "path": "/v1/admin/profiles/{profile}/files/{path:.*}"},
                 } if self._admin_config_rw else {}),
+                **({
+                    "admin_inventory_profiles": {"method": "GET", "path": "/v1/admin/inventory/profiles"},
+                    "admin_inventory_profile_skills": {"method": "GET", "path": "/v1/admin/inventory/profiles/{profile}/skills"},
+                } if self._admin_inventory_ro else {}),
             },
         })
 
@@ -3510,6 +3522,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_admin_delete_file(self, request: "web.Request") -> "web.Response":
         return await handle_delete_file(self, request)
+
+    async def _handle_admin_inventory_profiles(self, request: "web.Request") -> "web.Response":
+        return await handle_inventory_profiles(self, request)
+
+    async def _handle_admin_inventory_profile_skills(self, request: "web.Request") -> "web.Response":
+        return await handle_inventory_profile_skills(self, request)
 
     # ------------------------------------------------------------------
     # Browser-extension control (authenticated local/VPS API)
