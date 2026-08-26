@@ -11,7 +11,7 @@ import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
@@ -30,6 +30,7 @@ _REQUIRED_SCRIPTS = (
 )
 _COMMAND_TIMEOUT_SECONDS = 3600
 _BOOTSTRAP_TIMEOUT_SECONDS = 900
+_CI_RUN_LEASE = timedelta(hours=2)
 
 
 class CIValidationError(RuntimeError):
@@ -280,6 +281,8 @@ class LocalCIRunner:
         inspector: RepositoryInspector | None = None,
         python_argv: tuple[str, ...] = (".venv/bin/python",),
         now: Callable[[], datetime] | None = None,
+        supervisor_pid: Callable[[], int] | None = None,
+        pid_is_alive: Callable[[int], bool] | None = None,
     ) -> None:
         self._github = github
         self._ledger = ledger
@@ -287,8 +290,50 @@ class LocalCIRunner:
         self._inspector = inspector or GitRepositoryInspector()
         self._python_argv = python_argv
         self._now = now or (lambda: datetime.now(UTC))
+        self._supervisor_pid = supervisor_pid or os.getpid
+        self._pid_is_alive = pid_is_alive or _pid_is_alive
 
     def run(self, identity: CIAuditIdentity, worktree: Path) -> CIAuditReceipt:
+        """Run exact-head CI under a durable, PID-backed single-owner lease."""
+
+        resolved = Path(worktree).resolve()
+        manifest_path = resolved / "tests/manifests/test_lanes.toml"
+        if not resolved.is_dir() or not manifest_path.is_file():
+            raise CIValidationError("required CI owner files are missing")
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        claimed_at = _aware_now(self._now())
+        lease = self._ledger.claim_ci_run(
+            identity.repository,
+            identity.pr_number,
+            identity.base_sha,
+            identity.head_sha,
+            manifest_digest,
+            supervisor_pid=self._supervisor_pid(),
+            claimed_at=claimed_at,
+            stale_before=claimed_at - _CI_RUN_LEASE,
+            pid_is_alive=self._pid_is_alive,
+        )
+        if lease is None:
+            raise CIValidationError("exact-head CI audit is already running")
+        try:
+            receipt = self._run_claimed(identity, resolved)
+        except Exception as error:
+            self._ledger.finish_ci_run(
+                lease,
+                status="failed",
+                completed_at=_aware_now(self._now()),
+                error=type(error).__name__,
+            )
+            raise
+        self._ledger.finish_ci_run(
+            lease,
+            status="completed",
+            completed_at=receipt.completed_at,
+            receipt_id=receipt.receipt_id,
+        )
+        return receipt
+
+    def _run_claimed(self, identity: CIAuditIdentity, worktree: Path) -> CIAuditReceipt:
         worktree = Path(worktree).resolve()
         if not worktree.is_dir():
             raise CIValidationError("CI worktree does not exist")
@@ -412,6 +457,22 @@ class LocalCIRunner:
             or not os.access(resolved, os.X_OK)
         ):
             raise CIValidationError("worktree Python bootstrap failed")
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Read-only liveness check for a ledger-recorded OS process identity."""
+
+    if pid < 2:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _lane_argv(

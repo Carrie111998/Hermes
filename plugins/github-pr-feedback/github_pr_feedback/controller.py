@@ -1842,7 +1842,10 @@ def _local_ci_task(
         max_retries=3,
         # Local CI audits are always created dispatchable so the deterministic
         # repository-owned lane can run even when feedback coding is gated.
-        max_runtime_seconds=900,
+        # A deterministic required lane may run for an hour. Its durable
+        # exact-head CI lease prevents duplicate restarts while the real
+        # supervisor PID is alive; give the full lane sequence an 8h envelope.
+        max_runtime_seconds=8 * 60 * 60,
     )
 
 

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import hashlib
 import json
+import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,6 +42,13 @@ class MergeLease:
     head_sha: str
     owner: str
     claimed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CIRunLease:
+    run_id: str
+    version: int
+    supervisor_pid: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +133,24 @@ class FeedbackLedger:
             "CREATE INDEX IF NOT EXISTS ci_receipt_lookup ON ci_audit_receipts "
             "(repository, pr_number, head_sha, manifest_digest, status, completed_at)"
         )
+        self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS ci_audit_runs (
+                run_id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                base_sha TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                manifest_digest TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+                supervisor_pid INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                lease_version INTEGER NOT NULL,
+                receipt_id TEXT,
+                last_error TEXT,
+                UNIQUE (repository, pr_number, base_sha, head_sha, manifest_digest)
+            )
+            """)
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS merge_attempts (
                 repository TEXT NOT NULL,
@@ -878,6 +904,110 @@ class FeedbackLedger:
                     payload,
                 ),
             )
+
+    def claim_ci_run(
+        self,
+        repository: str,
+        pr_number: int,
+        base_sha: str,
+        head_sha: str,
+        manifest_digest: str,
+        *,
+        supervisor_pid: int,
+        claimed_at: datetime,
+        stale_before: datetime,
+        pid_is_alive: Callable[[int], bool | None],
+    ) -> CIRunLease | None:
+        """Claim one exact CI identity, fencing duplicate or live supervisors."""
+
+        if supervisor_pid < 2:
+            raise ValueError("CI supervisor PID must identify a real process")
+        claimed = _aware_utc(claimed_at, "claimed_at")
+        stale = _aware_utc(stale_before, "stale_before")
+        key = (repository, pr_number, base_sha, head_sha, manifest_digest)
+        run_id = hashlib.sha256(
+            "\0".join(map(str, key)).encode("utf-8")
+        ).hexdigest()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT status, supervisor_pid, updated_at, lease_version "
+                "FROM ci_audit_runs WHERE repository = ? AND pr_number = ? AND base_sha = ? "
+                "AND head_sha = ? AND manifest_digest = ?",
+                key,
+            ).fetchone()
+            version = 1
+            if row is not None:
+                version = int(row[3]) + 1
+                if row[0] == "running":
+                    updated_at = datetime.fromisoformat(str(row[2]))
+                    alive = pid_is_alive(int(row[1]))
+                    if alive is True or (alive is None and updated_at >= stale):
+                        return None
+                self._connection.execute(
+                    "UPDATE ci_audit_runs SET status = 'running', supervisor_pid = ?, "
+                    "started_at = ?, updated_at = ?, lease_version = ?, receipt_id = NULL, "
+                    "last_error = NULL WHERE run_id = ?",
+                    (supervisor_pid, claimed.isoformat(), claimed.isoformat(), version, run_id),
+                )
+            else:
+                self._connection.execute(
+                    "INSERT INTO ci_audit_runs (run_id, repository, pr_number, base_sha, head_sha, "
+                    "manifest_digest, status, supervisor_pid, started_at, updated_at, lease_version) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
+                    (run_id, *key, supervisor_pid, claimed.isoformat(), claimed.isoformat(), version),
+                )
+        return CIRunLease(run_id, version, supervisor_pid)
+
+    def finish_ci_run(
+        self,
+        lease: CIRunLease,
+        *,
+        status: str,
+        completed_at: datetime,
+        receipt_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"completed", "failed"}:
+            raise ValueError("CI run terminal status is invalid")
+        completed = _aware_utc(completed_at, "completed_at")
+        with self._transaction():
+            result = self._connection.execute(
+                "UPDATE ci_audit_runs SET status = ?, updated_at = ?, receipt_id = ?, "
+                "last_error = ? WHERE run_id = ? AND status = 'running' AND lease_version = ? "
+                "AND supervisor_pid = ?",
+                (
+                    status,
+                    completed.isoformat(),
+                    receipt_id,
+                    (error or "")[:1000] or None,
+                    lease.run_id,
+                    lease.version,
+                    lease.supervisor_pid,
+                ),
+            )
+            if result.rowcount != 1:
+                raise LedgerStateError("CI run lease is not held")
+
+    def latest_ci_run(
+        self, repository: str, pr_number: int, head_sha: str
+    ) -> dict[str, object] | None:
+        row = self._connection.execute(
+            "SELECT run_id, status, supervisor_pid, lease_version, receipt_id, updated_at, last_error "
+            "FROM ci_audit_runs WHERE repository = ? AND pr_number = ? AND head_sha = ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (repository, pr_number, head_sha),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": row[0],
+            "status": row[1],
+            "supervisor_pid": int(row[2]),
+            "lease_version": int(row[3]),
+            "receipt_id": row[4],
+            "updated_at": row[5],
+            "last_error": row[6],
+        }
 
     def latest_passing_ci_receipt(
         self,

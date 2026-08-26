@@ -38,3 +38,12 @@ def test_bot_cannot_clear_operator_intent_review() -> None:
         feedback("approve original", login="codex", offset=1),
     )
     assert pending_intent_review(items, owner_login="operator") is True
+
+
+def test_multiple_intent_reviews_require_an_explicit_comment_id() -> None:
+    items = (
+        feedback("Do not apply this; use the typed receipt instead.", offset=0),
+        feedback("I disagree; rather use the bounded retry instead.", offset=1),
+        feedback("dismiss", login="operator", offset=2, bot=False),
+    )
+    assert pending_intent_review(items, owner_login="operator") is True

@@ -15,6 +15,7 @@ _OPERATOR_COMMAND = re.compile(
     r"\b(?P<command>approve\s+original|dismiss|needs\s+more\s+evidence|use\s+alternative)\b",
     re.IGNORECASE,
 )
+_TARGET_COMMENT = re.compile(r"\bintent[-_ ]review\s*:\s*(\S+)", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,14 +48,7 @@ def operator_decision(feedback: Feedback, *, owner_login: str) -> str | None:
 
 def pending_intent_review(feedback: tuple[Feedback, ...], *, owner_login: str) -> bool:
     """Return whether a high-signal disagreement lacks a later operator decision."""
-
-    pending = False
-    for item in sorted(feedback, key=lambda value: value.created_at):
-        if classify_feedback(item) is not None:
-            pending = True
-        elif pending and operator_decision(item, owner_login=owner_login) is not None:
-            pending = False
-    return pending
+    return bool(pending_intent_comment_ids(feedback, owner_login=owner_login))
 
 
 def pending_intent_comment_ids(
@@ -67,5 +61,11 @@ def pending_intent_comment_ids(
         if classify_feedback(item) is not None:
             pending[item.feedback_id] = None
         elif operator_decision(item, owner_login=owner_login) is not None:
-            pending.clear()
+            target = _TARGET_COMMENT.search(str(item.body or ""))
+            if target is not None:
+                pending.pop(target.group(1).rstrip(".,);"), None)
+            elif len(pending) == 1:
+                # A concise operator reply is safe only when this PR has one
+                # unresolved intent item; multiple items require an ID.
+                pending.clear()
     return frozenset(pending)

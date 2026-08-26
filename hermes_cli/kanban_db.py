@@ -5182,6 +5182,103 @@ def reclaim_task(
     return True
 
 
+def suspend_task_for_watchdog(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    reason: str,
+    finding: dict[str, Any],
+    termination_fn=None,
+) -> bool:
+    """Stop one unhealthy worker and preserve its task as ``blocked``.
+
+    This is stricter than operator-driven :func:`reclaim_task`: automatic
+    supervision must prove that a host-local worker terminated before its
+    claim is released. If termination cannot be verified, no task or run row
+    changes and the caller can surface the task for operator intervention.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != "running"
+        or row["current_run_id"] is None
+        or int(row["current_run_id"]) != int(expected_run_id)
+    ):
+        return False
+
+    terminate = termination_fn or (
+        lambda pid, lock: _terminate_reclaimed_worker(pid, lock)
+    )
+    termination = terminate(row["worker_pid"], row["claim_lock"])
+    if not (
+        isinstance(termination, dict)
+        and termination.get("host_local")
+        and termination.get("termination_attempted")
+        and termination.get("terminated")
+    ):
+        return False
+
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["status"] != "running"
+            or current["current_run_id"] is None
+            or int(current["current_run_id"]) != int(expected_run_id)
+            or current["claim_lock"] != row["claim_lock"]
+        ):
+            return False
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, block_kind = 'transient' "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        metadata = {"watchdog_finding": finding, "termination": termination}
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="watchdog_blocked",
+            status="blocked",
+            summary=reason,
+            metadata=metadata,
+        )
+        # Preserve the kernel's sticky-block contract. ``recompute_ready``
+        # distinguishes deliberate blocks from circuit-breaker recovery by
+        # the canonical ``blocked`` event; without it, completing the repair
+        # parent could prematurely promote the original before watchdog
+        # reconciliation verifies the receipt.
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {"reason": reason, "kind": "transient", "source": "worker_watchdog"},
+            run_id=run_id,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "watchdog_blocked",
+            {
+                **finding,
+                "reason": reason,
+                "termination": termination,
+            },
+            run_id=run_id,
+        )
+    return True
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5435,10 +5532,57 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        review_approval = prior_status == "review"
+        if (
+            prior_status == "running"
+            and prior
+            and prior["current_run_id"] is not None
+        ):
+            claim_event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id, int(prior["current_run_id"])),
+            ).fetchone()
+            try:
+                claim_payload = (
+                    json.loads(claim_event["payload"])
+                    if claim_event and claim_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                claim_payload = {}
+            review_approval = (
+                isinstance(claim_payload, dict)
+                and claim_payload.get("source_status") == "review"
+            )
+        recognition_recipient: Optional[str] = None
+        if review_approval:
+            review_event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                review_payload = (
+                    json.loads(review_event["payload"])
+                    if review_event and review_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                review_payload = {}
+            implementer = (
+                review_payload.get("implementer")
+                if isinstance(review_payload, dict)
+                else None
+            )
+            if isinstance(implementer, str) and implementer.strip():
+                recognition_recipient = implementer.strip()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5549,6 +5693,21 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        if recognition_recipient is not None:
+            _append_event(
+                conn,
+                task_id,
+                "private_recognition",
+                {
+                    "basis": "independent_review_approved",
+                    "message": (
+                        "Strong work: your work passed independent review. "
+                        "Carry forward the same evidence-first, tightly scoped approach."
+                    ),
+                    "recipient_profile": recognition_recipient,
+                },
+                run_id=run_id,
+            )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -7370,7 +7529,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, goal_mode, goal_max_turns, skills "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7385,6 +7544,13 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        # A goal-mode root represents a durable objective, not a one-shot
+        # dispatch.  Its children must keep the same continuation contract;
+        # otherwise the first fan-out silently loses the goal loop and the
+        # coordinator receives premature worker exits instead of handoffs.
+        root_goal_mode = 1 if root_row["goal_mode"] else 0
+        root_goal_max_turns = root_row["goal_max_turns"]
+        root_skills = root_row["skills"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7419,8 +7585,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, goal_mode, goal_max_turns, skills) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7431,6 +7597,9 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    root_goal_mode,
+                    root_goal_max_turns,
+                    root_skills,
                 ),
             )
             _append_event(
@@ -8058,6 +8227,12 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    watchdog_blocked: list[str] = field(default_factory=list)
+    """Task ids suspended after deterministic repeated no-progress evidence."""
+    watchdog_restarted: list[str] = field(default_factory=list)
+    """Task ids requeued after their linked watchdog repair completed."""
+    watchdog_needs_operator: list[str] = field(default_factory=list)
+    """Task ids left fail-closed because repair or termination needs an operator."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -8082,6 +8257,10 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    host_capacity_saturated: bool = False
+    """True when ``kanban.max_in_progress`` already has every host worker
+    slot occupied. Ready work is intentionally deferred in this state, so the
+    gateway must not diagnose the dispatcher or profile as stuck."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8274,9 +8453,7 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
+    kill = signal_fn if signal_fn is not None else _worker_tree_signal
     if kill is None:
         return info
 
@@ -8310,6 +8487,31 @@ def _terminate_reclaimed_worker(
 
     info["terminated"] = not _pid_alive(pid)
     return info
+
+
+def _worker_tree_signal(pid: int, sig: int) -> None:
+    """Signal a dispatcher-owned worker and its descendants.
+
+    Kanban workers are spawned with ``start_new_session=True``, so on POSIX
+    the worker PID is also the process-group ID. Signalling only the leader
+    leaves terminal commands and provider children running after a reclaim or
+    timeout. Use the group only when ownership is provable and never target
+    the gateway's own group; otherwise retain the per-PID fallback.
+    """
+    if (
+        os.name != "nt"
+        and hasattr(os, "killpg")
+        and hasattr(os, "getpgid")
+        and hasattr(os, "getpgrp")
+    ):
+        try:
+            pgid = os.getpgid(int(pid))
+            if pgid == int(pid) and pgid != os.getpgrp():
+                os.killpg(pgid, sig)
+                return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    os.kill(int(pid), sig)
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -8469,9 +8671,7 @@ def enforce_max_runtime(
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
         killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
-        )
+        kill = signal_fn if signal_fn is not None else _worker_tree_signal
         if kill is not None:
             try:
                 kill(pid, signal.SIGTERM)
@@ -9644,6 +9844,211 @@ DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
 
+@dataclass(frozen=True)
+class ProcessSnapshot:
+    """Read-only process identity used by the priority-runtime guard."""
+
+    pid: int
+    argv: tuple[str, ...]
+    cwd: Optional[str]
+
+
+@dataclass(frozen=True)
+class ProcessScan:
+    """A process snapshot plus whether all relevant processes were readable."""
+
+    snapshots: tuple[ProcessSnapshot, ...]
+    complete: bool
+
+
+def _process_name_can_hide_python_runtime(name: Any) -> bool:
+    """Whether an unreadable process name could be the guarded Python owner.
+
+    macOS exposes login-shell supervisor rows with an empty cmdline and no cwd.
+    Those rows cannot execute a Python script themselves and must not make the
+    entire scan ``unknown``.  An unreadable Python row remains fail-closed.
+    """
+
+    try:
+        basename = Path(str(name or "")).name
+    except (TypeError, ValueError):
+        return True
+    if not basename:
+        return True
+    return bool(re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", basename))
+
+
+def _process_scan() -> ProcessScan:
+    """Collect a portable, read-only process snapshot via the core psutil dep.
+
+    Only processes owned by the current user can plausibly run an entrypoint
+    from that user's configured project roots. Unreadable same-user rows make
+    the scan incomplete; the caller then protects runtime capacity rather than
+    assuming the priority process is absent.
+    """
+    snapshots: list[ProcessSnapshot] = []
+    complete = True
+    try:
+        import psutil  # type: ignore
+
+        current_pid = os.getpid()
+        current_user = psutil.Process(current_pid).username()
+        for proc in psutil.process_iter(["pid", "username", "name", "cmdline", "cwd"]):
+            try:
+                info = proc.info
+                if int(info.get("pid") or 0) == current_pid:
+                    continue
+                username = info.get("username")
+                if username is not None and username != current_user:
+                    continue
+                argv = tuple(str(arg) for arg in (info.get("cmdline") or ()))
+                cwd = info.get("cwd")
+                if username is None:
+                    complete = False
+                    continue
+                if not argv:
+                    if _process_name_can_hide_python_runtime(info.get("name")):
+                        complete = False
+                    continue
+                if cwd is None:
+                    complete = False
+                    continue
+                snapshots.append(
+                    ProcessSnapshot(
+                        pid=int(info["pid"]),
+                        argv=argv,
+                        cwd=str(cwd),
+                    )
+                )
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+            except (psutil.AccessDenied, OSError, ValueError, TypeError):
+                complete = False
+    except Exception:
+        return ProcessScan(snapshots=(), complete=False)
+    return ProcessScan(snapshots=tuple(snapshots), complete=complete)
+
+
+def _resolved_path(value: str, *, base: Optional[Path] = None) -> Optional[Path]:
+    try:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            if base is None:
+                return None
+            path = base / path
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _snapshot_runs_target(
+    snapshot: ProcessSnapshot,
+    targets: set[Path],
+    *,
+    linked_worktree_common_dirs: Optional[set[Path]] = None,
+    linked_worktree_entries: tuple[Path, ...] = (),
+) -> bool:
+    """Prove that argv executes one of ``targets`` as a Python script."""
+    cwd = _resolved_path(snapshot.cwd) if snapshot.cwd else None
+    for index, arg in enumerate(snapshot.argv):
+        candidate = _resolved_path(arg, base=cwd)
+        candidate_matches = candidate in targets
+        if (
+            not candidate_matches
+            and candidate is not None
+            and linked_worktree_common_dirs
+        ):
+            for entry in linked_worktree_entries:
+                if len(candidate.parts) < len(entry.parts):
+                    continue
+                if candidate.parts[-len(entry.parts) :] != entry.parts:
+                    continue
+                candidate_root = candidate.parents[len(entry.parts) - 1]
+                candidate_common_dir = _git_common_dir(candidate_root)
+                if candidate_common_dir in linked_worktree_common_dirs:
+                    candidate_matches = True
+                    break
+        if not candidate_matches:
+            continue
+        # A directly executable script with a shebang has the target as argv0.
+        if index == 0:
+            return True
+        prior = snapshot.argv[:index]
+        python_indexes = [
+            i
+            for i, token in enumerate(prior)
+            if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(token).name)
+        ]
+        if not python_indexes:
+            continue
+        python_index = python_indexes[-1]
+        # ``python -m main.py`` names a module and ``python -c main.py`` is
+        # code text; neither executes the configured path.
+        if any(token in {"-c", "-m"} for token in prior[python_index + 1 :]):
+            continue
+        return True
+    return False
+
+
+def priority_runtime_state(
+    guard: Optional[Mapping[str, Any]],
+    *,
+    process_scan: Optional[ProcessScan] = None,
+) -> str:
+    """Return ``active``, ``inactive``, or ``unknown`` for a guarded runtime.
+
+    A match requires an exact configured project root and exact relative
+    entrypoint. Merely containing ``main.py`` in a command string, or running
+    an unrelated project's file with the same basename, never matches.
+    """
+    if not isinstance(guard, Mapping) or not bool(guard.get("enabled", False)):
+        return "inactive"
+    raw_roots = guard.get("project_roots")
+    raw_entries = guard.get("entrypoints", ("main.py",))
+    if not isinstance(raw_roots, (list, tuple)) or not raw_roots:
+        return "inactive"
+    if not isinstance(raw_entries, (list, tuple)) or not raw_entries:
+        return "inactive"
+
+    targets: set[Path] = set()
+    roots: list[Path] = []
+    entries: list[Path] = []
+    for raw_root in raw_roots:
+        root = _resolved_path(str(raw_root))
+        if root is None:
+            continue
+        roots.append(root)
+        for raw_entry in raw_entries:
+            entry = Path(str(raw_entry))
+            if entry.is_absolute() or ".." in entry.parts:
+                continue
+            if entry not in entries:
+                entries.append(entry)
+            target = _resolved_path(str(entry), base=root)
+            if target is not None:
+                targets.add(target)
+    if not targets:
+        return "inactive"
+
+    linked_common_dirs: Optional[set[Path]] = None
+    if bool(guard.get("include_linked_worktrees", False)):
+        linked_common_dirs = {
+            common_dir
+            for root in roots
+            if (common_dir := _git_common_dir(root)) is not None
+        }
+    scan = process_scan if process_scan is not None else _process_scan()
+    for snapshot in scan.snapshots:
+        if _snapshot_runs_target(
+            snapshot,
+            targets,
+            linked_worktree_common_dirs=linked_common_dirs,
+            linked_worktree_entries=tuple(entries),
+        ):
+            return "active"
+    return "inactive" if scan.complete else "unknown"
+
+
 def _system_memory_sample() -> dict:
     """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
 
@@ -9681,17 +10086,50 @@ def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -
     )
 
 
-def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
+def resolve_max_in_progress(
+    configured: Optional[int],
+    *,
+    priority_runtime_guard: Optional[Mapping[str, Any]] = None,
+    process_scan: Optional[ProcessScan] = None,
+) -> Optional[int]:
     """Return the effective global concurrency cap for a dispatch tick.
 
-    An explicit operator-configured value always wins. When unset, fall back
-    to the memory-derived default (see :func:`derive_default_max_in_progress`).
-    Callers that parse config (gateway dispatcher, ``hermes kanban dispatch``)
-    should route through this so both paths agree.
+    The explicit operator-configured value is the normal performance cap.
+    When unset, fall back to the memory-derived default (see
+    :func:`derive_default_max_in_progress`). A configured priority runtime may
+    temporarily lower either value, but never raises it. Callers that parse
+    config (gateway dispatcher, ``hermes kanban dispatch``) should route
+    through this so both paths agree.
     """
-    if configured is not None:
-        return configured
-    return derive_default_max_in_progress()
+    resolved = configured if configured is not None else derive_default_max_in_progress()
+    # A guard-enabled workstation can declare its measured normal lane without
+    # weakening the existing memory-derived safety cap on hosts where memory is
+    # observable. This matters on macOS, where the portable memory sample is
+    # intentionally unavailable and the historical fallback was unbounded.
+    if resolved is None and isinstance(priority_runtime_guard, Mapping):
+        try:
+            normal = int(priority_runtime_guard.get("normal_max_in_progress", 0))
+        except (TypeError, ValueError):
+            normal = 0
+        if (
+            bool(priority_runtime_guard.get("enabled", False))
+            and priority_runtime_guard.get("project_roots")
+            and normal > 0
+        ):
+            resolved = normal
+    state = priority_runtime_state(
+        priority_runtime_guard,
+        process_scan=process_scan,
+    )
+    if state not in {"active", "unknown"}:
+        return resolved
+    try:
+        protected = int((priority_runtime_guard or {}).get("max_in_progress", 3))
+    except (TypeError, ValueError):
+        protected = 3
+    if protected < 1:
+        protected = 3
+    return protected if resolved is None else min(resolved, protected)
 
 
 def configured_max_in_progress() -> Optional[int]:
@@ -9716,6 +10154,19 @@ def configured_max_in_progress() -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return ival if ival >= 1 else None
+
+
+def configured_priority_runtime_guard() -> Mapping[str, Any]:
+    """Read the generic priority-runtime guard block for daemon dispatch."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "priority_runtime_guard", {}
+        )
+    except Exception:
+        return {}
+    return raw if isinstance(raw, Mapping) else {}
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
@@ -9818,6 +10269,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -9853,6 +10305,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_by_profile=max_in_progress_by_profile,
             reconcile_orphans=reconcile_orphans,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -9873,6 +10326,7 @@ def dispatch_once(
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                max_in_progress_by_profile=max_in_progress_by_profile,
                 reconcile_orphans=reconcile_orphans,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
@@ -9900,6 +10354,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -9942,6 +10397,26 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    if not dry_run:
+        try:
+            from hermes_cli.kanban_worker_watchdog import (
+                load_watchdog_config,
+                run_watchdog_tick,
+            )
+
+            watchdog_result = run_watchdog_tick(
+                conn,
+                board=board,
+                config=load_watchdog_config(),
+            )
+            result.watchdog_blocked.extend(watchdog_result.blocked)
+            result.watchdog_restarted.extend(watchdog_result.restarted)
+            result.watchdog_needs_operator.extend(watchdog_result.needs_operator)
+        except Exception:
+            # Supervision is a safety aid, never a dispatcher availability
+            # dependency. Leave current claims untouched and try again next
+            # tick after logging the diagnostic.
+            _log.exception("kanban worker watchdog tick failed")
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -10004,6 +10479,7 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.host_capacity_saturated = True
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -10087,8 +10563,28 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    _profile_cap_overrides: dict[str, int] = {}
+    if isinstance(max_in_progress_by_profile, Mapping):
+        for name, raw_cap in max_in_progress_by_profile.items():
+            if (
+                isinstance(name, str)
+                and name.strip()
+                and isinstance(raw_cap, int)
+                and not isinstance(raw_cap, bool)
+                and raw_cap > 0
+            ):
+                _profile_cap_overrides[name.strip()] = raw_cap
+
+    def _cap_for_profile(profile: str) -> Optional[int]:
+        specific = _profile_cap_overrides.get(profile)
+        if specific is None:
+            return _per_profile_cap
+        if _per_profile_cap is None:
+            return specific
+        return min(specific, _per_profile_cap)
+
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+    if _per_profile_cap is not None or _profile_cap_overrides:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
@@ -10187,9 +10683,10 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        row_profile_cap = _cap_for_profile(row_assignee)
+        if row_profile_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+            if current >= row_profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
@@ -10222,7 +10719,7 @@ def _dispatch_once_locked(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
+            if row_profile_cap is not None and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
@@ -10284,7 +10781,10 @@ def _dispatch_once_locked(
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
+            if (
+                _cap_for_profile(claimed.assignee or "") is not None
+                and claimed.assignee
+            ):
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
@@ -10329,9 +10829,10 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
+        row_profile_cap = _cap_for_profile(row["assignee"])
+        if row_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
+            if current >= row_profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
@@ -10349,7 +10850,7 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
-            if _per_profile_cap is not None:
+            if row_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
@@ -10404,7 +10905,10 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
+            if (
+                _cap_for_profile(claimed.assignee or "") is not None
+                and claimed.assignee
+            ):
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
@@ -10763,6 +11267,12 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Stable local token for protected-remote worker prompts. Tool output can
+    # refer to $HERMES_CONTROL_HOME without disclosing the operator's absolute
+    # home path; the shell expands it only inside this worker process.
+    from hermes_constants import get_default_hermes_root
+
+    env["HERMES_CONTROL_HOME"] = str(get_default_hermes_root())
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -10976,7 +11486,8 @@ def run_daemon(
             # place everywhere else. Re-resolved every tick (config load is
             # mtime-cached) so operator edits apply without a restart.
             max_in_progress = resolve_max_in_progress(
-                configured_max_in_progress()
+                configured_max_in_progress(),
+                priority_runtime_guard=configured_priority_runtime_guard(),
             )
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
@@ -11193,6 +11704,31 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
     if task.assignee:
+        recognition_rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE kind = 'private_recognition' "
+            "ORDER BY id DESC LIMIT 500"
+        ).fetchall()
+        for recognition_row in recognition_rows:
+            try:
+                recognition = json.loads(recognition_row["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(recognition, dict):
+                continue
+            if recognition.get("recipient_profile") != task.assignee:
+                continue
+            message = recognition.get("message")
+            if isinstance(message, str) and message.strip():
+                lines.append("## Private recognition")
+                lines.append(_cap(message))
+                lines.append(
+                    "_This is encouragement only. Re-verify the current task and keep all "
+                    "safety, scope, and acceptance gates unchanged._"
+                )
+                lines.append("")
+            break
+
         role_rows = conn.execute(
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
@@ -11395,6 +11931,7 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    allow_nested: bool = False,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
@@ -11437,7 +11974,10 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    # A caller that creates a task and its notification subscription as one
+    # durable handoff may opt into savepoint composition. The default remains
+    # deliberately loud for accidental nested writes.
+    with write_txn(conn, allow_nested=allow_nested):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs

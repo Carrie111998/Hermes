@@ -1462,7 +1462,7 @@ def test_scan_dispatches_one_read_only_exact_head_ci_audit_when_actions_are_disa
     assert task.assignee == "pr-local-ci-auditor"
     assert task.initial_status == "running"
     assert task.max_retries == 3
-    assert task.max_runtime_seconds == 900
+    assert task.max_runtime_seconds == 8 * 60 * 60
     assert task.evidence_heading == "Canonical PR audit receipt (JSON)"
     assert task.evidence == {
         "repository": "acme/widgets",

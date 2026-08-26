@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -132,6 +133,8 @@ def build_runner(
     github: FakeGitHub | None = None,
     inspector: FakeInspector | None = None,
     commands: RecordingRunner | None = None,
+    supervisor_pid: int = 4242,
+    pid_is_alive=lambda _pid: True,
 ) -> tuple[LocalCIRunner, FeedbackLedger, RecordingRunner]:
     ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
     command_runner = commands or RecordingRunner()
@@ -142,8 +145,108 @@ def build_runner(
         inspector=inspector or FakeInspector(),
         python_argv=("python3",),
         now=lambda: NOW,
+        supervisor_pid=lambda: supervisor_pid,
+        pid_is_alive=pid_is_alive,
     )
     return runner, ledger, command_runner
+
+
+def test_ci_run_is_claimed_before_bootstrap_with_real_supervisor_pid(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    prepare_repository(worktree)
+    (worktree / "scripts/bootstrap_agent_workspace.py").write_text(
+        "# fixture\n", encoding="utf-8"
+    )
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    class ObservingRunner(RecordingRunner):
+        def run(self, argv, *, cwd, env, timeout):
+            lifecycle = ledger.latest_ci_run("acme/widgets", 17, HEAD_SHA)
+            assert lifecycle is not None
+            assert lifecycle["status"] == "running"
+            assert lifecycle["supervisor_pid"] == 4242
+            result = super().run(argv, cwd=cwd, env=env, timeout=timeout)
+            if argv == ("python3", "scripts/bootstrap_agent_workspace.py", "--venv", "link"):
+                executable = cwd / ".venv/bin/python"
+                executable.parent.mkdir(parents=True)
+                executable.write_text("#!/bin/sh\n", encoding="utf-8")
+                executable.chmod(0o755)
+            return result
+
+    commands = ObservingRunner()
+    runner = LocalCIRunner(
+        FakeGitHub(merge_state()),
+        ledger,
+        command_runner=commands,
+        inspector=FakeInspector(),
+        now=lambda: NOW,
+        supervisor_pid=lambda: 4242,
+        pid_is_alive=lambda pid: pid == 4242,
+    )
+    receipt = runner.run(CIAuditIdentity("acme/widgets", 17, BASE_SHA, HEAD_SHA), worktree)
+
+    lifecycle = ledger.latest_ci_run("acme/widgets", 17, HEAD_SHA)
+    assert lifecycle is not None
+    assert lifecycle["status"] == "completed"
+    assert lifecycle["receipt_id"] == receipt.receipt_id
+    assert commands.calls[0][0] == (
+        "python3",
+        "scripts/bootstrap_agent_workspace.py",
+        "--venv",
+        "link",
+    )
+    ledger.close()
+
+
+def test_active_exact_head_ci_run_rejects_duplicate_without_running_commands(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    prepare_repository(worktree)
+    first, ledger, _ = build_runner(tmp_path, supervisor_pid=4242)
+    manifest_digest = hashlib.sha256(
+        (worktree / "tests/manifests/test_lanes.toml").read_bytes()
+    ).hexdigest()
+    lease = ledger.claim_ci_run(
+        "acme/widgets", 17, BASE_SHA, HEAD_SHA, manifest_digest,
+        supervisor_pid=4242, claimed_at=NOW, stale_before=NOW - timedelta(hours=2),
+        pid_is_alive=lambda pid: pid == 4242,
+    )
+    assert lease is not None
+
+    with pytest.raises(CIValidationError, match="already running"):
+        first.run(CIAuditIdentity("acme/widgets", 17, BASE_SHA, HEAD_SHA), worktree)
+
+    assert first._commands.calls == []
+    ledger.close()
+
+
+def test_dead_stale_ci_supervisor_allows_one_fenced_takeover(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    prepare_repository(worktree)
+    runner, ledger, commands = build_runner(
+        tmp_path, supervisor_pid=5252, pid_is_alive=lambda _pid: False
+    )
+    digest = hashlib.sha256(
+        (worktree / "tests/manifests/test_lanes.toml").read_bytes()
+    ).hexdigest()
+    old = ledger.claim_ci_run(
+        "acme/widgets", 17, BASE_SHA, HEAD_SHA, digest,
+        supervisor_pid=4242,
+        claimed_at=NOW - timedelta(hours=3),
+        stale_before=NOW - timedelta(hours=2),
+        pid_is_alive=lambda _pid: False,
+    )
+    assert old is not None
+
+    receipt = runner.run(CIAuditIdentity("acme/widgets", 17, BASE_SHA, HEAD_SHA), worktree)
+
+    assert commands.calls
+    lifecycle = ledger.latest_ci_run("acme/widgets", 17, HEAD_SHA)
+    assert lifecycle is not None
+    assert lifecycle["status"] == "completed"
+    assert lifecycle["supervisor_pid"] == 5252
+    assert lifecycle["lease_version"] == old.version + 1
+    assert lifecycle["receipt_id"] == receipt.receipt_id
+    ledger.close()
 
 
 def test_local_ci_runner_executes_only_required_lanes_and_records_exact_head_receipt(
