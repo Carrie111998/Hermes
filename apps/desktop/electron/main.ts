@@ -124,6 +124,7 @@ import {
   withTransientRetries
 } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
+import { detectLocalGatewayRunning, type GatewayLiveness } from './local-gateway-detect'
 import {
   backendScopeKey,
   backendScopePrefix,
@@ -10955,6 +10956,20 @@ async function ensureBackend(profile) {
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
   if (route.backend === 'primary') {
+    // Adopt an already-running local gateway (e.g. installed via
+    // `hermes gateway install`) instead of spawning a duplicate `hermes serve`.
+    // Fixes #91564: without this, Desktop starts a second backend that loads
+    // the full MCP set, wasting RAM and causing contradictory UI state.
+    const existing = await detectLocalGatewayRunning()
+    if (existing.alive) {
+      const adopted = await adoptLocalGateway(existing)
+      if (adopted) {
+        setWslBridgeProfileState(key, adopted.mode !== 'remote')
+        return route.descriptorProfile
+          ? { ...adopted, profile: route.descriptorProfile, sharedPrimary: true }
+          : adopted
+      }
+    }
     const connection = await startHermes()
     setWslBridgeProfileState(key, connection.mode !== 'remote')
 
@@ -11022,7 +11037,61 @@ async function ensureBackend(profile) {
   return connection
 }
 
-// ── Registry-scoped backends (multi-connection, PR 2 of the campaign) ──────
+type AdoptedLocalConnection = {
+  baseUrl: string
+  mode: 'local'
+  source: 'local'
+  authMode: 'insecure'
+  token: null
+  wsUrl: string
+  adopted: true
+  adoptedPid: number | null
+}
+
+/**
+ * Adopt an already-running local gateway (e.g. installed via
+ * `hermes gateway install`) instead of spawning a duplicate `hermes serve`.
+ *
+ * Returns a connection descriptor compatible with `startHermes()` output,
+ * or `null` if the gateway is unreachable or requires auth we can't satisfy.
+ * A `null` return lets the caller fall back to spawning a fresh backend.
+ */
+async function adoptLocalGateway(existing: GatewayLiveness): Promise<AdoptedLocalConnection | null> {
+  const port = existing.port ?? 8642
+  const baseUrl = `http://127.0.0.1:${port}`
+
+  // Verify the gateway is actually responding before adopting it.
+  let status: any = null
+  try {
+    status = await fetchPublicJson(`${baseUrl}/api/status`, { timeoutMs: 3_000 })
+  } catch {
+    rememberLog(`[adopt] local gateway at ${baseUrl} did not respond to /api/status; falling back to spawn`)
+    return null
+  }
+
+  // If the gateway requires auth we can't satisfy (OAuth gate), don't adopt —
+  // the Desktop would need a ws-ticket mint flow that the external gateway
+  // didn't request. Fall back to spawning a fresh local backend.
+  if (status?.auth_required === true) {
+    rememberLog(`[adopt] local gateway at ${baseUrl} requires auth; falling back to spawn`)
+    return null
+  }
+
+  rememberLog(`[adopt] adopting local gateway at ${baseUrl} (PID ${existing.pid})`)
+
+  return {
+    baseUrl,
+    mode: 'local',
+    source: 'local',
+    authMode: 'insecure',
+    token: null,
+    wsUrl: `${baseUrl.replace(/^http/, 'ws')}/api/ws`,
+    adopted: true,
+    adoptedPid: existing.pid
+  }
+}
+
+// ── Registry-scoped backends (multi-connection, PR 2 of the campaign) ───────
 // Resolve a backend for (connectionId, profile) against the v2 registry.
 // The LOCAL connection routes through ensureBackend() when the v1 route is
 // itself local (so every single-source path stays byte-identical), and forces
@@ -11137,6 +11206,22 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
 
     if (localRoute.delegate) {
       return ensureBackend(profile)
+    }
+
+    // Adopt an already-running local gateway (e.g. installed via
+    // `hermes gateway install`) instead of spawning a duplicate forced-local
+    // child. Fixes #90316: without this, a remote-primary Desktop still
+    // spawns a loopback agent for the built-in "This device" entry.
+    const existing = await detectLocalGatewayRunning()
+    if (existing.alive) {
+      const adopted = await adoptLocalGateway(existing)
+      if (adopted) {
+        return {
+          ...adopted,
+          profile: profileKey,
+          connectionId: id
+        }
+      }
     }
 
     const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
