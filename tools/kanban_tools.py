@@ -425,7 +425,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     note = (
         "New note"
         + ("s" if len(fresh) > 1 else "")
-        + " on your kanban task from the operator (delivered mid-run). "
+        + " on your kanban task (delivered mid-run). "
         + "Take it into account for the work you're doing right now:\n"
         + "\n".join(lines)
     )
