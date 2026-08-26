@@ -384,6 +384,68 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("depth limit", result["error"].lower())
 
+    def test_single_persona_reaches_child_system_prompt(self):
+        parent = _make_mock_parent(depth=0)
+        persona = "Review security boundaries and return only findings."
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Review the authentication changes",
+                persona=persona,
+                parent_agent=parent,
+            )
+
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn(persona, prompt)
+        self.assertLess(
+            prompt.index(persona),
+            prompt.index("Review the authentication changes"),
+        )
+
+    def test_batch_persona_default_and_per_task_override_reach_children(self):
+        parent = _make_mock_parent(depth=0)
+        default_persona = "Act as a careful implementation reviewer."
+        override_persona = "Act as a skeptical test reviewer."
+
+        children = []
+        for _ in range(2):
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            children.append(child)
+
+        with patch("run_agent.AIAgent", side_effect=children) as MockAgent:
+            delegate_task(
+                tasks=[
+                    {"goal": "Review the implementation for correctness"},
+                    {
+                        "goal": "Review the test coverage for missing cases",
+                        "persona": override_persona,
+                    },
+                ],
+                persona=default_persona,
+                parent_agent=parent,
+            )
+
+        prompts = [
+            call.kwargs["ephemeral_system_prompt"]
+            for call in MockAgent.call_args_list
+        ]
+        self.assertIn(default_persona, prompts[0])
+        self.assertNotIn(override_persona, prompts[0])
+        self.assertIn(override_persona, prompts[1])
+        self.assertNotIn(default_persona, prompts[1])
 
     def test_child_inherits_runtime_credentials(self):
         parent = _make_mock_parent(depth=0)
@@ -1504,6 +1566,25 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_persona_is_forwarded_from_agent_dispatch(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "review this", "persona": "Act as a skeptic."},
+            )
+
+        self.assertEqual(captured["persona"], "Act as a skeptic.")
+
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
