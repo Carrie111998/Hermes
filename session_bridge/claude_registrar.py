@@ -67,36 +67,174 @@ _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 # ConPTY draws a run of blank cells as a cursor-forward escape instead of
-# literal spaces, so deleting the escape welds the words on either side into one
-# token. Measured against the live TUI on 2026-08-23: 85 of these in a single
-# readiness frame, 7 in one prompt echo, and zero CSI n G (absolute column) --
-# expanding this one form is what keeps drawn text readable as its own words.
-_ANSI_CURSOR_FORWARD_RE = re.compile(r"\x1b\[(\d*)C")
+# literal spaces, and redraws a row with a bare carriage return, so deleting
+# either welds text that was drawn apart into one token or one row. The frame is
+# replayed through a cursor below rather than stripped.
+_ANSI_CSI_FRAME_RE = re.compile(r"\x1b\[([0-?]*)[ -/]*([@-~])")
+_ANSI_NUMERIC_PARAMETERS_RE = re.compile(r"[0-9;]*\Z")
 _MAX_CURSOR_FORWARD_COLUMNS = 1024
+# An absolute column is bounded separately and higher than one cursor-forward
+# run, so a capped CSI 1024 C still lands inside the row it drew into.
+_MAX_TERMINAL_COLUMNS = 4096
 
 
-def _expand_cursor_forward(output: str) -> str:
-    """Restore skipped columns as the spaces the terminal drew in their place."""
+def _cursor_forward_columns(parameters: str) -> int:
+    """Columns skipped by one CSI n C, bounded the way the drawn run is."""
 
-    def _columns(match: re.Match[str]) -> str:
-        digits = match.group(1)
-        if not digits or len(digits) > 7:
-            # An absent parameter means one column; an implausibly long one is
-            # garble, and either way the cap below is the only size that matters.
-            columns = 1 if not digits else _MAX_CURSOR_FORWARD_COLUMNS
+    if not parameters:
+        return 1
+    if len(parameters) > 7:
+        # int() above sys.get_int_max_str_digits() RAISES, and nothing on this
+        # path catches it; an implausibly long count is garble in any case.
+        return _MAX_CURSOR_FORWARD_COLUMNS
+    # CSI 0 C still advances a single column.
+    return min(int(parameters) or 1, _MAX_CURSOR_FORWARD_COLUMNS)
+
+
+def _terminal_parameter(parameters: str, index: int, default: int) -> int:
+    """One numeric CSI parameter, with the escape's default for an absent one."""
+
+    values = parameters.split(";")
+    if index >= len(values):
+        return default
+    value = values[index]
+    if not value or not value.isdigit() or len(value) > 7:
+        return default
+    return int(value)
+
+
+class _TerminalFrame:
+    """The one row being drawn, plus the rows already left behind.
+
+    Deliberately NOT a persistent screen buffer addressed by absolute row. The
+    input here is a concatenation of many redraw frames rather than one screen,
+    so honouring a CUP row index literally would let a later frame overwrite --
+    and erase -- an answer an earlier frame had already drawn, which is the one
+    thing every predicate downstream needs to survive. A CUP therefore ends the
+    current row and starts another; only its COLUMN is positional.
+    """
+
+    def __init__(self) -> None:
+        self._rows: list[str] = []
+        self._line: list[str] = []
+        self._column = 0
+
+    def write(self, character: str) -> None:
+        if self._column >= _MAX_TERMINAL_COLUMNS:
+            return
+        if self._column > len(self._line):
+            self._line.extend(" " * (self._column - len(self._line)))
+        if self._column < len(self._line):
+            self._line[self._column] = character
         else:
-            # CSI 0 C still advances a single column.
-            columns = int(digits) or 1
-        return " " * min(columns, _MAX_CURSOR_FORWARD_COLUMNS)
+            self._line.append(character)
+        self._column += 1
 
-    return _ANSI_CURSOR_FORWARD_RE.sub(_columns, output)
+    def carriage_return(self) -> None:
+        self._column = 0
+
+    def line_feed(self) -> None:
+        self._rows.append("".join(self._line))
+        self._line = []
+        self._column = 0
+
+    def move_to_column(self, column: int) -> None:
+        self._column = min(max(column, 0), _MAX_TERMINAL_COLUMNS)
+
+    def advance(self, columns: int) -> None:
+        self.move_to_column(self._column + columns)
+
+    def erase_in_line(self, mode: int) -> None:
+        if mode == 0:
+            del self._line[self._column :]
+        elif mode == 1:
+            for index in range(min(self._column + 1, len(self._line))):
+                self._line[index] = " "
+        elif mode == 2:
+            self._line = []
+
+    def rendered(self) -> str:
+        return "\n".join([*self._rows, "".join(self._line)])
+
+
+def _render_terminal_frame(output: str) -> str:
+    """Replay the drawn frame through a cursor so rows read back as rows.
+
+    Claude Code's TUI redraws a row by emitting a bare CR and rewriting it, and
+    reaches the next row with CUP rather than a newline. Deleting those escapes
+    welds every drawn row into one line, so no line ever equals the answer.
+    Turning CR into LF instead is worse: it PROMOTES overwritten text into
+    visible lines, and a spinner redrawn forty times becomes forty of them.
+
+    The handled set is the one measured off live ConPTY frames on 2026-08-23
+    (85 CSI n C, 18 CSI n K, 15 CUP, 1 ED, and zero CSI n G) plus CR and LF.
+    Absolute-column, cursor-up/down/back and screen-erase escapes never appeared
+    and are dropped rather than modelled on a guess -- ED especially, since
+    erasing the screen would discard rows an earlier frame had already drawn.
+    """
+
+    frame = _TerminalFrame()
+    cursor = 0
+    length = len(output)
+    while cursor < length:
+        character = output[cursor]
+        if character == "\r":
+            frame.carriage_return()
+            cursor += 1
+            continue
+        if character == "\n":
+            frame.line_feed()
+            cursor += 1
+            continue
+        if character != "\x1b":
+            frame.write(character)
+            cursor += 1
+            continue
+        escape = _ANSI_CSI_FRAME_RE.match(output, cursor)
+        if escape is None:
+            # A lone ESC the old regex left alone stays where it was drawn.
+            frame.write(character)
+            cursor += 1
+            continue
+        parameters, final = escape.group(1), escape.group(2)
+        cursor = escape.end()
+        if _ANSI_NUMERIC_PARAMETERS_RE.match(parameters) is None:
+            # A private parameter (CSI ? 2004 h and friends) is not one of the
+            # layout forms; drop it exactly as the strip always did.
+            continue
+        if final == "C":
+            frame.advance(_cursor_forward_columns(parameters))
+        elif final in ("H", "f"):
+            frame.line_feed()
+            frame.move_to_column(_terminal_parameter(parameters, 1, 1) - 1)
+        elif final == "K":
+            frame.erase_in_line(_terminal_parameter(parameters, 0, 0))
+    return frame.rendered()
 
 
 def _stripped_terminal_text(output: str) -> str:
-    """Remove terminal control sequences, keeping drawn text spaced as drawn."""
+    """Render terminal control sequences, keeping drawn text where it was drawn."""
 
-    expanded = _expand_cursor_forward(output)
-    return _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", expanded)).replace("\r", "")
+    return _render_terminal_frame(_ANSI_OSC_RE.sub("", output))
+
+
+# The TUI draws a reply as "<marker> REGISTERED", never as bare REGISTERED, and
+# the glyph moves between CLI releases. It could not be measured here: the
+# registrar's isolation argv renders no TUI at all on the installed 2.1.246
+# against the 2.1.216 pin. Hardcoding one glyph fails closed and silently, so
+# any one- or two-character symbolic marker before a space is read as framing.
+_TUI_LINE_MARKER_RE = re.compile(r"^[^\w\s]{1,2}(?=\s)")
+_TUI_LINE_PREFIXES = ("Claude>", ">")
+
+
+def _strip_line_marker(line: str) -> str:
+    """Remove the TUI's own framing from the front of one drawn line."""
+
+    for prefix in _TUI_LINE_PREFIXES:
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    marker = _TUI_LINE_MARKER_RE.match(line)
+    return line if marker is None else line[marker.end() :].strip()
 
 
 _CLAUDE_PROVIDER_LIMIT_BANNER_RE = re.compile(
@@ -2379,10 +2517,7 @@ def _normalized_terminal_output(output: str, prompt: str | None) -> str:
         line = raw.strip()
         if _pasted_input_indicator(line):
             continue
-        for prefix in ("Claude>", ">"):
-            if line.startswith(prefix):
-                line = line[len(prefix) :].strip()
-                break
+        line = _strip_line_marker(line)
         if not line or line in prompt_lines:
             continue
         if (
@@ -2412,10 +2547,7 @@ def _has_exact_registered_response(output: str, prompt: str) -> bool:
         line = raw.strip()
         if not line or line in prompt_lines:
             continue
-        for prefix in ("Claude>", ">"):
-            if line.startswith(prefix):
-                line = line[len(prefix) :].strip()
-                break
+        line = _strip_line_marker(line)
         if line in prompt_lines:
             continue
         if line:
@@ -2445,11 +2577,7 @@ def _registered_suffix(output: str, *, require_complete: bool) -> str | None:
     cleaned = _stripped_terminal_text(output)
     lines = cleaned.splitlines()
     for index, raw in enumerate(lines):
-        line = raw.strip()
-        for prefix in ("Claude>", ">"):
-            if line.startswith(prefix):
-                line = line[len(prefix) :].strip()
-                break
+        line = _strip_line_marker(raw.strip())
         if line == "REGISTERED":
             suffix = ["REGISTERED"]
             suffix.extend(
