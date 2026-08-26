@@ -379,6 +379,14 @@ $script:ResolvedPathReport = @{
     install_dir       = $InstallDir
 }
 
+# Derive the real CPU arch once.  Stage-Python / Install-Venv use it to
+# prefer native ARM64 Python on Windows-on-ARM (uv defaults to the emulated
+# x64 build there -- astral-sh/uv#12906).  Get-WindowsArch is defined below;
+# PowerShell resolves function calls at runtime.  Never throws: non-Windows
+# hosts (dev sandboxes, tests) just keep the variable empty.
+$script:WindowsPythonArch = ''
+try { $script:WindowsPythonArch = Get-WindowsArch } catch { }
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -1110,11 +1118,45 @@ function Resolve-AvailablePythonVersion {
         if (-not $ver -or $seen.ContainsKey($ver)) { continue }
         $seen[$ver] = $true
         try {
-            $found = & $UvCmd python find $ver 2>$null
+            # Qualified request first on ARM64 hosts: uv resolves a bare
+            # "3.11" to the emulated x64 build there (astral-sh/uv#12906),
+            # which would mask an available native aarch64 interpreter.
+            $found = $null
+            if ($script:WindowsPythonArch -eq 'arm64') {
+                $found = & $UvCmd python find "$ver-aarch64" 2>$null
+            }
+            if (-not $found) {
+                $found = & $UvCmd python find $ver 2>$null
+            }
             if ($found) { return $ver }
         } catch { }
     }
     return $null
+}
+
+# Return $true when uv can provide a native ARM64 interpreter for $Ver.
+# Finds first (cheap); only downloads when nothing is installed, and only
+# reports success when the post-install find actually resolves.  The
+# x64/unqualified requests are left to the callers, so this can never
+# install an interpreter that nobody asks for.
+function Test-NativeArm64PythonAvailable {
+    param([string]$Ver)
+    try {
+        if (& $UvCmd python find "$Ver-aarch64" 2>$null) { return $true }
+    } catch { }
+
+    $prevEAP = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $UvCmd python install "$Ver-aarch64" *> $null
+        $ErrorActionPreference = $prevEAP
+    } catch {
+        $ErrorActionPreference = $prevEAP
+    }
+
+    try {
+        return [bool](& $UvCmd python find "$Ver-aarch64" 2>$null)
+    } catch { return $false }
 }
 
 function Test-Python {
@@ -1122,7 +1164,17 @@ function Test-Python {
     
     # Let uv find or install Python
     try {
-        $pythonPath = & $UvCmd python find $PythonVersion 2>$null
+        $pythonPath = $null
+        $qualifiedVer = $null
+        if ($script:WindowsPythonArch -eq 'arm64') {
+            # Native ARM64 first: a bare request resolves to the emulated
+            # x64 build on Windows-on-ARM (astral-sh/uv#12906).
+            $pythonPath = & $UvCmd python find "$PythonVersion-aarch64" 2>$null
+            if ($pythonPath) { $qualifiedVer = $PythonVersion }
+        }
+        if (-not $pythonPath) {
+            $pythonPath = & $UvCmd python find $PythonVersion 2>$null
+        }
         if ($pythonPath) {
             $ver = & $pythonPath --version 2>$null
             Write-Success "Python found: $ver"
@@ -1132,6 +1184,14 @@ function Test-Python {
     
     # Python not found -- use uv to install it (no admin needed!)
     Write-Info "Python $PythonVersion not found, installing via uv..."
+    if (-not $qualifiedVer -and $script:WindowsPythonArch -eq 'arm64') {
+        if (Test-NativeArm64PythonAvailable -Ver $PythonVersion) {
+            $qualifiedVer = $PythonVersion
+        } else {
+            Write-Warn "No native ARM64 build of Python $PythonVersion; falling back to x64 (emulated)"
+        }
+    }
+    $installTarget = if ($qualifiedVer) { "$qualifiedVer-aarch64" } else { $PythonVersion }
     # Capture EAP outside the try block so the catch's restore call always
     # has a meaningful value (see Install-Uv for the full rationale).
     $prevEAP = $ErrorActionPreference
@@ -1147,13 +1207,13 @@ function Test-Python {
         # semantics or stderr noise.  This fix was previously landed as
         # commit ec1714e71 and then lost in a release squash; reapplied here.
         $ErrorActionPreference = "Continue"
-        $uvOutput = & $UvCmd python install $PythonVersion 2>&1
+        $uvOutput = & $UvCmd python install $installTarget 2>&1
         $uvExitCode = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
 
         # Check if Python is now available (more reliable than exit code
         # since uv may return non-zero due to "already installed" etc.)
-        $pythonPath = & $UvCmd python find $PythonVersion 2>$null
+        $pythonPath = & $UvCmd python find $installTarget 2>$null
         if ($pythonPath) {
             $ver = & $pythonPath --version 2>$null
             Write-Success "Python installed: $ver"
@@ -1175,7 +1235,13 @@ function Test-Python {
     Write-Info "Trying to find any existing Python 3.10+..."
     foreach ($fallbackVer in $PythonFallbackVersions) {
         try {
-            $pythonPath = & $UvCmd python find $fallbackVer 2>$null
+            $pythonPath = $null
+            if ($script:WindowsPythonArch -eq 'arm64') {
+                $pythonPath = & $UvCmd python find "$fallbackVer-aarch64" 2>$null
+            }
+            if (-not $pythonPath) {
+                $pythonPath = & $UvCmd python find $fallbackVer 2>$null
+            }
             if ($pythonPath) {
                 $ver = & $pythonPath --version 2>$null
                 Write-Success "Found fallback: $ver"
@@ -2432,7 +2498,17 @@ function Install-Venv {
         $script:PythonVersion = $resolved
     }
 
-    Write-Info "Creating virtual environment with Python $PythonVersion..."
+    $venvPythonRequest = $PythonVersion
+    if ($script:WindowsPythonArch -eq 'arm64') {
+        # A bare request resolves to the emulated x64 build on
+        # Windows-on-ARM (astral-sh/uv#12906), so pin the native build when
+        # one exists.  Resolve-AvailablePythonVersion probes qualified
+        # requests first, so a resolved version implies the aarch64 build
+        # is available for it; Install-Venv re-resolves in its own process.
+        $venvPythonRequest = "$PythonVersion-aarch64"
+    }
+
+    Write-Info "Creating virtual environment with Python $venvPythonRequest..."
     
     Push-Location $InstallDir
 
@@ -2555,12 +2631,21 @@ function Install-Venv {
     # normal progress such as "Using CPython ..." on stderr; under Windows
     # PowerShell 5.1 with EAP=Stop that stderr is a NativeCommandError unless
     # we temporarily relax EAP and trust $LASTEXITCODE for real failures.
-    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion }
+    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $venvPythonRequest }
     # Relaxing EAP above means a *genuine* uv-venv failure (exit != 0) no longer
     # aborts on its own. Capture $LASTEXITCODE immediately and fail fast, so the
     # `venv` stage can't falsely report success (and Invoke-Stage can't emit
     # ok=true) when the venv was never created.
     $venvExitCode = $LASTEXITCODE
+    # A qualified build can be unavailable for the resolved version (e.g. 3.10
+    # has no aarch64 release, or a stale cache entry). The unqualified request
+    # still lands on the emulated x64 build, which works -- just slower.
+    if ($venvExitCode -ne 0 -and $venvPythonRequest -ne $PythonVersion) {
+        Write-Warn "Creating venv with $venvPythonRequest failed; retrying with $PythonVersion"
+        Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion }
+        $venvExitCode = $LASTEXITCODE
+        $venvPythonRequest = $PythonVersion
+    }
     if ($venvExitCode -ne 0) {
         throw "Failed to create virtual environment (uv venv exited with $venvExitCode)"
     }
@@ -2571,6 +2656,19 @@ function Install-Venv {
     $venvPythonExe = Join-Path $InstallDir "venv\Scripts\python.exe"
     if (-not (Test-Path -LiteralPath $venvPythonExe -PathType Leaf)) {
         throw "uv reported success but venv interpreter is missing at $venvPythonExe"
+    }
+
+    # Surface an emulated interpreter instead of failing the install: uv
+    # falls back to x64 builds on Windows-on-ARM whenever the requested
+    # version has no native aarch64 build (astral-sh/uv#12906).
+    if ($script:WindowsPythonArch -eq 'arm64') {
+        $venvArch = ''
+        try {
+            $venvArch = (& $venvPythonExe -c "import platform; print(platform.machine())" 2>$null) -join ''
+        } catch { }
+        if ($venvArch -and $venvArch -notmatch 'ARM64') {
+            Write-Warn "venv interpreter is $venvArch on a $script:WindowsPythonArch host; it will run under emulation"
+        }
     }
 
     # The replacement has a working interpreter, but the transaction is only
