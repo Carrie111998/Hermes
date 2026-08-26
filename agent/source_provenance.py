@@ -12,7 +12,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
 from hmac import compare_digest
+import os
 from pathlib import Path
+import stat
 from threading import RLock
 from typing import Iterator
 
@@ -23,6 +25,8 @@ from agent.redact import redact_sensitive_text
 
 MAX_SOURCE_SLICE_LINES = 2_000
 MAX_SOURCE_SLICE_BYTES = 262_144
+MAX_GRANTS_PER_REQUEST = 64
+DEFAULT_POLICY_DIGEST = sha256(b"hermes-llm-egress-policy-v1").hexdigest()
 
 
 class SourceProvenanceError(ValueError):
@@ -105,7 +109,8 @@ class SourceProvenanceRegistry:
 
         if not isinstance(path, Path):
             path = Path(path)
-        if path.is_symlink():
+        original_path = Path(path).expanduser()
+        if _contains_symlink_component(original_path):
             raise SourceProvenanceError("symlink_path")
         if not isinstance(content, bytes):
             raise SourceProvenanceError("invalid_content")
@@ -124,42 +129,63 @@ class SourceProvenanceRegistry:
             raise SourceProvenanceError("missing_identity")
 
         try:
-            canonical = path.expanduser().resolve(strict=True)
+            descriptor = _open_verified_source(original_path)
+        except SourceProvenanceError:
+            raise
         except OSError as exc:
             raise SourceProvenanceError("canonical_path_unavailable") from exc
-        if not canonical.is_file():
-            raise SourceProvenanceError("not_regular_file")
         try:
-            if get_read_block_error(str(canonical)) is not None:
-                raise SourceProvenanceError("sensitive_path")
+            canonical = original_path.resolve(strict=True)
+            if not canonical.is_file():
+                raise SourceProvenanceError("not_regular_file")
+            opened_stat = os.fstat(descriptor)
+            named_stat = os.stat(canonical, follow_symlinks=False)
+            if (opened_stat.st_dev, opened_stat.st_ino) != (named_stat.st_dev, named_stat.st_ino):
+                raise SourceProvenanceError("source_changed")
         except SourceProvenanceError:
+            os.close(descriptor)
+            raise
+        except OSError as exc:
+            os.close(descriptor)
+            raise SourceProvenanceError("canonical_path_unavailable") from exc
+        try:
+            blocked = get_read_block_error(str(canonical))
+        except SourceProvenanceError:
+            os.close(descriptor)
             raise
         except Exception as exc:
+            os.close(descriptor)
             raise SourceProvenanceError("read_policy_unavailable") from exc
+        if blocked is not None:
+            os.close(descriptor)
+            raise SourceProvenanceError("sensitive_path")
 
-        approved = _read_bounded_slice(canonical, line_start, line_end)
-        if not compare_digest(sha256(content).digest(), sha256(approved).digest()):
-            raise SourceProvenanceError("content_mismatch")
         try:
-            source_text = approved.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise SourceProvenanceError("non_text_source") from exc
-        try:
-            if redact_sensitive_text(
-                source_text,
-                force=True,
-                file_read=True,
-                redact_url_credentials=True,
-            ) != source_text:
-                raise SourceProvenanceError("redaction_changed_content")
-        except SourceProvenanceError:
-            raise
-        except Exception as exc:
-            raise SourceProvenanceError("redaction_unavailable") from exc
+            approved = _read_bounded_slice_fd(descriptor, line_start, line_end)
+            if not compare_digest(sha256(content).digest(), sha256(approved).digest()):
+                raise SourceProvenanceError("content_mismatch")
+            try:
+                source_text = approved.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise SourceProvenanceError("non_text_source") from exc
+            try:
+                if redact_sensitive_text(
+                    source_text,
+                    force=True,
+                    file_read=True,
+                    redact_url_credentials=True,
+                ) != source_text:
+                    raise SourceProvenanceError("redaction_changed_content")
+            except SourceProvenanceError:
+                raise
+            except Exception as exc:
+                raise SourceProvenanceError("redaction_unavailable") from exc
+        finally:
+            os.close(descriptor)
 
         grant = SourceGrant(
             canonical_path=canonical,
-            display_path=_safe_display_path(canonical),
+            display_path=_safe_display_path(original_path),
             line_start=line_start,
             line_end=line_end,
             content_sha256=sha256(approved).hexdigest(),
@@ -170,8 +196,21 @@ class SourceProvenanceRegistry:
             policy_digest=policy_digest,
         )
         with self._lock:
+            if len(self._grants.get(request_id, ())) >= MAX_GRANTS_PER_REQUEST:
+                raise SourceProvenanceError("grant_limit_exceeded")
             self._grants.setdefault(request_id, []).append(grant)
         return grant
+
+    @contextmanager
+    def request_scope(self, request_id: str) -> Iterator["SourceProvenanceRegistry"]:
+        """Bound grants to one request and clear them on every exit path."""
+
+        if not isinstance(request_id, str) or not request_id:
+            raise SourceProvenanceError("missing_identity")
+        try:
+            yield self
+        finally:
+            self.clear_request(request_id)
 
     def grants_for_request(self, request_id: str) -> tuple[SourceGrant, ...]:
         """Return an immutable snapshot of grants bound to ``request_id``."""
@@ -188,6 +227,63 @@ class SourceProvenanceRegistry:
             return
         with self._lock:
             self._grants.pop(request_id, None)
+
+    def clear_turn(self, turn_id: str) -> None:
+        """Discard every request grant belonging to one completed turn."""
+
+        if not isinstance(turn_id, str) or not turn_id:
+            return
+        with self._lock:
+            stale = [
+                request_id
+                for request_id, grants in self._grants.items()
+                if any(grant.turn_id == turn_id for grant in grants)
+            ]
+            for request_id in stale:
+                self._grants.pop(request_id, None)
+
+
+def provenance_kwargs_for_agent(agent, *, request_id: str | None = None) -> dict[str, object]:
+    """Return authenticated context-reference kwargs for a live agent turn."""
+
+    session_id = str(getattr(agent, "session_id", "") or "")
+    turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+    resolved_request_id = str(
+        request_id
+        or getattr(agent, "_current_api_request_id", "")
+        or (f"{turn_id}:context" if turn_id else "")
+    )
+    policy_digest = str(
+        getattr(agent, "_llm_egress_policy_digest", "")
+        or getattr(agent, "llm_egress_policy_digest", "")
+        or DEFAULT_POLICY_DIGEST
+    )
+    if not all((session_id, turn_id, resolved_request_id, policy_digest)):
+        return {}
+    registry = getattr(agent, "_source_provenance_registry", None)
+    if not isinstance(registry, SourceProvenanceRegistry):
+        registry = SourceProvenanceRegistry()
+        agent._source_provenance_registry = registry
+    return {
+        "source_provenance_registry": registry,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "request_id": resolved_request_id,
+        "policy_digest": policy_digest,
+    }
+
+
+def clear_agent_source_provenance(agent, *, request_id: str | None = None) -> None:
+    """Clear request/turn grants when a caller abandons context expansion."""
+
+    registry = getattr(agent, "_source_provenance_registry", None)
+    if not isinstance(registry, SourceProvenanceRegistry):
+        return
+    resolved_request_id = str(request_id or getattr(agent, "_current_api_request_id", "") or "")
+    if resolved_request_id:
+        registry.clear_request(resolved_request_id)
+        return
+    registry.clear_turn(str(getattr(agent, "_current_turn_id", "") or ""))
 
 
 def _read_bounded_slice(path: Path, line_start: int, line_end: int) -> bytes:
@@ -215,10 +311,72 @@ def _read_bounded_slice(path: Path, line_start: int, line_end: int) -> bytes:
     return b"".join(selected)
 
 
+def _contains_symlink_component(path: Path) -> bool:
+    """Check the original spelling before any resolution can erase a link."""
+
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            if current.is_symlink():
+                return True
+        except OSError as exc:
+            raise SourceProvenanceError("symlink_check_failed") from exc
+    return False
+
+
+def _open_verified_source(path: Path) -> int:
+    """Open once with no-follow semantics and reject non-regular/hardlinked files."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise SourceProvenanceError("not_regular_file")
+        if file_stat.st_nlink != 1:
+            raise SourceProvenanceError("unsafe_hardlink")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_bounded_slice_fd(descriptor: int, line_start: int, line_end: int) -> bytes:
+    """Read complete selected lines from the already-verified descriptor."""
+
+    selected: list[bytes] = []
+    total = 0
+    try:
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if line_number < line_start:
+                    continue
+                if line_number > line_end:
+                    break
+                total += len(line)
+                if total > MAX_SOURCE_SLICE_BYTES:
+                    raise SourceProvenanceError("slice_too_large")
+                selected.append(line)
+    except SourceProvenanceError:
+        raise
+    except OSError as exc:
+        raise SourceProvenanceError("canonical_read_failed") from exc
+    if len(selected) != line_end - line_start + 1:
+        raise SourceProvenanceError("line_range_unavailable")
+    return b"".join(selected)
+
+
 def _safe_display_path(path: Path) -> str:
     """Keep grant metadata portable and free of an absolute home path."""
 
     try:
-        return path.relative_to(Path.cwd().resolve()).as_posix()
+        absolute = path if path.is_absolute() else Path.cwd() / path
+        return absolute.relative_to(Path.cwd().resolve()).as_posix()
     except ValueError:
         return path.name

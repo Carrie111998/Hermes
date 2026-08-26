@@ -38,6 +38,7 @@ def test_registry_issues_only_an_exact_current_canonical_slice(tmp_path: Path):
     assert grant.canonical_path == source.resolve()
     assert (grant.line_start, grant.line_end) == (2, 3)
     assert grant.content_sha256 == sha256(approved).hexdigest()
+    assert grant.display_path == source.name
     assert registry.grants_for_request("request-1") == (grant,)
 
 
@@ -97,6 +98,177 @@ def test_registry_fails_closed_for_symlink_and_redacted_content(tmp_path: Path):
             content=target.read_bytes(),
             **_identity(),
         )
+
+
+def test_registry_rejects_symlinked_parent_before_resolution(tmp_path: Path):
+    from agent.source_provenance import SourceProvenanceError, SourceProvenanceRegistry
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    source = real_dir / "source.py"
+    source.write_text("safe\n", encoding="utf-8")
+    link_dir = tmp_path / "linked"
+    link_dir.symlink_to(real_dir, target_is_directory=True)
+
+    with pytest.raises(SourceProvenanceError, match="symlink"):
+        SourceProvenanceRegistry().issue_file_slice(
+            path=link_dir / "source.py",
+            line_start=1,
+            line_end=1,
+            content=b"safe\n",
+            **_identity(),
+        )
+
+
+def test_registry_rejects_unsafe_hardlink_alias(tmp_path: Path):
+    from agent.source_provenance import SourceProvenanceError, SourceProvenanceRegistry
+
+    source = tmp_path / "source.py"
+    source.write_text("safe\n", encoding="utf-8")
+    alias = tmp_path / "alias.py"
+    alias.hardlink_to(source)
+
+    with pytest.raises(SourceProvenanceError, match="hardlink"):
+        SourceProvenanceRegistry().issue_file_slice(
+            path=source,
+            line_start=1,
+            line_end=1,
+            content=b"safe\n",
+            **_identity(),
+        )
+
+
+def test_registry_never_grants_unseen_or_line_truncated_bytes(tmp_path: Path):
+    from agent.source_provenance import SourceProvenanceError, SourceProvenanceRegistry
+
+    source = tmp_path / "source.py"
+    source.write_text("first\nsecond\n", encoding="utf-8")
+    registry = SourceProvenanceRegistry()
+
+    with pytest.raises(SourceProvenanceError, match="content_mismatch"):
+        registry.issue_file_slice(
+            path=source,
+            line_start=1,
+            line_end=1,
+            content=b"first",  # no newline: not the complete selected line
+            **_identity(),
+        )
+    with pytest.raises(SourceProvenanceError, match="line_range"):
+        registry.issue_file_slice(
+            path=source,
+            line_start=3,
+            line_end=3,
+            content=b"",
+            **_identity(),
+        )
+
+
+def test_registry_bounds_grants_per_request(tmp_path: Path):
+    from agent.source_provenance import SourceProvenanceError, SourceProvenanceRegistry
+
+    source = tmp_path / "source.py"
+    source.write_text("safe\n", encoding="utf-8")
+    registry = SourceProvenanceRegistry()
+    for _ in range(64):
+        registry.issue_file_slice(
+            path=source,
+            line_start=1,
+            line_end=1,
+            content=b"safe\n",
+            **_identity(),
+        )
+    with pytest.raises(SourceProvenanceError, match="grant_limit"):
+        registry.issue_file_slice(
+            path=source,
+            line_start=1,
+            line_end=1,
+            content=b"safe\n",
+            **_identity(),
+        )
+
+
+def test_request_scope_clears_grants_on_success_error_and_cancel(tmp_path: Path):
+    from agent.source_provenance import SourceProvenanceRegistry
+
+    source = tmp_path / "source.py"
+    source.write_text("safe\n", encoding="utf-8")
+    registry = SourceProvenanceRegistry()
+
+    for outcome in ("success", "error", "cancel"):
+        request_id = f"request-{outcome}"
+        with registry.request_scope(request_id):
+            registry.issue_file_slice(
+                path=source,
+                line_start=1,
+                line_end=1,
+                content=b"safe\n",
+                **{**_identity(), "request_id": request_id},
+            )
+            assert registry.grants_for_request(request_id)
+            if outcome == "error":
+                with pytest.raises(RuntimeError):
+                    raise RuntimeError("tool failed")
+            elif outcome == "cancel":
+                with pytest.raises(KeyboardInterrupt):
+                    raise KeyboardInterrupt
+        assert registry.grants_for_request(request_id) == ()
+
+
+def test_registry_can_clear_all_request_grants_for_a_completed_turn(tmp_path: Path):
+    from agent.source_provenance import SourceProvenanceRegistry
+
+    source = tmp_path / "source.py"
+    source.write_text("safe\n", encoding="utf-8")
+    registry = SourceProvenanceRegistry()
+    for request_id in ("request-1", "request-2"):
+        registry.issue_file_slice(
+            path=source,
+            line_start=1,
+            line_end=1,
+            content=b"safe\n",
+            **{**_identity(), "request_id": request_id},
+        )
+    registry.issue_file_slice(
+        path=source,
+        line_start=1,
+        line_end=1,
+        content=b"safe\n",
+        **{**_identity(), "request_id": "other", "turn_id": "other-turn"},
+    )
+
+    registry.clear_turn("turn-1")
+    assert registry.grants_for_request("request-1") == ()
+    assert registry.grants_for_request("request-2") == ()
+    assert registry.grants_for_request("other")
+
+
+def test_provenance_kwargs_for_live_agent_bind_registry_and_request_identity():
+    from agent.source_provenance import (
+        DEFAULT_POLICY_DIGEST,
+        SourceProvenanceRegistry,
+        provenance_kwargs_for_agent,
+    )
+
+    agent = type(
+        "Agent",
+        (),
+        {"session_id": "session-1", "_current_turn_id": "turn-1"},
+    )()
+    kwargs = provenance_kwargs_for_agent(agent)
+
+    assert isinstance(kwargs["source_provenance_registry"], SourceProvenanceRegistry)
+    assert kwargs["session_id"] == "session-1"
+    assert kwargs["turn_id"] == "turn-1"
+    assert kwargs["request_id"] == "turn-1:context"
+    assert kwargs["policy_digest"] == DEFAULT_POLICY_DIGEST
+
+
+def test_cli_and_tui_file_reference_callers_pass_authenticated_provenance():
+    cli_source = Path("cli.py").read_text(encoding="utf-8")
+    tui_source = Path("tui_gateway/server.py").read_text(encoding="utf-8")
+
+    assert "**provenance_kwargs_for_agent(agent)" in cli_source
+    assert "**provenance_kwargs_for_agent(agent)" in tui_source
 
 
 def test_registry_keeps_grants_request_scoped_and_clearable(tmp_path: Path):
