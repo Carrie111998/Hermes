@@ -51,6 +51,7 @@ def test_pull_request_acceptance_executes_both_flag_probe_routes() -> None:
 
     assert "route: [installer, update]" in acceptance
     assert "route: ${{ matrix.route }}" in acceptance
+    assert "install-ref: ${{ matrix.install-ref }}" in acceptance
     assert "include-browser: ${{ matrix.route == 'installer' }}" in acceptance
     assert "include-browser: true" not in acceptance
 
