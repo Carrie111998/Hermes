@@ -1154,54 +1154,57 @@ def _macos_desktop_dr(app: Path) -> str | None:
     return (proc.stdout or "") + (proc.stderr or "")
 
 
-def check_macos_tcc_anchor_removed() -> None:
-    """Detect and repair a venv bricked by the reverted TCC anchor.
+def check_macos_tcc_anchor(should_fix: bool = False) -> None:
+    """macOS TCC anchor check (issue #85345).
 
-    The anchor (#95131/#95478, reverted) replaced ``venv/bin/python`` with a
-    real-file copy of the uv-store interpreter. On real Macs that copy could
-    not start: its ``LC_RPATH`` (``@executable_path/../lib``) resolved to
-    ``venv/lib/``, which holds no libpython — every hermes command died in
-    dyld (#95425), and re-pointed aliases lost the stdlib (#95541). The
-    revert stops NEW anchors; this check heals venvs the anchor already
-    converted, by restoring ``bin/python`` to a symlink pointing at the
-    recorded source interpreter (the marker file the anchor wrote).
-    Silent on non-macOS and on venvs the anchor never touched.
+    TCC keys permission grants to the interpreter's resolved path; uv-managed
+    interpreters move on every patch bump, orphaning grants and re-triggering
+    the permission-prompt storm after each update.  A stable, dylib-complete
+    real-file copy of the interpreter inside the venv keeps the TCC client
+    path constant: libpython is bundled into ``venv/lib/`` so the copy's
+    build-time rpath resolves, and the staged copy is booted once before it
+    replaces the symlink — the failure mode of the first attempt (#95425,
+    #95541) cannot reach a live venv.  Silent on non-macOS; informational
+    when the interpreter already has a stable path.
     """
     if sys.platform != "darwin":
         return
-    # Resolved at call time via the module global so tests can retarget it.
-    root = Path(globals()["__file__"]).resolve().parents[1]
-    for name in ("venv", ".venv"):
-        venv_bin = root / name / "bin"
-        marker = venv_bin / ".tcc-anchor-source"
-        if not marker.is_file():
-            continue
-        try:
-            source = Path(marker.read_text(encoding="utf-8").strip())
-            venv_py = venv_bin / "python"
-            if source.is_file() and venv_py.is_file() and not venv_py.is_symlink():
-                tmp = venv_bin / ".python-unanchor-tmp"
-                tmp.unlink(missing_ok=True)
-                os.symlink(source, tmp)
-                os.replace(tmp, venv_py)
-                # Restore versioned aliases to point at bin/python.
-                for alias in venv_bin.glob("python3*"):
-                    if alias.is_symlink() or alias.is_file():
-                        alias_tmp = venv_bin / f".{alias.name}.unanchor-tmp"
-                        alias_tmp.unlink(missing_ok=True)
-                        os.symlink("python", alias_tmp)
-                        os.replace(alias_tmp, alias)
-            marker.unlink(missing_ok=True)
-            check_ok(
-                "macOS TCC anchor removed",
-                f"({name}/bin/python restored to a symlink; the anchor "
-                "(#95425/#95541) is reverted)",
-            )
-        except Exception as e:  # diagnostics must never crash
-            check_warn(
-                "macOS TCC anchor cleanup failed",
-                f"({e}) — restore manually: ln -sf $(cat {marker}) {venv_bin / 'python'}",
-            )
+    from hermes_cli.macos_tcc_anchor import ensure_tcc_anchor, tcc_anchor_state
+
+    try:
+        status, detail = tcc_anchor_state()
+    except Exception as e:  # diagnostics must never crash
+        check_warn("macOS TCC anchor check failed", f"({e})")
+        return
+    if status == "skip":
+        return
+    if status == "active":
+        check_ok("macOS TCC anchor", f"({detail})")
+        return
+    if status == "stale":
+        if should_fix:
+            ensure_tcc_anchor()
+            status, detail = tcc_anchor_state()
+            if status == "active":
+                check_ok("macOS TCC anchor refreshed", f"({detail})")
+                return
+        check_warn(
+            "macOS TCC anchor stale",
+            f"({detail}) — interpreter changed since the last anchor; "
+            "run `hermes update` or `hermes doctor --fix`",
+        )
+        return
+    # missing — anchor never installed for a uv-managed interpreter.
+    if should_fix:
+        anchored = ensure_tcc_anchor()
+        if anchored is not None:
+            check_ok("macOS TCC anchor installed", f"({anchored})")
+            return
+    check_warn(
+        "macOS TCC anchor missing",
+        "(uv-managed interpreter has no stable path — TCC grants are "
+        "re-prompted after every update; run `hermes doctor --fix`)",
+    )
 
 
 def check_macos_full_disk_access() -> None:
@@ -1423,10 +1426,10 @@ def run_doctor(args):
     else:
         check_warn("Not in virtual environment", "(recommended)")
 
-    # macOS TCC anchor REVERTED (#95425/#95541: anchored copies couldn't load
-    # libpython — every hermes command died in dyld). This heals venvs the
-    # anchor already converted. Silent on non-macOS.
-    check_macos_tcc_anchor_removed()
+    # macOS TCC anchor (issue #85345): a dylib-complete, boot-verified copy of
+    # the interpreter keeps TCC grants stable across updates. Silent on
+    # non-macOS.
+    check_macos_tcc_anchor(should_fix=should_fix)
 
     # macOS Full Disk Access (issue #52010 follow-up): one grant silences
     # every per-folder prompt permanently. Silent on non-macOS.
