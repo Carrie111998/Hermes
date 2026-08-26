@@ -361,4 +361,26 @@ describe('ProvidersSettings', () => {
 
     await waitFor(() => expect(startManualLocalEndpoint).toHaveBeenCalledWith(null))
   })
+
+  it('hides the pool strategy control when a provider has only one subscription', async () => {
+    getCredentialPool.mockResolvedValue({
+      providers: [{
+        provider: 'openai-codex',
+        entries: [
+          {
+            auth_type: 'oauth', has_refresh: true, id: 'personal', index: 1,
+            label: 'Personal', last_status: null, priority: 0, request_count: 0,
+            source: 'manual:device_code', token_preview: ''
+          }
+        ]
+      }],
+      strategies: { 'openai-codex': 'no_failover' }
+    })
+
+    await renderProvidersSettings()
+
+    // A single subscription has no pool to strategize — the control is hidden.
+    expect(screen.queryByRole('combobox', { name: 'Pool strategy for openai-codex' })).toBeNull()
+    expect(screen.getByText('Personal')).toBeTruthy()
+  })
 })

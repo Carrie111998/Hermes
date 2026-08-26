@@ -40,6 +40,12 @@ const GOOGLE_PROVIDER = {
 }
 
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
+const ROUTE_PROVIDER = {
+  models: ['gpt-5-codex', 'gpt-5.1-codex', 'o3'],
+  name: 'WORK — ChatGPT / Codex',
+  slug: 'credential-route:work-codex',
+  credential_route: 'work-codex'
+}
 
 beforeEach(() => {
   $activeSessionId.set('runtime-1')
@@ -399,4 +405,25 @@ describe('ModelMenuPanel provider collapse', () => {
     expect($collapsedProviders.get()).toContain('google')
     expect($collapsedProviders.get()).toContain('deepseek')
   })
+
+
+describe('ModelMenuPanel credential routes', () => {
+  it('renders a credential route as its own provider group, separate from other providers', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [DEEPSEEK_PROVIDER, ROUTE_PROVIDER]
+    })
+
+    const { content } = renderPanel()
+    const { findByText } = content
+
+    // The route appears as a distinct group head...
+    expect(await findByText('WORK — ChatGPT / Codex')).toBeTruthy()
+    // ...and is NOT merged into DeepSeek — that provider's own group is present too.
+    expect(await findByText('DeepSeek')).toBeTruthy()
+    // The two are distinct groups (different slugs), so the route is its own section.
+    const routeGroup = screen.getByText('WORK — ChatGPT / Codex').closest('[role="group"]')
+    const deepseekGroup = screen.getByText('DeepSeek').closest('[role="group"]')
+    expect(routeGroup).not.toBe(deepseekGroup)
+  })
+})
 })

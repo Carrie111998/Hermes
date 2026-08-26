@@ -241,25 +241,26 @@ function OAuthAccountRows({
           <p className="px-3 pt-2 text-[length:var(--conversation-text-font-size)] font-semibold">
             {oauthProvider ? providerTitle(oauthProvider) : provider}
           </p>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-3 py-1">
-            <p className="text-xs text-muted-foreground">{copy.poolStrategy}</p>
-            <Select
-              onValueChange={value => onStrategyChange(provider, value)}
-              value={strategy}
-            >
-              <SelectTrigger
-                aria-label={copy.poolStrategyLabel(oauthProvider ? providerTitle(oauthProvider) : provider)}
-                className="min-w-40"
+          {providerAccounts.length > 1 && (
+            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-3 py-1">
+              <p className="text-xs text-muted-foreground">{copy.poolStrategy}</p>
+              <Select
+                onValueChange={value => onStrategyChange(provider, value)}
+                value={strategy}
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {POOL_STRATEGIES.map(strategy => (
-                  <SelectItem key={strategy} value={strategy}>{copy.poolStrategies[strategy]}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+                <SelectTrigger
+                  aria-label={copy.poolStrategyLabel(oauthProvider ? providerTitle(oauthProvider) : provider)}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {POOL_STRATEGIES.map(strategy => (
+                    <SelectItem key={strategy} value={strategy}>{copy.poolStrategies[strategy]}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           {providerAccounts.map(({ entry }) => {
         const isEditing = editing?.entry.id === entry.id && editing.provider === provider
         const name = entry.label || entry.id || provider
