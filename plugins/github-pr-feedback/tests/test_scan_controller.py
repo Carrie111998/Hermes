@@ -34,7 +34,7 @@ from github_pr_feedback.policy import (
 
 
 def test_scan_admission_budget_covers_a_large_pr_repair_queue() -> None:
-    assert MAX_ADMISSIONS_PER_SCAN >= 64
+    assert MAX_ADMISSIONS_PER_SCAN >= 128
 
 
 class FakeGitHub:
