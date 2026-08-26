@@ -3385,6 +3385,62 @@ _ACCENT = _SkinAwareAnsi("response_border", "#FFD700", bold=True)
 _DIM = "\x1b[2;3m"
 
 
+class _ThinkingAnsi:
+    """Lazy ANSI escape for reasoning/thinking text.
+
+    Resolves from the skin's ``ui_thinking`` color on first use.  When the
+    active skin does not define ``ui_thinking``, emits dim+italic only
+    (``\x1b[2;3m``) so thinking text inherits the terminal's default
+    foreground and stays readable in light and dark terminal modes —
+    including translucent acrylic terminal backgrounds (e.g. Windows
+    Terminal), where a forced hue can wash out against the desktop showing
+    through.  When ``ui_thinking`` IS defined, applies the same dim+italic
+    attributes plus a true-color tint, so skins can pick a high-contrast
+    color for acrylic/light/dark backgrounds without breaking readability.
+    Call ``.reset()`` to re-resolve after a ``/skin`` switch (mirrors
+    ``_SkinAwareAnsi``).
+    """
+
+    def __init__(self) -> None:
+        self._cached: str | None = None
+
+    def __str__(self) -> str:
+        if self._cached is None:
+            self._cached = self._resolve()
+        return self._cached
+
+    def __add__(self, other: str) -> str:
+        return str(self) + other
+
+    def __radd__(self, other: str) -> str:
+        return other + str(self)
+
+    def _resolve(self) -> str:
+        color = ""
+        try:
+            from hermes_cli.skin_engine import get_active_skin
+            color = get_active_skin().get_color("ui_thinking", "")
+        except Exception:
+            color = ""
+        if color:
+            color = _maybe_remap_for_light_mode(color)
+            try:
+                r = int(color[1:3], 16)
+                g = int(color[3:5], 16)
+                b = int(color[5:7], 16)
+                return f"\x1b[2;3;38;2;{r};{g};{b}m"
+            except (ValueError, IndexError):
+                pass
+        return "\x1b[2;3m"
+
+    def reset(self) -> None:
+        """Clear cache so the next access re-reads the skin."""
+        self._cached = None
+
+
+_THINKING = _ThinkingAnsi()
+
+
 def _b(s: str) -> str:
     """Bold if stdout is a real TTY; plain text otherwise (slash-worker safe)."""
     import sys as _sys
@@ -7562,7 +7618,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         if self.verbose:
-            _cprint(f"  {_DIM}[thinking] {preview_text}{_RST}")
+            _cprint(f"  {_THINKING}[thinking] {preview_text}{_RST}")
             return
 
         lines = preview_text.splitlines()
@@ -7571,7 +7627,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             preview += f"\n  ... ({len(lines) - 5} more lines)"
         else:
             preview = preview_text
-        _cprint(f"  {_DIM}[thinking] {preview}{_RST}")
+        _cprint(f"  {_THINKING}[thinking] {preview}{_RST}")
 
     def _flush_reasoning_preview(self, *, force: bool = False) -> None:
         """Flush buffered reasoning text at natural boundaries.
@@ -7709,7 +7765,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             w = self._scrollback_box_width()
             r_label = " Reasoning "
             r_fill = w - 2 - len(r_label)
-            _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
+            _cprint(f"\n{_THINKING}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
 
@@ -7717,9 +7773,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # reasoning is visible in real-time even without newlines.
         while "\n" in self._reasoning_buf:
             line, self._reasoning_buf = self._reasoning_buf.split("\n", 1)
-            _cprint(f"{_DIM}{line}{_RST}")
+            _cprint(f"{_THINKING}{line}{_RST}")
         if len(self._reasoning_buf) > 80:
-            _cprint(f"{_DIM}{self._reasoning_buf}{_RST}")
+            _cprint(f"{_THINKING}{self._reasoning_buf}{_RST}")
             self._reasoning_buf = ""
 
     def _close_reasoning_box(self) -> None:
@@ -7728,10 +7784,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Flush remaining reasoning buffer
             buf = getattr(self, "_reasoning_buf", "")
             if buf:
-                _cprint(f"{_DIM}{buf}{_RST}")
+                _cprint(f"{_THINKING}{buf}{_RST}")
                 self._reasoning_buf = ""
             w = self._scrollback_box_width()
-            _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
+            _cprint(f"{_THINKING}└{'─' * (w - 2)}┘{_RST}")
             self._reasoning_box_opened = False
 
             # Flush any content that was deferred while reasoning was rendering.
@@ -16930,17 +16986,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     w = self._scrollback_box_width()
                     r_label = " Reasoning "
                     r_fill = w - 2 - len(r_label)
-                    r_top = f"{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}"
-                    r_bot = f"{_DIM}└{'─' * (w - 2)}┘{_RST}"
+                    r_top = f"{_THINKING}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}"
+                    r_bot = f"{_THINKING}└{'─' * (w - 2)}┘{_RST}"
                     # Collapse long reasoning to the first 10 lines unless the
                     # user opted into full display via /reasoning full.
                     lines = reasoning.strip().splitlines()
                     if len(lines) > 10 and not getattr(self, "reasoning_full", False):
                         display_reasoning = "\n".join(lines[:10])
-                        display_reasoning += f"\n{_DIM}  ... ({len(lines) - 10} more lines — /reasoning full to show){_RST}"
+                        display_reasoning += f"\n{_THINKING}  ... ({len(lines) - 10} more lines — /reasoning full to show){_RST}"
                     else:
                         display_reasoning = reasoning.strip()
-                    _cprint(f"\n{r_top}\n{_DIM}{display_reasoning}{_RST}\n{r_bot}")
+                    _cprint(f"\n{r_top}\n{_THINKING}{display_reasoning}{_RST}\n{r_bot}")
 
             if response and not response_previewed:
                 # Use skin engine for label/color with fallback
