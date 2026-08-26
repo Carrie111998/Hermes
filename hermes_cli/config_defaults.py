@@ -361,8 +361,16 @@ DEFAULT_CONFIG = {
         # Dict mapping skill/mode name -> effort level (or off/false to disable
         # a skill's own suggestion). When the active skill has a suggestion and
         # its name matches a key here, the user's value wins. Empty by default:
-        # skill frontmatter suggestions pass through unchanged.
+        # skill frontmatter suggestions are INERT unless the user opts in (see
+        # reasoning_by_skill_optin) or sets an explicit value for the skill.
         "reasoning_by_skill": {},
+
+        # Opt-in switch for a skill's own frontmatter suggestion
+        # (`metadata.hermes.reasoning`). When false (default), a skill's
+        # suggestion is treated as inert recommendation data and NEVER raises
+        # effort/spend on its own — only an explicit `reasoning_by_skill[skill]`
+        # value is honored. Set true to let skill frontmatter suggestions fire.
+        "reasoning_by_skill_optin": False,
 
         # Per-provider opt-in to preserve assistant ``reasoning_content``
         # when replaying history.  The built-in echo families (DeepSeek,

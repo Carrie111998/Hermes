@@ -1427,8 +1427,21 @@ def resolve_reasoning_config(
                     # overrides behave on an unrecognized value.
                     skip_skill = True
 
-    # 2. Active skill's own suggestion (user has not overridden/disabled it).
-    if not skip_skill and active_skill and active_skill[1]:
+    # 2. Active skill's own suggestion — OPT-IN ONLY. A skill's
+    #    `metadata.hermes.reasoning` frontmatter is treated as inert
+    #    recommendation data by default: it never fires unless the user has
+    #    explicitly opted in via `agent.reasoning_by_skill_optin: true` (or
+    #    given an explicit `reasoning_by_skill[skill]` value, handled above).
+    #    This upholds the contract: "nothing changes by default" — installing
+    #    or viewing a third-party skill cannot silently raise model effort,
+    #    latency, or spend without user consent.
+    skill_optin = agent_cfg.get("reasoning_by_skill_optin")
+    if (
+        not skip_skill
+        and skill_optin
+        and active_skill
+        and active_skill[1]
+    ):
         parsed = parse_reasoning_effort(active_skill[1])
         if parsed is not None:
             return parsed

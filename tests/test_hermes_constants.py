@@ -513,24 +513,39 @@ class TestResolveReasoningConfigWithSkill:
     > per-model override > global agent.reasoning_effort.
     """
 
-    def _cfg(self, effort="medium", overrides=None, by_skill=None):
+    def _cfg(self, effort="medium", overrides=None, by_skill=None, optin=False):
         return {
             "model": {"default": "gpt-5"},
             "agent": {
                 "reasoning_effort": effort,
                 "reasoning_overrides": overrides or {},
                 "reasoning_by_skill": by_skill or {},
+                "reasoning_by_skill_optin": optin,
             },
         }
 
-    def test_skill_suggestion_beats_global(self):
-        """Active skill suggestion (xhigh) wins over global medium."""
+    def test_skill_suggestion_beats_global_when_opted_in(self):
+        """With explicit `reasoning_by_skill_optin: true`, an active skill's
+        suggestion (xhigh) wins over global medium. (Review #93378 blocker #2:
+        the suggestion must NOT fire without opt-in.)"""
         from hermes_constants import resolve_reasoning_config
-        cfg = self._cfg(effort="medium")
+        cfg = self._cfg(effort="medium", optin=True)
         result = resolve_reasoning_config(
             cfg, "gpt-5", active_skill=("plan", "xhigh")
         )
         assert result == {"enabled": True, "effort": "xhigh"}
+
+    def test_skill_suggestion_inert_without_optin(self):
+        """Reviewer blocker #2 regression: with default config
+        (`reasoning_by_skill_optin` false/absent), a skill declaring xhigh must
+        be INERT — the result is the pre-PR global medium. Installing/viewing a
+        third-party skill must never silently raise effort."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium")  # optin defaults False
+        result = resolve_reasoning_config(
+            cfg, "gpt-5", active_skill=("plan", "xhigh")
+        )
+        assert result == {"enabled": True, "effort": "medium"}
 
     def test_user_reasoning_by_skill_beats_skill_suggestion(self):
         """User config mapping plan->high beats the skill's xhigh suggestion."""
