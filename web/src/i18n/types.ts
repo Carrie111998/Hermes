@@ -17,7 +17,74 @@ export type Locale =
   | "hu"
   | "ar";
 
-import type { WisdomCopy } from "./wisdom-copy";
+export interface WisdomTranslations {
+  tab: string;
+  browseHub: string;
+  title: string;
+  loading: string;
+  unavailable: string;
+  setup: string;
+  setupDisclosure: string;
+  setupAction: string;
+  settingUp: string;
+  scanLocal: string;
+  search: string;
+  potential: string;
+  potentialHelp: string;
+  ownerReview: string;
+  ownerReviewHelp: string;
+  noDrafts: string;
+  prepare: string;
+  continueDraft: string;
+  localOnly: string;
+  qualifiedLocally: string;
+  savedLocally: string;
+  reviewExact: string;
+  draftState: (state: string) => string;
+  serverScanPassed: string;
+  noDescription: string;
+  managedInstalls: string;
+  close: string;
+  readEvery: string;
+  editReview: string;
+  unsavedChanges: string;
+  saveAndRescan: string;
+  savingRevision: string;
+  resetChanges: string;
+  reviewedHashes: string;
+  prepareTitle: string;
+  prepareNotice: string;
+  ownerDescription: string;
+  systemSpecification: string;
+  localOverlay: string;
+  cancel: string;
+  submit: string;
+  submitting: string;
+  publishing: string;
+  approve: string;
+  decline: string;
+  checkUpdates: (count: number) => string;
+  checking: string;
+  activityReady: (count: number) => string;
+  decisionPublished: (skill: string) => string;
+  decisionChanges: (skill: string) => string;
+  decisionDeclined: (skill: string) => string;
+  decisionChanged: (skill: string, state: string) => string;
+  installedNotice: (skill: string, version?: string) => string;
+  updateNotice: (skill: string, version?: string) => string;
+  newSkillNotice: (skill: string) => string;
+  archivedNotice: (skill: string) => string;
+  takedownNotice: (skill: string) => string;
+  markSeen: string;
+  install: string;
+  uninstall: string;
+  checkSkill: string;
+  installed: (version: number, mode: string) => string;
+  confirmAction: (action: string) => string;
+  acceptCompatibility: string;
+  acceptSensitive: string;
+  preserveModified: string;
+}
 
 export interface Translations {
   // ── Common ──
@@ -439,7 +506,7 @@ export interface Translations {
 
   // ── Skills page ──
   skills: {
-    wisdom: WisdomCopy;
+    wisdom: WisdomTranslations;
     title: string;
     searchPlaceholder: string;
     enabledOf: string;

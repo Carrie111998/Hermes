@@ -5,9 +5,99 @@
 // partial locales should use `defineLocale()` so missing desktop-only strings
 // fall back to English while new keys remain type-checked.
 
-import type { WisdomCopy } from './wisdom-copy'
-
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
+
+export interface WisdomTranslations {
+  title: string
+  loading: string
+  unavailable: string
+  setup: string
+  setupDisclosure: string
+  setupAction: string
+  settingUp: string
+  scanLocal: string
+  orgWide: string
+  sharedSkills: (count: number) => string
+  localCandidates: (count: number) => string
+  contributionWorkflow: string
+  potential: string
+  potentialHelp: string
+  ownerReview: string
+  ownerReviewHelp: string
+  noDrafts: string
+  noShared: string
+  noDescription: string
+  serverScanPassed: string
+  localOnly: string
+  qualifiedLocally: string
+  savedLocally: string
+  prepare: string
+  continueDraft: string
+  reviewExact: string
+  openDraft: string
+  draftState: (state: string) => string
+  authoritative: string
+  versionHistory: string
+  prepareTitle: string
+  prepareNotice: string
+  ownerDescription: string
+  systemSpecification: string
+  cancel: string
+  submit: string
+  submitting: string
+  readEvery: string
+  editReview: string
+  editOwnerDescription: string
+  unsavedChanges: string
+  saveAndRescan: string
+  savingRevision: string
+  resetChanges: string
+  reviewedHashes: string
+  ownerReviewExact: string
+  localOverlay: string
+  close: string
+  approve: string
+  publishing: string
+  proposalTitle: string
+  localSuggestion: string
+  proposalNotice: string
+  openCollective: string
+  prepareExact: string
+  specificationNotice: string
+  openFullReview: string
+  sendPrivateReview: string
+  serverEnforced: string
+  localAdvisory: string
+  serverReviewNotice: string
+  decline: string
+  approvePublish: string
+  checkUpdates: (count: number) => string
+  checking: string
+  install: string
+  uninstall: string
+  checkSkill: string
+  installed: (version: number, mode: string) => string
+  confirmAction: (action: string) => string
+  acceptCompatibility: string
+  acceptSensitive: string
+  preserveModified: string
+  alreadyCurrent: string
+  ownerCopyLabel: string
+  serverFactsLabel: string
+  notifications: string
+  activityReady: (count: number) => string
+  aSkill: string
+  decisionPublished: (skill: string) => string
+  decisionChanges: (skill: string) => string
+  decisionDeclined: (skill: string) => string
+  decisionChanged: (skill: string, state: string) => string
+  installedNotice: (skill: string, version?: string) => string
+  updateNotice: (skill: string, version?: string) => string
+  newSkillNotice: (skill: string) => string
+  archivedNotice: (skill: string) => string
+  takedownNotice: (skill: string) => string
+  markSeen: string
+}
 
 export type ToolTitleKey =
   | 'browser_click'
@@ -1071,7 +1161,7 @@ export interface Translations {
   }
 
   skills: {
-    collective: WisdomCopy
+    collective: WisdomTranslations
     tabSkills: string
     tabToolsets: string
     configuringProfile: string

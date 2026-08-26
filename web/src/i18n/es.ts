@@ -1,5 +1,4 @@
 import type { Translations } from "./types";
-import { wisdomCopy } from "./wisdom-copy";
 
 export const es: Translations = {
   common: {
@@ -362,7 +361,89 @@ export const es: Translations = {
   },
 
   skills: {
-    wisdom: wisdomCopy,
+    wisdom: {
+      tab: "Colectivo",
+      browseHub: "Explorar Hub",
+      title: "Sabiduría colectiva",
+      loading: "Cargando Sabiduría colectiva",
+      unavailable: "Sabiduría colectiva no está disponible.",
+      setup: "Sabiduría colectiva no está configurada para este perfil.",
+      setupDisclosure:
+        "La calificación de candidatos permanece en este perfil. Solo llegan al Gateway el contenido del borrador privado aprobado por su propietario, el texto del autor, los metadatos declarativos del manifiesto y el estado de las instalaciones gestionadas.",
+      setupAction: "Entiendo — configurar este perfil",
+      settingUp: "Configurando…",
+      scanLocal: "Analizar habilidades locales",
+      search: "Buscar habilidades compartidas…",
+      potential: "Habilidades que puedes compartir",
+      potentialHelp: "Habilidades locales que aún no se han enviado en su forma actual.",
+      ownerReview: "Tus borradores de contribución",
+      ownerReviewHelp: "Borradores privados y contribuciones que aún requieren tu atención.",
+      noDrafts: "No hay borradores de contribución que requieran tu atención.",
+      prepare: "Iniciar contribución",
+      continueDraft: "Continuar borrador",
+      localOnly: "Disponible para compartir desde este dispositivo",
+      qualifiedLocally: "Hermes identificó esta habilidad local como una posible contribución.",
+      savedLocally: "Hay un borrador privado guardado en este dispositivo.",
+      reviewExact: "Abrir borrador",
+      draftState: (state) => {
+        const labels: Record<string, string> = {
+          vetting: "Revisión del servidor en curso",
+          ready: "Lista para tu revisión",
+          owner_approved: "Aprobada por ti",
+          publishing: "Publicando",
+          pending_moderation: "Esperando la aprobación del administrador del colectivo",
+          changes_requested: "Cambios solicitados",
+        };
+        return labels[state] || state.replaceAll("_", " ");
+      },
+      serverScanPassed: "análisis del servidor superado",
+      noDescription: "No hay descripción escrita por el propietario.",
+      managedInstalls: "instalaciones gestionadas",
+      close: "Cerrar",
+      readEvery:
+        "Lee cada archivo sin procesar. La aprobación queda vinculada a los tres hashes exactos que aparecen abajo.",
+      editReview:
+        "Edita aquí la descripción, SKILL.md o el manifiesto declarativo. Al guardar se crea una nueva revisión privada, se repiten los análisis y se generan nuevos hashes; la habilidad local original no se modifica.",
+      unsavedChanges: "Estos cambios aún no se han analizado. Guarda y vuelve a analizar antes de aprobar.",
+      saveAndRescan: "Guardar cambios y volver a analizar",
+      savingRevision: "Guardando y volviendo a analizar…",
+      resetChanges: "Descartar cambios",
+      reviewedHashes: "Hashes de la revisión analizada actualmente por el servidor",
+      prepareTitle: "Revisar el paquete local antes de subirlo",
+      prepareNotice:
+        "Estos campos permanecen en este perfil hasta que los envíes expresamente a una revisión privada del servidor para el propietario. Nunca se incluyen los recuentos ni los motivos de calificación locales.",
+      ownerDescription: "Descripción escrita por el propietario",
+      systemSpecification: "Especificación del sistema (metadatos declarativos; no se instala ninguna dependencia)",
+      localOverlay: "Capa local",
+      cancel: "Cancelar",
+      submit: "Enviar a revisión privada del servidor",
+      submitting: "Enviando…",
+      publishing: "Publicando…",
+      approve: "Aprobar el contenido exacto y publicar",
+      decline: "Rechazar",
+      checkUpdates: (count) => `Buscar actualizaciones${count ? ` (${count})` : ""}`,
+      checking: "Comprobando…",
+      activityReady: (count) => `${count} ${count === 1 ? "notificación nueva" : "notificaciones nuevas"}`,
+      decisionPublished: (skill) => `${skill} fue aprobada y ahora se comparte con tu equipo.`,
+      decisionChanges: (skill) => `${skill} necesita cambios antes de poder compartirse.`,
+      decisionDeclined: (skill) => `${skill} no fue aprobada para compartir.`,
+      decisionChanged: (skill, state) => `El estado de la contribución ${skill} cambió a ${state}.`,
+      installedNotice: (skill, version) => `${skill}${version ? ` ${version}` : ""} se instaló en este perfil.`,
+      updateNotice: (skill, version) =>
+        `Hay una actualización disponible para ${skill}${version ? ` ${version}` : ""}.`,
+      newSkillNotice: (skill) => `${skill} se compartió con tu colectivo.`,
+      archivedNotice: (skill) => `${skill} ya no está disponible para nuevas instalaciones.`,
+      takedownNotice: (skill) => `${skill} se eliminó del colectivo.`,
+      markSeen: "Marcar todo como leído",
+      install: "Instalar…",
+      uninstall: "Desinstalar…",
+      checkSkill: "Comprobar esta habilidad",
+      installed: (version, mode) => `Instalada v${version} · ${mode}`,
+      confirmAction: (action) => `Confirmar ${action}`,
+      acceptCompatibility: "He revisado y acepto las acciones de compatibilidad.",
+      acceptSensitive: "Acepto expresamente los nuevos requisitos sensibles.",
+      preserveModified: "Conservar primero mi copia modificada como una bifurcación no gestionada.",
+    },
     title: "Habilidades",
     searchPlaceholder: "Buscar habilidades y conjuntos de herramientas...",
     enabledOf: "{enabled}/{total} habilitados",

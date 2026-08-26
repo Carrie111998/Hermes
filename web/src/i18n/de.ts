@@ -1,5 +1,4 @@
 import type { Translations } from "./types";
-import { wisdomCopy } from "./wisdom-copy";
 
 export const de: Translations = {
   common: {
@@ -361,7 +360,89 @@ export const de: Translations = {
   },
 
   skills: {
-    wisdom: wisdomCopy,
+    wisdom: {
+      tab: "Kollektiv",
+      browseHub: "Hub durchsuchen",
+      title: "Kollektives Wissen",
+      loading: "Kollektives Wissen wird geladen",
+      unavailable: "Kollektives Wissen ist nicht verfügbar.",
+      setup: "Kollektives Wissen ist für dieses Profil nicht eingerichtet.",
+      setupDisclosure:
+        "Die Qualifizierung von Kandidaten bleibt in diesem Profil. Nur vom Eigentümer freigegebene private Entwurfsinhalte, Autorentext, deklarative Manifest-Metadaten und der Status verwalteter Installationen erreichen das Gateway.",
+      setupAction: "Verstanden — dieses Profil einrichten",
+      settingUp: "Einrichtung läuft…",
+      scanLocal: "Lokale Skills scannen",
+      search: "Geteilte Skills suchen…",
+      potential: "Skills, die du teilen kannst",
+      potentialHelp: "Lokale Skills, die in ihrer aktuellen Form noch nicht eingereicht wurden.",
+      ownerReview: "Deine Beitragsentwürfe",
+      ownerReviewHelp: "Private Entwürfe und Beiträge, die noch deine Aufmerksamkeit benötigen.",
+      noDrafts: "Keine Beitragsentwürfe benötigen deine Aufmerksamkeit.",
+      prepare: "Beitrag beginnen",
+      continueDraft: "Entwurf fortsetzen",
+      localOnly: "Kann von diesem Gerät geteilt werden",
+      qualifiedLocally: "Hermes hat diesen lokalen Skill als möglichen Beitrag erkannt.",
+      savedLocally: "Ein privater Entwurf ist auf diesem Gerät gespeichert.",
+      reviewExact: "Entwurf öffnen",
+      draftState: (state) => {
+        const labels: Record<string, string> = {
+          vetting: "Serverprüfung läuft",
+          ready: "Bereit für deine Prüfung",
+          owner_approved: "Von dir freigegeben",
+          publishing: "Wird veröffentlicht",
+          pending_moderation: "Wartet auf Freigabe durch die Kollektivverwaltung",
+          changes_requested: "Änderungen angefordert",
+        };
+        return labels[state] || state.replaceAll("_", " ");
+      },
+      serverScanPassed: "Serverprüfung bestanden",
+      noDescription: "Keine vom Eigentümer verfasste Beschreibung.",
+      managedInstalls: "verwaltete Installationen",
+      close: "Schließen",
+      readEvery: "Lies jede Rohdatei. Die Freigabe ist an die drei unten gezeigten exakten Hashes gebunden.",
+      editReview:
+        "Bearbeite hier die Beschreibung, SKILL.md oder das deklarative Manifest. Beim Speichern wird eine neue private Revision erstellt, erneut gescannt und mit neuen Hashes versehen; dein lokaler Quell-Skill wird nicht überschrieben.",
+      unsavedChanges:
+        "Diese Änderungen wurden noch nicht gescannt. Speichere und scanne erneut, bevor du sie freigibst.",
+      saveAndRescan: "Änderungen speichern und neu scannen",
+      savingRevision: "Speichern und erneutes Scannen…",
+      resetChanges: "Änderungen verwerfen",
+      reviewedHashes: "Hashes der aktuell servergeprüften Revision",
+      prepareTitle: "Lokales Paket vor dem Hochladen prüfen",
+      prepareNotice:
+        "Diese Felder bleiben in diesem Profil, bis du sie ausdrücklich zur privaten Serverprüfung durch den Eigentümer einreichst. Lokale Qualifizierungszahlen und -gründe werden nie übermittelt.",
+      ownerDescription: "Vom Eigentümer verfasste Beschreibung",
+      systemSpecification: "Systemspezifikation (deklarative Metadaten; keine Abhängigkeiten werden installiert)",
+      localOverlay: "Lokale Überlagerung",
+      cancel: "Abbrechen",
+      submit: "Zur privaten Serverprüfung einreichen",
+      submitting: "Wird eingereicht…",
+      publishing: "Wird veröffentlicht…",
+      approve: "Exakten Inhalt freigeben und veröffentlichen",
+      decline: "Ablehnen",
+      checkUpdates: (count) => `Updates prüfen${count ? ` (${count})` : ""}`,
+      checking: "Wird geprüft…",
+      activityReady: (count) => `${count} neue ${count === 1 ? "Benachrichtigung" : "Benachrichtigungen"}`,
+      decisionPublished: (skill) => `${skill} wurde freigegeben und wird jetzt mit deinem Team geteilt.`,
+      decisionChanges: (skill) => `${skill} muss vor dem Teilen geändert werden.`,
+      decisionDeclined: (skill) => `${skill} wurde nicht zum Teilen freigegeben.`,
+      decisionChanged: (skill, state) => `Der Beitragsstatus von ${skill} wurde in ${state} geändert.`,
+      installedNotice: (skill, version) =>
+        `${skill}${version ? ` ${version}` : ""} wurde in diesem Profil installiert.`,
+      updateNotice: (skill, version) => `Für ${skill}${version ? ` ${version}` : ""} ist ein Update verfügbar.`,
+      newSkillNotice: (skill) => `${skill} wurde mit deinem Kollektiv geteilt.`,
+      archivedNotice: (skill) => `${skill} ist für neue Installationen nicht mehr verfügbar.`,
+      takedownNotice: (skill) => `${skill} wurde aus dem Kollektiv entfernt.`,
+      markSeen: "Alle als gelesen markieren",
+      install: "Installieren…",
+      uninstall: "Deinstallieren…",
+      checkSkill: "Diesen Skill prüfen",
+      installed: (version, mode) => `Installiert v${version} · ${mode}`,
+      confirmAction: (action) => `${action} bestätigen`,
+      acceptCompatibility: "Ich habe die Kompatibilitätsmaßnahmen geprüft und akzeptiere sie.",
+      acceptSensitive: "Ich akzeptiere die neuen sensiblen Anforderungen ausdrücklich.",
+      preserveModified: "Meine geänderte Kopie zuerst als nicht verwalteten Fork aufbewahren.",
+    },
     title: "Skills",
     searchPlaceholder: "Skills und Toolsets suchen...",
     enabledOf: "{enabled}/{total} aktiviert",

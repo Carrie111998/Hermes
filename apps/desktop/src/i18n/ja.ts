@@ -1,7 +1,6 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
-import { wisdomCopy } from './wisdom-copy'
 
 export const ja = defineLocale({
   common: {
@@ -1136,7 +1135,114 @@ export const ja = defineLocale({
   },
 
   skills: {
-    collective: wisdomCopy,
+    collective: {
+      title: 'コレクティブ・ウィズダム',
+      loading: 'コレクティブ・ウィズダムを読み込み中…',
+      unavailable: 'コレクティブ・ウィズダムは利用できません。',
+      setup: 'このプロファイルではコレクティブ・ウィズダムが設定されていません。',
+      setupDisclosure:
+        '候補の適格性評価はこのプロファイル内に保持されます。所有者が承認した非公開ドラフトの内容、作者の説明、宣言的なマニフェストのメタデータ、管理対象インストールの状態だけが Gateway に送信されます。',
+      setupAction: '理解しました — このプロファイルを設定',
+      settingUp: '設定中…',
+      scanLocal: 'ローカルスキルをスキャン',
+      orgWide: '組織全体のコレクティブ',
+      sharedSkills: count => `共有スキル ${count} 件`,
+      localCandidates: count => `ローカル候補 ${count} 件`,
+      contributionWorkflow: '貢献ワークフロー',
+      potential: '共有できるスキル',
+      potentialHelp: '現在の内容ではまだ提出されていないローカルスキルです。',
+      ownerReview: 'あなたの貢献ドラフト',
+      ownerReviewHelp: 'まだ対応が必要な非公開ドラフトと貢献です。',
+      noDrafts: '対応が必要な貢献ドラフトはありません。',
+      noShared: 'この検索に一致する共有スキルはありません。',
+      noDescription: '所有者による説明はありません',
+      serverScanPassed: 'サーバースキャン合格',
+      localOnly: 'このデバイスから共有できます。',
+      qualifiedLocally: 'Hermes がこのローカルスキルを貢献候補として認識しました。',
+      savedLocally: '非公開ドラフトがこのデバイスに保存されています。',
+      prepare: '貢献を開始',
+      continueDraft: 'ドラフトを続ける',
+      reviewExact: 'ドラフトを開く',
+      openDraft: 'ドラフトを開く',
+      draftState: state => {
+        const labels: Record<string, string> = {
+          vetting: 'サーバーレビュー中',
+          ready: 'レビュー待ち',
+          owner_approved: 'あなたが承認済み',
+          publishing: '公開中',
+          pending_moderation: 'コレクティブ管理者の承認待ち',
+          changes_requested: '変更が必要です'
+        }
+
+        return labels[state] || state.replaceAll('_', ' ')
+      },
+      authoritative: '公開とサーバースキャンの判断は Gateway が正本です。',
+      versionHistory: 'バージョン履歴',
+      prepareTitle: 'アップロード前にローカルパッケージを確認',
+      prepareNotice:
+        'ローカル候補のシグナルは含まれません。「提出」を押すまで、このプロファイルから内容は送信されません。',
+      ownerDescription: '所有者による説明',
+      systemSpecification: 'システム仕様',
+      cancel: 'キャンセル',
+      submit: '所有者限定のサーバーレビューに提出',
+      submitting: '提出中…',
+      readEvery: 'すべてのファイルを確認してください。承認は下記の正確な3つのハッシュに紐づきます。',
+      editReview:
+        'ここで説明、SKILL.md、宣言的マニフェストを編集できます。保存すると新しい非公開リビジョンが作成され、スキャンが再実行されて新しいハッシュが返されます。ローカルの元スキルは書き換えません。',
+      editOwnerDescription: '所有者による説明を編集',
+      unsavedChanges: 'これらの変更はまだスキャンされていません。承認前に保存して再スキャンしてください。',
+      saveAndRescan: '変更を保存して再スキャン',
+      savingRevision: '保存して再スキャン中…',
+      resetChanges: '編集を破棄',
+      reviewedHashes: '現在サーバーでレビュー済みのリビジョンのハッシュ',
+      ownerReviewExact: '所有者がレビューする正確な内容',
+      localOverlay: 'ローカルオーバーレイ',
+      close: '閉じる',
+      approve: '正確な内容を承認して公開',
+      publishing: '公開中…',
+      proposalTitle: 'コレクティブに公開 — 承認が必要',
+      localSuggestion: 'ローカル提案',
+      proposalNotice:
+        'Hermes がこのタスク後に再利用可能なスキルを認識しました。適格性の理由はこのデバイスだけに残り、正確なパッケージを確認して承認するまで何も共有されません。',
+      openCollective: 'コレクティブを開く',
+      prepareExact: '正確なパッケージを準備',
+      specificationNotice: '所有者による説明と宣言的なシステム仕様を確認してください。依存関係の操作は許可されません。',
+      openFullReview: '完全なレビューを開く',
+      sendPrivateReview: '所有者限定のサーバーレビューに送信',
+      serverEnforced: 'サーバーで強制',
+      localAdvisory: 'ローカル助言：提出前の独立スキャン',
+      serverReviewNotice:
+        '下記のすべての生ファイルを確認してください。承認はサーバーが確認した正確なハッシュに紐づきます。',
+      decline: '辞退',
+      approvePublish: '承認して公開',
+      checkUpdates: count => `更新を確認${count ? `（${count}）` : ''}`,
+      checking: '確認中…',
+      install: 'インストール…',
+      uninstall: 'アンインストール…',
+      checkSkill: 'このスキルを確認',
+      installed: (version, mode) => `インストール済み v${version} · ${mode}`,
+      confirmAction: action => `${action}を確認`,
+      acceptCompatibility: '互換性に関する操作を確認し、同意します。',
+      acceptSensitive: '新しい機密要件を明示的に受け入れます。',
+      preserveModified: '先に変更済みコピーを管理対象外のフォークとして保持します。',
+      alreadyCurrent: 'この管理対象スキルはすでに最新です。',
+      ownerCopyLabel: '所有者による説明（プラットフォーム未検証）',
+      serverFactsLabel: 'サーバー強制スキャンとサーバー由来の情報',
+      notifications: 'コレクティブ・ウィズダムの更新',
+      activityReady: count => `新しい通知 ${count} 件`,
+      aSkill: 'コレクティブ・ウィズダムのスキル',
+      decisionPublished: skill => `${skill} は承認され、チームと共有されました。`,
+      decisionChanges: skill => `${skill} は共有前に変更が必要です。`,
+      decisionDeclined: skill => `${skill} は共有が承認されませんでした。`,
+      decisionChanged: (skill, state) => `${skill} の貢献ステータスが ${state} に変わりました。`,
+      installedNotice: (skill, version) =>
+        `${skill}${version ? ` ${version}` : ''} をこのプロファイルにインストールしました。`,
+      updateNotice: (skill, version) => `${skill}${version ? ` ${version}` : ''} の更新を利用できます。`,
+      newSkillNotice: skill => `${skill} がコレクティブに共有されました。`,
+      archivedNotice: skill => `${skill} は新規インストールできなくなりました。`,
+      takedownNotice: skill => `${skill} はコレクティブから削除されました。`,
+      markSeen: 'すべて既読にする'
+    },
     tabCollective: 'コレクティブ',
     searchCollective: 'コレクティブを検索...',
     tabSkills: 'スキル',
