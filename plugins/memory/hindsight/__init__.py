@@ -2783,7 +2783,8 @@ class HindsightMemoryProvider(MemoryProvider):
             for pid in self._find_owned_daemon_pids(manager, profile):
                 if not manager._kill_process(pid):
                     try:
-                        os.kill(pid, signal.SIGKILL)
+                        # SIGKILL is POSIX-only; fall back to SIGTERM elsewhere.
+                        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
                     except OSError:
                         pass
         except Exception as exc:
