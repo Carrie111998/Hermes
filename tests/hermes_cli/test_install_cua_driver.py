@@ -1586,6 +1586,50 @@ class TestWindowsAutostartRepair:
         )
 
     @pytest.mark.windows_only
+    def test_unattended_refresh_skips_autostart_repair_to_avoid_uac(self):
+        """``windows_only``: an unattended refresh (installer_timeout set,
+        e.g. ``hermes update``'s confirmed-upgrade path) passes -NoAutoStart
+        specifically so install.ps1 never self-elevates (#87703) — but
+        ``_repair_cua_driver_autostart_windows`` has its OWN independent
+        elevating branch (Start-Process ... -Verb RunAs -Wait) that used to
+        run unconditionally after ANY successful install, including this one,
+        whenever the scheduled task wasn't already registered (guaranteed by
+        -NoAutoStart on a first-time unattended install). Confirm it's now
+        skipped for installer_timeout is not None, matching the -NoAutoStart
+        tradeoff: the task stays unregistered until the next interactive
+        `computer-use install --upgrade`, instead of popping a hidden UAC
+        prompt inside `hermes update`.
+        """
+        from unittest.mock import MagicMock
+        from hermes_cli import tools_config
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 1
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = ("", None)
+
+        def fake_which(name: str):
+            if name == "cua-driver":
+                return r"C:\Users\Ha Trung\AppData\Local\Programs\Cua\cua-driver\bin\cua-driver.exe"
+            return None
+
+        with patch.object(tools_config.shutil, "which", side_effect=fake_which), \
+             patch("subprocess.Popen", return_value=fake_proc), \
+             patch.object(tools_config, "_clear_stale_cua_install_lock"), \
+             patch.object(tools_config, "_cua_install_lock_held", return_value=False), \
+             patch.object(tools_config, "_cua_release_endpoint_reachable", return_value=True), \
+             patch.object(tools_config, "_repair_cua_driver_autostart_windows", return_value=True) as repair, \
+             patch.object(tools_config, "_print_warning"), \
+             patch.object(tools_config, "_print_info"), \
+             patch.object(tools_config, "_print_success"):
+            ok = tools_config._run_cua_driver_installer(
+                label="Refreshing", verbose=False, installer_timeout=120
+            )
+
+        assert ok is True
+        repair.assert_not_called()
+
+    @pytest.mark.windows_only
     def test_autostart_repair_quotes_username_space_path_via_file_path(self):
         """``windows_only``: same early return off Windows — the elevated
         PowerShell command string is only built on a real Windows host.
