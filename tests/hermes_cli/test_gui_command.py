@@ -938,8 +938,8 @@ def test_desktop_linux_needs_no_sandbox_when_user_namespaces_are_disabled(monkey
 
 
 @pytest.mark.linux_only
-def test_desktop_linux_namespace_probe_allows_app_profile_exception(monkeypatch):
-    """An AppArmor-enabled executable may still be granted user namespaces."""
+def test_desktop_linux_namespace_probe_matches_chromium_identity_mapping(monkeypatch):
+    """AppArmor probe requires Chromium's identity map and second user namespace."""
     monkeypatch.setattr(cli_main.sys, "platform", "linux")
     monkeypatch.setattr(cli_main.os, "geteuid", lambda: 1000)
 
@@ -953,7 +953,15 @@ def test_desktop_linux_namespace_probe_allows_app_profile_exception(monkeypatch)
     with patch("hermes_cli.main.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
         assert cli_main._desktop_linux_needs_no_sandbox() is False
 
-    assert run.call_args.args[0] == ["/usr/bin/unshare", "--user", "--map-root-user", "true"]
+    assert run.call_args.args[0] == [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-current-user",
+        "--",
+        "/usr/bin/unshare",
+        "--user",
+        "true",
+    ]
 
 
 @pytest.mark.linux_only

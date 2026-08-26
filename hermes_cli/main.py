@@ -8051,7 +8051,8 @@ def _desktop_linux_needs_no_sandbox() -> bool:
     ``unprivileged_userns_clone`` sysctl or zero user-namespace limit always
     blocks that path. Ubuntu's AppArmor restriction is more nuanced: a profile
     can explicitly grant an executable ``userns`` access, so on such hosts we
-    probe a throwaway child namespace before requesting the SUID helper.
+    probe the same identity-map and second namespace sequence Chromium uses
+    before requesting the SUID helper.
 
     We intentionally do NOT return True for root users here: running Electron as
     root without a sandbox is a qualitatively riskier path than launching as an
@@ -8092,7 +8093,15 @@ def _desktop_linux_needs_no_sandbox() -> bool:
         return True
     try:
         return subprocess.run(
-            [unshare, "--user", "--map-root-user", "true"],
+            [
+                unshare,
+                "--user",
+                "--map-current-user",
+                "--",
+                unshare,
+                "--user",
+                "true",
+            ],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
