@@ -1,13 +1,17 @@
-// 1) Install the window.hermesDesktop bridge BEFORE any vendored desktop module
-//    evaluates (this import must stay first — see bridge/boot.ts).
+// 1) Mark the native renderer before ANY reused Desktop module chooses a layout.
+//    This has to precede the bridge too: bridge/boot pulls in Desktop code.
+import '~mobile/runtime-marker'
+
+// 2) Install the window.hermesDesktop bridge BEFORE any vendored desktop module
+//    evaluates (see bridge/boot.ts).
 import '~bridge/boot'
 
-// 2) Design system + mobile structural CSS. ./styles.css inlines the desktop
+// 3) Design system + mobile structural CSS. ./styles.css inlines the desktop
 //    design system AND adds the Tailwind @source for the desktop renderer.
 import './styles.css'
 import '~mobile/theme-fallback.css'
 
-// 2b) Mobile-only wording overrides (touch gestures vs mouse/keyboard). Side
+// 3b) Mobile-only wording overrides (touch gestures vs mouse/keyboard). Side
 //     effect; must run before the I18nProvider reads the catalog.
 import '~mobile/i18n-overrides'
 
@@ -29,10 +33,6 @@ import { queryClient } from '@/lib/query-client'
 import { ThemeProvider } from '@/themes/context'
 
 import { MobileRoot } from './app'
-
-// Reused Desktop screens consult this marker to avoid desktop-only auto-focus
-// behavior that would raise Android's IME without an explicit user tap.
-document.documentElement.setAttribute('data-hermes-mobile', '')
 
 installClipboardShim()
 
