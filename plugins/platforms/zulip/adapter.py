@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 # realms may configure a different limit; keep Hermes at the standard maximum
 # so normal responses arrive as one message whenever the realm permits it.
 MAX_MESSAGE_LENGTH = 10_000
+_STANDALONE_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
+_STANDALONE_VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"})
 
 
 # Zulip KaTeX markup:
@@ -2478,24 +2480,40 @@ def _apply_yaml_config(yaml_cfg: dict, zulip_cfg: dict) -> Optional[dict]:
     return extra or None
 
 
+def _iter_standalone_media(media_files) -> List[Tuple[str, bool]]:
+    """Normalize standalone media_files to (path, is_voice) pairs."""
+    items: List[Tuple[str, bool]] = []
+    for item in media_files or []:
+        if isinstance(item, (tuple, list)) and item:
+            path = str(item[0] or "").strip()
+            is_voice = bool(item[1]) if len(item) > 1 else False
+        elif item:
+            path = str(item).strip()
+            is_voice = False
+        else:
+            continue
+        if path:
+            items.append((path, is_voice))
+    return items
+
+
 async def _standalone_send_zulip(
     pconfig: PlatformConfig,
     chat_id: str,
     message: str,
     *,
     thread_id: Optional[str] = None,
-    media_files: Optional[List[str]] = None,
+    media_files: Optional[List] = None,
     force_document: bool = False,
 ) -> dict:
-    """Send a Zulip message from out-of-process callers such as cron."""
-    if media_files:
-        return {
-            "error": (
-                "Zulip standalone sending does not support media attachments "
-                "yet; run the gateway adapter in-process or send text only."
-            )
-        }
+    """Send a Zulip message from out-of-process callers such as cron.
 
+    Text uses ``adapter.send``. Attachments reuse the live adapter upload
+    helpers (``send_image_file`` / ``send_video`` / ``send_document``),
+    which talk to Zulip via a throwaway ``_build_send_client()`` — no
+    event-queue connection required. A media failure is reported in
+    ``warnings`` so the digest still lands.
+    """
     if not check_zulip_requirements(pconfig):
         return {
             "error": (
@@ -2508,18 +2526,65 @@ async def _standalone_send_zulip(
     adapter = ZulipAdapter(pconfig)
     # ``send()`` treats ``_client is not None`` as the connected guard. Standalone
     # sends do not run the long-polling event queue, so mark the adapter ready
-    # without sharing a live event client.
+    # without sharing a live event client. Uploads use ``_build_send_client()``.
     adapter._client = object()
     metadata = {"thread_id": thread_id} if thread_id else None
-    result = await adapter.send(chat_id, message, metadata=metadata)
-    if result.success:
-        return {
-            "success": True,
-            "platform": "zulip",
-            "chat_id": chat_id,
-            "message_id": result.message_id,
-        }
-    return {"error": result.error or "Zulip send failed"}
+    media_items = _iter_standalone_media(media_files)
+    text = (message or "").strip()
+    warnings: List[str] = []
+    last_message_id = None
+    delivered = False
+
+    if text or not media_items:
+        result = await adapter.send(chat_id, message, metadata=metadata)
+        if not result.success:
+            return {"error": result.error or "Zulip send failed"}
+        last_message_id = result.message_id
+        delivered = True
+
+    for path, _is_voice in media_items:
+        ext = Path(path).suffix.lower()
+        try:
+            if not force_document and ext in _STANDALONE_IMAGE_EXTS:
+                result = await adapter.send_image_file(
+                    chat_id, path, metadata=metadata,
+                )
+            elif not force_document and ext in _STANDALONE_VIDEO_EXTS:
+                result = await adapter.send_video(
+                    chat_id, path, metadata=metadata,
+                )
+            else:
+                result = await adapter.send_document(
+                    chat_id, path, metadata=metadata,
+                )
+        except Exception as exc:
+            warning = f"Failed to send media {path}: {exc}"
+            logger.error("Zulip standalone: %s", warning, exc_info=True)
+            warnings.append(warning)
+            continue
+        if result.success:
+            last_message_id = result.message_id or last_message_id
+            delivered = True
+        else:
+            warnings.append(
+                f"Failed to send media {path}: {result.error or 'upload failed'}"
+            )
+
+    if not delivered:
+        error = "No deliverable text or media remained after processing"
+        if warnings:
+            return {"error": error, "warnings": warnings}
+        return {"error": error}
+
+    payload = {
+        "success": True,
+        "platform": "zulip",
+        "chat_id": chat_id,
+        "message_id": last_message_id,
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
 
 
 def interactive_setup() -> None:

@@ -4138,20 +4138,160 @@ class TestZulipPluginHooks:
         assert "preinstall with: pip install 'hermes-agent[zulip]'" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_standalone_sender_rejects_media_with_clear_error(self):
+    async def test_standalone_sender_checks_requirements_before_media_send(self):
         from plugins.platforms.zulip.adapter import _standalone_send_zulip
 
-        with patch("plugins.platforms.zulip.adapter.check_zulip_requirements") as check:
+        config = PlatformConfig(
+            enabled=True,
+            token="zlp_key",
+            extra={
+                "site_url": "https://example.zulipchat.com",
+                "bot_email": "bot@example.com",
+            },
+        )
+
+        with patch("plugins.platforms.zulip.adapter.check_zulip_requirements", return_value=False) as check, \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send", new_callable=AsyncMock) as send, \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send_document", new_callable=AsyncMock) as send_doc:
             result = await _standalone_send_zulip(
-                PlatformConfig(enabled=True),
+                config,
                 "general",
-                "hello",
-                media_files=[("/tmp/file.txt", False)],
+                "digest",
+                media_files=[("/tmp/report.pdf", False)],
             )
 
-        check.assert_not_called()
-        assert "does not support media attachments" in result["error"]
+        check.assert_called_once_with(config)
+        send.assert_not_called()
+        send_doc.assert_not_called()
+        assert "preinstall with: pip install 'hermes-agent[zulip]'" in result["error"]
 
+    @pytest.mark.asyncio
+    async def test_standalone_sender_uploads_pdf_after_text(self):
+        from plugins.platforms.zulip.adapter import _standalone_send_zulip
+
+        config = PlatformConfig(
+            enabled=True,
+            token="zlp_key",
+            extra={
+                "site_url": "https://example.zulipchat.com",
+                "bot_email": "bot@example.com",
+            },
+        )
+
+        async def fake_send(self, chat_id, content, reply_to=None, metadata=None):
+            assert chat_id == "general"
+            assert content == "Q4 digest"
+            assert metadata == {"thread_id": "ops"}
+            return type("Result", (), {
+                "success": True,
+                "message_id": "text-1",
+                "error": None,
+            })()
+
+        async def fake_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, **kwargs):
+            assert chat_id == "general"
+            assert file_path == "/tmp/report.pdf"
+            assert kwargs.get("metadata") == {"thread_id": "ops"}
+            return type("Result", (), {
+                "success": True,
+                "message_id": "doc-1",
+                "error": None,
+            })()
+
+        with patch("plugins.platforms.zulip.adapter.check_zulip_requirements", return_value=True), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send", fake_send), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send_document", fake_document), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send_image_file", new_callable=AsyncMock) as send_img:
+            result = await _standalone_send_zulip(
+                config,
+                "general",
+                "Q4 digest",
+                thread_id="ops",
+                media_files=[("/tmp/report.pdf", False)],
+            )
+
+        send_img.assert_not_called()
+        assert result["success"] is True
+        assert result["message_id"] == "doc-1"
+        assert "error" not in result
+        assert "warnings" not in result
+
+    @pytest.mark.asyncio
+    async def test_standalone_sender_routes_png_to_send_image_file(self):
+        from plugins.platforms.zulip.adapter import _standalone_send_zulip
+
+        config = PlatformConfig(
+            enabled=True,
+            token="zlp_key",
+            extra={
+                "site_url": "https://example.zulipchat.com",
+                "bot_email": "bot@example.com",
+            },
+        )
+
+        async def fake_send(self, chat_id, content, reply_to=None, metadata=None):
+            return type("Result", (), {
+                "success": True, "message_id": "text-1", "error": None,
+            })()
+
+        async def fake_image(self, chat_id, image_path, caption=None, reply_to=None, **kwargs):
+            assert image_path == "/tmp/chart.png"
+            return type("Result", (), {
+                "success": True, "message_id": "img-1", "error": None,
+            })()
+
+        with patch("plugins.platforms.zulip.adapter.check_zulip_requirements", return_value=True), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send", fake_send), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send_image_file", fake_image), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send_document", new_callable=AsyncMock) as send_doc:
+            result = await _standalone_send_zulip(
+                config,
+                "general",
+                "see chart",
+                media_files=[("/tmp/chart.png", False)],
+            )
+
+        send_doc.assert_not_called()
+        assert result["success"] is True
+        assert result["message_id"] == "img-1"
+
+    @pytest.mark.asyncio
+    async def test_standalone_sender_keeps_text_when_media_fails(self):
+        from plugins.platforms.zulip.adapter import _standalone_send_zulip
+
+        config = PlatformConfig(
+            enabled=True,
+            token="zlp_key",
+            extra={
+                "site_url": "https://example.zulipchat.com",
+                "bot_email": "bot@example.com",
+            },
+        )
+
+        async def fake_send(self, chat_id, content, reply_to=None, metadata=None):
+            return type("Result", (), {
+                "success": True, "message_id": "text-1", "error": None,
+            })()
+
+        async def fake_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, **kwargs):
+            return type("Result", (), {
+                "success": False, "message_id": None, "error": "File upload failed",
+            })()
+
+        with patch("plugins.platforms.zulip.adapter.check_zulip_requirements", return_value=True), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send", fake_send), \
+             patch("plugins.platforms.zulip.adapter.ZulipAdapter.send_document", fake_document):
+            result = await _standalone_send_zulip(
+                config,
+                "general",
+                "digest",
+                media_files=[("/tmp/report.pdf", False)],
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "text-1"
+        assert "error" not in result
+        assert any("report.pdf" in w and "upload failed" in w.lower() for w in result["warnings"])
 
 # ---------------------------------------------------------------------------
 # Rich delivery: media / send helpers
