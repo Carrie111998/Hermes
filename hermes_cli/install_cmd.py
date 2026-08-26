@@ -126,12 +126,27 @@ def cmd_install_shellctl(args: argparse.Namespace) -> int:
     port = int(getattr(args, "port", _DEFAULT_PORT) or _DEFAULT_PORT)
     host_hint = getattr(args, "ssh_host", "") or "your-hermes-host"
     allowed_root = str(getattr(args, "allowed_root", "") or "").strip()
-    if not allowed_root:
+    max_capture_secs = getattr(args, "max_open_capture_secs", None)
+    if not allowed_root or max_capture_secs is None:
         from hermes_cli.config import load_config
 
         shellctl_cfg = (load_config() or {}).get("shellctl") or {}
         if isinstance(shellctl_cfg, dict):
-            allowed_root = str(shellctl_cfg.get("allowed_root") or "").strip()
+            if not allowed_root:
+                allowed_root = str(shellctl_cfg.get("allowed_root") or "").strip()
+            if max_capture_secs is None:
+                max_capture_secs = shellctl_cfg.get("max_open_capture_secs", 300)
+    try:
+        max_capture_secs = int(max_capture_secs if max_capture_secs is not None else 300)
+    except (TypeError, ValueError):
+        print("error: shellctl.max_open_capture_secs must be an integer", file=sys.stderr)
+        return 2
+    if not 1 <= max_capture_secs <= 3600:
+        print(
+            "error: shellctl.max_open_capture_secs must be between 1 and 3600",
+            file=sys.stderr,
+        )
+        return 2
 
     token_file = _token_file()
     bridge_file = _bridge_file()
@@ -140,14 +155,15 @@ def cmd_install_shellctl(args: argparse.Namespace) -> int:
     remote_token_cmd = "cat " + shlex.quote(str(token_file))
     daemon_cmd = (
         "python3 ~/.hermes-shellctl daemon --port %d "
-        "--token-file ~/.hermes-shellctl-token" % port
+        "--token-file ~/.hermes-shellctl-token "
+        "--max-open-capture-secs %d" % (port, max_capture_secs)
     )
     if allowed_root:
         daemon_cmd += " --allowed-root " + shlex.quote(allowed_root)
 
     bar = "=" * 72
     print(bar)
-    print(" Hermes shellctl: SSH file and image bridge")
+    print(" Hermes shellctl: SSH file, image, and audio bridge")
     print(bar)
     print()
     print("The bridge token is a shared secret stored only in:")
@@ -186,7 +202,8 @@ def cmd_install_shellctl(args: argparse.Namespace) -> int:
     print("session already owns that RemoteForward. Close the old session or")
     print("choose a different --port, update both endpoints, and reinstall.")
     print()
-    print("Then in the TUI: /get <local-path>, /send <file>, or /paste")
+    print("Then in the TUI use /get, /send, or /paste. For audio, run")
+    print("hermes-shellbridge say/listen/listen-start/listen-stop/stop-play.")
     print(bar)
 
     # Persist the resolved config so host bridge callers can load it.
@@ -227,6 +244,15 @@ def register_cli(install_parser: argparse.ArgumentParser) -> None:
         help=(
             "restrict client-side pulls to this directory tree; defaults "
             "to shellctl.allowed_root in config.yaml"
+        ),
+    )
+    sc.add_argument(
+        "--max-open-capture-secs",
+        type=int,
+        default=None,
+        help=(
+            "maximum open microphone capture duration; defaults to "
+            "shellctl.max_open_capture_secs in config.yaml, then 300 seconds"
         ),
     )
     sc.add_argument(

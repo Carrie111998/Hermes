@@ -1,20 +1,19 @@
-# Hermes shellctl — SSH-layer file & image bridge
+# Hermes shellctl: SSH file, image, and audio bridge
 
-Move **images, PDFs, and any file** between the Hermes host (the box you
-SSH into, running the TUI) and **your local machine** — over your
-**existing SSH connection**, with no extra tunnel, no ControlMaster
-requirement, and no dependency on iTerm2 / a specific terminal / a
-specific OS.
+Move images, PDFs, arbitrary files, microphone input, and speaker output between
+the Hermes host (the box you SSH into, running the TUI) and **your local
+machine** over your **existing SSH connection**, with no extra tunnel, no
+ControlMaster requirement, and no dependency on iTerm2, a specific terminal,
+or a specific OS.
 
 Works on macOS, Linux, WSL, and any host that runs `ssh` (PuTTY
 included). The client is a **single zero-dependency Python 3 file**
 (stdlib only) — installs on a locked-down corporate Mac with no
 admin/sudo and no package manager.
 
-> This bridge is one slice of a general SSH media bridge. This branch
-> ships the **file/image** transfer path. The **audio** path (TTS +
-> mic) is a sibling feature that reuses the same daemon + install
-> scaffolding.
+> This bridge now includes the file/image foundation and the stacked audio
+> extension. Audio routes gateway TTS to local speakers and local microphone
+> capture back to gateway STT through the same authenticated daemon.
 
 ## Why this exists
 
@@ -73,12 +72,15 @@ host before running the installer:
 ```yaml
 shellctl:
   allowed_root: ~/Documents/hermes-share
+  max_open_capture_secs: 300
 ```
 
 The path is interpreted on the SSH client machine. You can override it for one
 installation with `hermes install shellctl --allowed-root <client-path>`. The
 installer adds `--allowed-root` to the generated daemon command. Symlinks that
-resolve outside the root are rejected.
+resolve outside the root are rejected. `max_open_capture_secs` defaults to five
+minutes and accepts values from 1 through 3600 seconds. The installer passes it
+to the client daemon as `--max-open-capture-secs`.
 
 ## Use (in the TUI)
 
@@ -87,6 +89,11 @@ resolve outside the root are rejected.
 | `/get <local-path>` | Pull a file FROM your machine; auto-attaches it to the turn (image/pdf/any) |
 | `/paste` | Pull your machine's **clipboard image/file** and attach it |
 | `/send <host-path>` | Push a Hermes-side file TO your machine and open it locally |
+| `hermes-shellbridge say <text>` | Generate gateway TTS and play it on your local speakers |
+| `hermes-shellbridge listen [secs]` | Record your local microphone and send the WAV to gateway STT |
+| `hermes-shellbridge listen-start` | Begin a local microphone capture, bounded by the configured maximum |
+| `hermes-shellbridge listen-stop` | Stop the open capture and send it to gateway STT |
+| `hermes-shellbridge stop-play` | Interrupt local playback with a short silent WAV |
 
 Image files land in the gateway images dir and carry an `/image` hint so
 the TUI attaches them as visual content; everything else lands in the
@@ -115,7 +122,15 @@ Possession of that token plus access to the listener grants the ability to:
   unless `shellctl.allowed_root` or `--allowed-root` restricts it;
 * read clipboard file or image content through `/clipboard`;
 * write files into the configured download directory and request that the OS
-  open them through `/push`.
+  open them through `/push`;
+* play supplied audio through local speakers and activate the local microphone
+  remotely through `/record` or `/record-start`. Token possession therefore
+  permits remote microphone activation while the daemon is running.
+
+A compromised Hermes host can obtain the token and activate the microphone
+without another local confirmation. Each open capture stops after the configured
+maximum even if no stop request arrives. Daemon shutdown and a failed start
+response also terminate the recorder and delete its temporary WAV.
 
 The listener binds to `127.0.0.1`, but the SSH `RemoteForward` deliberately
 makes it reachable from the Hermes host. A process on a compromised Hermes host
@@ -125,8 +140,10 @@ Hermes host. The optional allowed root limits file pulls, but it does not remove
 clipboard or push access. Do not run the bridge for an untrusted host. Stop the
 daemon and SSH session to remove access.
 
-Each transfer is capped at 64 MB. Existing destination files are never
-replaced; shellctl allocates a numbered filename instead.
+Each transfer and captured WAV is capped at 64 MB. The daemon checks a capture's
+size before reading it, and the host bridge bounds response reads as a second
+line of defense. Existing destination files are never replaced; shellctl
+allocates a numbered filename instead.
 
 ## RemoteForward troubleshooting
 

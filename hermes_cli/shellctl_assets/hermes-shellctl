@@ -21,9 +21,12 @@ Run:  hermes-shellctl daemon --port 8765 --token-file <path>
 The token is a bearer credential for every endpoint. A caller with the token
 and listener access can pull any file readable by this process unless
 ``--allowed-root`` is set, read clipboard content, and push files into the
-download directory. The SSH reverse forward intentionally gives the remote
-Hermes host listener access, so a compromised host is inside this trust
-boundary.
+download directory. The audio extension also lets that caller play audio and
+activate the local microphone remotely. Token possession permits remote
+microphone activation, and compromise of the Hermes host permits eavesdropping
+while the daemon and SSH reverse forward are running. The SSH reverse forward
+intentionally gives the remote Hermes host listener access, so a compromised
+host is inside this trust boundary.
 """
 from __future__ import annotations
 
@@ -33,9 +36,11 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -47,6 +52,14 @@ _TOKEN = ""
 _DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
 _ALLOWED_ROOT = ""
 _MAX_BYTES = 64 * 1024 * 1024  # 64 MB cap per transfer
+_MAX_AUDIO_BYTES = 64 * 1024 * 1024
+_MAX_OPEN_CAPTURE_SECS = 300
+_MAX_CONFIGURED_CAPTURE_SECS = 3600
+_AUDIO_EXTENSIONS = frozenset({"aac", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "wav"})
+_OPEN_CAPTURE = {
+    "out_wav": None, "active": False, "process": None, "watchdog": None,
+}
+_CAPTURE_LOCK = threading.Lock()
 
 
 class _BodyTooLarge(ValueError):
@@ -287,6 +300,223 @@ def _clipboard_grab():
         return None, None, None, "install xclip for clipboard images"
 
 
+def _play_audio(path):
+    if _IS_MAC:
+        player = _which("afplay")
+        args = [player, path] if player else None
+    else:
+        player = _which("paplay", "aplay", "ffplay", "mpv")
+        if player and player.endswith("ffplay"):
+            args = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+        else:
+            args = [player, path] if player else None
+    if not args:
+        return False, "no audio player found"
+    try:
+        subprocess.run(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=600,
+        )
+        return True, "played"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
+def _find_micrec():
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "micrec"),
+        os.path.expanduser("~/.hermes/shellctl/micrec"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _record_mic(seconds):
+    seconds = max(1, min(seconds, 120))
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        if _IS_MAC:
+            recorder = _find_micrec()
+            if recorder:
+                args = [recorder, tmp.name, str(seconds)]
+            else:
+                recorder = _which("rec", "sox")
+                if recorder:
+                    args = [recorder, "-q", "-d", tmp.name, "trim", "0", str(seconds)]
+                else:
+                    ffmpeg = _which("ffmpeg")
+                    if not ffmpeg:
+                        return None, "no recorder (install sox or ffmpeg)"
+                    args = [
+                        ffmpeg, "-y", "-f", "avfoundation", "-i", ":default",
+                        "-t", str(seconds), "-loglevel", "quiet", tmp.name,
+                    ]
+        else:
+            recorder = _which("arecord")
+            if recorder:
+                args = [
+                    recorder, "-q", "-d", str(seconds), "-f", "cd", tmp.name,
+                ]
+            else:
+                ffmpeg = _which("ffmpeg")
+                if not ffmpeg:
+                    return None, "no recorder (install alsa-utils or ffmpeg)"
+                args = [
+                    ffmpeg, "-y", "-f", "pulse", "-i", "default", "-t",
+                    str(seconds), "-loglevel", "quiet", tmp.name,
+                ]
+        subprocess.run(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=seconds + 15,
+        )
+        return _read_audio_file(tmp.name)
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def _read_audio_file(path):
+    """Read a captured WAV without allowing an unbounded allocation."""
+    size = os.path.getsize(path)
+    if size > _MAX_AUDIO_BYTES:
+        return None, "capture exceeds %d byte limit" % _MAX_AUDIO_BYTES
+    with open(path, "rb") as stream:
+        data = stream.read(_MAX_AUDIO_BYTES + 1)
+    if len(data) > _MAX_AUDIO_BYTES:
+        return None, "capture exceeds %d byte limit" % _MAX_AUDIO_BYTES
+    if not data:
+        return None, "capture produced no audio"
+    return data, "ok"
+
+
+def _claim_open_capture(expected_process=None):
+    """Atomically detach one capture so only one caller can clean it up."""
+    with _CAPTURE_LOCK:
+        if not _OPEN_CAPTURE["active"]:
+            return None
+        if (
+            expected_process is not None
+            and _OPEN_CAPTURE["process"] is not expected_process
+        ):
+            return None
+        claimed = dict(_OPEN_CAPTURE)
+        _OPEN_CAPTURE.update({
+            "active": False, "out_wav": None, "process": None,
+            "watchdog": None,
+        })
+    watchdog = claimed.get("watchdog")
+    if watchdog is not None:
+        watchdog.cancel()
+    return claimed
+
+
+def _terminate_process(process):
+    """Terminate a recorder and escalate to kill if it does not exit."""
+    try:
+        process.terminate()
+        process.wait(timeout=10)
+    except Exception:  # noqa: BLE001
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _discard_open_capture(expected_process=None):
+    """Stop and remove a capture without returning its audio."""
+    claimed = _claim_open_capture(expected_process)
+    if claimed is None:
+        return False
+    _terminate_process(claimed["process"])
+    try:
+        os.unlink(claimed["out_wav"])
+    except OSError:
+        pass
+    return True
+
+
+def _record_start_open():
+    """Start one bounded open capture while holding the state lock."""
+    with _CAPTURE_LOCK:
+        if _OPEN_CAPTURE["active"]:
+            return False, "capture already active", None
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        if _IS_MAC:
+            recorder = _which("rec", "sox")
+            if recorder:
+                args = [recorder, "-q", "-d", tmp.name]
+            else:
+                recorder = _which("ffmpeg")
+                args = (
+                    [
+                        recorder, "-y", "-f", "avfoundation", "-i",
+                        ":default", "-loglevel", "quiet", tmp.name,
+                    ]
+                    if recorder else None
+                )
+        else:
+            recorder = _which("arecord")
+            if recorder:
+                args = [recorder, "-q", "-f", "cd", tmp.name]
+            else:
+                recorder = _which("ffmpeg")
+                args = (
+                    [
+                        recorder, "-y", "-f", "pulse", "-i", "default",
+                        "-loglevel", "quiet", tmp.name,
+                    ]
+                    if recorder else None
+                )
+        if not args:
+            os.unlink(tmp.name)
+            return False, "no recorder available", None
+        try:
+            process = subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as exc:  # noqa: BLE001
+            os.unlink(tmp.name)
+            return False, str(exc), None
+        watchdog = threading.Timer(
+            _MAX_OPEN_CAPTURE_SECS, _discard_open_capture, args=(process,)
+        )
+        watchdog.daemon = True
+        _OPEN_CAPTURE.update({
+            "active": True, "out_wav": tmp.name, "process": process,
+            "watchdog": watchdog,
+        })
+    watchdog.start()
+    return True, "recording", process
+
+
+def _record_stop_open():
+    """Claim and stop the active capture without racing another request."""
+    claimed = _claim_open_capture()
+    if claimed is None:
+        return None, "no open capture"
+    process = claimed["process"]
+    out_wav = claimed["out_wav"]
+    try:
+        _terminate_process(process)
+        return _read_audio_file(out_wav)
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+    finally:
+        try:
+            os.unlink(out_wav)
+        except OSError:
+            pass
+
+
 def _capabilities():
     return {
         "open": bool(
@@ -294,6 +524,10 @@ def _capabilities():
         ),
         "clipboard": bool(
             _which("pngpaste") or _IS_MAC or _which("xclip")
+        ),
+        "play": bool(_which("afplay", "paplay", "aplay", "ffplay", "mpv")),
+        "record": bool(
+            _find_micrec() or _which("rec", "sox", "arecord", "ffmpeg")
         ),
     }
 
@@ -320,13 +554,17 @@ class _Handler(BaseHTTPRequestHandler):
             raw if raw is not None
             else json.dumps(payload or {}).encode()
         )
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra_headers or {}).items():
-            self.send_header(k, str(v))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
 
     def _read_body(self):
         raw_length = self.headers.get("Content-Length")
@@ -416,7 +654,61 @@ class _Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if not self._auth_ok():
             return self._send(401, {"error": "unauthorized"})
-        q = parse_qs(u.query)
+        q = parse_qs(u.query, keep_blank_values=True)
+        if u.path == "/play":
+            try:
+                data = self._read_body()
+            except _BodyTooLarge:
+                return self._send(413, {"error": "request body too large"})
+            except _MalformedBody as exc:
+                return self._send(400, {"error": str(exc)})
+            if not data:
+                return self._send(400, {"error": "empty body"})
+            extension = (q.get("fmt") or ["mp3"])[0].lower().lstrip(".")
+            if extension not in _AUDIO_EXTENSIONS:
+                return self._send(400, {"error": "unsupported audio format"})
+            tmp = tempfile.NamedTemporaryFile(
+                suffix="." + extension, delete=False
+            )
+            try:
+                tmp.write(data)
+                tmp.close()
+                ok, msg = _play_audio(tmp.name)
+                return self._send(
+                    200 if ok else 500, {"ok": ok, "msg": msg}
+                )
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        if u.path == "/record":
+            raw_seconds = (q.get("secs") or ["8"])[0]
+            try:
+                seconds = int(raw_seconds)
+            except (TypeError, ValueError):
+                return self._send(400, {"error": "secs must be an integer"})
+            if not 1 <= seconds <= 120:
+                return self._send(400, {"error": "secs must be between 1 and 120"})
+            data, msg = _record_mic(seconds)
+            if data is None:
+                code = 413 if "byte limit" in msg else 500
+                return self._send(code, {"error": msg})
+            return self._send(200, raw=data, ctype="audio/wav")
+        if u.path == "/record-start":
+            ok, msg, process = _record_start_open()
+            if not ok:
+                return self._send(409, {"error": msg})
+            sent = self._send(200, {"ok": True, "status": msg})
+            if not sent:
+                _discard_open_capture(process)
+            return sent
+        if u.path == "/record-stop":
+            data, msg = _record_stop_open()
+            if data is None:
+                code = 413 if "byte limit" in msg else 409
+                return self._send(code, {"error": msg})
+            return self._send(200, raw=data, ctype="audio/wav")
         if u.path == "/push":
             name = (
                 os.path.basename(
@@ -478,7 +770,7 @@ def _read_token_file(path):
 
 
 def cmd_daemon(args):
-    global _TOKEN, _DOWNLOAD_DIR, _ALLOWED_ROOT
+    global _TOKEN, _DOWNLOAD_DIR, _ALLOWED_ROOT, _MAX_OPEN_CAPTURE_SECS
     _TOKEN = args.token or _read_token_file(args.token_file) or os.environ.get(
         "HERMES_SHELLCTL_TOKEN", ""
     )
@@ -500,7 +792,24 @@ def cmd_daemon(args):
             )
             return 2
         _ALLOWED_ROOT = root
+    if not 1 <= args.max_open_capture_secs <= _MAX_CONFIGURED_CAPTURE_SECS:
+        print(
+            "FATAL: max open capture seconds must be between 1 and %d"
+            % _MAX_CONFIGURED_CAPTURE_SECS,
+            file=sys.stderr,
+        )
+        return 2
+    _MAX_OPEN_CAPTURE_SECS = args.max_open_capture_secs
     srv = ThreadingHTTPServer((args.host, args.port), _Handler)
+    old_signal_handlers = {}
+
+    def stop_daemon(signum, frame):
+        raise KeyboardInterrupt
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+            if signum is not None:
+                old_signal_handlers[signum] = signal.signal(signum, stop_daemon)
     print(
         "hermes-shellctl %s listening on %s:%d (%s, caps=%s)" % (
             SHELLCTL_VERSION,
@@ -515,6 +824,11 @@ def cmd_daemon(args):
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        _discard_open_capture()
+        srv.server_close()
+        for signum, handler in old_signal_handlers.items():
+            signal.signal(signum, handler)
     return 0
 
 
@@ -529,6 +843,12 @@ def main(argv=None):
     d.add_argument("--token", default="")
     d.add_argument("--token-file", default="")
     d.add_argument("--download-dir", default="")
+    d.add_argument(
+        "--max-open-capture-secs",
+        type=int,
+        default=_MAX_OPEN_CAPTURE_SECS,
+        help="stop an unclosed microphone capture after this many seconds",
+    )
     d.add_argument(
         "--allowed-root",
         default="",

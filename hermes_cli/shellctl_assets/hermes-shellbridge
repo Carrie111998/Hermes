@@ -22,6 +22,7 @@ with a plain-path hint. stdlib only.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import time
@@ -29,29 +30,24 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 
+from hermes_constants import get_hermes_home
+
 CLIENT_URL = os.environ.get(
     "HERMES_SHELLCTL_URL", "http://127.0.0.1:8765"
 )
 _CLIENT_TOK_VAR = "HERMES_SHELLCTL_" + "TOKEN"
 CLIENT_TOKEN = os.environ.get(_CLIENT_TOK_VAR, "")
+_HERMES_HOME = get_hermes_home()
 IMAGES_DIR = os.environ.get(
-    "HERMES_SHELLBRIDGE_IMAGES_DIR",
-    os.path.join(
-        os.path.expanduser(
-            os.environ.get("HERMES_HOME", "~/.hermes")
-        ),
-        "images",
-    ),
+    "HERMES_SHELLBRIDGE_IMAGES_DIR", str(_HERMES_HOME / "images")
 )
 FILES_DIR = os.environ.get(
-    "HERMES_SHELLBRIDGE_FILES_DIR",
-    os.path.join(
-        os.path.expanduser(
-            os.environ.get("HERMES_HOME", "~/.hermes")
-        ),
-        "downloads",
-    ),
+    "HERMES_SHELLBRIDGE_FILES_DIR", str(_HERMES_HOME / "downloads")
 )
+DASH_URL = os.environ.get("HERMES_DASHBOARD_URL", "http://127.0.0.1:9192")
+_DASH_TOK_VAR = "HERMES_DASHBOARD_SESSION_" + "TOKEN"
+DASH_TOKEN = os.environ.get(_DASH_TOK_VAR, "")
+_MAX_AUDIO_BYTES = 64 * 1024 * 1024
 
 # Image extensions that should land in IMAGES_DIR + carry an `/image`
 # hint so the TUI attaches them as visual content. Everything else is
@@ -222,6 +218,184 @@ def cmd_send(args):
         return 1
 
 
+def _dash_req(method, path, body=None, ctype="application/json", timeout=130):
+    req = urllib.request.Request(DASH_URL + path, data=body, method=method)
+    if DASH_TOKEN:
+        req.add_header("X-Hermes-Session-Token", DASH_TOKEN)
+    if body is not None:
+        req.add_header("Content-Type", ctype)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _strip_markdown_for_speech(text):
+    """Remove common Markdown syntax before sending text to TTS."""
+    import re
+
+    result = re.sub(r"```[\s\S]*?```", " ", text)
+    result = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", result)
+    result = re.sub(r"https?://\S+", "", result)
+    result = re.sub(r"\*\*(.+?)\*\*", r"\1", result)
+    result = re.sub(r"\*(.+?)\*", r"\1", result)
+    result = re.sub(r"`(.+?)`", r"\1", result)
+    result = re.sub(r"^#+\s*", "", result, flags=re.MULTILINE)
+    result = re.sub(r"^\s*[-*]\s+", "", result, flags=re.MULTILINE)
+    result = re.sub(r"^\s*\d+\.\s+", "", result, flags=re.MULTILINE)
+    result = re.sub(r"_{1,2}(.+?)_{1,2}", r"\1", result)
+    result = re.sub(r"~~(.+?)~~", r"\1", result)
+    result = re.sub(r"^>\s*", "", result, flags=re.MULTILINE)
+    result = re.sub(r"[|#]", " ", result)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
+def cmd_say(args):
+    text = _strip_markdown_for_speech(args.text)
+    if not text:
+        _emit({"ok": True, "played": False, "bytes": 0})
+        return 0
+    try:
+        with _dash_req(
+            "POST", "/api/audio/speak",
+            body=json.dumps({"text": text}).encode(), timeout=60,
+        ) as response:
+            result = json.loads(response.read())
+        data_url = result.get("data_url") or result.get("audio") or ""
+        if not data_url.startswith("data:"):
+            raise ValueError("TTS returned no audio data URL")
+        header, encoded = data_url.split(",", 1)
+        audio = base64.b64decode(encoded, validate=True)
+        fmt = "mp3"
+        if "audio/" in header:
+            fmt = header.split("audio/", 1)[1].split(";", 1)[0] or fmt
+        with _client_req(
+            "POST", "/play?fmt=" + quote(fmt), body=audio, timeout=600
+        ) as response:
+            played = json.loads(response.read())
+        ok = bool(played.get("ok"))
+        _emit({"ok": ok, "played": ok, "bytes": len(audio)})
+        return 0 if ok else 1
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": "speak failed: %s" % exc})
+        return 1
+
+
+def _transcribe_and_emit(wav):
+    data_url = "data:audio/wav;base64," + base64.b64encode(wav).decode()
+    try:
+        with _dash_req(
+            "POST", "/api/audio/transcribe",
+            body=json.dumps({
+                "data_url": data_url, "mime_type": "audio/wav",
+            }).encode(), timeout=130,
+        ) as response:
+            result = json.loads(response.read())
+        _emit({
+            "ok": True, "transcript": result.get("transcript", ""),
+            "bytes": len(wav),
+        })
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": "transcription failed: %s" % exc})
+        return 1
+
+
+def _read_audio_response(response):
+    """Read a WAV response with a fixed allocation ceiling."""
+    length = (
+        response.headers.get("Content-Length")
+        if hasattr(response, "headers") else None
+    )
+    if length is not None:
+        try:
+            length = int(length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid recording Content-Length") from exc
+        if length > _MAX_AUDIO_BYTES:
+            raise ValueError(
+                "recording exceeds %d byte limit" % _MAX_AUDIO_BYTES
+            )
+    wav = response.read(_MAX_AUDIO_BYTES + 1)
+    if len(wav) > _MAX_AUDIO_BYTES:
+        raise ValueError("recording exceeds %d byte limit" % _MAX_AUDIO_BYTES)
+    return wav
+
+
+def cmd_listen(args):
+    try:
+        seconds = int(args.secs)
+    except (TypeError, ValueError):
+        _emit({"ok": False, "error": "secs must be an integer"})
+        return 1
+    try:
+        with _client_req(
+            "POST", "/record?secs=%d" % seconds,
+            timeout=max(seconds, 1) + 30,
+        ) as response:
+            wav = _read_audio_response(response)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": "record failed: %s" % exc})
+        return 1
+    if not wav:
+        _emit({"ok": False, "error": "no audio recorded"})
+        return 1
+    return _transcribe_and_emit(wav)
+
+
+def cmd_listen_start(args):
+    try:
+        with _client_req(
+            "POST", "/record-start", body=b"", timeout=15
+        ) as response:
+            result = json.loads(response.read())
+        ok = bool(result.get("ok"))
+        _emit({"ok": ok, "status": result.get("status")})
+        return 0 if ok else 1
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": "record-start failed: %s" % exc})
+        return 1
+
+
+def cmd_listen_stop(args):
+    try:
+        with _client_req(
+            "POST", "/record-stop", body=b"", timeout=40
+        ) as response:
+            wav = _read_audio_response(response)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": "record-stop failed: %s" % exc})
+        return 1
+    if not wav:
+        _emit({"ok": False, "error": "no audio recorded"})
+        return 1
+    return _transcribe_and_emit(wav)
+
+
+def _silent_wav(ms=60, rate=8000):
+    import struct
+
+    samples = max(1, int(rate * ms / 1000))
+    data = b"\x00\x00" * samples
+    return (
+        b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE"
+        + b"fmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+        + b"data" + struct.pack("<I", len(data)) + data
+    )
+
+
+def cmd_stop_play(args):
+    try:
+        with _client_req(
+            "POST", "/play?fmt=wav", body=_silent_wav(), timeout=15
+        ) as response:
+            result = json.loads(response.read())
+        ok = bool(result.get("ok"))
+        _emit({"ok": ok, "stopped": ok})
+        return 0 if ok else 1
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": "stop-play failed: %s" % exc})
+        return 1
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="hermes-shellbridge", description=__doc__
@@ -236,6 +410,15 @@ def main(argv=None):
     s.add_argument("path")
     s.add_argument("--no-open", action="store_true")
     s.set_defaults(func=cmd_send)
+    say = sub.add_parser("say")
+    say.add_argument("text")
+    say.set_defaults(func=cmd_say)
+    listen = sub.add_parser("listen")
+    listen.add_argument("secs", nargs="?", default="8")
+    listen.set_defaults(func=cmd_listen)
+    sub.add_parser("listen-start").set_defaults(func=cmd_listen_start)
+    sub.add_parser("listen-stop").set_defaults(func=cmd_listen_stop)
+    sub.add_parser("stop-play").set_defaults(func=cmd_stop_play)
     args = p.parse_args(argv)
     return args.func(args)
 

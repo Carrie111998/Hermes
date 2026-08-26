@@ -237,7 +237,7 @@ def test_install_cli_parser_accepts_shellctl_options():
     assert args.allowed_root == "/safe/files"
 
 
-def test_install_shellctl_writes_assets_and_token(tmp_path, capsys):
+def test_install_shellctl_writes_assets_and_token(tmp_path, capsys, monkeypatch):
     import argparse
 
     from hermes_constants import (
@@ -245,6 +245,13 @@ def test_install_shellctl_writes_assets_and_token(tmp_path, capsys):
         set_hermes_home_override,
     )
     import hermes_cli.install_cmd as install_cmd
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"shellctl": {"max_open_capture_secs": 42}},
+    )
 
     home = tmp_path / "profile-home"
     override = set_hermes_home_override(home)
@@ -254,6 +261,7 @@ def test_install_shellctl_writes_assets_and_token(tmp_path, capsys):
             port=8765,
             ssh_host="myhost",
             allowed_root="~/shared",
+            max_open_capture_secs=None,
         )
         assert install_cmd.cmd_install_shellctl(args) == 0
     finally:
@@ -270,5 +278,6 @@ def test_install_shellctl_writes_assets_and_token(tmp_path, capsys):
     assert "RemoteForward 127.0.0.1:8765" in out
     assert "ExitOnForwardFailure yes" in out
     assert "--token-file ~/.hermes-shellctl-token" in out
+    assert "--max-open-capture-secs 42" in out
     assert "--allowed-root '~/shared'" in out
     assert token not in out
