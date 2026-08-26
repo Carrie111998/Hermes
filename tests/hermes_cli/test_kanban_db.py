@@ -49,6 +49,77 @@ def _init_git_repo(repo: Path) -> None:
 
 
 
+def test_session_bound_task_cannot_be_reassigned_across_profiles(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="session-bound", assignee="alice")
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="awaiting human",
+            worker_session_id="alice-worker-session",
+        ) is True
+
+        assert kb.assign_task(conn, task_id, "alice") is True
+        with pytest.raises(RuntimeError, match="session-bound.*alice"):
+            kb.assign_task(conn, task_id, "bob")
+        assert kb.reassign_task(conn, task_id, "bob") is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.assignee == "alice"
+        assert task.worker_session_id == "alice-worker-session"
+    finally:
+        conn.close()
+
+
+def test_reassign_preflights_session_binding_before_reclaiming(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="claimed session-bound", assignee="alice")
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="awaiting human",
+            worker_session_id="alice-worker-session",
+        ) is True
+        assert kb.unblock_task(conn, task_id) is True
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+
+        before_task = dict(conn.execute(
+            "SELECT status, assignee, worker_session_id, claim_lock, claim_expires, "
+            "worker_pid, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone())
+        before_run = dict(conn.execute(
+            "SELECT status, outcome, ended_at, claim_lock FROM task_runs WHERE id = ?",
+            (before_task["current_run_id"],),
+        ).fetchone())
+
+        assert kb.reassign_task(
+            conn,
+            task_id,
+            "bob",
+            reclaim_first=True,
+            reason="cross-profile recovery",
+        ) is False
+
+        after_task = dict(conn.execute(
+            "SELECT status, assignee, worker_session_id, claim_lock, claim_expires, "
+            "worker_pid, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone())
+        after_run = dict(conn.execute(
+            "SELECT status, outcome, ended_at, claim_lock FROM task_runs WHERE id = ?",
+            (before_task["current_run_id"],),
+        ).fetchone())
+        assert after_task == before_task
+        assert after_run == before_run
+    finally:
+        conn.close()
+
+
 @pytest.mark.windows_only
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
@@ -101,7 +172,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """
     db_path = tmp_path / "legacy-kanban.db"
     conn = sqlite3.connect(str(db_path))
-    # Pre-#16081 ``tasks`` shape: missing tenant, idempotency_key, session_id.
+    # Legacy ``tasks`` shape: missing additive metadata and session columns.
     conn.execute("""
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY,
@@ -153,9 +224,14 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy_worker_session = migrated.execute(
+            "SELECT worker_session_id FROM tasks WHERE id = 'legacy'"
+        ).fetchone()[0]
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
+    assert "worker_session_id" in task_columns
+    assert legacy_worker_session is None
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "run_id" in event_columns
@@ -164,6 +240,13 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+
+    # Repeated initialization is idempotent and preserves the legacy row.
+    with kb.connect(db_path) as migrated_again:
+        row = migrated_again.execute(
+            "SELECT title, worker_session_id FROM tasks WHERE id = 'legacy'"
+        ).fetchone()
+        assert tuple(row) == ("old board task", None)
 
 
 # ---------------------------------------------------------------------------

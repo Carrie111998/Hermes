@@ -228,6 +228,89 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_records_worker_session_id_from_session_context(monkeypatch, worker_env):
+    from gateway.session_context import scoped_current_session_id
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    with scoped_current_session_id("kanban-context-session"):
+        out = kt._handle_block({"reason": "awaiting human"})
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).worker_session_id == "kanban-context-session"
+    finally:
+        conn.close()
+
+
+def test_non_dispatcher_context_cannot_stamp_worker_session(monkeypatch, worker_env):
+    from agent.delegation_context import non_dispatcher_owned_context
+    from gateway.session_context import scoped_current_session_id
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "inherited-worker-session")
+    with non_dispatcher_owned_context(), scoped_current_session_id("cron-session"):
+        assert kt._worker_session_id(worker_env) is None
+
+
+def test_worker_session_id_fails_closed_when_ownership_check_errors(
+    monkeypatch, worker_env
+):
+    from agent import delegation_context
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-process-session")
+
+    def raise_ownership_error():
+        raise RuntimeError("ownership context unavailable")
+
+    monkeypatch.setattr(
+        delegation_context,
+        "is_dispatcher_owned_worker_context",
+        raise_ownership_error,
+    )
+    assert kt._worker_session_id(worker_env) is None
+
+
+def test_worker_session_id_fails_closed_when_session_context_errors(
+    monkeypatch, worker_env
+):
+    from gateway import session_context
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-process-session")
+
+    def raise_session_error(_key):
+        raise RuntimeError("session context unavailable")
+
+    monkeypatch.setattr(session_context, "get_session_env", raise_session_error)
+    assert kt._worker_session_id(worker_env) is None
+
+
+def test_block_never_overwrites_the_first_worker_session(monkeypatch, worker_env):
+    from gateway.session_context import scoped_current_session_id
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    with scoped_current_session_id("first-worker-session"):
+        assert json.loads(kt._handle_block({"reason": "awaiting human"}))["ok"] is True
+
+    conn = kb.connect()
+    try:
+        assert kb.block_task(
+            conn,
+            worker_env,
+            reason="duplicate block",
+            worker_session_id="different-worker-session",
+        ) is False
+        assert kb.get_task(conn, worker_env).worker_session_id == "first-worker-session"
+    finally:
+        conn.close()
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
