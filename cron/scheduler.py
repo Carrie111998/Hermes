@@ -543,6 +543,7 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     ensure_cron_dir,
+    ensure_profile_dir,
     mark_job_run,
     save_job_output,
     use_cron_store,
@@ -866,7 +867,7 @@ def _record_forced_release(job_id: str, name: str, age_seconds: float, allowance
         del _forced_releases[:-_FORCED_RELEASE_HISTORY]
     try:
         path = _get_hermes_home() / "cron" / "inflight_forced_releases.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_cron_dir(path.parent)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except Exception as e:  # never let telemetry break a tick
@@ -1407,7 +1408,7 @@ def _write_usage_audit(record: dict) -> None:
     """
     try:
         path = _usage_audit_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_cron_dir(path.parent)
         line = json.dumps(record, ensure_ascii=False)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -3965,7 +3966,10 @@ def _run_job_script(
         LLM can report the problem to the user.
     """
     scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_profile_dir(scripts_dir)
+    except OSError as exc:
+        return False, f"Profile home unavailable for cron script: {exc}"
     scripts_dir_resolved = scripts_dir.resolve()
 
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:

@@ -101,8 +101,10 @@ def _read_last_output(job_id: str) -> str:
 
 def _write_last_output(job_id: str, output: str) -> None:
     try:
+        from cron.jobs import ensure_profile_dir
+
         path = _snapshot_path(job_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_profile_dir(path.parent)
         path.write_text(output, encoding="utf-8")
     except Exception as exc:
         logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)

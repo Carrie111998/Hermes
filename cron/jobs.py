@@ -210,10 +210,31 @@ def ensure_cron_dir(cron_dir: Optional[Path] = None) -> Path:
         if store.require_existing_home
         else (cron_dir or store.cron_dir)
     )
-    target.mkdir(
-        parents=not store.require_existing_home,
-        exist_ok=True,
-    )
+    return ensure_profile_dir(target)
+
+
+def ensure_profile_dir(path: Path) -> Path:
+    """Create a profile-owned directory without reviving a guarded home."""
+    store = _current_cron_store()
+    target = Path(path).expanduser().resolve()
+    if not store.require_existing_home:
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    home = store.cron_dir.parent.resolve()
+    try:
+        relative = target.relative_to(home)
+    except ValueError as exc:
+        raise ValueError(f"Cron path escapes guarded profile home: {target}") from exc
+
+    # parents=False at every level makes concurrent profile deletion terminal:
+    # the next mkdir fails instead of rebuilding the removed profile root.
+    current = home
+    if not current.is_dir():
+        raise FileNotFoundError(f"Guarded profile home no longer exists: {home}")
+    for part in relative.parts:
+        current = current / part
+        current.mkdir(exist_ok=True)
     return target
 
 
@@ -725,10 +746,7 @@ def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
     ensure_cron_dir()
-    store.output_dir.mkdir(
-        parents=not store.require_existing_home,
-        exist_ok=True,
-    )
+    ensure_profile_dir(store.output_dir)
     _secure_dir(store.cron_dir)
     _secure_dir(store.output_dir)
 
@@ -1080,7 +1098,7 @@ def _record_persisted_error_recovery(job: Dict[str, Any], previous_next_run: str
     del _persisted_error_recoveries_recent[:-_PERSISTED_ERROR_RECOVERY_HISTORY]
     try:
         path = _current_cron_store().cron_dir / "persisted_error_recoveries.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_cron_dir(path.parent)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except Exception as exc:  # never let telemetry break a tick
@@ -3927,7 +3945,7 @@ def save_job_output(job_id: str, output: str):
     """Save job output to file."""
     ensure_dirs()
     job_output_dir = _job_output_dir(job_id)
-    job_output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_profile_dir(job_output_dir)
     _secure_dir(job_output_dir)
 
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")

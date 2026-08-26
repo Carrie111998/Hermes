@@ -927,8 +927,9 @@ def test_real_tick_does_not_recreate_missing_guarded_profile(tmp_path):
     """The tick lock must honor the multiplex profile-home boundary."""
     import shutil
 
-    from cron.jobs import use_cron_store
-    from cron.scheduler import tick
+    from cron.jobs import save_job_output, use_cron_store
+    from cron.monitor import _write_last_output
+    from cron.scheduler import _run_job_script, _write_usage_audit, tick
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     profile_home = tmp_path / "profiles" / "deleted"
@@ -939,6 +940,12 @@ def test_real_tick_does_not_recreate_missing_guarded_profile(tmp_path):
             shutil.rmtree(profile_home)
             with pytest.raises(FileNotFoundError):
                 tick(verbose=False)
+            _write_usage_audit({"job_id": "deleted"})
+            _write_last_output("deleted", "late output")
+            script_ok, _error = _run_job_script("late.py")
+            assert not script_ok
+            with pytest.raises(FileNotFoundError):
+                save_job_output("deleted", "late output")
     finally:
         reset_hermes_home_override(home_token)
 
