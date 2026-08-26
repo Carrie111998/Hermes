@@ -59,7 +59,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -7006,7 +7006,19 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message: Any,
         result: Dict[str, Any],
     ) -> int:
-        """Detect transcript-shaped result["messages"] and return turn start."""
+        """Detect transcript-shaped result["messages"] and return turn start.
+
+        The prefix comparison matches on the normalized ``(role, content)``
+        pair, not full dict equality: the API layer builds bare
+        ``{"role", "content"}`` entries while the agent-layer copies in
+        ``result["messages"]`` carry extra keys stamped by the durability /
+        flush path (``timestamp``, ``_db_persisted``, and on assistant turns
+        ``reasoning`` / ``finish_reason`` / provider items). Full-dict equality
+        failed on every turn, so ``turn_start`` was always 0 and the fallback
+        concatenated the prior history on top of an agent transcript that
+        already contained it — the stored snapshot near-doubled per turn under
+        ``previous_response_id`` / ``conversation`` chaining (#95137).
+        """
         agent_messages = result.get("messages") if isinstance(result, dict) else None
         if not isinstance(agent_messages, list) or not agent_messages:
             return 0
@@ -7014,11 +7026,40 @@ class APIServerAdapter(BasePlatformAdapter):
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
         expected_prefix = prior + [current_user]
-        if agent_messages[:len(expected_prefix)] == expected_prefix:
+        if APIServerAdapter._normalized_prefix_match(agent_messages, expected_prefix):
             return len(expected_prefix)
-        if prior and agent_messages[:len(prior)] == prior:
+        if prior and APIServerAdapter._normalized_prefix_match(agent_messages, prior):
             return len(prior)
         return 0
+
+    @staticmethod
+    def _normalized_message_identity(msg: Any) -> Optional[Tuple[str, Any]]:
+        """Identity of a transcript message for prefix comparison.
+
+        None (never equal to anything) for shapes that are not transcript
+        messages, so a non-dict or unknown-role entry on either side forces a
+        mismatch instead of a false prefix hit.
+        """
+        if not isinstance(msg, dict):
+            return None
+        role = msg.get("role")
+        if role not in {"system", "developer", "user", "assistant", "tool"}:
+            return None
+        return (str(role), msg.get("content"))
+
+    @classmethod
+    def _normalized_prefix_match(
+        cls, agent_messages: List[Any], expected_prefix: List[Any]
+    ) -> bool:
+        """True when agent_messages starts with expected_prefix by identity."""
+        if len(agent_messages) < len(expected_prefix):
+            return False
+        for agent_msg, prefix_msg in zip(agent_messages, expected_prefix):
+            agent_id = cls._normalized_message_identity(agent_msg)
+            prefix_id = cls._normalized_message_identity(prefix_msg)
+            if agent_id is None or prefix_id is None or agent_id != prefix_id:
+                return False
+        return True
 
     @classmethod
     def _turn_transcript_messages(
