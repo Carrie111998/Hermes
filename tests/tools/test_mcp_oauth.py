@@ -140,7 +140,7 @@ class TestHermesTokenStorage:
             "client_secret": "secret",
             "redirect_uris": ["http://127.0.0.1:12345/callback"],
             "token_endpoint_auth_method": "none",
-        }))
+        }), encoding="utf-8")
 
         loaded = asyncio.run(HermesTokenStorage("supabase").get_client_info())
 
@@ -605,12 +605,12 @@ class TestInvalidateTokensOnClientChange:
         (d / "chg-server.client.json").write_text(json.dumps(info), encoding="utf-8")
         (d / "chg-server.json").write_text(json.dumps({
             "access_token": "old-token", "token_type": "Bearer",
-        }))
+        }), encoding="utf-8")
         (d / "chg-server.meta.json").write_text(json.dumps({
             "issuer": "https://idp.example",
             "authorization_endpoint": "https://idp.example/auth",
             "token_endpoint": "https://idp.example/token",
-        }))
+        }), encoding="utf-8")
         return storage, d
 
     def test_changed_client_id_drops_tokens(self, tmp_path, monkeypatch):
@@ -645,7 +645,7 @@ class TestInvalidateTokensOnClientChange:
         d.mkdir(parents=True, exist_ok=True)
         (d / "fresh-server.json").write_text(json.dumps({
             "access_token": "tok", "token_type": "Bearer",
-        }))
+        }), encoding="utf-8")
         _invalidate_tokens_on_client_change(storage, "client-x", None)
         # No recorded client identity -> nothing provably stale.
         assert (d / "fresh-server.json").exists()

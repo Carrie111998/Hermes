@@ -26,8 +26,7 @@ def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypat
             storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
             storage._tokens_path().write_text(
                 '{"access_token":"%s","token_type":"Bearer","expires_in":3600}'
-                % access_token
-            )
+                % access_token, encoding="utf-8")
         finally:
             reset_hermes_home_override(token)
 
@@ -102,7 +101,7 @@ async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     tokens_file.write_text(json.dumps({
         "access_token": "OLD",
         "token_type": "Bearer",
-    }))
+    }), encoding="utf-8")
 
     mgr = MCPOAuthManager()
     provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
