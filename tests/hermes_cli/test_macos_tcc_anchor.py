@@ -136,9 +136,12 @@ class TestEnsureTccAnchor:
         assert marker.read_text(encoding="utf-8").strip() == str(
             store_bin / "python3.11"
         )
-        # Alias symlinks no longer resolve into the versioned store.
+        # A copied macOS interpreter can boot as ``python`` but not through a
+        # ``python3`` alias pointing at that copy: CPython then loses the venv
+        # prefix and looks for stdlib under its build-time /install prefix.
+        # Keep aliases on the original, executable uv-store interpreter.
         alias = venv_py.parent / "python3"
-        assert not tcc._is_uv_macos_store(str(alias.resolve(strict=False)))
+        assert alias.resolve(strict=False) == store_bin / "python3.11"
 
     def test_idempotent(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)
@@ -153,6 +156,21 @@ class TestEnsureTccAnchor:
         assert anchored == venv_py
         assert venv_py.is_file() and not venv_py.is_symlink()
         assert marker.read_text(encoding="utf-8") == before
+
+    def test_repairs_aliases_left_by_predecessor_anchor(self, tmp_path, monkeypatch):
+        _darwin(monkeypatch)
+        store_bin = _build_store(tmp_path)
+        root = _build_checkout(tmp_path, store_bin=store_bin, anchored=True)
+        venv_bin = root / ".venv" / "bin"
+
+        # The preceding implementation anchored ``python`` and left the
+        # aliases pointing to that copied executable.  This is the on-disk
+        # shape that makes Desktop's ``python3`` updater fail to boot.
+        assert (venv_bin / "python3").resolve(strict=False) == venv_bin / "python"
+
+        tcc.ensure_tcc_anchor(root)
+
+        assert (venv_bin / "python3").resolve(strict=False) == store_bin / "python3.11"
 
     def test_reanchors_after_patch_bump(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)

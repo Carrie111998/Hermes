@@ -174,16 +174,18 @@ def _anchor_marker(venv_bin: Path) -> Path:
     return venv_bin / _MARKER_NAME
 
 
-def _repoint_aliases(venv_bin: Path, anchor: Path) -> None:
-    """Re-point uv alias symlinks at the stable anchor.
+def _repoint_aliases(venv_bin: Path, source_file: Path) -> None:
+    """Point Python aliases at the original executable uv-store binary.
 
-    ``python3`` / ``python3.11`` inside the venv bin dir currently resolve into
-    the versioned store; anything spawned through them would still churn TCC.
-    Only symlinks that resolve into the uv store are touched.
+    A stable real-file TCC anchor works when invoked as ``python``.  CPython
+    loses the venv prefix, however, when an alias such as ``python3`` resolves
+    through that copied executable.  Keep aliases on the source binary so
+    launchers that invoke ``python3`` remain bootable.
     """
     # Union of the running interpreter's expected aliases and every versioned
     # alias actually on disk — a store built by a different Python minor than
     # the one running this code must still get its aliases repointed.
+    anchor = venv_bin / "python"
     names = set(_sibling_names())
     try:
         names.update(p.name for p in venv_bin.glob("python3.*") if p.is_symlink())
@@ -194,11 +196,15 @@ def _repoint_aliases(venv_bin: Path, anchor: Path) -> None:
         try:
             if not alias.is_symlink():
                 continue
-            if not _is_uv_macos_store(str(alias.resolve(strict=False))):
+            resolved = alias.resolve(strict=False)
+            if not (
+                _is_uv_macos_store(str(resolved))
+                or resolved == anchor
+            ):
                 continue
             tmp = venv_bin / f".{name}.tcc-tmp"
             try:
-                os.symlink(anchor.name, tmp)
+                os.symlink(str(source_file), tmp)
                 os.replace(tmp, alias)
             except OSError:
                 try:
@@ -227,7 +233,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
         os.chmod(tmp_path, source_file.stat().st_mode | 0o111)
         os.replace(tmp_path, venv_py)
         _anchor_marker(venv_bin).write_text(str(source_file), encoding="utf-8")
-        _repoint_aliases(venv_bin, venv_py)
+        _repoint_aliases(venv_bin, source_file)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -266,6 +272,7 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
             if marker.is_file() and marker.read_text(encoding="utf-8").strip() == str(
                 source_file
             ):
+                _repoint_aliases(venv_py.parent, source_file)
                 return venv_py
         except OSError:
             pass
