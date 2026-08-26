@@ -155,6 +155,14 @@ class TerminalEnvironmentProvider(abc.ABC):
         ``status`` is ``"ready"`` / ``"needs_setup"`` / ``"unavailable"``;
         ``detail`` carries setup guidance for non-ready rows. Must never
         raise and must stay fast (<~2s).
+
+        ``detail`` must never include credential material — it is returned
+        verbatim to dashboard clients, and under a named-profile request it
+        is resolved against that profile's own secrets. Resolve credentials
+        synchronously on the calling thread: the profile secret scope is
+        context-local, so a probe that fans out to its own threads,
+        subprocesses, or tasks would resolve against the process
+        environment instead.
         """
         if self.is_available():
             return ("ready", "")
