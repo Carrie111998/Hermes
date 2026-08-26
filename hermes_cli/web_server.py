@@ -7137,9 +7137,16 @@ async def update_memory_provider_config(
 
 @app.get("/api/config")
 async def get_config(profile: Optional[str] = None):
-    with _profile_scope(profile):
-        config = _normalize_config_for_web(read_raw_config())
+    # _profile_scope blocks on the process-wide _SKILLS_PROFILE_LOCK and
+    # read_raw_config() reads from disk; on the event loop a slow lock-holder
+    # froze the whole gateway for >1s (observed via the loop watchdog).
+    # asyncio.to_thread copies the contextvar context, so the profile
+    # override stays scoped to the worker thread.
+    def _run():
+        with _profile_scope(profile):
+            return _normalize_config_for_web(read_raw_config())
 
+    config = await asyncio.to_thread(_run)
     # Strip internal keys that the frontend shouldn't see or send back
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
@@ -7752,7 +7759,7 @@ def _apply_model_assignment_sync(
                     })
 
         try:
-            effective_config = read_raw_config()
+            effective_config = load_config()
             effective_provider, effective_model = resolve_cron_model_drift_defaults(
                 effective_config
             )
@@ -7978,10 +7985,26 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # is not sent in the PUT body. A full-replace save would silently
             # drop those keys. Deep-merge incoming over what's on disk so the
             # frontend can only overwrite what it explicitly sends.
-            existing = read_raw_config()
-            incoming = _denormalize_config_from_web(body.config)
-            save_config(_deep_merge(existing, incoming))
-
+            with _CONFIG_MUTATION_LOCK:
+                existing = read_raw_config()
+                incoming = _denormalize_config_from_web(body.config)
+                merged = _deep_merge(existing, incoming)
+                # Compare normalized approvals.mode across the in-memory
+                # documents, not config blocks and not cache re-reads: the
+                # settings page PUTs the defaulted GET record while disk
+                # holds sparse YAML, so a block compare is always-unequal
+                # (every autosave would broadcast), and reloading after the
+                # save can serve the pre-save cache on an (mtime_ns, size)
+                # key collision. Only approvals.mode feeds session.info, so
+                # it is the honest trigger.
+                approvals_mode_changed = _approval_mode_of(merged) != _approval_mode_of(existing)
+                save_config(merged)
+        # REST saves bypass the config.set RPC (which re-emits itself), so
+        # refresh live sessions' cached approval/YOLO indicators after a mode
+        # change. Own-profile saves only: a profile-scoped save targets a
+        # different HERMES_HOME than this process's gateway sessions.
+        if approvals_mode_changed and not _is_other_profile(body.profile or profile):
+            _broadcast_gateway_session_info()
         return {"ok": True}
 
     try:
@@ -13388,7 +13411,7 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
 
         token = set_hermes_home_override(str(home))
         try:
-            profile_cfg = read_raw_config()
+            profile_cfg = load_config()
         finally:
             reset_hermes_home_override(token)
         raw = cfg_get(
@@ -13413,7 +13436,7 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
 
     multiplex = False
     try:
-        cfg = read_raw_config()
+        cfg = load_config()
         multiplex = bool(cfg_get(cfg, "gateway", "multiplex_profiles", default=False))
         env_flag = _os.getenv("GATEWAY_MULTIPLEX_PROFILES", "").strip().lower()
         if env_flag in {"1", "true", "yes", "on"}:
