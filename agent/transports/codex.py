@@ -357,29 +357,30 @@ class ResponsesApiTransport(ProviderTransport):
     # response are stamped with the endpoint that minted them. Plain class
     # attribute default; mutated on the instance, not the class.
     _last_issuer_kind: Optional[str] = None
+    _last_issuer_model: Optional[str] = None
 
     @property
     def api_mode(self) -> str:
         return "codex_responses"
 
-    def _resolve_issuer_kind(self, model: str, params: Dict[str, Any]) -> str:
-        """Classify the current Responses endpoint and wire model."""
+    def _resolve_issuer_kind(self, params: Dict[str, Any]) -> str:
+        """Classify the current Responses endpoint from transport params."""
         from agent.codex_responses_adapter import _classify_responses_issuer
-        from agent.model_metadata import strip_codex_context_variant_suffix
 
         return _classify_responses_issuer(
             is_xai_responses=params.get("is_xai_responses") is True,
             is_github_responses=params.get("is_github_responses") is True,
             is_codex_backend=params.get("is_codex_backend") is True,
             base_url=params.get("base_url"),
-            model=strip_codex_context_variant_suffix(model),
         )
 
     def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
         """Convert OpenAI chat messages to Responses API input items."""
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
-        issuer = self._resolve_issuer_kind(str(kwargs.get("model") or ""), kwargs)
+        issuer = self._resolve_issuer_kind(kwargs)
+        issuer_model = str(kwargs.get("model") or "").strip() or None
         self._last_issuer_kind = issuer
+        self._last_issuer_model = issuer_model
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=kwargs.get("is_xai_responses") is True,
@@ -388,6 +389,7 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs.get("replay_encrypted_reasoning", True)
             ),
             current_issuer_kind=issuer,
+            current_issuer_model=issuer_model,
             native_compaction_eligible=_native_compaction_active(
                 kwargs.get("context_management")
             ),
@@ -483,8 +485,10 @@ class ResponsesApiTransport(ProviderTransport):
         # items captured from the response, and passed to the input
         # converter so foreign-issuer reasoning blocks in history are
         # dropped before the API rejects them.
-        issuer_kind = self._resolve_issuer_kind(model, params)
+        issuer_kind = self._resolve_issuer_kind(params)
+        issuer_model = str(model or "").strip() or None
         self._last_issuer_kind = issuer_kind
+        self._last_issuer_model = issuer_model
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -592,6 +596,7 @@ class ResponsesApiTransport(ProviderTransport):
                 is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
+                current_issuer_model=issuer_model,
                 native_compaction_eligible=native_compaction_active,
             ),
             "store": False,
@@ -789,8 +794,13 @@ class ResponsesApiTransport(ProviderTransport):
         # call. Either way it gets stamped onto reasoning items so future
         # turns can detect a model swap and drop foreign-issuer blobs.
         issuer_kind = kwargs.get("issuer_kind") or self._last_issuer_kind
+        issuer_model = kwargs.get("issuer_model") or self._last_issuer_model
         # _normalize_codex_response returns (SimpleNamespace, finish_reason_str)
-        msg, finish_reason = _normalize_codex_response(response, issuer_kind=issuer_kind)
+        msg, finish_reason = _normalize_codex_response(
+            response,
+            issuer_kind=issuer_kind,
+            issuer_model=issuer_model,
+        )
 
         tool_calls = None
         if msg and msg.tool_calls:

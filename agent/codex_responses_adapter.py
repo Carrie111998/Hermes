@@ -31,28 +31,25 @@ def _classify_responses_issuer(
     is_github_responses: bool = False,
     is_codex_backend: bool = False,
     base_url: Optional[str] = None,
-    model: Optional[str] = None,
 ) -> str:
-    """Stable endpoint/model identity that mints encrypted_content.
+    """Stable identifier for the Responses endpoint that mints encrypted_content.
 
-    ``reasoning.encrypted_content`` is sealed to the endpoint and model that
-    issued it. Stamping both dimensions on persisted reasoning items prevents
-    a multi-model router from replaying one model's opaque continuation into
-    another model merely because both share a base URL.
+    ``reasoning.encrypted_content`` is sealed to the endpoint that issued it:
+    replaying a Codex-minted blob against xAI (or vice versa) deterministically
+    returns HTTP 400 ``invalid_encrypted_content``. Stamping the issuer on
+    persisted reasoning items and filtering at replay time lets a single
+    conversation switch models without poisoning history with un-decryptable
+    reasoning blocks.
     """
     if is_xai_responses:
-        issuer = "xai_responses"
-    elif is_github_responses:
-        issuer = "github_responses"
-    elif is_codex_backend:
-        issuer = "codex_backend"
-    elif base_url:
-        issuer = f"other:{base_url}"
-    else:
-        issuer = "other"
-
-    model_identity = str(model or "").strip()
-    return f"{issuer}|model:{model_identity}" if model_identity else issuer
+        return "xai_responses"
+    if is_github_responses:
+        return "github_responses"
+    if is_codex_backend:
+        return "codex_backend"
+    if base_url:
+        return f"other:{base_url}"
+    return "other"
 
 
 # Throttle the per-process cross-issuer skip warning so we don't flood logs
@@ -472,6 +469,7 @@ def _chat_messages_to_responses_input(
     is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True,
     current_issuer_kind: Optional[str] = None,
+    current_issuer_model: Optional[str] = None,
     native_compaction_eligible: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
@@ -505,18 +503,16 @@ def _chat_messages_to_responses_input(
     ``status``/``content`` are still replayed; only ``id`` is unsafe to
     reuse across a Copilot connection.
 
-    ``current_issuer_kind`` enables a per-item cross-issuer guard. The
-    Responses API's ``encrypted_content`` blob is decryptable only by the
-    endpoint that minted it — replaying a Codex-issued blob against xAI
-    (or vice versa) always yields HTTP 400 ``invalid_encrypted_content``
-    and breaks every subsequent turn in the same session.  When this
-    argument is provided and a reasoning item carries an ``_issuer_kind``
-    stamp from a different endpoint, the item is dropped from the replayed
-    input.  Legacy items without a stamp are still replayed
-    (backwards-compatible).  The two guards compose:
+    ``current_issuer_kind`` and ``current_issuer_model`` enable per-item
+    provenance guards. A Responses ``encrypted_content`` blob belongs to the
+    endpoint/model route that minted it; another model behind the same custom
+    endpoint may accept the opaque blob but interpret stale reasoning as its
+    own continuation. When a reasoning item carries a different
+    ``_issuer_kind`` or ``_issuer_model`` stamp, it is dropped from replay.
+    Legacy items without either stamp remain backwards-compatible. The guards
+    compose:
     ``replay_encrypted_reasoning=False`` is the session-wide kill switch
-    (drops ALL replay); ``current_issuer_kind`` is the per-item filter
-    that runs only when replay is still enabled.
+    (drops ALL replay); issuer/model provenance filters run only when replay is still enabled.
 
     ``native_compaction_eligible`` mirrors, for THIS request, the decision
     made by ``native_compaction.native_compaction_context_management`` — it
@@ -596,26 +592,32 @@ def _chat_messages_to_responses_input(
                                 and not native_compaction_eligible
                             ):
                                 continue
-                            # Cross-issuer guard: drop reasoning blocks that
-                            # were minted by a different Responses endpoint.
-                            # The current endpoint cannot decrypt foreign
-                            # encrypted_content and would reject the whole
-                            # request with HTTP 400 invalid_encrypted_content.
+                            # Provenance guard: drop reasoning blocks minted
+                            # by a different Responses endpoint or model.
+                            # Some routers reject foreign encrypted_content;
+                            # others accept it and silently continue stale work.
                             # Unstamped (legacy) items pass through.
                             item_issuer = ri.get("_issuer_kind")
-                            if (
+                            item_model = ri.get("_issuer_model")
+                            foreign_issuer = (
                                 current_issuer_kind is not None
                                 and item_issuer is not None
                                 and item_issuer != current_issuer_kind
-                            ):
+                            )
+                            foreign_model = (
+                                current_issuer_model is not None
+                                and item_model is not None
+                                and item_model != current_issuer_model
+                            )
+                            if foreign_issuer or foreign_model:
                                 global _CROSS_ISSUER_WARN_EMITTED
                                 if not _CROSS_ISSUER_WARN_EMITTED:
                                     logger.warning(
-                                        "Dropping reasoning item minted by %s while "
-                                        "calling %s — encrypted_content is sealed to "
-                                        "its issuer. This happens when a session "
-                                        "switches model providers mid-conversation.",
-                                        item_issuer, current_issuer_kind,
+                                        "Dropping reasoning item minted by %s/%s while "
+                                        "calling %s/%s — encrypted_content is sealed "
+                                        "to its issuer and model.",
+                                        item_issuer, item_model,
+                                        current_issuer_kind, current_issuer_model,
                                     )
                                     _CROSS_ISSUER_WARN_EMITTED = True
                                 continue
@@ -623,12 +625,11 @@ def _chat_messages_to_responses_input(
                             # Responses API cannot look up items by ID and
                             # returns 404.  The encrypted_content blob is
                             # self-contained for reasoning chain continuity.
-                            # Also strip the internal "_issuer_kind" stamp;
-                            # it is a Hermes-side metadata key and not part
-                            # of the Responses API schema.
+                            # Strip Hermes-side provenance metadata; neither
+                            # stamp is part of the Responses API schema.
                             replay_item = {
                                 k: v for k, v in ri.items()
-                                if k not in ("id", "_issuer_kind")
+                                if k not in ("id", "_issuer_kind", "_issuer_model")
                             }
                             items.append(replay_item)
                             item_sources.append(msg)
@@ -1384,13 +1385,12 @@ def _normalize_codex_response(
     response: Any,
     *,
     issuer_kind: Optional[str] = None,
+    issuer_model: Optional[str] = None,
 ) -> tuple[Any, str]:
     """Normalize a Responses API object to an assistant_message-like object.
 
-    ``issuer_kind`` (when provided) is stamped onto each reasoning item the
-    response yields, so future replays can detect when the active endpoint
-    differs from the one that minted the encrypted_content blob and drop
-    the item instead of triggering HTTP 400 invalid_encrypted_content.
+    Issuer endpoint/model provenance is stamped onto each reasoning item so
+    future replays can drop blobs minted by a different route.
     """
     response_status = getattr(response, "status", None)
     if isinstance(response_status, str):
@@ -1548,6 +1548,8 @@ def _normalize_codex_response(
                 # cross-issuer guard.
                 if issuer_kind:
                     raw_item["_issuer_kind"] = issuer_kind
+                if issuer_model:
+                    raw_item["_issuer_model"] = issuer_model
                 item_id = getattr(item, "id", None)
                 if isinstance(item_id, str) and item_id.startswith("rs_tmp_"):
                     logger.debug(
@@ -1579,6 +1581,8 @@ def _normalize_codex_response(
                 raw_item = {"type": "compaction", "encrypted_content": encrypted}
                 if issuer_kind:
                     raw_item["_issuer_kind"] = issuer_kind
+                if issuer_model:
+                    raw_item["_issuer_model"] = issuer_model
                 reasoning_items_raw.append(raw_item)
                 logger.info(
                     "Native Responses compaction item captured (%d chars encrypted).",

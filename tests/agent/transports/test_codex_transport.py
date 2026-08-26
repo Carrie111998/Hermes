@@ -69,12 +69,14 @@ class TestCodexBuildKwargs:
                 ),
             ],
         ))
+        captured_reasoning = normalized.provider_data["codex_reasoning_items"]
+        assert captured_reasoning[0]["_issuer_model"] == "gemini/gemini-3.6-flash"
         history = [
             {"role": "user", "content": "first"},
             {
                 "role": "assistant",
                 "content": normalized.content,
-                "codex_reasoning_items": normalized.provider_data["codex_reasoning_items"],
+                "codex_reasoning_items": captured_reasoning,
             },
             {"role": "user", "content": "next"},
         ]
@@ -92,11 +94,13 @@ class TestCodexBuildKwargs:
             base_url=base_url,
         )
 
-        assert [
-            item["encrypted_content"]
-            for item in same_model["input"]
-            if item.get("type") == "reasoning"
-        ] == ["model-a-blob"]
+        same_model_reasoning = [
+            item for item in same_model["input"] if item.get("type") == "reasoning"
+        ]
+        assert [item["encrypted_content"] for item in same_model_reasoning] == [
+            "model-a-blob"
+        ]
+        assert "_issuer_model" not in same_model_reasoning[0]
         assert not any(item.get("type") == "reasoning" for item in other_model["input"])
 
     def test_900k_context_variant_suffix_stripped_on_wire(self, transport):
@@ -808,7 +812,7 @@ class TestCodexBuildKwargs:
 
         monkeypatch.setattr(
             "agent.codex_responses_adapter._normalize_codex_response",
-            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+            lambda resp, issuer_kind=None, issuer_model=None: (msg, "tool_calls"),
         )
         normalized = transport.normalize_response(response)
 
@@ -990,7 +994,7 @@ class TestOpencodeReservedToolAliases:
         response = SimpleNamespace(output=[], status="completed")
         monkeypatch.setattr(
             "agent.codex_responses_adapter._normalize_codex_response",
-            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+            lambda resp, issuer_kind=None, issuer_model=None: (msg, "tool_calls"),
         )
         normalized = transport.normalize_response(response)
         names = [tc.name for tc in normalized.tool_calls]
