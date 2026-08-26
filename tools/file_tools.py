@@ -24,7 +24,7 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
-from agent.source_provenance import active_source_provenance
+from agent.source_provenance_tools import issue_active_read_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -132,73 +132,6 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
         kept.append(lines[0][:max_chars])
 
     return "\n".join(kept), len(kept), True
-
-
-def _issue_active_read_provenance(
-    *,
-    resolved: Path | PurePosixPath,
-    source_path: Path | None,
-    offset: int,
-    limit: int,
-    returned_content: str,
-    result_dict: dict,
-    file_ops,
-) -> None:
-    """Issue provenance only for a verified local ``read_file`` result.
-
-    A registry never treats the JSON returned by an arbitrary tool as source
-    evidence. For the trusted host file tool, re-read the exact bounded raw
-    interval and require that its line-numbered projection exactly equals the
-    successful, unredacted result before minting a grant.
-    """
-
-    context = active_source_provenance()
-    if context is None or not isinstance(resolved, Path) or source_path is None:
-        return
-    if result_dict.get("error") or result_dict.get("truncated_by") or not returned_content:
-        return
-    try:
-        canonical = resolved.resolve(strict=True)
-        if resolved.is_symlink() or not canonical.is_file():
-            return
-        selected: list[bytes] = []
-        with canonical.open("rb") as handle:
-            for line_number, raw_line in enumerate(handle, start=1):
-                if line_number < offset:
-                    continue
-                if line_number >= offset + limit:
-                    break
-                selected.append(raw_line)
-        if not selected:
-            return
-        raw = b"".join(selected)
-        decoded = raw.decode("utf-8")
-        from tools.tool_output_limits import get_max_line_length
-
-        # read_file's gutter renderer truncates individual long lines for
-        # display. A grant must identify bytes the model actually received,
-        # never the undisplayed suffix of a clamped line.
-        if any(len(line) > get_max_line_length() for line in decoded.split("\n")):
-            return
-        expected = file_ops._add_line_numbers(decoded, offset)
-        if returned_content != expected:
-            return
-        context.registry.issue_file_slice(
-            # Keep the unresolved spelling so leaf and ancestor symlinks are
-            # still visible to the registry's no-follow validation.
-            path=source_path,
-            line_start=offset,
-            line_end=offset + len(selected) - 1,
-            content=raw,
-            session_id=context.session_id,
-            turn_id=context.turn_id,
-            request_id=context.request_id,
-            policy_digest=context.policy_digest,
-        )
-    except Exception:
-        # This is a provenance failure, never a reason to turn an ordinary
-        # read into a more permissive source grant.
-        return
 
 
 # If the total file size exceeds this AND the caller didn't specify a narrow
@@ -2073,7 +2006,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         if result.content == content_before_redaction:
-            _issue_active_read_provenance(
+            issue_active_read_provenance(
                 resolved=_resolved,
                 source_path=_source_path,
                 offset=offset,

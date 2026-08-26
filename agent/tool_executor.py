@@ -20,7 +20,6 @@ import os
 import random
 import threading
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -34,6 +33,10 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.source_provenance_tools import (
+    attach_trusted_source_provenance_metadata,
+    source_provenance_activation,
+)
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -55,84 +58,6 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
-
-
-def _source_provenance_activation(agent, function_name: str):
-    """Activate request identity only around the trusted ``read_file`` tool."""
-
-    if function_name != "read_file":
-        return nullcontext()
-    try:
-        from agent.source_provenance import (
-            DEFAULT_POLICY_DIGEST,
-            SourceProvenanceRegistry,
-            activate_source_provenance,
-            following_api_request_id,
-        )
-
-        session_id = str(getattr(agent, "session_id", "") or "")
-        turn_id = str(getattr(agent, "_current_turn_id", "") or "")
-        request_id = following_api_request_id(
-            str(getattr(agent, "_current_api_request_id", "") or ""),
-            turn_id,
-        )
-        policy_digest = str(
-            getattr(agent, "_llm_egress_policy_digest", "")
-            or getattr(agent, "llm_egress_policy_digest", "")
-            or DEFAULT_POLICY_DIGEST
-        )
-        if not all((session_id, turn_id, request_id, policy_digest)):
-            return nullcontext()
-        registry = getattr(agent, "_source_provenance_registry", None)
-        if registry is None:
-            registry = SourceProvenanceRegistry()
-            agent._source_provenance_registry = registry
-        if not isinstance(registry, SourceProvenanceRegistry):
-            return nullcontext()
-        return activate_source_provenance(
-            registry,
-            session_id=session_id,
-            turn_id=turn_id,
-            request_id=request_id,
-            policy_digest=policy_digest,
-        )
-    except Exception:
-        # Tool execution remains available; a missing identity simply cannot
-        # create a source grant.
-        return nullcontext()
-
-
-def _attach_trusted_source_provenance_metadata(agent, function_name: str) -> None:
-    """Keep opaque trusted-read grant digests off the provider message path."""
-
-    if function_name != "read_file":
-        return
-    try:
-        from agent.llm_egress_firewall import source_grant_digest
-        from agent.source_provenance import SourceProvenanceRegistry
-
-        registry = getattr(agent, "_source_provenance_registry", None)
-        from agent.source_provenance import following_api_request_id
-
-        turn_id = str(getattr(agent, "_current_turn_id", "") or "")
-        request_id = following_api_request_id(
-            str(getattr(agent, "_current_api_request_id", "") or ""),
-            turn_id,
-        )
-        if not isinstance(registry, SourceProvenanceRegistry) or not request_id:
-            return
-        digests = tuple(source_grant_digest(grant) for grant in registry.grants_for_request(request_id))
-        if not digests:
-            return
-        metadata = getattr(agent, "_source_provenance_metadata", None)
-        if not isinstance(metadata, dict):
-            metadata = {}
-            agent._source_provenance_metadata = metadata
-        metadata[request_id] = {"source_grant_digests": digests}
-    except Exception:
-        # Metadata is advisory to a later firewall consumer; never infer a
-        # grant from a tool error or from arbitrary terminal/general output.
-        return
 
 
 def _pairing_tool_call_id(tool_call: Any) -> str:
@@ -802,7 +727,7 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            with _source_provenance_activation(agent, function_name):
+            with source_provenance_activation(agent, function_name):
                 return execute(final_args)
         finally:
             _hb_stop.set()
@@ -1889,7 +1814,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        _attach_trusted_source_provenance_metadata(agent, name)
+        attach_trusted_source_provenance_metadata(agent, name)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -2812,7 +2737,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
-        _attach_trusted_source_provenance_metadata(agent, function_name)
+        attach_trusted_source_provenance_metadata(agent, function_name)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,

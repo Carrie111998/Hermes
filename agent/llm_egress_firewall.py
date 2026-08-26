@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import fcntl
 import ipaddress
 import json
 import math
@@ -26,6 +25,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from agent.file_safety import get_read_block_error
+from agent.cross_process_file_lock import exclusive_file_lock
 from agent.redact import redact_sensitive_text
 
 
@@ -69,6 +69,13 @@ class SanitizedSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class UntrustedProvenanceSegment:
+    """Content-free marker for tool bytes with no trusted origin proof."""
+
+    content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class ValidatedToolSyntaxSegment:
     """Strictly parsed syntax emitted by a protected local tool result."""
 
@@ -88,7 +95,11 @@ class OutboundText:
     """Ordered typed segments that construct one outbound JSON string."""
 
     segments: tuple[
-        LiteralSegment | SanitizedSegment | ValidatedToolSyntaxSegment | SourceBoundSegment,
+        LiteralSegment
+        | SanitizedSegment
+        | ValidatedToolSyntaxSegment
+        | SourceBoundSegment
+        | UntrustedProvenanceSegment,
         ...,
     ]
 
@@ -189,6 +200,7 @@ _HERMES_TASK_ID = re.compile(r"^t_[0-9a-f]{8}$")
 _PROMPT_CACHE_KEY = re.compile(r"^pck_[0-9a-f]{24}$")
 _MAX_BASE64_CANDIDATE_CHARS = 262_144
 _VALIDATED_TOOL_SYNTAX = {
+    "separator": re.compile(r"[ \t\r\n,:=()\[\]{}]+"),
     "github_url": re.compile(
         r"https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}"
         r"(?:\.git|/(?:pull|issues)/[0-9]{1,10})?"
@@ -577,6 +589,41 @@ def _contains_secret(value: Any, *, seen: set[int] | None = None) -> bool:
     return False
 
 
+def _contains_exact_secret(
+    value: Any,
+    exact_values: Sequence[str],
+    *,
+    seen: set[int] | None = None,
+) -> bool:
+    """Match authoritative applied/environment credential bytes exactly."""
+
+    if isinstance(value, str):
+        return any(secret in value for secret in exact_values)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return True
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return True
+        seen.add(identity)
+        return any(
+            _contains_exact_secret(key, exact_values, seen=seen)
+            or _contains_exact_secret(item, exact_values, seen=seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        identity = id(value)
+        if identity in seen:
+            return True
+        seen.add(identity)
+        return any(
+            _contains_exact_secret(item, exact_values, seen=seen) for item in value
+        )
+    return False
+
+
 def _contains_private_absolute_path(value: Any, *, seen: set[int] | None = None) -> bool:
     """Reject common host-private absolute paths without blocking API paths."""
 
@@ -726,6 +773,8 @@ def _is_strict_sanitized_only_payload(
 
     if isinstance(value, SanitizedSegment):
         return isinstance(value.text, str), 1 if isinstance(value.text, str) else 0
+    if isinstance(value, UntrustedProvenanceSegment):
+        return False, 0
     if isinstance(value, ValidatedToolSyntaxSegment):
         try:
             validate_tool_syntax(value.text, value.syntax_kind)
@@ -799,6 +848,7 @@ class LLMEgressFirewall:
         conservative_chars_per_token: int = 3,
         policy_digest: str | None = None,
         static_literal_hashes_by_policy: Mapping[str, Sequence[str]] | None = None,
+        exact_secret_values: Sequence[str] = (),
     ) -> None:
         if max_serialized_bytes <= 0:
             raise ValueError("max_serialized_bytes must be positive")
@@ -835,6 +885,9 @@ class LLMEgressFirewall:
         )
         self._conservative_chars_per_token = conservative_chars_per_token
         self._policy_digest = str(policy_digest or "")
+        self._exact_secret_values = tuple(
+            dict.fromkeys(value for value in exact_secret_values if isinstance(value, str) and value)
+        )
         self._static_literal_hashes_by_policy = {
             str(policy_digest): frozenset(
                 digest
@@ -1010,6 +1063,11 @@ class LLMEgressFirewall:
             except Exception:
                 reasons.append("redaction_failed")
             try:
+                if _contains_exact_secret(scan_values, self._exact_secret_values):
+                    reasons.append("exact_secret_detected")
+            except Exception:
+                reasons.append("exact_secret_scan_failed")
+            try:
                 if _contains_canonical_base64(base64_scan_values):
                     reasons.append("base64_payload")
             except Exception:
@@ -1162,6 +1220,7 @@ class LLMEgressFirewall:
                 | SanitizedSegment
                 | ValidatedToolSyntaxSegment
                 | SourceBoundSegment
+                | UntrustedProvenanceSegment
             ),
         ) -> str:
             nonlocal sanitized_bytes, source_segment_count
@@ -1223,6 +1282,9 @@ class LLMEgressFirewall:
                 scan_values.append(text)
                 base64_scan_values.append(text)
                 return text
+            if isinstance(segment, UntrustedProvenanceSegment):
+                reasons.append("untrusted_provenance")
+                return ""
             reasons.append("invalid_source_segment")
             return ""
 
@@ -1234,6 +1296,7 @@ class LLMEgressFirewall:
                     SanitizedSegment,
                     ValidatedToolSyntaxSegment,
                     SourceBoundSegment,
+                    UntrustedProvenanceSegment,
                 ),
             ):
                 return render_text_segment(value)
@@ -1340,36 +1403,33 @@ class LLMEgressFirewall:
         flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(self._receipt_path, flags, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            file_size = os.fstat(fd).st_size
-            previous_hash = ""
-            if file_size:
-                read_start = max(0, file_size - 131_072)
-                os.lseek(fd, read_start, os.SEEK_SET)
-                prior_chunk = os.read(fd, file_size - read_start)
-                prior_lines = prior_chunk.splitlines()
-                if prior_lines:
-                    previous_hash = sha256(prior_lines[-1]).hexdigest()
-            receipt["receipt_prev_sha256"] = previous_hash
-            receipt_material = json.dumps(
-                receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
-            ).encode("utf-8")
-            receipt["receipt_sha256"] = sha256(
-                previous_hash.encode("ascii") + receipt_material
-            ).hexdigest()
-            encoded = (
-                json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-                + "\n"
-            ).encode("utf-8")
-            os.lseek(fd, 0, os.SEEK_END)
-            if os.write(fd, encoded) != len(encoded):
-                raise OSError("short receipt write")
-        finally:
+        with exclusive_file_lock(self._receipt_path.with_suffix(".lock")):
+            fd = os.open(self._receipt_path, flags, 0o600)
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.fchmod(fd, 0o600)
+                file_size = os.fstat(fd).st_size
+                previous_hash = ""
+                if file_size:
+                    read_start = max(0, file_size - 131_072)
+                    os.lseek(fd, read_start, os.SEEK_SET)
+                    prior_chunk = os.read(fd, file_size - read_start)
+                    prior_lines = prior_chunk.splitlines()
+                    if prior_lines:
+                        previous_hash = sha256(prior_lines[-1]).hexdigest()
+                receipt["receipt_prev_sha256"] = previous_hash
+                receipt_material = json.dumps(
+                    receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+                ).encode("utf-8")
+                receipt["receipt_sha256"] = sha256(
+                    previous_hash.encode("ascii") + receipt_material
+                ).hexdigest()
+                encoded = (
+                    json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+                    + "\n"
+                ).encode("utf-8")
+                os.lseek(fd, 0, os.SEEK_END)
+                if os.write(fd, encoded) != len(encoded):
+                    raise OSError("short receipt write")
             finally:
                 os.close(fd)
 
@@ -1386,6 +1446,7 @@ __all__ = [
     "SourceBoundSegment",
     "SourceGrant",
     "TypedOutboundRequest",
+    "UntrustedProvenanceSegment",
     "ValidatedToolSyntaxSegment",
     "classify_destination",
     "source_grant_digest",

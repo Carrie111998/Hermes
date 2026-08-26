@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from agent.llm_egress_firewall import (
     SourceBoundSegment,
     SourceGrant,
     TypedOutboundRequest,
+    UntrustedProvenanceSegment,
     ValidatedToolSyntaxSegment,
     DestinationClass,
     classify_destination,
@@ -75,6 +77,14 @@ _TOOL_SYNTAX_TOKEN = re.compile(
     r"[A-Za-z0-9_.-]{1,100}#[0-9]{1,10}|[0-9a-f]{40}|[0-9a-f]{64})\b)"
 )
 _VALIDATED_SYNTAX_TOOL_NAMES = frozenset({"terminal"})
+_CREDENTIAL_ENV_SUFFIXES = (
+    "_API_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "_KEY",
+    "_PASSWORD",
+    "_CREDENTIAL",
+)
 
 _PRIVATE_PATH_IN_TEXT = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
@@ -137,6 +147,35 @@ def provider_uses_egress_firewall(provider: Any) -> bool:
     """Return whether an exact configured provider owns a protected remote lane."""
 
     return str(provider or "").strip().lower() in _PROTECTED_REMOTE_PROVIDERS
+
+
+def _exact_provider_secret_values() -> tuple[str, ...]:
+    """Snapshot exact profile and credential environment values before send.
+
+    This is the final provider-boundary interlock for the exact applied-secret
+    class tracked in #77165; shape-based redaction remains an independent scan.
+    """
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    try:
+        from hermes_cli.env_loader import get_secret_source_values
+
+        values = list(get_secret_source_values(home).values())
+    except Exception:
+        values = []
+    values.extend(
+        value
+        for name, value in os.environ.items()
+        if value and name.upper().endswith(_CREDENTIAL_ENV_SUFFIXES)
+    )
+    return tuple(
+        dict.fromkeys(value for value in values if isinstance(value, str) and value)
+    )
 
 
 def _read_grant_text(grant: SourceGrant) -> str | None:
@@ -272,39 +311,35 @@ def _segment_protected_tool_result(
     used_grants: dict[str, SourceGrant],
     *,
     sanitized_cap: int,
-) -> SanitizedSegment | SourceBoundSegment | ValidatedToolSyntaxSegment | OutboundText:
-    """Type only complete, firewall-revalidated local terminal syntax spans."""
+) -> ValidatedToolSyntaxSegment | UntrustedProvenanceSegment | OutboundText:
+    """Admit only fully parsed terminal syntax; preserve all other provenance."""
 
-    segments: list[SanitizedSegment | SourceBoundSegment | ValidatedToolSyntaxSegment] = []
+    del grant_texts, used_grants, sanitized_cap
+    segments: list[ValidatedToolSyntaxSegment] = []
     cursor = 0
     for match in _TOOL_SYNTAX_TOKEN.finditer(text):
         if match.start() > cursor:
-            prefix = _segment_text(
-                text[cursor : match.start()],
-                grant_texts,
-                used_grants,
-                sanitized_cap=sanitized_cap,
-            )
-            segments.extend(prefix.segments if isinstance(prefix, OutboundText) else (prefix,))
+            separator = text[cursor : match.start()]
+            try:
+                validate_tool_syntax(separator, "separator")
+            except (TypeError, ValueError):
+                return UntrustedProvenanceSegment(
+                    sha256(text.encode("utf-8")).hexdigest()
+                )
+            segments.append(ValidatedToolSyntaxSegment(separator, "separator"))
         kind = match.lastgroup or ""
         token = validate_tool_syntax(match.group(0), kind)
         segments.append(ValidatedToolSyntaxSegment(token, kind))
         cursor = match.end()
     if cursor < len(text):
-        suffix = _segment_text(
-            text[cursor:],
-            grant_texts,
-            used_grants,
-            sanitized_cap=sanitized_cap,
-        )
-        segments.extend(suffix.segments if isinstance(suffix, OutboundText) else (suffix,))
+        separator = text[cursor:]
+        try:
+            validate_tool_syntax(separator, "separator")
+        except (TypeError, ValueError):
+            return UntrustedProvenanceSegment(sha256(text.encode("utf-8")).hexdigest())
+        segments.append(ValidatedToolSyntaxSegment(separator, "separator"))
     if not segments:
-        return _segment_text(
-            text,
-            grant_texts,
-            used_grants,
-            sanitized_cap=sanitized_cap,
-        )
+        return UntrustedProvenanceSegment(sha256(text.encode("utf-8")).hexdigest())
     return segments[0] if len(segments) == 1 else OutboundText(tuple(segments))
 
 
@@ -506,6 +541,7 @@ def authorize_agent_sdk_kwargs(
         static_literal_hashes_by_policy={
             policy_digest: _structural_literal_hashes(body)
         },
+        exact_secret_values=_exact_provider_secret_values(),
     )
     try:
         authorization = firewall.authorize(

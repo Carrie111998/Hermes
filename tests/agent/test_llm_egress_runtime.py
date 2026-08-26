@@ -285,9 +285,8 @@ def test_protected_kanban_types_only_recognized_terminal_result_syntax(
     monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
     agent = _agent(tmp_path)
     output = (
-        "origin https://github.com/acme/widget.git\n"
-        "run_id=1129 --force-with-lease refs/heads/codex/fix-135\n"
-        "_force_close_actionable_pending_routes_for_cycle"
+        "https://github.com/acme/widget.git\n"
+        "run_id=1129 --force-with-lease refs/heads/codex/fix-135"
     )
     kwargs = {
         "model": "test-model",
@@ -314,6 +313,80 @@ def test_protected_kanban_types_only_recognized_terminal_result_syntax(
 
     assert authorized == kwargs
     assert json.loads(receipt.payload_bytes) == kwargs
+
+
+def test_protected_terminal_file_bytes_keep_untrusted_provenance(
+    tmp_path, monkeypatch
+):
+    """Ungrantable terminal reads must never become sanitized by omission."""
+
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    calls = []
+    innocent_source = "def calculate_total(items):\n    return sum(items)\n"
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        dispatch_authorized_agent_request(
+            agent,
+            {
+                "model": "test-model",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_terminal_file_read",
+                                "type": "function",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": '{"command":"cat internal_source.py"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_terminal_file_read",
+                        "content": innocent_source,
+                    },
+                ],
+            },
+            lambda request: calls.append(request),
+        )
+
+    assert "untrusted_provenance" in exc_info.value.decision.reason_codes
+    assert calls == []
+
+
+def test_exact_applied_secret_is_denied_at_final_provider_boundary(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import env_loader
+
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    secret = "purple-lantern-river-cobalt"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setitem(
+        env_loader._SECRET_SOURCE_VALUES_BY_HOME,
+        str(home.resolve()),
+        {"EXTERNAL_VALUE": secret},
+    )
+    agent = _agent(tmp_path / "egress")
+    calls = []
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        dispatch_authorized_agent_request(
+            agent,
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": f"result: {secret}"}],
+            },
+            lambda request: calls.append(request),
+        )
+
+    assert "exact_secret_detected" in exc_info.value.decision.reason_codes
+    assert calls == []
 
 
 def test_tool_syntax_without_recognized_terminal_call_remains_blocked(
@@ -387,7 +460,7 @@ def test_protected_kanban_recognizes_direct_codex_function_items(
             {
                 "type": "function_call_output",
                 "call_id": "call_terminal123",
-                "output": "origin https://github.com/acme/widget.git run_id=1129",
+                "output": "https://github.com/acme/widget.git run_id=1129",
             },
         ],
     }
