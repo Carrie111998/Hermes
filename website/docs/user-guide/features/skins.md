@@ -41,6 +41,8 @@ display:
 | `poseidon` | Ocean-god theme — deep blue and seafoam | `Poseidon Agent` | Deep blue to seafoam gradient. Ocean-themed spinners ("charting currents", "sounding the depth"). Trident ASCII art banner. |
 | `sisyphus` | Sisyphean theme — austere grayscale with persistence | `Sisyphus Agent` | Light grays with stark contrast. Boulder-themed spinners ("pushing uphill", "resetting the boulder", "enduring the loop"). Boulder-and-hill ASCII art banner. |
 | `charizard` | Volcanic theme — burnt orange and ember | `Charizard Agent` | Warm burnt orange to ember gradient. Fire-themed spinners ("banking into the draft", "measuring burn"). Dragon-silhouette ASCII art banner. |
+| `digitalocean-dark` | DigitalOcean Blue on deep navy and teal cloud surfaces | `DigitalOcean Sammy` | DigitalOcean Blue (`#0069FF`) focus states over deep navy and teal cloud surfaces, with a geometric DigitalOcean logo banner and cloud-infrastructure spinner verbs. |
+| `digitalocean-light` | DigitalOcean Blue on bright cloud surfaces | `DigitalOcean Sammy` | Bright cloud surfaces with DigitalOcean Blue (`#0069FF`) focus states, cool slate text, and the same geometric logo banner. |
 
 ## Complete list of configurable keys
 

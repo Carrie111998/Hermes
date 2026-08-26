@@ -2,9 +2,139 @@
 
 import json
 import os
+import re
 import pytest
 from pathlib import Path
 from unittest.mock import patch
+
+# ANSI Shadow glyphs used by builtin banner_logo word-art. Longest-first
+# matching is required because I (`██╗`) is a prefix of H (`██╗  ██╗`).
+_ANSI_SHADOW = {
+    "G": (
+        " ██████╗ ",
+        "██╔════╝ ",
+        "██║  ███╗",
+        "██║   ██║",
+        "╚██████╔╝",
+        " ╚═════╝ ",
+    ),
+    "O": (
+        " ██████╗ ",
+        "██╔═══██╗",
+        "██║   ██║",
+        "██║   ██║",
+        "╚██████╔╝",
+        " ╚═════╝ ",
+    ),
+    "N": (
+        "███╗   ██╗",
+        "████╗  ██║",
+        "██╔██╗ ██║",
+        "██║╚██╗██║",
+        "██║ ╚████║",
+        "╚═╝  ╚═══╝",
+    ),
+    "T": (
+        "████████╗",
+        "╚══██╔══╝",
+        "   ██║   ",
+        "   ██║   ",
+        "   ██║   ",
+        "   ╚═╝   ",
+    ),
+    "A": (
+        " █████╗ ",
+        "██╔══██╗",
+        "███████║",
+        "██╔══██║",
+        "██║  ██║",
+        "╚═╝  ╚═╝",
+    ),
+    "C": (
+        " ██████╗",
+        "██╔════╝",
+        "██║     ",
+        "██║     ",
+        "╚██████╗",
+        " ╚═════╝",
+    ),
+    "D": (
+        "██████╗ ",
+        "██╔══██╗",
+        "██║  ██║",
+        "██║  ██║",
+        "██████╔╝",
+        "╚═════╝ ",
+    ),
+    "E": (
+        "███████╗",
+        "██╔════╝",
+        "█████╗  ",
+        "██╔══╝  ",
+        "███████╗",
+        "╚══════╝",
+    ),
+    "H": (
+        "██╗  ██╗",
+        "██║  ██║",
+        "███████║",
+        "██╔══██║",
+        "██║  ██║",
+        "╚═╝  ╚═╝",
+    ),
+    "L": (
+        "██╗     ",
+        "██║     ",
+        "██║     ",
+        "██║     ",
+        "███████╗",
+        "╚══════╝",
+    ),
+    "I": (
+        "██╗",
+        "██║",
+        "██║",
+        "██║",
+        "██║",
+        "╚═╝",
+    ),
+}
+
+
+def _decode_ansi_shadow_logo(banner_logo: str) -> str:
+    """Read the letters spelled by a Rich-markup ANSI Shadow banner_logo."""
+    rows = [
+        line for line in (
+            re.sub(r"\[/?[^\]]*\]", "", line) for line in banner_logo.splitlines()
+        )
+        if line.strip()
+    ]
+    assert len(rows) == 6, f"expected 6 art rows, got {len(rows)}"
+    width = max(len(row) for row in rows)
+    rows = [row.ljust(width) for row in rows]
+    letters = []
+    pos = 0
+    glyphs = sorted(_ANSI_SHADOW.items(), key=lambda item: -len(item[1][0]))
+    while pos < width:
+        if all(row[pos] == " " for row in rows):
+            pos += 1
+            continue
+        match = None
+        for name, glyph in glyphs:
+            glen = len(glyph[0])
+            if pos + glen <= width and all(
+                rows[i][pos:pos + glen] == glyph[i] for i in range(6)
+            ):
+                match = name
+                pos += glen
+                break
+        if match is None:
+            window = [row[pos:pos + 12] for row in rows]
+            raise AssertionError(
+                f"unrecognized ANSI Shadow glyph at column {pos}: {window!r}"
+            )
+        letters.append(match)
+    return "".join(letters)
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +229,38 @@ class TestBuiltinSkins:
         assert skin.name == "warm-lightmode"
         assert skin.get_color("banner_text") == "#2C1810"
         assert skin.get_color("completion_menu_bg") == "#F5EFE0"
+
+    @pytest.mark.parametrize(
+        ("name", "status_bar_bg"),
+        [("digitalocean-dark", "#000C2A"), ("digitalocean-light", "#E3E8F4")],
+    )
+    def test_digitalocean_skins_load(self, name, status_bar_bg):
+        from hermes_cli.skin_engine import load_skin
+
+        skin = load_skin(name)
+        assert skin.name == name
+        assert skin.get_color("ui_accent") == "#0069FF"
+        assert skin.get_color("status_bar_bg") == status_bar_bg
+        assert skin.get_branding("agent_name") == "DigitalOcean Sammy"
+        assert "████" in skin.banner_logo
+        assert _decode_ansi_shadow_logo(skin.banner_logo) == "DIGITALOCEAN"
+        hero = re.sub(r"\[/?[^\]]*\]", "", skin.banner_hero)
+        assert "#0069FF" in skin.banner_hero
+        assert "⣿" not in hero  # old droplet used braille; logomark is block cells
+        # Official mark: thick C-ring open on the left, three detached squares
+        # (inner / left / bottom) in a down-left stair.
+        assert "████    ██████" in hero  # left pixel separated from inner square
+        assert "    ████      ████" in hero  # bottom pixel offset under the gap
+        assert skin.banner_hero.count("█") >= 40
+
+    def test_digitalocean_skins_share_the_same_logomark(self):
+        from hermes_cli.skin_engine import load_skin
+
+        strip = lambda s: re.sub(r"\[/?[^\]]*\]", "", s)
+        dark = load_skin("digitalocean-dark")
+        light = load_skin("digitalocean-light")
+        assert strip(dark.banner_hero) == strip(light.banner_hero)
+        assert strip(dark.banner_logo).splitlines()[0].startswith("██████╗ ██╗ ██████╗")
 
     def test_unknown_skin_falls_back_to_default(self):
         from hermes_cli.skin_engine import load_skin

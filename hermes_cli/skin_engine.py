@@ -104,6 +104,8 @@ BUILT-IN SKINS
 - ``slate``   — Cool blue developer-focused theme
 - ``daylight`` — Light background theme with dark text and blue accents
 - ``warm-lightmode`` — Warm brown/gold text for light terminal backgrounds
+- ``digitalocean-dark`` — DigitalOcean Blue on deep navy/teal cloud surfaces
+- ``digitalocean-light`` — DigitalOcean Blue on bright cloud surfaces
 
 USER SKINS
 ==========
@@ -564,6 +566,154 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
 [#4A4A4A]⠀⠀⠀⠀⠀⣀⣴⣿⣿⣿⣿⣿⣿⣦⣀⠀⠀⠀⠀⠀⠀[/]
 [#656565]⠀⠀⠀━━━━━━━━━━━━━━━━━━━━━━━⠀⠀⠀[/]
 [dim #4A4A4A]⠀⠀⠀⠀⠀⠀⠀⠀⠀the boulder⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]""",
+    },
+    "digitalocean-dark": {
+        "name": "digitalocean-dark",
+        "description": "DigitalOcean Blue on deep navy and teal cloud surfaces",
+        "colors": {
+            "banner_border": "#325553",
+            "banner_title": "#E5ECEB",
+            "banner_accent": "#0069FF",
+            "banner_dim": "#6F908C",
+            "banner_text": "#C9D6D4",
+            "ui_accent": "#0069FF",
+            "ui_label": "#9FDDFF",
+            "ui_ok": "#68D391",
+            "ui_error": "#FF7B8A",
+            "ui_warn": "#FFE175",
+            "prompt": "#0069FF",
+            "input_rule": "#325553",
+            "response_border": "#0069FF",
+            "status_bar_bg": "#000C2A",
+            "status_bar_text": "#E5ECEB",
+            "status_bar_strong": "#0069FF",
+            "status_bar_dim": "#8A96B5",
+            "status_bar_good": "#68D391",
+            "status_bar_warn": "#FFE175",
+            "status_bar_bad": "#FFAF8C",
+            "status_bar_critical": "#FF7B8A",
+            "session_label": "#0069FF",
+            "session_border": "#4D5B7C",
+            "voice_status_bg": "#000C2A",
+            "selection_bg": "#13302E",
+            "completion_menu_bg": "#000C2A",
+            "completion_menu_current_bg": "#13302E",
+            "completion_menu_meta_bg": "#000A0A",
+            "completion_menu_meta_current_bg": "#1F403E",
+        },
+        "spinner": {
+            "waiting_faces": ["(do)", "(· )", "( ·)", "(··)"],
+            "thinking_faces": ["(do)", "(//)", "(-- )", "( --)"],
+            "thinking_verbs": [
+                "provisioning droplets", "routing the request", "scaling the control plane",
+                "checking the region", "keeping it simple",
+            ],
+            "wings": [["⟪#", "#⟫"], ["⟪·", "·⟫"], ["⟪/", "/⟫"]],
+        },
+        "branding": {
+            "agent_name": "DigitalOcean Sammy",
+            "welcome": "Welcome to DigitalOcean Sammy. Type your message or /help for commands.",
+            "goodbye": "Goodbye from the cloud. ▌",
+            "response_label": " ▌ DigitalOcean Sammy ",
+            "prompt_symbol": "▌",
+            "help_header": "▌ Available Commands",
+        },
+        "tool_prefix": "│",
+        "banner_logo": """[bold #F5F5F5]██████╗ ██╗ ██████╗ ██╗████████╗ █████╗ ██╗      ██████╗  ██████╗███████╗ █████╗ ███╗   ██╗[/]
+[bold #E7E7E7]██╔══██╗██║██╔════╝ ██║╚══██╔══╝██╔══██╗██║     ██╔═══██╗██╔════╝██╔════╝██╔══██╗████╗  ██║[/]
+[#D7D7D7]██║  ██║██║██║  ███╗██║   ██║   ███████║██║     ██║   ██║██║     █████╗  ███████║██╔██╗ ██║[/]
+[#C7C7C7]██║  ██║██║██║   ██║██║   ██║   ██╔══██║██║     ██║   ██║██║     ██╔══╝  ██╔══██║██║╚██╗██║[/]
+[#B7B7B7]██████╔╝██║╚██████╔╝██║   ██║   ██║  ██║███████╗╚██████╔╝╚██████╗███████╗██║  ██║██║ ╚████║[/]
+[#8A96B5]╚═════╝ ╚═╝ ╚═════╝ ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝[/]""",
+        "banner_hero": """[#0069FF]        ▄▄██████████▄▄▄[/]
+[#0069FF]     ▄██████████████████▄[/]
+[#0069FF]   ▄██████████████████████▄[/]
+[#0069FF]  ███████▀▀        ▀▀███████▄[/]
+[#0069FF] ██████▀              ▀██████[/]
+[#0069FF]██████▀                ▀██████[/]
+[#0069FF]██████                  ██████[/]
+[#0069FF]▀▀▀▀▀▀                  ██████[/]
+[#0069FF]                        ██████[/]
+[#0069FF]         ██████        ▄██████[/]
+[#0069FF] ████    ██████       ███████[/]
+[#0069FF] ████    ██████    ▄████████[/]
+[#0069FF]     ████      ███████████▀[/]
+[#0069FF]     ████      █████████▀[/]
+[#0069FF]     ▀▀▀▀      █████▀▀[/]""",
+    },
+    "digitalocean-light": {
+        "name": "digitalocean-light",
+        "description": "DigitalOcean Blue on bright cloud surfaces",
+        "colors": {
+            "banner_border": "#D6DCEA",
+            "banner_title": "#000C2A",
+            "banner_accent": "#0069FF",
+            "banner_dim": "#4D5B7C",
+            "banner_text": "#11192E",
+            "ui_accent": "#0069FF",
+            "ui_label": "#1433D6",
+            "ui_ok": "#006650",
+            "ui_error": "#A2001D",
+            "ui_warn": "#7A4A00",
+            "prompt": "#0069FF",
+            "input_rule": "#D6DCEA",
+            "response_border": "#0069FF",
+            "status_bar_bg": "#E3E8F4",
+            "status_bar_text": "#000C2A",
+            "status_bar_strong": "#0069FF",
+            "status_bar_dim": "#4D5B7C",
+            "status_bar_good": "#006650",
+            "status_bar_warn": "#7A4A00",
+            "status_bar_bad": "#A2001D",
+            "status_bar_critical": "#A2001D",
+            "session_label": "#0069FF",
+            "session_border": "#8A96B5",
+            "voice_status_bg": "#E3E8F4",
+            "selection_bg": "#C6E3FF",
+            "completion_menu_bg": "#FFFFFF",
+            "completion_menu_current_bg": "#E3E8F4",
+            "completion_menu_meta_bg": "#F7F8FB",
+            "completion_menu_meta_current_bg": "#D6DCEA",
+        },
+        "spinner": {
+            "waiting_faces": ["(do)", "(· )", "( ·)", "(··)"],
+            "thinking_faces": ["(do)", "(//)", "(-- )", "( --)"],
+            "thinking_verbs": [
+                "provisioning droplets", "routing the request", "scaling the control plane",
+                "checking the region", "keeping it simple",
+            ],
+            "wings": [["⟪#", "#⟫"], ["⟪·", "·⟫"], ["⟪/", "/⟫"]],
+        },
+        "branding": {
+            "agent_name": "DigitalOcean Sammy",
+            "welcome": "Welcome to DigitalOcean Sammy. Type your message or /help for commands.",
+            "goodbye": "Goodbye from the cloud. ▌",
+            "response_label": " ▌ DigitalOcean Sammy ",
+            "prompt_symbol": "▌",
+            "help_header": "▌ Available Commands",
+        },
+        "tool_prefix": "│",
+        "banner_logo": """[bold #000C2A]██████╗ ██╗ ██████╗ ██╗████████╗ █████╗ ██╗      ██████╗  ██████╗███████╗ █████╗ ███╗   ██╗[/]
+[bold #1433D6]██╔══██╗██║██╔════╝ ██║╚══██╔══╝██╔══██╗██║     ██╔═══██╗██╔════╝██╔════╝██╔══██╗████╗  ██║[/]
+[#0069FF]██║  ██║██║██║  ███╗██║   ██║   ███████║██║     ██║   ██║██║     █████╗  ███████║██╔██╗ ██║[/]
+[#1450D6]██║  ██║██║██║   ██║██║   ██║   ██╔══██║██║     ██║   ██║██║     ██╔══╝  ██╔══██║██║╚██╗██║[/]
+[#2870E6]██████╔╝██║╚██████╔╝██║   ██║   ██║  ██║███████╗╚██████╔╝╚██████╗███████╗██║  ██║██║ ╚████║[/]
+[#4D5B7C]╚═════╝ ╚═╝ ╚═════╝ ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝[/]""",
+        "banner_hero": """[#0069FF]        ▄▄██████████▄▄▄[/]
+[#0069FF]     ▄██████████████████▄[/]
+[#0069FF]   ▄██████████████████████▄[/]
+[#0069FF]  ███████▀▀        ▀▀███████▄[/]
+[#0069FF] ██████▀              ▀██████[/]
+[#0069FF]██████▀                ▀██████[/]
+[#0069FF]██████                  ██████[/]
+[#0069FF]▀▀▀▀▀▀                  ██████[/]
+[#0069FF]                        ██████[/]
+[#0069FF]         ██████        ▄██████[/]
+[#0069FF] ████    ██████       ███████[/]
+[#0069FF] ████    ██████    ▄████████[/]
+[#0069FF]     ████      ███████████▀[/]
+[#0069FF]     ████      █████████▀[/]
+[#0069FF]     ▀▀▀▀      █████▀▀[/]""",
     },
     "charizard": {
         "name": "charizard",
