@@ -126,6 +126,7 @@ export function NarrowOverlays() {
   const sideOf = (c: Contribution) => (paneChrome(c).placement === 'left' ? 'left' : 'right')
   const revealed = reveal ? collapsibles.find(p => p.id === reveal.id) : undefined
   const sides = [...new Set(collapsibles.map(sideOf))]
+  const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
 
   // The revealed pane's ZONE-mates that also left the grid (the sessions zone
   // stacks SESSIONS | BOTS): the overlay mirrors the zone's tab strip so a
@@ -160,6 +161,15 @@ export function NarrowOverlays() {
         />
       ))}
 
+      {revealed && mobileRenderer && (
+        <button
+          aria-label={`Close ${revealed.title ?? revealed.id}`}
+          className="absolute inset-0 z-30 cursor-default"
+          data-narrow-pane-scrim=""
+          onClick={closeReveal}
+          type="button"
+        />
+      )}
       {revealed && (
         <div
           className={cn(
