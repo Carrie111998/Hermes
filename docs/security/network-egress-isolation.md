@@ -11,7 +11,7 @@ commands.
 
 ## Threat Model
 
-The Hermes [SECURITY.md](../../SECURITY.md) §2 defines the trust model. The
+The Hermes [SECURITY.md](../../.github/SECURITY.md) §2 defines the trust model. The
 terminal backend is the primary execution boundary. However, when running with
 `network_mode: host`, any command the agent executes can reach any endpoint on
 the network, including external ones.
@@ -190,6 +190,6 @@ docker compose exec gateway \
 
 ## Related
 
-- [SECURITY.md](../../SECURITY.md) — Hermes trust model and vulnerability reporting
+- [SECURITY.md](../../.github/SECURITY.md) — Hermes trust model and vulnerability reporting
 - [Terminal backends](../../README.md) — sandboxed execution targets
 - [docker-compose.yml](../../docker-compose.yml) — default compose configuration

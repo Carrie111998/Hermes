@@ -7,7 +7,7 @@ tenants, and unknown columns are kept verbatim in its `data` blob, so this
 script emits company identity ONLY. Contacts are tenant data and belong in
 `contacts` (see STATUS-AND-PLAN.md item 4), never here.
 
-    python build_corpus.py "customer list - KitchenAppliancesCustomerData.csv" corpus.csv
+    python scripts/leads/build_corpus.py data/kitchen-appliances-customers.csv corpus.csv
     python -m server import-candidates --dataset-id kitchen-appliances --version 1 --file corpus.csv
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from server.quality import normalize_name
 
 # Hand-written because the raw file uses trade names and misspellings that no

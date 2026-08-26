@@ -1,3 +1,56 @@
+# Repository Map — read this first
+
+This repo is **two things stacked**. Knowing which layer you are in decides
+almost everything about a change.
+
+**1. The product: the Interfaze lead agent.** A FastAPI service plus its own
+web UI, sold to operators who research and contact B2B leads.
+
+| Path | What it is |
+|---|---|
+| `server/` | The product API (`server/app.py`, `server/routes/`). Entry point: `interfaze-api` → `server/api_cli.py`. |
+| `server/lead_research/` | The lead engine — discovery, enrichment, scoring, verification, providers. Most product work lands here. |
+| `server/webui/` | The product's web interface (vanilla JS, no build step). This is the UI, **not** anything named `web/`. |
+| `skills/sales/` | Agent-facing instruction text the runs dispatch to: lead-discovery, lead-research, contact-discovery, cold-email-outreach, whatsapp-outreach, linkedin-notes, document-processing, company-brain-build. |
+| `company-packs/` | Per-tenant config (`company.yaml`, market preferences, templates). Read via `server/run_types.py`. |
+| `candidate-manifests/`, `scripts/leads/` | Curated candidate data and the scripts that build corpora from it. |
+| `tests/server/` | The product test suite. Run this before anything else. |
+| `PRODUCT.md` | The product spec. Code comments cite it by section (`PRODUCT.md §7.5`). |
+| `docs/product/` | Status, roadmap, design notes, TODO. |
+
+**2. The runtime underneath: Hermes**, an upstream agent framework, vendored.
+The product does not import it much — `server/agent_service.py` *shells out*
+to the `hermes` CLI (`hermes -z <prompt> --skills <skill> --yolo`). Treat it as
+a dependency you happen to be able to edit, not as your codebase.
+
+| Path | What it is |
+|---|---|
+| `cli.py`, `run_agent.py`, `hermes_*.py`, `model_tools.py`, `toolsets*.py` | Framework core, top-level modules (pinned in `pyproject.toml`'s `py-modules`). |
+| `agent/`, `tools/`, `hermes_cli/`, `gateway/`, `cron/` | Agent loop, tool implementations, CLI, messaging gateway, scheduler. |
+| `plugins/` | Integrations. `plugins/web/scrapling/` is the one the product depends on. |
+| `optional-skills/`, `optional-mcps/`, `locales/` | Shipped catalogs. `Dockerfile.interfaze-api` copies `skills/` and `optional-skills/` into the image. |
+| `tests/` (everything except `tests/server/`) | Upstream framework tests. |
+| `AGENTS.md` (below this map) | The upstream contributor guide. It describes **Hermes**, not the product. |
+
+## Where things run
+
+- Container: `Dockerfile.interfaze-api` + `docker-compose.interfaze.yml`. These
+  are the only container files; the upstream Hermes gateway image was removed.
+- CI: `.github/workflows/interfaze-api.yml` is the product pipeline (tests,
+  packaging, image build + boot). `ci.yml` orchestrates the upstream lanes.
+- Local state lives under `$HERMES_HOME` (`/data` in the image).
+
+## Conventions worth knowing before you edit
+
+- Changing product behaviour usually means touching `server/`, a `skills/sales/`
+  SKILL.md, and `tests/server/` together — the skill text is part of the contract.
+- `data/` is gitignored: customer exports and lead corpora carry contact PII and
+  must never be committed.
+- Don't reintroduce `build/`, `.worktrees/`, or `.claude/worktrees/` into git —
+  they put duplicate copies of every file in the path of every search.
+
+---
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.

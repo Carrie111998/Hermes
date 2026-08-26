@@ -3,23 +3,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_MD = REPO_ROOT / "skills" / "social-media" / "xurl" / "SKILL.md"
-DOC_MD = (
-    REPO_ROOT
-    / "website"
-    / "docs"
-    / "user-guide"
-    / "skills"
-    / "bundled"
-    / "social-media"
-    / "social-media-xurl.md"
-)
+# The mirror of these assertions against website/docs/.../social-media-xurl.md
+# went away with the Docusaurus site; SKILL.md is the only copy now.
 
 
 def test_xurl_article_ingestion_uses_raw_api_mode():
-    skill_text = SKILL_MD.read_text(encoding="utf-8")
-    docs_text = DOC_MD.read_text(encoding="utf-8")
-
-    for text in (skill_text, docs_text):
+    for text in (SKILL_MD.read_text(encoding="utf-8"),):
         assert "For X Articles, use raw API mode" in text
         assert "`xurl read`" in text
         assert "do not put `read` before a `/2/tweets/...`" in text
