@@ -1,10 +1,11 @@
 import { QueryClient } from '@tanstack/react-query'
-import { cleanup, render, renderHook } from '@testing-library/react'
+import { cleanup, render, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelInfo } from '@/hermes'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $confirmRequest, settleConfirm } from '@/store/confirm'
 import {
   $activeSessionId,
   $currentModel,
@@ -42,7 +43,11 @@ vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
       desktop: {
-        modelSwitchFailed: 'Model switch failed'
+        modelSwitchFailed: 'Model switch failed',
+        modelConfirmTitle: 'Confirm model switch',
+        modelConfirmBody: 'This model has unusual pricing or data-training terms.',
+        modelConfirmAccept: 'Switch anyway',
+        modelConfirmCancel: 'Cancel'
       }
     }
   })
@@ -73,6 +78,8 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    // Shared module-level vi.fn()s keep call history across tests unless cleared.
+    notifyError.mockClear()
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     setCurrentModel('')
@@ -83,6 +90,8 @@ describe('useModelControls', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    settleConfirm(false)
+    $confirmRequest.set(null)
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     setCurrentModel('')
@@ -585,5 +594,101 @@ describe('useModelControls', () => {
       provider: 'anthropic'
     })
     expect(queryClient.getQueryData(modelOptionsQueryKey('default', 'tile-runtime'))).toBeUndefined()
+  })
+
+  it('asks for expensive-model confirmation and retries with confirm_expensive_model instead of silently dropping the pick', async () => {
+    // Contributor-tier / high-price models make the gateway answer
+    // confirm_required WITHOUT applying the switch, waiting for the client to
+    // re-send with confirm_expensive_model: true (the TUI handshake). Desktop
+    // used to treat that response as success — the pick painted, the next turn
+    // still ran the old model, and no dialog ever appeared.
+    $activeSessionId.set('session-1')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+
+    const requestGateway = vi.fn(async () => {
+      // First call returns the gateway's data-policy guard; only after the user
+      // confirms does the second call actually apply the switch.
+      if (requestGateway.mock.calls.length === 1) {
+        return {
+          key: 'model',
+          value: 'muse-spark-1.2-contributor-free',
+          warning: 'This model trains on your data.',
+          confirm_required: true,
+          confirm_message: 'This model trains on your data.'
+        } as never
+      }
+
+      return { key: 'model', value: 'muse-spark-1.2-contributor-free' } as never
+    })
+
+    let controls!: Controls
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    const pending = controls.selectModel({ model: 'muse-spark-1.2-contributor-free', provider: 'opencode-free' })
+
+    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
+
+    // The first request must go out bare; only an explicit user confirmation
+    // adds confirm_expensive_model.
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect(requestGateway).toHaveBeenNthCalledWith(1, 'config.set', {
+      session_id: 'session-1',
+      key: 'model',
+      value: 'muse-spark-1.2-contributor-free --provider opencode-free --global'
+    })
+    // The dialog carries the gateway's own guard message so the user knows WHY.
+    expect($confirmRequest.get()).toMatchObject({
+      description: 'This model trains on your data.',
+      confirmLabel: 'Switch anyway'
+    })
+
+    settleConfirm(true)
+
+    await expect(pending).resolves.toBe(true)
+
+    expect(requestGateway).toHaveBeenCalledTimes(2)
+    expect(requestGateway).toHaveBeenNthCalledWith(2, 'config.set', {
+      session_id: 'session-1',
+      key: 'model',
+      value: 'muse-spark-1.2-contributor-free --provider opencode-free --global',
+      confirm_expensive_model: true
+    })
+    // Confirmed pick sticks in the composer and is not treated as a failure.
+    expect($currentModel.get()).toBe('muse-spark-1.2-contributor-free')
+    expect($currentProvider.get()).toBe('opencode-free')
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('rolls the optimistic pick back when the user declines the expensive-model confirmation', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+
+    const requestGateway = vi.fn(async () =>
+      ({
+        key: 'model',
+        value: 'muse-spark-1.2-contributor-free',
+        confirm_required: true,
+        confirm_message: 'This model trains on your data.'
+      }) as never
+    )
+
+    let controls!: Controls
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    const pending = controls.selectModel({ model: 'muse-spark-1.2-contributor-free', provider: 'opencode-free' })
+
+    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
+
+    settleConfirm(false)
+
+    await expect(pending).resolves.toBe(false)
+
+    // No retry goes out behind a declined dialog, and the composer falls back
+    // to the model that will actually run next turn.
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect($currentModel.get()).toBe('fable-5')
+    expect($currentProvider.get()).toBe('nous')
   })
 })

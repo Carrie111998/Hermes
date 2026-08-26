@@ -2916,6 +2916,10 @@ export interface Translations {
     cwdStagedTitle: string
     cwdStagedMessage: string
     modelSwitchFailed: string
+    modelConfirmTitle: string
+    modelConfirmBody: string
+    modelConfirmAccept: string
+    modelConfirmCancel: string
     sessionExported: string
     sessionExportFailed: string
     imageSaved: string

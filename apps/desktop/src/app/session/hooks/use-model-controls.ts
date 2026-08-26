@@ -7,6 +7,7 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
 import { notifyError } from '@/store/notifications'
+import { confirm } from '@/store/confirm'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
@@ -217,6 +218,31 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         return true
       }
 
+      // Shared by real failures and declined confirmations: undo the
+      // optimistic paint above and the model-options cache patch. Declared
+      // before the try so the catch block can reach it too.
+      const restorePreviousPaint = () => {
+        if (touchesPrimary) {
+          setCurrentModel(prevModel)
+          setCurrentProvider(prevProvider)
+          setCurrentModelSource(prevSource)
+        } else if (liveSessionId) {
+          sessionTileDelegate()?.updateSession(liveSessionId, state => ({
+            ...state,
+            model: prevModel,
+            provider: prevProvider
+          }))
+        }
+
+        updateModelOptionsCache(
+          liveSessionId,
+          prevProvider,
+          prevModel,
+          touchesPrimary && !liveSessionId,
+          liveGatewayProfile
+        )
+      }
+
       try {
         // The PRIMARY profile's main agent is the profile's default — its
         // model/provider choice IS the default, so persist it to config.yaml
@@ -235,11 +261,49 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
         const scope = persistsAsDefault ? '--global' : '--session'
 
-        const result = await requestGateway<{ deferred?: boolean }>('config.set', {
+        const switchParams = {
           session_id: liveSessionId,
           key: 'model',
           value: `${selection.model} --provider ${selection.provider} ${scope}`
-        })
+        }
+
+        const result = await requestGateway<{
+          confirm_message?: string
+          confirm_required?: boolean
+          deferred?: boolean
+        }>('config.set', switchParams)
+
+        // Contributor-tier / unusually priced models come back as
+        // confirm_required with the switch NOT applied: the gateway parks the
+        // request until the client re-sends it with confirm_expensive_model
+        // (the same handshake ui-tui's /model runs). Treating that response as
+        // success would paint a pick the next turn never runs.
+        if (result?.confirm_required) {
+          const confirmed = await confirm({
+            title: copy.modelConfirmTitle,
+            description: result.confirm_message || copy.modelConfirmBody,
+            confirmLabel: copy.modelConfirmAccept,
+            cancelLabel: copy.modelConfirmCancel,
+            destructive: true
+          })
+
+          if (!confirmed) {
+            restorePreviousPaint()
+
+            return false
+          }
+
+          const retryResult = await requestGateway<{ deferred?: boolean }>('config.set', {
+            ...switchParams,
+            confirm_expensive_model: true
+          })
+
+          if (!retryResult?.deferred) {
+            void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+          }
+
+          return true
+        }
 
         // A pick made DURING a turn is queued by the gateway and applied at the
         // next turn start (`deferred`). Re-fetching now would answer with the
@@ -261,31 +325,22 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
           return true
         }
 
-        if (touchesPrimary) {
-          setCurrentModel(prevModel)
-          setCurrentProvider(prevProvider)
-          setCurrentModelSource(prevSource)
-        } else if (liveSessionId) {
-          sessionTileDelegate()?.updateSession(liveSessionId, state => ({
-            ...state,
-            model: prevModel,
-            provider: prevProvider
-          }))
-        }
-
-        updateModelOptionsCache(
-          liveSessionId,
-          prevProvider,
-          prevModel,
-          touchesPrimary && !liveSessionId,
-          liveGatewayProfile
-        )
+        restorePreviousPaint()
         notifyError(err, copy.modelSwitchFailed)
 
         return false
       }
     },
-    [copy.modelSwitchFailed, queryClient, requestGateway, updateModelOptionsCache]
+    [
+      copy.modelConfirmAccept,
+      copy.modelConfirmBody,
+      copy.modelConfirmCancel,
+      copy.modelConfirmTitle,
+      copy.modelSwitchFailed,
+      queryClient,
+      requestGateway,
+      updateModelOptionsCache
+    ]
   )
 
   return { applySavedMainModel, refreshCurrentModel, selectModel }

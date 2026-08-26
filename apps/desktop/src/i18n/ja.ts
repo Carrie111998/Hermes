@@ -3045,6 +3045,10 @@ export const ja = defineLocale({
     cwdStagedMessage:
       'このアクティブなセッションへの cwd の変更を適用するにはデスクトップバックエンドを再起動してください。',
     modelSwitchFailed: 'モデルの切り替えに失敗しました',
+    modelConfirmTitle: 'モデル切り替えの確認',
+    modelConfirmBody: 'このモデルは既知の価格が非常に高いか、データ学習の条件を含んでいます。',
+    modelConfirmAccept: 'それでも切り替える',
+    modelConfirmCancel: 'キャンセル',
     sessionExported: 'セッションをエクスポートしました',
     sessionExportFailed: 'セッションをエクスポートできませんでした',
     imageSaved: '画像を保存しました',
