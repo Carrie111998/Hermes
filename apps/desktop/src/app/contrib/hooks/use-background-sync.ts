@@ -1,19 +1,250 @@
 import { useStore } from '@nanostores/react'
-import { useEffect } from 'react'
+import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import { getLatestSessionMessages, type ProfileScope } from '@/hermes'
+import { preserveLocalAssistantErrors, sealOpenToolParts, toChatMessages } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
 import { refreshActiveProfile } from '@/store/profile'
-import { $activeSessionId, $currentCwd, setCurrentCwd } from '@/store/session'
+import {
+  $activeSessionId,
+  $busy,
+  $currentCwd,
+  $messagingSessions,
+  $selectedStoredSessionId,
+  $sessions,
+  getSessionOwnerHint,
+  sessionMatchesStoredId,
+  setCurrentCwd
+} from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import {
   $sessionStates,
+  $sessionTiles,
   publishSessionState,
   SESSION_WATCHDOG_TIMEOUT_MS,
   setSessionStalled
 } from '@/store/session-states'
 
+import type { ClientSessionState } from '../../types'
 import type { GatewayRequester } from '../types'
+
+interface ActiveTranscriptSession {
+  ownerRoute?: SessionProfileRoute
+  profile?: string | null
+}
+
+/** Resolve an active transcript from visible rows or its unique hidden owner. */
+export function resolveActiveTranscriptSession(storedSessionId: string): ActiveTranscriptSession | undefined {
+  const visible =
+    $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ??
+    $messagingSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+
+  if (visible) {
+    return { profile: visible.profile }
+  }
+
+  const ownerRoute = getSessionOwnerHint(storedSessionId)
+
+  return ownerRoute ? { ownerRoute, profile: ownerRoute.profile } : undefined
+}
+
+export interface ActiveTranscriptRefreshDeps {
+  activeSessionIdRef: MutableRefObject<string | null>
+  busyRef: MutableRefObject<boolean>
+  requestSequenceRef: MutableRefObject<number>
+  selectedStoredSessionIdRef: MutableRefObject<string | null>
+  resolveSession: (storedSessionId: string) => ActiveTranscriptSession | null | undefined
+  signatureRef: MutableRefObject<Map<string, string>>
+  updateSessionState: (
+    sessionId: string,
+    updater: (state: ClientSessionState) => ClientSessionState,
+    storedSessionId?: string | null
+  ) => ClientSessionState
+}
+
+/**
+ * Reconcile the persisted transcripts of every open WORKSPACE TILE (#93942
+ * slice 1). Bot canonical chats live here — never in $sessions /
+ * $messagingSessions (they carry the core `hidden` flag), so the main-pane
+ * reconcile path's resolveSession() bails on them and a background delivery
+ * never reaches an open bot chat. Each tile carries its own stored↔runtime id
+ * pair, so no resolution step is needed; refreshes are signature-gated per
+ * tile so a no-change event costs nothing, and a busy tile is skipped (its own
+ * stream owns the view while streaming).
+ *
+ * Sequencing note (#94255 review): all tiles SHARE one request sequence, so a
+ * second tick arriving mid-read invalidates every in-flight read from the
+ * first (latest-wins — same discipline as the main pane path). Under rapid
+ * tick bursts only the final tick lands updates; that is intended, since each
+ * tick re-reads from storage anyway.
+ */
+export async function reconcileTileTranscripts({
+  requestSequenceRef,
+  busyRef,
+  signatureRef,
+  updateSessionState,
+  tiles: tilesOverride
+}: {
+  busyRef: MutableRefObject<boolean>
+  requestSequenceRef: MutableRefObject<number>
+  signatureRef: MutableRefObject<Map<string, string>>
+  tiles?: Array<{ storedSessionId: string; runtimeId?: string }>
+  updateSessionState: (
+    sessionId: string,
+    updater: (state: ClientSessionState) => ClientSessionState,
+    storedSessionId?: string | null
+  ) => ClientSessionState
+}): Promise<void> {
+  const tiles = tilesOverride ?? $sessionTiles.get()
+
+  for (const tile of tiles) {
+    const storedSessionId = tile.storedSessionId
+    const runtimeSessionId = tile.runtimeId
+
+    if (!runtimeSessionId) {
+      // Resume not yet bound — the tile's own stream owns the view.
+      continue
+    }
+
+    if (!storedSessionId || !runtimeSessionId || busyRef.current) {
+      continue
+    }
+
+    if ($activeSessionId.get() === runtimeSessionId) {
+      // The main pane reconcile already owns this surface.
+      continue
+    }
+
+    const requestId = ++requestSequenceRef.current
+
+    // With a tiles override (test path), the live $sessionTiles check can't
+    // see the synthetic tile — treat override tiles as present.
+    const stillPresent = tilesOverride
+      ? tilesOverride.some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
+      : $sessionTiles.get().some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
+
+    try {
+      const latest = await getLatestSessionMessages(storedSessionId)
+
+      if (requestId !== requestSequenceRef.current || busyRef.current || !stillPresent) {
+        // Tile closed or superseded mid-read — discard AND prune its
+        // signature so the map doesn't grow one entry per ever-opened tile
+        // for the app's lifetime (#94255 review point 3).
+        signatureRef.current.delete(`tile:${storedSessionId}`)
+
+        continue
+      }
+
+      const signatureKey = `tile:${storedSessionId}`
+      const signature = sessionMessagesSignature(latest.messages)
+
+      if (signatureRef.current.get(signatureKey) === signature) {
+        continue
+      }
+
+      signatureRef.current.set(signatureKey, signature)
+      const messages = toChatMessages(latest.messages)
+
+      updateSessionState(
+        runtimeSessionId,
+        state => ({
+          ...state,
+          messages: preserveLocalAssistantErrors(
+            graftRefreshedTailOntoBackfill(messages, state.messages),
+            state.messages
+          )
+        }),
+        storedSessionId
+      )
+    } catch {
+      // Non-fatal: the next change event retries.
+    }
+  }
+}
+
+/** Reconcile one persisted transcript snapshot into the currently viewed session. */
+export async function reconcileActiveTranscript({
+  activeSessionIdRef,
+  busyRef,
+  requestSequenceRef,
+  resolveSession,
+  selectedStoredSessionIdRef,
+  signatureRef,
+  updateSessionState
+}: ActiveTranscriptRefreshDeps): Promise<void> {
+  const storedSessionId = selectedStoredSessionIdRef.current
+  const runtimeSessionId = activeSessionIdRef.current
+
+  if (!storedSessionId || !runtimeSessionId || busyRef.current) {
+    return
+  }
+
+  const stored = resolveSession(storedSessionId)
+
+  if (!stored) {
+    return
+  }
+
+  const requestId = requestSequenceRef.current + 1
+  requestSequenceRef.current = requestId
+
+  try {
+    const profileScope: ProfileScope = stored.ownerRoute
+      ? {
+          connectionId: stored.ownerRoute.connectionId,
+          profile: stored.ownerRoute.targetProfile ?? stored.ownerRoute.profile
+        }
+      : stored.profile
+
+    const latest = await getLatestSessionMessages(storedSessionId, profileScope)
+
+    if (
+      requestId !== requestSequenceRef.current ||
+      busyRef.current ||
+      selectedStoredSessionIdRef.current !== storedSessionId ||
+      activeSessionIdRef.current !== runtimeSessionId
+    ) {
+      return
+    }
+
+    const signatureKey = stored.ownerRoute
+      ? JSON.stringify([
+          stored.ownerRoute.connectionId,
+          stored.ownerRoute.profile,
+          stored.ownerRoute.targetProfile ?? '',
+          stored.ownerRoute.mode ?? '',
+          storedSessionId
+        ])
+      : `${stored.profile ?? 'default'}:${storedSessionId}`
+
+    const signature = sessionMessagesSignature(latest.messages)
+
+    if (signatureRef.current.get(signatureKey) === signature) {
+      return
+    }
+
+    signatureRef.current.set(signatureKey, signature)
+    const messages = toChatMessages(latest.messages)
+
+    updateSessionState(
+      runtimeSessionId,
+      state => ({
+        ...state,
+        // The refresh re-reads only the newest tail page; graft it onto any
+        // older pages "Show earlier" already backfilled instead of clobbering
+        // them (see transcript-backfill).
+        messages: preserveLocalAssistantErrors(graftRefreshedTailOntoBackfill(messages, state.messages), state.messages)
+      }),
+      storedSessionId
+    )
+  } catch {
+    // Non-fatal: the next change event or manual resume can hydrate the view.
+  }
+}
 
 // Cron sessions are written by a background scheduler tick, messaging turns by
 // the background gateway (Telegram, WeChat, Discord, …) — neither signals the
@@ -92,18 +323,26 @@ export function rehydrateLiveSessionStatuses(
 
     const existing = $sessionStates.get()[runtimeSessionId]
 
+    // A turn we just submitted is not yet running as far as the backend is
+    // concerned, so the snapshot honestly reports it idle — but the local
+    // stream is already waiting on its first token, and it is the newer
+    // information. The stream path refuses to clear busy in exactly this window
+    // (`awaitingResponse && !sawAssistantPayload`); without the same refusal
+    // here a poll lands between submit and first token and darkens the row.
+    const busy = working || Boolean(existing?.awaitingResponse && !existing.sawAssistantPayload)
+
     // Avoid re-arming the watchdog on every poll. Publish only when the
     // authoritative live snapshot differs from the renderer mirror; normal
     // gateway events continue to own subsequent transitions.
     if (
       !existing ||
       existing.storedSessionId !== storedSessionId ||
-      existing.busy !== working ||
+      existing.busy !== busy ||
       existing.needsInput !== needsInput
     ) {
       publishSessionState(runtimeSessionId, {
         ...(existing ?? createClientSessionState(storedSessionId)),
-        busy: working,
+        busy,
         needsInput,
         storedSessionId
       })
@@ -142,14 +381,20 @@ export function rehydrateLiveSessionStatuses(
 
       const existing = $sessionStates.get()[runtimeSessionId]
 
-      if (existing?.busy || existing?.needsInput) {
+      if (existing?.busy || existing?.needsInput || existing?.awaitingResponse) {
         publishSessionState(runtimeSessionId, {
           ...existing,
           awaitingResponse: false,
           busy: false,
           needsInput: false,
           streamId: null,
-          turnStartedAt: null
+          turnStartedAt: null,
+          turnLive: false,
+          // The turn ended without its completion events reaching us — a lost
+          // `tool.complete` would otherwise leave a spinning tool row in an
+          // idle session. Seal open tool parts the same way the settle path
+          // does, so the transcript matches the state.
+          messages: sealOpenToolParts(existing.messages)
         })
       }
     }
@@ -166,18 +411,25 @@ export function resetLiveRuntimeTracking(): void {
 }
 
 interface BackgroundSyncParams {
+  activeConnectionId: null | string
   activeGatewayProfile: string
   activeIsMessaging: boolean
   activeSessionId: null | string
+  activeStoredSessionId: null | string
   freshDraftReady: boolean
   gatewayState: string
-  refreshActiveMessagingTranscript: () => Promise<unknown> | unknown
+  refreshActiveTranscript: () => Promise<unknown> | unknown
   refreshCronJobs: () => Promise<unknown> | unknown
   refreshCurrentModel: (force?: boolean) => Promise<unknown> | unknown
   refreshHermesConfig: () => Promise<unknown> | unknown
   refreshMessagingSessions: () => Promise<unknown> | unknown
   refreshSessions: () => Promise<unknown> | unknown
   requestGateway: GatewayRequester
+  updateSessionState: (
+    sessionId: string,
+    updater: (state: ClientSessionState) => ClientSessionState,
+    storedSessionId?: string | null
+  ) => ClientSessionState
 }
 
 /** Poll a callback while the tab is visible, on `intervalMs`; re-checks on tab
@@ -185,9 +437,24 @@ interface BackgroundSyncParams {
  *  safety-net refreshes, not the live path, so they're the right thing to slow
  *  when the machine is spending its charge. Returns nothing — meant to live
  *  inside an effect. */
+export function windowIsActivelyViewed({
+  focused,
+  visibilityState
+}: {
+  focused: boolean
+  visibilityState: DocumentVisibilityState
+}): boolean {
+  return visibilityState === 'visible' && focused
+}
+
 function visiblePoll(intervalMs: number, tick: () => void): () => void {
   const run = () => {
-    if (document.visibilityState === 'visible') {
+    // On macOS an unfocused or app-hidden BrowserWindow commonly remains
+    // `visibilityState === "visible"`. Visibility alone therefore kept every
+    // safety-net gateway poll alive while the user was in another app. These
+    // are stale-data backstops, not the live event path, so pause them until
+    // the window is actually being viewed and catch up immediately on focus.
+    if (windowIsActivelyViewed({ focused: document.hasFocus(), visibilityState: document.visibilityState })) {
       tick()
     }
   }
@@ -200,11 +467,13 @@ function visiblePoll(intervalMs: number, tick: () => void): () => void {
   })
 
   document.addEventListener('visibilitychange', run)
+  window.addEventListener('focus', run)
 
   return () => {
     unsubscribeBattery()
     window.clearInterval(intervalId)
     document.removeEventListener('visibilitychange', run)
+    window.removeEventListener('focus', run)
   }
 }
 
@@ -215,22 +484,81 @@ function visiblePoll(intervalMs: number, tick: () => void): () => void {
  * All the "the desktop websocket won't tell us, so poll" logic in one place.
  */
 export function useBackgroundSync({
+  activeConnectionId,
   activeGatewayProfile,
   activeIsMessaging,
   activeSessionId,
+  activeStoredSessionId,
   freshDraftReady,
   gatewayState,
-  refreshActiveMessagingTranscript,
+  refreshActiveTranscript,
   refreshCronJobs,
   refreshCurrentModel,
   refreshHermesConfig,
   refreshMessagingSessions,
   refreshSessions,
-  requestGateway
+  requestGateway,
+  updateSessionState
 }: BackgroundSyncParams): void {
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const cronChangeTick = useStore($cronChangeTick)
   const sessionsChangeTick = useStore($sessionsChangeTick)
+  const activeTranscriptBusy = useStore($busy)
+  const activeTranscriptRefreshPendingRef = useRef<string | null>(null)
+  // Tile reconcile state (#93942 slice 1): shared sequence guard + per-tile
+  // transcript signatures, so no-change ticks and closed tiles cost nothing.
+  const tileRequestSequenceRef = useRef(0)
+  const tileSignatureRef = useRef(new Map<string, string>())
+  // Read $busy.get() directly inside the reconcile loop instead of mirroring
+  // the atom into a ref (lint: no-restricted-syntax — refs synced from atoms
+  // lag one render). The reconcile runs on tick, not render, so .get() is
+  // always current.
+
+  const requestActiveTranscriptRefresh = useCallback(
+    (preservePending: boolean) => {
+      if (!activeStoredSessionId || !activeSessionId) {
+        return
+      }
+
+      const storedSessionId = activeStoredSessionId
+      const runtimeSessionId = activeSessionId
+      const sessionKey = `${storedSessionId}:${runtimeSessionId}`
+
+      if (preservePending) {
+        activeTranscriptRefreshPendingRef.current = sessionKey
+      }
+
+      if ($busy.get()) {
+        return
+      }
+
+      if (preservePending && activeTranscriptRefreshPendingRef.current === sessionKey) {
+        activeTranscriptRefreshPendingRef.current = null
+      }
+
+      let sawBusyDuringRead = false
+
+      const unsubscribeBusy = $busy.listen(busy => {
+        sawBusyDuringRead ||= busy
+      })
+
+      void Promise.resolve(refreshActiveTranscript()).finally(() => {
+        unsubscribeBusy()
+
+        // If streaming began while the read was in flight, reconciliation was
+        // discarded and the external event still needs one idle retry.
+        if (
+          preservePending &&
+          (sawBusyDuringRead || $busy.get()) &&
+          $activeSessionId.get() === runtimeSessionId &&
+          $selectedStoredSessionId.get() === storedSessionId
+        ) {
+          activeTranscriptRefreshPendingRef.current = sessionKey
+        }
+      })
+    },
+    [activeSessionId, activeStoredSessionId, refreshActiveTranscript]
+  )
 
   useEffect(() => {
     if (gatewayState !== 'open') {
@@ -256,7 +584,7 @@ export function useBackgroundSync({
         })
         .catch(() => undefined)
     }
-  }, [gatewayState, refreshCurrentModel, refreshSessions, requestGateway])
+  }, [activeConnectionId, activeGatewayProfile, gatewayState, refreshCurrentModel, refreshSessions, requestGateway])
 
   // A reconnect loses renderer-only working/attention atoms while the backend
   // keeps the actual turns alive. Re-seed from the gateway's in-memory session
@@ -324,6 +652,21 @@ export function useBackgroundSync({
       lastRunAt = Date.now()
       void refreshSessions()
       void refreshMessagingSessions()
+      requestActiveTranscriptRefresh(true)
+      // Bot canonical chats live in workspace tiles, never in the main-pane
+      // selection — without this they never see background deliveries
+      // (#93942 scenario A). Signature-gated per tile, so no-change ticks
+      // cost nothing.
+      void reconcileTileTranscripts({
+        busyRef: {
+          get current() {
+            return $busy.get()
+          }
+        },
+        requestSequenceRef: tileRequestSequenceRef,
+        signatureRef: tileSignatureRef,
+        updateSessionState
+      })
     }
 
     const unsubscribe = $sessionsChangeTick.listen(() => {
@@ -346,7 +689,14 @@ export function useBackgroundSync({
         window.clearTimeout(timer)
       }
     }
-  }, [changeEventsAvailable, gatewayState, refreshMessagingSessions, refreshSessions])
+  }, [
+    changeEventsAvailable,
+    gatewayState,
+    refreshMessagingSessions,
+    refreshSessions,
+    requestActiveTranscriptRefresh,
+    updateSessionState
+  ])
 
   // Keep the cron-jobs section live without a user action (scheduler ticks in
   // the background). cron.changed (jobs.json moved: CRUD or a scheduler tick's
@@ -366,24 +716,47 @@ export function useBackgroundSync({
     )
   }, [changeEventsAvailable, cronChangeTick, gatewayState, refreshCronJobs])
 
-  // Only the open messaging transcript needs its own cadence — local chats are
-  // live over the websocket already. sessions.changed re-pulls it via the tick
-  // dep; the visible poll is the backstop.
+  // A busy transition only consumes a pending sessions.changed refresh. It
+  // never creates one, so an ordinary local turn going busy -> idle does not
+  // add a REST read. The event itself is coalesced by the list throttle above.
   useEffect(() => {
-    if (gatewayState !== 'open' || !activeIsMessaging) {
+    if (
+      gatewayState !== 'open' ||
+      activeTranscriptBusy ||
+      !activeSessionId ||
+      !activeStoredSessionId ||
+      activeTranscriptRefreshPendingRef.current !== `${activeStoredSessionId}:${activeSessionId}`
+    ) {
       return
     }
 
-    const dispose = visiblePoll(
+    requestActiveTranscriptRefresh(true)
+  }, [activeSessionId, activeStoredSessionId, activeTranscriptBusy, gatewayState, requestActiveTranscriptRefresh])
+
+  // Preserve the pre-existing messaging behavior: refresh once when a
+  // messaging transcript opens, then keep its visibility backstop. Desktop
+  // sessions never enter this effect and therefore gain no periodic timer.
+  useEffect(() => {
+    if (gatewayState !== 'open' || !activeIsMessaging || !activeSessionId || !activeStoredSessionId) {
+      return
+    }
+
+    const runScheduledRefresh = () => requestActiveTranscriptRefresh(false)
+
+    runScheduledRefresh()
+
+    return visiblePoll(
       changeEventsAvailable ? ACTIVE_MESSAGING_SESSION_BACKSTOP_INTERVAL_MS : ACTIVE_MESSAGING_SESSION_POLL_INTERVAL_MS,
-      () => void refreshActiveMessagingTranscript()
+      runScheduledRefresh
     )
-
-    void refreshActiveMessagingTranscript()
-
-    return dispose
-    // sessionsChangeTick: an inbound turn re-pulls the open transcript.
-  }, [activeIsMessaging, changeEventsAvailable, gatewayState, refreshActiveMessagingTranscript, sessionsChangeTick])
+  }, [
+    activeIsMessaging,
+    activeSessionId,
+    activeStoredSessionId,
+    changeEventsAvailable,
+    gatewayState,
+    requestActiveTranscriptRefresh
+  ])
 
   // Messaging session lists against an older backend: no sessions.changed, so
   // keep the legacy visible poll. (Event-capable backends fold this into the
