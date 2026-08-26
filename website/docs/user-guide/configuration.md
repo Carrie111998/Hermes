@@ -2314,7 +2314,7 @@ Configure browser automation behavior:
 
 ```yaml
 browser:
-  inactivity_timeout: 120        # Seconds before auto-closing idle sessions
+  inactivity_timeout: 120        # Seconds before auto-closing idle sessions, including Browser Use CLI daemons
   command_timeout: 30             # Timeout in seconds for browser commands (screenshot, navigate, etc.)
   record_sessions: false         # Auto-record browser sessions as WebM videos to ~/.hermes/browser_recordings/
   # Optional CDP override — when set, Hermes attaches directly to your own
