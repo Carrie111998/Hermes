@@ -1902,9 +1902,57 @@ def test_scan_suppresses_high_confidence_self_resolution_receipts(tmp_path: Path
     result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
 
     assert result.created == 1
-    assert result.skipped["self_resolution_receipt"] == 4
-    assert [task.evidence["feedback_id"] for task in kanban.tasks] == ["still-actionable"]
+    assert result.skipped["self_resolution_receipt"] == 3
+    assert result.skipped["duplicate"] == 1
+    assert [task.evidence["feedback_id"] for task in kanban.tasks] == ["superseded"]
     ledger.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        (
+            "Thanks for the careful review — points 1 and 3 are addressed in "
+            f"{'a' * 40}. Focused verification: 3 tests pass."
+        ),
+        (
+            f"Pushed {'b' * 40} addressing both review points. Verification: "
+            "40 tests passed, 0 failed."
+        ),
+        (
+            "Thanks for the careful review — both points were checked against the tree "
+            f"at {'c' * 40}; neither required a code change."
+        ),
+        (
+            "Updated the existing branch against current main with the complete exact-head "
+            "repair/CI/merge continuation series. Fresh verification: 335 plugin tests passed; "
+            "Ruff and git diff --check passed."
+        ),
+        (
+            "Integrated the latest approved follow-ups in two commits. Fresh verification on "
+            "the updated head: 356 focused tests passed, Ruff passed, and git diff --check passed."
+        ),
+        (
+            "Exact-head verification of merge head "
+            f"{'d' * 40} in a clean worktree confirms the re-review findings. "
+            "A runtime import check passes. No code changes were made at this head."
+        ),
+    ],
+)
+def test_self_resolution_suppresses_semantic_owner_completion_receipts(body: str) -> None:
+    item = feedback("semantic-owner-completion", reviewer="owner", body=body)
+
+    assert _is_self_resolution_receipt(item, owner_login="owner") is True
+
+
+def test_self_resolution_does_not_trust_unverified_supersession_claim() -> None:
+    item = feedback(
+        "unverified-supersession",
+        reviewer="owner",
+        body="Confirmed the gap. This narrower PR is superseded by #94495.",
+    )
+
+    assert _is_self_resolution_receipt(item, owner_login="owner") is False
 
 
 @pytest.mark.parametrize(

@@ -1219,6 +1219,40 @@ def _is_self_resolution_receipt(feedback: Feedback, *, owner_login: str) -> bool
         return True
     if _has_unresolved_action(body):
         return False
+    semantic_owner_completion = (
+        body.startswith(
+            (
+                "thanks for the careful review",
+                "pushed ",
+                "updated ",
+                "integrated ",
+                "exact-head verification of merge head ",
+            )
+        )
+        and any(
+            marker in body
+            for marker in (
+                "addressed",
+                "addressing",
+                "checked against the tree",
+                "complete exact-head repair",
+                "integrated the latest approved",
+                "confirms the re-review findings",
+            )
+        )
+        and (
+            _LANE_PASS_EVIDENCE.search(body) is not None
+            or re.search(r"\btests?\s+pass\b", body) is not None
+            or "neither required a code change" in body
+            or "no code changes were made" in body
+        )
+        and (
+            re.search(r"\b[0-9a-f]{40,64}\b", body) is not None
+            or body.startswith(("updated ", "integrated "))
+        )
+    )
+    if semantic_owner_completion:
+        return True
     reconciled_ci_receipt = (
         body.startswith("re: local pr ci audit receipt ")
         and "already resolved" in body
@@ -1397,7 +1431,9 @@ def _is_self_resolution_receipt(feedback: Feedback, *, owner_login: str) -> bool
     )
     if audit_marker and inherited_marker and routed_separately:
         return True
-    return body.startswith("confirmed ") and "superseded" in body
+    # A self-authored supersession claim is not canonical repository evidence:
+    # the named replacement may later close unmerged, leaving the defect open.
+    return False
 
 
 def _has_unresolved_action(body: str) -> bool:
