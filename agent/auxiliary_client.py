@@ -6694,6 +6694,9 @@ def resolve_provider_client(
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
             custom_base = (custom_entry.get("base_url") or "").strip()
+            # Use caller's explicit base_url when the named entry has none.
+            if not custom_base and explicit_base_url:
+                custom_base = _to_openai_base_url(explicit_base_url).strip()
             custom_key = (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
@@ -8225,11 +8228,12 @@ def _resolve_task_provider_model(
         try:
             from hermes_cli.providers import get_provider
 
-            return get_provider(normalized) is not None
+            if get_provider(normalized) is not None:
+                return True
         except Exception:
             # Keep the high-risk provider-backed routes safe even if provider
             # catalog loading is unavailable during early import/test paths.
-            return normalized in {
+            if normalized in {
                 "anthropic",
                 "copilot",
                 "copilot-acp",
@@ -8238,7 +8242,18 @@ def _resolve_task_provider_model(
                 "openai-codex",
                 "qwen-oauth",
                 "xai-oauth",
-            }
+            }:
+                return True
+        # User-defined providers (config.yaml providers:/custom_providers) are
+        # first-class: don't rewrite the name to "custom" (that would 401 via
+        # OPENAI_API_KEY fallback). Keep the name so resolution hits the
+        # named-custom branch using the provider's own base_url + key_env.
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+
+            return _get_named_custom_provider(normalized) is not None
+        except Exception:
+            return False
 
     if provider:
         provider, base_url = _expand_direct_api_alias(provider, base_url)

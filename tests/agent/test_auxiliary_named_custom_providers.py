@@ -408,3 +408,68 @@ class TestResolveProviderClientMainRuntimeCustom:
         assert model == "explicit-model"
         assert "explicit.example.com" in str(client.base_url)
         assert client.api_key == "sk-explicit"
+
+
+class TestUserDefinedProviderWithBaseUrl:
+    """Regression guard: a user-defined ``providers:`` entry (base_url +
+    key_env) paired with an explicit base_url (as the settings UI stamps it)
+    must keep its provider name — not be rewritten to ``"custom"``, which
+    would authenticate with OPENAI_API_KEY and 401 on key-required endpoints.
+    """
+
+    def test_providers_dict_entry_preserves_name_with_base_url(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MYRELAY_API_KEY", "sk-myrelay-real")
+        _write_config(tmp_path, {
+            "providers": {
+                "myrelay": {
+                    "name": "myrelay",
+                    "base_url": "https://my-relay.example.com/v1",
+                    "key_env": "MYRELAY_API_KEY",
+                },
+            },
+            "auxiliary": {"vision": {"provider": "myrelay", "model": "vision-model"}},
+        })
+        from agent.auxiliary_client import (
+            _resolve_task_provider_model,
+            resolve_vision_provider_client,
+        )
+
+        prov, model, base, key, _ = _resolve_task_provider_model(
+            "vision", "myrelay", "vision-model", base_url="https://my-relay.example.com/v1"
+        )
+        assert prov == "myrelay", f"provider rewritten to {prov!r}"
+        assert base == "https://my-relay.example.com/v1"
+
+        resolved_provider, client, resolved_model = resolve_vision_provider_client(
+            provider="myrelay", model="vision-model", base_url="https://my-relay.example.com/v1"
+        )
+        assert resolved_provider == "myrelay"
+        assert client is not None
+        assert resolved_model == "vision-model"
+        assert client.api_key not in (None, "", "no-key-required"), (
+            f"vision client fell back to placeholder key: {client.api_key!r}"
+        )
+        assert client.api_key == "sk-myrelay-real"
+
+    def test_providers_dict_entry_without_base_url_still_resolves(self, tmp_path, monkeypatch):
+        """Dashboard-style call (provider only, no caller base_url) must
+        keep working — the named-custom branch reads base_url from config."""
+        monkeypatch.setenv("MYRELAY_API_KEY", "sk-myrelay-real")
+        _write_config(tmp_path, {
+            "providers": {
+                "myrelay": {
+                    "name": "myrelay",
+                    "base_url": "https://my-relay.example.com/v1",
+                    "key_env": "MYRELAY_API_KEY",
+                },
+            },
+            "auxiliary": {"vision": {"provider": "myrelay", "model": "vision-model"}},
+        })
+        from agent.auxiliary_client import resolve_vision_provider_client
+
+        resolved_provider, client, resolved_model = resolve_vision_provider_client(
+            provider="myrelay", model="vision-model"
+        )
+        assert resolved_provider == "myrelay"
+        assert client is not None
+        assert client.api_key == "sk-myrelay-real"
