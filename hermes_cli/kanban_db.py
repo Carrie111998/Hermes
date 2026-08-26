@@ -8006,11 +8006,18 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
-# Pattern matching a GitHub PR URL in task comments.
+# Match the complete URL-like token so malformed text after the numeric PR id
+# cannot be silently discarded before terminal-state lookup.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+(?![\w-])",
+    r'''https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+[^\s<>()\[\]{}"']*''',
     re.IGNORECASE,
 )
+_RESPAWN_GUARD_PR_URL_VALID_RE = re.compile(
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+"
+    r"(?:/[^\s?#]*)?(?:\?[^\s#]*)?(?:#[^\s]*)?",
+    re.IGNORECASE,
+)
+_RESPAWN_GUARD_PR_URL_TRAILING_PUNCTUATION = ".,;:!?"
 _RESPAWN_GUARD_PR_LOOKUP_TIMEOUT_SECONDS = 5
 
 
@@ -9574,7 +9581,12 @@ def check_respawn_guard(
         if not c["body"]:
             continue
         for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"]):
-            if _github_pr_is_terminal(match.group(0)) is not True:
+            pr_url = match.group(0).rstrip(
+                _RESPAWN_GUARD_PR_URL_TRAILING_PUNCTUATION
+            )
+            if _RESPAWN_GUARD_PR_URL_VALID_RE.fullmatch(pr_url) is None:
+                return "active_pr"
+            if _github_pr_is_terminal(pr_url) is not True:
                 return "active_pr"
 
     return None

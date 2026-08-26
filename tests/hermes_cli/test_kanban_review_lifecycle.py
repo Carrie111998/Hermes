@@ -523,6 +523,71 @@ def test_active_pr_guard_allows_verifiably_terminal_pr(
     assert looked_up == ["https://github.com/example/repo/pull/123"]
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "%2Fevil",
+        ".example",
+    ],
+)
+def test_active_pr_guard_fails_closed_for_malformed_numeric_suffix(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    looked_up: list[str] = []
+
+    def terminal(url: str) -> bool:
+        looked_up.append(url)
+        return True
+
+    monkeypatch.setattr(kb, "_github_pr_is_terminal", terminal)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resume implementation", assignee="worker")
+        kb.add_comment(
+            conn,
+            task_id,
+            author="worker",
+            body=f"Candidate: https://github.com/example/repo/pull/123{suffix}",
+        )
+
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+    assert looked_up == []
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "?diff=split",
+        "#discussion_r123",
+        "/files",
+    ],
+)
+def test_active_pr_guard_preserves_unambiguous_url_suffixes(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    url = f"https://github.com/example/repo/pull/123{suffix}"
+    looked_up: list[str] = []
+
+    def terminal(candidate: str) -> bool:
+        looked_up.append(candidate)
+        return True
+
+    monkeypatch.setattr(kb, "_github_pr_is_terminal", terminal)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resume implementation", assignee="worker")
+        kb.add_comment(conn, task_id, author="worker", body=f"Merged ({url}).")
+
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+    assert looked_up == [url]
+
+
 @pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
 def test_github_pr_terminal_lookup_accepts_closed_and_merged(
     monkeypatch: pytest.MonkeyPatch, state: str
