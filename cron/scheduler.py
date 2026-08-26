@@ -6662,7 +6662,9 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         if not execution_id:
             return
         try:
-            finish_execution(execution_id, success=False, error=error)
+            finish_execution(
+                execution_id, success=False, error=error, api_calls=0
+            )
         except Exception:
             logger.warning(
                 "Job '%s': failed to close unstarted execution ledger row",
@@ -7614,6 +7616,7 @@ def tick(
                     job["execution_id"],
                     success=False,
                     error="Fire claim lost; execution was not started.",
+                    api_calls=0,
                 )
                 return True
             # Production CAS returns the exact persisted record with its unique
@@ -7728,6 +7731,7 @@ def tick(
                     execution["id"],
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
+                    api_calls=0,
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.

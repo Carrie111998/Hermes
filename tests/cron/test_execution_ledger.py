@@ -298,9 +298,45 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         ("exec-submit-fail", {
             "success": False,
             "error": "Executor dispatch failed: executor rejected",
+            "api_calls": 0,
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_builtin_lost_fire_claim_finishes_with_zero_usage(monkeypatch):
+    import cron.scheduler as scheduler
+
+    finished = []
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-lost-claim"},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        scheduler, "get_due_jobs", lambda: [{"id": "lost-claim"}]
+    )
+    monkeypatch.setattr(
+        scheduler, "claim_job_for_fire", lambda _job_id, **_kwargs: False
+    )
+
+    assert scheduler.tick(verbose=False, sync=True) == 1
+    assert finished == [
+        (
+            "exec-lost-claim",
+            {
+                "success": False,
+                "error": "Fire claim lost; execution was not started.",
+                "api_calls": 0,
+            },
+        )
+    ]
+    assert "lost-claim" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
