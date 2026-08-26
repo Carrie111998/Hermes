@@ -5447,6 +5447,20 @@ class BasePlatformAdapter(ABC):
         before it can enter the primary conversation call.
         """
 
+    async def on_agent_input_persisted(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> None:
+        """Hook called after this turn's user row durably commits.
+
+        The runner invokes it only when :meth:`on_agent_run_started`
+        returned an input-persistence marker; an exception here aborts the
+        turn before its primary conversation call.
+        """
+
     async def on_agent_run_persisted(
         self,
         event: MessageEvent,

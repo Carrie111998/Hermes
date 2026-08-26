@@ -335,13 +335,14 @@ async def test_handoff_target_is_config_only_not_payload_interpolation():
 
 
 @pytest.mark.asyncio
-async def test_mock_runner_without_explicit_proxy_reaches_durable_dispatch():
+async def test_runner_without_proxy_reaches_durable_dispatch():
     adapter = _make_adapter(_handoff_routes())
     db = _with_admission_lock_api(
         SimpleNamespace(set_meta_if_absent=AsyncMock(return_value=True))
     )
     runner = MagicMock()
     runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._get_proxy_url = lambda: None
     runner._session_db = db
     runner._session_key_for_source = (
         lambda source: f"key:{source.chat_id}"
@@ -1372,7 +1373,7 @@ async def test_real_state_db_duplicate_replay_survives_adapter_restart(tmp_path)
     original_db.set_meta(state_key, bound_state)
     assert original_db.request_handoff_once("original-session", "discord")
     assert original_db.claim_handoff("original-session")
-    assert original_db.complete_running_handoff("original-session")
+    original_db.complete_handoff("original-session")
     original_db.close()
 
     restarted_db = SessionDB(db_path=db_path)

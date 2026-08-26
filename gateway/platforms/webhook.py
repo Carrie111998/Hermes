@@ -1225,13 +1225,7 @@ class WebhookAdapter(BasePlatformAdapter):
             # dispatching any remote agent request.  Legacy webhook routes and
             # already-terminal duplicates take their existing paths above.
             runner = self.gateway_runner
-            proxy_url_fn = getattr(runner, "__dict__", {}).get(
-                "_get_proxy_url"
-            )
-            if not callable(proxy_url_fn):
-                proxy_url_fn = getattr(type(runner), "_get_proxy_url", None)
-                if callable(proxy_url_fn):
-                    proxy_url_fn = proxy_url_fn.__get__(runner, type(runner))
+            proxy_url_fn = getattr(runner, "_get_proxy_url", None)
             if callable(proxy_url_fn) and proxy_url_fn():
                 await _release_admission_lock()
                 logger.error(
