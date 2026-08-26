@@ -883,6 +883,9 @@ def _load_env_file_into_environ() -> int:
         return 0
     added = 0
     known = set(ip._BEARER_PROVIDERS) | set(ip._NON_BEARER_PROVIDERS)
+    for env_name, spec in ip._HEADER_AUTH_PROVIDERS.items():
+        known.add(env_name)
+        known.update(spec.get("aliases") or ())
     for name in known:
         if name in os.environ and os.environ[name].strip():
             continue
