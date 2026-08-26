@@ -118,6 +118,23 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api.runDebugShare", () => {
+  it("sends the caller consent marker and no redaction opt-out", async () => {
+    const fetchMock = jsonFetchMock({
+      auto_delete_seconds: 21600,
+      failures: [],
+      redacted: true,
+      urls: { Report: "https://paste.rs/example" },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.runDebugShare();
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toEqual({ consent: true, lines: 200 });
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });
