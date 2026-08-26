@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useState } from 'react'
 
-import { type NewSessionPlacement, startNewSessionDrag } from '@/app/chat/new-session-drag'
+import { type NewSessionPlacement, type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Codicon } from '@/components/ui/codicon'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
 import type { SessionInfo } from '@/hermes'
@@ -14,7 +14,6 @@ import { notifyError } from '@/store/notifications'
 import { newSessionInProfile, selectProfile } from '@/store/profile'
 import { switchBranchInRepo } from '@/store/projects'
 import { $sessionProfilesUsage } from '@/store/session'
-import type { TileDock } from '@/store/session-states'
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 
 import { SidebarGroupRow, SidebarRowLead, SidebarRowLink, SidebarRowStack } from '../chrome'
@@ -34,7 +33,7 @@ interface SidebarWorkspaceGroupProps {
   group: SidebarSessionGroup
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
-  onNewSessionSplit?: (dir: TileDock, opts?: { anchor?: string; before?: null | string; cwd?: null | string }) => void
+  onNewSessionSplit?: NewSessionSplitHandler
   // When set (linked worktree rows), shows a remove affordance that runs a real
   // `git worktree remove`.
   onRemove?: () => void

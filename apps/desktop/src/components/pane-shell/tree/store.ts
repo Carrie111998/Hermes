@@ -510,6 +510,16 @@ export const isMainStripPane = (paneId: string): boolean =>
   (registry.getArea('panes').find(c => c.id === paneId)?.data as { placement?: string } | undefined)?.placement ===
   'main'
 
+/** Whether a zone may receive a SESSION drop — an existing session dragged
+ *  from the sidebar, or a brand-new one dropped from a create-drag ("New
+ *  session" row, project "+" buttons, "New project" +). Any zone hosting a
+ *  chat strip or another main tile qualifies; standing side chrome never does.
+ *  The resolvers (session-drag.ts / new-session-drag.ts) and the zone overlay
+ *  (tree-group.tsx) share this one truth, so every painted zone can commit
+ *  and every denied zone stays dark — the two cannot drift apart again. */
+export const hostsSessionDropTarget = (paneIds: readonly string[]): boolean =>
+  paneIds.some(isSessionStripPane) || paneIds.some(isMainStripPane)
+
 /** The zone the session-tab verbs (⌘T / ⌘⇧T / the strip's "+") act on: the
  *  first of hovered / focused / workspace that hosts a chat strip. Same ladder
  *  ⌘1…⌘9 indexes, so the number keys and the tab verbs can't disagree about

@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
+import type { NewSessionPlacement } from '@/app/chat/new-session-drag'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import {
@@ -20,8 +21,10 @@ import { type ProjectIdeaTemplate, randomIdeaTemplates } from '@/lib/project-ide
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import {
+  $newProjectDropPlacement,
   $projectDialog,
   addProjectFolder,
+  clearNewProjectDropPlacement,
   closeProjectDialog,
   createProject,
   generateProjectIdea,
@@ -46,6 +49,22 @@ export function ProjectDialog() {
   const [generatingIdea, setGeneratingIdea] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
+
+  // A "New project" DRAG arms where the project should start (tab-strip slot /
+  // pane edge / pane center) before the dialog opens. Snapshot it per open —
+  // the submit forwards it as `dropPlacement`, and closing clears the store's
+  // arm so a later plain-click create never inherits a stale placement.
+  let dropPlacement: NewSessionPlacement | undefined
+
+  if (open) {
+    dropPlacement = $newProjectDropPlacement.get() ?? undefined
+  }
+
+  useEffect(() => {
+    if (!open) {
+      clearNewProjectDropPlacement()
+    }
+  }, [open])
 
   useEffect(() => {
     if (open) {
@@ -124,7 +143,14 @@ export function ProjectDialog() {
     // A project owns sessions by folder (cwd-prefix), so creation requires at
     // least one — a folder-less project couldn't hold a session anyway.
     if (mode === 'create' && trimmed && folders.length) {
-      await runSubmit(() => createProject({ folders, idea: idea.trim() || undefined, name: trimmed, use: true }))
+      await runSubmit(() =>
+        createProject({ dropPlacement, folders, idea: idea.trim() || undefined, name: trimmed, use: true })
+      )
+
+      // Consume the arm in the same breath as the create it fed — success or
+      // failure — so an armed placement can never outlive its own dialog
+      // flow. (Closing on cancel discards it through the open-state effect.)
+      clearNewProjectDropPlacement()
     }
   }
 

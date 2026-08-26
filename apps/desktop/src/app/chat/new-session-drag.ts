@@ -22,7 +22,6 @@
 import type { PointerEvent as ReactPointerEvent } from 'react'
 
 import { queryAllVisible } from '@/components/pane-shell/pane-visibility'
-import { findGroup } from '@/components/pane-shell/tree/model'
 import {
   rectContains,
   slotBefore,
@@ -32,10 +31,21 @@ import {
   type StripSnapshot,
   subZonePosition
 } from '@/components/pane-shell/tree/renderer/drag-session'
-import { $layoutTree, $treeDragging, type DropHint, NEW_SESSION_DRAG } from '@/components/pane-shell/tree/store'
+import { $treeDragging, type DropHint, NEW_SESSION_DRAG } from '@/components/pane-shell/tree/store'
 import type { EngineZone, ZoneRect } from '@/components/pane-shell/tree/zones-engine'
 import { translateNow } from '@/i18n'
 import type { TileDock } from '@/store/session-states'
+
+import { tileZoneHost } from './tile-zone-host'
+
+/** Create a new session as a tile at a resolved drop target. The shared
+ *  handler shape threaded from every create-drag source through the sidebar
+ *  into `openNewSessionTile` — one declaration, so the payload cannot drift
+ *  between call sites. */
+export type NewSessionSplitHandler = (
+  dir: TileDock,
+  opts?: { anchor?: string; before?: null | string; cwd?: null | string }
+) => void
 
 /** Where a dragged new session lands. `center` stacks a fresh tab into the
  *  anchor's zone (optionally at a strip slot via `before`); an edge dir splits
@@ -67,17 +77,6 @@ function snapshotSurfaces(): SurfaceSnapshot[] {
   }))
 }
 
-/** A new session may land in a zone only if it hosts a chat surface — never the
- *  sidebar/terminal zones. Returns the pane a stack anchors to. (Identical gate
- *  to a session drag: a new chat is a chat, so it stacks/splits relative to the
- *  existing chat surfaces only.) */
-function chatZonePane(groupId: string): null | string {
-  const tree = $layoutTree.get()
-  const panes = tree ? (findGroup(tree, groupId)?.panes ?? []) : []
-
-  return panes.find(p => p === 'workspace' || p.startsWith('session-tile:')) ?? null
-}
-
 /**
  * Begin dragging a brand-new session from the sidebar's "New session" row. The
  * drop language mirrors a session drag (stack / split), but commit CREATES the
@@ -103,7 +102,7 @@ export function startNewSessionDrag(
   let strips: StripSnapshot[] = []
   let surfaces: SurfaceSnapshot[] = []
   let composers: ZoneRect[] = []
-  let zoneHost = new Map<string, null | string>()
+  let zoneHost = new Map<string, { chat: boolean; pane: string }>()
 
   // Commit intent, updated per resolved move (the machinery flushes the final
   // move before commit, so this always matches the released-at position).
@@ -124,7 +123,13 @@ export function startNewSessionDrag(
       strips = snapshotStrips()
       surfaces = snapshotSurfaces()
       composers = queryAllVisible('[data-slot="composer-root"]').map(snapRect)
-      zoneHost = new Map(zones.map(zone => [zone.id, chatZonePane(zone.id)]))
+      zoneHost = new Map(
+        zones.flatMap(z => {
+          const host = tileZoneHost(z.id)
+
+          return host ? [[z.id, host]] : []
+        })
+      )
       source?.style.setProperty('opacity', '0.45')
       // The distinct sentinel: the zone overlay lights its normal targets, but
       // the "link to chat" affordance (gated on SESSION_TILE_DRAG) stays dark.
@@ -152,7 +157,7 @@ export function startNewSessionDrag(
 
       if (strip) {
         const stack = slotBefore(strip.slots, x)
-        placement = { anchor: host, before: stack.before, cwd: opts?.cwd, dir: 'center' }
+        placement = { anchor: host.pane, before: stack.before, cwd: opts?.cwd, dir: 'center' }
 
         return { groupId: zone.id, groupIds: [zone.id], kind: 'group', pos: 'center', stack }
       }
@@ -160,7 +165,7 @@ export function startNewSessionDrag(
       // Over the composer (and everything in it) counts as the zone CENTER —
       // dropping on a chat's input stacks into that chat, never splits below it.
       const surface = surfaces.find(s => rectContains(s.rect, x, y))
-      const anchor = surface?.anchor ?? host
+      const anchor = surface?.anchor ?? host.pane
       const pos = composers.some(rect => rectContains(rect, x, y)) ? 'center' : subZonePosition(zones, zone.id, x, y)
 
       if (pos === 'center') {
@@ -181,6 +186,113 @@ export function startNewSessionDrag(
       // round-trips session.create, then revealTreePane's the fresh tile. A
       // commit with no placement (release on a deny zone) creates nothing.
       onCreate(placement)
+    }
+  })
+}
+
+/**
+ * Begin dragging a brand-new PROJECT from the project-overview header's
+ * "New project" + button. Same machinery and drop language as
+ * {@link startNewSessionDrag} — tab strip / pane edge / pane center — but the
+ * gesture arms a placement that is CONSUMED BY THE DIALOG FLOW rather than
+ * creating anything at release:
+ *
+ * 1. Engaging the drag records the placement via `onArm`.
+ * 2. A sub-threshold release stays an ordinary click (`opts.onTap` → the
+ *    project dialog); an Esc abort or a deny-zone release creates nothing and
+ *    clears the armed placement.
+ * 3. A valid commit opens the exact same "New project" dialog. When that flow
+ *    later creates a project, the completion side replays the placement so the
+ *    project's fresh session draft opens precisely where it was dropped — and
+ *    stays there.
+ */
+export function startNewProjectDrag(
+  onArm: (placement: NewSessionPlacement | null) => void,
+  e: ReactPointerEvent<HTMLElement>,
+  opts?: { onTap?: () => void }
+) {
+  let zones: EngineZone[] = []
+  let strips: StripSnapshot[] = []
+  let surfaces: SurfaceSnapshot[] = []
+  let composers: ZoneRect[] = []
+  let zoneHost = new Map<string, { chat: boolean; pane: string }>()
+
+  let placement: NewSessionPlacement | null = null
+
+  const source = e.currentTarget
+  const restoreOpacity = source?.style.opacity ?? ''
+
+  startDragSession(e, {
+    ghost: { label: translateNow('sidebar.projects.newButton') },
+    onTap: opts?.onTap,
+
+    onEngage() {
+      zones = snapshotZones()
+      strips = snapshotStrips()
+      surfaces = snapshotSurfaces()
+      composers = queryAllVisible('[data-slot="composer-root"]').map(snapRect)
+      zoneHost = new Map(
+        zones.flatMap(z => {
+          const host = tileZoneHost(z.id)
+
+          return host ? [[z.id, host]] : []
+        })
+      )
+      source?.style.setProperty('opacity', '0.45')
+      $treeDragging.set(NEW_SESSION_DRAG)
+    },
+
+    onEnd() {
+      if (source) {
+        source.style.opacity = restoreOpacity
+      }
+
+      // A drag that never committed (Esc, deny-zone release) leaves no armed
+      // placement behind, so a later plain dialog create can't inherit it.
+      if (!placement) {
+        onArm(null)
+      }
+    },
+
+    resolveMove(x, y): DropHint | null {
+      const zone = zones.find(z => rectContains(z.rect, x, y))
+      const host = zone ? zoneHost.get(zone.id) : null
+
+      if (!zone || !host) {
+        placement = null
+
+        return null
+      }
+
+      const strip = strips.find(s => s.groupId === zone.id && rectContains(s.rect, x, y))
+
+      if (strip) {
+        const stack = slotBefore(strip.slots, x)
+        placement = { anchor: host.pane, before: stack.before, dir: 'center' }
+
+        return { groupId: zone.id, groupIds: [zone.id], kind: 'group', pos: 'center', stack }
+      }
+
+      const surface = surfaces.find(s => rectContains(s.rect, x, y))
+      const anchor = surface?.anchor ?? host.pane
+      const pos = composers.some(rect => rectContains(rect, x, y)) ? 'center' : subZonePosition(zones, zone.id, x, y)
+
+      if (pos === 'center') {
+        placement = { anchor, dir: 'center' }
+      } else {
+        placement = { anchor, dir: pos }
+      }
+
+      return { groupId: zone.id, groupIds: [zone.id], kind: 'group', pos }
+    },
+
+    onCommit() {
+      // Arm BEFORE opening the dialog: the dialog's create path reads the armed
+      // placement when it succeeds, so the created project lands exactly here.
+      // No placement (deny-zone release) → the dialog still opens as a plain
+      // click would, and onEnd has already cleared any stale arm.
+      onArm(placement)
+      opts?.onTap?.()
     }
   })
 }

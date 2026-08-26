@@ -1,7 +1,7 @@
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 
-import { startNewSessionDrag } from '@/app/chat/new-session-drag'
+import { type NewSessionSplitHandler, startNewProjectDrag, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -40,14 +40,23 @@ const HEADER_ACTION_BTN =
 // composer instead).
 export function SidebarSectionAddButton({
   ariaLabel,
+  onNewProjectDrag,
   onNewSessionSplit,
   onPlainClick
 }: {
   ariaLabel: string
+  /** Present when this header "+" creates a PROJECT (the project-overview
+   *  mode's "New project" button): dragging it arms where that project should
+   *  start and a valid drop opens the same "New project" dialog. `onArm` also
+   *  receives null so an aborted/deny-zone drag can clear a stale placement. */
+  onNewProjectDrag?: {
+    onArm: (placement: { anchor: string; before?: null | string; cwd?: null | string; dir: TileDock } | null) => void
+  }
   /** Absent when this header "+" has no session-creating drag semantics
    *  (e.g. the project-overview mode, where the "+" opens the project
-   *  dialog). Then the button stays click-only. */
-  onNewSessionSplit?: (dir: TileDock, opts?: { anchor?: string; before?: null | string; cwd?: null | string }) => void
+   *  dialog). Then the button stays click-only unless `onNewProjectDrag` is
+   *  supplied. */
+  onNewSessionSplit?: NewSessionSplitHandler
   onPlainClick: () => void
 }) {
   return (
@@ -60,13 +69,17 @@ export function SidebarSectionAddButton({
           onPlainClick()
         }}
         onPointerDown={
-          onNewSessionSplit
+          onNewProjectDrag
             ? event => {
-                startNewSessionDrag(placement => {
-                  onNewSessionSplit(placement.dir, { anchor: placement.anchor, before: placement.before })
-                }, event)
+                startNewProjectDrag(onNewProjectDrag.onArm, event, { onTap: onPlainClick })
               }
-            : undefined
+            : onNewSessionSplit
+              ? event => {
+                  startNewSessionDrag(placement => {
+                    onNewSessionSplit(placement.dir, { anchor: placement.anchor, before: placement.before })
+                  }, event)
+                }
+              : undefined
         }
         size="icon-xs"
         variant="ghost"

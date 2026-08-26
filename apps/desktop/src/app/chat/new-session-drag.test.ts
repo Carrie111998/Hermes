@@ -4,7 +4,7 @@ import type * as TreeModel from '@/components/pane-shell/tree/model'
 import type * as TreeStore from '@/components/pane-shell/tree/store'
 import { NEW_SESSION_DRAG } from '@/components/pane-shell/tree/store'
 
-import { type NewSessionPlacement, startNewSessionDrag } from './new-session-drag'
+import { type NewSessionPlacement, startNewProjectDrag, startNewSessionDrag } from './new-session-drag'
 
 // ---------------------------------------------------------------------------
 // The drag MACHINERY (startDragSession) is exercised by the pane-shell's own
@@ -59,7 +59,10 @@ vi.mock('@/components/pane-shell/tree/model', async importOriginal => {
   }
 })
 
-vi.mock('@/i18n', () => ({ translateNow: () => 'New session' }))
+vi.mock('@/i18n', () => ({
+  // Key-aware so each resolver's ghost label is pinned to its own string.
+  translateNow: (key: string) => (key === 'sidebar.projects.newButton' ? 'New project' : 'New session')
+}))
 
 // A chat zone hosting the workspace pane — the only kind of zone a new session
 // may land in.
@@ -279,5 +282,103 @@ describe('startNewSessionDrag', () => {
     spec.onCommit(hint)
 
     expect(onCreate).toHaveBeenCalledWith({ anchor: 'workspace', cwd: undefined, dir: 'right' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// startNewProjectDrag — the "New project" + variant. Same drop language, but
+// the placement ARMS the dialog flow instead of creating anything at release:
+// a valid commit arms + opens the dialog, a sub-threshold release is the plain
+// click, and an aborted/deny-zone drag clears any stale arm.
+// ---------------------------------------------------------------------------
+
+describe('startNewProjectDrag', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    captured.spec = null
+    findGroup.mockImplementation((_tree: unknown, groupId: string) =>
+      groupId === 'g1' ? { panes: ['workspace'] } : null
+    )
+  })
+
+  function engageProject(onArm: (placement: NewSessionPlacement | null) => void = vi.fn(), onTap?: () => void) {
+    startNewProjectDrag(onArm, fakePointerEvent(), { onTap })
+    const spec = captured.spec
+
+    if (!spec) {
+      throw new Error('startDragSession was not called')
+    }
+
+    spec.onEngage(0, 0)
+
+    return spec
+  }
+
+  it('arms the dropped placement and opens the project dialog on a valid commit', () => {
+    const onArm = vi.fn()
+    const onTap = vi.fn()
+    subZonePosition.mockReturnValue('center')
+    const spec = engageProject(onArm, onTap)
+
+    const hint = spec.resolveMove(400, 300, false)
+    spec.onCommit(hint)
+
+    expect(onArm).toHaveBeenCalledWith({ anchor: 'workspace', dir: 'center' })
+    // The SAME dialog a plain click opens — the drag only adds the placement.
+    expect(onTap).toHaveBeenCalledOnce()
+  })
+
+  it('carries the tab-strip slot in the armed placement', () => {
+    const onArm = vi.fn()
+    slotBefore.mockReturnValue({ before: 'session-tile:abc' })
+    const spec = engageProject(onArm)
+
+    const hint = spec.resolveMove(150, 20, false)
+    spec.onCommit(hint)
+
+    expect(onArm).toHaveBeenCalledWith({ anchor: 'workspace', before: 'session-tile:abc', dir: 'center' })
+  })
+
+  it('keeps a sub-threshold release an ordinary dialog click — nothing armed', () => {
+    const onArm = vi.fn()
+    const onTap = vi.fn()
+    engageProject(onArm, onTap)
+
+    captured.spec!.onTap!()
+
+    expect(onTap).toHaveBeenCalledOnce()
+    expect(onArm).not.toHaveBeenCalled()
+  })
+
+  it('clears the arm when released over a deny zone', () => {
+    const onArm = vi.fn()
+    const spec = engageProject(onArm)
+
+    const hint = spec.resolveMove(5000, 5000, false)
+
+    expect(hint).toBeNull()
+
+    spec.onCommit(hint)
+    spec.onEnd()
+
+    expect(onArm).toHaveBeenLastCalledWith(null)
+  })
+
+  it('does not clear a committed arm on drag end', () => {
+    const onArm = vi.fn()
+    subZonePosition.mockReturnValue('right')
+    const spec = engageProject(onArm)
+
+    const hint = spec.resolveMove(780, 300, false)
+    spec.onCommit(hint)
+    spec.onEnd()
+
+    expect(onArm).toHaveBeenCalledOnce()
+    expect(onArm).not.toHaveBeenCalledWith(null)
+  })
+
+  it('drops a ghost labelled like the New project control', () => {
+    engageProject()
+    expect(captured.spec?.ghost).toEqual({ label: 'New project' })
   })
 })

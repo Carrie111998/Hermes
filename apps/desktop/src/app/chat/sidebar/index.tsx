@@ -85,6 +85,7 @@ import {
 } from '@/store/profile'
 import {
   $activeProjectId,
+  $newProjectDropPlacement,
   $projects,
   $projectScope,
   $projectTree,
@@ -127,7 +128,7 @@ import {
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
-import { $focusedStoredSessionId, $workingSessionIds, type TileDock } from '@/store/session-states'
+import { $focusedStoredSessionId, $workingSessionIds } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
@@ -143,7 +144,7 @@ import {
   SKILLS_ROUTE
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
-import { startNewSessionDrag } from '../new-session-drag'
+import { type NewSessionSplitHandler, startNewSessionDrag } from '../new-session-drag'
 
 import { SidebarSectionAddButton } from './chrome'
 import { SidebarCronJobsSection } from './cron-jobs-section'
@@ -309,7 +310,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
    *  used by the new-session drags (the "New session" row and the project "+"
    *  buttons), which land a fresh session exactly where it's dropped. The
    *  context-menu "Open in split" path passes just a `dir`. */
-  onNewSessionSplit: (dir: TileDock, opts?: { anchor?: string; before?: null | string; cwd?: null | string }) => void
+  onNewSessionSplit: NewSessionSplitHandler
   onManageCronJob: (jobId: string) => void
   onTriggerCronJob: (jobId: string) => Promise<void>
 }
@@ -1783,10 +1784,22 @@ export function ChatSidebar({
                           // same gesture as the nav's "New session" row: drag
                           // it onto a chat zone's tab strip / edge / center to
                           // create the session exactly there. Project-overview
-                          // mode stays click-only: its "+" opens the project
-                          // dialog, not a session.
+                          // mode drags its "+" (the "New project" button) with
+                          // the project-drag variant: a drop opens the SAME
+                          // project dialog, and the created project starts at
+                          // the dropped spot.
                           <SidebarSectionAddButton
                             ariaLabel={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
+                            onNewProjectDrag={
+                              agentsGrouped
+                                ? {
+                                    // Dragging the "New project" + arms WHERE the
+                                    // project should start; the dialog flow consumes
+                                    // it on create (see $newProjectDropPlacement).
+                                    onArm: placement => $newProjectDropPlacement.set(placement)
+                                  }
+                                : undefined
+                            }
                             onNewSessionSplit={agentsGrouped ? undefined : onNewSessionSplit}
                             onPlainClick={() => {
                               if (agentsGrouped) {
@@ -1818,7 +1831,13 @@ export function ChatSidebar({
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
                 onEnterProject={onEnterProject}
-                onNewSessionInWorkspace={showAllProfiles ? undefined : onNewSessionInWorkspace}
+                // Clicks stay unconditional (upstream behavior): the folder
+                // target is independent of the active profile, so a new-chat
+                // click must work in All Profiles too — same as ⌘N. Only the
+                // DRAG is scoped out: it would resolve the session's owner
+                // route against a single profile, which All Profiles doesn't
+                // have.
+                onNewSessionInWorkspace={onNewSessionInWorkspace}
                 onNewSessionSplit={showAllProfiles ? undefined : onNewSessionSplit}
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}

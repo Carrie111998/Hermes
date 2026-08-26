@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useMemo, useState } from 'react'
 
-import { startNewSessionDrag } from '@/app/chat/new-session-drag'
+import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Codicon } from '@/components/ui/codicon'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { HermesGitWorktree } from '@/global'
@@ -12,7 +12,6 @@ import { displayPath } from '@/lib/display-path'
 import { $dismissedWorktreeIds, dismissWorktree, setWorkspaceNodeOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { removeWorktreePath } from '@/store/projects'
-import type { TileDock } from '@/store/session-states'
 
 import { SidebarRowStack } from '../chrome'
 
@@ -43,7 +42,7 @@ export function EnteredProjectContent({
   project: SidebarProjectTree
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
-  onNewSessionSplit?: (dir: TileDock, opts?: { anchor?: string; before?: null | string; cwd?: null | string }) => void
+  onNewSessionSplit?: NewSessionSplitHandler
   repoWorktrees?: Record<string, HermesGitWorktree[]>
   liveSessions?: SessionInfo[]
   removedSessionIds?: ReadonlySet<string>
@@ -93,7 +92,7 @@ function RepoFlatSection({
   showHeader: boolean
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
-  onNewSessionSplit?: (dir: TileDock, opts?: { anchor?: string; before?: null | string; cwd?: null | string }) => void
+  onNewSessionSplit?: NewSessionSplitHandler
   discoveredWorktrees?: HermesGitWorktree[]
   liveSessions?: SessionInfo[]
   removedSessionIds?: ReadonlySet<string>

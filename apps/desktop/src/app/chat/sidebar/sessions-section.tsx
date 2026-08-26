@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useCallback, useMemo } from 'react'
 
-import { startNewSessionDrag } from '@/app/chat/new-session-drag'
+import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
@@ -21,7 +21,6 @@ import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
-import type { TileDock } from '@/store/session-states'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
@@ -109,7 +108,7 @@ interface SidebarSessionsSectionProps {
   onToggleUnread: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   /** Create a new session as a tile at a drop target (drag from a project "+"). */
-  onNewSessionSplit?: (dir: TileDock, opts?: { anchor?: string; before?: null | string; cwd?: null | string }) => void
+  onNewSessionSplit?: NewSessionSplitHandler
   pinned: boolean
   rootClassName?: string
   contentClassName?: string
@@ -445,7 +444,11 @@ export function SidebarSessionsSection({
         onEnter={onEnterProject}
         onNewSession={onNewSessionInWorkspace}
         onNewSessionSplit={onNewSessionSplit}
-        previewSessions={project.path ? projectOverviewPreviews?.[project.path] : undefined}
+        // Keyed by project ID to match the producer: `overlayLivePreviews`
+        // writes `out[node.id]` (workspace-groups.ts). A path key made Home
+        // (path: null) and any id/path-divergent project fall back to stale
+        // preview rows instead of the live overlay.
+        previewSessions={projectOverviewPreviews?.[project.id]}
         project={project}
         renderRows={renderRows}
       />

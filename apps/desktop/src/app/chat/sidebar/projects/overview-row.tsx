@@ -1,12 +1,11 @@
 import type * as React from 'react'
 import { useRef } from 'react'
 
-import { startNewSessionDrag } from '@/app/chat/new-session-drag'
+import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import type { TileDock } from '@/store/session-states'
 
 import {
   SIDEBAR_LEAD_ICON_SIZE,
@@ -68,7 +67,7 @@ interface ProjectOverviewRowProps {
   onNewSession?: (path: null | string) => void
   /** Drag the project's "+" onto a chat zone: create a new session pinned to
    *  this project's cwd, placed exactly where it's dropped. */
-  onNewSessionSplit?: (dir: TileDock, opts?: { anchor?: string; before?: null | string; cwd?: null | string }) => void
+  onNewSessionSplit?: NewSessionSplitHandler
   renderRows?: (sessions: SessionInfo[]) => React.ReactNode
   activeProjectId?: null | string
   previewSessions?: SessionInfo[]
