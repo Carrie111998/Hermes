@@ -8,7 +8,6 @@ import {
   $currentModel,
   $currentProvider,
   $selectedStoredSessionId,
-  $sessions,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwdTransient,
@@ -27,6 +26,7 @@ import { reportInstallMethodWarning } from '@/store/updates'
 import { finalizeInterruptedMessages } from '../../use-prompt-actions/rewind'
 import { hasSessionInfoStatePatch, PRE_TURN_LIVE_SETTLE_GRACE_MS, sessionInfoStatePatch } from '../utils'
 
+import { workspaceIdentityMatchesSelectedSession } from './session-info-gate'
 import type { GatewayEventContext } from './types'
 
 /**
@@ -38,33 +38,10 @@ import type { GatewayEventContext } from './types'
  * marked un-owned for the rest of the conversation. Matching goes through the
  * lineage (`sessionMatchesStoredId`) so a compression-rotated tip and the root
  * a pinned-row selection may hold still read as one conversation.
+ *
+ * (The predicate itself lives in ./session-info-gate so the cwd and branch
+ * foreground publishes share ONE identity check — #92888.)
  */
-function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined): boolean {
-  const infoStoredSessionId = storedSessionId?.trim() || null
-  const selected = $selectedStoredSessionId.get() ?? null
-
-  if (!infoStoredSessionId) {
-    return true
-  }
-
-  // A named session cannot describe a fresh draft. Treating a null selection as
-  // a wildcard let a background tile's `session.info` rehome the draft to the
-  // tile's workspace.
-  if (!selected) {
-    return false
-  }
-
-  if (infoStoredSessionId === selected) {
-    return true
-  }
-
-  // Either id may be the live tip or the lineage root, so ask whether ONE row
-  // answers to both rather than assuming which side rotated.
-  return $sessions
-    .get()
-    .some(session => sessionMatchesStoredId(session, infoStoredSessionId) && sessionMatchesStoredId(session, selected))
-}
-
 /** session.info / session.usage / session.title. */
 export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, explicitSid, isActiveEvent, occurredAt, fromActiveSource } = ctx
@@ -120,7 +97,15 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       // Active-session model/provider still flows through the session state
       // cache via updateSessionState → syncRuntimeMetadataToView below.
 
-      if (typeof payload?.cwd === 'string' && sessionInfoDescribesSelectedSession(payload.stored_session_id)) {
+      // Workspace-identifying fields may reach the foreground composer only
+      // when this event's durable stored-session identity matches the
+      // selected conversation — see workspaceIdentityMatchesSelectedSession
+      // for why (#92888: a background Kanban worker's session.info carries
+      // ITS PR-worktree cwd/branch, and publishing that unguarded left the
+      // default chat's coding rail pointing at another session's checkout).
+      const workspaceIdentityMatches = workspaceIdentityMatchesSelectedSession(payload?.stored_session_id)
+
+      if (typeof payload?.cwd === 'string' && workspaceIdentityMatches) {
         // The active session's agent can relocate itself (new repo/worktree
         // via the terminal). When the SAME active session's cwd actually
         // moves, follow it — refresh the project tree + scope so the sidebar
@@ -145,7 +130,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         }
       }
 
-      if (typeof payload?.branch === 'string') {
+      if (typeof payload?.branch === 'string' && workspaceIdentityMatches) {
         setCurrentBranch(payload.branch)
       }
 
