@@ -94,6 +94,81 @@ from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
 
+_GITHUB_PR_FEEDBACK_IDEMPOTENCY_PREFIX = "github-pr-feedback:"
+_EXACT_HEAD_PR_MARKERS = ("expected_head_sha", "pr_number", "repository")
+_PR_WRITE_ACTION_RE = re.compile(
+    r"\b(?:repair|fix|push|reply|respond|base[-_ ]?refresh|"
+    r"refresh(?:ing)?\s+(?:the\s+)?base|resolve(?:d|s|ing)?\s+(?:a\s+)?merge\s+conflict)\b",
+    re.IGNORECASE,
+)
+
+
+def is_atomic_pr_automation_task(
+    *, body: Optional[str], idempotency_key: Optional[str]
+) -> bool:
+    """Return whether a task carries indivisible PR-automation identity.
+
+    The feedback plugin's idempotency namespace is authoritative. Typed
+    exact-head handoffs are also atomic even if a caller omitted that key;
+    marker order and JSON formatting deliberately do not matter.
+    """
+    key = (idempotency_key or "").strip().casefold()
+    if key.startswith(_GITHUB_PR_FEEDBACK_IDEMPOTENCY_PREFIX):
+        return True
+    evidence = (body or "").casefold()
+    return all(marker in evidence for marker in _EXACT_HEAD_PR_MARKERS)
+
+
+def _task_requires_pr_write_authority(
+    *, title: str, body: Optional[str], idempotency_key: Optional[str]
+) -> bool:
+    if not is_atomic_pr_automation_task(
+        body=body, idempotency_key=idempotency_key
+    ):
+        return False
+    return _PR_WRITE_ACTION_RE.search(f"{title}\n{body or ''}") is not None
+
+
+def _profile_is_explicitly_read_only(profile: Optional[str]) -> bool:
+    """Read operator-authored profile authority metadata, failing open."""
+    if not profile:
+        return False
+    try:
+        import yaml
+
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_path = get_profile_dir(profile) / "profile.yaml"
+        with profile_path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    authority = str(
+        data.get("execution_authority") or data.get("authority") or ""
+    ).strip().casefold()
+    if authority in {"read-only", "read_only", "readonly", "review-only"}:
+        return True
+    description = str(data.get("description") or "").casefold()
+    return "read-only" in description or "read only" in description
+
+
+def _validate_pr_task_assignee_authority(
+    *,
+    title: str,
+    body: Optional[str],
+    idempotency_key: Optional[str],
+    assignee: Optional[str],
+) -> None:
+    if _task_requires_pr_write_authority(
+        title=title, body=body, idempotency_key=idempotency_key
+    ) and _profile_is_explicitly_read_only(assignee):
+        raise ValueError(
+            f"read-only profile {assignee!r} cannot own PR repair, push, "
+            "reply, or base-refresh work"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -3231,6 +3306,12 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    _validate_pr_task_assignee_authority(
+        title=title,
+        body=body,
+        idempotency_key=idempotency_key,
+        assignee=assignee,
+    )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -3708,10 +3789,18 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, title, body, idempotency_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
+        _validate_pr_task_assignee_authority(
+            title=row["title"],
+            body=row["body"],
+            idempotency_key=row["idempotency_key"],
+            assignee=profile,
+        )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
