@@ -2469,13 +2469,15 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     temp_dir = os.path.realpath(tempfile.gettempdir())
     basename = os.path.basename(operand)
     # The verifier's nudge renders the temp dir with native separators, but
-    # the echoed command may spell the same path with either separator, so
-    # canonicalize separators on both sides before the exact-string check.
-    # Deliberately NOT os.path.normpath: it collapses ``..`` and the
-    # obfuscation-shaped traversals must stay non-exempt (#95456).
-    operand_cmp = operand.replace("\\", "/")
-    joined_cmp = os.path.join(temp_dir, basename).replace("\\", "/")
-    if operand_cmp != joined_cmp:
+    # the echoed command may spell the same path with either separator — and
+    # on Windows with a different drive-letter case (``c:\...`` from %TEMP%
+    # vs ``C:\...`` from gettempdir). ``os.path.normcase`` folds separators
+    # AND case on Windows and is the identity on POSIX, so one comparison
+    # covers every spelling without loosening POSIX matching. Deliberately
+    # NOT os.path.normpath: it collapses ``..`` and the obfuscation-shaped
+    # traversals must stay non-exempt (#95456; case-folding measured by
+    # @anhtahaylove against both implementations of this comparison).
+    if os.path.normcase(operand) != os.path.normcase(os.path.join(temp_dir, basename)):
         return False
 
     target = os.path.realpath(operand)

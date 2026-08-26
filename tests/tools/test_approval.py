@@ -138,6 +138,22 @@ class TestDetectDangerousRm:
         ):
             assert detect_dangerous_command(command) == (False, None, None), command
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows drive-letter case folding")
+    def test_verification_cleanup_exemption_matches_windows_case_spellings(self):
+        """Drive-letter/case variants of the same temp dir exempt (#95456).
+
+        ``%TEMP%`` can arrive lower-cased (``c:\\...``); Windows paths are
+        case-insensitive, so the comparison folds via ``os.path.normcase``
+        rather than separator replacement alone (measured by @anhtahaylove:
+        separator-only matching missed exactly these spellings).
+        """
+        for command in (
+            r"rm -f c:\Users\Administrator\AppData\Local\Temp\hermes-verify-example.py",
+            "rm -f c:/users/administrator/appdata/local/temp/hermes-verify-example.py",
+            r"rm -f c:\Users\Administrator\AppData\Local\Temp\hermes-verify-example.py",
+        ):
+            assert detect_dangerous_command(command) == (False, None, None), command
+
     @pytest.mark.skipif(os.name != "nt", reason="Windows backslash tokenization")
     def test_verification_cleanup_exemption_still_rejects_windows_traversals(self):
         """The Windows fix must not widen the exemption (#95456)."""
