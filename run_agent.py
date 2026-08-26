@@ -7651,11 +7651,13 @@ class AIAgent:
             opts = self._lmstudio_reasoning_options_cached()
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in opts)
-        # Ollama Cloud (and any Ollama-compatible server): the native
-        # /api/show capabilities list is authoritative — emit reasoning_effort
-        # only for models that declare the "thinking" capability. deepseek-v4
-        # has it; gemma3 / qwen3-coder don't. Cached per (model, base_url).
-        if base_url_host_matches(self._base_url_lower, "ollama.com"):
+        # Ollama Cloud AND local/self-hosted Ollama: the native /api/show
+        # capabilities list is authoritative — emit reasoning_effort only for
+        # models that declare the "thinking" capability. deepseek-v4 has it;
+        # gemma3 / qwen3-coder don't. Local Ollama 400s with
+        # '"model" does not support thinking' if we send the field anyway.
+        # Cached per (model, base_url).
+        if self._is_ollama_compatible_endpoint():
             return self._ollama_supports_thinking_cached()
         if not self._is_openrouter_url():
             return False
@@ -7734,6 +7736,25 @@ class AIAgent:
             opts = []
         cache[key] = (opts, _time.monotonic())
         return opts
+
+    def _is_ollama_compatible_endpoint(self) -> bool:
+        """True for Ollama Cloud and local/self-hosted Ollama servers.
+
+        Used to decide whether to probe ``/api/show`` for the ``thinking``
+        capability before emitting ``reasoning_effort``. Must NOT match
+        arbitrary custom endpoints (vLLM, ARK, llama.cpp) — those still
+        rely on CustomProfile's un-gated reasoning_effort for GLM-5.2 etc.
+        """
+        if base_url_host_matches(self._base_url_lower, "ollama.com"):
+            return True
+        if getattr(self, "_ollama_num_ctx", None):
+            # query_ollama_num_ctx already succeeded against /api/show.
+            return True
+        url = self._base_url_lower or ""
+        if ":11434" in url:
+            return True
+        provider = (self.provider or "").strip().lower()
+        return provider == "ollama"
 
     def _ollama_supports_thinking_cached(self) -> bool:
         """Probe Ollama's ``/api/show`` capabilities once per (model, base_url).

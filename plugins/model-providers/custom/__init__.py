@@ -4,6 +4,8 @@ Covers any endpoint registered as provider="custom", including local
 Ollama instances and OpenAI-compatible reasoning endpoints (GLM-5.2 on
 Volcengine ARK, vLLM, llama.cpp). Key quirks:
   - ollama_num_ctx → extra_body.options.num_ctx (local context window)
+  - local Ollama without the ``thinking`` capability → omit reasoning_effort
+    entirely (sending it 400s: '"model" does not support thinking')
   - reasoning_config disabled → top-level reasoning_effort="none"
     (Ollama /v1/chat/completions ignores think=False — ollama#14820)
     + extra_body.think = False for /api/chat and proxies
@@ -18,6 +20,32 @@ from providers import register_provider
 from providers.base import ProviderProfile
 
 
+def _endpoint_is_ollama(
+    *,
+    ollama_num_ctx: int | None = None,
+    base_url: str | None = None,
+) -> bool:
+    """True when this custom endpoint is an Ollama server, not vLLM/ARK/etc.
+
+    Local Ollama rejects ``reasoning_effort`` on instruct models with HTTP 400
+    ('does not support thinking'). GLM-5.2 on ARK still needs that field, so
+    we only gate it when we already know the backend is Ollama.
+    """
+    if ollama_num_ctx:
+        return True
+    url = (base_url or "").strip().lower()
+    if ":11434" in url:
+        return True
+    try:
+        from utils import base_url_host_matches
+
+        if base_url_host_matches(url, "ollama.com"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
@@ -26,6 +54,8 @@ class CustomProfile(ProviderProfile):
         *,
         reasoning_config: dict | None = None,
         ollama_num_ctx: int | None = None,
+        supports_reasoning: bool = False,
+        base_url: str | None = None,
         **ctx: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
@@ -36,6 +66,15 @@ class CustomProfile(ProviderProfile):
             options = extra_body.get("options", {})
             options["num_ctx"] = ollama_num_ctx
             extra_body["options"] = options
+
+        # Local Ollama instruct models (qwen3-coder, gemma, …) 400 if we send
+        # reasoning_effort at all — including "none". Omit the field unless
+        # /api/show advertised the thinking capability. Non-Ollama custom
+        # endpoints (GLM-5.2/ARK, vLLM) keep the un-gated path below.
+        if _endpoint_is_ollama(
+            ollama_num_ctx=ollama_num_ctx, base_url=base_url
+        ) and not supports_reasoning:
+            return extra_body, top_level
 
         # Reasoning / thinking control for custom OpenAI-compatible endpoints
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).

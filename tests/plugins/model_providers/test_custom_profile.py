@@ -13,6 +13,8 @@ These tests pin the wire-shape contract:
                           including ``max``/``xhigh``
   - enabled + no effort → nothing emitted (endpoint's server default applies)
   - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
+  - local Ollama without thinking capability → omit reasoning_effort
+    (instruct models 400: '"model" does not support thinking')
 """
 
 from __future__ import annotations
@@ -106,4 +108,67 @@ class TestCustomReasoningWithNumCtx:
         )
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
+
+    def test_glm_still_emits_effort_when_supports_reasoning_false(self, custom_profile):
+        """Non-Ollama custom endpoints (ARK/vLLM) ignore supports_reasoning.
+
+        CustomProfile always emits reasoning_effort there so GLM-5.2 keeps
+        working. The Ollama-only gate must not leak onto this path.
+        """
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            supports_reasoning=False,
+            model="glm-5.2",
+        )
+        assert tl == {"reasoning_effort": "high"}
+        assert "think" not in eb
+
+    def test_local_ollama_non_thinking_omits_reasoning_effort(self, custom_profile):
+        """Instruct Ollama models 400 if reasoning_effort is sent at all."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            ollama_num_ctx=262144,
+            supports_reasoning=False,
+            base_url="http://127.0.0.1:11434/v1",
+            model="hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL",
+        )
+        assert tl == {}
+        assert "think" not in eb
+        assert eb == {"options": {"num_ctx": 262144}}
+
+    def test_local_ollama_non_thinking_omits_even_disabled_effort(self, custom_profile):
+        """reasoning_effort='none' also 400s on non-thinking Ollama models."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            ollama_num_ctx=8192,
+            supports_reasoning=False,
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3-coder",
+        )
+        assert tl == {}
+        assert "think" not in eb
+        assert eb == {"options": {"num_ctx": 8192}}
+
+    def test_local_ollama_thinking_model_still_emits_effort(self, custom_profile):
+        """Thinking-capable Ollama models keep top-level reasoning_effort."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            ollama_num_ctx=8192,
+            supports_reasoning=True,
+            base_url="http://127.0.0.1:11434/v1",
+            model="deepseek-r1",
+        )
+        assert tl == {"reasoning_effort": "medium"}
+        assert eb == {"options": {"num_ctx": 8192}}
+
+    def test_local_ollama_detected_by_default_port(self, custom_profile):
+        """Port 11434 is enough to identify Ollama even without num_ctx."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            supports_reasoning=False,
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3-coder",
+        )
+        assert tl == {}
+        assert eb == {}
 

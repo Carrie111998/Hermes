@@ -300,6 +300,23 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["extra_body"]["think"] is False
 
+    def test_local_ollama_non_thinking_omits_reasoning_effort(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL",
+            messages=msgs,
+            provider_profile=profile,
+            ollama_num_ctx=262144,
+            supports_reasoning=False,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            base_url="http://127.0.0.1:11434/v1",
+        )
+        assert "reasoning_effort" not in kw
+        assert "think" not in kw.get("extra_body", {})
+        assert kw["extra_body"]["options"]["num_ctx"] == 262144
+
 
 
     def test_gemini_openai_compat_flash_reasoning_maps_to_nested_google_thinking_config(self, transport):
