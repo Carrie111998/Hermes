@@ -24,7 +24,6 @@ import pytest
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
-    UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
     describe_holder,
     read_live_update,
@@ -137,13 +136,16 @@ def test_dead_owner_is_reclaimed_not_honored(marker):
     assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
 
 
-def test_owner_past_the_age_ceiling_is_reclaimed(marker):
-    """A live-but-wedged updater must not hold the lock forever."""
-    long_ago = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
+def test_old_but_live_owner_is_not_reclaimed(marker):
+    """Elapsed age alone must never authorize a second mutating update."""
+    long_ago = int(time.time()) - 24 * 60 * 60
     marker.write_text(f"{os.getpid()}\n{long_ago}\n", encoding="utf-8")
 
     lock = UpdateLock(path=marker)
-    assert lock.acquire() is True
+    assert lock.acquire() is False
+    assert lock.holder is not None
+    assert lock.holder.pid == os.getpid()
+    assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
 
 
 @pytest.mark.parametrize(

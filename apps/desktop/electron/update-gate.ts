@@ -59,13 +59,13 @@ export interface WaitForUpdateClearanceOptions {
 }
 
 /**
- * Park until no update signal remains, or the deadline passes.
+ * Park until no update signal remains, or the in-process-only deadline passes.
  *
  * Returns 'clear' when the gate was already open (no wait happened),
  * 'finished' when it opened during the wait, and 'timeout' when the deadline
- * expired with the gate still closed (callers proceed anyway — matching the
- * long-standing marker-gate behavior, since a wedged updater must not brick
- * the app forever).
+ * expired while only the in-process flag remained. A live marker has an
+ * externally confirmed owner and never times out: proceeding would start a
+ * backend from the managed venv while that owner is still replacing it.
  */
 export async function waitForUpdateClearance(
   deps: UpdateGateDeps,
@@ -82,7 +82,7 @@ export async function waitForUpdateClearance(
 
   const deadline = now() + options.timeoutMs
 
-  while (reason && now() < deadline) {
+  while (reason && (reason === 'marker' || now() < deadline)) {
     if (options.onWaitTick) {
       await options.onWaitTick(reason)
     }

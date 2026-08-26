@@ -23,10 +23,10 @@ unchanged and remain byte-compatible with the Rust and Electron readers:
 
     <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
 
-A marker only counts as a live update when its pid is alive AND it is younger
-than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
-crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first.
+A marker counts as a live update while its pid is alive. Elapsed age is retained
+for diagnostics but never authorizes a second updater to steal a live owner's
+lock. A dead or malformed marker is removed on read by whoever notices it first,
+so a crashed updater still self-heals instead of wedging every future update.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import threading
 import time
@@ -59,12 +60,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# Keep in sync with UPDATE_MARKER_MAX_AGE_MS in
-# apps/desktop/electron/update-marker.ts — the same marker is read by both, and
-# a shorter ceiling here would let Python steal a lock Electron still considers
-# live. A full update (git pull + uv sync + desktop rebuild) is minutes.
-UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
 _OWNERSHIP_MUTEX_NAME = "Global\\HermesUpdateMarkerOwnership"
@@ -210,9 +205,10 @@ def _read_live_update_unlocked(marker: Path) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
     Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
-    unreadable, malformed, dead-pid, and past-the-ceiling all mean "no live
-    update", and a stale marker file is deleted so it can't strand future runs.
-    Never raises.
+    unreadable, malformed, and dead-pid markers mean "no live update", and a
+    dead marker file is deleted so it can't strand future runs. Elapsed age is
+    diagnostic only: a confirmed-live owner keeps the operation lock until it
+    exits or releases it. Never raises.
     """
     try:
         raw = marker.read_text(encoding="utf-8")
@@ -227,10 +223,10 @@ def _read_live_update_unlocked(marker: Path) -> UpdateHolder | None:
     try:
         started_at = float(lines[1].strip())
     except (IndexError, ValueError):
-        started_at = float("-inf")
+        started_at = float("nan")
 
     age = time.time() - started_at
-    if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
+    if not math.isfinite(started_at) or not _pid_alive(pid):
         try:
             marker.unlink()
         except OSError:

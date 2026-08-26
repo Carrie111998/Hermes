@@ -2042,11 +2042,11 @@ function directoryExists(filePath) {
 // cycle loops. Instead the fresh instance parks until the update finishes, then
 // brings the backend up itself (it is the surviving instance — the updater's
 // own relaunch hits our single-instance lock and quits). Marker parsing +
-// staleness self-heal live in update-marker.ts (unit-tested).
+// dead-owner self-heal lives in update-marker.ts (unit-tested).
 
-// How long we'll park the launch waiting for a live update to finish before
-// giving up and starting the backend anyway (belt-and-suspenders alongside the
-// marker's own age ceiling; covers a stuck-but-alive updater).
+// How long we'll park on the in-process-only update flag. A confirmed-live
+// marker owner never times out: starting the backend while that process is
+// replacing the managed venv would violate update ownership.
 const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
 const UPDATE_WAIT_POLL_MS = 1000
 // How long the desktop lingers on the "updating, don't reopen" overlay after

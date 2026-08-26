@@ -120,13 +120,6 @@ pub(crate) struct UpdateMarkerGuard {
     owned: bool,
 }
 
-/// Never treat a marker older than this as a live update. Mirrors
-/// UPDATE_MARKER_MAX_AGE_MS in apps/desktop/electron/update-marker.ts and
-/// UPDATE_MARKER_MAX_AGE_SECONDS in hermes_cli/update_lock.py — all three read
-/// this one file, so a shorter ceiling in any of them would steal a lock the
-/// others still consider live.
-const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
-
 #[cfg(windows)]
 struct MarkerTransaction(windows_sys::Win32::Foundation::HANDLE);
 
@@ -219,8 +212,9 @@ impl MarkerAcquireError {
 }
 
 /// Read the marker and report a live owner, if any. `None` for every "no live
-/// update" case — absent, unreadable, malformed, dead pid, or past the ceiling
-/// — matching `readLiveUpdateMarker` in the Electron gate. Never panics.
+/// update" case — absent, unreadable, malformed, or dead pid — matching
+/// `readLiveUpdateMarker` in the Electron gate. Age remains diagnostic only:
+/// elapsed time never authorizes takeover from a confirmed-live owner.
 ///
 /// Self-PID is returned so `acquire` can adopt the desktop's pre-written claim
 /// without refreshing its acquisition time (#74761). A foreign live pid (e.g.
@@ -229,13 +223,13 @@ fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
     let raw = std::fs::read_to_string(path).ok()?;
     let mut lines = raw.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
-    let started_at: u64 = lines.next().unwrap_or("").trim().parse().unwrap_or(0);
+    let started_at: u64 = lines.next()?.trim().parse().ok()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let age_secs = now.saturating_sub(started_at);
-    if age_secs > UPDATE_MARKER_MAX_AGE_SECS || !pid_is_alive(pid) {
+    if !pid_is_alive(pid) {
         return None;
     }
     Some(MarkerOwner { pid, age_secs })
@@ -444,8 +438,8 @@ impl UpdateMarkerGuard {
     /// desktop, and that loop can outlive `app.exit(0)`. Relying on `Drop`
     /// alone therefore leaves a *successful* update looking active — a live
     /// pid holding a fresh marker — which blocks desktop startup and every
-    /// other updater for the full age ceiling. Idempotent: `Drop` still runs
-    /// and tolerates an already-removed marker.
+    /// other updater indefinitely. Idempotent: `Drop` still runs and tolerates
+    /// an already-removed marker.
     fn complete(&self) {
         if !self.owned {
             return;
@@ -844,7 +838,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // relaunch: this process can stay wedged in its native event loop even
     // after a successful app.exit(), and a live pid on a fresh marker would
     // make a completed update look active — blocking desktop startup and
-    // every other updater until the age ceiling expires.
+    // every other updater until this process exits.
     _update_marker.complete();
 
     if let Some(target_app) = launch_target {
@@ -1801,29 +1795,29 @@ mod tests {
     }
 
     #[test]
-    fn acquire_reclaims_a_marker_past_the_age_ceiling() {
-        let dir = unique_tmp_dir("marker-stale-age");
+    fn live_marker_owner_retains_an_old_live_owner() {
+        let dir = unique_tmp_dir("marker-old-live");
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join(".hermes-update-in-progress");
 
-        // Our own (live) pid, but started well past the ceiling: a wedged
-        // updater must not hold the lock forever.
+        // Our own live pid with an old diagnostic timestamp. Age alone must
+        // never authorize a second process to mutate the shared installation.
         let long_ago = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
-            .saturating_sub(UPDATE_MARKER_MAX_AGE_SECS + 60);
+            .saturating_sub(24 * 60 * 60);
         std::fs::write(&marker, format!("{}\n{long_ago}", std::process::id())).unwrap();
 
-        let guard = UpdateMarkerGuard::acquire(marker.clone())
-            .unwrap_or_else(|_| panic!("a marker past the ceiling must be reclaimable"));
-        let body = std::fs::read_to_string(&marker).unwrap();
+        let owner =
+            live_marker_owner(&marker).expect("an old live owner must remain authoritative");
+        assert_eq!(owner.pid, std::process::id());
+        assert!(owner.age_secs >= 23 * 60 * 60);
         assert_eq!(
-            body.lines().next().unwrap().trim().parse::<u32>().unwrap(),
-            std::process::id(),
-            "reclaiming rewrites the stale marker with our pid"
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("{}\n{long_ago}", std::process::id()),
+            "reading an old live owner must not rewrite or delete its marker"
         );
-        drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -429,7 +429,10 @@ function Get-LiveInstallOwner {
         $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $age = [Math]::Max(0L, $now - $startedAt)
         $alive = [bool](Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
-        if ($alive -and $age -le 1200) {
+        # Age is diagnostic only. A confirmed-live owner keeps the operation
+        # lock until it exits or releases it; elapsed time must never authorize
+        # a second installer to mutate the same checkout and managed venv.
+        if ($alive) {
             return [pscustomobject]@{ Pid = $ownerPid; AgeSeconds = $age }
         }
     } catch {}

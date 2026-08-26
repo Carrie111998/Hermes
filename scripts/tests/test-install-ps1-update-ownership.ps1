@@ -8,6 +8,8 @@ $firstOut = Join-Path $root 'first.out'
 $firstErr = Join-Path $root 'first.err'
 $secondOut = Join-Path $root 'second.out'
 $secondErr = Join-Path $root 'second.err'
+$oldLiveOut = Join-Path $root 'old-live.out'
+$oldLiveErr = Join-Path $root 'old-live.err'
 $thirdOut = Join-Path $root 'third.out'
 $thirdErr = Join-Path $root 'third.err'
 $staleAOut = Join-Path $root 'stale-a.out'
@@ -65,6 +67,18 @@ try {
     $secondJson = Get-Content -LiteralPath $secondOut -Raw | ConvertFrom-Json
     Assert-True (-not $secondJson.ok) 'overlapping installer unexpectedly acquired ownership'
     Assert-True ($secondJson.reason -match "PID $($first.Id)") 'refusal did not name the live owner PID'
+
+    # Age only the timestamp while the owner stays alive. Long-running updates
+    # must remain exclusive; elapsed time is not permission to steal the lock.
+    "$($first.Id)`n$([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeSeconds())`n" |
+        Set-Content -LiteralPath $marker -NoNewline -Encoding ASCII
+    $oldLiveCode = Invoke-Probe $oldLiveOut $oldLiveErr
+    Assert-True ($oldLiveCode -eq 1) "old-but-live owner was stolen (exit $oldLiveCode)"
+    $oldLiveJson = Get-Content -LiteralPath $oldLiveOut -Raw | ConvertFrom-Json
+    Assert-True (-not $oldLiveJson.ok) 'old-but-live owner unexpectedly allowed a contender'
+    Assert-True ($oldLiveJson.reason -match "PID $($first.Id)") 'old-live refusal did not name owner PID'
+    $markerOwner = [int]((Get-Content -LiteralPath $marker -TotalCount 1).Trim())
+    Assert-True ($markerOwner -eq $first.Id) 'old-but-live owner marker was replaced'
 
     $first.WaitForExit()
     $firstJson = Get-Content -LiteralPath $firstOut -Raw | ConvertFrom-Json
