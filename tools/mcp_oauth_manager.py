@@ -279,6 +279,13 @@ def _make_hermes_provider_class() -> Optional[type]:
                 if fresh_refresh is not None and fresh_refresh == stale_refresh:
                     return False
 
+                # No refresh token on the disk entry. The access token may
+                # still be usable right now, but adopting it would trade an
+                # explicit reauth today for a silent one at expiry, with no
+                # way to refresh in between. Treat it as unrecoverable.
+                if fresh_refresh is None:
+                    return False
+
                 # Defence-in-depth. Not load-bearing: is_token_valid() below
                 # already rejects an empty access_token, so mutating this
                 # guard away leaves the suite green. Kept because recovering
@@ -300,10 +307,19 @@ def _make_hermes_provider_class() -> Optional[type]:
                 except (TypeError, ValueError):
                     return False
 
+                # Publish, then restore on rejection. is_token_valid() reads
+                # the context rather than taking a token argument, so the
+                # candidate has to be installed to be tested; keeping the
+                # previous value lets a losing probe leave the context exactly
+                # as it found it instead of stranding a rejected token there
+                # for the caller to clean up.
+                previous_tokens = self.context.current_tokens
                 self.context.current_tokens = fresh
                 self.context.update_token_expiry(fresh)
 
                 if not self.context.is_token_valid():
+                    self.context.current_tokens = previous_tokens
+                    self.context.update_token_expiry(previous_tokens)
                     return False
 
                 return True

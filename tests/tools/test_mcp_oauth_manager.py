@@ -535,7 +535,73 @@ async def test_refresh_400_recovers_token_rotated_by_peer(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_refresh_400_rejects_disk_token_without_refresh_token(
+    tmp_path, monkeypatch
+):
+    """A disk token with no refresh token is a dead end, not a recovery.
+
+    Its access token may still be inside its TTL, so the naive "is it
+    different and currently valid?" test says yes — but adopting it only
+    defers the reauth to expiry, with no way to refresh in between. Recovery
+    must require a refresh token to recover *onto*.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    provider.context.current_tokens = _token("A1", "R1")
+    # Different access token, still valid, but nothing to refresh with later.
+    await provider.context.storage.set_tokens(_token("A2", None))
+
+    resp = _fake_response(
+        400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
+    )
+    result = await provider._handle_refresh_response(resp)
+
+    assert result is False, "a token with no refresh token must not be adopted"
+    assert provider.context.current_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_400_does_not_strand_a_rejected_token_in_the_context(
+    tmp_path, monkeypatch
+):
+    """A rejected candidate must not be left installed on the context.
+
+    is_token_valid() reads the context, so the candidate has to be published
+    to be tested. This asserts on the state the recovery helper itself leaves
+    behind, because the caller's clear_tokens() would otherwise mask the
+    difference: without the restore, current_tokens still points at the
+    rejected candidate when the helper returns.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    stale = _token("A1", "R1")
+    provider.context.current_tokens = stale
+    await provider.context.storage.set_tokens(_token("A2", "R2"))
+
+    seen = []
+    provider.context.is_token_valid = lambda: (
+        seen.append(provider.context.current_tokens) or False
+    )
+
+    recovered = await provider._hermes_reload_tokens_after_refresh_failure()
+
+    assert recovered is False
+    assert seen and seen[0].access_token == "A2", "candidate must be testable"
+    assert provider.context.current_tokens is stale, (
+        "a rejected candidate must not be left on the context"
+    )
+
+
+
+@pytest.mark.asyncio
 async def test_refresh_400_still_clears_when_disk_is_same_token(tmp_path, monkeypatch):
+
     """No peer wrote anything: the credential really is dead — clear it."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
