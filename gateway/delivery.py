@@ -102,6 +102,7 @@ def resolve_delivery_transport(
     without letting Relay hijack unrelated platform targets.
     """
     live_adapters = adapters or {}
+    platform_value = str(getattr(platform, "value", platform)).lower()
     native = live_adapters.get(platform)
     native_config = config.platforms.get(platform)
 
@@ -112,7 +113,7 @@ def resolve_delivery_transport(
     # so cron keeps using the live adapter — required for per-run Discord threads.
     if native is None:
         for adapter_platform, candidate in live_adapters.items():
-            if str(getattr(adapter_platform, "value", adapter_platform)).lower() == platform.value.lower():
+            if str(getattr(adapter_platform, "value", adapter_platform)).lower() == platform_value:
                 native = candidate
                 break
 

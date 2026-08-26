@@ -211,7 +211,7 @@ async def test_disabled_native_adapter_does_not_shadow_relay(tmp_path, monkeypat
 
 
 def test_delivery_transport_uses_value_equivalent_live_platform_key():
-    """Ein rekonstruierter Platform-Enum darf den Live-Adapter nicht verlieren."""
+    """A reconstructed Platform enum must retain the live adapter."""
     native = RecordingAdapter()
 
     class ReconstructedPlatform:
@@ -226,6 +226,23 @@ def test_delivery_transport_uses_value_equivalent_live_platform_key():
     assert transport is not None
     assert transport.adapter is native
     assert transport.transport_platform is Platform.DISCORD
+
+
+def test_delivery_transport_accepts_string_platform_for_value_fallback():
+    """Compatibility fallback accepts callers with a plain platform string."""
+    native = RecordingAdapter()
+
+    class ReconstructedPlatform:
+        value = "discord"
+
+    transport = resolve_delivery_transport(
+        cast(Platform, "discord"),
+        GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True)}),
+        cast(Any, {ReconstructedPlatform(): native}),
+    )
+
+    assert transport is not None
+    assert transport.adapter is native
 
 
 class StaleTopicAdapter:

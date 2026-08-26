@@ -1783,8 +1783,15 @@ def _open_continuable_cron_thread(
             try:
                 member_coro = add_member(str(new_thread_id), str(origin_user_id))
                 member_future = safe_schedule_threadsafe(member_coro, loop)  # type: ignore[arg-type]
-                if member_future is not None:
-                    member_future.result(timeout=30)
+                if member_future is None:
+                    # ``safe_schedule_threadsafe`` normally closes rejected
+                    # coroutines itself. Close defensively so alternate
+                    # schedulers and test doubles cannot leak this coroutine.
+                    member_coro.close()
+                else:
+                    # Membership is best-effort; do not block the scheduler
+                    # as long as a failed thread creation would.
+                    member_future.result(timeout=10)
             except Exception as member_error:
                 # Membership is a usability enhancement, not a reason to lose
                 # an otherwise valid briefing delivery.
