@@ -244,6 +244,28 @@ class TestOfferedApprovalScopes:
         assert sent["allow_permanent"] is False
         assert sent["allow_session"] is False
 
+    def test_gateway_payload_carries_no_synthetic_command(self, monkeypatch):
+        """The label identifies the gate in logs; it is not a command.
+
+        Sending it as one puts a placeholder inside a code fence on every
+        surface, which reads as a command the human is meant to inspect.
+        """
+        sent = {}
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda *a, **k: True)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda session_key, notify_cb, approval_data, surface="gateway": (
+                sent.update(approval_data)
+                or {"resolved": True, "choice": "once", "reason": None}
+            ),
+        )
+        res = request_tool_approval("terminal", "Add this to the Calendar")
+        assert res["approved"] is True
+        assert sent["command"] == ""
+        assert sent["description"] == "Add this to the Calendar"
+
     def test_gateway_unoffered_always_is_not_persisted(self, monkeypatch):
         calls = {"permanent": []}
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)

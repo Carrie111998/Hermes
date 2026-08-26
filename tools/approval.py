@@ -3652,6 +3652,7 @@ def _run_approval_gate(
     no_human_block_message: str = "",
     allow_session: bool = True,
     allow_permanent: bool = True,
+    display_is_command: bool = True,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3692,6 +3693,13 @@ def _run_approval_gate(
             ``fail_closed_when_no_human`` blocks.
         allow_session: When False, ``[s]ession`` is not offered and is not
             persisted if a surface returns it anyway.
+        display_is_command: False when ``display_target`` is a synthetic
+            label rather than something the user could inspect or run. The
+            gateway payload then carries no command, and every surface
+            renders the description as the whole request instead of framing
+            it as a note about a command preview. The CLI prompt, the
+            ``/approve`` queue, and the approval hooks keep the label, where
+            it identifies the gate in logs and listings.
         allow_permanent: When False, ``[a]lways`` is not offered and is not
             persisted if a surface returns it anyway. A gate whose key
             describes something narrower than the rule — one file, one
@@ -3797,7 +3805,9 @@ def _run_approval_gate(
         if notify_cb is not None:
             from agent.redact import redact_sensitive_text
             approval_data = {
-                "command": redact_sensitive_text(display_target),
+                "command": (
+                    redact_sensitive_text(display_target) if display_is_command else ""
+                ),
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
@@ -4118,8 +4128,11 @@ def request_tool_approval(
     # session/permanent allowlist machinery as command patterns, namespaced
     # to avoid ever colliding with a real command pattern key.
     pattern_key = f"plugin_rule:{key_suffix}"
-    # A synthetic "command" string for the display/allowlist layer. It never
-    # executes; it only labels the gate. Namespaced identically.
+    # A synthetic "command" string for the allowlist/log layer. It never
+    # executes; it only labels the gate. Namespaced identically. It is kept
+    # out of the approval surfaces themselves via display_is_command=False,
+    # since a placeholder in a code fence reads as a command the human is
+    # meant to inspect and cannot.
     display_target = f"<{tool_name}> (plugin approval rule)"
 
     return _run_approval_gate(
@@ -4129,6 +4142,7 @@ def request_tool_approval(
         approval_callback=approval_callback,
         allow_session=allow_session,
         allow_permanent=allow_permanent,
+        display_is_command=False,
         cron_deny_message=(
             f"BLOCKED: Tool '{tool_name}' requires approval ({description}) "
             "but cron jobs run without a user present to approve it. Find an "

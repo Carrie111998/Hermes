@@ -4231,6 +4231,10 @@ class BasePlatformAdapter(ABC):
     # sharing the assembly logic (header → fenced command preview → reason →
     # optional smart-deny note).
     _EA_HEADER: str = "⚠️ Command Approval Required\n\n"
+    # Used when there is no command to preview — a plugin approval rule gates
+    # a tool call, not a shell string, so "Command" would name something the
+    # human is not being shown.
+    _EA_HEADER_NO_COMMAND: str = "⚠️ Approval Required\n\n"
     _EA_CODE_OPEN: str = "```\n"
     _EA_CODE_CLOSE: str = "\n```\n"
     _EA_REASON_LABEL: str = "Reason: "
@@ -4269,8 +4273,20 @@ class BasePlatformAdapter(ABC):
         ``_EA_SMART_DENY_LINE`` when ``smart_denied``. Button construction
         stays platform-local; adapters with additional trailing instructions
         (e.g. reaction legends) append them to this core.
+
+        An empty ``command`` means there is nothing to preview — a plugin
+        approval rule gates a tool call rather than a shell string. Rendering
+        an empty code fence there frames the description as an aside about a
+        command the reader cannot see, when it is in fact the entire request,
+        so the fence and the ``Reason:`` label are both dropped and the
+        no-command header is used instead.
         """
         cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
+        if not cmd_preview:
+            text = f"{self._EA_HEADER_NO_COMMAND}{self._ea_escape(description)}"
+            if smart_denied:
+                text += self._EA_SMART_DENY_LINE
+            return text
         text = (
             f"{self._EA_HEADER}"
             f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"

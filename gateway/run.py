@@ -713,7 +713,14 @@ def _format_exec_approval_fallback(
 ) -> str:
     """Render the text fallback from approval capabilities, not platform names."""
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
-    heading = "⚠️ **Dangerous command requires approval:**"
+    # An empty command means there is nothing to preview: a plugin approval
+    # rule gates a tool call rather than a shell string, so the description
+    # is the request itself rather than a note about a command shown above.
+    has_command = bool(cmd_preview)
+    heading = (
+        "⚠️ **Dangerous command requires approval:**" if has_command
+        else "⚠️ **Approval required:**"
+    )
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
@@ -725,10 +732,11 @@ def _format_exec_approval_fallback(
         if allow_permanent:
             choices.append(f"`{command_prefix}approve always` to approve permanently")
     choices.append(f"`{command_prefix}deny` to cancel")
-    return (
-        f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
-        + ", ".join(choices[:-1]) + f", or {choices[-1]}."
+    body = (
+        f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n" if has_command
+        else f"{heading}\n{description}\n\n"
     )
+    return body + ", ".join(choices[:-1]) + f", or {choices[-1]}."
 
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""

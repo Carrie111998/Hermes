@@ -1219,11 +1219,20 @@ class TeamsAdapter(BasePlatformAdapter):
             title="Deny", verb="hermes_approve",
             data={**btn_data_base, "hermes_action": "deny"}, style="destructive",
         ))
-        body = [
-            TextBlock(text="⚠️ Command Approval Required", wrap=True, weight="Bolder"),
-            TextBlock(text=f"```\n{cmd_preview}\n```", wrap=True),
-            TextBlock(text=f"Reason: {description}", wrap=True, isSubtle=True),
-        ]
+        # No command to preview: a plugin approval rule gates a tool call, not
+        # a shell string, so the description is the whole request rather than
+        # a note about something shown above it.
+        if cmd_preview:
+            body = [
+                TextBlock(text="⚠️ Command Approval Required", wrap=True, weight="Bolder"),
+                TextBlock(text=f"```\n{cmd_preview}\n```", wrap=True),
+                TextBlock(text=f"Reason: {description}", wrap=True, isSubtle=True),
+            ]
+        else:
+            body = [
+                TextBlock(text="⚠️ Approval Required", wrap=True, weight="Bolder"),
+                TextBlock(text=description, wrap=True),
+            ]
         if smart_denied:
             body.append(TextBlock(
                 text="Smart DENY: owner override applies to this one operation only.", wrap=True

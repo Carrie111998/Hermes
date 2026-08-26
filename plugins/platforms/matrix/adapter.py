@@ -2642,6 +2642,7 @@ class MatrixAdapter(BasePlatformAdapter):
     # the smart-deny/scope wording in its local tail (reaction legend), so the
     # core is used for the header + fence + reason head only.
     _EA_HEADER = "⚠️ **Dangerous command requires approval**\n"
+    _EA_HEADER_NO_COMMAND = "⚠️ **Approval required**\n"
     _EA_CMD_BUDGET = 2000
 
     async def send_exec_approval(

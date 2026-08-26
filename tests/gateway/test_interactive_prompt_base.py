@@ -106,3 +106,38 @@ class TestAdapterParity:
                     assert meta["page"] == o_page
                     assert meta["total_pages"] == o_tp
                     assert meta["page_info"] == o_info
+
+
+class TestExecApprovalWithoutACommand:
+    """A plugin approval rule gates a tool call, not a shell string.
+
+    ``request_tool_approval`` passes ``display_is_command=False``, so the
+    gateway payload carries no command. An empty code fence there would frame
+    the description as an aside about something the reader cannot see, when it
+    is in fact the entire request.
+    """
+
+    def _adapter(self):
+        return _bare(_DefaultAdapter)
+
+    def test_no_fence_and_no_reason_label(self):
+        text = self._adapter()._format_exec_approval("", "Add this to Basia's Calendar")
+        assert "```" not in text
+        assert "Reason:" not in text
+        assert "Add this to Basia's Calendar" in text
+
+    def test_header_does_not_say_command(self):
+        text = self._adapter()._format_exec_approval("", "delete one record")
+        assert "Command" not in text
+        assert "Approval Required" in text
+
+    def test_smart_deny_note_is_kept(self):
+        text = self._adapter()._format_exec_approval("", "reason", smart_denied=True)
+        assert "Smart DENY" in text
+
+    def test_a_real_command_is_unchanged(self):
+        text = self._adapter()._format_exec_approval("rm -rf /tmp/x", "recursive delete")
+        assert "```" in text
+        assert "rm -rf /tmp/x" in text
+        assert "Reason: recursive delete" in text
+        assert "Command Approval Required" in text

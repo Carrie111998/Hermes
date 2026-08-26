@@ -6296,6 +6296,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # Template attrs for the shared _format_exec_approval core (HTML mode).
     _EA_HEADER = "⚠️ <b>Command Approval Required</b>\n\n"
+    _EA_HEADER_NO_COMMAND = "⚠️ <b>Approval Required</b>\n\n"
     _EA_CODE_OPEN = "<pre>"
     _EA_CODE_CLOSE = "</pre>\n\n"
     _EA_SMART_DENY_LINE = "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."

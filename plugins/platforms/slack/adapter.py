@@ -7054,10 +7054,18 @@ class SlackAdapter(BasePlatformAdapter):
             # ``command``, so budget the preview against the fixed parts
             # instead of a flat truncation that overflows once the header +
             # reason are added.
-            header = ":warning: *Command Approval Required*\n"
+            # An empty command means there is nothing to preview: a plugin
+            # approval rule gates a tool call rather than a shell string, and
+            # an empty fence would frame the reason as an aside about
+            # something the reader cannot see.
+            has_command = bool(command)
+            header = (
+                ":warning: *Command Approval Required*\n" if has_command
+                else ":warning: *Approval Required*\n"
+            )
             if smart_denied:
                 header += "*Smart DENY:* owner override applies to this one operation only.\n"
-            reason = f"Reason: {description[:500]}"
+            reason = f"Reason: {description[:500]}" if has_command else description[:500]
             budget = 3000 - len(header) - len(reason) - len("``````\n") - len("...")
             cmd_preview = command[:budget] + "..." if len(command) > budget else command
 
@@ -7091,20 +7099,25 @@ class SlackAdapter(BasePlatformAdapter):
                 "action_id": "hermes_deny",
                 "value": session_key,
             })
+            section_text = (
+                f"{header}```{cmd_preview}```\n{reason}" if has_command
+                else f"{header}{reason}"
+            )
             blocks = [
                 {
                     "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"{header}```{cmd_preview}```\n{reason}",
-                    },
+                    "text": {"type": "mrkdwn", "text": section_text},
                 },
                 {"type": "actions", "elements": actions},
             ]
 
+            notification_text = (
+                f"⚠️ Command approval required: {cmd_preview[:100]}" if has_command
+                else f"⚠️ Approval required: {description[:100]}"
+            )
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
-                "text": f"⚠️ Command approval required: {cmd_preview[:100]}",
+                "text": notification_text,
                 "blocks": sanitize_blocks(blocks),
             }
             if thread_ts:

@@ -7491,17 +7491,22 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(reason_display) > reason_budget:
                 reason_display = reason_display[: reason_budget - 15] + "... [truncated]"
 
+            # An empty command means there is nothing to preview: a plugin
+            # approval rule gates a tool call rather than a shell string.
+            has_command = bool(command)
             prompt_prefix = (
                 "⚠️ **Command Approval Required**\n\n"
                 "Do you want Hermes to run this command?\n\n"
                 "**Requested command:**\n```bash\n"
-            )
+            ) if has_command else "⚠️ **Approval Required**\n\n"
             if smart_denied:
                 prompt_prefix += "**Smart DENY:** owner override applies to this one operation only.\n\n"
             mention_content = self._approval_mention_content()
             if mention_content:
                 prompt_prefix = f"{mention_content}\n{prompt_prefix}"
-            prompt_tail = f"\n```\n**Reason:** {reason_display}"
+            prompt_tail = (
+                f"\n```\n**Reason:** {reason_display}" if has_command else reason_display
+            )
             truncated_suffix = "\n... [truncated]"
             command_budget = max(0, self.MAX_MESSAGE_LENGTH - len(prompt_prefix) - len(prompt_tail))
             content_cmd_display = str(command or "")
@@ -7519,11 +7524,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(embed_cmd_display) > max_embed_desc:
                 embed_cmd_display = embed_cmd_display[: max_embed_desc - 3] + "..."
             embed = discord.Embed(
-                title="⚠️ Command Approval Required",
-                description=f"```\n{embed_cmd_display}\n```",
+                title="⚠️ Command Approval Required" if has_command else "⚠️ Approval Required",
+                description=(
+                    f"```\n{embed_cmd_display}\n```" if has_command else reason_display
+                ),
                 color=discord.Color.orange(),
             )
-            embed.add_field(name="Reason", value=reason_display, inline=False)
+            if has_command:
+                embed.add_field(name="Reason", value=reason_display, inline=False)
 
             require_admin, admin_user_ids = _resolve_exec_approval_admin_gate(
                 getattr(self.config, "extra", None)
