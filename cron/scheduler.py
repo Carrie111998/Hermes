@@ -5121,6 +5121,7 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    execution_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5138,6 +5139,12 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run',
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
+
+    ``execution_id``: the caller's ``cron.executions.db`` execution id for
+    this attempt (see ``_run_one_job_body``), bound task-locally to
+    ``HERMES_CRON_EXECUTION_ID`` alongside ``HERMES_CRON_SESSION`` for the
+    duration of the run. Lets in-process trusted code (native plugins) join
+    a cron-triggered tool call back to this exact execution record.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5596,7 +5603,9 @@ def run_job(
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
+    _cron_execution_id_var = _VAR_MAP["HERMES_CRON_EXECUTION_ID"]
     _cron_session_token = None
+    _cron_execution_id_token = None
     _non_dispatcher_token = None
     try:
         if not _cwd_lock_acquired:
@@ -5620,6 +5629,9 @@ def run_job(
         # which would suppress the legacy os.environ fallback used by standalone
         # cron entrypoints and tests.
         _cron_session_token = _cron_session_var.set("1")
+        _cron_execution_id_token = _cron_execution_id_var.set(
+            str(execution_id) if execution_id else ""
+        )
 
         # Mark this job as NOT the dispatcher-owned kanban worker.
         #
@@ -6487,6 +6499,8 @@ def run_job(
         clear_session_vars(_ctx_tokens)
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
+        if _cron_execution_id_token is not None:
+            _cron_execution_id_var.reset(_cron_execution_id_token)
         if _non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
@@ -6882,6 +6896,7 @@ def _run_one_job_body(
                     job,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
+                    execution_id=execution_id,
                 )
             else:
                 success, output, final_response, error = run_job(
@@ -6889,6 +6904,7 @@ def _run_one_job_body(
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
+                    execution_id=execution_id,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
