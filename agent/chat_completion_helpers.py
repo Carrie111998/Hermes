@@ -739,6 +739,55 @@ def _reset_stale_streak(agent) -> None:
         pass
 
 
+def _is_responsive_provider_error(error) -> bool:
+    """True when *error* carries an authoritative HTTP response from the
+    provider — a real status code (429/503/401/…) proves the provider is
+    reachable, however unhappy. Timeouts, socket drops, and the locally
+    built TimeoutErrors of the stale detectors carry no status and stay
+    False. Shapes covered: openai/anthropic ``APIStatusError``
+    (``.status_code``), ``httpx.HTTPStatusError`` (``.response.status_code``),
+    botocore ``ClientError`` (dict ``.response`` with ResponseMetadata)."""
+    if error is None:
+        return False
+    if isinstance(getattr(error, "status_code", None), int):
+        return True
+    resp = getattr(error, "response", None)
+    if resp is None:
+        return False
+    if isinstance(getattr(resp, "status_code", None), int):
+        return True
+    if isinstance(resp, dict):
+        try:
+            meta = resp.get("ResponseMetadata") or {}
+            return isinstance(meta.get("HTTPStatusCode"), int)
+        except Exception:
+            return False
+    return False
+
+
+def _resolve_stale_on_responsive_error(agent, error) -> None:
+    """Any authoritative provider response resolves the stale/no-response
+    condition this breaker represents: a prompt 429/503/401 proves the
+    provider is reachable again, so the breaker must not mask that newer,
+    more accurate state by short-circuiting the normal retry/rate-limit/
+    fallback machinery's next attempt as "provider unresponsive". Streak
+    and probe window both clear; subsequent handling belongs to the normal
+    HTTP error policy. A timeout / no-byte / stale outcome carries no
+    status, so it leaves the breaker open (the stale kill paths bump the
+    streak themselves)."""
+    try:
+        if _stale_streak(agent) and _is_responsive_provider_error(error):
+            logger.info(
+                "Stale give-up breaker cleared: provider answered with a real "
+                "HTTP response (%s) — no longer unresponsive; normal retry "
+                "policy owns the error.",
+                type(error).__name__,
+            )
+            _reset_stale_streak(agent)
+    except Exception:
+        logger.debug("stale resolve-on-response failed", exc_info=True)
+
+
 _INTERRUPTED_WAIT_STALE_SECONDS = 30.0
 
 # Half-open probe window for the tripped give-up breaker (#89587). Worst
@@ -746,6 +795,15 @@ _INTERRUPTED_WAIT_STALE_SECONDS = 30.0
 # local stale ceiling, so 300s bounds the duty cycle to one wedged wait per
 # ~15 min while cloud providers (180s stale timeout) recover within ~5 min.
 _STALE_PROBE_INTERVAL_S = 300.0
+
+# Serializes the check-elapsed → arm-next-window → admit-probe transition in
+# _check_stale_giveup: concurrent callers reaching an expired window boundary
+# must not each observe it elapsed and all claim the same probe opportunity —
+# at most one call per window reaches provider dispatch. Module-level (not
+# per-agent) because lazy per-agent lock creation would itself race; the
+# critical section is a few attribute reads/writes, so cross-agent contention
+# is negligible.
+_stale_probe_claim_lock = threading.Lock()
 
 
 def _record_interrupted_provider_wait(
@@ -830,7 +888,9 @@ def _check_stale_giveup(agent, *, allow_probe: bool = True) -> None:
     probe that itself wedges (a full stale-timeout wait) cannot be
     followed by another until the next window. ``allow_probe=False``
     (the Bedrock mid-call escalation) keeps the unconditional raise —
-    returning there would leave an un-abortable worker polling.
+    that site is already ending the call as stale, so an admitted probe
+    there could never dispatch: it would only consume the window's single
+    claim and push real recovery out by another full cooldown.
     """
     _giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
     _streak = _stale_streak(agent)
@@ -845,12 +905,29 @@ def _check_stale_giveup(agent, *, allow_probe: bool = True) -> None:
     )
     if allow_probe and _interval > 0:
         try:
+            _admitted = False
             _now = time.monotonic()
-            _probe_after = float(
-                getattr(agent, "_stale_probe_after", 0.0) or 0.0
-            )
-            if _probe_after and _now >= _probe_after:
-                agent._stale_probe_after = _now + _interval
+            # The read-decide-write on ``_stale_probe_after`` is a claim:
+            # under the lock, exactly one caller at an expired-window
+            # boundary observes it elapsed, re-arms it, and is admitted —
+            # every concurrent loser sees the freshly armed window and
+            # falls through to the fail-fast raise below.
+            with _stale_probe_claim_lock:
+                _probe_after = float(
+                    getattr(agent, "_stale_probe_after", 0.0) or 0.0
+                )
+                if _probe_after and _now >= _probe_after:
+                    agent._stale_probe_after = _now + _interval
+                    _admitted = True
+                elif not _probe_after:
+                    # First short-circuit past the threshold (the trip call,
+                    # or an interrupt-counted overshoot that never ran this
+                    # guard): arm the window so the probe fires only after a
+                    # cooldown, never as an immediate re-wait of the stale
+                    # timeout.
+                    _probe_after = _now + _interval
+                    agent._stale_probe_after = _probe_after
+            if _admitted:
                 logger.warning(
                     "Stale give-up breaker half-open: allowing one probe "
                     "attempt (streak=%d, next window in %.0fs).",
@@ -858,13 +935,6 @@ def _check_stale_giveup(agent, *, allow_probe: bool = True) -> None:
                     _interval,
                 )
                 return
-            if not _probe_after:
-                # First short-circuit past the threshold (the trip call, or
-                # an interrupt-counted overshoot that never ran this guard):
-                # arm the window so the probe fires only after a cooldown,
-                # never as an immediate re-wait of the stale timeout.
-                _probe_after = _now + _interval
-                agent._stale_probe_after = _probe_after
             _extra = (
                 f" Next automatic probe in ~{max(0, int(_probe_after - _now))}s."
             )
@@ -1403,7 +1473,7 @@ def direct_api_call(agent, api_kwargs: dict):
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
         )
-    except Exception:
+    except Exception as _api_exc:
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
         with request_client_lock:
@@ -1418,6 +1488,9 @@ def direct_api_call(agent, api_kwargs: dict):
                 f"{int(time.time() - call_start)}s with no response "
                 f"(threshold: {int(stale_timeout)}s)"
             ) from None
+        # A real HTTP response (429/5xx/4xx) proves the provider reachable —
+        # resolve the stale condition (see _resolve_stale_on_responsive_error).
+        _resolve_stale_on_responsive_error(agent, _api_exc)
         raise
     else:
         if getattr(agent, "_interrupt_requested", False):
@@ -1987,6 +2060,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _join_worker_for_relay_teardown(t, label="Non-streaming")
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        # A real HTTP response (429/5xx/4xx) proves the provider reachable —
+        # resolve the stale/no-response condition so the tripped breaker
+        # cannot short-circuit the normal retry policy's next attempt as
+        # "provider unresponsive".
+        _resolve_stale_on_responsive_error(agent, result["error"])
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
@@ -3971,8 +4049,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # Escalate across turns: raises RuntimeError once the streak
                     # crosses HERMES_STREAM_STALE_GIVEUP, so a persistently wedged
                     # Bedrock provider aborts fast instead of re-waiting the timeout.
-                    # Mid-call: never probe — returning here would leave the
-                    # un-abortable worker polling instead of ending the call.
+                    # Mid-call: never probe — this path is already ending the
+                    # call as stale (TimeoutError below), so an admitted probe
+                    # could never dispatch; it would only consume the window's
+                    # single claim and delay real recovery by a full cooldown.
                     _check_stale_giveup(agent, allow_probe=False)
                     # Streak still under the give-up threshold: end THIS call with a
                     # TimeoutError so the outer retry loop / next turn re-evaluates
@@ -4000,6 +4080,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
             if result["error"] is not None:
+                # Mirrors the non-streaming path: an authoritative Bedrock
+                # HTTP response resolves the stale condition (see
+                # _resolve_stale_on_responsive_error).
+                _resolve_stale_on_responsive_error(agent, result["error"])
                 raise result["error"]
             # Success — clear the cross-turn breaker (#58962): Bedrock proved
             # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
@@ -5882,6 +5966,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
             return _stub
+        # Mirrors the non-streaming path: an authoritative provider HTTP
+        # response resolves the stale condition (see
+        # _resolve_stale_on_responsive_error).
+        _resolve_stale_on_responsive_error(agent, result["error"])
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
