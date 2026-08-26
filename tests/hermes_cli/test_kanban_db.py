@@ -1792,3 +1792,49 @@ def test_detect_crashed_workers_releases_held_claim_without_recounting(
         assert "budget_hold_reclaimed" in kinds
         assert "crashed" not in kinds
         assert "protocol_violation" not in kinds
+
+
+def test_detect_crashed_workers_leaves_held_claim_while_pid_alive(
+    kanban_home, monkeypatch,
+):
+    """Direct counterpart to the release test: while the held worker's pid is
+    still ALIVE, ``detect_crashed_workers`` must not act on the held claim at
+    all — status/claim/pid stay exactly as the worker left them and no reclaim
+    event of any kind is appended."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="budget-hold-alive", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 424242)
+
+        kb._record_task_failure(conn, tid, **_hold_failure_kwargs())
+        held = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert held["status"] == "running"
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == []
+        assert getattr(kb.detect_crashed_workers, "_last_rate_limited", []) == []
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] == f"{host}:worker"
+        assert row["claim_expires"] is not None
+        assert row["worker_pid"] == 424242
+        kinds = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
+            ).fetchall()
+        ]
+        assert "budget_hold_reclaimed" not in kinds
+        assert "crashed" not in kinds
+        assert "protocol_violation" not in kinds
