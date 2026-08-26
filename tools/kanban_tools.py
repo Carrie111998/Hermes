@@ -1748,6 +1748,13 @@ KANBAN_LIST_SCHEMA = {
             },
             "kind": {
                 "type": "string",
+                # Mirrors kanban_db.VALID_BLOCK_KINDS, the same way
+                # KANBAN_BLOCK_SCHEMA below does: kanban_db is imported
+                # lazily in this module to avoid an import cycle, so it is
+                # not available where these schema dicts are built. Add a
+                # kind there and update both enums. Until then the handler
+                # still validates against the real constant, so an unlisted
+                # kind is rejected by name rather than silently mishandled.
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "Optional block-kind filter. Pair with status='blocked' to "
