@@ -2057,7 +2057,9 @@ def _clear_planned_restart_notification() -> None:
 
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
-os.environ["_HERMES_GATEWAY"] = "1"
+# Note: Do NOT unconditionally set _HERMES_GATEWAY=1 at module level.
+# Setting it here caused any lazy import of gateway.run in CLI mode to be
+# falsely identified as the gateway daemon and clobber TERMINAL_CWD (#95577).
 
 _ensure_ssl_certs()
 
@@ -2344,6 +2346,8 @@ if _config_path.exists():
                 os.environ[_key] = str(_val)
         # Terminal config is nested — bridge to TERMINAL_* env vars.
         # config.yaml overrides .env for these since it's the documented config path.
+        # Note: 'cwd' is only bridged to TERMINAL_CWD when running as gateway daemon (_HERMES_GATEWAY=1)
+        # to prevent clobbering one-shot CLI launch directory (#95577).
         _terminal_cfg = _cfg.get("terminal", {})
         if _terminal_cfg and isinstance(_terminal_cfg, dict):
             _terminal_backend = str(
@@ -2352,7 +2356,6 @@ if _config_path.exists():
             _terminal_env_map = {
                 "backend": "TERMINAL_ENV",
                 "degraded_mode": "TERMINAL_DEGRADED_MODE",
-                "cwd": "TERMINAL_CWD",
                 "timeout": "TERMINAL_TIMEOUT",
                 "home_mode": "TERMINAL_HOME_MODE",
                 "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
@@ -2383,6 +2386,8 @@ if _config_path.exists():
                 "sandbox_dir": "TERMINAL_SANDBOX_DIR",
                 "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
             }
+            if os.environ.get("_HERMES_GATEWAY") == "1":
+                _terminal_env_map["cwd"] = "TERMINAL_CWD"
             for _cfg_key, _env_var in _terminal_env_map.items():
                 if _cfg_key in _terminal_cfg:
                     _val = _terminal_cfg[_cfg_key]
@@ -2611,24 +2616,28 @@ os.environ["HERMES_QUIET"] = "1"
 # by the config bridge above).  Placeholder values are resolved per-backend —
 # see gateway/cwd_placeholder.py for the three-case contract (local vs docker
 # mount-off vs docker mount-on).  MESSAGING_CWD is a backward-compat fallback.
+# IMPORTANT: Only resolve and mutate TERMINAL_CWD when actually running as a gateway daemon
+# (_HERMES_GATEWAY=1). Late lazy imports of gateway.run in CLI / one-shot mode must not clobber
+# the process launch directory with the daemon home_fallback (#95577).
 from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
 
-_configured_cwd = os.environ.get("TERMINAL_CWD", "")
-if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
-    _resolved_cwd = resolve_placeholder_terminal_cwd(
-        configured_cwd=_configured_cwd,
-        terminal_backend=os.environ.get("TERMINAL_ENV", ""),
-        messaging_cwd=os.getenv("MESSAGING_CWD"),
-        docker_mount_cwd_to_workspace=os.getenv(
-            "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false"
-        ).lower()
-        in {"true", "1", "yes"},
-        home_fallback=str(Path.home()),
-    )
-    if _resolved_cwd is None:
-        os.environ.pop("TERMINAL_CWD", None)
-    else:
-        os.environ["TERMINAL_CWD"] = _resolved_cwd
+if os.environ.get("_HERMES_GATEWAY") == "1":
+    _configured_cwd = os.environ.get("TERMINAL_CWD", "")
+    if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
+        _resolved_cwd = resolve_placeholder_terminal_cwd(
+            configured_cwd=_configured_cwd,
+            terminal_backend=os.environ.get("TERMINAL_ENV", ""),
+            messaging_cwd=os.getenv("MESSAGING_CWD"),
+            docker_mount_cwd_to_workspace=os.getenv(
+                "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false"
+            ).lower()
+            in {"true", "1", "yes"},
+            home_fallback=str(Path.home()),
+        )
+        if _resolved_cwd is None:
+            os.environ.pop("TERMINAL_CWD", None)
+        else:
+            os.environ["TERMINAL_CWD"] = _resolved_cwd
 
 from gateway.config import (
     ChannelOverride,
@@ -30994,9 +31003,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
-    # Enable interactive exec approval for dangerous commands on messaging
-    # platforms. Set here (not at module import) so incidental imports of
-    # gateway.run from CLI/tool code do not poison HERMES_EXEC_ASK.
+    # Mark this process as a running gateway daemon and enable interactive exec approval
+    # for dangerous commands on messaging platforms. Set here (not at module import) so
+    # incidental imports of gateway.run from CLI/tool code do not poison HERMES_EXEC_ASK
+    # or mutate TERMINAL_CWD (#95577).
+    os.environ["_HERMES_GATEWAY"] = "1"
     os.environ["HERMES_EXEC_ASK"] = "1"
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
