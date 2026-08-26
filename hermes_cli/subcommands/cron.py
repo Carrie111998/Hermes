@@ -246,6 +246,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_remove.add_argument("job_id", help="Job ID to remove")
 
     # cron status
+    # cron show — the untruncated view `cron list` points at for a long
+    # paused_reason.
+    cron_show = cron_subparsers.add_parser(
+        "show", aliases=["detail"], help="Show one job in full (untruncated pause reason)"
+    )
+    cron_show.add_argument("job_id", help="Job ID")
+
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
     cron_runs = cron_subparsers.add_parser(

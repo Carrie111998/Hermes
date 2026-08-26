@@ -1,7 +1,7 @@
 """
 Cron subcommand for hermes CLI.
 
-Handles standalone cron management commands like list, create, edit,
+Handles standalone cron management commands like list, show, create, edit,
 pause/resume/run/remove, status, and tick.
 """
 
@@ -96,6 +96,26 @@ def _warn_if_gateway_not_running() -> None:
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
 
+# A containment reason is written to be READ — the 2026-08-25 Gate-2 incident
+# happened because nobody saw one. So the listing shows as much of it as fits on
+# a line and, when it clips, names the command that prints the rest verbatim.
+# Never clip silently: a truncated barrier text that looks complete is worse
+# than no text at all.
+_PAUSE_REASON_LIST_LIMIT = 160
+
+
+def _clip_pause_reason(reason: str, limit: int = _PAUSE_REASON_LIST_LIMIT):
+    """Return ``(shown, was_clipped)`` for a one-line rendering of ``reason``.
+
+    Newlines collapse to spaces so a multi-line reason cannot break the
+    listing's alignment.
+    """
+    flat = " ".join(str(reason).split())
+    if len(flat) <= limit:
+        return flat, False
+    return flat[: limit - 1].rstrip() + "…", True
+
+
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
@@ -150,10 +170,19 @@ def cron_list(show_all: bool = False):
         print(f"  {color(job_id, Colors.YELLOW)} {status}")
         print(f"    Name:      {name}")
         if state == "paused":
-            paused_reason = job.get("paused_reason") or "(no reason recorded)"
+            raw_reason = job.get("paused_reason")
             paused_at = job.get("paused_at")
             suffix = f" (since {paused_at})" if paused_at else ""
-            print(f"    Paused:    {paused_reason}{suffix}")
+            if raw_reason:
+                shown, clipped = _clip_pause_reason(raw_reason)
+                print(f"    Paused:    {shown}{suffix}")
+                if clipped:
+                    print(color(
+                        f"               full reason: hermes cron show {job_id}",
+                        Colors.DIM,
+                    ))
+            else:
+                print(f"    Paused:    (no reason recorded){suffix}")
         print(f"    Schedule:  {schedule}")
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
@@ -213,6 +242,49 @@ def cron_list(show_all: bool = False):
         print()
 
     _warn_if_gateway_not_running()
+
+
+def cron_show(job_id: str) -> int:
+    """Print one job in full — including the UNTRUNCATED pause reason.
+
+    ``cron list`` clips a long ``paused_reason`` to keep the listing readable;
+    this is where the whole text lives, so clipping never loses it.
+    """
+    from cron.jobs import get_job
+
+    job = get_job(job_id)
+    if job is None:
+        print(color(f"No such job: {job_id}", Colors.RED))
+        return 1
+
+    state = job.get("state", "scheduled" if job.get("enabled", True) else "paused")
+    print()
+    print(f"{color(job.get('id', job_id), Colors.YELLOW)}  {job.get('name', '(unnamed)')}")
+    print(f"  State:     {state}")
+    print(f"  Enabled:   {job.get('enabled', True)}")
+    print(f"  Schedule:  {job.get('schedule_display', job.get('schedule', {}).get('value', '?'))}")
+    print(f"  Next run:  {job.get('next_run_at', '?')}")
+
+    paused_at = job.get("paused_at")
+    if paused_at:
+        print(f"  Paused at: {paused_at}")
+    reason = job.get("paused_reason")
+    if reason:
+        print("  Paused because:")
+        for line in str(reason).splitlines() or [""]:
+            print(f"    {line}")
+    elif state == "paused" or not job.get("enabled", True):
+        print(color("  Paused because: (no reason recorded)", Colors.DIM))
+
+    history = job.get("paused_history") or []
+    if history:
+        print(f"  Earlier pauses ({len(history)}):")
+        for entry in history:
+            past_reason = entry.get("paused_reason") or "(no reason recorded)"
+            resumed = entry.get("resumed_at") or "?"
+            print(f"    {entry.get('paused_at', '?')} → {resumed}: {past_reason}")
+    print()
+    return 0
 
 
 def cron_tick():
@@ -597,6 +669,9 @@ def cron_command(args):
         cron_list(show_all)
         return 0
 
+    if subcmd in {"show", "detail"}:
+        return cron_show(args.job_id)
+
     if subcmd == "status":
         cron_status()
         return 0
@@ -648,5 +723,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|barrier|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|show|create|edit|pause|resume|barrier|run|remove|status|runs|tick]")
     sys.exit(1)

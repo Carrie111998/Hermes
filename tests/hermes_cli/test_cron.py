@@ -142,6 +142,72 @@ class TestCronCommandLifecycle:
 
         assert "Paused:    (no reason recorded)" in capsys.readouterr().out
 
+    def test_list_clips_a_long_reason_and_says_where_the_rest_is(
+        self, tmp_cron_dir, capsys
+    ):
+        """A clipped barrier text that looks complete is worse than none.
+
+        The live store already carries a 1860-character containment reason
+        (tracker-identity-repair, 2026-08-26); pasted whole into an 80-job
+        listing it buries every other job on the screen.
+        """
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        long_reason = (
+            "Gate-2 identity-clobber ceremony barrier; Diego-authorized "
+            "2026-08-25; resume only after Gate 2 lands. " + ("detail " * 60)
+        ).strip()
+        cron_command(
+            Namespace(cron_command="pause", job_id=job["id"], reason=long_reason)
+        )
+        capsys.readouterr()
+
+        cron_command(Namespace(cron_command="list", all=True))
+        out = capsys.readouterr().out
+
+        assert "Gate-2 identity-clobber ceremony barrier" in out
+        assert "…" in out
+        assert long_reason not in out
+        assert f"full reason: hermes cron show {job['id']}" in out
+        # The clip is a one-liner, not a wall: the reason contributes exactly
+        # the Paused line plus the pointer.
+        reason_lines = [ln for ln in out.splitlines() if "detail" in ln]
+        assert len(reason_lines) == 1
+
+    def test_list_does_not_point_at_show_for_a_short_reason(
+        self, tmp_cron_dir, capsys
+    ):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(
+            Namespace(cron_command="pause", job_id=job["id"], reason="host saturated")
+        )
+        capsys.readouterr()
+
+        cron_command(Namespace(cron_command="list", all=True))
+        out = capsys.readouterr().out
+
+        assert "Paused:    host saturated (since " in out
+        assert "full reason:" not in out
+        assert "…" not in out
+
+    def test_list_collapses_a_multiline_reason_onto_one_line(
+        self, tmp_cron_dir, capsys
+    ):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(
+            Namespace(
+                cron_command="pause",
+                job_id=job["id"],
+                reason="barrier held\nresume after Gate 2",
+            )
+        )
+        capsys.readouterr()
+
+        cron_command(Namespace(cron_command="list", all=True))
+        out = capsys.readouterr().out
+
+        assert "Paused:    barrier held resume after Gate 2 (since " in out
+
+
     def test_run_reason_from_the_real_parser_reaches_the_audit_event(
         self, tmp_cron_dir, monkeypatch
     ):
@@ -780,3 +846,95 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+
+class TestCronShow:
+    def test_show_prints_the_reason_untruncated(self, tmp_cron_dir, capsys):
+        """`cron list` may clip; this is the surface that never does."""
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        long_reason = "Gate-2 containment barrier. " + ("why " * 200)
+        long_reason = long_reason.strip()
+        cron_command(
+            Namespace(cron_command="pause", job_id=job["id"], reason=long_reason)
+        )
+        capsys.readouterr()
+
+        rc = cron_command(Namespace(cron_command="show", job_id=job["id"]))
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert long_reason in out
+        assert "…" not in out
+        assert "State:     paused" in out
+
+    def test_show_of_a_pause_with_no_reason_does_not_print_none(
+        self, tmp_cron_dir, capsys
+    ):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(Namespace(cron_command="pause", job_id=job["id"]))
+        capsys.readouterr()
+
+        rc = cron_command(Namespace(cron_command="show", job_id=job["id"]))
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "(no reason recorded)" in out
+        assert "None" not in out
+
+    def test_show_of_a_running_job_says_nothing_about_pausing(
+        self, tmp_cron_dir, capsys
+    ):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        capsys.readouterr()
+
+        rc = cron_command(Namespace(cron_command="show", job_id=job["id"]))
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Paused" not in out
+        assert "None" not in out
+
+    def test_show_surfaces_earlier_pauses(self, tmp_cron_dir, capsys):
+        """The WHY of a LIFTED hold is exactly what the incident needed."""
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(
+            Namespace(
+                cron_command="pause", job_id=job["id"], reason="Gate-2 barrier"
+            )
+        )
+        cron_command(Namespace(cron_command="resume", job_id=job["id"]))
+        capsys.readouterr()
+
+        cron_command(Namespace(cron_command="show", job_id=job["id"]))
+        out = capsys.readouterr().out
+
+        assert "Earlier pauses (1)" in out
+        assert "Gate-2 barrier" in out
+        assert "None" not in out
+
+    def test_show_of_a_missing_job_exits_nonzero(self, tmp_cron_dir, capsys):
+        rc = cron_command(Namespace(cron_command="show", job_id="nope-123"))
+
+        assert rc == 1
+        assert "No such job: nope-123" in capsys.readouterr().out
+
+    def test_show_is_reachable_from_the_real_parser(self, tmp_cron_dir, capsys):
+        """A hand-built Namespace cannot catch a missing subparser."""
+        import argparse
+
+        from hermes_cli.subcommands.cron import build_cron_parser
+
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=lambda a: 0)
+
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(
+            Namespace(cron_command="pause", job_id=job["id"], reason="held")
+        )
+        capsys.readouterr()
+
+        args = parser.parse_args(["cron", "show", job["id"]])
+        assert args.cron_command == "show"
+        assert cron_command(args) == 0
+        assert "held" in capsys.readouterr().out
