@@ -2981,6 +2981,22 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    @staticmethod
+    def _offer_tool(agent, name: str) -> None:
+        """Keep a test's request schemas and executable-name set coherent."""
+        agent.valid_tool_names.add(name)
+        agent.tools = [
+            *agent.tools,
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "Test tool.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
     def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
         relay_lease = SimpleNamespace(
             parent_session_id="",
@@ -4395,7 +4411,7 @@ class TestRunConversation:
         (up to 3 times). If a retry succeeds (valid JSON args), tool execution
         proceeds."""
         self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
+        self._offer_tool(agent, "write_file")
         bad_tc = _mock_tool_call(
             name="write_file",
             arguments='{"path":"report.md","content":"partial',
@@ -4438,7 +4454,7 @@ class TestRunConversation:
         from hermes_constants import PARTIAL_STREAM_STUB_ID
 
         self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
+        self._offer_tool(agent, "write_file")
         bad_tc = _mock_tool_call(
             name="write_file",
             arguments='{"path":"report.md","content":"partial',
@@ -4483,7 +4499,7 @@ class TestRunConversation:
         from hermes_constants import PARTIAL_STREAM_STUB_ID
 
         self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
+        self._offer_tool(agent, "write_file")
 
         stall = _mock_response(content="", finish_reason="length", tool_calls=None)
         stall.id = PARTIAL_STREAM_STUB_ID
@@ -4517,7 +4533,7 @@ class TestRunConversation:
     def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
         """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
         self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
+        self._offer_tool(agent, "write_file")
         good_tc = _mock_tool_call(
             name="write_file",
             arguments='{"path":"ok.md","content":"x"}',

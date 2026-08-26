@@ -1089,7 +1089,16 @@ def _begin_tool_execution(
             pass
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    request_registry_bindings=None,
+) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -1377,6 +1386,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
+                        expected_registry_entry=(
+                            request_registry_bindings.get(function_name)
+                            if request_registry_bindings is not None
+                            else None
+                        ),
+                        enforce_registry_entry=(
+                            request_registry_bindings is not None
+                        ),
+                        request_registry_bindings=request_registry_bindings,
                     )
 
                 managed = _run_agent_tool_execution_middleware(
@@ -1943,7 +1961,16 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    request_registry_bindings=None,
+) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -2525,6 +2552,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            expected_registry_entry=(
+                                request_registry_bindings.get(function_name)
+                                if request_registry_bindings is not None
+                                else None
+                            ),
+                            enforce_registry_entry=(
+                                request_registry_bindings is not None
+                            ),
+                            request_registry_bindings=request_registry_bindings,
                         )
 
                 (
@@ -2607,6 +2643,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            expected_registry_entry=(
+                                request_registry_bindings.get(function_name)
+                                if request_registry_bindings is not None
+                                else None
+                            ),
+                            enforce_registry_entry=(
+                                request_registry_bindings is not None
+                            ),
+                            request_registry_bindings=request_registry_bindings,
                         )
 
                 (
@@ -2855,7 +2900,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+def execute_tool_calls_segmented(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    segments=None,
+    request_registry_bindings=None,
+) -> None:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
@@ -2893,11 +2946,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                request_registry_bindings=request_registry_bindings,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                request_registry_bindings=request_registry_bindings,
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):
