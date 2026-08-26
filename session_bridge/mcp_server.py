@@ -19,6 +19,7 @@ import time
 from typing import Any, cast
 
 from .catalog import UnifiedCatalog
+from .claude_visibility import normalized_claude_visibility_repair_rows
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
@@ -1070,6 +1071,12 @@ def _claude_visibility_status_payload(
             else:
                 degraded.add(str(item["code"]))
 
+    repair_required, repair_malformed = normalized_claude_visibility_repair_rows(
+        raw.get("repair_required", [])
+    )
+    if repair_malformed:
+        degraded.add("invalid_status")
+
     attempts = _nonnegative_int(usage_raw.get("attempts"), degraded)
     reserved_cost = _nonnegative_decimal(
         usage_raw.get("reserved_cost_usd", "0"), degraded
@@ -1126,6 +1133,7 @@ def _claude_visibility_status_payload(
             "registration_limit_reached": attempts >= daily_limit,
             "emergency_cost_limit_reached": cost_blocked,
         },
+        "repair_required": repair_required,
         "degraded_reasons": [],
         "last_cycle": tracked("last_cycle"),
         "last_empty_cycle": tracked("last_empty_cycle"),

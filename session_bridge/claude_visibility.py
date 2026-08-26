@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 import hashlib
 import json
 import math
+import re
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
@@ -373,6 +375,89 @@ def normalized_claude_visibility_error(error_code: object) -> tuple[str, bool]:
     if error_code in CLAUDE_VISIBILITY_FATAL_CODES:
         return str(error_code), False
     return "unknown_error_code", False
+
+
+# One renderer for the operator's only escape hatch, shared by every surface
+# that reports an abandoned repair lease. A second copy would reintroduce the
+# exact drift this reporting change exists to remove.
+CLAUDE_VISIBILITY_REPAIR_IDENTIFIER = re.compile(
+    r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z"
+)
+_CLAUDE_VISIBILITY_REPAIR_ROW_KEYS = frozenset(
+    {"job_id", "reserved_claude_uuid", "error_code"}
+)
+
+
+def claude_visibility_repair_command(
+    job_id: object, reserved_claude_uuid: object, error_code: object
+) -> str | None:
+    """Render the guarded repair invocation, or nothing at all.
+
+    An abandoned repair lease is excluded from every automatic reclaim path on
+    purpose, so this operator invocation IS the recovery path -- worth nothing
+    if the reader has to reconstruct it. It is assembled from stored
+    identifiers, so anything that is not plainly an identifier yields no command
+    rather than a line that could read as one thing and mean another.
+    """
+
+    if error_code != "bridge_conflict":
+        return None
+    for value in (job_id, reserved_claude_uuid):
+        if not isinstance(
+            value, str
+        ) or not CLAUDE_VISIBILITY_REPAIR_IDENTIFIER.match(value):
+            return None
+    return (
+        "hermes-session-bridge claude-visibility-repair-failed "
+        f"--job-id {job_id} "
+        f"--reserved-claude-uuid {reserved_claude_uuid} "
+        f"--error-code {error_code} "
+        "--apply --confirm-exact-terminal-repair"
+    )
+
+
+def normalized_claude_visibility_repair_rows(
+    rows: object,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Shape the store's repair_required rows; report whether any was malformed.
+
+    A row of the WRONG SHAPE is dropped and reported -- that is bad evidence.
+    A correctly shaped row whose identifiers will not render is KEPT with
+    command=None: the reader still needs to know the job exists.  Callers decide
+    what to do with the malformed flag; the strict public surfaces degrade on it.
+    """
+
+    if not isinstance(rows, list):
+        return [], rows is not None
+    shaped: list[dict[str, Any]] = []
+    malformed = False
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != _CLAUDE_VISIBILITY_REPAIR_ROW_KEYS
+        ):
+            malformed = True
+            continue
+        job_id = row["job_id"]
+        reserved = row["reserved_claude_uuid"]
+        error_code = row["error_code"]
+        if not all(
+            isinstance(value, str)
+            for value in (job_id, reserved, error_code)
+        ):
+            malformed = True
+            continue
+        shaped.append(
+            {
+                "job_id": job_id,
+                "reserved_claude_uuid": reserved,
+                "error_code": error_code,
+                "command": claude_visibility_repair_command(
+                    job_id, reserved, error_code
+                ),
+            }
+        )
+    return shaped, malformed
 
 
 def validate_claude_visibility_identity_binding(
