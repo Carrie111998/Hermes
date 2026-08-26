@@ -50,13 +50,6 @@ jobs:
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
   # Skipped workflows (if condition is false) don't spin up runners.
   # ─────────────────────────────────────────────────────────────────────
-  tests:
-    name: Python tests
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
-    uses: ./.github/workflows/tests.yml
-    with:
-      slice_count: 8
 
   lint:
     name: Python lints
@@ -112,7 +105,6 @@ jobs:
   all-checks-pass:
     name: All required checks pass
     needs:
-      - tests
       - lint
       - history-check
       - contributor-check

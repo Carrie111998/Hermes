@@ -125,11 +125,14 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/server/test_clean_demo_e2e.py -q
 
-      - name: Run server tests
+      # The whole tree, not just tests/server: after the upstream framework
+      # suites were removed this is 110 files and about 90 seconds, so there is
+      # no reason to run a subset and no second workflow covering the rest.
+      - name: Run the test suite
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          python -m pytest tests/server -q
+          python -m pytest tests -q
 
       # Test files are listed one by one: `node --test <dir>` only picks up
       # `test-*` / `*.test.*` names, which would silently skip these.
