@@ -20,6 +20,7 @@ import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { toggleHud } from '@/store/hud'
 import { $previewTabs, closeRightRailTab, newBrowserTab, openPreview } from '@/store/preview'
 import { $nativeNotifyPrefs, resumeNativeNotifications, silenceNativeNotificationsFor } from '@/store/native-notifications'
+import { toggleWakeWord } from '@/store/wake-word'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
   $fileBrowserOpen,
@@ -207,16 +208,21 @@ export function MobileBehaviors() {
     let disposed = false
     let stopListening: () => void = () => undefined
 
-    const handleAction = () => {
+    const handleAction = (action: 'newTask' | 'wakeToggle') => {
+      if (action === 'wakeToggle') {
+        void toggleWakeWord()
+        return
+      }
+
       navigate(NEW_CHAT_ROUTE)
       requestComposerFocus('main')
     }
 
     void consumePendingMobileQuickAction().then(action => {
-      if (!disposed && action === 'newTask') handleAction()
+      if (!disposed && action) handleAction(action)
     })
     void listenForMobileQuickActions(action => {
-      if (!disposed && action === 'newTask') handleAction()
+      if (!disposed) handleAction(action)
     }).then(stop => {
       if (disposed) stop()
       else stopListening = stop

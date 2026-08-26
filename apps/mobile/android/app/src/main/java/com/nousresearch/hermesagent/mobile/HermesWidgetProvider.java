@@ -14,6 +14,7 @@ import android.widget.RemoteViews;
  */
 public class HermesWidgetProvider extends AppWidgetProvider {
     public static final String ACTION_NEW_TASK = "com.nousresearch.hermesagent.mobile.NEW_TASK";
+    public static final String ACTION_WAKE_TOGGLE = "com.nousresearch.hermesagent.mobile.WAKE_TOGGLE";
 
     @Override
     public void onUpdate(Context context, AppWidgetManager manager, int[] appWidgetIds) {
@@ -21,6 +22,7 @@ public class HermesWidgetProvider extends AppWidgetProvider {
             RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.hermes_widget);
             views.setOnClickPendingIntent(R.id.hermes_widget_open, activityIntent(context, Intent.ACTION_MAIN, 100));
             views.setOnClickPendingIntent(R.id.hermes_widget_new_task, activityIntent(context, ACTION_NEW_TASK, 101));
+            views.setOnClickPendingIntent(R.id.hermes_widget_wake, activityIntent(context, ACTION_WAKE_TOGGLE, 102));
             manager.updateAppWidget(widgetId, views);
         }
     }

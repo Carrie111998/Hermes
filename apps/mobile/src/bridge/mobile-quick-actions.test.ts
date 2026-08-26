@@ -18,6 +18,9 @@ describe('mobile quick actions', () => {
     plugin.getPending.mockResolvedValue({ action: 'newTask' })
     await expect(consumePendingMobileQuickAction()).resolves.toBe('newTask')
 
+    plugin.getPending.mockResolvedValue({ action: 'wakeToggle' })
+    await expect(consumePendingMobileQuickAction()).resolves.toBe('wakeToggle')
+
     plugin.getPending.mockResolvedValue({ action: 'sendSilently' })
     await expect(consumePendingMobileQuickAction()).resolves.toBeNull()
   })

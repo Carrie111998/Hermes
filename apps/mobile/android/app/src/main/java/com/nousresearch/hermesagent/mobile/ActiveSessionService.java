@@ -144,6 +144,9 @@ public class ActiveSessionService extends Service {
         Intent newTask = new Intent(this, MainActivity.class)
                 .setAction(HermesWidgetProvider.ACTION_NEW_TASK)
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        Intent wakeToggle = new Intent(this, MainActivity.class)
+                .setAction(HermesWidgetProvider.ACTION_WAKE_TOGGLE)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
         return builder
                 .setSmallIcon(R.mipmap.ic_launcher)
@@ -151,6 +154,7 @@ public class ActiveSessionService extends Service {
                 .setContentText("Keeping your remote session ready")
                 .setContentIntent(PendingIntent.getActivity(this, 4101, open, flags))
                 .addAction(android.R.drawable.ic_input_add, "New task", PendingIntent.getActivity(this, 4102, newTask, flags))
+                .addAction(android.R.drawable.ic_btn_speak_now, "Wake", PendingIntent.getActivity(this, 4103, wakeToggle, flags))
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .setOngoing(true)
                 .setShowWhen(false)
