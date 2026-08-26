@@ -70,8 +70,12 @@ function mintOwnershipChallenge() {
   return crypto.randomBytes(32).toString('hex')
 }
 
-function ownershipChallengePayload(challenge, spawnNonce, pid, protocolVersion) {
+function ownershipProofMessage(challenge, spawnNonce, pid, protocolVersion) {
   return `${challenge}:${spawnNonce}:${pid}:${protocolVersion}`
+}
+
+function ownershipProofKey(token) {
+  return crypto.createHmac('sha256', token).update('hermes-ssh-ownership-v2').digest()
 }
 
 function verifyOwnershipChallengeProof(proof, token, challenge, spawnNonce, pid) {
@@ -86,8 +90,8 @@ function verifyOwnershipChallengeProof(proof, token, challenge, spawnNonce, pid)
   }
 
   const expected = crypto
-    .createHmac('sha256', token)
-    .update(ownershipChallengePayload(challenge, spawnNonce, pid, PROTOCOL_VERSION))
+    .createHmac('sha256', ownershipProofKey(token))
+    .update(ownershipProofMessage(challenge, spawnNonce, pid, PROTOCOL_VERSION))
     .digest()
 
   const received = Buffer.from(proof.proof, 'hex')

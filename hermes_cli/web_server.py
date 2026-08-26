@@ -546,6 +546,7 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_RUNTIME_PURELIB: Optional[Tuple[str, int, int]] = None
 _SSH_RUNTIME_MARKER: Optional[str] = None
+_SSH_OWNERSHIP_PROOF_LABEL = b"hermes-ssh-ownership-v2"
 
 
 def _apply_ssh_session_token(token: str) -> None:
@@ -554,8 +555,18 @@ def _apply_ssh_session_token(token: str) -> None:
         _SESSION_TOKEN = token
 
 
+def _remove_ssh_runtime_marker() -> None:
+    if _SSH_RUNTIME_MARKER is None:
+        return
+    try:
+        os.unlink(_SSH_RUNTIME_MARKER)
+    except OSError:
+        pass
+
+
 def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
     global _SSH_OWNER_NONCE, _SSH_RUNTIME_PURELIB, _SSH_RUNTIME_MARKER
+    _remove_ssh_runtime_marker()
     _SSH_OWNER_NONCE = nonce
     _SSH_RUNTIME_PURELIB = None
     _SSH_RUNTIME_MARKER = None
@@ -593,6 +604,9 @@ def _ssh_runtime_intact() -> bool:
     except OSError:
         return False
     return (st.st_dev, st.st_ino) == (device, inode)
+
+
+atexit.register(_remove_ssh_runtime_marker)
 
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the
@@ -987,7 +1001,9 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     is_mcp_oauth_callback = path.startswith("/api/mcp/oauth/callback/")
     is_ssh_ownership_challenge = (
-        path == "/api/ssh/ownership" and "challenge" in request.query_params
+        _SSH_OWNER_NONCE is not None
+        and path == "/api/ssh/ownership"
+        and "challenge" in request.query_params
     )
     if (
         path.startswith("/api/")
@@ -3635,9 +3651,10 @@ async def get_ssh_ownership(request: Request):
     proof = None
     if challenge is not None:
         canonical = f"{challenge}:{_SSH_OWNER_NONCE}:{pid}:{protocol_version}"
-        proof = hmac.new(
-            _SESSION_TOKEN.encode(), canonical.encode(), hashlib.sha256
-        ).hexdigest()
+        proof_key = hmac.new(
+            _SESSION_TOKEN.encode(), _SSH_OWNERSHIP_PROOF_LABEL, hashlib.sha256
+        ).digest()
+        proof = hmac.new(proof_key, canonical.encode(), hashlib.sha256).hexdigest()
 
     response = {
         "ok": True,

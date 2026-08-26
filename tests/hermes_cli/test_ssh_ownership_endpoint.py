@@ -25,8 +25,11 @@ def test_ssh_ownership_valid_challenge_returns_verifiable_protocol_2_proof(monke
     assert payload["protocolVersion"] == 2
     assert payload["pid"] == os.getpid()
     canonical = f"{challenge}:{nonce}:{os.getpid()}:2".encode()
+    proof_key = hmac.new(
+        token.encode(), b"hermes-ssh-ownership-v2", hashlib.sha256
+    ).digest()
     assert hmac.compare_digest(
-        payload["proof"], hmac.new(token.encode(), canonical, hashlib.sha256).hexdigest()
+        payload["proof"], hmac.new(proof_key, canonical, hashlib.sha256).hexdigest()
     )
 
 
@@ -65,6 +68,16 @@ def test_ssh_ownership_endpoint_rejects_malformed_unauthenticated_challenge(
     response = client.get("/api/ssh/ownership", params={"challenge": challenge})
 
     assert response.status_code == 400
+
+
+def test_ssh_ownership_challenge_requires_an_active_ssh_owner(monkeypatch):
+    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", None)
+    web_server.app.state.auth_required = False
+    client = TestClient(web_server.app)
+
+    response = client.get("/api/ssh/ownership", params={"challenge": "a" * 64})
+
+    assert response.status_code == 401
 
 
 def test_ssh_ownership_reports_replaced_runtime(tmp_path, monkeypatch):
@@ -143,11 +156,15 @@ def test_ssh_runtime_marker_survives_in_place_installs(tmp_path, monkeypatch):
     )
 
     web_server._apply_ssh_owner_nonce("0123456789abcdef")
+    marker = web_server._SSH_RUNTIME_MARKER
     try:
+        assert marker is not None
+        assert os.path.isfile(marker)
         (purelib / "newpkg").mkdir()  # a package landing in the live venv
         assert web_server._ssh_runtime_intact() is True
     finally:
         web_server._apply_ssh_owner_nonce(None)
+    assert not os.path.exists(marker)
 
 
 def test_ssh_runtime_readonly_purelib_falls_back_to_stat(tmp_path, monkeypatch):
@@ -169,6 +186,8 @@ def test_ssh_runtime_readonly_purelib_falls_back_to_stat(tmp_path, monkeypatch):
     # (daemon threads crash in their excepthooks → nondeterministic teardown
     # errors file-wide, the Aug 2026 CI flake). chmod is thread-safe and
     # exercises the genuine OSError path.
+    if os.name != "posix":  # pragma: no cover - Windows mode bits differ
+        pytest.skip("POSIX directory mode bits are required")
     if os.geteuid() == 0:  # pragma: no cover - root ignores mode bits
         pytest.skip("directory write bits are not enforced for root")
     purelib.chmod(0o555)
