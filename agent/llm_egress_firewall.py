@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import stat
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from hmac import compare_digest
@@ -110,6 +111,9 @@ class EgressDecision:
     request_id: str
     policy_digest: str
     reason_codes: tuple[str, ...] = ()
+    base_url: str = ""
+    api_mode: str = ""
+    grant_digests: tuple[str, ...] = ()
 
 
 class EgressBlocked(RuntimeError):
@@ -119,6 +123,14 @@ class EgressBlocked(RuntimeError):
         self.decision = decision
         reasons = ",".join(decision.reason_codes) or "policy_denied"
         super().__init__(f"LLM egress blocked: {reasons}")
+
+
+class SanitizedTextRejected(ValueError):
+    """Raised when remote text cannot earn the sanitized segment type."""
+
+    def __init__(self, reason_code: str):
+        self.reason_code = reason_code
+        super().__init__(f"sanitized remote text rejected: {reason_code}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,12 +175,36 @@ _BASE64_CANDIDATE = re.compile(
     r"(?<![A-Za-z0-9_+/\-])([A-Za-z0-9_+/\-]{4,}={0,2})(?![A-Za-z0-9_+/=\-])"
 )
 _MAX_BASE64_CANDIDATE_CHARS = 262_144
+_PRIVATE_ABSOLUTE_PATH = re.compile(
+    r"(?:^|[\s\"'`(])(?:"
+    r"/(?:Users|home|private|var/folders|root|Volumes)/[^\s\"'`)]+"
+    r"|~(?:/|\\)[^\s\"'`)]+"
+    r"|[A-Za-z]:\\+(?:Users|Documents and Settings)\\+[^\s\"'`)]+"
+    r")",
+    re.IGNORECASE,
+)
 # These are fixed provider-protocol grammar atoms, not a caller-configurable
 # egress allowlist. Several happen to round-trip as unpadded Base64 even though
 # they are required JSON schema words. They still go through the final secret
 # scan; this set only resolves the mathematical ambiguity in Base64 detection.
 _PROTOCOL_GRAMMAR_ATOMS = frozenset(
-    {"messages", "role", "content", "user", "assistant", "system", "tool"}
+    {
+        "assistant",
+        "computer_call_output",
+        "content",
+        "developer",
+        "function_call",
+        "function_call_output",
+        "input_image",
+        "input_text",
+        "messages",
+        "output_text",
+        "reasoning",
+        "role",
+        "system",
+        "tool",
+        "user",
+    }
 )
 
 
@@ -279,6 +315,25 @@ def _canonical_base64_candidate(candidate: str) -> bool:
         return False
     if not 4 <= len(candidate) <= _MAX_BASE64_CANDIDATE_CHARS:
         return False
+    # Short alphabetic words frequently round-trip mathematically as
+    # unpadded Base64 (for example "ordinary" and "review"). Require an
+    # encoding signal for short candidates; long all-alpha blobs remain
+    # suspicious even without padding.
+    if len(candidate) < 24 and not any(
+        character.isdigit() or character in "=+/-_" for character in candidate
+    ) and not candidate.isupper():
+        return False
+    # Short, word-like URL-safe slugs are common model/provider identifiers.
+    # Keep genuinely encoding-shaped values such as ``-_8A`` eligible for the
+    # canonical decoder below.
+    if (
+        len(candidate) < 16
+        and any(character in "-_" for character in candidate)
+        and candidate[0].isalnum()
+        and candidate[-1].isalnum()
+        and sum(character.isalpha() for character in candidate) >= 2
+    ):
+        return False
     unpadded = candidate.rstrip("=")
     if "=" in unpadded or len(unpadded) % 4 == 1:
         return False
@@ -301,7 +356,29 @@ def _canonical_base64_candidate(candidate: str) -> bool:
 
 def _contains_canonical_base64(value: Any, *, seen: set[int] | None = None) -> bool:
     if isinstance(value, str):
-        return any(_canonical_base64_candidate(match.group(1)) for match in _BASE64_CANDIDATE.finditer(value))
+        # Fixed Hermes/Nous attribution tags are protocol metadata, not an
+        # encoded source payload. They remain subject to secret/path scans.
+        if value.startswith(("product=hermes-agent", "client=hermes-client-")):
+            return False
+        for match in _BASE64_CANDIDATE.finditer(value):
+            candidate = match.group(1)
+            prefix = value[max(0, match.start() - 16) : match.start()].lower()
+            if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate.lower()):
+                continue
+            if _canonical_base64_candidate(candidate):
+                return True
+        # Providers and source-control tools sometimes wrap an otherwise
+        # canonical encoding at a fixed column. Normalize only bounded chunks
+        # so ordinary prose words are not concatenated into a false candidate.
+        chunked = re.compile(
+            r"(?<![A-Za-z0-9_+/=-])(?:[A-Za-z0-9_+/=-]{2,4}\s+){2,}"
+            r"[A-Za-z0-9_+/=-]{2,4}(?![A-Za-z0-9_+/=-])"
+        )
+        for match in chunked.finditer(value):
+            candidate = re.sub(r"\s+", "", match.group(0))
+            if _canonical_base64_candidate(candidate):
+                return True
+        return False
     if isinstance(value, (bytes, bytearray, memoryview)):
         return True
     if seen is None:
@@ -355,6 +432,167 @@ def _contains_secret(value: Any, *, seen: set[int] | None = None) -> bool:
     return False
 
 
+def _contains_private_absolute_path(value: Any, *, seen: set[int] | None = None) -> bool:
+    """Reject common host-private absolute paths without blocking API paths."""
+
+    if isinstance(value, str):
+        return _PRIVATE_ABSOLUTE_PATH.search(value) is not None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return True
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return True
+        seen.add(identity)
+        return any(
+            _contains_private_absolute_path(key, seen=seen)
+            or _contains_private_absolute_path(item, seen=seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        identity = id(value)
+        if identity in seen:
+            return True
+        seen.add(identity)
+        return any(_contains_private_absolute_path(item, seen=seen) for item in value)
+    return False
+
+
+def _contains_grant_substring(grant_content: bytes, candidate: bytes) -> bool:
+    """Reject source-derived proper substrings in sanitized text.
+
+    Newline-trimmed line grants commonly appear in JSON without their source
+    line ending. A fixed eight-byte window detects meaningful excerpts in
+    linear time and avoids quadratic work on large source slices.
+    """
+
+    if not grant_content or not candidate:
+        return False
+    grant_variants = (grant_content, grant_content.rstrip(b"\r\n"))
+    for variant in grant_variants:
+        if not variant:
+            continue
+        if variant in candidate:
+            return True
+        if len(candidate) < len(variant) and candidate in variant and len(candidate) >= 4:
+            return True
+        window = min(8, len(candidate), len(variant))
+        if window >= 4:
+            source_windows = {
+                variant[offset : offset + window]
+                for offset in range(0, len(variant) - window + 1)
+            }
+            if any(
+                candidate[offset : offset + window] in source_windows
+                for offset in range(0, len(candidate) - window + 1)
+            ):
+                return True
+    return False
+
+
+def validate_sanitized_text(text: str, *, max_bytes: int = 32_768) -> str:
+    """Return unchanged bounded remote-safe text or reject it fail-closed.
+
+    This is the only constructor-side admission path for SanitizedSegment.
+    The firewall repeats the same scans on the final rendered payload.
+    """
+
+    if not isinstance(text, str):
+        raise SanitizedTextRejected("invalid_sanitized_text")
+    if max_bytes <= 0 or len(text.encode("utf-8")) > max_bytes:
+        raise SanitizedTextRejected("sanitized_bytes_exceeded")
+    try:
+        if _contains_secret(text):
+            raise SanitizedTextRejected("secret_detected")
+    except SanitizedTextRejected:
+        raise
+    except Exception as exc:
+        raise SanitizedTextRejected("redaction_failed") from exc
+    try:
+        if _contains_canonical_base64(text):
+            raise SanitizedTextRejected("base64_payload")
+    except SanitizedTextRejected:
+        raise
+    except Exception as exc:
+        raise SanitizedTextRejected("base64_scan_failed") from exc
+    try:
+        if _contains_private_absolute_path(text):
+            raise SanitizedTextRejected("private_absolute_path")
+    except SanitizedTextRejected:
+        raise
+    except Exception as exc:
+        raise SanitizedTextRejected("private_path_scan_failed") from exc
+    return text
+
+
+def _is_strict_sanitized_only_payload(
+    value: Any,
+    *,
+    seen: set[int] | None = None,
+) -> tuple[bool, int]:
+    """Recognize the one grantless remote shape approved by policy.
+
+    Every text leaf must be an explicit :class:`SanitizedSegment`. Raw text,
+    static literals, source references, binary values, cycles, and unsupported
+    containers make the entire payload ineligible. The positive count prevents
+    an empty structural request from acquiring grantless status.
+    """
+
+    if isinstance(value, SanitizedSegment):
+        return isinstance(value.text, str), 1 if isinstance(value.text, str) else 0
+    if isinstance(value, LiteralSegment):
+        return isinstance(value.text, str), 0
+    if isinstance(value, SourceBoundSegment):
+        return False, 0
+    if isinstance(value, OutboundText):
+        if not value.segments:
+            return False, 0
+        count = 0
+        for segment in value.segments:
+            allowed, segment_count = _is_strict_sanitized_only_payload(segment, seen=seen)
+            if not allowed:
+                return False, 0
+            count += segment_count
+        return count > 0, count
+    if value is None or isinstance(value, (bool, int)):
+        return True, 0
+    if isinstance(value, float):
+        return math.isfinite(value), 0
+    if isinstance(value, (str, bytes, bytearray, memoryview, set, frozenset)):
+        return False, 0
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return False, 0
+        seen.add(identity)
+        count = 0
+        for key, item in value.items():
+            if not isinstance(key, str):
+                return False, 0
+            allowed, item_count = _is_strict_sanitized_only_payload(item, seen=seen)
+            if not allowed:
+                return False, 0
+            count += item_count
+        return True, count
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in seen:
+            return False, 0
+        seen.add(identity)
+        count = 0
+        for item in value:
+            allowed, item_count = _is_strict_sanitized_only_payload(item, seen=seen)
+            if not allowed:
+                return False, 0
+            count += item_count
+        return True, count
+    return False, 0
+
+
 class LLMEgressFirewall:
     """Validate a final LLM request and record a content-free receipt."""
 
@@ -363,6 +601,7 @@ class LLMEgressFirewall:
         state_dir: Path | str,
         *,
         max_serialized_bytes: int = 262_144,
+        max_sanitized_bytes: int = 32_768,
         max_conservative_tokens: int = 87_382,
         conservative_chars_per_token: int = 3,
         policy_digest: str | None = None,
@@ -370,6 +609,8 @@ class LLMEgressFirewall:
     ) -> None:
         if max_serialized_bytes <= 0:
             raise ValueError("max_serialized_bytes must be positive")
+        if max_sanitized_bytes <= 0:
+            raise ValueError("max_sanitized_bytes must be positive")
         if max_conservative_tokens <= 0:
             raise ValueError("max_conservative_tokens must be positive")
         if conservative_chars_per_token <= 0:
@@ -377,6 +618,7 @@ class LLMEgressFirewall:
         self._state_dir = Path(state_dir)
         self._receipt_path = self._state_dir / "llm-egress-receipts.jsonl"
         self._max_serialized_bytes = max_serialized_bytes
+        self._max_sanitized_bytes = max_sanitized_bytes
         self._max_conservative_tokens = max_conservative_tokens
         self._conservative_chars_per_token = conservative_chars_per_token
         self._policy_digest = str(policy_digest or "")
@@ -422,6 +664,8 @@ class LLMEgressFirewall:
             _route_value(route, "base_url"),
             _route_value(route, "api_mode"),
         )
+        base_url = str(_route_value(route, "base_url") or "")
+        api_mode = str(_route_value(route, "api_mode") or "")
         typed_request = request if isinstance(request, TypedOutboundRequest) else None
         if typed_request is not None:
             session_id = typed_request.session_id
@@ -438,26 +682,45 @@ class LLMEgressFirewall:
         valid_grants: list[SourceGrant] = []
         grant_contents: dict[str, tuple[SourceGrant, bytes]] = {}
         source_segment_count = 0
+        sanitized_only = False
+        if typed_request is not None:
+            sanitized_shape, sanitized_count = _is_strict_sanitized_only_payload(
+                typed_request.payload
+            )
+            sanitized_only = sanitized_shape and sanitized_count > 0
 
         if destination == DestinationClass.UNKNOWN:
             reasons.append("unknown_destination")
+        if destination in {DestinationClass.REMOTE, DestinationClass.UNKNOWN} and not all(
+            (session_id, turn_id, request_id, policy_digest)
+        ):
+            reasons.append("missing_request_identity")
         if self._policy_digest and policy_digest != self._policy_digest:
             reasons.append("policy_digest_mismatch")
         if destination in {DestinationClass.REMOTE, DestinationClass.UNKNOWN}:
             if typed_request is None:
                 reasons.append("typed_request_required")
-            grant_reasons, valid_grants, grant_contents = self._validate_grants(
-                grants,
-                session_id=session_id,
-                turn_id=turn_id,
-                request_id=request_id,
-                policy_digest=policy_digest,
-            )
-            reasons.extend(grant_reasons)
+            # The sole grantless remote lane is a structurally verified request
+            # whose every text leaf is an explicit bounded SanitizedSegment.
+            # Passing even one purported grant opts back into exact source
+            # validation so malformed or unbound authority cannot be ignored.
+            if grants or not sanitized_only:
+                grant_reasons, valid_grants, grant_contents = self._validate_grants(
+                    grants,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    policy_digest=policy_digest,
+                )
+                reasons.extend(grant_reasons)
 
         if typed_request is not None:
             logical_request, construction_reasons, source_segment_count, scan_values = (
-                self._construct_typed_request(typed_request, grant_contents)
+                self._construct_typed_request(
+                    typed_request,
+                    grant_contents,
+                    allow_sanitized_segments=True,
+                )
             )
             reasons.extend(construction_reasons)
         else:
@@ -488,6 +751,9 @@ class LLMEgressFirewall:
                 request_id=request_id,
                 policy_digest=policy_digest,
                 reason_codes=("serialization_failed",),
+                base_url=base_url,
+                api_mode=api_mode,
+                grant_digests=tuple(source_grant_digest(grant) for grant in valid_grants),
             )
             self._block(decision, valid_grants)
 
@@ -511,6 +777,11 @@ class LLMEgressFirewall:
                     reasons.append("base64_payload")
             except Exception:
                 reasons.append("base64_scan_failed")
+            try:
+                if _contains_private_absolute_path(scan_values):
+                    reasons.append("private_absolute_path")
+            except Exception:
+                reasons.append("private_path_scan_failed")
 
         decision = EgressDecision(
             allowed=not reasons,
@@ -527,6 +798,9 @@ class LLMEgressFirewall:
             request_id=request_id,
             policy_digest=policy_digest,
             reason_codes=tuple(dict.fromkeys(reasons)),
+            base_url=base_url,
+            api_mode=api_mode,
+            grant_digests=tuple(source_grant_digest(grant) for grant in valid_grants),
         )
         if not decision.allowed:
             self._block(decision, valid_grants)
@@ -619,12 +893,15 @@ class LLMEgressFirewall:
         self,
         request: TypedOutboundRequest,
         grant_contents: Mapping[str, tuple[SourceGrant, bytes]],
+        *,
+        allow_sanitized_segments: bool = False,
     ) -> tuple[Mapping[str, Any], list[str], int, list[str]]:
         """Build a plain JSON request exclusively from typed segment nodes."""
 
         reasons: list[str] = []
         referenced_grants: set[str] = set()
         source_segment_count = 0
+        sanitized_bytes = 0
         scan_values: list[str] = []
         allowed_static_hashes = self._static_literal_hashes_by_policy.get(
             request.policy_digest,
@@ -643,7 +920,7 @@ class LLMEgressFirewall:
         def render_text_segment(
             segment: LiteralSegment | SanitizedSegment | SourceBoundSegment,
         ) -> str:
-            nonlocal source_segment_count
+            nonlocal sanitized_bytes, source_segment_count
             if isinstance(segment, LiteralSegment):
                 if not isinstance(segment.text, str):
                     reasons.append("invalid_literal_segment")
@@ -654,8 +931,18 @@ class LLMEgressFirewall:
                     reasons.append("source_bytes_in_literal")
                 return segment.text
             if isinstance(segment, SanitizedSegment):
-                reasons.append("sanitized_segment_forbidden")
+                if not allow_sanitized_segments:
+                    reasons.append("sanitized_segment_forbidden")
                 if isinstance(segment.text, str):
+                    encoded = segment.text.encode("utf-8")
+                    sanitized_bytes += len(encoded)
+                    if sanitized_bytes > self._max_sanitized_bytes:
+                        reasons.append("sanitized_bytes_exceeded")
+                    if any(
+                        _contains_grant_substring(content, encoded)
+                        for _, content in grant_contents.values()
+                    ):
+                        reasons.append("source_bytes_in_sanitized_segment")
                     scan_values.append(segment.text)
                     return segment.text
                 reasons.append("invalid_literal_segment")
@@ -745,6 +1032,11 @@ class LLMEgressFirewall:
         decision: EgressDecision,
         grants: Sequence[SourceGrant],
     ) -> None:
+        try:
+            if self._state_dir.is_symlink():
+                raise OSError("egress state directory must not be a symlink")
+        except OSError:
+            raise
         self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         receipt = asdict(decision)
         receipt["destination_class"] = decision.destination_class.value
@@ -752,6 +1044,8 @@ class LLMEgressFirewall:
         for field in (
             "provider",
             "model",
+            "base_url",
+            "api_mode",
             "session_id",
             "turn_id",
             "request_id",
@@ -767,16 +1061,34 @@ class LLMEgressFirewall:
             }
             for grant in grants
         ]
-        encoded = (
-            json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode("utf-8")
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(self._receipt_path, flags, 0o600)
         try:
             os.fchmod(fd, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
+            file_size = os.fstat(fd).st_size
+            previous_hash = ""
+            if file_size:
+                read_start = max(0, file_size - 131_072)
+                os.lseek(fd, read_start, os.SEEK_SET)
+                prior_chunk = os.read(fd, file_size - read_start)
+                prior_lines = prior_chunk.splitlines()
+                if prior_lines:
+                    previous_hash = sha256(prior_lines[-1]).hexdigest()
+            receipt["receipt_prev_sha256"] = previous_hash
+            receipt_material = json.dumps(
+                receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+            receipt["receipt_sha256"] = sha256(
+                previous_hash.encode("ascii") + receipt_material
+            ).hexdigest()
+            encoded = (
+                json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            os.lseek(fd, 0, os.SEEK_END)
             if os.write(fd, encoded) != len(encoded):
                 raise OSError("short receipt write")
         finally:

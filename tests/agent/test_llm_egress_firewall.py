@@ -91,6 +91,16 @@ def _typed_request(request, *, source_grant: SourceGrant | None = None):
     )
 
 
+def _sanitized_request(text: str) -> TypedOutboundRequest:
+    return TypedOutboundRequest(
+        payload={"messages": [{"role": LiteralSegment("user"), "content": SanitizedSegment(text)}]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+
+
 _COMMON_STATIC_LITERALS = {
     "messages",
     "role",
@@ -273,9 +283,96 @@ def test_only_exact_policy_allowlisted_static_wrappers_accompany_source(tmp_path
             LiteralSegment("</source>"),
         )
     )
-    with pytest.raises(EgressBlocked) as sanitized_exc:
-        gate.preflight(typed_request, _route(), grants=(grant,))
-    assert "sanitized_segment_forbidden" in sanitized_exc.value.decision.reason_codes
+    sanitized = gate.authorize(typed_request, _route(), grants=(grant,))
+    assert json.loads(sanitized.payload_bytes)["messages"][0]["content"] == (
+        "<source>\nx=1\n</source>"
+    )
+
+
+def test_bounded_sanitized_remote_text_needs_no_source_grant(tmp_path):
+    request = TypedOutboundRequest(
+        payload={"messages": [{"role": SanitizedSegment("user"), "content": SanitizedSegment("Fix CI now.")}]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    authorization = firewall(tmp_path).authorize(request, _route(), grants=())
+    assert json.loads(authorization.payload_bytes) == {
+        "messages": [{"content": "Fix CI now.", "role": "user"}]
+    }
+    assert authorization.decision.source_grant_count == 0
+
+
+def test_remote_sanitized_request_requires_complete_request_identity(tmp_path):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment("Fix CI now.")]},
+        session_id="session-1",
+        turn_id="",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).authorize(request, _route(), grants=())
+
+    assert "missing_request_identity" in exc_info.value.decision.reason_codes
+
+
+def test_sanitized_remote_text_has_an_independent_exact_byte_cap(tmp_path):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment("CI fix!!")]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    assert firewall(tmp_path, max_sanitized_bytes=8).preflight(request, _route()).allowed
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path, max_sanitized_bytes=7).preflight(request, _route())
+    assert "sanitized_bytes_exceeded" in exc_info.value.decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("token=super-secret-value", "secret_detected"),
+        (base64.b64encode(b"encoded private detail").decode("ascii"), "base64_payload"),
+        ("Read /Users/private/repository/file.py", "private_absolute_path"),
+        (r"Read C:\\Users\\private\\secrets.txt", "private_absolute_path"),
+    ],
+)
+def test_sanitized_remote_text_denies_secrets_encoding_and_private_paths(
+    tmp_path,
+    text,
+    reason,
+):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment(text)]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).preflight(request, _route())
+    assert reason in exc_info.value.decision.reason_codes
+
+
+def test_source_bytes_cannot_be_relabelled_as_sanitized_text(tmp_path):
+    path = tmp_path / "private.py"
+    path.write_text("private source\n", encoding="utf-8")
+    grant = _source_grant(path)
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment("private source\n")]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).preflight(request, _route(), grants=(grant,))
+    assert "source_bytes_in_sanitized_segment" in exc_info.value.decision.reason_codes
 
 
 def test_firewall_binds_requests_to_its_configured_policy_digest(tmp_path):
@@ -489,12 +586,70 @@ def test_canonical_base64_payloads_are_rejected_even_when_decoded_content_is_ben
     assert "base64_payload" in exc_info.value.decision.reason_codes
 
 
+def test_base64_payload_split_by_whitespace_is_still_rejected(tmp_path):
+    encoded = base64.b64encode(b"private source that must not leave the host").decode("ascii")
+    split = " ".join(encoded[index : index + 2] for index in range(0, len(encoded), 2))
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).preflight(_sanitized_request(split), _route())
+    assert "base64_payload" in exc_info.value.decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "commit 0123456789abcdef0123456789abcdef01234567 is already reviewed",
+        "The prose mentions commit 0123456789abcdef0123456789abcdef01234567 here.",
+    ],
+)
+def test_sha_and_commit_references_in_prose_are_not_base64_false_positives(tmp_path, text):
+    decision = firewall(tmp_path).preflight(_sanitized_request(text), _route())
+    assert "base64_payload" not in decision.reason_codes
+
+
+def test_sanitized_proper_substring_of_grant_text_is_rejected(tmp_path):
+    path = tmp_path / "source.txt"
+    path.write_text("private source\n", encoding="utf-8")
+    grant = _source_grant(path)
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment("private source")]},
+        session_id=grant.session_id,
+        turn_id=grant.turn_id,
+        request_id=grant.request_id,
+        policy_digest=grant.policy_digest,
+    )
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).preflight(request, _route(), grants=(grant,))
+    assert "source_bytes_in_sanitized_segment" in exc_info.value.decision.reason_codes
+
+
+def test_symlink_state_directory_is_rejected(tmp_path):
+    target = tmp_path / "receipts-target"
+    target.mkdir()
+    state = tmp_path / "egress"
+    state.symlink_to(target, target_is_directory=True)
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(state).preflight(_sanitized_request("safe request"), _route())
+    assert "receipt_unavailable" in exc_info.value.decision.reason_codes
+
+
 def test_ordinary_short_base64_alphabet_words_are_not_false_positives(tmp_path):
     decision = firewall(tmp_path).preflight(
         _request("ordinary short words remain usable"),
         _route(base_url="http://127.0.0.1:11434"),
     )
     assert "base64_payload" not in decision.reason_codes
+
+
+def test_short_alphabetic_words_are_allowed_in_sanitized_remote_text(tmp_path):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment("ordinary review carefully")]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    assert firewall(tmp_path).preflight(request, _route()).allowed
 
 
 def test_scanner_error_fails_closed(monkeypatch, tmp_path):
@@ -600,6 +755,20 @@ def test_receipt_hashes_unsafe_identity_and_route_labels(tmp_path):
     assert str(Path.home()) not in receipt_text
 
 
+def test_receipt_redacts_route_credentials_and_binds_route_metadata(tmp_path):
+    route = _route(
+        base_url="https://user:password@example.test/v1?api_key=route-secret",
+        api_mode="chat_completions",
+    )
+    firewall(tmp_path).preflight(_sanitized_request("safe request"), route)
+    receipt_text = (tmp_path / "llm-egress-receipts.jsonl").read_text()
+    assert "password" not in receipt_text
+    assert "route-secret" not in receipt_text
+    receipt = json.loads(receipt_text.splitlines()[0])
+    assert receipt["api_mode"] == "chat_completions"
+    assert receipt["base_url"].startswith("sha256:")
+
+
 def test_receipt_is_owner_only_and_rejects_symlink_ledger(tmp_path):
     path = tmp_path / "private.py"
     path.write_text("x=1\n", encoding="utf-8")
@@ -644,6 +813,19 @@ def test_concurrent_receipt_appends_remain_complete_json_lines(tmp_path):
     assert {receipt["request_id"] for receipt in receipts} == {
         f"req-{index}" for index in range(32)
     }
+
+
+def test_receipts_form_a_content_free_hash_chain(tmp_path):
+    gate = firewall(tmp_path)
+    gate.preflight(_sanitized_request("first"), _route())
+    gate.preflight(_sanitized_request("second"), _route())
+    lines = (tmp_path / "llm-egress-receipts.jsonl").read_bytes().splitlines()
+    first = json.loads(lines[0])
+    second = json.loads(lines[1])
+    assert first["receipt_prev_sha256"] == ""
+    assert second["receipt_prev_sha256"] == sha256(lines[0]).hexdigest()
+    assert first["receipt_sha256"]
+    assert second["receipt_sha256"]
 
 
 def test_unknown_destination_fails_closed_even_with_source_grant(tmp_path):
