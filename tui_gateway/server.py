@@ -1987,6 +1987,13 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _detached_profile_cwd(profile_home: Path | None) -> str:
+    """Neutral execution cwd for a session with no workspace ownership."""
+    home = Path(profile_home) if profile_home is not None else get_hermes_home()
+    workspace = home / "workspace"
+    return str(workspace if workspace.is_dir() else home)
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -2008,6 +2015,16 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
+        # Isolated child metadata must cross the process boundary in its turn
+        # or control frame so the serving parent can validate topology first.
+        if (
+            isinstance(params, dict)
+            and params.get("type") == "session.info"
+            and (_sessions.get(sid) or {}).get(
+                "_defer_compute_host_session_info"
+            )
+        ):
+            return True
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
             from tui_gateway.event_replay import _stamp_event
 
@@ -2135,6 +2152,11 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
+        cwd = _session_cwd(session)
+        cwd_owned = _session_owns_cwd(session)
+        explicit_cwd = bool(session.get("explicit_cwd"))
+        cwd_from_settle = bool(session.get("cwd_from_settle"))
+        workspace_topology_generation = _workspace_topology_generation(session)
     return {
         "type": "turn.start",
         "sid": sid,
@@ -2145,7 +2167,14 @@ def _compute_host_turn_frame(
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
-        "cwd": _session_cwd(session),
+        "cwd": cwd,
+        "cwd_owned": cwd_owned,
+        "explicit_cwd": explicit_cwd,
+        "cwd_from_settle": cwd_from_settle,
+        # Causal version of the parent topology this turn starts from. The host
+        # returns it as its snapshot base so completion can distinguish a
+        # genuine host-side settle from a parent move that happened meanwhile.
+        "workspace_topology_generation": workspace_topology_generation,
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
@@ -2161,15 +2190,21 @@ def _metadata_mirror(session: dict | None) -> dict:
     return mirror if isinstance(mirror, dict) else {}
 
 
-def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
+def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> bool:
     """Mirror host-owned session metadata in the serving process.
 
     The compute host is the only writer of live agent/history state while turn
     isolation is active. The serving process keeps read metadata from the last
     host frame so UI reads do not construct a second in-process agent.
+    Returns whether the frame passed the parent's workspace-generation gate.
     """
     if not isinstance(frame, dict):
-        return
+        return False
+    info = frame.get("session_info")
+    workspace_changed = False
+    workspace_accepted = False
+    persist_host_workspace = False
+    repair_parent_workspace = False
     with session.get("history_lock", threading.Lock()):
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
@@ -2186,16 +2221,102 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
                 session["_metadata_message_count"] = int(frame.get("message_count") or 0)
             except Exception:
                 pass
-    info = frame.get("session_info")
-    if isinstance(info, dict):
-        mirror = dict(_metadata_mirror(session))
-        mirror.update(info)
-        session["_metadata_mirror"] = mirror
-        session["_metadata_mirror_updated_at"] = time.time()
+        if isinstance(info, dict):
+            base_generation = frame.get("workspace_topology_base_generation")
+            host_generation = frame.get("workspace_topology_generation")
+            current_generation = _workspace_topology_generation(session)
+            generation_aware = (
+                isinstance(base_generation, int)
+                and not isinstance(base_generation, bool)
+                and base_generation >= 0
+            )
+            host_generation_aware = (
+                isinstance(host_generation, int)
+                and not isinstance(host_generation, bool)
+                and host_generation >= 0
+            )
+            current_generation_aware = (
+                isinstance(session.get("_workspace_topology_generation"), int)
+                and not isinstance(
+                    session.get("_workspace_topology_generation"), bool
+                )
+                and session.get("_workspace_topology_generation") >= 0
+            )
+            accept_workspace = (
+                host_generation_aware
+                and host_generation >= base_generation
+                and current_generation <= base_generation
+                if generation_aware
+                else not current_generation_aware
+            )
+            workspace_accepted = accept_workspace
+            if accept_workspace:
+                if isinstance(info.get("cwd"), str):
+                    session["cwd"] = info["cwd"]
+                    workspace_changed = True
+                for key in ("cwd_owned", "explicit_cwd", "cwd_from_settle"):
+                    if key in info:
+                        session[key] = bool(info.get(key))
+                        workspace_changed = True
+                if host_generation_aware:
+                    session["_workspace_topology_generation"] = max(
+                        current_generation, host_generation
+                    )
+                    persist_host_workspace = (
+                        generation_aware
+                        and host_generation > base_generation
+                        and _session_owns_cwd(session)
+                    )
+            elif frame.get("type") in {"turn.end", "turn.error"}:
+                # A stale child from the pre-authoritative persistence contract
+                # may already have written its settled cwd through another
+                # SQLite handle. Repair that row before the queued turn drains.
+                repair_parent_workspace = _session_owns_cwd(session)
+            mirror = dict(_metadata_mirror(session))
+            if accept_workspace:
+                mirror.update(info)
+            else:
+                # Callers may return the acknowledgement itself to Desktop.
+                # Remove rejected topology there as well as from the mirror so
+                # no response consumer can repaint the stale host workspace.
+                for key in {
+                    "cwd",
+                    "cwd_owned",
+                    "explicit_cwd",
+                    "cwd_from_settle",
+                    "branch",
+                    "project",
+                }:
+                    info.pop(key, None)
+                mirror.update(info)
+            session["_metadata_mirror"] = mirror
+            session["_metadata_mirror_updated_at"] = time.time()
+            authoritative_cwd = _persisted_session_cwd(session)
+            if (
+                persist_host_workspace or repair_parent_workspace
+            ) and authoritative_cwd:
+                # Workspace moves use this same lock around their SQLite write.
+                # Keeping acceptance/repair inside it makes the DB ordering
+                # match the in-memory generation ordering in both directions.
+                _persist_session_cwd_and_schedule_git_meta(
+                    session, authoritative_cwd
+                )
+    if workspace_changed:
+        _register_session_cwd(session)
+    return workspace_accepted
+
+
+def _apply_compute_host_control_metadata(sid: str, session: dict, frame: dict) -> None:
+    if _apply_compute_host_metadata_mirror(session, frame):
+        _emit("session.info", sid, _session_info(session.get("agent"), session))
 
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     is_error = frame.get("type") == "turn.error"
+    # Host metadata is authoritative for the completed turn. Merge it before
+    # publishing running=False so no concurrently accepted next turn can frame
+    # stale cwd ownership back into the host.
+    _apply_compute_host_metadata_mirror(session, frame)
     with session["history_lock"]:
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
@@ -2213,7 +2334,6 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
-    _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
     except TypeError:
@@ -2275,6 +2395,16 @@ def _send_compute_host_control(
     frame = dict(payload or {})
     frame.setdefault("type", "control")
     frame.setdefault("command", command)
+    session = _sessions.get(sid)
+    if session is not None and "workspace_topology_generation" not in frame:
+        history_lock = session.get("history_lock")
+        lock_context = (
+            history_lock if history_lock is not None else contextlib.nullcontext()
+        )
+        with lock_context:
+            frame["workspace_topology_generation"] = _workspace_topology_generation(
+                session
+            )
     return _get_compute_host_supervisor().control(
         sid,
         route_name=route_name,
@@ -2957,6 +3087,16 @@ def _normalize_completion_path(path_part: str) -> str:
 
 def _completion_cwd(params: dict | None = None) -> str:
     params = params or {}
+    # Desktop omits cwd when creating a session detached from a named Project.
+    # Detached is an ownership state, not permission to inherit whichever
+    # project path last reached terminal config / the gateway process. Resolve
+    # the session's neutral cwd on the authoritative backend profile instead.
+    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    if source in _LAUNCH_CWD_NOT_A_WORKSPACE and not str(
+        params.get("cwd") or ""
+    ).strip():
+        return _detached_profile_cwd(_profile_home(params.get("profile")))
+
     raw = (
         params.get("cwd")
         or _sessions.get(params.get("session_id") or "", {}).get("cwd")
@@ -3069,20 +3209,82 @@ def _session_cwd(session: dict | None) -> str:
 _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
 
 
+def _workspace_topology_generation(session: dict | None) -> int:
+    """Return this session's monotonic workspace mutation version."""
+    if session is None:
+        return 0
+    value = session.get("_workspace_topology_generation", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _bump_workspace_topology_generation_locked(session: dict) -> int:
+    """Claim the next workspace topology version while history_lock is held."""
+    generation = _workspace_topology_generation(session) + 1
+    session["_workspace_topology_generation"] = generation
+    return generation
+
+
+def _session_owns_cwd(session: dict | None) -> bool:
+    """Whether a session's runtime cwd is also durable workspace ownership.
+
+    Fresh sessions derive this from the native source + explicit-cwd contract.
+    Resumed sessions carry ``cwd_owned`` reconstructed from the stored row so
+    the current client surface cannot reinterpret legacy or detached topology.
+    """
+    if session is None:
+        return False
+    if "cwd_owned" in session:
+        return bool(session.get("cwd_owned"))
+    return bool(session.get("explicit_cwd")) or (
+        _session_source(session) not in _LAUNCH_CWD_NOT_A_WORKSPACE
+    )
+
+
 def _persisted_session_cwd(session: dict) -> str | None:
     """The cwd to stamp on the session's DB row, or None to leave it unset.
 
     See :func:`_ensure_session_db_row` for why the launch directory counts as a
     workspace for terminal sessions but not for the desktop.
     """
-    if session.get("explicit_cwd"):
-        return _session_cwd(session)
-    if _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE:
+    if not _session_owns_cwd(session):
         return None
     # Only the session's OWN directory. `_session_cwd` falls back to the
     # gateway-wide completion cwd, which belongs to no session in particular —
     # stamping that would invent a workspace for a session that never had one.
     return str(session.get("cwd") or "") or None
+
+
+def _reconstruct_session_cwd(
+    row: dict,
+    profile_home: Path | None,
+    *,
+    request_source: str | None = None,
+) -> tuple[str, bool, bool]:
+    """Rebuild runtime cwd, ownership, and explicitness from one stored row."""
+    stored_cwd = str(row.get("cwd") or "").strip()
+    stored_source = _resolve_session_source(
+        str(row.get("source") or "").strip()
+        or str(request_source or "").strip()
+        or None
+    )
+    stored_state = {
+        "cwd": stored_cwd,
+        "explicit_cwd": bool(stored_cwd),
+        "source": stored_source,
+    }
+    owned = _session_owns_cwd(stored_state)
+    if stored_cwd:
+        cwd = stored_cwd
+    elif owned:
+        cwd = _profile_configured_cwd(profile_home) or _default_session_cwd()
+    else:
+        cwd = _detached_profile_cwd(profile_home)
+    # Only Desktop rows distinguish an explicit pick from their neutral launch
+    # cwd. Terminal rows own their launch cwd but remain settle-followable.
+    explicit = bool(stored_cwd) and stored_source in _LAUNCH_CWD_NOT_A_WORKSPACE
+    return cwd, owned, explicit
 
 
 def _heal_dead_cwd(cwd: str) -> str:
@@ -3164,12 +3366,40 @@ def _display_session_cwd(session: dict | None) -> str:
     healed = _heal_dead_cwd(cwd)
     if healed and healed != cwd and session is not None:
         session["cwd"] = healed
-        _persist_session_cwd_and_schedule_git_meta(session, healed)
+        _register_session_cwd(session)
+        if _session_owns_cwd(session):
+            _persist_session_cwd_and_schedule_git_meta(session, healed)
 
     return healed
 
 
-def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
+def _session_workspace_info(session: dict | None) -> dict:
+    """Project runtime cwd separately from durable workspace ownership.
+
+    The projection performs the existing local dead-cwd healing. Owned paths
+    are persisted by :func:`_display_session_cwd`; neutral execution paths are
+    updated in memory only, so a detached session stays detached.
+    """
+    cwd = _display_session_cwd(session)
+    owned = _session_owns_cwd(session)
+    profile_home = str((session or {}).get("profile_home") or "").strip()
+    project_cwd = _persisted_session_cwd(session) if session is not None else cwd
+    project = (
+        _project_info_for_cwd(project_cwd, Path(profile_home))
+        if profile_home
+        else _project_info_for_cwd(project_cwd)
+    )
+    return {
+        "cwd": cwd,
+        "cwd_owned": owned,
+        "branch": _git_branch_for_cwd(cwd) if owned else "",
+        "project": project,
+    }
+
+
+def _reconcile_session_cwd_from_terminal(
+    session: dict | None, *, persist: bool = True
+) -> bool:
     """Re-anchor a session that SETTLED in another git checkout. Returns moved.
 
     An agent told to work in a fresh worktree does exactly that — `git worktree
@@ -3238,16 +3468,26 @@ def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
     if not landed_common or landed_common != current_common:
         return False
 
-    session["cwd"] = resolved
-    # The session works here now, so this is its workspace — a desktop chat
-    # whose cwd was an unpersisted launch artifact earns a real row. The
-    # settle marker keeps this adoption overridable by the NEXT settle while
-    # still yielding to a user's explicit choice (see the guard above).
-    session["explicit_cwd"] = True
-    session["cwd_from_settle"] = True
+    history_lock = session.get("history_lock")
+    lock_context = history_lock if history_lock is not None else contextlib.nullcontext()
+    with lock_context:
+        # Re-check after the git probes: an explicit parent/user move may have
+        # landed while those subprocesses ran and must retain authority.
+        if session.get("explicit_cwd") and not session.get("cwd_from_settle"):
+            return False
+        session["cwd"] = resolved
+        # The session works here now, so this is its workspace — a desktop chat
+        # whose cwd was an unpersisted launch artifact earns a real row. The
+        # settle marker keeps this adoption overridable by the NEXT settle while
+        # still yielding to a user's explicit choice (see the guard above).
+        session["explicit_cwd"] = True
+        session["cwd_owned"] = True
+        session["cwd_from_settle"] = True
+        _bump_workspace_topology_generation_locked(session)
     _register_session_cwd(session)
 
-    _persist_session_cwd_and_schedule_git_meta(session, resolved)
+    if persist:
+        _persist_session_cwd_and_schedule_git_meta(session, resolved)
     return True
 
 
@@ -3760,24 +4000,42 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
     resolved = os.path.abspath(os.path.expanduser(cwd))
     if not os.path.isdir(resolved):
         raise ValueError(f"working directory does not exist: {cwd}")
+    history_lock = session.get("history_lock")
+    lock_context = history_lock if history_lock is not None else contextlib.nullcontext()
+    with lock_context:
+        _publish_explicit_session_cwd_locked(session, resolved)
+    _finish_explicit_session_cwd_change(session, resolved, persist=True)
+    return resolved
+
+
+def _publish_explicit_session_cwd_locked(session: dict, resolved: str) -> int:
+    """Publish an explicit workspace while the session history lock is held."""
     session["cwd"] = resolved
     # An explicit user choice — persist it as the workspace (and let a later
     # lazy row creation persist it too, not the launch-dir fallback).
     session["explicit_cwd"] = True
+    session["cwd_owned"] = True
     # A user's choice supersedes any earlier settle-adopted cwd: from here on
     # the terminal wandering must not move the workspace again.
     session["cwd_from_settle"] = False
+    return _bump_workspace_topology_generation_locked(session)
+
+
+def _finish_explicit_session_cwd_change(
+    session: dict, resolved: str, *, persist: bool
+) -> None:
+    """Run non-authoritative side effects after live topology publication."""
     _register_session_cwd(session)
-    # The synchronous DB write claims ordering authority; Git subprocesses stay
-    # off the hot path and may publish only for that exact generation.
-    _persist_session_cwd_and_schedule_git_meta(session, resolved)
+    if persist:
+        # The synchronous DB write claims ordering authority; Git subprocesses
+        # stay off the hot path and may publish only for that exact generation.
+        _persist_session_cwd_and_schedule_git_meta(session, resolved)
     try:
         from tools.terminal_tool import cleanup_vm
 
         cleanup_vm(session["session_key"])
     except Exception:
         pass
-    return resolved
 
 
 # ── Config I/O ────────────────────────────────────────────────────────
@@ -6236,7 +6494,9 @@ def _session_usage_snapshot(session: dict | None) -> dict:
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 
 
-def _project_info_for_cwd(cwd: str) -> dict | None:
+def _project_info_for_cwd(
+    cwd: str, profile_home: Path | None = None
+) -> dict | None:
     """Return the first-class Project owning ``cwd`` for UI status surfaces.
 
     Backed by the per-profile projects.db (the same store the desktop's project
@@ -6250,7 +6510,8 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
     try:
         from hermes_cli import projects_db as pdb
 
-        with pdb.connect_closing() as conn:
+        db_path = Path(profile_home) / "projects.db" if profile_home else None
+        with pdb.connect_closing(db_path) as conn:
             project = pdb.project_for_path(conn, cwd)
         if project is None:
             return None
@@ -6272,7 +6533,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
                 session = candidate
                 break
     mirror = _metadata_mirror(session)
-    cwd = _display_session_cwd(session)
+    workspace = _session_workspace_info(session)
     session_key = str(
         (session or {}).get("session_key") or getattr(agent, "session_id", "") or ""
     )
@@ -6337,9 +6598,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "approval_mode": approval_mode,
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
         "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        **workspace,
         "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
@@ -7056,10 +7315,15 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     if not os.path.isdir(resolved):
         return
 
-    session["cwd"] = resolved
-    session["explicit_cwd"] = True
-    # An explicit project switch supersedes any earlier settle-adopted cwd.
-    session["cwd_from_settle"] = False
+    history_lock = session.get("history_lock")
+    lock_context = history_lock if history_lock is not None else contextlib.nullcontext()
+    with lock_context:
+        session["cwd"] = resolved
+        session["explicit_cwd"] = True
+        session["cwd_owned"] = True
+        # An explicit project switch supersedes any earlier settle-adopted cwd.
+        session["cwd_from_settle"] = False
+        _bump_workspace_topology_generation_locked(session)
     _register_session_cwd(session)
 
     _persist_session_cwd_and_schedule_git_meta(session, resolved)
@@ -7069,12 +7333,7 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
         info = (
             _session_info(agent, session)
             if agent is not None
-            else {
-                "cwd": resolved,
-                "branch": _git_branch_for_cwd(resolved),
-                "project": _project_info_for_cwd(resolved),
-                "lazy": True,
-            }
+            else {**_session_workspace_info(session), "lazy": True}
         )
         _emit("session.info", sid, info)
     except Exception:
@@ -7814,6 +8073,8 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    explicit_cwd: bool = False,
+    cwd_owned: bool | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -7830,6 +8091,7 @@ def _init_session(
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
+            "explicit_cwd": explicit_cwd,
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -7849,6 +8111,8 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        if cwd_owned is not None:
+            _sessions[sid]["cwd_owned"] = cwd_owned
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -7869,9 +8133,9 @@ def _init_session(
                 with _sessions_lock:
                     if sid in _sessions:
                         _sessions[sid]["cwd"] = row["cwd"]
-            else:
+            elif _persisted_session_cwd(_sessions[sid]):
                 try:
-                    _cwd = _sessions[sid]["cwd"]
+                    _cwd = _persisted_session_cwd(_sessions[sid])
                     if hasattr(db, "update_session_cwd"):
                         _persist_session_cwd_and_schedule_git_meta(
                             _sessions[sid], _cwd, db=db
@@ -9174,7 +9438,7 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
 
 
 def _lazy_resume_info(
-    cwd: str,
+    session: dict,
     *,
     model: str = "",
     provider: str = "",
@@ -9183,9 +9447,7 @@ def _lazy_resume_info(
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        **_session_workspace_info(session),
         "model": model or _resolve_model(),
         "tools": {},
         "skills": {},
@@ -9212,11 +9474,13 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    explicit_cwd: bool = False,
+    cwd_owned: bool | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
     now = time.time()
-    return {
+    record = {
         "agent": None,
         "agent_error": None,
         "agent_ready": threading.Event(),
@@ -9228,7 +9492,7 @@ def _deferred_session_record(
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
-        "explicit_cwd": False,
+        "explicit_cwd": explicit_cwd,
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
@@ -9250,6 +9514,9 @@ def _deferred_session_record(
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
     }
+    if cwd_owned is not None:
+        record["cwd_owned"] = cwd_owned
+    return record
 
 
 def _claim_or_reuse_live(
@@ -9508,7 +9775,7 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
+        return _session_info(agent, session)
     # The SESSION's own workspace, not the gateway's launch directory. Reporting
     # `_default_session_cwd()` here told a lazily-resumed session's client that
     # its workspace was wherever the gateway process happened to start, so the
@@ -9516,11 +9783,8 @@ def _fallback_session_info(session: dict) -> dict:
     # rebound correctly (#71254). `branch` is always emitted ("" outside a git
     # repo) so a client can clear a stale label instead of retaining it — the
     # same contract `_lazy_session_info` above already follows.
-    cwd = _session_cwd(session)
     return {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        **_session_workspace_info(session),
         "lazy": True,
         "model": _resolve_model(),
         "skills": {},
@@ -12243,7 +12507,20 @@ def _run_prompt_submit(
             # frame paths retire the marker as they emit).
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
-            _emit_settled_session_info(sid, session, agent)
+            # Isolated turns return this snapshot in turn.end. Publishing it
+            # directly from the child would bypass the serving process' causal
+            # workspace-generation check and could repaint a newer explicit
+            # parent move with the turn-start cwd.
+            if session.get("_defer_compute_host_session_info"):
+                try:
+                    _reconcile_session_cwd_from_terminal(session, persist=False)
+                except Exception:
+                    logger.debug(
+                        "failed to reconcile isolated settled session cwd",
+                        exc_info=True,
+                    )
+            else:
+                _emit_settled_session_info(sid, session, agent)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -14894,7 +15171,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             return f"compute-host {route_name} failed: {exc}"
         if ack.get("type") in {"control.error", "error"}:
             return str(ack.get("message") or f"compute-host {route_name} failed")
-        _apply_compute_host_metadata_mirror(session, ack)
+        _apply_compute_host_control_metadata(sid, session, ack)
         return str(ack.get("output") or "")
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"

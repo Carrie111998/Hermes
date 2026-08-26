@@ -33,6 +33,7 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $sessions,
   $turnStartedAt,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
@@ -48,7 +49,9 @@ import {
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
   setSessions,
-  setTurnStartedAt
+  setTurnStartedAt,
+  setWorkspaceCwdOwner,
+  workspaceCwdBelongsToSelectedSession
 } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionTiles } from '@/store/session-states'
@@ -1053,6 +1056,47 @@ describe('resumeSession failure recovery', () => {
     await resume!('stored-1', true)
 
     expect($messages.get().map(message => message.id)).toContain('user-optimistic')
+  })
+
+  it('reconciles a detached resume response without attaching its execution cwd', async () => {
+    setCurrentCwd('/previous/project')
+    setSelectedStoredSessionId('stored-detached')
+    setSessions([storedSession({ cwd: null, id: 'stored-detached' })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-detached' } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: { cwd: '/home/backend/.hermes/workspace', cwd_owned: false },
+          message_count: 0,
+          messages: [],
+          resumed: 'stored-detached',
+          running: false,
+          session_id: 'runtime-detached',
+          session_key: 'stored-detached'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-detached"
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    await act(async () => {
+      await resume!('stored-detached', true)
+    })
+
+    expect($currentCwd.get()).toBe('/previous/project')
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
+    expect($sessions.get().find(session => session.id === 'stored-detached')?.cwd).toBeNull()
   })
 
   it('keeps the complete transcript with the live tail after a full renderer restart', async () => {
@@ -2255,6 +2299,57 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
   })
 
+  it('keeps a detached warm cache unowned when session.activate is unsupported', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const cachedState = clientState('stored-A')
+
+    cachedState.cwd = ''
+    cachedState.cwdOwned = false
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', cachedState]])
+    }
+
+    setCurrentCwd('/previous/project')
+    setWorkspaceCwdOwner('previous-session')
+    setSessions([storedSession({ cwd: null, id: 'stored-A' })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        throw new Error('Method not found')
+      }
+
+      if (method === 'session.usage') {
+        return { input: 0, output: 0, total: 0 } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect(requestGateway.mock.calls.map(([method]) => method)).toEqual(
+      expect.arrayContaining(['session.activate', 'session.usage'])
+    )
+    expect($currentCwd.get()).toBe('/previous/project')
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
+    expect(sessionStateByRuntimeIdRef.current.get('rt-A')).toMatchObject({ cwd: '', cwdOwned: false })
+  })
+
   it('re-arms a pending clarify in place on the warm session.activate path', async () => {
     const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
       current: new Map([['stored-A', 'rt-A']])
@@ -3153,7 +3248,7 @@ describe('createBackendSessionForSend workspace target', () => {
     vi.restoreAllMocks()
   })
 
-  it('omits cwd for an explicit no-workspace draft even when global cwd changes before send', async () => {
+  it('fresh-main route omits cwd for Home even when global cwd changes before send', async () => {
     const params = await createWith(
       () => {
         $activeGatewayProfile.set('default')
@@ -3206,7 +3301,7 @@ describe('openNewSessionTile workspace target', () => {
     vi.restoreAllMocks()
   })
 
-  it('omits cwd for a Home tile even when project scope resolves to a repo', async () => {
+  it('occupied-main openNewSessionTile route omits cwd for Home even when project scope resolves to a repo', async () => {
     $projectScope.set('p_voice')
     $projectTree.set([
       {
@@ -3235,7 +3330,14 @@ describe('openNewSessionTile workspace target', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    render(
+      <Harness
+        activeSessionId="runtime-main"
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-main"
+      />
+    )
     await waitFor(() => expect(handle).not.toBeNull())
 
     await act(async () => {
@@ -3243,6 +3345,43 @@ describe('openNewSessionTile workspace target', () => {
     })
 
     expect(createParams).not.toHaveProperty('cwd')
+    expect($sessionTiles.get().some(tile => tile.storedSessionId === 'stored-home-tile')).toBe(true)
+  })
+
+  it('releases the previous Files workspace when a centered Home tile is detached', async () => {
+    setSelectedStoredSessionId('stored-main')
+    setCurrentCwd('/previous/project')
+    setWorkspaceCwdOwner('stored-main')
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return {
+          info: { cwd: '/home/backend/.hermes/workspace', cwd_owned: false },
+          session_id: 'runtime-home-center',
+          stored_session_id: 'stored-home-center'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="runtime-main"
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-main"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { cwd: null })
+    })
+
+    expect($currentCwd.get()).toBe('/previous/project')
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
   })
 })
 describe('selectSidebarItem', () => {

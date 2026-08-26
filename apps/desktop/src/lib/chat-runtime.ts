@@ -48,6 +48,22 @@ export function createClientSessionState(
   }
 }
 
+/** Normalize the backend's optional cwd-ownership contract for every Desktop
+ * runtime-info consumer. Missing ownership is the legacy contract: a non-empty
+ * cwd is owned. Explicit false keeps the execution path off workspace surfaces. */
+export function runtimeWorkspaceStatePatch(info: {
+  cwd?: unknown
+  cwd_owned?: unknown
+}): Partial<Pick<ClientSessionState, 'cwd' | 'cwdOwned'>> {
+  if (typeof info.cwd !== 'string') {
+    return {}
+  }
+
+  const cwdOwned = typeof info.cwd_owned === 'boolean' ? info.cwd_owned : Boolean(info.cwd)
+
+  return { cwd: cwdOwned ? info.cwd : '', cwdOwned }
+}
+
 export function sessionTitle(session: SessionInfo): string {
   return session.title?.trim() || session.preview?.trim() || 'Untitled session'
 }

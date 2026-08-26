@@ -176,6 +176,9 @@ export interface ClientSessionState {
   messages: ChatMessage[]
   branch: string
   cwd: string
+  /** Whether cwd is a user/session workspace. Absent preserves legacy
+   *  non-empty-cwd ownership for cached states created by older renderers. */
+  cwdOwned?: boolean
   model: string
   provider: string
   reasoningEffort: string
@@ -217,3 +220,19 @@ export interface ClientSessionState {
    *  tile's context count. Null until the first turn reports. */
   usage: null | UsageStats
 }
+
+export type SessionRuntimeStatePatch = Partial<
+  Pick<
+    ClientSessionState,
+    | 'branch'
+    | 'cwd'
+    | 'cwdOwned'
+    | 'fast'
+    | 'model'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'serviceTier'
+    | 'yolo'
+  >
+>

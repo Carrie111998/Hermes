@@ -499,7 +499,16 @@ class ComputeHost:
                 message_count = len(session.get("history") or [])
                 interrupted = bool(session.get("_turn_cancel_requested"))
                 session_key = str(session.get("session_key") or "")
+                workspace_topology_generation = server._workspace_topology_generation(
+                    session
+                )
             session_info = server._session_info(session.get("agent"), session)
+            session_info.update(
+                {
+                    "explicit_cwd": bool(session.get("explicit_cwd")),
+                    "cwd_from_settle": bool(session.get("cwd_from_settle")),
+                }
+            )
             self._bump_progress()
             self.emit(
                 {
@@ -512,7 +521,14 @@ class ComputeHost:
                     "interrupted": interrupted,
                     "ended_ns": now_ns(),
                     "session_info": session_info,
-                    "session_info_emitted": True,
+                    "workspace_topology_base_generation": frame.get(
+                        "workspace_topology_generation"
+                    ),
+                    "workspace_topology_generation": workspace_topology_generation,
+                    # The child defers its final session.info so the serving
+                    # process can resolve parent-vs-host workspace ordering
+                    # before publishing one authoritative Desktop event.
+                    "session_info_emitted": False,
                 }
             )
         except Exception as exc:
@@ -536,12 +552,80 @@ class ComputeHost:
             session["transport"] = self._transport
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
-            if frame.get("cwd"):
-                session["cwd"] = str(frame.get("cwd"))
+            topology_keys = (
+                "cwd",
+                "cwd_owned",
+                "explicit_cwd",
+                "cwd_from_settle",
+            )
+            topology_changed = False
+            generation_advanced = False
+            history_lock = session.get("history_lock")
+            lock_context = (
+                history_lock
+                if history_lock is not None
+                else contextlib.nullcontext()
+            )
+            with lock_context:
+                before = tuple(
+                    (field in session, session.get(field)) for field in topology_keys
+                )
+                incoming_generation = frame.get("workspace_topology_generation")
+                generation_aware = (
+                    isinstance(incoming_generation, int)
+                    and not isinstance(incoming_generation, bool)
+                    and incoming_generation >= 0
+                )
+                current_generation = server._workspace_topology_generation(session)
+                current_generation_aware = (
+                    isinstance(session.get("_workspace_topology_generation"), int)
+                    and not isinstance(
+                        session.get("_workspace_topology_generation"), bool
+                    )
+                    and session.get("_workspace_topology_generation") >= 0
+                )
+                generation_advanced = generation_aware and (
+                    not current_generation_aware
+                    or incoming_generation > current_generation
+                )
+                accept_topology = not generation_aware or generation_advanced
+                if accept_topology:
+                    if frame.get("cwd"):
+                        session["cwd"] = str(frame.get("cwd"))
+                    if "cwd_owned" in frame:
+                        session["cwd_owned"] = bool(frame.get("cwd_owned"))
+                    if "explicit_cwd" in frame:
+                        session["explicit_cwd"] = bool(frame.get("explicit_cwd"))
+                    if "cwd_from_settle" in frame:
+                        session["cwd_from_settle"] = bool(
+                            frame.get("cwd_from_settle")
+                        )
+                    if generation_aware:
+                        session["_workspace_topology_generation"] = (
+                            incoming_generation
+                        )
+                    after = tuple(
+                        (field in session, session.get(field))
+                        for field in topology_keys
+                    )
+                    topology_changed = after != before
+            session["_defer_compute_host_session_info"] = True
             if frame.get("profile_home"):
                 session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
+            if topology_changed:
+                # This is the child-process half of a native workspace move.
+                # Reuse its non-persisting side effects so terminal registration
+                # and any cached backend reseed happen here, where tool calls run.
+                server._finish_explicit_session_cwd_change(
+                    session, str(session.get("cwd") or ""), persist=False
+                )
+            elif generation_advanced:
+                # Even an idempotent explicit move must re-anchor a shell that
+                # wandered beneath the same session workspace. No backend
+                # cleanup is needed when the topology tuple itself is unchanged.
+                server._register_session_cwd(session)
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
@@ -604,6 +688,12 @@ class ComputeHost:
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    explicit_cwd=bool(frame.get("explicit_cwd")),
+                    cwd_owned=(
+                        bool(frame.get("cwd_owned"))
+                        if "cwd_owned" in frame
+                        else None
+                    ),
                 )
             finally:
                 reset_transport(token)
@@ -611,7 +701,7 @@ class ComputeHost:
             # If _init_session's side machinery (slash worker, approval notify) is
             # unavailable, keep a minimal host-owned session rather than failing
             # the turn after the expensive agent build succeeded.
-            server._sessions[sid] = {
+            fallback = {
                 "agent": agent,
                 "session_key": key,
                 "history": list(history),
@@ -624,6 +714,12 @@ class ComputeHost:
                 "attached_images": [],
                 "image_counter": 0,
                 "cwd": str(frame.get("cwd") or os.getcwd()),
+                "explicit_cwd": bool(frame.get("explicit_cwd")),
+                "cwd_from_settle": bool(frame.get("cwd_from_settle")),
+                "_workspace_topology_generation": int(
+                    frame.get("workspace_topology_generation") or 0
+                ),
+                "_defer_compute_host_session_info": True,
                 "cols": int(frame.get("cols") or 80),
                 "slash_worker": None,
                 "show_reasoning": server._load_show_reasoning(),
@@ -631,16 +727,25 @@ class ComputeHost:
                 "edit_snapshots": {},
                 "tool_started_at": {},
                 "model_override": frame.get("model_override"),
-                "source": server._sanitize_client_source(frame.get("source")),
+                "source": server._resolve_session_source(frame.get("source")),
                 "transport": self._transport,
             }
+            if "cwd_owned" in frame:
+                fallback["cwd_owned"] = bool(frame.get("cwd_owned"))
+            server._sessions[sid] = fallback
         session = server._sessions[sid]
         session["transport"] = self._transport
+        session["_workspace_topology_generation"] = int(
+            frame.get("workspace_topology_generation") or 0
+        )
+        session["_defer_compute_host_session_info"] = True
         session["profile_home"] = profile_home or session.get("profile_home")
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if "cwd_from_settle" in frame:
+            session["cwd_from_settle"] = bool(frame.get("cwd_from_settle"))
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
@@ -653,6 +758,36 @@ class ComputeHost:
             self.emit({"type": "reload_mcp.ack", "sid": sid, "request_id": request_id, "response": resp})
         except Exception as exc:
             self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": str(exc)})
+
+    @staticmethod
+    def _control_session_snapshot(server: Any, session: dict, frame: dict) -> dict:
+        """Return the same causal topology envelope used by ``turn.end``."""
+        with session["history_lock"]:
+            session_key = str(session.get("session_key") or "")
+            history_version = int(session.get("history_version", 0))
+            message_count = len(session.get("history") or [])
+            workspace_topology_generation = server._workspace_topology_generation(
+                session
+            )
+            explicit_cwd = bool(session.get("explicit_cwd"))
+            cwd_from_settle = bool(session.get("cwd_from_settle"))
+        session_info = server._session_info(session.get("agent"), session)
+        session_info.update(
+            {
+                "explicit_cwd": explicit_cwd,
+                "cwd_from_settle": cwd_from_settle,
+            }
+        )
+        return {
+            "session_key": session_key,
+            "history_version": history_version,
+            "message_count": message_count,
+            "session_info": session_info,
+            "workspace_topology_base_generation": frame.get(
+                "workspace_topology_generation"
+            ),
+            "workspace_topology_generation": workspace_topology_generation,
+        }
 
     def _handle_control(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
@@ -721,10 +856,6 @@ class ComputeHost:
                         }
                     )
                     return
-                with session["history_lock"]:
-                    session_key = str(session.get("session_key") or "")
-                    history_version = int(session.get("history_version", 0))
-                    message_count = len(session.get("history") or [])
                 self.emit(
                     {
                         "type": "control.ack",
@@ -732,10 +863,7 @@ class ComputeHost:
                         "request_id": request_id,
                         "route_name": route_name,
                         "result": response.get("result") or {},
-                        "session_key": session_key,
-                        "history_version": history_version,
-                        "message_count": message_count,
-                        "session_info": server._session_info(session.get("agent"), session),
+                        **self._control_session_snapshot(server, session, frame),
                     }
                 )
                 return
@@ -745,9 +873,6 @@ class ComputeHost:
                 output = server._mirror_slash_side_effects(sid, session, command)
             with session["history_lock"]:
                 messages = server._history_to_messages(list(session.get("history") or []))
-                history_version = int(session.get("history_version", 0))
-                message_count = len(session.get("history") or [])
-                session_key = str(session.get("session_key") or "")
             self.emit(
                 {
                     "type": "control.ack",
@@ -755,11 +880,8 @@ class ComputeHost:
                     "request_id": request_id,
                     "route_name": route_name,
                     "output": output,
-                    "session_key": session_key,
-                    "history_version": history_version,
-                    "message_count": message_count,
                     "messages": messages,
-                    "session_info": server._session_info(session.get("agent"), session),
+                    **self._control_session_snapshot(server, session, frame),
                 }
             )
         except Exception as exc:

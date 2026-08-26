@@ -169,6 +169,15 @@ describe('applyRuntimeInfo foreground scoping', () => {
     expect($currentCwd.get()).toBe('/project-b')
     expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
   })
+
+  it('keeps a neutral execution cwd available without claiming it as a workspace', () => {
+    setSelectedStoredSessionId('session-detached')
+    const patch = applyRuntimeInfo({ cwd: '/home/backend/.hermes/workspace', cwd_owned: false })
+
+    expect(patch).toMatchObject({ cwd: '', cwdOwned: false })
+    expect($currentCwd.get()).toBe('/main-repo')
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
+  })
 })
 
 describe('applyStoredSessionPreviewRuntimeInfo workspace paint', () => {

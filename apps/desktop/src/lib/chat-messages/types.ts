@@ -81,6 +81,8 @@ export type GatewayEventPayload = {
   running?: boolean
   turn_started_at?: number | null
   cwd?: string
+  /** False when cwd is only the backend's neutral execution fallback. */
+  cwd_owned?: boolean
   branch?: string
   terminal_backend?: string
   credential_warning?: string

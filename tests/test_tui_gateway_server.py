@@ -489,6 +489,721 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         server._sessions.pop("iso-sid", None)
 
 
+def test_compute_host_turn_end_waits_for_started_parent_workspace_move(
+    monkeypatch, tmp_path
+):
+    host_lock_attempted = threading.Event()
+    allow_host_lock = threading.Event()
+
+    class ObservedHistoryLock:
+        """Expose whether completion could cross the topology boundary."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.host_acquired_before_move_commit = None
+
+        def __enter__(self):
+            if threading.current_thread().name == "host-completion":
+                acquired = self._lock.acquire(blocking=False)
+                self.host_acquired_before_move_commit = acquired
+                host_lock_attempted.set()
+                if not allow_host_lock.wait(5):
+                    raise AssertionError("test did not release host completion")
+                if not acquired:
+                    self._lock.acquire()
+            else:
+                self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    old_cwd = tmp_path / "neutral"
+    new_cwd = tmp_path / "explicit-project"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    session = _session(
+        agent=None,
+        cwd=str(old_cwd),
+        cwd_owned=False,
+        explicit_cwd=False,
+        cwd_from_settle=False,
+        source="desktop",
+        _compute_host_active=True,
+        running=True,
+        queued_prompt={"text": "queued next turn", "transport": None},
+    )
+    session["agent"] = None
+    session["session_key"] = "stored-isolated-session"
+    history_lock = ObservedHistoryLock()
+    session["history_lock"] = history_lock
+    server._sessions["iso-sid"] = session
+    emitted = []
+    queued_frames = []
+    row = {"id": session["session_key"], "cwd": str(old_cwd)}
+    db_updated = threading.Event()
+    release_move = threading.Event()
+    move_done = threading.Event()
+    completion_started = threading.Event()
+    completion_done = threading.Event()
+    move_result = {}
+    thread_errors = []
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return dict(row) if session_id == row["id"] else None
+
+        def update_session_cwd(
+            self,
+            session_id,
+            cwd,
+            branch=None,
+            root=None,
+            replace_git_meta=True,
+        ):
+            assert session_id == row["id"]
+            row["cwd"] = cwd
+            db_updated.set()
+            if not release_move.wait(5):
+                raise AssertionError("test did not release paused workspace move")
+
+    class FakeSupervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            queued_frames.append(dict(frame))
+            return frame["request_id"]
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_profile_db(_params):
+        yield FakeDB()
+
+    monkeypatch.setattr(server, "_profile_db", fake_profile_db)
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "main")
+    monkeypatch.setattr(server, "_git_common_repo_root_for_cwd", lambda _cwd: str(new_cwd))
+    monkeypatch.setattr(server, "_persist_session_cwd_and_schedule_git_meta", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: FakeSupervisor())
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, current=None: {
+            "cwd": (current or session)["cwd"],
+            "cwd_owned": bool((current or session).get("cwd_owned")),
+            "explicit_cwd": bool((current or session).get("explicit_cwd")),
+            "cwd_from_settle": bool((current or session).get("cwd_from_settle")),
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_process_isolation_config",
+        lambda _cfg=None: {
+            "turn_isolation": True,
+            "compute_host_heartbeat_secs": 15,
+            "compute_host_respawn_max": 3,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    turn_start = server._compute_host_turn_frame(
+        "turn-1", "iso-sid", session, "running turn"
+    )
+
+    def run_move():
+        try:
+            move_result.update(
+                server._methods["session.workspace.move"](
+                    "move-1",
+                    {"session_key": session["session_key"], "cwd": str(new_cwd)},
+                )
+            )
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            move_done.set()
+
+    def complete_host_turn():
+        completion_started.set()
+        try:
+            server._on_compute_host_turn_done(
+                "turn-1",
+                "iso-sid",
+                session,
+                {
+                    "type": "turn.end",
+                    "workspace_topology_base_generation": turn_start[
+                        "workspace_topology_generation"
+                    ],
+                    "workspace_topology_generation": turn_start[
+                        "workspace_topology_generation"
+                    ],
+                    "session_info": {
+                        "cwd": str(old_cwd),
+                        "cwd_owned": False,
+                        "explicit_cwd": False,
+                        "cwd_from_settle": False,
+                    },
+                },
+            )
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            completion_done.set()
+
+    move_thread = threading.Thread(target=run_move, name="workspace-move")
+    completion_thread = threading.Thread(
+        target=complete_host_turn, name="host-completion"
+    )
+    try:
+        move_thread.start()
+        assert db_updated.wait(5), "workspace move never reached the DB/live gap"
+
+        completion_thread.start()
+        assert completion_started.wait(5), "host completion thread did not start"
+        assert host_lock_attempted.wait(5), "host completion did not reach history_lock"
+
+        # The row already names the new workspace, but live topology has not
+        # published yet. Completion must remain ordered behind that publication:
+        # it may neither emit the host's stale neutral snapshot nor drain the
+        # queued turn into a frame built from generation 0.
+        assert history_lock.host_acquired_before_move_commit is False
+        allow_host_lock.set()
+        assert not completion_done.is_set()
+        assert not emitted
+        assert not queued_frames
+
+        release_move.set()
+        assert move_done.wait(5), "workspace move did not finish"
+        assert completion_done.wait(5), "host completion did not finish"
+        move_thread.join(timeout=1)
+        completion_thread.join(timeout=1)
+
+        assert not thread_errors
+        assert "error" not in move_result, move_result
+
+        assert session["cwd"] == str(new_cwd)
+        assert session["cwd_owned"] is True
+        assert session["explicit_cwd"] is True
+        assert session["cwd_from_settle"] is False
+        assert session["_workspace_topology_generation"] == 1
+        assert row["cwd"] == str(new_cwd)
+        assert queued_frames[-1]["cwd"] == str(new_cwd)
+        assert queued_frames[-1]["cwd_owned"] is True
+        assert queued_frames[-1]["explicit_cwd"] is True
+        assert queued_frames[-1]["cwd_from_settle"] is False
+        session_info_events = [
+            payload for event, _sid, payload in emitted if event == "session.info"
+        ]
+        assert session_info_events
+        assert all(payload["cwd"] == str(new_cwd) for payload in session_info_events)
+        assert all(payload["cwd_owned"] is True for payload in session_info_events)
+    finally:
+        allow_host_lock.set()
+        release_move.set()
+        move_thread.join(timeout=5)
+        completion_thread.join(timeout=5)
+        server._sessions.pop("iso-sid", None)
+
+
+def test_compute_host_turn_end_applies_host_settle_without_parent_mutation(
+    monkeypatch, tmp_path
+):
+    old_cwd = tmp_path / "neutral"
+    settled_cwd = tmp_path / "settled-project"
+    old_cwd.mkdir()
+    settled_cwd.mkdir()
+    session = _session(
+        agent=None,
+        cwd=str(old_cwd),
+        cwd_owned=False,
+        explicit_cwd=False,
+        cwd_from_settle=False,
+        source="desktop",
+        _compute_host_active=True,
+        running=True,
+        queued_prompt={"text": "queued next turn", "transport": None},
+    )
+    session["agent"] = None
+    queued_frames = []
+
+    class FakeSupervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            queued_frames.append(dict(frame))
+            return frame["request_id"]
+
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: FakeSupervisor())
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_process_isolation_config",
+        lambda _cfg=None: {
+            "turn_isolation": True,
+            "compute_host_heartbeat_secs": 15,
+            "compute_host_respawn_max": 3,
+        },
+    )
+
+    turn_start = server._compute_host_turn_frame(
+        "turn-1", "iso-sid", session, "running turn"
+    )
+
+    server._on_compute_host_turn_done(
+        "turn-1",
+        "iso-sid",
+        session,
+        {
+            "type": "turn.end",
+            "workspace_topology_base_generation": turn_start[
+                "workspace_topology_generation"
+            ],
+            "workspace_topology_generation": (
+                turn_start["workspace_topology_generation"] + 1
+            ),
+            "session_info": {
+                "cwd": str(settled_cwd),
+                "cwd_owned": True,
+                "explicit_cwd": True,
+                "cwd_from_settle": True,
+            },
+        },
+    )
+
+    assert session["cwd"] == str(settled_cwd)
+    assert session["cwd_owned"] is True
+    assert session["explicit_cwd"] is True
+    assert session["cwd_from_settle"] is True
+
+    next_frame = queued_frames[-1]
+    assert next_frame["cwd"] == str(settled_cwd)
+    assert next_frame["cwd_owned"] is True
+    assert next_frame["explicit_cwd"] is True
+    assert next_frame["cwd_from_settle"] is True
+
+
+def test_generationless_control_ack_cannot_rewind_generation_aware_workspace(
+    monkeypatch, tmp_path
+):
+    old_cwd = tmp_path / "old-host-workspace"
+    new_cwd = tmp_path / "new-parent-workspace"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    session = _session(
+        agent=None,
+        cwd=str(new_cwd),
+        cwd_owned=True,
+        explicit_cwd=True,
+        cwd_from_settle=False,
+        source="desktop",
+        _compute_host_active=True,
+        _workspace_topology_generation=1,
+    )
+    session["agent"] = None
+    emitted = []
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "new-branch")
+    monkeypatch.setattr(server, "_project_info_for_cwd", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    # An acknowledgement from a legacy/old child arrives after generation 1
+    # was published by session.workspace.move. It carries topology but no
+    # causal envelope, so only its non-topology metadata remains usable.
+    server._apply_compute_host_metadata_mirror(
+        session,
+        {
+            "type": "control.ack",
+            "session_info": {
+                "cwd": str(old_cwd),
+                "cwd_owned": False,
+                "explicit_cwd": False,
+                "cwd_from_settle": True,
+                "branch": "old-branch",
+                "project": {"id": "old-project"},
+                "model": "host-model",
+            },
+        },
+    )
+    server._emit("session.info", "sid", server._session_info(None, session))
+    next_frame = server._compute_host_turn_frame(
+        "next-turn", "sid", session, "continue"
+    )
+
+    assert session["cwd"] == str(new_cwd)
+    assert session["cwd_owned"] is True
+    assert session["explicit_cwd"] is True
+    assert session["cwd_from_settle"] is False
+    assert session["_metadata_mirror"]["model"] == "host-model"
+    assert "cwd" not in session["_metadata_mirror"]
+    assert "branch" not in session["_metadata_mirror"]
+    assert emitted[-1][2]["cwd"] == str(new_cwd)
+    assert emitted[-1][2]["cwd_owned"] is True
+    assert emitted[-1][2]["branch"] == "new-branch"
+    assert next_frame["cwd"] == str(new_cwd)
+    assert next_frame["cwd_owned"] is True
+    assert next_frame["workspace_topology_generation"] == 1
+
+
+def test_generationless_control_ack_remains_compatible_with_legacy_session(
+    monkeypatch, tmp_path
+):
+    legacy_cwd = tmp_path / "legacy-host-workspace"
+    legacy_cwd.mkdir()
+    session = _session(
+        agent=None,
+        cwd=str(tmp_path),
+        cwd_owned=False,
+        explicit_cwd=False,
+        cwd_from_settle=False,
+        source="desktop",
+    )
+    session["agent"] = None
+    session.pop("_workspace_topology_generation", None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
+
+    server._apply_compute_host_metadata_mirror(
+        session,
+        {
+            "type": "control.ack",
+            "session_info": {
+                "cwd": str(legacy_cwd),
+                "cwd_owned": True,
+                "explicit_cwd": True,
+                "cwd_from_settle": True,
+            },
+        },
+    )
+
+    assert session["cwd"] == str(legacy_cwd)
+    assert session["cwd_owned"] is True
+    assert session["explicit_cwd"] is True
+    assert session["cwd_from_settle"] is True
+
+
+def test_compute_host_control_request_snapshots_parent_topology_generation(monkeypatch):
+    captured = {}
+
+    class FakeSupervisor:
+        def control(self, sid, **kwargs):
+            captured.update({"sid": sid, **kwargs})
+            return {"type": "control.ack"}
+
+    session = _session(_workspace_topology_generation=7)
+    server._sessions["control-generation"] = session
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: FakeSupervisor())
+    try:
+        server._send_compute_host_control(
+            "control-generation",
+            route_name="slash.prompt",
+            command="/prompt concise",
+        )
+    finally:
+        server._sessions.pop("control-generation", None)
+
+    assert captured["payload"]["workspace_topology_generation"] == 7
+
+
+def test_stale_compute_host_control_metadata_emits_no_parent_session_info(
+    monkeypatch, tmp_path
+):
+    child_cwd = tmp_path / "child-old"
+    parent_cwd = tmp_path / "parent-new"
+    child_cwd.mkdir()
+    parent_cwd.mkdir()
+    session = _session(
+        agent=None,
+        cwd=str(parent_cwd),
+        cwd_owned=True,
+        explicit_cwd=True,
+        cwd_from_settle=False,
+        _compute_host_active=True,
+        _workspace_topology_generation=1,
+    )
+    session["agent"] = None
+    server._sessions["stale-control"] = session
+    emitted = []
+    ack = {
+        "type": "control.ack",
+        "workspace_topology_base_generation": 1,
+        "workspace_topology_generation": 0,
+        "session_info": {
+            "cwd": str(child_cwd),
+            "cwd_owned": False,
+            "explicit_cwd": False,
+            "cwd_from_settle": False,
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    try:
+        server._apply_compute_host_control_metadata("stale-control", session, ack)
+    finally:
+        server._sessions.pop("stale-control", None)
+
+    assert session["cwd"] == str(parent_cwd)
+    assert session["cwd_owned"] is True
+    assert session["_workspace_topology_generation"] == 1
+    assert "cwd" not in ack["session_info"]
+    assert emitted == []
+
+
+def test_accepted_compute_host_control_topology_emits_one_parent_session_info(
+    monkeypatch, tmp_path
+):
+    old_cwd = tmp_path / "old"
+    child_cwd = tmp_path / "child-current"
+    old_cwd.mkdir()
+    child_cwd.mkdir()
+    session = _session(
+        agent=None,
+        cwd=str(old_cwd),
+        cwd_owned=False,
+        explicit_cwd=False,
+        cwd_from_settle=False,
+        _compute_host_active=True,
+        _workspace_topology_generation=1,
+    )
+    session["agent"] = None
+    server._sessions["accepted-control"] = session
+    emitted = []
+    ack = {
+        "type": "control.ack",
+        "workspace_topology_base_generation": 1,
+        "workspace_topology_generation": 2,
+        "session_info": {
+            "cwd": str(child_cwd),
+            "cwd_owned": True,
+            "explicit_cwd": True,
+            "cwd_from_settle": True,
+        },
+    }
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server,
+        "_persist_session_cwd_and_schedule_git_meta",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, current: {
+            "cwd": current["cwd"],
+            "cwd_owned": current["cwd_owned"],
+            "explicit_cwd": current["explicit_cwd"],
+            "cwd_from_settle": current["cwd_from_settle"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    try:
+        server._apply_compute_host_control_metadata("accepted-control", session, ack)
+    finally:
+        server._sessions.pop("accepted-control", None)
+
+    assert session["cwd"] == str(child_cwd)
+    assert session["cwd_owned"] is True
+    assert session["_workspace_topology_generation"] == 2
+    assert emitted == [
+        (
+            "session.info",
+            "accepted-control",
+            {
+                "cwd": str(child_cwd),
+                "cwd_owned": True,
+                "explicit_cwd": True,
+                "cwd_from_settle": True,
+            },
+        )
+    ]
+
+
+def test_stale_host_settle_completion_repairs_shared_db_before_resume(
+    monkeypatch, tmp_path
+):
+    """A rejected child settle cannot remain authoritative after restart."""
+    import contextlib
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    old_cwd = tmp_path / "old-workspace"
+    parent_cwd = tmp_path / "parent-workspace"
+    stale_settled_cwd = tmp_path / "stale-settled-workspace"
+    for path in (home, old_cwd, parent_cwd, stale_settled_cwd):
+        path.mkdir()
+    db_path = home / "state.db"
+    parent_db = SessionDB(db_path=db_path)
+    child_db = SessionDB(db_path=db_path)
+    session_key = "stale-settle-row"
+    parent_db.create_session(session_key, source="desktop", cwd=str(old_cwd))
+    token = set_hermes_home_override(home)
+    resumed_sid = ""
+
+    @contextlib.contextmanager
+    def parent_profile_db(_params):
+        yield parent_db
+
+    session = _session(
+        agent=None,
+        session_key=session_key,
+        profile_home=str(home),
+        cwd=str(old_cwd),
+        cwd_owned=True,
+        explicit_cwd=True,
+        cwd_from_settle=False,
+        source="desktop",
+        running=True,
+        _compute_host_active=True,
+        _workspace_topology_generation=0,
+    )
+    session["agent"] = None
+    server._sessions["stale-settle-live"] = session
+    monkeypatch.setattr(server, "_profile_db", parent_profile_db)
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "main")
+    monkeypatch.setattr(
+        server, "_git_common_repo_root_for_cwd", lambda _cwd: str(parent_cwd)
+    )
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    try:
+        moved = server._methods["session.workspace.move"](
+            "move-1", {"session_key": session_key, "cwd": str(parent_cwd)}
+        )
+        assert "error" not in moved, moved
+        assert session["_workspace_topology_generation"] == 1
+        assert parent_db.get_session(session_key)["cwd"] == str(parent_cwd)
+
+        # This is the real two-handle race: the child commits its stale settle
+        # after the parent's generation-1 move has already committed.
+        child_db.update_session_cwd(session_key, str(stale_settled_cwd))
+        assert parent_db.get_session(session_key)["cwd"] == str(stale_settled_cwd)
+
+        server._on_compute_host_turn_done(
+            "turn-1",
+            "stale-settle-live",
+            session,
+            {
+                "type": "turn.end",
+                "workspace_topology_base_generation": 0,
+                "workspace_topology_generation": 1,
+                "session_info": {
+                    "cwd": str(stale_settled_cwd),
+                    "cwd_owned": True,
+                    "explicit_cwd": True,
+                    "cwd_from_settle": True,
+                },
+                "session_info_emitted": False,
+            },
+        )
+
+        assert session["cwd"] == str(parent_cwd)
+        assert session["cwd_from_settle"] is False
+        assert parent_db.get_session(session_key)["cwd"] == str(parent_cwd)
+
+        # Drop all live authority and reconstruct through the real resume path.
+        server._sessions.pop("stale-settle-live", None)
+        _prepare_workspace_resume_runtime(monkeypatch, home, parent_db, home)
+        resumed = _resume_workspace_session(session_key, "cold")
+        resumed_sid = resumed["result"]["session_id"]
+        assert server._sessions[resumed_sid]["cwd"] == str(parent_cwd)
+        assert resumed["result"]["info"]["cwd_owned"] is True
+    finally:
+        server._sessions.pop("stale-settle-live", None)
+        if resumed_sid:
+            _close_workspace_test_session(resumed_sid, session_key)
+        child_db.close()
+        parent_db.close()
+        reset_hermes_home_override(token)
+
+
+def test_accepted_host_settle_persists_and_resumes(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    old_cwd = tmp_path / "old-workspace"
+    settled_cwd = tmp_path / "settled-workspace"
+    for path in (home, old_cwd, settled_cwd):
+        path.mkdir()
+    db = SessionDB(db_path=home / "state.db")
+    session_key = "accepted-settle-row"
+    db.create_session(session_key, source="desktop", cwd=str(old_cwd))
+    token = set_hermes_home_override(home)
+    resumed_sid = ""
+    session = _session(
+        agent=None,
+        session_key=session_key,
+        profile_home=str(home),
+        cwd=str(old_cwd),
+        cwd_owned=True,
+        explicit_cwd=False,
+        cwd_from_settle=False,
+        source="desktop",
+        running=True,
+        _compute_host_active=True,
+        _workspace_topology_generation=0,
+    )
+    session["agent"] = None
+    server._sessions["accepted-settle-live"] = session
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    try:
+        server._on_compute_host_turn_done(
+            "turn-1",
+            "accepted-settle-live",
+            session,
+            {
+                "type": "turn.end",
+                "workspace_topology_base_generation": 0,
+                "workspace_topology_generation": 1,
+                "session_info": {
+                    "cwd": str(settled_cwd),
+                    "cwd_owned": True,
+                    "explicit_cwd": True,
+                    "cwd_from_settle": True,
+                },
+                "session_info_emitted": False,
+            },
+        )
+
+        assert session["cwd"] == str(settled_cwd)
+        assert session["cwd_from_settle"] is True
+        assert db.get_session(session_key)["cwd"] == str(settled_cwd)
+
+        server._sessions.pop("accepted-settle-live", None)
+        _prepare_workspace_resume_runtime(monkeypatch, home, db, home)
+        resumed = _resume_workspace_session(session_key, "cold")
+        resumed_sid = resumed["result"]["session_id"]
+        assert server._sessions[resumed_sid]["cwd"] == str(settled_cwd)
+        assert resumed["result"]["info"]["cwd_owned"] is True
+    finally:
+        server._sessions.pop("accepted-settle-live", None)
+        if resumed_sid:
+            _close_workspace_test_session(resumed_sid, session_key)
+        db.close()
+        reset_hermes_home_override(token)
+
+
 def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):
@@ -5409,7 +6124,9 @@ def test_superseded_by_resume_is_recoverable_end_reason():
     assert "superseded_by_resume" not in server._RECLAIM_END_REASONS
 
 
-def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch):
+def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(
+    monkeypatch, tmp_path
+):
     """The lazy/unpersisted resume branch (no state.db row yet — every fresh
     Bot Chat) must ALSO rebind the transport and cancel the pending reap when
     it hands back a sentinel-parked live record. Found by live WS E2E after
@@ -5448,13 +6165,21 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         ),
     )
 
+    neutral_cwd = tmp_path / "neutral-workspace"
+    neutral_cwd.mkdir()
     session = _session(
         session_key="stored-lazy",
         transport=server._detached_ws_transport,
         running=False,
         history=[],
         profile_home=None,
+        cwd=str(neutral_cwd),
+        cwd_owned=False,
+        explicit_cwd=False,
+        source="desktop",
     )
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "")
+    monkeypatch.setattr(server, "_project_info_for_cwd", lambda *_args, **_kwargs: None)
     server._sessions["lazy-sid"] = session
 
     try:
@@ -5471,6 +6196,15 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         )
 
         assert resp is not None and resp["result"]["session_id"] == "lazy-sid"
+        assert resp["result"]["info"] == {
+            "branch": "",
+            "cwd": str(neutral_cwd),
+            "cwd_owned": False,
+            "lazy": True,
+            "model": server._resolve_model(),
+            "profile_name": "",
+            "project": None,
+        }
         assert session["transport"] is live_transport
         assert "lazy-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
@@ -14306,6 +15040,391 @@ def test_session_create_reports_requested_profile_name(monkeypatch, tmp_path):
         _clear()
 
 
+@pytest.mark.parametrize("profile", ["default", "coder"])
+@pytest.mark.parametrize("workspace_exists", [False, True])
+def test_desktop_detached_session_create_uses_profile_default_workspace(
+    monkeypatch, tmp_path, profile, workspace_exists
+):
+    from hermes_cli import projects_db as pdb
+
+    default_home = tmp_path / ".hermes"
+    named_home = default_home / "profiles" / "coder"
+    profile_home = default_home if profile == "default" else named_home
+    profile_home.mkdir(parents=True)
+    workspace = profile_home / "workspace"
+    if workspace_exists:
+        workspace.mkdir()
+    fallback_cwd = workspace if workspace_exists else profile_home
+    with pdb.connect_closing(profile_home / "projects.db") as conn:
+        pdb.create_project(
+            conn,
+            name="Neutral Cwd Project",
+            folders=[str(profile_home)],
+            primary_path=str(profile_home),
+        )
+
+    stale_config_cwd = tmp_path / "configured-project"
+    stale_env_cwd = tmp_path / "process-project"
+    for path in (stale_config_cwd, stale_env_cwd):
+        path.mkdir()
+
+    monkeypatch.setenv("TERMINAL_CWD", str(stale_env_cwd))
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"terminal": {"cwd": str(stale_config_cwd)}}
+    )
+    monkeypatch.setattr(server, "get_hermes_home", lambda: default_home)
+    monkeypatch.setattr(
+        server, "_profile_home", lambda name: named_home if name == "coder" else None
+    )
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "")
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    sid = None
+    session_key = ""
+    token = set_hermes_home_override(default_home)
+    try:
+        response = server._methods["session.create"](
+            "detached",
+            {"cols": 80, "profile": profile, "source": "desktop"},
+        )
+        sid = response["result"]["session_id"]
+        session_key = response["result"]["stored_session_id"]
+        session = server._sessions[sid]
+        assert response["result"]["info"]["cwd"] == str(fallback_cwd)
+        assert response["result"]["info"]["cwd_owned"] is False
+        assert session["cwd"] == str(fallback_cwd)
+        assert session["explicit_cwd"] is False
+        assert server._persisted_session_cwd(session) is None
+        assert response["result"]["info"]["project"] is None
+    finally:
+        if sid is not None:
+            _close_workspace_test_session(sid, session_key)
+        reset_hermes_home_override(token)
+
+
+def _close_workspace_test_session(sid: str, session_key: str) -> None:
+    """Use the runtime cleanup seams and release terminal cwd registration."""
+    if sid in server._sessions:
+        server._methods["session.close"]("workspace-test-close", {"session_id": sid})
+    from tools.terminal_tool import clear_task_env_overrides
+
+    clear_task_env_overrides(session_key)
+
+
+class _WorkspaceResumeAgent:
+    model = "test-model"
+    provider = "test-provider"
+    reasoning_config = None
+    service_tier = ""
+    tools = []
+
+    def close(self):
+        return None
+
+
+def _prepare_workspace_resume_runtime(monkeypatch, home, db, configured_cwd):
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: None)
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"terminal": {"cwd": str(configured_cwd)}}
+    )
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: _WorkspaceResumeAgent())
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *a, **k: threading.Event()
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    # Deferred history owns its hydration thread, but these tests stop at the
+    # reconstructed live record rather than building an external model client.
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+
+
+def _resume_workspace_session(session_key: str, mode: str) -> dict:
+    params = {"session_id": session_key, "source": "desktop"}
+    if mode == "deferred":
+        params["defer_history"] = True
+    elif mode == "eager":
+        params["eager_build"] = True
+    response = server._methods["session.resume"]("workspace-resume", params)
+    assert "error" not in response, response
+    return response
+
+
+@pytest.mark.parametrize("mode", ["cold", "deferred", "eager"])
+@pytest.mark.parametrize("owned", [False, True], ids=["detached", "explicit"])
+def test_desktop_create_restart_resume_preserves_workspace_ownership(
+    monkeypatch, tmp_path, mode, owned
+):
+    from hermes_cli import projects_db as pdb
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    neutral = home / "workspace"
+    workspace = tmp_path / "picked-workspace"
+    neutral.mkdir(parents=True)
+    workspace.mkdir()
+    token = set_hermes_home_override(home)
+    db = SessionDB(db_path=home / "state.db")
+    created_sid = resumed_sid = session_key = ""
+    try:
+        with pdb.connect_closing(home / "projects.db") as conn:
+            project_id = pdb.create_project(
+                conn,
+                name="Picked Project",
+                folders=[str(workspace)],
+                primary_path=str(workspace),
+            )
+        project = {
+            "id": project_id,
+            "name": "Picked Project",
+            "primary_path": str(workspace),
+            "slug": "picked-project",
+        }
+        _prepare_workspace_resume_runtime(monkeypatch, home, db, home)
+
+        create_params = {"source": "desktop"}
+        if owned:
+            create_params["cwd"] = str(workspace)
+        created = server._methods["session.create"](
+            "workspace-create", create_params
+        )["result"]
+        created_sid = created["session_id"]
+        session_key = created["stored_session_id"]
+        server._ensure_session_db_row(server._sessions[created_sid])
+        assert db.get_session(session_key)["cwd"] == (str(workspace) if owned else None)
+        if not owned and mode == "cold":
+            db._conn.execute("UPDATE sessions SET source='' WHERE id=?", (session_key,))
+            db._conn.commit()
+            monkeypatch.setattr(server, "_resolve_session_platform", lambda: "tui")
+        _close_workspace_test_session(created_sid, session_key)
+        created_sid = ""
+
+        resumed = _resume_workspace_session(session_key, mode)
+        resumed_sid = resumed["result"]["session_id"]
+        record = server._sessions[resumed_sid]
+        if mode == "deferred":
+            assert record["resume_history_ready"].wait(2)
+
+        expected_cwd = workspace if owned else neutral
+        expected_project = project if owned else None
+        assert record["cwd"] == str(expected_cwd)
+        assert record["explicit_cwd"] is owned
+        assert resumed["result"]["info"]["cwd_owned"] is owned
+        assert resumed["result"]["info"]["project"] == expected_project
+        assert server._session_info(_WorkspaceResumeAgent(), record)["project"] == expected_project
+        assert db.get_session(session_key)["cwd"] == (str(workspace) if owned else None)
+
+        # A second resume exercises the warm live-reuse response, not a builder.
+        warm = _resume_workspace_session(session_key, "cold")["result"]
+        assert warm["session_id"] == resumed_sid
+        assert warm["info"]["cwd_owned"] is owned
+    finally:
+        if created_sid:
+            _close_workspace_test_session(created_sid, session_key)
+        if resumed_sid:
+            _close_workspace_test_session(resumed_sid, session_key)
+        db.close()
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize(
+    ("stored_source", "request_source", "stored_cwd", "owned", "explicit", "cwd_kind"),
+    [
+        ("", "desktop", None, False, False, "neutral"),
+        ("tui", "desktop", None, True, False, "default"),
+        ("desktop", "tui", "picked", True, True, "picked"),
+    ],
+)
+def test_reconstruct_cwd_uses_stored_topology_then_explicit_request_source(
+    monkeypatch, tmp_path, stored_source, request_source, stored_cwd, owned, explicit, cwd_kind
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    neutral = home / "workspace"
+    neutral.mkdir()
+    monkeypatch.setattr(server, "_resolve_session_platform", lambda: "tui")
+
+    picked = tmp_path / "picked"
+    picked.mkdir()
+    cwd, actual_owned, actual_explicit = server._reconstruct_session_cwd(
+        {"cwd": str(picked) if stored_cwd else None, "source": stored_source},
+        home,
+        request_source=request_source,
+    )
+
+    expected_cwd = {
+        "default": Path(server._default_session_cwd()),
+        "neutral": neutral,
+        "picked": picked,
+    }[cwd_kind]
+    assert (cwd, actual_owned, actual_explicit) == (str(expected_cwd), owned, explicit)
+
+
+def test_named_profile_session_info_resolves_project_from_its_own_db(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import projects_db as pdb
+
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "coder"
+    workspace = tmp_path / "coder-project"
+    launch_home.mkdir()
+    profile_home.mkdir(parents=True)
+    workspace.mkdir()
+    with pdb.connect_closing(profile_home / "projects.db") as conn:
+        project_id = pdb.create_project(
+            conn,
+            name="Coder Project",
+            folders=[str(workspace)],
+            primary_path=str(workspace),
+        )
+
+    token = set_hermes_home_override(launch_home)
+    try:
+        session = {
+            "cwd": str(workspace),
+            "cwd_owned": True,
+            "explicit_cwd": True,
+            "history_lock": threading.Lock(),
+            "profile_home": str(profile_home),
+            "session_key": "named-project",
+            "source": "desktop",
+        }
+        monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "")
+        info = server._session_info(_WorkspaceResumeAgent(), session)
+        assert info["project"] == {
+            "id": project_id,
+            "name": "Coder Project",
+            "primary_path": str(workspace),
+            "slug": "coder-project",
+        }
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_workspace_ownership_survives_turn_isolation_frame_and_fallback_record(
+    tmp_path,
+):
+    detached = {
+        "cols": 80,
+        "cwd": str(tmp_path),
+        "cwd_owned": False,
+        "explicit_cwd": False,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": "detached-frame",
+        "source": "desktop",
+    }
+
+    frame = server._compute_host_turn_frame("rid", "sid", detached, "hello")
+    record = server._deferred_session_record(
+        "detached-frame",
+        cols=80,
+        cwd=str(tmp_path),
+        history=[],
+        lease=None,
+        source="desktop",
+        explicit_cwd=False,
+        cwd_owned=False,
+    )
+
+    assert frame["cwd_owned"] is False
+    assert frame["explicit_cwd"] is False
+    assert record["cwd_owned"] is False
+    assert record["explicit_cwd"] is False
+
+
+@pytest.mark.parametrize("projection", ["lazy", "fallback", "built", "status"])
+def test_every_info_projection_heals_dead_neutral_cwd(
+    monkeypatch, tmp_path, projection
+):
+    live = tmp_path / "live"
+    live.mkdir()
+    session = {
+        "agent": None,
+        "cwd": str(live / "dead"),
+        "cwd_owned": False,
+        "explicit_cwd": False,
+        "history_lock": threading.Lock(),
+        "session_key": "dead-neutral",
+        "source": "desktop",
+    }
+    monkeypatch.setattr(server, "_git_common_repo_root_for_cwd", lambda _cwd: "")
+    monkeypatch.setattr(server, "_git_repo_root_for_cwd", lambda _cwd: "")
+    monkeypatch.setattr(
+        server,
+        "_project_info_for_cwd",
+        lambda cwd, *_args, **_kwargs: (
+            {
+                "id": "wrong-neutral-project",
+                "name": "Wrong Neutral Project",
+                "primary_path": str(live),
+                "slug": "wrong-neutral-project",
+            }
+            if cwd
+            else None
+        ),
+    )
+    if projection == "status":
+        server._sessions["dead-neutral-status"] = session
+        try:
+            response = server._methods["session.status"](
+                "rid", {"session_id": "dead-neutral-status"}
+            )
+            assert "result" in response
+            assert "Project:" not in response["result"]["output"]
+            assert session["cwd"] == str(live)
+        finally:
+            server._sessions.pop("dead-neutral-status", None)
+        return
+    else:
+        info = {
+            "lazy": lambda: server._lazy_resume_info(session),
+            "fallback": lambda: server._fallback_session_info(session),
+            "built": lambda: server._session_info(_WorkspaceResumeAgent(), session),
+        }[projection]()
+    assert (info["cwd"], info["cwd_owned"], info["project"]) == (
+        str(live),
+        False,
+        None,
+    )
+
+
+@pytest.mark.parametrize("mode", ["deferred", "eager"])
+def test_legacy_tui_null_cwd_persistence_is_resume_mode_independent(
+    monkeypatch, tmp_path, mode
+):
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    workspace = home / "workspace"
+    workspace.mkdir(parents=True)
+    token = set_hermes_home_override(home)
+    db = SessionDB(db_path=home / "state.db")
+    resumed_sid = ""
+    try:
+        db.create_session("legacy-tui-null", source="tui", cwd=None)
+        _prepare_workspace_resume_runtime(monkeypatch, home, db, workspace)
+        resumed = _resume_workspace_session("legacy-tui-null", mode)
+        resumed_sid = resumed["result"]["session_id"]
+        if mode == "deferred":
+            assert server._sessions[resumed_sid]["resume_history_ready"].wait(2)
+        assert db.get_session("legacy-tui-null")["cwd"] == str(workspace)
+        assert resumed["result"]["info"]["cwd_owned"] is True
+    finally:
+        if resumed_sid:
+            _close_workspace_test_session(resumed_sid, "legacy-tui-null")
+        db.close()
+        reset_hermes_home_override(token)
+
+
 def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path):
     """Issue #62503: delete must target the profile state.db + sessions dir."""
     profile_home = tmp_path / "profiles" / "mlperf"
@@ -14594,7 +15713,13 @@ def test_teardown_ends_session_in_profile_db(monkeypatch, tmp_path):
     assert str(seen.get("db_path")).endswith("state.db")
 
 
-def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("parent_owned", "parent_explicit"),
+    [(False, False), (True, True)],
+)
+def test_session_branch_writes_to_parent_profile_db(
+    monkeypatch, tmp_path, parent_owned, parent_explicit
+):
     """session.branch must copy history into the parent's profile state.db."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
@@ -14630,6 +15755,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
             seen["created"] = new_key
             seen["parent"] = kwargs.get("parent_session_id")
             seen["profile_name"] = kwargs.get("profile_name")
+            seen["created_cwd"] = kwargs.get("cwd")
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
@@ -14664,11 +15790,13 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         "running": False,
         "cols": 80,
         "profile_home": str(profile_home),
-        "source": "tui",
+        "source": "desktop",
         "agent": FakeAgent(),
         "created_at": 1.0,
         "last_active": 1.0,
         "cwd": str(tmp_path),
+        "cwd_owned": parent_owned,
+        "explicit_cwd": parent_explicit,
     }
     server._sessions["parent"] = parent
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
@@ -14705,7 +15833,12 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         assert seen.get("launch") is None
         assert seen.get("launch_create") is None
         child_sid = resp["result"]["session_id"]
-        assert server._sessions[child_sid]["profile_home"] == str(profile_home)
+        child = server._sessions[child_sid]
+        assert child["profile_home"] == str(profile_home)
+        assert seen["created_cwd"] == (str(tmp_path) if parent_owned else None)
+        assert child["cwd_owned"] is parent_owned
+        assert child["explicit_cwd"] is parent_explicit
+        assert resp["result"]["info"]["cwd_owned"] is parent_owned
         # The branched AGENT must be bound to the parent profile's state.db —
         # not just the row. Otherwise its own flushes (and a later compression
         # rotation) land on the launch db, splitting the lineage again.
@@ -19509,7 +20642,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         server._sessions.pop("sid_trim", None)
 
 
-def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch):
+def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch, tmp_path):
     """A lazily-resumed session must report ITS workspace, not the gateway's.
 
     ``_fallback_session_info`` used ``_default_session_cwd()`` — the directory the
@@ -19521,9 +20654,11 @@ def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch):
     monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
-    info = server._fallback_session_info({"cwd": "/projects/session-own-repo"})
+    session_cwd = tmp_path / "session-own-repo"
+    session_cwd.mkdir()
+    info = server._fallback_session_info({"cwd": str(session_cwd)})
 
-    assert info["cwd"] == "/projects/session-own-repo"
+    assert info["cwd"] == str(session_cwd)
     assert info["branch"] == "bb/feature"
 
 
@@ -21039,7 +22174,13 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
         lambda cwd: str(new_cwd),
     )
 
-    live = {"session_key": target, "running": True, "cwd": str(tmp_path / "old-project")}
+    live = {
+        "session_key": target,
+        "running": True,
+        "cwd": str(tmp_path / "old-project"),
+        "cwd_owned": False,
+        "source": "desktop",
+    }
     server._sessions["live-sid"] = live
     monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
 
@@ -21052,3 +22193,67 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+    assert live.get("cwd_owned") is True
+
+
+def test_workspace_move_db_failure_does_not_publish_live_topology(
+    monkeypatch, tmp_path
+):
+    target = "stored-running-session"
+    old_cwd = tmp_path / "old-project"
+    new_cwd = tmp_path / "dest-project"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def update_session_cwd(self, *_args, **_kwargs):
+            raise OSError("disk write failed")
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_db(_params):
+        yield FakeDB()
+
+    live = _session(
+        agent=None,
+        session_key=target,
+        running=True,
+        cwd=str(old_cwd),
+        cwd_owned=False,
+        explicit_cwd=False,
+        cwd_from_settle=False,
+        source="desktop",
+        _workspace_topology_generation=4,
+    )
+    live["agent"] = None
+    server._sessions["live-sid"] = live
+    emitted = []
+    monkeypatch.setattr(server, "_profile_db", fake_db)
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "main")
+    monkeypatch.setattr(
+        server, "_git_common_repo_root_for_cwd", lambda _cwd: str(new_cwd)
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    try:
+        result = server._methods["session.workspace.move"](
+            "move-1", {"session_key": target, "cwd": str(new_cwd)}
+        )
+
+        assert result["error"]["code"] == 5007
+        assert live["cwd"] == str(old_cwd)
+        assert live["cwd_owned"] is False
+        assert live["explicit_cwd"] is False
+        assert live["cwd_from_settle"] is False
+        assert live["_workspace_topology_generation"] == 4
+        assert not emitted
+    finally:
+        server._sessions.pop("live-sid", None)

@@ -48,6 +48,557 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
     assert _default_workers() == 8
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+def test_compute_host_reconstructs_workspace_ownership(monkeypatch, tmp_path, fallback):
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    sid = f"ownership-{'fallback' if fallback else 'native'}"
+    agent = object()
+    monkeypatch.setattr(server, "_make_agent", lambda *args, **kwargs: agent)
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *_args: False)
+
+    def init_session(init_sid, key, init_agent, history, **kwargs):
+        if fallback:
+            raise RuntimeError("boom")
+        server._sessions[init_sid] = {
+            "agent": init_agent,
+            "cwd": kwargs["cwd"],
+            "cwd_owned": kwargs["cwd_owned"],
+            "explicit_cwd": kwargs["explicit_cwd"],
+            "history": history,
+            "history_lock": threading.Lock(),
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(server, "_init_session", init_session)
+
+    frame = {
+        "cols": 80,
+        "cwd": str(tmp_path),
+        "cwd_owned": False,
+        "explicit_cwd": False,
+        "history": [],
+        "session_key": "detached-host",
+        "sid": sid,
+        "source": "desktop",
+    }
+    try:
+        session = host._ensure_server_session(server, frame)
+        assert session["cwd_owned"] is False
+        assert session["explicit_cwd"] is False
+        assert session["_defer_compute_host_session_info"] is True
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_compute_host_fallback_preserves_absent_legacy_cwd_ownership(monkeypatch, tmp_path):
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    sid = "legacy-fallback-ownership"
+    monkeypatch.setattr(server, "_make_agent", lambda *args, **kwargs: object())
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *_args: False)
+    monkeypatch.setattr(
+        server,
+        "_init_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    frame = {
+        "cols": 80,
+        "cwd": str(tmp_path),
+        "explicit_cwd": False,
+        "history": [],
+        "session_key": "legacy-tui-host",
+        "sid": sid,
+        "source": "tui",
+    }
+    try:
+        session = host._ensure_server_session(server, frame)
+        assert "cwd_owned" not in session
+        assert server._session_owns_cwd(session) is True
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_compute_host_reused_session_refreshes_actual_terminal_cwd(
+    monkeypatch, tmp_path
+):
+    """A newer parent topology must reach the host's real terminal resolver."""
+    from tools import terminal_tool
+
+    old_cwd = tmp_path / "old-workspace"
+    new_cwd = tmp_path / "new-workspace"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    sid = "reused-host-cwd"
+    session_key = "stored-reused-host-cwd"
+    session = {
+        "agent": object(),
+        "cwd": str(old_cwd),
+        "cwd_owned": True,
+        "explicit_cwd": True,
+        "cwd_from_settle": False,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": session_key,
+        "_workspace_topology_generation": 0,
+    }
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+
+    # Keep this production-path terminal invocation hermetic while still using
+    # the real LocalEnvironment and foreground cwd-resolution chain.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(old_cwd))
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+
+    server._sessions[sid] = session
+    server._register_session_cwd(session)
+    assert terminal_tool.get_session_cwd(session_key) == str(old_cwd)
+
+    try:
+        before_update = json.loads(
+            terminal_tool.terminal_tool(command="pwd", task_id=session_key)
+        )
+        assert before_update["exit_code"] == 0, before_update
+        assert os.path.realpath(
+            before_update["output"].strip()
+        ) == os.path.realpath(str(old_cwd))
+
+        updated = host._ensure_server_session(
+            server,
+            {
+                "sid": sid,
+                "session_key": session_key,
+                "cwd": str(new_cwd),
+                "cwd_owned": True,
+                "explicit_cwd": True,
+                "cwd_from_settle": False,
+                "workspace_topology_generation": 1,
+            },
+        )
+        assert updated["cwd"] == str(new_cwd)
+        assert updated["_workspace_topology_generation"] == 1
+
+        result = json.loads(
+            terminal_tool.terminal_tool(command="pwd", task_id=session_key)
+        )
+        assert result["exit_code"] == 0, result
+        assert os.path.realpath(result["output"].strip()) == os.path.realpath(
+            str(new_cwd)
+        )
+
+        transient = json.loads(
+            terminal_tool.terminal_tool(
+                command="pwd", task_id=session_key, workdir=str(old_cwd)
+            )
+        )
+        assert transient["exit_code"] == 0, transient
+        assert os.path.realpath(transient["output"].strip()) == os.path.realpath(
+            str(old_cwd)
+        )
+        after_transient = json.loads(
+            terminal_tool.terminal_tool(command="pwd", task_id=session_key)
+        )
+        assert after_transient["exit_code"] == 0, after_transient
+        assert os.path.realpath(
+            after_transient["output"].strip()
+        ) == os.path.realpath(str(new_cwd))
+    finally:
+        terminal_tool.cleanup_all_environments()
+        terminal_tool.clear_task_env_overrides(session_key)
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_compute_host_reused_session_rejects_stale_topology_and_skips_noop_reset(
+    monkeypatch, tmp_path
+):
+    from tools import terminal_tool
+
+    current_cwd = tmp_path / "current-workspace"
+    stale_cwd = tmp_path / "stale-workspace"
+    shell_cwd = tmp_path / "shell-subdirectory"
+    current_cwd.mkdir()
+    stale_cwd.mkdir()
+    shell_cwd.mkdir()
+    sid = "host-topology-ordering"
+    session = {
+        "agent": object(),
+        "cwd": str(current_cwd),
+        "cwd_owned": True,
+        "explicit_cwd": True,
+        "cwd_from_settle": False,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": "stored-host-topology-ordering",
+        "_workspace_topology_generation": 2,
+    }
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    resets = []
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(
+        server,
+        "_finish_explicit_session_cwd_change",
+        lambda current, resolved, *, persist: resets.append(
+            (current["cwd"], resolved, persist)
+        ),
+    )
+    server._sessions[sid] = session
+    server._register_session_cwd(session)
+    terminal_tool.record_session_cwd(session["session_key"], str(shell_cwd))
+
+    try:
+        for stale_generation in (1, 2):
+            host._ensure_server_session(
+                server,
+                {
+                    "sid": sid,
+                    "session_key": session["session_key"],
+                    "cwd": str(stale_cwd),
+                    "cwd_owned": False,
+                    "explicit_cwd": False,
+                    "cwd_from_settle": True,
+                    "workspace_topology_generation": stale_generation,
+                },
+            )
+            assert session["cwd"] == str(current_cwd)
+            assert session["cwd_owned"] is True
+            assert session["explicit_cwd"] is True
+            assert session["cwd_from_settle"] is False
+            assert session["_workspace_topology_generation"] == 2
+            assert terminal_tool.get_session_cwd(session["session_key"]) == str(
+                shell_cwd
+            )
+
+        # A causally newer explicit move re-anchors an active shell even when
+        # its topology tuple is idempotent, but does not tear down/reseed the
+        # host environment because its workspace/backend topology is unchanged.
+        host._ensure_server_session(
+            server,
+            {
+                "sid": sid,
+                "session_key": session["session_key"],
+                "cwd": str(current_cwd),
+                "cwd_owned": True,
+                "explicit_cwd": True,
+                "cwd_from_settle": False,
+                "workspace_topology_generation": 3,
+            },
+        )
+        assert session["_workspace_topology_generation"] == 3
+        assert terminal_tool.get_session_cwd(session["session_key"]) == str(
+            current_cwd
+        )
+        assert resets == []
+    finally:
+        terminal_tool.clear_task_env_overrides(session["session_key"])
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+@pytest.mark.parametrize(
+    ("source", "frame_extra", "expected_owned"),
+    [
+        ("tui", {}, True),
+        (
+            "desktop",
+            {
+                "cwd_owned": False,
+                "workspace_topology_generation": 1,
+            },
+            False,
+        ),
+    ],
+    ids=["legacy-absent-cwd-owned", "detached-neutral"],
+)
+def test_compute_host_reused_session_preserves_workspace_ownership_registration(
+    monkeypatch, tmp_path, source, frame_extra, expected_owned
+):
+    from tools import terminal_tool
+
+    old_cwd = tmp_path / f"{source}-old"
+    new_cwd = tmp_path / f"{source}-new"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    sid = f"host-{source}-ownership"
+    session_key = f"stored-host-{source}-ownership"
+    session = {
+        "agent": object(),
+        "cwd": str(old_cwd),
+        "explicit_cwd": False,
+        "cwd_from_settle": False,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": session_key,
+        "source": source,
+    }
+    if source == "desktop":
+        session["cwd_owned"] = False
+        session["_workspace_topology_generation"] = 0
+
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    server._sessions[sid] = session
+    server._register_session_cwd(session)
+
+    try:
+        host._ensure_server_session(
+            server,
+            {
+                "sid": sid,
+                "session_key": session_key,
+                "cwd": str(new_cwd),
+                "explicit_cwd": False,
+                **frame_extra,
+            },
+        )
+        assert ("cwd_owned" in session) is (source == "desktop")
+        assert server._session_owns_cwd(session) is expected_owned
+        assert terminal_tool.get_session_cwd(session_key) == str(new_cwd)
+        assert terminal_tool.resolve_task_overrides(session_key) == {
+            "cwd": str(new_cwd),
+            "cwd_source": "session",
+        }
+    finally:
+        terminal_tool.clear_task_env_overrides(session_key)
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_compute_host_turn_end_returns_host_workspace_topology(monkeypatch, tmp_path):
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    settled_cwd = tmp_path / "settled-project"
+    settled_cwd.mkdir()
+    session = {
+        "agent": object(),
+        "cwd": str(tmp_path),
+        "cwd_owned": False,
+        "explicit_cwd": False,
+        "cwd_from_settle": False,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "session_key": "host-topology",
+    }
+    monkeypatch.setattr(host, "_ensure_server_session", lambda _server, _frame: session)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+
+    def run_prompt(*_args, **_kwargs):
+        with session["history_lock"]:
+            session.update(
+                {
+                    "cwd": str(settled_cwd),
+                    "cwd_owned": True,
+                    "explicit_cwd": True,
+                    "cwd_from_settle": True,
+                    "running": False,
+                }
+            )
+            server._bump_workspace_topology_generation_locked(session)
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session: {
+            "cwd": _session["cwd"],
+            "cwd_owned": _session["cwd_owned"],
+        },
+    )
+
+    try:
+        host._run_real_turn(
+            {
+                "request_id": "turn-topology",
+                "sid": "host-topology",
+                "text": "settle",
+                "workspace_topology_generation": 0,
+            }
+        )
+        turn_end = next(
+            frame
+            for frame in _json_lines(out)
+            if frame.get("type") == "turn.end"
+        )
+        assert turn_end["session_info"] == {
+            "cwd": str(settled_cwd),
+            "cwd_owned": True,
+            "explicit_cwd": True,
+            "cwd_from_settle": True,
+        }
+        assert turn_end["workspace_topology_base_generation"] == 0
+        assert turn_end["workspace_topology_generation"] == 1
+        assert turn_end["session_info_emitted"] is False
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("route_name", ["slash.prompt", "session.compress"])
+def test_compute_host_control_session_info_carries_topology_generations(
+    monkeypatch, route_name
+):
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    sid = f"control-topology-{route_name}"
+    session = {
+        "agent": object(),
+        "cwd": "/host/workspace",
+        "cwd_owned": True,
+        "explicit_cwd": True,
+        "cwd_from_settle": False,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 4,
+        "session_key": "stored-control-topology",
+        "_workspace_topology_generation": 3,
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session: {
+            "cwd": _session["cwd"],
+            "cwd_owned": _session["cwd_owned"],
+        },
+    )
+    monkeypatch.setattr(server, "_mirror_slash_side_effects", lambda *_args: "ok")
+    if route_name == "session.compress":
+        monkeypatch.setitem(
+            server._methods,
+            "session.compress",
+            lambda _rid, _params: {"result": {"status": "compressed"}},
+        )
+
+    try:
+        host._handle_control(
+            {
+                "type": "control",
+                "sid": sid,
+                "request_id": "control-1",
+                "route_name": route_name,
+                "command": "/prompt concise",
+                "workspace_topology_generation": 2,
+            }
+        )
+        ack = next(
+            frame
+            for frame in _json_lines(out)
+            if frame.get("type") == "control.ack"
+        )
+        assert ack["workspace_topology_base_generation"] == 2
+        assert ack["workspace_topology_generation"] == 3
+        assert ack["session_info"] == {
+            "cwd": "/host/workspace",
+            "cwd_owned": True,
+            "explicit_cwd": True,
+            "cwd_from_settle": False,
+        }
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_compute_host_control_defers_direct_session_info_until_parent_ack(
+    monkeypatch,
+):
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    sid = "stale-control-session-info"
+    session = {
+        "agent": object(),
+        "cwd": "/child/old",
+        "cwd_owned": False,
+        "explicit_cwd": False,
+        "cwd_from_settle": False,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 1,
+        "session_key": "stored-stale-control",
+        "transport": host._transport,
+        "_workspace_topology_generation": 0,
+        "_defer_compute_host_session_info": True,
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, current: {
+            "cwd": current["cwd"],
+            "cwd_owned": current["cwd_owned"],
+        },
+    )
+
+    def emit_before_ack(*_args):
+        server._emit(
+            "session.info",
+            sid,
+            {"cwd": "/child/old", "cwd_owned": False},
+        )
+        return "ok"
+
+    monkeypatch.setattr(server, "_mirror_slash_side_effects", emit_before_ack)
+
+    try:
+        host._handle_control(
+            {
+                "type": "control",
+                "sid": sid,
+                "request_id": "control-stale",
+                "route_name": "slash.prompt",
+                "command": "/prompt concise",
+                "workspace_topology_generation": 1,
+            }
+        )
+        frames = _json_lines(out)
+        assert not [frame for frame in frames if frame.get("type") == "rpc"]
+        ack = next(frame for frame in frames if frame.get("type") == "control.ack")
+        assert ack["workspace_topology_base_generation"] == 1
+        assert ack["workspace_topology_generation"] == 0
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_supervisor_still_forwards_ordinary_child_rpc(tmp_path):
+    forwarded = []
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "compute-host.json",
+        rpc_sink=forwarded.append,
+        autostart=False,
+    )
+    message = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": "message.delta",
+            "session_id": "sid",
+            "payload": {"text": "still forwarded"},
+        },
+    }
+
+    supervisor._handle_host_frame({"type": "rpc", "message": message})
+
+    assert forwarded == [message]
+
+
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "prompt.submit": "turn-path",

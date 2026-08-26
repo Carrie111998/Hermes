@@ -59,6 +59,7 @@ import {
   $yoloActive,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
+  releaseWorkspaceCwdOwner,
   resolveComposerSessionKey,
   sessionPinId,
   setActiveSessionId,
@@ -664,9 +665,13 @@ export function useSessionActions({
         openSessionTile(stored, dir, undefined, undefined, workspaceScope)
         patchSessionTile(stored, { runtimeId: created.session_id })
 
-        if (dir === 'center' && runtimeInfo?.cwd) {
-          setCurrentCwdTransient(runtimeInfo.cwd)
-          setWorkspaceCwdOwner(stored)
+        if (dir === 'center' && runtimeInfo?.cwd !== undefined) {
+          if (runtimeInfo.cwd && runtimeInfo.cwdOwned !== false) {
+            setCurrentCwdTransient(runtimeInfo.cwd)
+            setWorkspaceCwdOwner(stored)
+          } else {
+            releaseWorkspaceCwdOwner()
+          }
         }
 
         revealTreePane(`session-tile:${stored}`)
@@ -905,13 +910,19 @@ export function useSessionActions({
           setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
           syncSessionStateToView(cachedRuntimeId, cachedViewState)
-          setCurrentCwdTransient(cachedViewState.cwd)
-          // The warm cache IS this conversation's own workspace truth, so the
-          // switch is already re-homed here. This claim cannot wait for
-          // `session.activate`: its missing-RPC compat branch returns before
-          // `applyRuntimeInfo` runs, which would leave the workspace marked
-          // un-owned for the life of the session (#71254).
-          setWorkspaceCwdOwner(storedSessionId)
+
+          if (cachedViewState.cwd && cachedViewState.cwdOwned !== false) {
+            setCurrentCwdTransient(cachedViewState.cwd)
+            // The warm cache IS this conversation's own workspace truth, so the
+            // switch is already re-homed here. This claim cannot wait for
+            // `session.activate`: its missing-RPC compat branch returns before
+            // `applyRuntimeInfo` runs, which would leave the workspace marked
+            // un-owned for the life of the session (#71254).
+            setWorkspaceCwdOwner(storedSessionId)
+          } else {
+            releaseWorkspaceCwdOwner()
+          }
+
           setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
 
@@ -1458,7 +1469,7 @@ export function useSessionActions({
 
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
-        patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
+        patchSessionWorkspace(storedSessionId, runtimeInfo)
 
         // Preserve the turn-elapsed timer across cold resume: the gateway
         // reports when the in-flight turn started so the desktop can restore
@@ -1754,7 +1765,7 @@ export function useSessionActions({
         )
 
         const runtimeInfo = applyRuntimeInfo(branched.info, { foreground: false })
-        patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
+        patchSessionWorkspace(routedSessionId, runtimeInfo)
 
         if (runtimeInfo) {
           updateSessionState(branched.session_id, state => ({ ...state, ...runtimeInfo }), routedSessionId)

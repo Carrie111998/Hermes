@@ -693,6 +693,8 @@ export interface SessionRuntimeInfo {
   config_warning?: string
   credential_warning?: string
   cwd?: string
+  /** False when cwd is only the backend's execution fallback, not a workspace. */
+  cwd_owned?: boolean
   desktop_contract?: number
   fast?: boolean
   install_warning?: string
