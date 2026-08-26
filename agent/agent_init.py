@@ -2003,6 +2003,12 @@ def init_agent(
                                 _init_kwargs["session_title"] = _st
                         except Exception:
                             pass
+                    # Thread the parent's session_id so a provider can tell the
+                    # fork shapes apart (documented in the provider-plugin API).
+                    # Every provider.initialize() takes **kwargs, so this is a
+                    # no-op for providers that ignore it.
+                    if agent._parent_session_id:
+                        _init_kwargs["parent_session_id"] = agent._parent_session_id
                     # Thread gateway user identity for per-user memory scoping
                     if agent._user_id:
                         _init_kwargs["user_id"] = agent._user_id
