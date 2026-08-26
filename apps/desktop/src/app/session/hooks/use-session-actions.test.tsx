@@ -3244,6 +3244,55 @@ describe('openNewSessionTile workspace target', () => {
 
     expect(createParams).not.toHaveProperty('cwd')
   })
+
+  it('uses the Bot profile default instead of leaking the ambient composer model', async () => {
+    setCurrentModel('ambient-model')
+    setCurrentProvider('ambient-provider')
+
+    let createParams: Record<string, unknown> | undefined
+
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method, params) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return {
+          info: { cwd: '', model: 'profile-default-model', tools: {}, skills: {} },
+          session_id: RUNTIME_SESSION_ID,
+          stored_session_id: 'stored-bot-tile'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const route = {
+      connectionId: 'local',
+      mode: 'local' as const,
+      profile: 'writer',
+      targetProfile: 'writer'
+    }
+
+    await act(async () => {
+      await handle!.openNewSessionTile('center', {
+        listed: false,
+        route,
+        workspaceScope: {
+          ownerRoute: route,
+          workspaceMode: 'bots',
+          workspaceOwnerKey: 'bot:local::writer'
+        }
+      })
+    })
+
+    expect(createParams).toMatchObject({ hidden: true, profile: 'writer' })
+    expect(createParams).not.toHaveProperty('model')
+    expect(createParams).not.toHaveProperty('provider')
+  })
 })
 describe('selectSidebarItem', () => {
   it('fronts the workspace pane when navigating to a sidebar route (issue #72602)', async () => {

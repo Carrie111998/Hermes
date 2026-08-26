@@ -213,7 +213,8 @@ function reconcileAuthoritativeMessages(
 // never the profile default (that lives in Settings → Model).
 async function desktopSessionCreateParams(
   cwd: string,
-  capturedRoute = $newChatRoute.get()
+  capturedRoute = $newChatRoute.get(),
+  includeComposerModel = true
 ): Promise<Record<string, unknown>> {
   // Treat Send as the linearization point for the visible selector state. The
   // profile handshake below can yield long enough for background config/model
@@ -239,7 +240,7 @@ async function desktopSessionCreateParams(
     source: 'desktop',
     ...(cwd && { cwd }),
     ...(profile ? { profile: capturedRoute?.targetProfile || profile } : {}),
-    ...(selection.model
+    ...(includeComposerModel && selection.model
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
@@ -613,8 +614,13 @@ export function useSessionActions({
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
 
+        // Bot-workspace tabs target an agent profile without switching the
+        // window's ambient composer. Do not leak that unrelated session's
+        // model/provider into the Bot chat; omitting both lets the selected
+        // profile supply its configured default. Ordinary Sessions tiles keep
+        // the sticky composer override.
         const params = {
-          ...(await desktopSessionCreateParams(cwd, capturedRoute)),
+          ...(await desktopSessionCreateParams(cwd, capturedRoute, workspaceScope.workspaceMode !== 'bots')),
           ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
         }
 
