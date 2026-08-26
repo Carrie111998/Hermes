@@ -194,6 +194,30 @@ class TestBackup:
         assert "skills/example/browser-automation/README.md" in names
 
 
+    @pytest.mark.parametrize("factory_name", ["create_pre_update_backup", "create_pre_migration_backup"])
+    def test_automatic_full_zip_prunes_root_browser_automation_but_keeps_nested_user_content(
+        self, tmp_path, factory_name
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        runtime = hermes_home / "browser-automation/chrome-profile"
+        runtime.mkdir(parents=True)
+        (runtime / "first_party_sets.db").write_bytes(b"locked runtime")
+        nested = hermes_home / "skills/example/browser-automation"
+        nested.mkdir(parents=True)
+        (nested / "README.md").write_text("user content\n")
+
+        import hermes_cli.backup as backup_mod
+
+        out_zip = getattr(backup_mod, factory_name)(hermes_home=hermes_home, keep=2)
+
+        assert out_zip is not None
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            names = zf.namelist()
+        assert not any(name.startswith("browser-automation/") for name in names)
+        assert "skills/example/browser-automation/README.md" in names
+
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
         """SQLite staging temp files must be created on the output zip's
         filesystem (dir=out_path.parent), NOT the system /tmp default — a

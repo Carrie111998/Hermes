@@ -344,6 +344,25 @@ def _should_exclude(rel_path: Path) -> bool:
     return False
 
 
+def _prune_excluded_dirs(dirnames: List[str], rel_dir: Path) -> set[str]:
+    """Prune an ``os.walk`` directory list using root-aware exclusions.
+
+    ``rel_dir`` is relative to HERMES_HOME.  Runtime/code directories in
+    ``_ROOT_ONLY_EXCLUDED_DIRS`` are excluded only as direct children of the
+    root so identically named nested user content remains backup-eligible.
+    Returns the names removed from ``dirnames``.
+    """
+    is_root = rel_dir == Path(".")
+    original = set(dirnames)
+    dirnames[:] = [
+        name
+        for name in dirnames
+        if name not in _EXCLUDED_DIRS
+        or (name in _ROOT_ONLY_EXCLUDED_DIRS and not is_root)
+    ]
+    return original - set(dirnames)
+
+
 def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> bool:
     """Return True when a candidate file should not be written to a backup zip."""
     if _should_exclude(rel_path):
@@ -830,13 +849,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         # Prune excluded directories in-place so os.walk doesn't descend
         # Root runtime/code directories are pruned only at root; nested user
         # content with the same names must be preserved.
-        is_root = rel_dir == Path(".")
-        orig_dirnames = dirnames[:]
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in _EXCLUDED_DIRS or (d in _ROOT_ONLY_EXCLUDED_DIRS and not is_root)
-        ]
-        for removed in set(orig_dirnames) - set(dirnames):
+        for removed in _prune_excluded_dirs(dirnames, rel_dir):
             skipped_dirs.add(str(rel_dir / removed))
 
         for fname in filenames:
@@ -2095,7 +2108,8 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
             # Prune excluded directories in-place so os.walk doesn't descend
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+            rel_dir = dp.relative_to(hermes_root)
+            _prune_excluded_dirs(dirnames, rel_dir)
 
             for fname in filenames:
                 fpath = dp / fname
