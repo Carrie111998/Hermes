@@ -7968,6 +7968,55 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+_WORKTREE_ENVIRONMENT_NAMES = (".venv", "venv")
+
+
+def _bootstrap_worktree_environments(repo_root: Path, target: Path) -> None:
+    """Link project-local ignored environments into a child worktree when absent.
+
+    Environment contents are deliberately never copied.  A symlinked source is
+    accepted only when its resolved target remains inside the project root; a
+    pre-existing destination, including a broken symlink, is left untouched.
+    """
+    try:
+        source_root = repo_root.resolve(strict=True)
+        target_root = target.resolve(strict=True)
+    except OSError as exc:
+        _log.warning("worktree environment bootstrap roots unavailable: %s", exc)
+        return
+
+    for environment_name in _WORKTREE_ENVIRONMENT_NAMES:
+        source = repo_root / environment_name
+        destination = target / environment_name
+        try:
+            if destination.exists() or destination.is_symlink() or not source.exists():
+                continue
+            resolved_source = source.resolve(strict=True)
+            resolved_destination = destination.resolve(strict=False)
+        except OSError as exc:
+            _log.warning(
+                "worktree environment bootstrap skipped %s: %s", environment_name, exc
+            )
+            continue
+        try:
+            source_is_project_local = resolved_source.is_relative_to(source_root)
+            destination_is_worktree_local = resolved_destination.is_relative_to(target_root)
+        except ValueError:
+            source_is_project_local = False
+            destination_is_worktree_local = False
+        if not source_is_project_local or not destination_is_worktree_local:
+            _log.warning("worktree environment bootstrap refused unsafe %s", environment_name)
+            continue
+        if not resolved_source.is_dir():
+            continue
+        try:
+            os.symlink(str(resolved_source), str(destination), target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            _log.warning(
+                "worktree environment bootstrap could not link %s: %s", environment_name, exc
+            )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -7975,6 +8024,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            _bootstrap_worktree_environments(repo_root, target)
             return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -7996,6 +8046,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    _bootstrap_worktree_environments(repo_root, target)
 
 
 def _resolve_worktree_workspace(
