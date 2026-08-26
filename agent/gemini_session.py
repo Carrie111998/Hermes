@@ -44,22 +44,101 @@ _SETTLE_SECONDS = 30.0
 _RETRY_BACKOFF_SECONDS = 7.5
 
 
-def _find_aistudio_target(http_url: str) -> Optional[str]:
-    """Return a webSocketDebuggerUrl for an existing aistudio.google.com tab."""
+#: Budget for the liveness probe below. Deliberately tiny next to
+#: _SETTLE_SECONDS: the whole point is to reject a dead tab in ~3s instead of
+#: discovering it 30s later.
+_LIVENESS_TIMEOUT = 3.0
+
+
+def _find_aistudio_targets(http_url: str) -> list[tuple[str, str]]:
+    """Return ``(target_id, webSocketDebuggerUrl)`` for every aistudio page tab.
+
+    A LIST, not the first match, so a caller can step past a dead one.
+    """
     import urllib.request
 
+    found: list[tuple[str, str]] = []
     try:
         with urllib.request.urlopen(f"{http_url}/json", timeout=3.0) as resp:
             targets = json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return None
+        return found
     for target in targets:
         if not isinstance(target, dict):
             continue
         url = str(target.get("url") or "")
         ws = str(target.get("webSocketDebuggerUrl") or "")
-        if url.startswith(_AISTUDIO_ORIGIN) and target.get("type") == "page" and ws:
+        tid = str(target.get("id") or "")
+        if url.startswith(_AISTUDIO_ORIGIN) and target.get("type") == "page" and ws and tid:
+            found.append((tid, ws))
+    return found
+
+
+def _target_is_responsive(ws_url: str, *, timeout: float = _LIVENESS_TIMEOUT) -> bool:
+    """Whether the tab's renderer executes JavaScript at all right now.
+
+    NOT the same failure as the wedged tab the fresh-tab retry below was built
+    for. A WEDGED tab is alive -- it runs JS, it just never completes the lazy
+    MakerSuiteService RPC chain, which is only observable by waiting out
+    _SETTLE_SECONDS. A FROZEN tab (Chrome's background-tab freezing/discarding)
+    executes nothing, and is observable in ~3s.
+
+    Telling them apart matters twice over. Diagnosed on grok_session
+    2026-08-25: a frozen tab still appears in /json/list with a valid
+    webSocketDebuggerUrl AND the websocket still CONNECTS, because that
+    handshake is browser-level, not renderer-level. Only an evaluation
+    distinguishes them, and against a frozen tab it HANGS to the full timeout
+    rather than erroring -- so without this probe a frozen tab costs the caller
+    a whole 30s settle window. That in turn made the fresh-tab retry
+    unaffordable: it is gated on budget_seconds covering backoff + settle
+    (37.5s), which the collector's per-provider fair share does not reach.
+    Spending 3s here instead leaves the retry within budget.
+    """
+    from websocket import create_connection
+
+    try:
+        ws = create_connection(ws_url, timeout=timeout, suppress_origin=True)
+    except Exception:
+        return False
+    try:
+        ws.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "1", "returnByValue": True},
+                }
+            )
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = ws.recv()
+            if isinstance(frame, bytes):
+                frame = frame.decode("utf-8")
+            message = json.loads(frame)
+            if message.get("id") == 1:          # skip interleaved events
+                return "error" not in message
+        return False
+    except Exception:
+        return False
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _live_aistudio_target(http_url: str) -> Optional[str]:
+    """First aistudio tab whose renderer actually answers, else None.
+
+    None means "go open a fresh tab" -- which is exactly what the caller
+    already does when no tab exists at all, so a frozen tab now takes the same
+    recovery path as a missing one.
+    """
+    for tid, ws in _find_aistudio_targets(http_url):
+        if _target_is_responsive(ws):
             return ws
+        logger.debug("gemini_session: aistudio tab %s is frozen; skipping", tid)
     return None
 
 
@@ -291,7 +370,9 @@ def fetch_gemini_budget_usage(
         logger.debug("gemini_session: no CDP browser on :%s", DEFAULT_BROWSER_CDP_PORT)
         return None
 
-    ws_url = _find_aistudio_target(http_url)
+    # A frozen tab reads as "no usable tab", so it falls into the open-a-fresh-tab
+    # branch below instead of costing a full settle window first.
+    ws_url = _live_aistudio_target(http_url)
     fresh_target_id: Optional[str] = None
     try:
         if ws_url is not None:
