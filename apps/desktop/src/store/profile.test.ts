@@ -26,6 +26,8 @@ const {
   ensureGatewayProfile,
   invalidateProfileListFetches,
   prewarmProfileBackend,
+  profileLabel,
+  profileWearsHomeGlyph,
   refreshProfiles
 } = await import('./profile')
 
@@ -237,5 +239,43 @@ describe('stale profile-list fetches across a backend switch (#85731)', () => {
     await oldFetch
 
     expect($profiles.get().map(profile => profile.name)).toEqual(['default', 'coder'])
+  })
+})
+
+describe('profileWearsHomeGlyph — who gets a face (#92033)', () => {
+  it('keeps the home glyph while the default profile is anonymous', () => {
+    expect(profileWearsHomeGlyph(profile('default', true))).toBe(true)
+  })
+
+  it('drops the home glyph once the default profile is display-renamed', () => {
+    // `hermes profile rename default <Name>` sets display_name and leaves the
+    // canonical id alone — that rename is the whole trigger.
+    expect(profileWearsHomeGlyph({ ...profile('default', true), display_name: 'Hermes' })).toBe(false)
+  })
+
+  it('treats a blank display name as no name at all', () => {
+    expect(profileWearsHomeGlyph({ ...profile('default', true), display_name: '   ' })).toBe(true)
+  })
+
+  it('agrees with profileLabel — the mark appears exactly when the label is not the id', () => {
+    // Both helpers read `display_name` through the same trim, so the mark and
+    // the tooltip can never disagree about which name a profile is wearing.
+    // Pinned here so a refactor of either one has to keep them in step.
+    for (const profileUnderTest of [
+      profile('default', true),
+      { ...profile('default', true), display_name: 'Hermes' },
+      { ...profile('default', true), display_name: '   ' },
+      profile('work'),
+      { ...profile('work'), display_name: 'Work' }
+    ]) {
+      const labelIsTheCanonicalId = profileLabel(profileUnderTest) === profileUnderTest.name
+
+      expect(profileWearsHomeGlyph(profileUnderTest)).toBe(profileUnderTest.is_default && labelIsTheCanonicalId)
+    }
+  })
+
+  it('never claims the home glyph for a named profile', () => {
+    expect(profileWearsHomeGlyph(profile('work'))).toBe(false)
+    expect(profileWearsHomeGlyph({ ...profile('work'), display_name: 'Work' })).toBe(false)
   })
 })
