@@ -593,6 +593,8 @@ class MemoryStore:
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
+            if bak is _READ_FAILED:
+                return _read_failed_error(self._path_for(target))
             if bak:
                 return _drift_error(self._path_for(target), bak)
 
@@ -600,11 +602,11 @@ class MemoryStore:
             matches = [(i, e) for i, e in enumerate(entries) if regex.search(e)]
 
             if not matches:
-                return {
+                return self._consolidation_failure({
                     "success": False,
                     "error": f"No entry matched pattern '{pattern}'.",
                     "candidates": _fuzzy_candidates(pattern, entries),
-                }
+                })
 
             if len(matches) > 1:
                 # Mirror replace(): only auto-resolve ambiguity when every
@@ -612,7 +614,7 @@ class MemoryStore:
                 # tighten the pattern rather than guess which to rewrite.
                 unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
-                    previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
+                    previews = self._previews([e for _, e in matches])
                     return {
                         "success": False,
                         "error": f"Pattern '{pattern}' matched multiple entries. Tighten the pattern.",
@@ -631,7 +633,7 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(test_entries))
             if new_total > limit:
                 current = self._char_count(target)
-                return {
+                return self._consolidation_failure({
                     "success": False,
                     "error": (
                         f"Patch would put memory at {new_total:,}/{limit:,} chars. "
@@ -641,7 +643,7 @@ class MemoryStore:
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
-                }
+                })
 
             entries[idx] = new_entry
             self._set_entries(target, entries)
