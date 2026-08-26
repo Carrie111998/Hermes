@@ -107,8 +107,17 @@ class TestResolveTimezoneNameLogging:
         os.environ.pop("HERMES_TIMEZONE", None)
 
     def test_config_read_failure_is_logged_and_falls_back(self, caplog):
-        """A broken config.yaml read should log a debug message and still
-        resolve to "" (server-local fallback) instead of raising."""
+        """A broken config.yaml read should log a warning and still resolve
+        to "" (server-local fallback) instead of raising.
+
+        Both the fast-path reader and its yaml.safe_load fallback have to
+        fail to reach the outer except block: when ``read_raw_config``
+        raises, ``_resolve_timezone_name`` catches that internally and
+        falls through to the ``open()``/``yaml.safe_load`` branch, so
+        ``builtins.open`` also needs to raise for this test to exercise the
+        outer "give up entirely" path (as opposed to the managed-overlay
+        failure covered separately below).
+        """
         fake_path = MagicMock()
         fake_path.exists.return_value = True
         with patch(
@@ -123,10 +132,11 @@ class TestResolveTimezoneNameLogging:
                 result = hermes_time._resolve_timezone_name()
 
         assert result == ""
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
             "falling back to" in record.message.lower()
-            for record in caplog.records
-        ), "expected a debug log record explaining the fallback"
+            for record in warning_records
+        ), "expected a warning log record explaining the fallback"
 
     def test_managed_overlay_failure_is_logged_and_falls_back(self, caplog):
         """A broken managed_scope overlay should log a debug message and
