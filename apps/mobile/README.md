@@ -52,7 +52,7 @@ Every mobile capability begins with a deliberate user action. Hermes never reque
 - **Camera:** **Capture photo** appears only in the mobile composer. It requests Android camera permission when tapped, does not write the image to the gallery, and keeps the capture as a normal draft attachment until the user sends it.
 - **Incoming shares:** Android’s Share sheet can open Hermes with text and attachments. Shared text and files are staged in the composer; Hermes does not auto-send shared content to an agent session. Each shared URI is read once through its grant and capped at 25 MiB.
 - **Microphone:** requested only when the user starts voice input; the access probe immediately releases its test track.
-- **Notifications:** the Settings test button is the explicit Android permission prompt. Hermes separates attention-needed, activity, and non-urgent background-update channels. This is local-notification support only—server-to-device push while the app is suspended is not implemented or claimed.
+- **Notifications:** first successful connection asks for Android notification permission; Settings also offers a benign local test. Hermes separates attention-needed, activity, and non-urgent background-update channels. This is local-notification support only—server-to-device push while the app is suspended is not implemented or claimed.
 
 **Device-proof gate:** these source-level paths are covered by tests and native compilation, but camera, share-sheet, Android permission prompts, notification channels, and gallery behavior remain real-device acceptance items.
 
