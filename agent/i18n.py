@@ -72,7 +72,7 @@ _LANGUAGE_ALIASES: dict[str, str] = {
     # Irish (Gaeilge) — ga is the BCP-47 code
     "irish": "ga", "gaeilge": "ga", "ga-ie": "ga",
     # Portuguese (European)
-    "portuguese": "pt", "português": "pt", "portugues": "pt",
+    "portuguese": "pt", "portugues": "pt", "português": "pt",
     "pt-pt": "pt",
     # Portuguese (Brazilian) — separate catalog
     "pt-br": "pt-br",

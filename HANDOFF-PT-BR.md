@@ -264,7 +264,7 @@ Fixes #XXXX (se aplicável)
 
 ## 🎓 Lições Aprendidas
 
-1. **Backend i18n:** O sistema já está bem estruturado, apenas adicionar a entrada
+1. **Backend i18n:** O sistema já está bem estruturado, basta adicionar o novo locale a entrada
 2. **Frontend TypeScript:** Precisa manter tipagem forte
 3. **Tradução:** Demanda mais tempo do que parece, exigir revisão
 4. **Aliases:** Importante para UX, usuário pode usar vários formatos
