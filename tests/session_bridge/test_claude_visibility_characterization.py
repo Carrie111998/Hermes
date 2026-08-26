@@ -25,7 +25,11 @@ from session_bridge.characterize import (
     cleanup_characterized_claude_visibility,
     retire_aborted_claude_visibility_characterization,
 )
-from session_bridge.cli import ProductionBackend, _claude_visibility_preflight
+from session_bridge.cli import (
+    ProductionBackend,
+    _CLAUDE_VISIBILITY_PINNED_VERSION,
+    _claude_visibility_preflight,
+)
 from session_bridge.cli import main
 from session_bridge.config import BridgeConfig
 from session_bridge.claude_registrar import ClaudeRegistrarOutcome
@@ -46,6 +50,16 @@ from session_bridge.store import SessionBridgeStore
 
 
 SECRET = b"characterization-marker-secret"
+
+# Derived from the pin, never restated. These literals were hardcoded to the
+# then-current version and went stale the moment the pin moved, so nine
+# preflight tests began asserting version_unpinned instead of the gate each
+# one names -- the same staleness that took the live visibility lane down for
+# 21h on 2026-08-26. Anything that must equal the pin is built from it here.
+PINNED = _CLAUDE_VISIBILITY_PINNED_VERSION
+PINNED_BANNER = f"{PINNED} (Claude Code)"
+_PINNED_SERIES, _, _PINNED_PATCH_TEXT = PINNED.rpartition(".")
+_PINNED_PATCH = int(_PINNED_PATCH_TEXT)
 
 
 def _aborted_characterization_state(
@@ -594,14 +608,14 @@ def test_characterization_serializes_concurrent_root_operations(
     }
 
 
-def _claude_216_runner(
+def _claude_pinned_version_runner(
     calls: list[tuple[list[str], dict[str, Any]]],
     *,
     auth_payload: str = '{"loggedIn":true}',
 ) -> Any:
     def runner(argv: list[str], **kwargs: Any) -> Any:
         calls.append((argv, kwargs))
-        stdout = "2.1.216 (Claude Code)" if argv[-1] == "--version" else auth_payload
+        stdout = PINNED_BANNER if argv[-1] == "--version" else auth_payload
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     return runner
@@ -1384,7 +1398,7 @@ def test_ready_continuation_rejects_incomplete_or_unstructured_suffix(
         (
             '{"loggedIn": true}',
             {
-                "version": "2.1.216",
+                "version": PINNED,
                 "authentication": "available",
                 "theme": "light",
             },
@@ -1424,7 +1438,7 @@ def test_claude_preflight_requires_explicit_true_auth_without_registration(
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
         calls.append(argv)
-        stdout = "2.1.216" if argv[-1] == "--version" else auth_payload
+        stdout = PINNED if argv[-1] == "--version" else auth_payload
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     result = _claude_visibility_preflight(
@@ -1444,7 +1458,7 @@ def test_claude_preflight_requires_explicit_true_auth_without_registration(
     assert all("--session-id" not in call and "--print" not in call for call in calls)
 
 
-def test_claude_216_preflight_reads_onboarding_and_user_theme_separately(
+def test_claude_pinned_preflight_reads_onboarding_and_user_theme_separately(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     global_config = tmp_path / ".claude.json"
@@ -1476,13 +1490,13 @@ def test_claude_216_preflight_reads_onboarding_and_user_theme_separately(
 
     result = _claude_visibility_preflight(
         ("claude",),
-        runner=_claude_216_runner(calls),
+        runner=_claude_pinned_version_runner(calls),
         global_config_path=global_config,
         user_settings_path=user_settings,
     )
 
     assert result == {
-        "version": "2.1.216",
+        "version": PINNED,
         "authentication": "available",
         "theme": "light",
     }
@@ -1501,7 +1515,7 @@ def test_claude_216_preflight_reads_onboarding_and_user_theme_separately(
     ["CLAUDE_CODE_POWERUP_ONBOARDING", "CLAUDE_CODE_TEAM_ONBOARDING"],
 )
 @pytest.mark.parametrize("forced_value", ["banner", "step"])
-def test_claude_216_preflight_rejects_forced_onboarding_before_commands(
+def test_claude_pinned_preflight_rejects_forced_onboarding_before_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     environment_name: str,
@@ -1523,7 +1537,7 @@ def test_claude_216_preflight_rejects_forced_onboarding_before_commands(
     assert (
         _claude_visibility_preflight(
             ("claude",),
-            runner=_claude_216_runner(calls),
+            runner=_claude_pinned_version_runner(calls),
             global_config_path=global_config,
             user_settings_path=user_settings,
         )
@@ -1546,7 +1560,7 @@ def test_claude_216_preflight_rejects_forced_onboarding_before_commands(
         '{"theme":"dark","theme":"light"}',
     ],
 )
-def test_claude_216_preflight_user_settings_theme_fails_closed(
+def test_claude_pinned_preflight_user_settings_theme_fails_closed(
     tmp_path: Path, settings_payload: str
 ) -> None:
     global_config = tmp_path / ".claude.json"
@@ -1558,7 +1572,7 @@ def test_claude_216_preflight_user_settings_theme_fails_closed(
     assert (
         _claude_visibility_preflight(
             ("claude",),
-            runner=_claude_216_runner(calls),
+            runner=_claude_pinned_version_runner(calls),
             global_config_path=global_config,
             user_settings_path=user_settings,
         )
@@ -1566,7 +1580,7 @@ def test_claude_216_preflight_user_settings_theme_fails_closed(
     )
 
 
-def test_claude_216_preflight_deep_user_settings_json_fails_closed(
+def test_claude_pinned_preflight_deep_user_settings_json_fails_closed(
     tmp_path: Path,
 ) -> None:
     global_config = tmp_path / ".claude.json"
@@ -1581,7 +1595,7 @@ def test_claude_216_preflight_deep_user_settings_json_fails_closed(
     assert (
         _claude_visibility_preflight(
             ("claude",),
-            runner=_claude_216_runner(calls),
+            runner=_claude_pinned_version_runner(calls),
             global_config_path=global_config,
             user_settings_path=user_settings,
         )
@@ -1591,7 +1605,7 @@ def test_claude_216_preflight_deep_user_settings_json_fails_closed(
 
 @pytest.mark.parametrize("invalid_target", ["global", "settings"])
 @pytest.mark.parametrize("invalid_kind", ["missing", "directory", "oversized"])
-def test_claude_216_preflight_requires_bounded_regular_state_files(
+def test_claude_pinned_preflight_requires_bounded_regular_state_files(
     tmp_path: Path, invalid_target: str, invalid_kind: str
 ) -> None:
     global_config = tmp_path / ".claude.json"
@@ -1609,7 +1623,7 @@ def test_claude_216_preflight_requires_bounded_regular_state_files(
     assert (
         _claude_visibility_preflight(
             ("claude",),
-            runner=_claude_216_runner(calls),
+            runner=_claude_pinned_version_runner(calls),
             global_config_path=global_config,
             user_settings_path=user_settings,
         )
@@ -1632,7 +1646,7 @@ def test_claude_preflight_command_failure_fails_before_spending_slot(
         calls.append(argv)
         is_version = argv[-1] == "--version"
         failed = failed_call == ("version" if is_version else "auth")
-        stdout = "2.1.216" if is_version else '{"loggedIn": true}'
+        stdout = PINNED if is_version else '{"loggedIn": true}'
         return type(
             "Result",
             (),
@@ -1671,7 +1685,7 @@ def test_claude_preflight_malformed_or_unknown_global_config_fails_closed(
     user_settings.write_text('{"theme":"light"}', encoding="utf-8")
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1692,7 +1706,7 @@ def test_claude_preflight_missing_global_config_fails_closed(tmp_path: Path) -> 
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
         calls.append(argv)
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1714,7 +1728,7 @@ def test_claude_preflight_surrogate_auth_output_fails_closed(tmp_path: Path) -> 
     user_settings.write_text('{"theme":"light"}', encoding="utf-8")
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}\ud800'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}\ud800'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1741,7 +1755,7 @@ def test_claude_preflight_deeply_nested_auth_json_fails_closed(
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
-        stdout = "2.1.216" if argv[-1] == "--version" else auth_payload
+        stdout = PINNED if argv[-1] == "--version" else auth_payload
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1768,7 +1782,7 @@ def test_claude_preflight_deeply_nested_global_json_fails_closed(
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1794,7 +1808,7 @@ def test_claude_preflight_does_not_treat_global_theme_as_user_setting(
     settings.write_text('{"theme":null}', encoding="utf-8")
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1811,11 +1825,11 @@ def test_claude_preflight_does_not_treat_global_theme_as_user_setting(
 @pytest.mark.parametrize(
     "version_output",
     [
-        "2.1.215 (Claude Code)",
-        "2.1.217 (Claude Code)",
-        "2.1.216-beta (Claude Code)",
-        "2.1.216 (Claude Code) extra",
-        "Claude Code 2.1.216",
+        f"{_PINNED_SERIES}.{_PINNED_PATCH - 1} (Claude Code)",
+        f"{_PINNED_SERIES}.{_PINNED_PATCH + 1} (Claude Code)",
+        f"{PINNED}-beta (Claude Code)",
+        f"{PINNED} (Claude Code) extra",
+        f"Claude Code {PINNED}",
     ],
 )
 def test_claude_preflight_rejects_every_unpinned_version(
@@ -1856,7 +1870,7 @@ def test_claude_preflight_rejects_forced_team_onboarding_before_commands(
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
         calls.append(argv)
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1896,7 +1910,7 @@ def test_claude_preflight_rejects_any_claude_config_dir_before_commands(
 
     def runner(argv: list[str], **_kwargs: Any) -> Any:
         calls.append(argv)
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert (
@@ -1942,11 +1956,11 @@ def test_claude_preflight_resolves_default_custom_oauth_global_state(
 
     def runner(argv: list[str], **kwargs: Any) -> Any:
         assert kwargs["env"]["DISABLE_UPDATES"] == "1"
-        stdout = "2.1.216" if argv[-1] == "--version" else '{"loggedIn":true}'
+        stdout = PINNED if argv[-1] == "--version" else '{"loggedIn":true}'
         return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
     assert _claude_visibility_preflight(("claude",), runner=runner) == {
-        "version": "2.1.216",
+        "version": PINNED,
         "authentication": "available",
         "theme": "dark-ansi",
     }
@@ -3431,7 +3445,7 @@ def _preflight_state(tmp_path: Path, *, theme: str | None = "light") -> tuple[Pa
 
 def _preflight_runner(
     *,
-    version_output: str = "2.1.216",
+    version_output: str = PINNED,
     version_returncode: int = 0,
     auth_output: str = '{"loggedIn":true}',
     auth_returncode: int = 0,
@@ -3465,7 +3479,7 @@ def test_preflight_detail_reports_no_failure_code_on_success(tmp_path: Path) -> 
 
     assert detail.failure_code is None
     assert detail.startup == {
-        "version": "2.1.216",
+        "version": PINNED,
         "authentication": "available",
         "theme": "light",
     }
