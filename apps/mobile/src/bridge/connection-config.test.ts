@@ -25,7 +25,7 @@ describe('normalizeRemoteBaseUrl', () => {
 
 describe('requireSecureRemoteBaseUrl', () => {
   it('preserves a secure gateway path prefix', () => {
-    expect(requireSecureRemoteBaseUrl('https://argos.tailnet.ts.net/hermes/')).toBe('https://argos.tailnet.ts.net/hermes')
+    expect(requireSecureRemoteBaseUrl('https://mobile-gateway.tailnet.ts.net/hermes/')).toBe('https://mobile-gateway.tailnet.ts.net/hermes')
   })
 
   it('rejects cleartext gateways for the installed mobile client', () => {
