@@ -3117,7 +3117,8 @@ class SessionBridgeStore:
             conn = self.db._conn
             assert conn is not None
             status_rows = conn.execute(
-                """SELECT state, error_code, error_detail, lease_expires_at
+                """SELECT id, reserved_claude_uuid, state, error_code,
+                          error_detail, lease_expires_at
                    FROM session_claude_visibility_jobs AS job
                    WHERE job.operator_cleared_at IS NULL AND NOT EXISTS (
                        SELECT 1
@@ -3163,6 +3164,7 @@ class SessionBridgeStore:
         retry_codes: dict[str, int] = {}
         failed_codes: dict[str, int] = {}
         fatal_groups: dict[tuple[str, str | None, str | None], int] = {}
+        repair_required: list[dict[str, Any]] = []
 
         def add_fatal(
             code: str, state: object, error_code: object, *, count: int = 1
@@ -3185,15 +3187,41 @@ class SessionBridgeStore:
                     and error_code not in CLAUDE_VISIBILITY_RETRY_CODES
                 ):
                     counts[literal_state] += 1
-                    add_fatal(
-                        "bridge_conflict"
-                        if error_code == "bridge_conflict"
+                    if (
+                        error_code == "bridge_conflict"
                         and row["error_detail"]
                         == "exact terminal reconciliation in progress"
-                        else "unknown_error_code",
-                        literal_state,
-                        error_code,
-                    )
+                    ):
+                        # The detail marker excludes this row from every ordinary
+                        # reclaim path, so an expired repair lease is not "in
+                        # progress" -- it is waiting on an operator, and it waits
+                        # forever unless this projection says so out loud.  A NULL
+                        # expiry can never expire and is therefore also abandoned;
+                        # reporting is authority-free, so naming it cannot free it.
+                        lease_expires_at = row["lease_expires_at"]
+                        abandoned = (
+                            lease_expires_at is None
+                            or float(lease_expires_at) <= status_time
+                        )
+                        add_fatal(
+                            "reconciliation_repair_abandoned"
+                            if abandoned
+                            else "reconciliation_repair_active",
+                            literal_state,
+                            error_code,
+                        )
+                        if abandoned:
+                            repair_required.append(
+                                {
+                                    "job_id": row["id"],
+                                    "reserved_claude_uuid": row[
+                                        "reserved_claude_uuid"
+                                    ],
+                                    "error_code": error_code,
+                                }
+                            )
+                    else:
+                        add_fatal("unknown_error_code", literal_state, error_code)
                     continue
                 lease_expires_at = row["lease_expires_at"]
                 if (
@@ -3246,6 +3274,7 @@ class SessionBridgeStore:
                 "reserved_cost_usd": str(total_cost),
             },
             "fatal": fatal,
+            "repair_required": repair_required,
             "lineage": lineage,
             "characterizations": [
                 {"job_id": row["job_id"], "state": row["state"]}

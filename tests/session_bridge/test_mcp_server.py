@@ -3769,3 +3769,43 @@ def test_app_rejects_short_explicit_tokens(db: SessionDB) -> None:
             ),
             token="too-short",
         )
+
+
+def test_mcp_status_names_an_abandoned_repair_lease() -> None:
+    """degraded_reasons must carry the specific code, not 'invalid_status'."""
+
+    config = ClaudeVisibilityConfig(
+        enabled=True,
+        continuous=True,
+        daily_registration_limit=25,
+        reserved_cost_per_attempt_usd="0.02",
+        emergency_daily_cost_usd="0.50",
+    )
+    raw = {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 1,
+            "claude_retry": 0,
+            "claude_visible": 0,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "usage": {
+            "local_day": "2026-08-26",
+            "attempts": 1,
+            "reserved_cost_usd": "0.02",
+        },
+        "fatal": [
+            {
+                "code": "reconciliation_repair_abandoned",
+                "state": "claude_leased",
+                "error_code": "bridge_conflict",
+                "count": 1,
+            }
+        ],
+    }
+
+    payload = _claude_visibility_status_payload(raw, config)
+
+    assert payload["degraded_reasons"] == ["reconciliation_repair_abandoned"]

@@ -1114,3 +1114,31 @@ def test_claim_failure_is_logged_with_its_cause(caplog) -> None:
     assert "UNIQUE constraint failed" in logged[0]
     # ...and still never reaches public output.
     assert "secret" not in repr(result)
+
+
+def test_enqueue_gates_name_an_abandoned_repair_lease() -> None:
+    """The coordinator still blocks, but reports why in usable terms."""
+
+    raw = {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 1,
+            "claude_retry": 0,
+            "claude_visible": 0,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "fatal": [
+            {
+                "code": "reconciliation_repair_abandoned",
+                "state": "claude_leased",
+                "error_code": "bridge_conflict",
+                "count": 1,
+            }
+        ],
+    }
+
+    _open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(raw)
+
+    assert fatal_reasons == ("reconciliation_repair_abandoned",)

@@ -30,6 +30,18 @@ CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
 CLAUDE_VISIBILITY_ERROR_CODES = (
     CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
 )
+# Fatal-group codes the read-only status may emit. THREE readers -- cli,
+# mcp_server and coordinator -- each used to hardcode this set inline and
+# flatten anything outside it to a generic "invalid status". That is how an
+# abandoned repair lease came to report itself as malformed evidence instead of
+# as the one condition it actually was, sending an operator hunting a schema bug
+# that did not exist. Extend HERE, once; the readers derive from this.
+CLAUDE_VISIBILITY_STATUS_FATAL_CODES = frozenset({
+    "unknown_job_state",
+    "unknown_error_code",
+    "reconciliation_repair_active",
+    "reconciliation_repair_abandoned",
+})
 # Why the startup preflight refused, one fixed code per gate. These never reach
 # public CLI output -- `main` collapses ProviderDegraded to {"error":
 # "provider_degraded"} on purpose -- they exist so the SERVICE LOG names the
@@ -60,4 +72,6 @@ CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES = CLAUDE_VISIBILITY_ERROR_CODES | fr
     "unknown_registrar_error_code",
     "unknown_registrar_status",
     "unknown_retry_code",
+    "reconciliation_repair_active",
+    "reconciliation_repair_abandoned",
 })

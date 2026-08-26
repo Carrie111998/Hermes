@@ -24,6 +24,7 @@ from .catalog import UnifiedCatalog
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
+    CLAUDE_VISIBILITY_STATUS_FATAL_CODES,
 )
 from .codex_adapter import SidebarVerificationError
 from .config import BridgeConfig, is_canonical_sidebar_string
@@ -1062,10 +1063,10 @@ def _claude_visibility_status_payload(
         fatal = []
     else:
         for item in fatal:
-            if not isinstance(item, Mapping) or item.get("code") not in {
-                "unknown_job_state",
-                "unknown_error_code",
-            }:
+            if (
+                not isinstance(item, Mapping)
+                or item.get("code") not in CLAUDE_VISIBILITY_STATUS_FATAL_CODES
+            ):
                 degraded.add("invalid_status")
             else:
                 degraded.add(str(item["code"]))
