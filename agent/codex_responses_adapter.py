@@ -31,25 +31,28 @@ def _classify_responses_issuer(
     is_github_responses: bool = False,
     is_codex_backend: bool = False,
     base_url: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
-    """Stable identifier for the Responses endpoint that mints encrypted_content.
+    """Stable endpoint/model identity that mints encrypted_content.
 
-    ``reasoning.encrypted_content`` is sealed to the endpoint that issued it:
-    replaying a Codex-minted blob against xAI (or vice versa) deterministically
-    returns HTTP 400 ``invalid_encrypted_content``. Stamping the issuer on
-    persisted reasoning items and filtering at replay time lets a single
-    conversation switch models without poisoning history with un-decryptable
-    reasoning blocks.
+    ``reasoning.encrypted_content`` is sealed to the endpoint and model that
+    issued it. Stamping both dimensions on persisted reasoning items prevents
+    a multi-model router from replaying one model's opaque continuation into
+    another model merely because both share a base URL.
     """
     if is_xai_responses:
-        return "xai_responses"
-    if is_github_responses:
-        return "github_responses"
-    if is_codex_backend:
-        return "codex_backend"
-    if base_url:
-        return f"other:{base_url}"
-    return "other"
+        issuer = "xai_responses"
+    elif is_github_responses:
+        issuer = "github_responses"
+    elif is_codex_backend:
+        issuer = "codex_backend"
+    elif base_url:
+        issuer = f"other:{base_url}"
+    else:
+        issuer = "other"
+
+    model_identity = str(model or "").strip()
+    return f"{issuer}|model:{model_identity}" if model_identity else issuer
 
 
 # Throttle the per-process cross-issuer skip warning so we don't flood logs

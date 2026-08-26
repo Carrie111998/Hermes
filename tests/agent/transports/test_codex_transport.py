@@ -39,6 +39,66 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
+    def test_custom_endpoint_reasoning_replay_is_scoped_to_model(self):
+        """Encrypted reasoning from one routed model must not reach another."""
+        from agent.transports.codex import ResponsesApiTransport
+
+        transport = ResponsesApiTransport()
+        base_url = "http://localhost:20129/v1"
+        transport.build_kwargs(
+            model="gemini/gemini-3.6-flash",
+            messages=[{"role": "user", "content": "first"}],
+            tools=[],
+            base_url=base_url,
+        )
+        normalized = transport.normalize_response(SimpleNamespace(
+            status="completed",
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    id="rs_model_a",
+                    encrypted_content="model-a-blob",
+                    summary=[],
+                ),
+                SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="done")],
+                    id="msg_model_a",
+                ),
+            ],
+        ))
+        history = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": normalized.content,
+                "codex_reasoning_items": normalized.provider_data["codex_reasoning_items"],
+            },
+            {"role": "user", "content": "next"},
+        ]
+
+        same_model = transport.build_kwargs(
+            model="gemini/gemini-3.6-flash",
+            messages=history,
+            tools=[],
+            base_url=base_url,
+        )
+        other_model = transport.build_kwargs(
+            model="gemini/gemini-3.7-flash",
+            messages=history,
+            tools=[],
+            base_url=base_url,
+        )
+
+        assert [
+            item["encrypted_content"]
+            for item in same_model["input"]
+            if item.get("type") == "reasoning"
+        ] == ["model-a-blob"]
+        assert not any(item.get("type") == "reasoning" for item in other_model["input"])
+
     def test_900k_context_variant_suffix_stripped_on_wire(self, transport):
         """``-900k`` large-context picker variants are Hermes-side aliases —
         the Codex backend only knows the base slug, so build_kwargs must
