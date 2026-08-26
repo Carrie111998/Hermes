@@ -932,12 +932,19 @@ export function usePromptActions({
 
         applySurvivorRowIds(sessionId, survivorRowIds)
       } catch (err) {
+        // The reload never landed (e.g. a provider error at turn time). Roll
+        // the optimistic truncation back to the full original history so the
+        // UI doesn't desync from what's persisted — same rationale as
+        // restoreToMessage's own catch a few lines below: leaving it
+        // truncated is what made the transcript look blank/duplicative until
+        // an unrelated state change forced a full re-render.
         updateSessionState(sessionId, state => ({
           ...state,
           busy: false,
           awaitingResponse: false,
           turnLive: false,
-          turnStartedAt: null
+          turnStartedAt: null,
+          messages
         }))
         notifyError(err, copy.regenerateFailed)
       }
