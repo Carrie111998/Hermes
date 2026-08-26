@@ -990,7 +990,7 @@ def _session_search_impl(
             current_session_id = None
 
     # Scroll shape takes precedence — explicit anchor beats any query.
-    if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
+    if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None and around_message_id != 0:
         return _scroll(
             db=db,
             session_id=session_id,
