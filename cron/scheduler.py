@@ -529,6 +529,7 @@ from cron.executions import (
     amend_execution_after_abandon,
     create_execution,
     finish_execution,
+    live_execution_for_job,
     mark_execution_running,
 )
 
@@ -1183,6 +1184,68 @@ def _emit_cron_skipped_duplicate(
         except Exception as ee:
             logger.warning(
                 "Event emit failed for cron_skipped_duplicate: %s", ee
+            )
+
+
+#: ``reason`` stamped on CRON_SKIPPED_DUPLICATE when the blocker is a live run
+#: in a DIFFERENT process. Kept distinct from Guard #3's two in-process reasons
+#: so audit.jsonl can separate "this process already had it" from "another
+#: process still has it" — the operator response differs (the second means
+#: finding another machine/CLI, not restarting this one).
+CROSS_PROCESS_FIRE_BLOCKED_REASON = "cross_process_fire_blocked"
+
+
+def _emit_cron_skipped_cross_process(
+    emitter, job_id: str, job_name: str, row: dict
+) -> None:
+    """Emit CRON_SKIPPED_DUPLICATE for a fire blocked by a live run ELSEWHERE.
+
+    Guard #5's counterpart to :func:`_emit_cron_skipped_duplicate`. Reuses the
+    same event type deliberately: the operator-visible fact is identical ("a
+    duplicate fire was rejected"), and ``reason`` is the field that already
+    exists to separate the sub-cases, so every existing subscriber, route and
+    dashboard keeps working unchanged.
+
+    ``prior_cron_started_event_id`` is None and *cannot* be otherwise: the
+    blocking run belongs to another process, and its ``cron_started`` event id
+    lives in that process's ``_InFlightRecord``, never in the ledger. The
+    execution id and owner pid go in the log line instead — that is what an
+    operator needs in order to find the other run.
+
+    Never raises: losing this record must not cost the tick its job.
+    """
+    elapsed = None
+    stamp = row.get("started_at") or row.get("claimed_at")
+    if stamp:
+        try:
+            from datetime import datetime as _datetime
+            from cron.jobs import _ensure_aware as _cron_ensure_aware
+
+            elapsed = round(max(0.0, (
+                _hermes_now() - _cron_ensure_aware(
+                    _datetime.fromisoformat(stamp)
+                )
+            ).total_seconds()), 1)
+        except Exception:
+            elapsed = None  # unparseable stamp must not block the emit
+    logger.warning(
+        "Cron cross-process duplicate fire blocked: job_id=%s job_name=%s "
+        "owner_pid=%s execution=%s elapsed=%ss",
+        job_id, job_name, row.get("pid"), row.get("id"), elapsed,
+    )
+    if emitter:
+        try:
+            emitter.on_job_skipped_duplicate(
+                job_id=job_id,
+                job_name=job_name,
+                prior_cron_started_event_id=None,
+                prior_elapsed_seconds=elapsed,
+                reason=CROSS_PROCESS_FIRE_BLOCKED_REASON,
+            )
+        except Exception as ee:
+            logger.warning(
+                "Event emit failed for cron_skipped_duplicate "
+                "(cross-process): %s", ee
             )
 
 
@@ -6499,6 +6562,58 @@ def _tick_admitted(
             # We hold the in-flight slot for _job_id from here; release it
             # on every exit path (the existing inner try/except below was
             # extended with a `finally: _release_in_flight(_job_id)`).
+
+            # Cross-process same-job guard (Guard #5, 2026-08-25) ----------
+            # Guard #3 above is a plain dict under a threading.Lock, so it is
+            # blind to a fire running in ANOTHER process. That gap is why the
+            # built-in ticker could run a job while `hermes cron run` was
+            # already running it (source='builtin' overlapping source='direct'
+            # in executions.db). The durable ledger is the cross-process
+            # signal, and unlike a claim TTL it distinguishes a slow run from
+            # a dead one instead of guessing from elapsed time.
+            #
+            # `live_execution_for_job` excludes rows owned by THIS process, so
+            # it cannot see the row `_submit_with_guard` just stamped for this
+            # very run, and cannot be wedged by a stale own-process row (whose
+            # pid is alive by definition and which recovery deliberately never
+            # cleans). Guard #3 owns the in-process case; this owns the rest.
+            #
+            # Refuses only on POSITIVE proof of life: a dead or unprovable
+            # owner falls through and the job fires, so this can never leave a
+            # job permanently unfireable. Never raises — a ledger fault must
+            # not cost the tick its jobs; it degrades to Guard #3 alone.
+            try:
+                _live_elsewhere = live_execution_for_job(_job_id)
+            except Exception:
+                logger.warning(
+                    "Cross-process liveness check failed for job %s; running "
+                    "on the in-process guard alone", _job_id, exc_info=True,
+                )
+                _live_elsewhere = None
+            if _live_elsewhere is not None:
+                _emit_cron_skipped_cross_process(
+                    emitter, _job_id, _cron_job_name, _live_elsewhere
+                )
+                # Release the slot Guard #3 just acquired, exactly as the
+                # min-interval reject below does — otherwise the rejected
+                # fire's own slot blocks the next legitimate one.
+                _release_in_flight(_job_id)
+                if _execution_id:
+                    try:
+                        finish_execution(
+                            _execution_id,
+                            success=False,
+                            error=(
+                                "Duplicate fire blocked; a run of this job is "
+                                "still live in another process."
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "finish_execution failed for cross-process "
+                            "duplicate-blocked %s", _job_id,
+                        )
+                return False
 
             # Min-seconds-between-fires guard (Guard #4, 2026-04-30 follow-up)
             # ------------------------------------------------------------

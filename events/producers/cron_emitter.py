@@ -98,7 +98,7 @@ class CronEventEmitter:
         job_id: str,
         job_name: str,
         prior_cron_started_event_id: Optional[str],
-        prior_elapsed_seconds: float,
+        prior_elapsed_seconds: Optional[float],
         reason: str,
     ) -> str:
         """Emit cron_skipped_duplicate when the in-flight guard rejects a fire.
@@ -110,6 +110,11 @@ class CronEventEmitter:
         ``reason`` is one of:
           * ``"concurrent_fire_blocked"`` -- prior fire still healthy and running
           * ``"prior_fire_exceeded_timeout"`` -- prior fire wedged-but-tracked
+          * ``"cross_process_fire_blocked"`` -- prior fire is live in ANOTHER
+            process (Guard #5, 2026-08-25), proved from the execution ledger.
+            ``prior_cron_started_event_id`` is always None for this reason:
+            that id lives in the owning process's ``_InFlightRecord`` and is
+            never written to the ledger, so it is unavailable by construction.
         """
         return self.bus.emit(
             event_type=EventType.CRON_SKIPPED_DUPLICATE,
