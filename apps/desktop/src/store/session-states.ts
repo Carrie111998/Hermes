@@ -1373,20 +1373,35 @@ export function openSessionTileForProfile(
   profile: string,
   dir: TileDock = 'right',
   anchor?: string,
-  before?: null | string
+  before?: null | string,
+  ownerRoute?: SessionOwnerRoute
 ): boolean {
   const targetProfile = normalizeProfileKey(profile)
 
   if (targetProfile === profileKey()) {
     openSessionTile(storedSessionId, dir, anchor, before)
 
+    if (ownerRoute) {
+      patchSessionTile(storedSessionId, { ownerRoute })
+    }
+
     return true
   }
 
   const stored = tilesByProfile[targetProfile] ?? []
 
-  if (!stored.some(tile => tile.storedSessionId === storedSessionId)) {
-    tilesByProfile[targetProfile] = [...stored, { anchor, before: before ?? undefined, dir, storedSessionId }]
+  const existing = stored.find(tile => tile.storedSessionId === storedSessionId)
+
+  if (!existing) {
+    tilesByProfile[targetProfile] = [
+      ...stored,
+      { anchor, before: before ?? undefined, dir, ownerRoute, storedSessionId }
+    ]
+    persistTiles()
+  } else if (ownerRoute) {
+    tilesByProfile[targetProfile] = stored.map(tile =>
+      tile.storedSessionId === storedSessionId ? { ...tile, ownerRoute } : tile
+    )
     persistTiles()
   }
 

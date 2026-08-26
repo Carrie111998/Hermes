@@ -1818,7 +1818,7 @@ describe('branchStoredSession desktop source tagging', () => {
     expect(branchParams).toEqual({ session_id: 'live-parent', count: 2 })
   })
 
-  it('branches an explicit tile on its exact owner when two connections expose the same profile', async () => {
+  it('keeps a branch-from-branched tile on the exact owner when connections share a profile', async () => {
     vi.mocked(ensureGatewayProfile).mockClear()
     $activeGatewayProfile.set('default')
     setCurrentCwd('/foreground/workspace')
@@ -1854,11 +1854,15 @@ describe('branchStoredSession desktop source tagging', () => {
       { storedSessionId: 'tile-stored', ownerRoute: { connectionId: 'source-b', profile: 'default' } }
     ])
 
+    let branchNumber = 0
+
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.branch') {
+        branchNumber += 1
+
         return {
-          session_id: 'branch-runtime',
-          stored_session_id: 'branch-stored',
+          session_id: `branch-runtime-${branchNumber}`,
+          stored_session_id: `branch-stored-${branchNumber}`,
           title: 'Branch',
           message_count: 2,
           messages: [],
@@ -1917,30 +1921,46 @@ describe('branchStoredSession desktop source tagging', () => {
     expect($currentModel.get()).toBe('foreground-model')
     expect($currentProvider.get()).toBe('foreground-provider')
     expect($freshDraftReady.get()).toBe(true)
-    expect($sessions.get().find(session => session.id === 'branch-stored')).toMatchObject({
+    expect($sessions.get().find(session => session.id === 'branch-stored-1')).toMatchObject({
       cwd: '/tile/workspace',
       parent_session_id: 'tile-stored',
       profile: 'default'
     })
-    expect(sessionStateByRuntimeIdRef.current.get('branch-runtime')).toMatchObject({
+    expect(sessionStateByRuntimeIdRef.current.get('branch-runtime-1')).toMatchObject({
       cwd: '/tile/workspace',
       fast: true,
       messages: tileMessages,
       model: 'tile-model',
       provider: 'tile-provider',
-      storedSessionId: 'branch-stored'
+      storedSessionId: 'branch-stored-1'
     })
+    expect(sessionTileOwnerRoute('branch-stored-1')).toEqual({ connectionId: 'source-b', profile: 'default' })
+
+    await expect(branchCurrentSession!(undefined, 'branch-runtime-1')).resolves.toBe(true)
+
+    expect(requestGateway).toHaveBeenCalledWith('session.branch', {
+      session_id: 'branch-runtime-1',
+      count: 2
+    })
+    expect(tileOwnerBinder).toHaveBeenNthCalledWith(2, 'source-b', 'default')
+    expect($sessions.get().find(session => session.id === 'branch-stored-2')).toMatchObject({
+      parent_session_id: 'branch-stored-1',
+      profile: 'default'
+    })
+    expect(sessionTileOwnerRoute('branch-stored-2')).toEqual({ connectionId: 'source-b', profile: 'default' })
   })
 
   it('fails closed when an explicit tile has no exact connection owner', async () => {
     const tileMessages: ClientSessionState['messages'] = [
       { id: 'tile-q', role: 'user', parts: [{ type: 'text', text: 'tile question' }] }
     ]
+
     const sessionStateByRuntimeIdRef = {
       current: new Map<string, ClientSessionState>([
         ['tile-runtime', { ...createClientSessionState('tile-stored', tileMessages), cwd: '/tile/workspace' }]
       ])
     }
+
     const requestGateway = vi.fn(async () => ({}) as never)
     const bindGatewayRequestForOwner = vi.fn()
     let branchCurrentSession: ((messageId?: string, targetSessionId?: string) => Promise<boolean>) | null = null
@@ -2069,6 +2089,23 @@ describe('branchStoredSession desktop source tagging', () => {
     expect(approvalModeForProfile('work')).toBe('off')
     expect(approvalModeForProfile('other')).toBe('manual')
     expect(release).toHaveBeenCalledOnce()
+
+    const persistedTiles = JSON.parse(window.localStorage.getItem('hermes.desktop.sessionTiles.v2') ?? '{}') as Record<
+      string,
+      Array<{ ownerRoute?: SessionProfileRoute; storedSessionId: string }>
+    >
+
+    expect(persistedTiles.work).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ownerRoute: { connectionId: 'source-a', profile: 'work' },
+          storedSessionId: 'branch-stored-race'
+        })
+      ])
+    )
+
+    $activeGatewayProfile.set('work')
+    expect(sessionTileOwnerRoute('branch-stored-race')).toEqual({ connectionId: 'source-a', profile: 'work' })
   })
 
   it('releases the source lease after a terminal branch failure', async () => {

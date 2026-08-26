@@ -104,6 +104,7 @@ import {
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
   requestForSessionProfile,
+  type SessionOwnerRoute,
   type SessionOwnerScope,
   type SessionProfileRoute
 } from '@/store/session-request-router'
@@ -1911,7 +1912,8 @@ export function useSessionActions({
       profile?: null | string,
       sourceRequest?: GatewayRequester,
       uiIntent?: BranchUiIntent,
-      branchCount?: number
+      branchCount?: number,
+      sourceOwnerRoute?: SessionOwnerRoute
     ): Promise<boolean> => {
       creatingSessionRef.current = true
 
@@ -2026,7 +2028,9 @@ export function useSessionActions({
             routedSessionId,
             resolvedUiIntent.profile,
             'center',
-            resolvedUiIntent.anchor
+            resolvedUiIntent.anchor,
+            undefined,
+            sourceOwnerRoute
           )
 
           if (openedInActiveProfile) {
@@ -2106,6 +2110,7 @@ export function useSessionActions({
       const startingCwd = isForeground ? $currentCwd.get().trim() : targetState!.cwd.trim()
       const uiIntent = captureBranchUiIntent()
       let sourceLease: GatewayRequestLease | null = null
+      let sourceOwnerRoute: SessionOwnerRoute | undefined
 
       // Pin transport, source profile, and UI intent before profile resolution
       // yields. The command lease keeps a background source registered across
@@ -2135,6 +2140,7 @@ export function useSessionActions({
           }
 
           profile = normalizeProfileKey(owner.profile)
+          sourceOwnerRoute = owner
           sourceLease = bindGatewayRequestForOwner(owner.connectionId, profile)
         }
 
@@ -2193,7 +2199,8 @@ export function useSessionActions({
           profile,
           sourceLease.request,
           uiIntent,
-          messageId || !isForeground ? branchMessages.length : undefined
+          messageId || !isForeground ? branchMessages.length : undefined,
+          sourceOwnerRoute
         )
       } catch (err) {
         notifyError(err, copy.branchFailed)
