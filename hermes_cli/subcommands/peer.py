@@ -7,6 +7,8 @@ bot on THIS machine a transport to message bots on THAT machine:
     hermes peer add spark --url http://spark.lan:8377 --key <API_SERVER_KEY>
     hermes peer dm spark "Message from 🤖 dixie (@dixie): disk status?"
     hermes peer dm spark/researcher "..."      # named profile (multiplexed peer)
+    hermes peer run spark --idempotency-key ticket-123 < /tmp/long-task.txt
+    hermes peer status spark run_abc123
 
 ``dm`` resolves the remote agent's canonical "Bot Chat" session (by title,
 creating it when missing), runs ONE synchronous agent turn over the peer's
@@ -14,6 +16,10 @@ existing ``POST /api/sessions/{id}/chat`` endpoint, and prints the reply on
 stdout — the exact cross-machine twin of the local
 ``hermes -p <bot> chat --in ~ -c "Bot Chat" ...`` bot-messaging command, so
 the Bot Mode protocol composes over it unchanged.
+
+``run`` starts the same canonical-session turn through the asynchronous Runs
+API and returns a ``run_id`` immediately. ``status`` polls that handle without
+holding the original HTTP connection open. Use this pair for long turns.
 
 Design notes:
 - No new server surface: the peer's stock api_server is the transport.
@@ -33,6 +39,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -76,17 +83,28 @@ def _peer_secret(name: str) -> str:
         return (os.environ.get(env_name) or "").strip()
 
 
-def _request(url: str, key: str, *, method: str = "GET", body: dict | None = None, timeout: int = LIST_TIMEOUT_S) -> dict:
+def _request(
+    url: str,
+    key: str,
+    *,
+    method: str = "GET",
+    body: dict | None = None,
+    timeout: int = LIST_TIMEOUT_S,
+    headers: dict[str, str] | None = None,
+) -> dict:
     data = json.dumps(body).encode("utf-8") if body is not None else None
+    request_headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "User-Agent": "hermes-peer-dm",
+    }
+    if headers:
+        request_headers.update(headers)
     req = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "hermes-peer-dm",
-        },
+        headers=request_headers,
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — user-registered peer URL
         payload = resp.read().decode("utf-8", "replace")
@@ -181,6 +199,28 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
         return str(exc)
 
 
+def _resolve_peer_target(target: str) -> tuple[str, str | None, dict, str]:
+    """Resolve a registered target to ``(name, profile, config, key)``."""
+    peer_name, profile = _parse_target(target)
+    peer = _load_peers().get(peer_name)
+    if not isinstance(peer, dict) or not peer.get("url"):
+        raise LookupError(f"No peer named '{peer_name}'. Run: hermes peer list")
+    key = _peer_secret(peer_name)
+    if not key:
+        raise PermissionError(
+            f"No API key for peer '{peer_name}'. Set it: hermes peer add {peer_name} "
+            f"--url <url> --key <key> (or add {_peer_key_env(peer_name)}=<key> to ~/.hermes/.env)"
+        )
+    return peer_name, profile, peer, key
+
+
+def _message_from_args(args) -> str:
+    message = (getattr(args, "message", None) or "").strip()
+    if not message and not sys.stdin.isatty():
+        message = sys.stdin.read().strip()
+    return message
+
+
 def cmd_peer(args) -> int:
     action = getattr(args, "peer_action", None)
 
@@ -233,33 +273,109 @@ def cmd_peer(args) -> int:
             print(f"{name}\t{entry.get('url', '?')}\t[{has_key}]{note}")
         return 0
 
-    if action == "dm":
+    if action in {"dm", "run", "status"}:
         try:
-            peer_name, profile = _parse_target(args.target)
+            peer_name, profile, peer, key = _resolve_peer_target(args.target)
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        peers = _load_peers()
-        peer = peers.get(peer_name)
-        if not isinstance(peer, dict) or not peer.get("url"):
-            print(f"No peer named '{peer_name}'. Run: hermes peer list", file=sys.stderr)
+        except (LookupError, PermissionError) as exc:
+            print(str(exc), file=sys.stderr)
             return 1
-        key = _peer_secret(peer_name)
-        if not key:
-            print(
-                f"No API key for peer '{peer_name}'. Set it: hermes peer add {peer_name} "
-                f"--url <url> --key <key> (or add {_peer_key_env(peer_name)}=<key> to ~/.hermes/.env)",
-                file=sys.stderr,
-            )
-            return 1
-        message = (args.message or "").strip()
-        if not message and not sys.stdin.isatty():
-            message = sys.stdin.read().strip()
+
+        base = _base_url(peer, profile)
+
+        if action == "status":
+            run_id = (getattr(args, "run_id", None) or "").strip()
+            if not run_id:
+                print("Run ID required.", file=sys.stderr)
+                return 2
+            try:
+                result = _request(
+                    f"{base}/v1/runs/{urllib.parse.quote(run_id, safe='')}",
+                    key,
+                )
+            except urllib.error.HTTPError as exc:
+                print(
+                    f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}",
+                    file=sys.stderr,
+                )
+                return 1
+            except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+                print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
+                return 1
+
+            payload = {"peer": peer_name, "profile": profile, **result}
+            if getattr(args, "json", False):
+                print(json.dumps(payload))
+            else:
+                print(f"{run_id}: {result.get('status', 'unknown')}")
+                if result.get("output"):
+                    print(result["output"])
+                elif result.get("error"):
+                    print(result["error"], file=sys.stderr)
+            return 0
+
+        message = _message_from_args(args)
         if not message:
             print("Message required (argument or stdin).", file=sys.stderr)
             return 2
 
-        base = _base_url(peer, profile)
+        if action == "run":
+            idempotency_key = (
+                getattr(args, "idempotency_key", None) or f"peer-{uuid.uuid4().hex}"
+            ).strip()
+            if (
+                not idempotency_key
+                or len(idempotency_key) > 255
+                or re.search(r"[\r\n\x00]", idempotency_key)
+            ):
+                print(
+                    "Idempotency key must be 1-255 characters without control newlines.",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                session_id = _ensure_bot_chat(base, key)
+                result = _request(
+                    f"{base}/v1/runs",
+                    key,
+                    method="POST",
+                    body={"input": message, "session_id": session_id},
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+            except urllib.error.HTTPError as exc:
+                print(
+                    f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}",
+                    file=sys.stderr,
+                )
+                return 1
+            except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+                print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
+                return 1
+
+            run_id = str(result.get("run_id") or "")
+            if not run_id:
+                print(f"Peer '{peer_name}' did not return a run ID.", file=sys.stderr)
+                return 1
+            payload = {
+                "peer": peer_name,
+                "profile": profile,
+                "session_id": session_id,
+                "run_id": run_id,
+                "status": result.get("status") or "started",
+                "idempotency_key": idempotency_key,
+                "replayed": bool(result.get("replayed", False)),
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(payload))
+            else:
+                replay = " (replayed)" if payload["replayed"] else ""
+                print(f"{run_id}: {payload['status']}{replay}")
+                print(f"session_id: {session_id}")
+                print(f"idempotency_key: {idempotency_key}")
+            return 0
+
         try:
             session_id = _ensure_bot_chat(base, key)
             result = _request(
@@ -312,6 +428,8 @@ def build_peer_parser(subparsers) -> None:
             "  hermes peer list\n"
             '  hermes peer dm spark "Message from 🤖 dixie (@dixie): disk status?"\n'
             '  hermes peer dm spark/researcher "..."   # named profile on a multiplexed peer\n'
+            "  hermes peer run spark --idempotency-key ticket-123 < long-task.txt\n"
+            "  hermes peer status spark run_abc123\n"
             "  hermes peer remove spark\n"
             "\n"
             "Exit codes: 0 ok, 1 delivery/peer error, 2 usage error."
@@ -335,8 +453,45 @@ def build_peer_parser(subparsers) -> None:
         "dm",
         help="Message an agent on a peer gateway and print its reply",
     )
-    dm_p.add_argument("target", help="<peer> or <peer>/<agent> (named profile on a multiplexed peer)")
-    dm_p.add_argument("message", nargs="?", default=None, help="Message text (or stdin)")
-    dm_p.add_argument("--json", action="store_true", default=False, help="Emit a JSON result")
+    dm_p.add_argument(
+        "target", help="<peer> or <peer>/<agent> (named profile on a multiplexed peer)"
+    )
+    dm_p.add_argument(
+        "message", nargs="?", default=None, help="Message text (or stdin)"
+    )
+    dm_p.add_argument(
+        "--json", action="store_true", default=False, help="Emit a JSON result"
+    )
+
+    run_p = peer_sub.add_parser(
+        "run",
+        help="Start a long peer turn asynchronously and return its run ID",
+    )
+    run_p.add_argument(
+        "target", help="<peer> or <peer>/<agent> (named profile on a multiplexed peer)"
+    )
+    run_p.add_argument(
+        "message", nargs="?", default=None, help="Message text (or stdin)"
+    )
+    run_p.add_argument(
+        "--idempotency-key",
+        default=None,
+        help="Stable retry key (generated when omitted)",
+    )
+    run_p.add_argument(
+        "--json", action="store_true", default=False, help="Emit a JSON result"
+    )
+
+    status_p = peer_sub.add_parser(
+        "status",
+        help="Read the status and final output of an asynchronous peer run",
+    )
+    status_p.add_argument(
+        "target", help="<peer> or <peer>/<agent> (named profile on a multiplexed peer)"
+    )
+    status_p.add_argument("run_id", help="Run ID returned by 'hermes peer run'")
+    status_p.add_argument(
+        "--json", action="store_true", default=False, help="Emit a JSON result"
+    )
 
     parser.set_defaults(func=cmd_peer)

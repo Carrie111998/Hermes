@@ -92,6 +92,8 @@ def test_dm_unknown_peer_and_missing_key(monkeypatch):
 class _FakePeer(BaseHTTPRequestHandler):
     sessions: list = []
     chats: list = []
+    runs: list = []
+    run_idempotency_keys: list = []
     auth_seen: list = []
 
     def _json(self, payload, status=200):
@@ -104,6 +106,14 @@ class _FakePeer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).auth_seen.append(self.headers.get("Authorization", ""))
+        if self.path == "/v1/runs/run_1":
+            return self._json({
+                "object": "hermes.run",
+                "run_id": "run_1",
+                "status": "completed",
+                "session_id": "bc_existing",
+                "output": "async reply from the other machine",
+            })
         if self.path.startswith("/api/sessions"):
             data = [{"id": s, "title": "Bot Chat"} for s in type(self).sessions]
             return self._json({"object": "list", "data": data})
@@ -122,12 +132,23 @@ class _FakePeer(BaseHTTPRequestHandler):
 
         if self.path.startswith("/api/sessions/") and self.path.endswith("/chat"):
             type(self).chats.append(body.get("message"))
+            return self._json({
+                "object": "hermes.session.chat.completion",
+                "session_id": "bc_1",
+                "message": {
+                    "role": "assistant",
+                    "content": "reply from the other machine",
+                },
+            })
+
+        if self.path == "/v1/runs":
+            type(self).runs.append(body)
+            type(self).run_idempotency_keys.append(
+                self.headers.get("Idempotency-Key", "")
+            )
             return self._json(
-                {
-                    "object": "hermes.session.chat.completion",
-                    "session_id": "bc_1",
-                    "message": {"role": "assistant", "content": "reply from the other machine"},
-                }
+                {"run_id": "run_1", "status": "started", "replayed": False},
+                202,
             )
 
         return self._json({"error": {"message": "not found"}}, 404)
@@ -140,6 +161,8 @@ class _FakePeer(BaseHTTPRequestHandler):
 def fake_peer_server():
     _FakePeer.sessions = []
     _FakePeer.chats = []
+    _FakePeer.runs = []
+    _FakePeer.run_idempotency_keys = []
     _FakePeer.auth_seen = []
     server = HTTPServer(("127.0.0.1", 0), _FakePeer)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -320,3 +343,58 @@ def test_dm_older_peer_with_visible_bot_chat_still_works(monkeypatch, capsys, fa
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["reply"] == "reply from the other machine"
     assert _FakePeer.sessions == ["bc_visible"]
+
+
+def test_run_starts_async_turn_with_canonical_session_and_idempotency(
+    monkeypatch, capsys, fake_peer_server
+):
+    _FakePeer.sessions = ["bc_existing"]
+    monkeypatch.setattr(
+        peer_cmd, "_load_peers", lambda: {"spark": {"url": fake_peer_server}}
+    )
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(
+            peer_action="run",
+            target="spark",
+            message="long task",
+            idempotency_key="ticket-123",
+            json=True,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "peer": "spark",
+        "profile": None,
+        "session_id": "bc_existing",
+        "run_id": "run_1",
+        "status": "started",
+        "idempotency_key": "ticket-123",
+        "replayed": False,
+    }
+    assert _FakePeer.runs == [{"input": "long task", "session_id": "bc_existing"}]
+    assert _FakePeer.run_idempotency_keys == ["ticket-123"]
+
+
+def test_status_reads_async_run_output(monkeypatch, capsys, fake_peer_server):
+    monkeypatch.setattr(
+        peer_cmd, "_load_peers", lambda: {"spark": {"url": fake_peer_server}}
+    )
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(
+            peer_action="status",
+            target="spark",
+            run_id="run_1",
+            json=True,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "completed"
+    assert payload["output"] == "async reply from the other machine"
