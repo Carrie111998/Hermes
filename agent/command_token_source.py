@@ -27,6 +27,12 @@ Output contract: print ONLY the token on stdout, either bare or as JSON with
 an ``access_token`` field (``expires_in`` is honoured when present) — the
 shape OAuth 2.0 token endpoints and the helpers above already emit.
 
+Command execution: ``key_cmd`` is an argv-style command line. Hermes parses it
+with ``shlex`` and invokes the resulting argument vector with shell execution
+disabled. Shell operators and expansion syntax are rejected rather than
+reinterpreted, so shell-only helpers must be migrated to an executable plus
+explicit arguments.
+
 Precedence: an explicit ``--api-key`` still wins (the one-off recovery escape
 hatch); otherwise ``key_cmd`` is preferred over a static ``api_key`` /
 ``key_env`` on the same entry.
@@ -36,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 import threading
 import time
@@ -63,12 +70,53 @@ class CommandTokenError(RuntimeError):
     """A ``key_cmd`` failed to produce a usable token."""
 
 
+_SHELL_SYNTAX = frozenset(
+    (";", "&", "|", "<", ">", "$", "(", ")", "`", "\r", "\n")
+)
+
+
+def _parse_command_argv(command: str, label: str) -> list[str]:
+    """Parse an argv-style command without granting it shell semantics."""
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single_quote:
+            escaped = True
+            continue
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            continue
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            continue
+        if not in_single_quote and not in_double_quote and char in _SHELL_SYNTAX:
+            raise CommandTokenError(
+                f"key_cmd for provider {label!r} contains unsupported shell syntax; "
+                "use an argv-style command without shell operators"
+            )
+
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} could not be parsed as argv"
+        ) from exc
+    if not argv:
+        raise CommandTokenError(f"key_cmd for provider {label!r} is empty")
+    return argv
+
+
 def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
-    """Run *command*, returning ``(token, ttl_seconds_or_None)``."""
+    """Run *command* as argv, returning ``(token, ttl_seconds_or_None)``."""
+    argv = _parse_command_argv(command, label)
     try:
         completed = subprocess.run(
-            command,
-            shell=True,
+            argv,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=_MINT_TIMEOUT_SECONDS,
