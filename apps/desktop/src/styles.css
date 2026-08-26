@@ -3459,3 +3459,37 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
 [data-hud-shell] [data-slot='composer-bounds'] *::-webkit-scrollbar {
   display: none;
 }
+
+/* Profile-rail breathing badge (#95502): a finished-but-unseen turn in any of
+   a profile's sessions pulses that profile's square. Opacity-only travel on a
+   compositor layer — no layout, no paint — mirroring the arc-border budget. */
+/* The breathing initial (#95502): finished-but-unseen work in this profile's
+   sessions. Reuses the desktop's OWN resting states — the letter breathes
+   between the unselected dim (opacity .35) and the selected bright
+   (opacity 1.0), inherited from the official profile square styling. Only the
+   LETTER's opacity animates; the square's background stays at its resting
+   unselected fill (22% color-mix), so there is zero glow, zero box-shadow,
+   zero extra visual noise — a quiet dim→bright pulse of the glyph itself, in
+   the profile color, matching the official look-and-feel exactly. */
+[data-profile-breathing='true'] {
+  animation: profile-breath 1.6s ease-in-out infinite;
+}
+
+@keyframes profile-breath {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Reduced motion: hold a static resting opacity instead of pulsing
+   (mirrors the app-wide reduce policy). */
+@media (prefers-reduced-motion: reduce) {
+  [data-profile-breathing='true'] {
+    animation: none;
+    opacity: 0.85;
+  }
+}
