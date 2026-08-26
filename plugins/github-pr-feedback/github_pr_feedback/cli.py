@@ -684,6 +684,28 @@ def _status() -> int:
     return 0
 
 
+def _reusable_ci_receipt(
+    ledger: object,
+    identity: CIAuditIdentity,
+    worktree: Path,
+) -> CIAuditReceipt | None:
+    """Reuse immutable exact-head evidence instead of repeating an expensive lane."""
+
+    reader = getattr(ledger, "latest_ci_receipt_for_head", None)
+    if not callable(reader):
+        return None
+    receipt = reader(identity.repository, identity.pr_number, identity.head_sha)
+    if receipt is None:
+        return None
+    if not isinstance(receipt, CIAuditReceipt) or receipt.identity != identity:
+        raise LedgerStateError("stored CI receipt identity is inconsistent")
+    manifest_path = worktree / "tests/manifests/test_lanes.toml"
+    if not manifest_path.is_file():
+        return None
+    manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    return receipt if receipt.manifest_digest == manifest_digest else None
+
+
 def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
     handoff_completed = False
     try:
@@ -706,8 +728,10 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
         return 1
     ledger = FeedbackLedger.for_current_profile()
     try:
-        receipt = LocalCIRunner(github, ledger).run(identity, worktree)
-    except (CIValidationError, GitHubClientError):
+        receipt = _reusable_ci_receipt(ledger, identity, worktree)
+        if receipt is None:
+            receipt = LocalCIRunner(github, ledger).run(identity, worktree)
+    except (CIValidationError, GitHubClientError, LedgerStateError):
         print(json.dumps({"status": "audit_unavailable"}, sort_keys=True))
         return_code = 1
     else:

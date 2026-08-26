@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -1657,6 +1658,47 @@ def test_failed_audit_handoff_dispatches_the_typed_receipt_before_completion(
 
     assert result == 1
     assert dispatched == [receipt]
+
+
+def test_audit_reuses_exact_head_manifest_receipt_without_rerunning_lane(
+    tmp_path: Path,
+) -> None:
+    from github_pr_feedback.ci_runner import CIAuditIdentity, CIAuditReceipt
+    from github_pr_feedback.cli import _reusable_ci_receipt
+    from github_pr_feedback.github_client import CheckState
+
+    worktree = tmp_path / "repository"
+    manifest = worktree / "tests/manifests/test_lanes.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("[lane.fast]\nargv = ['pytest']\n", encoding="utf-8")
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    identity = CIAuditIdentity("acme/widgets", 17, "b" * 40, "a" * 40)
+    receipt = CIAuditReceipt(
+        receipt_id="f" * 64,
+        identity=identity,
+        manifest_digest=digest,
+        status="failed",
+        started_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 25, 12, 1, tzinfo=UTC),
+        actions_state=CheckState(False, True, 0),
+        commands=(),
+    )
+
+    class Ledger:
+        def latest_ci_receipt_for_head(
+            self, repository: str, pr_number: int, head_sha: str
+        ) -> CIAuditReceipt:
+            assert (repository, pr_number, head_sha) == (
+                identity.repository,
+                identity.pr_number,
+                identity.head_sha,
+            )
+            return receipt
+
+    assert _reusable_ci_receipt(Ledger(), identity, worktree) is receipt
+
+    manifest.write_text("[lane.changed]\nargv = ['pytest']\n", encoding="utf-8")
+    assert _reusable_ci_receipt(Ledger(), identity, worktree) is None
 
 
 def test_ci_audit_handoff_terminates_only_a_task_scoped_parent(
