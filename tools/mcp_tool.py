@@ -6225,7 +6225,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _watch_awaitable = None
                     if asyncio.iscoroutine(_call_coro) and callable(_watch_children):
                         candidate = _watch_children()
-                        if inspect.isawaitable(candidate):
+                        if asyncio.iscoroutine(candidate):
                             _watch_awaitable = candidate
                     if _watch_awaitable is None:
                         # Stubbed sessions (MagicMock in tests) return a
