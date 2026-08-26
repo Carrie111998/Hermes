@@ -26,8 +26,7 @@ def build_debug_parser(subparsers, *, cmd_debug: Callable) -> None:
 Examples:
     hermes debug share              Upload debug report (asks for confirmation)
     hermes debug share --yes        Skip confirmation (for scripts/CI)
-    hermes debug share --lines 500  Include more log lines
-    hermes debug share --expire 30  Keep paste for 30 days
+    hermes debug share --local --lines 500  Inspect more log lines locally
     hermes debug share --local      Print report locally (no upload)
     hermes debug share --local --no-redact  Inspect unredacted logs locally
     hermes debug share --nous       Upload to Nous-internal storage (private)
@@ -43,13 +42,15 @@ Examples:
         "--lines",
         type=int,
         default=200,
-        help="Number of log lines to include per log file (default: 200)",
+        help="Number of log lines for --local or --nous (default: 200)",
     )
     share_parser.add_argument(
         "--expire",
         type=int,
         default=7,
-        help="Paste expiry in days (default: 7)",
+        # Retained for CLI compatibility. Public pastes use the fixed six-hour
+        # deletion schedule and private Nous bundles use their fixed retention.
+        help=argparse.SUPPRESS,
     )
     share_parser.add_argument(
         "--local",
