@@ -73,6 +73,117 @@ class TestRenameToolSearchBridgeForXai:
         _rename_tool_search_bridge_for_xai(tools)
         assert tools[0]["function"]["name"] == "tool_search"
 
+    def test_transport_build_aliases_xai_tool_search(self, transport):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "description": "Search deferred tools.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        kwargs = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "Find a tool"}],
+            tools=tools,
+            provider="xai-oauth",
+            base_url="https://api.x.ai/v1",
+        )
+
+        assert kwargs["tools"][0]["function"]["name"] == "hermes_tool_search"
+
+    def test_transport_rejects_xai_bridge_alias_collision(self, transport):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "description": "Search deferred tools.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "hermes_tool_search",
+                    "description": "Conflicting caller-supplied tool.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+        with pytest.raises(ValueError, match="reserved wire alias"):
+            transport.build_kwargs(
+                model="grok-4.6",
+                messages=[{"role": "user", "content": "Find a tool"}],
+                tools=tools,
+                provider="xai-oauth",
+            )
+
+    def test_transport_aliases_replayed_xai_tool_search_call(self, transport):
+        messages = [
+            {"role": "user", "content": "Find a tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": '{"queries":["calendar"]}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_search", "content": "{}"},
+        ]
+
+        kwargs = transport.build_kwargs(
+            model="grok-4.6",
+            messages=messages,
+            tools=[],
+            provider="xai-oauth",
+        )
+
+        assert kwargs["messages"][1]["tool_calls"][0]["function"]["name"] == (
+            "hermes_tool_search"
+        )
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "tool_search"
+
+    def test_transport_keeps_non_xai_tool_search_names(self, transport):
+        tools = [{"type": "function", "function": {"name": "tool_search"}}]
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {"name": "tool_search", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=tools,
+            provider="openai",
+            base_url="https://api.openai.com/v1",
+        )
+
+        assert kwargs["tools"][0]["function"]["name"] == "tool_search"
+        assert kwargs["messages"][0]["tool_calls"][0]["function"]["name"] == (
+            "tool_search"
+        )
+
 
 def _fake_response(tool_name):
     tc = SimpleNamespace(

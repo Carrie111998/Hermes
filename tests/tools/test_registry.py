@@ -40,6 +40,21 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
+    def test_reserved_wire_alias_is_rejected(self):
+        import pytest
+
+        reg = ToolRegistry()
+
+        with pytest.raises(ValueError, match="reserved wire alias"):
+            reg.register(
+                name="hermes_tool_search",
+                toolset="plugin",
+                schema=_make_schema("hermes_tool_search"),
+                handler=_dummy_handler,
+            )
+
+        assert reg.get_entry("hermes_tool_search") is None
+
 
     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
         """Parallel MCP registrations with one name leave exactly one owner."""
@@ -107,6 +122,21 @@ class TestGetDefinitions:
         assert all(d["type"] == "function" for d in defs)
         names = {d["function"]["name"] for d in defs}
         assert names == {"t1", "t2"}
+
+    def test_dynamic_schema_cannot_expose_reserved_wire_alias(self):
+        import pytest
+
+        reg = ToolRegistry()
+        reg.register(
+            name="safe_name",
+            toolset="plugin",
+            schema=_make_schema("safe_name"),
+            handler=_dummy_handler,
+            dynamic_schema_overrides=lambda: {"name": "hermes_tool_search"},
+        )
+
+        with pytest.raises(ValueError, match="reserved wire alias"):
+            reg.get_definitions({"safe_name"})
 
 
     def test_reuses_shared_check_fn_once_per_call(self):

@@ -34,6 +34,7 @@ from agent.reasoning_effort import (
     clamp_effort,
     codex_supported_efforts,
 )
+from agent.tool_name_aliases import reject_reserved_wire_tool_name
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
@@ -121,14 +122,45 @@ def _alias_reserved_tools(
     reverse mapping lives in :data:`_RESERVED_ALIAS_TO_NAME`, applied in
     ``normalize_response`` so Hermes dispatch never sees the alias.
     """
+    for tool in response_tools:
+        if isinstance(tool, dict):
+            name = tool.get("name")
+            if isinstance(name, str):
+                reject_reserved_wire_tool_name(name)
+
     rewritten: List[Dict[str, Any]] = []
     for tool in response_tools:
         if isinstance(tool, dict) and tool.get("name") in reserved_names:
             aliased = dict(tool)
-            aliased["name"] = f"{_RESERVED_TOOL_ALIAS_PREFIX}{tool['name']}"
+            canonical_name = tool["name"]
+            wire_name = f"{_RESERVED_TOOL_ALIAS_PREFIX}{canonical_name}"
+            aliased["name"] = wire_name
+            description = aliased.get("description")
+            if isinstance(description, str):
+                aliased["description"] = description.replace(canonical_name, wire_name)
             rewritten.append(aliased)
         else:
             rewritten.append(tool)
+    return rewritten
+
+
+def _alias_reserved_function_calls(
+    response_input: List[Dict[str, Any]],
+    reserved_names: Tuple[str, ...],
+) -> List[Dict[str, Any]]:
+    """Alias replayed function-call names without mutating conversation history."""
+    rewritten: List[Dict[str, Any]] = []
+    for item in response_input:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and item.get("name") in reserved_names
+        ):
+            aliased = dict(item)
+            aliased["name"] = f"{_RESERVED_TOOL_ALIAS_PREFIX}{item['name']}"
+            rewritten.append(aliased)
+        else:
+            rewritten.append(item)
     return rewritten
 
 
@@ -605,20 +637,26 @@ class ResponsesApiTransport(ProviderTransport):
         from agent.model_metadata import (
             strip_codex_context_variant_suffix as _strip_ctx_variant,
         )
+        response_input = _chat_messages_to_responses_input(
+            payload_messages,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+            replay_encrypted_reasoning=replay_encrypted_reasoning,
+            current_issuer_kind=issuer_kind,
+            native_compaction_eligible=native_compaction_active,
+        )
+        if is_xai_responses:
+            response_input = _alias_reserved_function_calls(
+                response_input, ("tool_search",)
+            )
+
         kwargs = {
             # ``-900k`` large-context picker variants are Hermes-side aliases
             # (gpt-5.6-sol-900k etc.) — the Codex/OpenAI backend only knows
             # the base slug, so strip the suffix before it hits the wire.
             "model": _strip_ctx_variant(model),
             "instructions": instructions,
-            "input": _chat_messages_to_responses_input(
-                payload_messages,
-                is_xai_responses=is_xai_responses,
-                is_github_responses=is_github_responses,
-                replay_encrypted_reasoning=replay_encrypted_reasoning,
-                current_issuer_kind=issuer_kind,
-                native_compaction_eligible=native_compaction_active,
-            ),
+            "input": response_input,
             "store": False,
         }
         if response_tools:
@@ -833,7 +871,7 @@ class ResponsesApiTransport(ProviderTransport):
                     name = "web_search"
                 # Undo the OpenCode reserved-name wire aliases the same way
                 # (hermes_web_search / hermes_search_files, #85589).
-                elif name in _RESERVED_ALIAS_TO_NAME:
+                if name in _RESERVED_ALIAS_TO_NAME:
                     name = _RESERVED_ALIAS_TO_NAME[name]
                 tool_calls.append(ToolCall(
                     id=tc.id if hasattr(tc, "id") else (name or None),

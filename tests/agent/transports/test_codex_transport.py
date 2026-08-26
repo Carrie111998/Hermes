@@ -36,7 +36,6 @@ class TestCodexTransportBasic:
         assert result[0]["type"] == "function"
         assert result[0]["name"] == "terminal"
 
-
 class TestCodexBuildKwargs:
 
     def test_900k_context_variant_suffix_stripped_on_wire(self, transport):
@@ -979,6 +978,89 @@ class TestXaiReservedToolSearchAlias:
         # ordinary tools go out untouched.
         assert "tool_describe" in names
         assert "read_file" in names
+
+    def test_xai_aliases_description_without_mutating_tool_registry(self, transport):
+        tools = [
+            {
+                **self._TOOLS[0],
+                "function": {
+                    **self._TOOLS[0]["function"],
+                    "description": "Call tool_search before tool_describe.",
+                },
+            },
+            *self._TOOLS[1:],
+        ]
+
+        kwargs = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            is_xai_responses=True,
+        )
+
+        aliased = next(t for t in kwargs["tools"] if t.get("name") == "hermes_tool_search")
+        assert "hermes_tool_search" in aliased["description"]
+        assert tools[0]["function"]["description"] == "Call tool_search before tool_describe."
+        assert tools[0]["function"]["name"] == "tool_search"
+
+    def test_reserved_tool_search_is_aliased_in_replayed_history(self, transport):
+        messages = [
+            {"role": "user", "content": "Find a calendar tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_search",
+                        "call_id": "call_search",
+                        "response_item_id": "fc_search",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": '{"queries":["calendar"]}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": '{"matches":[]}',
+            },
+        ]
+
+        kwargs = transport.build_kwargs(
+            model="grok-4.6",
+            messages=messages,
+            tools=list(self._TOOLS),
+            is_xai_responses=True,
+        )
+
+        function_call = next(
+            item for item in kwargs["input"] if item.get("type") == "function_call"
+        )
+        assert function_call["name"] == "hermes_tool_search"
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "tool_search"
+
+    def test_xai_rejects_bridge_alias_collision(self, transport):
+        tools = list(self._TOOLS) + [
+            {
+                "type": "function",
+                "function": {
+                    "name": "hermes_tool_search",
+                    "description": "Conflicting caller-supplied tool.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        with pytest.raises(ValueError, match="reserved wire alias"):
+            transport.build_kwargs(
+                model="grok-4.6",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=tools,
+                is_xai_responses=True,
+            )
 
     def test_non_xai_backend_keeps_tool_search_name(self, transport):
         kw = transport.build_kwargs(

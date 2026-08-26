@@ -11,6 +11,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 
 import json
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.reasoning_effort import (
@@ -24,6 +25,7 @@ from agent.reasoning_effort import (
 )
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
+from agent.tool_name_aliases import TOOL_SEARCH_WIRE_ALIAS, reject_reserved_wire_tool_name
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
@@ -35,10 +37,21 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 # same literal name for every provider, so Grok providers are unusable
 # whenever the bridge is active. Mirror the web_search treatment in
 # transports/codex.py (_rename_client_web_search_for_xai): alias the wire
-# declaration and map the alias back in normalize_response. The alias value
-# matches _CODEX_TOOL_SEARCH_ALIAS from the Codex-side fix for the same
-# reserved-name class (#83122) so the two transports stay consistent.
-_XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
+# declaration and map the alias back in normalize_response. The shared wire
+# alias comes from ``agent.tool_name_aliases`` so both transports stay
+# consistent.
+_XAI_TOOL_SEARCH_ALIAS = TOOL_SEARCH_WIRE_ALIAS
+
+
+def _is_xai_target(params: dict[str, Any]) -> bool:
+    provider = str(params.get("provider") or params.get("provider_name") or "")
+    if provider.strip().lower() in {"xai", "xai-oauth"}:
+        return True
+    base_url = str(params.get("base_url") or "").strip()
+    try:
+        return (urlsplit(base_url).hostname or "").lower() == "api.x.ai"
+    except ValueError:
+        return False
 
 
 def _rename_tool_search_bridge_for_xai(
@@ -51,6 +64,12 @@ def _rename_tool_search_bridge_for_xai(
     pass through untouched. The alias is mapped back to ``tool_search`` in
     ``normalize_response`` before dispatch.
     """
+    for tool in tools:
+        if isinstance(tool, dict):
+            name = (tool.get("function") or {}).get("name")
+            if isinstance(name, str):
+                reject_reserved_wire_tool_name(name)
+
     rewritten: list[dict[str, Any]] = []
     for tool in tools:
         if (
@@ -62,6 +81,38 @@ def _rename_tool_search_bridge_for_xai(
             rewritten.append(aliased)
         else:
             rewritten.append(tool)
+    return rewritten
+
+
+def _rename_replayed_tool_search_for_xai(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Alias canonical tool-search calls in replayed assistant history."""
+    rewritten: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            rewritten.append(message)
+            continue
+        tool_calls = message.get("tool_calls")
+        if message.get("role") != "assistant" or not isinstance(tool_calls, list):
+            rewritten.append(message)
+            continue
+
+        calls: list[Any] = []
+        changed = False
+        for tool_call in tool_calls:
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if isinstance(function, dict) and function.get("name") == "tool_search":
+                calls.append(
+                    {
+                        **tool_call,
+                        "function": {**function, "name": _XAI_TOOL_SEARCH_ALIAS},
+                    }
+                )
+                changed = True
+            else:
+                calls.append(tool_call)
+        rewritten.append({**message, "tool_calls": calls} if changed else message)
     return rewritten
 
 
@@ -542,6 +593,11 @@ class ChatCompletionsTransport(ProviderTransport):
         # Pass model so the Gemini thought_signature (extra_content) is kept for
         # Gemini targets and stripped for strict non-Gemini providers.
         sanitized = self.convert_messages(messages, model=model)
+
+        if _is_xai_target(params):
+            sanitized = _rename_replayed_tool_search_for_xai(sanitized)
+            if tools:
+                tools = _rename_tool_search_bridge_for_xai(tools)
 
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
