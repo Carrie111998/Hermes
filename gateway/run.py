@@ -1031,6 +1031,45 @@ def _has_platform_display_override(user_config: dict, platform_key: str, setting
     return isinstance(platform_cfg, dict) and setting in platform_cfg
 
 
+def _customer_facing_whatsapp_bot_turn(event: Any) -> bool:
+    """Return whether a WhatsApp bot turn came from an external participant.
+
+    Bot-mode WhatsApp chats are commonly customer-facing. The bridge marks
+    linked-device messages typed by the owner explicitly; every other bot-mode
+    inbound must be treated as external rather than inheriting operator-facing
+    diagnostics.
+    """
+    source = getattr(event, "source", None)
+    if getattr(source, "platform", None) != Platform.WHATSAPP:
+        return False
+    try:
+        from gateway.platforms.whatsapp_common import _get_wsecret
+
+        mode = str(_get_wsecret("WHATSAPP_MODE", "self-chat") or "self-chat")
+    except Exception:
+        # An unreadable trust mode must not expose operator diagnostics.
+        mode = "bot"
+    if mode.strip().lower() != "bot":
+        return False
+    metadata = getattr(event, "metadata", None)
+    return not bool(
+        isinstance(metadata, dict) and metadata.get("whatsapp_from_owner") is True
+    )
+
+
+def _requires_explicit_internal_display_opt_in(
+    user_config: dict,
+    platform_key: str,
+    setting: str,
+    source: Any,
+) -> bool:
+    """Require a per-platform opt-in before exposing internals to bot chats."""
+    return bool(
+        getattr(source, "_customer_facing_bot_turn", False)
+        and not _has_platform_display_override(user_config, platform_key, setting)
+    )
+
+
 def _resolve_gateway_display_bool(
     user_config: dict,
     platform_key: str,
@@ -5310,6 +5349,8 @@ class TurnRunner:
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         ctx = self._ctx
+        if getattr(ctx.source, "_customer_facing_bot_turn", False):
+            return
         if not ctx._status_adapter or not ctx._run_still_current():
             return
         prepared_message = _prepare_gateway_status_message(
@@ -16482,6 +16523,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        if getattr(source, "_customer_facing_bot_turn", False):
+            logger.debug(
+                "Suppressing operator notice in customer-facing WhatsApp bot chat"
+            )
+            return
         adapter = self._adapter_for_source(source)
         if not adapter:
             return
@@ -16997,6 +17043,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        # Stamp a turn-local trust classification once, inside the profile's
+        # secret scope. Downstream notice/progress rails consume this marker;
+        # SessionSource serialization intentionally ignores dynamic attrs.
+        source._customer_facing_bot_turn = _customer_facing_whatsapp_bot_turn(event)
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -20865,18 +20915,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Mattermost requires explicit per-platform opt-in because this is
             # scratch text, not ordinary final-answer content.
             try:
+                _reasoning_config = _load_gateway_config()
                 _show_reasoning_effective = _resolve_gateway_display_bool(
-                    _load_gateway_config(),
+                    _reasoning_config,
                     _platform_config_key(source.platform),
                     "show_reasoning",
                     default=bool(getattr(self, "_show_reasoning", False)),
                     platform=source.platform,
                     require_platform_override_for={Platform.MATTERMOST},
                 )
+                if _requires_explicit_internal_display_opt_in(
+                    _reasoning_config,
+                    _platform_config_key(source.platform),
+                    "show_reasoning",
+                    source,
+                ):
+                    _show_reasoning_effective = False
             except Exception:
                 _show_reasoning_effective = (
                     False
-                    if source.platform == Platform.MATTERMOST
+                    if (
+                        source.platform == Platform.MATTERMOST
+                        or getattr(source, "_customer_facing_bot_turn", False)
+                    )
                     else getattr(self, "_show_reasoning", False)
                 )
             if _show_reasoning_effective and response and not _intentional_silence:
@@ -28708,6 +28769,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        if _requires_explicit_internal_display_opt_in(
+            user_config, platform_key, "tool_progress", source
+        ):
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -28722,6 +28787,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             allow_generic: bool = False,
         ) -> str:
             """Return off|raw|generic for a gateway visibility surface."""
+            if _requires_explicit_internal_display_opt_in(
+                user_config, platform_key, setting, source
+            ):
+                return "off"
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {
