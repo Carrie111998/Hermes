@@ -107,10 +107,41 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    # sys.executable verbatim — never resolved (see the symlink test below).
+    assert exec_line.split(" ")[0].strip('"') == sys.executable
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
+
+
+def test_exec_keeps_venv_symlink_interpreter_unresolved(tmp_path, xdg_home, monkeypatch):
+    """#94058: uv-created venvs make ``bin/python`` a symlink into a shared
+    base-interpreter tree. CPython discovers ``pyvenv.cfg`` from the
+    executable path *as invoked*, so resolving the symlink escapes the venv
+    and the entry dies on the first third-party import. Exec must use the
+    unresolved venv path.
+    """
+    root = _make_project(tmp_path)
+    base_python = tmp_path / "uv-store" / "cpython-3.11" / "bin" / "python3.11"
+    base_python.parent.mkdir(parents=True)
+    base_python.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+    assert venv_python.resolve() == base_python
+
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
+    assert str(base_python) not in exec_line
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
