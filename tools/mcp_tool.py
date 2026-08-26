@@ -975,7 +975,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
             _scope = mcp_field(result, "cache_scope", "cacheScope")
             if _ttl is not None:
                 cache_meta_out["ttl_ms"] = _ttl
-            if _scope is not None:
+            if _scope is not None and _scope != "":
                 cache_meta_out["cache_scope"] = _scope
         items.extend(getattr(result, items_attr, None) or [])
         cursor = mcp_field(result, "next_cursor", "nextCursor")
