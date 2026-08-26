@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -53,6 +54,8 @@ from hermes_time import now as _hermes_now
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
+from .outbox import HindsightOutbox, OutboxRow
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,7 +75,7 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.9.2"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -810,6 +813,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # can race the interpreter shutdown and emit "cannot schedule new
         # futures after interpreter shutdown" / "Unclosed client session".
         self._retain_queue: queue.Queue = queue.Queue()
+        self._outbox: HindsightOutbox | None = None
+        self._outbox_replay_thread: threading.Thread | None = None
+        self._outbox_wakeup = threading.Event()
         self._writer_thread: threading.Thread | None = None
         self._shutting_down = threading.Event()
         self._atexit_registered = False
@@ -1302,6 +1308,28 @@ class HindsightMemoryProvider(MemoryProvider):
             )
         )
 
+    @staticmethod
+    def _is_not_found_error(exc: Exception) -> bool:
+        """Return True for an SDK/API 404 without importing generated models.
+
+        ``hindsight-client`` lazily imports a large generated Pydantic model
+        graph when ``hindsight_client_api.exceptions`` is first imported. Doing
+        that on the prefetch thread can delay the first operation-status poll
+        by several seconds. The generated exception exposes ``status`` and
+        ``http_resp.status`` across supported SDK versions, while the class
+        name provides a fallback for lightweight test doubles/older clients.
+        """
+        status = getattr(exc, "status", None)
+        if status is None:
+            response = getattr(exc, "http_resp", None)
+            status = getattr(response, "status", None)
+        if status is not None:
+            try:
+                return int(status) == 404
+            except (TypeError, ValueError):
+                pass
+        return type(exc).__name__ == "NotFoundException"
+
     def _ensure_writer(self) -> None:
         """Lazy-start the single retain-writer thread.
 
@@ -1357,17 +1385,15 @@ class HindsightMemoryProvider(MemoryProvider):
         means "no longer pending" and is treated as done. Transient errors
         return False so the caller keeps waiting until its deadline.
         """
-        from hindsight_client_api.exceptions import NotFoundException
-
         try:
             resp = self._run_hindsight_operation(
                 lambda client: client.operations.get_operation_status(
                     bank_id=bank_id, operation_id=op_id
                 )
             )
-        except NotFoundException:
-            return True
         except Exception as exc:
+            if self._is_not_found_error(exc):
+                return True
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
         status = str(getattr(resp, "status", "") or "").lower()
@@ -1510,6 +1536,92 @@ class HindsightMemoryProvider(MemoryProvider):
                     logger.warning("Hindsight retain failed: %s", exc, exc_info=True)
             finally:
                 self._retain_queue.task_done()
+
+    def _ensure_outbox_replay(self) -> None:
+        """Start the durable replay worker without starting the legacy writer."""
+        thread = self._outbox_replay_thread
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._outbox_replay_loop,
+            daemon=True,
+            name="hindsight-outbox-replay",
+        )
+        self._outbox_replay_thread = thread
+        thread.start()
+
+    def _outbox_replay_loop(self) -> None:
+        """Replay persisted rows after startup and whenever Hindsight recovers."""
+        while not self._shutting_down.is_set():
+            rows: list[OutboxRow] = []
+            if self._outbox is not None:
+                try:
+                    rows = self._outbox.claim_due(limit=1, replay_only=True)
+                except Exception as exc:
+                    logger.warning("Hindsight outbox read failed: %s", exc)
+            if rows:
+                self._deliver_outbox_row(rows[0])
+                continue
+            self._outbox_wakeup.wait(timeout=1.0)
+            self._outbox_wakeup.clear()
+
+    def _retain_batch_from_outbox(self, client, row: OutboxRow):
+        """Send a queued retain, using idempotency when the SDK exposes it."""
+        kwargs = {
+            "bank_id": row.bank_id,
+            "items": [row.item],
+            "document_id": row.document_id,
+            "retain_async": row.retain_async,
+        }
+        if row.retain_async and row.operation_id:
+            try:
+                supports_operation_id = "operation_id" in inspect.signature(
+                    client.aretain_batch
+                ).parameters
+            except (TypeError, ValueError):
+                supports_operation_id = False
+            if supports_operation_id:
+                kwargs["operation_id"] = row.operation_id
+        return client.aretain_batch(**kwargs)
+
+    def _deliver_outbox_row(self, row: OutboxRow) -> None:
+        """Deliver one persisted request; failed rows remain for retry."""
+        try:
+            operation_id = None
+            if row.retain_async and self._outbox is not None:
+                operation_id = self._outbox.ensure_operation_id(row.id, row.operation_id)
+                row = OutboxRow(
+                    id=row.id,
+                    dedupe_key=row.dedupe_key,
+                    bank_id=row.bank_id,
+                    document_id=row.document_id,
+                    update_mode=row.update_mode,
+                    retain_async=row.retain_async,
+                    operation_id=operation_id,
+                    item=row.item,
+                    attempts=row.attempts,
+                    available_at=row.available_at,
+                    state=row.state,
+                    last_error=row.last_error,
+                )
+            resp = self._run_hindsight_operation(
+                lambda client: self._retain_batch_from_outbox(client, row)
+            )
+            if row.retain_async:
+                self._track_retain_ops(resp, row.bank_id)
+            if self._outbox is not None:
+                self._outbox.acknowledge(row.id)
+            logger.debug("Hindsight outbox delivery succeeded: row=%s", row.id)
+        except Exception as exc:
+            delay = min(300.0, float(2 ** min(row.attempts, 8)))
+            if self._outbox is not None:
+                self._outbox.reschedule(
+                    row.id, type(exc).__name__, delay_seconds=delay
+                )
+            logger.warning(
+                "Hindsight unavailable; retain row %s kept for retry in %.0fs: %s",
+                row.id, delay, exc,
+            )
 
     def _register_atexit(self) -> None:
         """Register an idempotent atexit hook to drain the writer.
@@ -1679,6 +1791,9 @@ class HindsightMemoryProvider(MemoryProvider):
             user=self._user_id,
             session=self._session_id,
         )
+        self._outbox = HindsightOutbox(get_hermes_home() / "hindsight" / "outbox.sqlite3")
+        self._outbox.release_stale_claims()
+        self._outbox.activate_replay_rows()
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
@@ -1837,6 +1952,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
+
+        self._ensure_outbox_replay()
 
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
@@ -2141,33 +2258,32 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
 
+        item = self._build_retain_kwargs(
+            content,
+            context=retain_context,
+            metadata=metadata_snapshot,
+            tags=lineage_tags or None,
+        )
+        item.pop("bank_id", None)
+        item.pop("retain_async", None)
+        if update_mode is not None:
+            item["update_mode"] = update_mode
+        dedupe_key = f"{document_id}:{self._turn_index}:{num_turns}"
+        row_id = self._outbox.enqueue(
+            dedupe_key=dedupe_key,
+            bank_id=bank_id,
+            document_id=document_id,
+            update_mode=update_mode,
+            retain_async=retain_async_flag,
+            item=item,
+        )
+
         def _do_retain() -> None:
-            item = self._build_retain_kwargs(
-                content,
-                context=retain_context,
-                metadata=metadata_snapshot,
-                tags=lineage_tags or None,
-            )
-            item.pop("bank_id", None)
-            item.pop("retain_async", None)
-            if update_mode is not None:
-                item["update_mode"] = update_mode
-            logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
-                         bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
-            resp = self._run_hindsight_operation(
-                lambda client: client.aretain_batch(
-                    bank_id=bank_id,
-                    items=[item],
-                    document_id=document_id,
-                    retain_async=retain_async_flag,
-                )
-            )
-            # For async retains the write is only *accepted* here; track the
-            # returned operation id(s) so the next-turn prefetch can wait for
-            # true server-side completion (read-after-write) before recalling.
-            if retain_async_flag:
-                self._track_retain_ops(resp, bank_id)
-            logger.debug("Hindsight retain succeeded")
+            row = self._outbox.claim(row_id)
+            if row is not None:
+                logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
+                             bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
+                self._deliver_outbox_row(row)
 
         self._ensure_writer()
         self._register_atexit()
@@ -2176,6 +2292,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # only fires on turns that actually persist.
         self._emit_saving_indicator()
         self._retain_queue.put(_do_retain)
+        self._outbox_wakeup.set()
         # Advance the append watermark only after the delta is queued, so a
         # later retain doesn't re-ship turns we've already handed to the writer.
         if update_mode == "append":
@@ -2425,9 +2542,19 @@ class HindsightMemoryProvider(MemoryProvider):
                     "abandoning %d pending retain(s)",
                     self._retain_queue.qsize(),
                 )
+        replay = self._outbox_replay_thread
+        if replay is not None and replay.is_alive():
+            self._outbox_wakeup.set()
+            replay.join(timeout=10.0)
+            if replay.is_alive():
+                logger.warning("Hindsight outbox replay worker did not stop within 10s")
+        workers_stopped = not (
+            (writer is not None and writer.is_alive())
+            or (replay is not None and replay.is_alive())
+        )
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
-        if self._client is not None:
+        if workers_stopped and self._client is not None:
             try:
                 if self._mode == "local_embedded":
                     # HindsightEmbedded.close() delegates to its sync client.close().
@@ -2452,6 +2579,12 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception:
                 pass
             self._client = None
+        if workers_stopped and self._outbox is not None:
+            try:
+                self._outbox.close()
+            except Exception:
+                pass
+            self._outbox = None
         # The module-global background event loop (_loop / _loop_thread)
         # is intentionally NOT stopped here. It is shared across every
         # HindsightMemoryProvider instance in the process — the plugin
