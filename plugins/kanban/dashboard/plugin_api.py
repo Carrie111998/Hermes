@@ -575,6 +575,21 @@ def get_task(
                 "latest_summary": child_summaries.get(child.id),
                 "result": child.result,
             })
+        hierarchy_child_ids = kanban_db.hierarchy_child_ids(conn, task_id)
+        hierarchy_summaries = kanban_db.latest_summaries(conn, hierarchy_child_ids)
+        hierarchy_child_results = []
+        for child_id in hierarchy_child_ids:
+            child = kanban_db.get_task(conn, child_id)
+            if child is None:
+                continue
+            hierarchy_child_results.append({
+                "id": child.id,
+                "title": child.title,
+                "status": child.status,
+                "kind": child.kind,
+                "latest_summary": hierarchy_summaries.get(child.id),
+                "result": child.result,
+            })
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
         diags = _compute_task_diagnostics(conn, task_ids=[task_id])
@@ -589,6 +604,13 @@ def get_task(
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
             "child_results": child_results,
+            "hierarchy_child_results": hierarchy_child_results,
+            "hierarchy_progress": {
+                "completed": sum(
+                    child["status"] == "done" for child in hierarchy_child_results
+                ),
+                "total": len(hierarchy_child_results),
+            },
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -1070,9 +1092,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             )
 
         if payload.parent_id is not None or payload.clear_parent:
-            kanban_db.reparent_issue(
-                conn, task_id, None if payload.clear_parent else payload.parent_id,
-            )
+            try:
+                kanban_db.reparent_issue(
+                    conn, task_id, None if payload.clear_parent else payload.parent_id,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
@@ -1089,7 +1114,10 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.delete_task(conn, task_id)
+        try:
+            ok = kanban_db.delete_task(conn, task_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}

@@ -142,6 +142,73 @@ def test_dashboard_filters_and_reparents_recursive_issues(client):
     assert moved.json()["task"]["parent_id"] == other["id"]
 
 
+@pytest.mark.parametrize("case", ["cycle", "self", "orphan"])
+def test_dashboard_reparent_validation_returns_4xx(client, case):
+    root = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "root", "kind": "project"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parent_id": root["id"]},
+    ).json()["task"]
+    parent_id = {
+        "cycle": child["id"],
+        "self": root["id"],
+        "orphan": "t_missing",
+    }[case]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{root['id']}", json={"parent_id": parent_id},
+    )
+
+    assert 400 <= response.status_code < 500, response.text
+    assert response.json()["detail"]
+
+
+def test_dashboard_parent_delete_validation_returns_4xx(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent"},
+    ).json()["task"]
+    client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "contained", "parent_id": parent["id"]},
+    )
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{parent['id']}")
+
+    assert 400 <= response.status_code < 500, response.text
+    assert response.json()["detail"]
+
+
+def test_task_detail_separates_hierarchy_children_from_dependencies(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent"},
+    ).json()["task"]
+    contained_open = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "contained open", "parent_id": parent["id"]},
+    ).json()["task"]
+    contained_done = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "contained done", "parent_id": parent["id"]},
+    ).json()["task"]
+    dependency = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "dependency child", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{contained_done['id']}", json={"status": "done"},
+    ).status_code == 200
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{parent['id']}").json()
+
+    assert {row["id"] for row in detail["hierarchy_child_results"]} == {
+        contained_open["id"], contained_done["id"],
+    }
+    assert detail["hierarchy_progress"] == {"completed": 1, "total": 2}
+    assert [row["id"] for row in detail["child_results"]] == [dependency["id"]]
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

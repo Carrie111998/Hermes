@@ -3939,6 +3939,8 @@
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
     const childResults = props.data.child_results || [];
+    const hierarchyChildren = props.data.hierarchy_child_results || [];
+    const hierarchyProgress = props.data.hierarchy_progress || { completed: 0, total: 0 };
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
@@ -4056,9 +4058,27 @@
         }
         return null;
       })(),
+      hierarchyChildren.length > 0 ? h("details", { className: "hermes-kanban-section", open: true },
+        h("summary", { className: "hermes-kanban-section-head" },
+          `Contained Issues (${hierarchyProgress.completed}/${hierarchyProgress.total} completed)`),
+        hierarchyChildren.map(function (child) {
+          return h("div", { key: child.id, className: "hermes-kanban-comment" },
+            h("div", { className: "hermes-kanban-comment-head" },
+              h("span", { className: "hermes-kanban-comment-author" },
+                `${child.kind || "task"} · ${child.title || child.id}`),
+              h(Badge, { variant: "outline" }, child.status),
+              h("button", {
+                type: "button",
+                className: "hermes-kanban-diag-action-btn",
+                onClick: function () { if (props.onOpenTask) props.onOpenTask(child.id); },
+              }, tx(i18n, "open", "Open")),
+            ),
+          );
+        }),
+      ) : null,
       childResults.length > 0 ? h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" },
-          `${tx(i18n, "childResults", "Child Results")} (${childResults.length})`),
+          `Dependency ${tx(i18n, "childResults", "Child Results")} (${childResults.length})`),
         childResults.map(function (child) {
           var childResult = child.result || child.latest_summary || null;
           return h("div", { key: child.id, className: "hermes-kanban-comment" },
