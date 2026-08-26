@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -108,11 +109,24 @@ def test_same_signature_dedups_same_incident(monkeypatch, tmp_path):
     assert inc.get_incident(id1)["state"] == "detected"
 
 
-def test_signature_normalizes_dynamic_numbers():
+def test_signature_normalizes_long_dynamic_numbers():
     assert incidents._error_signature(
-        "job-1", "request 123 failed after 45 seconds"
+        "job-1", "request 123456 failed at 1720000000"
     ) == incidents._error_signature(
-        "job-1", "request 987 failed after 60 seconds"
+        "job-1", "request 987654 failed at 1730000000"
+    )
+
+
+def test_signature_preserves_status_and_exit_codes():
+    assert incidents._error_signature(
+        "job-1", "request failed with status 404"
+    ) != incidents._error_signature(
+        "job-1", "request failed with status 500"
+    )
+    assert incidents._error_signature(
+        "job-1", "script exited with code 1"
+    ) != incidents._error_signature(
+        "job-1", "script exited with code 137"
     )
 
 
@@ -123,26 +137,26 @@ def test_unacked_incident_alerts_immediately_then_after_four_hours_and_daily(
     started = datetime(2026, 8, 26, tzinfo=timezone.utc)
 
     monkeypatch.setattr(inc, "_hermes_now", lambda: started)
-    inc_id, should_alert = inc.upsert_incident_for_alert("job-1", "boom 123")
+    inc_id, should_alert = inc.upsert_incident_for_alert("job-1", "boom 12345")
     assert should_alert is True
     assert inc.mark_incident_alerted(inc_id) is True
 
     monkeypatch.setattr(inc, "_hermes_now", lambda: started + timedelta(hours=1))
-    same_id, should_alert = inc.upsert_incident_for_alert("job-1", "boom 456")
+    same_id, should_alert = inc.upsert_incident_for_alert("job-1", "boom 45678")
     assert same_id == inc_id
     assert should_alert is False
 
     monkeypatch.setattr(inc, "_hermes_now", lambda: started + timedelta(hours=4))
-    _, should_alert = inc.upsert_incident_for_alert("job-1", "boom 789")
+    _, should_alert = inc.upsert_incident_for_alert("job-1", "boom 78901")
     assert should_alert is True
     assert inc.mark_incident_alerted(inc_id) is True
 
     monkeypatch.setattr(inc, "_hermes_now", lambda: started + timedelta(hours=5))
-    _, should_alert = inc.upsert_incident_for_alert("job-1", "boom 999")
+    _, should_alert = inc.upsert_incident_for_alert("job-1", "boom 99999")
     assert should_alert is False
 
     monkeypatch.setattr(inc, "_hermes_now", lambda: started + timedelta(hours=28))
-    _, should_alert = inc.upsert_incident_for_alert("job-1", "boom 111")
+    _, should_alert = inc.upsert_incident_for_alert("job-1", "boom 11111")
     assert should_alert is True
 
 
@@ -312,6 +326,162 @@ def test_existing_incident_schema_gains_alert_confirmation_column(
     row = inc.get_incident(inc_id)
     assert row is not None
     assert row["last_alerted_at"] is not None
+
+
+def test_existing_incidents_migrate_to_normalized_signatures(monkeypatch, tmp_path):
+    db_path = tmp_path / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True)
+    legacy_rows = [
+        ("job-1", "request abcdef123456 failed", "alerted"),
+        ("job-2", "worker failed at 1720000000", "closed"),
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE cron_incidents (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 error_sig TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 failure_type TEXT NOT NULL DEFAULT 'unknown',
+                 first_seen_at TEXT NOT NULL,
+                 last_seen_at TEXT NOT NULL,
+                 last_alerted_at TEXT,
+                 acked_at TEXT,
+                 closed_at TEXT,
+                 error TEXT NOT NULL,
+                 output_file TEXT
+               )"""
+        )
+        for job_id, error, state in legacy_rows:
+            normalized = incidents._normalize_error(error)[:200]
+            legacy_sig = hashlib.sha256(
+                job_id.encode() + normalized.encode()
+            ).hexdigest()[:12]
+            legacy_id = incidents._incident_id(job_id, legacy_sig)
+            conn.execute(
+                """INSERT INTO cron_incidents
+                   (id, job_id, error_sig, state, failure_type,
+                    first_seen_at, last_seen_at, last_alerted_at,
+                    acked_at, closed_at, error, output_file)
+                   VALUES (?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, NULL)""",
+                (
+                    legacy_id,
+                    job_id,
+                    legacy_sig,
+                    state,
+                    "2026-08-25T00:00:00+00:00",
+                    "2026-08-26T00:00:00+00:00",
+                    "2026-08-25T00:00:00+00:00" if state == "alerted" else None,
+                    "2026-08-26T00:00:00+00:00" if state == "closed" else None,
+                    "2026-08-26T00:00:00+00:00" if state == "closed" else None,
+                    error,
+                ),
+            )
+
+    inc = _point_db(monkeypatch, tmp_path)
+    rows = {row["job_id"]: row for row in inc.list_incidents()}
+
+    assert set(rows) == {"job-1", "job-2"}
+    for job_id, error, state in legacy_rows:
+        expected_sig = inc._error_signature(job_id, error)
+        assert rows[job_id]["id"] == inc._incident_id(job_id, expected_sig)
+        assert rows[job_id]["error_sig"] == expected_sig
+        assert rows[job_id]["state"] == state
+
+
+def test_signature_migration_merges_collisions_and_preserves_ack(monkeypatch, tmp_path):
+    db_path = tmp_path / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True)
+    errors = (
+        ("worker failed at 1720000000", "alerted"),
+        ("worker failed at 1730000000", "closed"),
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE cron_incidents (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                 error_sig TEXT NOT NULL, state TEXT NOT NULL,
+                 failure_type TEXT NOT NULL DEFAULT 'unknown',
+                 first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                 last_alerted_at TEXT, acked_at TEXT, closed_at TEXT,
+                 error TEXT NOT NULL, output_file TEXT
+               )"""
+        )
+        for index, (error, state) in enumerate(errors):
+            normalized = incidents._normalize_error(error)[:200]
+            legacy_sig = hashlib.sha256(
+                b"job-1" + normalized.encode()
+            ).hexdigest()[:12]
+            conn.execute(
+                """INSERT INTO cron_incidents
+                   VALUES (?, 'job-1', ?, ?, 'unknown', ?, ?, NULL, ?, ?, ?, NULL)""",
+                (
+                    incidents._incident_id("job-1", legacy_sig),
+                    legacy_sig,
+                    state,
+                    f"2026-08-2{index + 4}T00:00:00+00:00",
+                    f"2026-08-2{index + 5}T00:00:00+00:00",
+                    "2026-08-26T00:00:00+00:00" if state == "closed" else None,
+                    "2026-08-26T00:00:00+00:00" if state == "closed" else None,
+                    error,
+                ),
+            )
+
+    inc = _point_db(monkeypatch, tmp_path)
+    rows = inc.list_incidents()
+
+    assert len(rows) == 1
+    assert rows[0]["state"] == "closed"
+    expected_sig = inc._error_signature("job-1", errors[0][0])
+    assert rows[0]["id"] == inc._incident_id("job-1", expected_sig)
+    assert inc.upsert_incident_for_alert("job-1", errors[1][0])[1] is False
+
+
+def test_signature_migration_matches_legacy_raw_error_after_redaction(
+    monkeypatch, tmp_path
+):
+    db_path = tmp_path / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True)
+    raw_error = "provider rejected api_key=sk-secret-value"
+    stored_error = "provider rejected api_key=***REDACTED***"
+    legacy_sig = hashlib.sha256(
+        b"job-1" + incidents._normalize_error(raw_error)[:200].encode()
+    ).hexdigest()[:12]
+    legacy_id = incidents._incident_id("job-1", legacy_sig)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE cron_incidents (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                 error_sig TEXT NOT NULL, state TEXT NOT NULL,
+                 failure_type TEXT NOT NULL DEFAULT 'unknown',
+                 first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                 last_alerted_at TEXT, acked_at TEXT, closed_at TEXT,
+                 error TEXT NOT NULL, output_file TEXT
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO cron_incidents
+               VALUES (?, 'job-1', ?, 'closed', 'auth', ?, ?, NULL, ?, ?, ?, NULL)""",
+            (
+                legacy_id,
+                legacy_sig,
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-26T00:00:00+00:00",
+                "2026-08-26T00:00:00+00:00",
+                "2026-08-26T00:00:00+00:00",
+                stored_error,
+            ),
+        )
+
+    inc = _point_db(monkeypatch, tmp_path)
+    inc.list_incidents()  # Run the eager migration from persisted data.
+    incident_id, should_alert = inc.upsert_incident_for_alert("job-1", raw_error)
+
+    assert should_alert is False
+    assert inc.count_incidents() == 1
+    row = inc.get_incident(incident_id)
+    assert row is not None
+    assert row["state"] == "closed"
 
 
 # ── Scheduler gating ───────────────────────────────────────────────────────

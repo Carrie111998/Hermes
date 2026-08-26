@@ -354,8 +354,10 @@ cron:
 A recurring job that keeps failing with the *same* error creates a durable
 **incident**, keyed by the job plus a normalized signature of the raw error
 text, in the same per-profile ledger database as the execution history. The
-incident alerts immediately, then after four hours, then daily while it stays
-open. Failed alert deliveries remain due and retry on the next failed run.
+incident alerts immediately, then on subsequent failing runs after four hours,
+then daily while it stays open. Disabled jobs and successful runs do not send
+incident reminders. Failed alert deliveries remain due and retry on the next
+failed run.
 
 ```bash
 hermes cron incidents                 # list incidents (newest activity first)
