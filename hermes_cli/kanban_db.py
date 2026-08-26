@@ -1107,6 +1107,11 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Persisted model-policy decision. ``route_snapshot`` is canonical JSON
+    # (generated at claim time) and is verified again before spawning.
+    routing_priority: Optional[str] = None
+    routing_tier: Optional[str] = None
+    route_snapshot: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1215,6 +1220,11 @@ class Task:
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
+            routing_priority=(
+                row["routing_priority"] if "routing_priority" in keys else None
+            ),
+            routing_tier=(row["routing_tier"] if "routing_tier" in keys else None),
+            route_snapshot=(row["route_snapshot"] if "route_snapshot" in keys else None),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -3761,6 +3771,7 @@ def set_model_override(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
+    rejection: Optional[str] = None
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -3769,14 +3780,31 @@ def set_model_override(
             return False
         if row["status"] == "archived":
             raise RuntimeError(f"cannot set model override on archived task {task_id}")
-        conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-            (model, provider, task_id),
-        )
-        _append_event(
-            conn, task_id, "model_override_set",
-            {"model": model, "provider": provider},
-        )
+        if model:
+            try:
+                from hermes_cli.kanban_model_policy import PolicyError, ModelRoutingPolicy
+                ModelRoutingPolicy.load().validate_override(provider, model)
+            except (PolicyError, ValueError) as exc:
+                rejection = str(exc)
+                _append_event(
+                    conn, task_id, "model_override_rejected",
+                    {"model": model, "provider": provider, "reason": rejection},
+                )
+        if rejection is not None:
+            # Commit the audit event before rejecting the caller; raising in this
+            # transaction would roll the event back and erase the evidence.
+            pass
+        else:
+            conn.execute(
+                "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
+                (model, provider, task_id),
+            )
+            _append_event(
+                conn, task_id, "model_override_set",
+                {"model": model, "provider": provider},
+            )
+    if rejection is not None:
+        raise ValueError(f"routing policy rejected model override: {rejection}")
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("model_override", "provider_override"))
     return True
@@ -4614,6 +4642,48 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _snapshot_claim_route(conn: sqlite3.Connection, task_id: str, status: str) -> Optional[dict[str, str]]:
+    """Resolve and durably snapshot an approved route, or block fail-closed.
+
+    Called inside a claim transaction before its ready/review -> running CAS.
+    No policy (or an invalid persisted override) is a routing block, never an
+    implicit fall-back to a profile default.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    try:
+        from hermes_cli.kanban_model_policy import PolicyError, policy_for_task
+        policy, route = policy_for_task(task)
+        if task.model_override:
+            approved = policy.validate_override(task.provider_override, task.model_override)
+            route = {**route, **approved}
+    except (PolicyError, ValueError) as exc:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL "
+            "WHERE id=? AND status=? AND claim_lock IS NULL",
+            (task_id, status),
+        )
+        event = "model_resource_blocked" if (task.routing_priority or "").upper() == "P4" else "routing_blocked"
+        _append_event(conn, task_id, event, {"reason": str(exc), "source_status": status})
+        return None
+    if route["priority"] == "P0":
+        conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+            "routing_priority=?, routing_tier=?, route_snapshot=? "
+            "WHERE id=? AND status=? AND claim_lock IS NULL",
+            ("P0", "deterministic", json.dumps(route, sort_keys=True), task_id, status),
+        )
+        _append_event(conn, task_id, "deterministic_routed", {"route": route, "source_status": status})
+        return None
+    snapshot = json.dumps(route, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "UPDATE tasks SET routing_priority=?, routing_tier=?, route_snapshot=? WHERE id=?",
+        (route["priority"], route["tier"], snapshot, task_id),
+    )
+    return route
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4655,6 +4725,10 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # Policy routing is an admission gate, not a post-claim spawn hint.
+        # This fail-closed path records its own routing event and leaves no run.
+        if _snapshot_claim_route(conn, task_id, "ready") is None:
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4693,7 +4767,8 @@ def claim_task(
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "routing_priority, routing_tier, route_snapshot "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4702,8 +4777,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                routing_priority, routing_tier, route_snapshot, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4712,6 +4787,9 @@ def claim_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                trow["routing_priority"] if trow else None,
+                trow["routing_tier"] if trow else None,
+                trow["route_snapshot"] if trow else None,
                 now,
             ),
         )
@@ -4775,6 +4853,8 @@ def claim_review_task(
                     },
                 )
             return None
+        if _snapshot_claim_route(conn, task_id, "review") is None:
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4791,7 +4871,8 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "routing_priority, routing_tier, route_snapshot "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4800,8 +4881,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                routing_priority, routing_tier, route_snapshot, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4810,6 +4891,9 @@ def claim_review_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                trow["routing_priority"] if trow else None,
+                trow["routing_tier"] if trow else None,
+                trow["route_snapshot"] if trow else None,
                 now,
             ),
         )
@@ -10727,6 +10811,22 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Defense in depth: dispatch may be called with a Task reconstructed from
+    # hostile/direct DB writes. Only the route snapshot produced by claim is
+    # allowed to reach subprocess creation.
+    try:
+        from hermes_cli.kanban_model_policy import policy_for_task
+        policy, resolved_route = policy_for_task(task)
+        if task.model_override:
+            resolved_route = {**resolved_route, **policy.validate_override(task.provider_override, task.model_override)}
+        persisted_route = json.loads(task.route_snapshot or "")
+        if persisted_route != resolved_route:
+            raise ValueError("persisted route snapshot does not match routing policy")
+    except Exception as exc:
+        if isinstance(exc, ValueError) and "routing policy" in str(exc):
+            raise
+        raise ValueError(f"routing policy rejected task {task.id}: {exc}") from exc
 
     from hermes_cli.profiles import normalize_profile_name
 
