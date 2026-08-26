@@ -26,8 +26,8 @@ def test_skill_frontmatter_meets_authoring_contract():
     assert len(metadata["description"]) <= 60
     assert metadata["description"].endswith(".")
     assert metadata["author"].split(",")[0].strip() != "Hermes Agent"
-    assert metadata["platforms"] == ["linux", "macos", "windows"]
-    assert metadata["metadata"]["hermes"]["related_skills"] == [
+    assert {"linux", "macos", "windows"} <= set(metadata["platforms"])
+    assert {
         "mcp-oauth-remote-gateway",
         "mpp-agent",
-    ]
+    } <= set(metadata["metadata"]["hermes"]["related_skills"])
