@@ -2,26 +2,15 @@ from __future__ import annotations
 
 import subprocess
 
+from tests.conftest import write_valid_model_routing_config
+
 
 def _make_task(kb, *, assignee: str):
-    return kb.Task(
-        id="t_spawn_tools",
-        title="spawn tools",
-        body=None,
-        assignee=assignee,
-        status="running",
-        priority=0,
-        created_by="test",
-        created_at=1,
-        started_at=None,
-        completed_at=None,
-        workspace_kind="dir",
-        workspace_path=None,
-        claim_lock="lock",
-        claim_expires=None,
-        tenant=None,
-        current_run_id=7,
-    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="spawn tools", assignee=assignee, workspace_kind="dir")
+        task = kb.claim_task(conn, task_id, claimer=f"{assignee}:1")
+        assert task is not None
+        return task
 
 
 def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):
@@ -56,7 +45,7 @@ agent:
 """.lstrip(),
         encoding="utf-8",
     )
-    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    write_valid_model_routing_config(root)
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
@@ -78,11 +67,12 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    task = _make_task(kb, assignee="elias")
+    pid = kb._default_spawn(task, str(workspace))
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
-    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["env"]["HERMES_KANBAN_TASK"] == task.id
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
@@ -98,7 +88,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     """
     root = tmp_path / ".hermes"
     (root / "profiles" / "elias").mkdir(parents=True)
-    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    write_valid_model_routing_config(root)
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
@@ -118,8 +108,17 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    task = _make_task(kb, assignee="elias")
-    task.model_override = "gpt-5.6-sol"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="spawn tools",
+            assignee="elias",
+            workspace_kind="dir",
+            provider_override="openai",
+            model_override="large",
+        )
+        task = kb.claim_task(conn, task_id, claimer="elias:1")
+        assert task is not None
     kb._default_spawn(task, str(workspace))
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
@@ -130,8 +129,8 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     args = parser.parse_args(captured["cmd"][3:])
 
     assert args.command == "chat"
-    assert args.model == "gpt-5.6-sol"
-    assert args.query == "work kanban task t_spawn_tools"
+    assert args.model == "large"
+    assert args.query == f"work kanban task {task_id}"
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):

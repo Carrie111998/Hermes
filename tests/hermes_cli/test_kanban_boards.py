@@ -61,6 +61,8 @@ def fresh_home(tmp_path, monkeypatch):
         pass
     # Kanban module-level init cache must not leak between tests.
     kb._INITIALIZED_PATHS.clear()
+    from tests.conftest import write_valid_model_routing_config
+    write_valid_model_routing_config(home)
     return home
 
 
@@ -257,29 +259,16 @@ class TestWorkerSpawnEnv:
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         kb.create_board("spawntest")
 
-        task = kb.Task(
-            id="t_abc",
-            title="worker test",
-            body=None,
-            assignee="teknium",
-            status="ready",
-            priority=0,
-            created_by="user",
-            created_at=0,
-            started_at=None,
-            completed_at=None,
-            workspace_kind="scratch",
-            workspace_path=None,
-            claim_lock=None,
-            claim_expires=None,
-            tenant=None,
-        )
+        with kb.connect(board="spawntest") as conn:
+            task_id = kb.create_task(conn, title="worker test", assignee="teknium")
+            task = kb.claim_task(conn, task_id, claimer="teknium:1")
+            assert task is not None
 
         kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
-        assert env["HERMES_KANBAN_TASK"] == "t_abc"
+        assert env["HERMES_KANBAN_TASK"] == task.id
         # DB path should match the per-board DB, not the legacy default.
         expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
         assert env["HERMES_KANBAN_DB"] == str(expected_db)

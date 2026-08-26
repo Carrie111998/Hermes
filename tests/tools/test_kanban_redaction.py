@@ -22,6 +22,8 @@ def worker_env(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from tests.conftest import write_valid_model_routing_config
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path

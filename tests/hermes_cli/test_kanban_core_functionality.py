@@ -34,6 +34,8 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from tests.conftest import write_valid_model_routing_config
+    write_valid_model_routing_config(home)
     # Existing crash-detection tests pre-date the grace window; pin to 0
     # so they keep their immediate-reclaim semantics.
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
@@ -721,7 +723,8 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     try:
         tid = kb.create_task(conn, title="skill-loading test",
                              assignee="some-profile")
-        task = kb.get_task(conn, tid)
+        task = kb.claim_task(conn, tid, claimer="some-profile:1")
+        assert task is not None
         workspace = kb.resolve_workspace(task)
         pid = kb._default_spawn(task, str(workspace))
         assert pid == 99999

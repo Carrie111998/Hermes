@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from tests.conftest import write_valid_model_routing_config
+
 
 # ---------------------------------------------------------------------------
 # Gating
@@ -25,6 +27,7 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     import tools.kanban_tools  # ensure registered
@@ -50,6 +53,7 @@ def worker_env(monkeypatch, tmp_path):
     after we've created the task."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
@@ -62,10 +66,12 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        task = kb.claim_task(conn, tid)
+        assert task is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
     return tid
 
 
@@ -170,6 +176,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     # Set up isolated HERMES_HOME
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
@@ -236,6 +243,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
 
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
@@ -457,6 +465,7 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
     from pathlib import Path as _Path
@@ -694,6 +703,7 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     from pathlib import Path as _P
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
@@ -738,6 +748,7 @@ def multi_board_env(monkeypatch, tmp_path):
     """
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     # Make sure neither HERMES_KANBAN_DB nor HERMES_KANBAN_BOARD pin a
     # board — the test is specifically about the per-call override.

@@ -16,6 +16,8 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from tests.conftest import write_valid_model_routing_config
+    write_valid_model_routing_config(home)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     # Allow the kanban notifier path-validator to upload artifacts the
     # tests write under ``tmp_path``. Without this, every artifact-delivery

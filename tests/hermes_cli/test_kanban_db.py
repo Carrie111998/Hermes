@@ -38,18 +38,8 @@ def routed_task(kanban_home):
     but their real claims must still carry the authorized snapshot a dispatcher
     worker receives. This prevents hand-written route snapshots in test setup.
     """
-    (kanban_home / "config.yaml").write_text(
-        """
-model_routing:
-  enabled: true
-  tiers:
-    T1:
-      - {provider: nous, model: small}
-  classification:
-    P1: {tier: T1}
-""".strip(),
-        encoding="utf-8",
-    )
+    from tests.conftest import write_valid_model_routing_config
+    write_valid_model_routing_config(kanban_home)
 
     def create_and_claim(conn, *, title: str, assignee: str, **kwargs):
         claimer = kwargs.pop("claimer", None)

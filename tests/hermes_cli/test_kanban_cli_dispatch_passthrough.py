@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,9 +22,11 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # Do not purge project modules from sys.modules. Other collected test
+    # modules retain references to them at import time, so deleting and
+    # re-importing creates split-brain singleton/caches for later tests in a
+    # direct multi-file pytest invocation. Kanban path resolution is dynamic
+    # from HERMES_HOME, and monkeypatch restores the environment on teardown.
     yield test_home
 
 

@@ -1771,14 +1771,18 @@ model_routing:
 """
 
 
-@pytest.fixture
-def valid_model_routing_config() -> Path:
-    """Persist the minimal valid production routing policy for this test home."""
-    home = Path(os.environ["HERMES_HOME"])
+def write_valid_model_routing_config(home: Path) -> Path:
+    """Persist the minimal valid production routing policy at ``home``."""
     home.mkdir(parents=True, exist_ok=True)
     path = home / "config.yaml"
     path.write_text(_VALID_MODEL_ROUTING_CONFIG, encoding="utf-8")
     return path
+
+
+@pytest.fixture
+def valid_model_routing_config() -> Path:
+    """Persist the minimal valid production routing policy for this test home."""
+    return write_valid_model_routing_config(Path(os.environ["HERMES_HOME"]))
 
 
 @pytest.fixture

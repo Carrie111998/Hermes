@@ -15,26 +15,15 @@ from __future__ import annotations
 
 import subprocess
 
+from tests.conftest import write_valid_model_routing_config
+
 
 def _make_task(kb, *, assignee: str = "w"):
-    return kb.Task(
-        id="t_cwd",
-        title="cwd pin",
-        body=None,
-        assignee=assignee,
-        status="running",
-        priority=0,
-        created_by="test",
-        created_at=1,
-        started_at=None,
-        completed_at=None,
-        workspace_kind="dir",
-        workspace_path=None,
-        claim_lock="lock",
-        claim_expires=None,
-        tenant=None,
-        current_run_id=1,
-    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="cwd pin", assignee=assignee, workspace_kind="dir")
+        task = kb.claim_task(conn, task_id, claimer=f"{assignee}:1")
+        assert task is not None
+        return task
 
 
 def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
@@ -61,7 +50,7 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     (root / "profiles" / "w").mkdir(parents=True)
     (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    write_valid_model_routing_config(root)
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb

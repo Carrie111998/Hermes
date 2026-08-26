@@ -10,6 +10,7 @@ import os
 import pytest
 
 from hermes_state import SessionDB
+from tests.conftest import write_valid_model_routing_config
 
 
 @pytest.fixture()
@@ -24,6 +25,9 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     """The dispatcher tags the worker's env so its session is a `kanban` row."""
     from hermes_cli import kanban_db as kb
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    write_valid_model_routing_config(tmp_path)
+
     captured = {}
 
     class _Proc:
@@ -37,29 +41,17 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
-    task = kb.Task(
-        id="t_b21733fb",
-        title="ship it",
-        body=None,
-        assignee="default",
-        status="in_progress",
-        priority=0,
-        created_by=None,
-        created_at=0,
-        started_at=None,
-        completed_at=None,
-        workspace_kind="scratch",
-        workspace_path=None,
-        claim_lock=None,
-        claim_expires=None,
-        tenant=None,
-    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ship it", assignee="default")
+        task = kb.claim_task(conn, task_id, claimer="default:1")
+        assert task is not None
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)
 
     kb._default_spawn(task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
+    assert captured["env"]["HERMES_KANBAN_TASK"] == task_id
 
 
 def test_kanban_rows_stay_out_of_the_session_list(db):

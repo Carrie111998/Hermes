@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import write_valid_model_routing_config
+
 # The subprocess-boundary tests below spawn ``sys.executable -c`` with a tmp
 # cwd. Without an explicit PYTHONPATH the child resolves ``hermes_cli`` /
 # ``agent`` through whatever install is on sys.path (in a worktree that is the
@@ -28,6 +30,7 @@ def _python_with_repo_path(code: str) -> str:
 def _make_running_kanban_task(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     attachments_root = tmp_path / "attachments"
     workspace = tmp_path / "parent-workspace"
     workspace.mkdir()

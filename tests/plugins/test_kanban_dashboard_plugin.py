@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from tests.conftest import write_valid_model_routing_config
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
@@ -543,6 +545,7 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     compare)."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    write_valid_model_routing_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()

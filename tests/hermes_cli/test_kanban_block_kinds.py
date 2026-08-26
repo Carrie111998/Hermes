@@ -29,6 +29,8 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from tests.conftest import write_valid_model_routing_config
+    write_valid_model_routing_config(home)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
