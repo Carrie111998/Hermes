@@ -2534,9 +2534,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "fallback chain is empty (not configured, or every entry dropped "
             "as invalid at init)" if _chain_len == 0 else "fallback chain exhausted"
         )
+        # An empty chain is the normal state of a default install with no
+        # fallback_providers configured, so it must not write a config-sounding
+        # WARNING into errors.log on the first transient empty response. Real
+        # exhaustion — a chain that was configured and has now been walked to
+        # the end — is a genuine degradation and keeps WARNING.
+        _base_level = logging.INFO if _chain_len == 0 else logging.WARNING
+        # Cleared per episode alongside _fallback_index / _fallback_activated in
+        # restore_primary_runtime and switch_model, so a later, genuinely
+        # different incident warns again instead of being suppressed for the
+        # life of the process.
         _already = getattr(agent, "_fallback_unavailable_logged", False)
         logger.log(
-            logging.DEBUG if _already else logging.WARNING,
+            logging.DEBUG if _already else _base_level,
             "Fallback not activated: %s (index=%d, chain_len=%d, reason=%s)",
             _why,
             agent._fallback_index,
