@@ -752,6 +752,14 @@ def test_gateway_formatter_renders_async_block():
     assert "Investigate flaky test" in txt
 
 
+def test_async_formatter_renders_unmeasured_api_calls_as_na():
+    text = format_process_notification(_make_async_evt(api_calls=None))
+
+    assert text is not None
+    assert "API calls: n/a" in text
+    assert "API calls: None" not in text
+
+
 def test_gateway_cli_origin_event_left_unrouted():
     """An empty session_key (CLI origin) is left without routing fields."""
     from gateway.run import GatewayRunner

@@ -128,6 +128,7 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
                 "success": False,
                 "error": "Gemini HTTP 503 (UNAVAILABLE)",
                 "delivery_outcome": "delivered",
+                "api_calls": 0,
             },
         )
     ]
@@ -322,6 +323,7 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
                 "success": False,
                 "error": "KeyboardInterrupt",
                 "delivery_outcome": "suppressed",
+                "api_calls": 0,
             },
         )
     ]

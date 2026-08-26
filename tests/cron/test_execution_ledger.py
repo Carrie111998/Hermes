@@ -171,6 +171,32 @@ def test_run_one_job_persists_measured_api_calls(monkeypatch):
     assert finished[-1][1]["api_calls"] == 4
 
 
+def test_run_one_job_persists_zero_when_dispatch_is_rejected(monkeypatch):
+    import cron.scheduler as scheduler
+
+    finished = []
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: False)
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    assert scheduler.run_one_job(
+        {"id": "already-dispatched", "execution_id": "exec-rejected"}
+    ) is True
+    assert finished == [
+        (
+            "exec-rejected",
+            {
+                "success": False,
+                "error": "Dispatch claim rejected; execution was not started.",
+                "api_calls": 0,
+            },
+        )
+    ]
+
+
 def test_quick_backup_includes_execution_ledger():
     from hermes_cli.backup import _QUICK_STATE_FILES
 

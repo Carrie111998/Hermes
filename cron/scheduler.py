@@ -6322,6 +6322,8 @@ def run_job(
         if usage_out is not None:
             usage_out["api_calls"] = (
                 int(result.get("api_calls") or 0)
+                # run_conversation results are measured unless a runtime
+                # explicitly marks its turn counter otherwise (Codex app-server).
                 if result.get("api_calls_measured", True)
                 else None
             )
@@ -6855,6 +6857,9 @@ def _run_one_job_body(
     execution_usage = _cron_execution_usage.get()
     if execution_usage is None:
         execution_usage = {}
+    # The execution has not entered the agent path yet, so early terminal
+    # exits (for example, a rejected one-shot dispatch claim) are measured zero.
+    execution_usage.setdefault("api_calls", 0)
 
     def _finish_execution(**kwargs):
         if "api_calls" in execution_usage:

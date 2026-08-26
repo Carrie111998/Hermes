@@ -2977,6 +2977,7 @@ def _format_async_delegation(evt: dict) -> str:
     summary = evt.get("summary")
     error = evt.get("error")
     api_calls = evt.get("api_calls", 0)
+    api_calls_display = "n/a" if api_calls is None else str(api_calls)
     duration = evt.get("duration_seconds", "?")
     truncated = evt.get("truncated") or evt.get("exit_reason") == "max_iterations"
     dispatched_at = evt.get("dispatched_at")
@@ -3081,7 +3082,10 @@ def _format_async_delegation(evt: dict) -> str:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
     lines.append(f"Role: {role}   Model: {model}")
     _trunc = " [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""
-    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s{_trunc}")
+    lines.append(
+        f"Status: {status}   API calls: {api_calls_display}   "
+        f"Duration: {duration}s{_trunc}"
+    )
     lines.append("--- RESULT ---")
     if status in ("completed", "success") and summary:
         if truncated:
