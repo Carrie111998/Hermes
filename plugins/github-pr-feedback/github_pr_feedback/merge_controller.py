@@ -20,6 +20,7 @@ from .github_client import (
 )
 from .ledger import FeedbackLedger, MergeLease
 from .policy import FeedbackReceipt, MergeMaintainerPolicy, PluginPolicy, PullRequest
+from .intent_review import pending_intent_review
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,7 @@ class MergeSnapshot:
     manifest_digest: str
     feedback_clear: bool
     base_head_sha: str
+    intent_review_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +178,8 @@ def evaluate_merge(
         blockers.append("governed_review_missing")
     if not snapshot.feedback_clear:
         blockers.append("feedback_unprocessed")
+    if snapshot.intent_review_pending:
+        blockers.append("intent_review_required")
     method = _allowed_merge_method(policy, snapshot.repository_merge_policy)
     if method is None:
         blockers.append("merge_method_unavailable")
@@ -392,6 +396,8 @@ class CanonicalMergeEvidenceSource:
         if receipt is not None and not isinstance(receipt, CIAuditReceipt):
             raise GitHubClientError("CI receipt had an invalid type")
         feedback_clear = self._feedback_clear(pull)
+        feedback = self._github.list_feedback(policy.repository, number)
+        intent_pending = pending_intent_review(feedback, owner_login=target.owner_login)
         return MergeSnapshot(
             repository_private=self._github.repository_is_private(policy.repository),
             pull_request=pull,
@@ -409,6 +415,7 @@ class CanonicalMergeEvidenceSource:
             base_head_sha=self._github.get_branch_head(
                 policy.repository, policy.base_branch
             ),
+            intent_review_pending=intent_pending,
         )
 
     def _feedback_clear(self, pull: PullRequestMergeState) -> bool:

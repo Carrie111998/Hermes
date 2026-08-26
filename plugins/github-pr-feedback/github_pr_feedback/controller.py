@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from .github_client import MAX_FEEDBACK_BODY_CHARS, Feedback
 from .ledger import ClaimLease, FeedbackLedger, LedgerStateError
+from .intent_review import classify_feedback, pending_intent_comment_ids
 from .policy import FeedbackReceipt, PluginPolicy, PullRequest, RepositoryTarget, RoutingDecision
 
 MAX_ADMISSIONS_PER_SCAN = 128
@@ -574,6 +575,23 @@ class ScanController:
                         feedback_id=feedback.feedback_id,
                         head_sha=pull_request.head_sha,
                     )
+                    if classify_feedback(feedback) is not None:
+                        feedback_pending = True
+                        pending_ids = pending_intent_comment_ids(
+                            feedback_items, owner_login=target.owner_login
+                        )
+                        if feedback.feedback_id not in pending_ids:
+                            continue
+                        self._kanban.create_or_get_task(
+                            _intent_review_task(
+                                self._policy,
+                                receipt,
+                                feedback.body,
+                                target.local_path,
+                            )
+                        )
+                        skipped["intent_review_required"] += 1
+                        continue
                     receipt_reason = _ci_receipt_feedback_reason(
                         self._ledger, receipt, feedback.body
                     )
@@ -1589,6 +1607,50 @@ def _task(
         initial_status="running" if auto_dispatch else "blocked",
         max_retries=2 if auto_dispatch else 1,
         max_runtime_seconds=900 if auto_dispatch else None,
+    )
+
+
+def _intent_review_task(
+    policy: PluginPolicy,
+    receipt: FeedbackReceipt,
+    body: str,
+    repository_path: Path,
+) -> KanbanTask:
+    """Create one operator-visible, per-PR decision card without a fixer."""
+
+    maintainer = policy.merge_maintainer
+    assignee = maintainer.assignee if maintainer is not None else policy.assignee
+    digest = sha256(body.encode("utf-8", errors="replace")).hexdigest()
+    return KanbanTask(
+        title=f"Operator intent required: PR #{receipt.pr_number}",
+        instructions=(
+            "This PR has explicit disagreement or a replacement approach in review feedback. "
+            "Do not edit, push, reply, approve, or merge. Notify the operator with the bounded "
+            "evidence and wait for `approve original`, `use alternative: ...`, `dismiss`, or "
+            "`needs more evidence`. The decision applies only to this PR and exact head."
+        ),
+        board=policy.board or "",
+        assignee=assignee,
+        repository_path=repository_path,
+        head_sha=receipt.head_sha,
+        branch="",
+        idempotency_key=(
+            f"intent-review:{receipt.repository}:{receipt.pr_number}:"
+            f"{receipt.feedback_kind}:{receipt.feedback_id}:{receipt.head_sha}:{digest}"
+        ),
+        evidence={
+            "untrusted": True,
+            "intent_review": True,
+            "repository": receipt.repository,
+            "pr_number": receipt.pr_number,
+            "feedback_kind": receipt.feedback_kind,
+            "feedback_id": receipt.feedback_id,
+            "expected_head_sha": receipt.head_sha,
+            "body": body[:MAX_FEEDBACK_BODY_CHARS],
+        },
+        initial_status="blocked",
+        max_retries=0,
+        max_runtime_seconds=300,
     )
 
 

@@ -140,6 +140,7 @@ def eligible_snapshot(**overrides: object) -> MergeSnapshot:
             "unresolved_review_threads",
         ),
         (eligible_snapshot(feedback_clear=False), "feedback_unprocessed"),
+        (eligible_snapshot(intent_review_pending=True), "intent_review_required"),
         (
             eligible_snapshot(repository_merge_policy=RepositoryMergePolicy(False, False, False)),
             "merge_method_unavailable",
