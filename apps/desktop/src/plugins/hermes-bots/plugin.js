@@ -12176,7 +12176,15 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
         jsx(ScrollArea, {
           className: 'max-h-64 min-h-0',
           children: jsx('div', {
-            className: 'grid gap-0.5 pr-2',
+            // `grid-cols-[minmax(0,1fr)]` is load-bearing (same hardening as the
+            // DialogContent body in ui/dialog.tsx): an implicit grid track sizes
+            // to unbreakable content, and every row's second line is a nowrap
+            // `truncate` (`@handle · in “A, B, C…”`). Once bots belong to a group,
+            // that line is long, the implicit track balloons past the dialog, and
+            // the vertical-only ScrollArea clips rows on BOTH sides instead of
+            // truncating them. Pinning the column keeps the track at the dialog
+            // width so `truncate` does its job.
+            className: 'grid w-full min-w-0 grid-cols-[minmax(0,1fr)] gap-0.5 pr-2',
             children: visible.length
               ? visible.map(bot => {
                   const meta = botRosterMeta(bot, allMeta)

@@ -40,3 +40,16 @@ test('source contract: every selected machine is persisted in the durable room r
   assert.match(pluginSource, /room\.members = roomMembers/)
   assert.doesNotMatch(pluginSource, /const remoteMembers = selected/)
 })
+
+test('source contract: bot list pins its grid column so long group lists truncate', () => {
+  // The picker's ScrollArea is vertical-only. An implicit grid track sizes to
+  // unbreakable content — each row's `@handle · in “A, B, C…”` line is a nowrap
+  // truncate — so once bots belong to groups the track outgrows the dialog and
+  // rows clip on BOTH sides instead of truncating (same class as the
+  // DialogContent body fix in ui/dialog.tsx). The column must stay pinned.
+  const dialogBody = pluginSource.slice(
+    pluginSource.indexOf('function CreateGroupChatDialog('),
+    pluginSource.indexOf('// ── threads: the Slack/Discord shape')
+  )
+  assert.match(dialogBody, /className: 'grid w-full min-w-0 grid-cols-\[minmax\(0,1fr\)\] gap-0\.5 pr-2'/)
+})
