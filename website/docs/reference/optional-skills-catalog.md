@@ -238,6 +238,7 @@ hermes skills uninstall <skill-name>
 |-------|-------------|
 | [**cloudflare-temporary-deploy**](/docs/user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy) | Deploy a Worker live, no account, via wrangler --temporary. |
 | [**page-agent**](/docs/user-guide/skills/optional/web-development/web-development-page-agent) | Embed an in-page natural-language GUI copilot in web apps. |
+| [**ux-ui-wireframe-architect**](/docs/user-guide/skills/optional/web-development/web-development-ux-ui-wireframe-architect) | Plan low-fidelity wireframes for product interfaces. |
 
 ## yuanbao
 
