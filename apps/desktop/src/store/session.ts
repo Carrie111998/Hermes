@@ -117,27 +117,74 @@ export function sessionBelongsToProfile(
 }
 
 /**
- * The profile a routed session belongs to, for keying the remembered id.
+ * The profile that owns a session, from SYNC known sources only: the session
+ * row (the cross-profile aggregator tags each row) then the owner hint recorded
+ * at open time. Returns undefined when neither knows — the caller must resolve
+ * it (cross-profile probe) rather than fall back to whatever is active, because
+ * "active" is presentation state and never a routing authority. Hidden sessions
+ * (Bot Mode's canonical "Bot Chat") never appear in the row list, so the hint is
+ * often the only sync source.
+ */
+export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId: null | string): string | undefined {
+  const owner = knownSessionOwner(sessions, sessionId)
+
+  return typeof owner === 'string' ? owner : (owner?.targetProfile ?? owner?.profile)?.trim() || undefined
+}
+
+/**
+ * The complete known owner of a session, including its registry connection
+ * when the row or an open-time hint carries one. Session-scoped RPC callers
+ * must use this instead of `knownSessionProfile`: two sources can expose the
+ * same profile name, so returning only that name silently collapses the route
+ * back to the local/profile-only path.
+ */
+export function knownSessionOwner(
+  sessions: readonly SessionInfo[],
+  sessionId: null | string
+): SessionProfileRoute | string | undefined {
+  if (!sessionId) {
+    return undefined
+  }
+
+  const session = sessions.find(candidate => sessionMatchesStoredId(candidate, sessionId))
+  const profile = session?.profile?.trim()
+  const connectionId = session?.connection_id?.trim()
+  const hint = getSessionOwnerHint(sessionId)
+
+  if (connectionId) {
+    return { connectionId, profile: profile || 'default' }
+  }
+
+  const hintProfiles = new Set([hint?.profile.trim() || 'default', hint?.targetProfile?.trim() || 'default'])
+
+  if (hint && (!profile || hintProfiles.has(profile || 'default'))) {
+    return hint
+  }
+
+  if (profile) {
+    return profile
+  }
+
+  return hint
+}
+
+/**
+ * The profile a routed session belongs to, for keying the remembered id and
+ * other PRESENTATION uses (which profile's sidebar/navigation this session sits
+ * under). Falls back to the active gateway profile when the owner is unknown.
  *
- * Prefer the owning profile recorded on the session row (the cross-profile
- * aggregator tags each row), so the session is remembered under ITS profile
- * even while a different one is live. Falls back to the active gateway profile
- * for a session not yet in the in-memory list.
+ * Do NOT use this to ROUTE a session-scoped RPC: the active-profile fallback is
+ * exactly what sends a hidden/unlisted session's RPC to a backend that never
+ * owned it. Routing must use `knownSessionOwner` + a cross-profile probe and
+ * surface an error instead of falling back. This remains for the navigation
+ * keying it was written for.
  */
 export function rememberedSessionProfile(
   sessions: readonly SessionInfo[],
   sessionId: null | string,
   activeProfile: null | string
 ): string {
-  if (sessionId) {
-    const owner = sessions.find(session => sessionMatchesStoredId(session, sessionId))?.profile?.trim()
-
-    if (owner) {
-      return owner
-    }
-  }
-
-  return (activeProfile ?? '').trim() || 'default'
+  return knownSessionProfile(sessions, sessionId) ?? ((activeProfile ?? '').trim() || 'default')
 }
 
 // The last non-overlay route (a page like /skills, or a session route), so a
@@ -179,17 +226,22 @@ export type NewChatWorkspaceTarget = null | string | undefined
 
 export const getConfiguredDefaultProjectDir = (): string => configuredDefaultProjectDir
 
-export async function syncConfiguredDefaultProjectDir(): Promise<string> {
+export async function syncConfiguredDefaultProjectDir(shouldPublish: () => boolean = () => true): Promise<string> {
   const settings = window.hermesDesktop?.settings?.getDefaultProjectDir
 
   if (!settings) {
-    configuredDefaultProjectDir = ''
+    if (shouldPublish()) {
+      configuredDefaultProjectDir = ''
+    }
 
-    return ''
+    return configuredDefaultProjectDir
   }
 
   const { dir } = await settings()
-  configuredDefaultProjectDir = dir?.trim() || ''
+
+  if (shouldPublish()) {
+    configuredDefaultProjectDir = dir?.trim() || ''
+  }
 
   return configuredDefaultProjectDir
 }
@@ -197,21 +249,26 @@ export async function syncConfiguredDefaultProjectDir(): Promise<string> {
 /** Align the renderer workspace with the main-process default (home dir when
  *  packaged, optional Settings override). Clears stale install-dir paths that
  *  PR #37586's localStorage stickiness can preserve across the #37536 fix. */
-export async function ensureDefaultWorkspaceCwd(): Promise<void> {
+export async function ensureDefaultWorkspaceCwd(shouldPublish: () => boolean = () => true): Promise<void> {
   const sanitize = window.hermesDesktop?.sanitizeWorkspaceCwd
 
-  if (!sanitize) {
+  if (!sanitize || !shouldPublish()) {
     return
   }
 
-  await syncConfiguredDefaultProjectDir()
+  await syncConfiguredDefaultProjectDir(shouldPublish)
+
+  if (!shouldPublish()) {
+    return
+  }
+
   const configured = getConfiguredDefaultProjectDir()
 
   // Transient: each source below is already remembered or comes from config, so
   // persisting would only promote a configured default into the per-backend
   // memory of what the user picked.
   const seedLiveCwd = (cwd: string) => {
-    if (cwd && !$activeSessionId.get()) {
+    if (shouldPublish() && cwd && !$activeSessionId.get()) {
       setCurrentCwdTransient(cwd)
     }
   }
