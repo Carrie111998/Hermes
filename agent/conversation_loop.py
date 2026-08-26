@@ -1570,6 +1570,92 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+# ── Claim-evidence reconciliation (execution-fidelity, Task A3) ─────────────
+#
+# The model sometimes asserts it completed an action ("I've created the file",
+# "successfully deleted X") in its final text. This monitoring layer scans that
+# text for done-claims and cross-references them against the turn's ToolTrace
+# records: a claim with no confirmed trace is flagged. It NEVER raises and
+# NEVER blocks the response — worst case it logs, and (only if
+# ``_APPEND_ADVISORY`` is on) appends a one-line advisory.
+
+# First-person done-claims only. ``I've`` is ``I`` + ``'ve`` (no whitespace).
+_CLAIM_RE = re.compile(
+    r"("
+    r"\bI(?:'ve\s+|\s+have\s+|\s+)(?:successfully\s+)?"
+    r"(?:created|deleted|updated|saved|wrote|sent|added|removed|"
+    r"replaced|committed|moved|renamed|uploaded)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# User-facing advisory is opt-in. Built-in file/memory/bash tools are not
+# traced yet, so appending the note by default would staple it onto ordinary
+# correct answers. Logging still happens regardless.
+_APPEND_ADVISORY = False
+
+
+def reconcile_claims(final_response, traces):
+    """Cross-reference done-claims in ``final_response`` against ``traces``.
+
+    ``traces`` is the list of :class:`agent.trajectory.ToolTrace` recorded this
+    turn. Returns ``(adjusted_response, findings)`` where findings is a list of
+    ``{"claim": str, "status": str}`` dicts. Status is:
+      - "unsupported": a done-claim but no write trace exists to back it.
+      - "unconfirmed": a done-claim, writes ran, but none confirmed
+        ("succeeded"); the strongest matching trace is unknown/pending/failed.
+    Pure monitoring: logs warnings, optionally appends at most one advisory
+    line, never raises. Default is log-only (``_APPEND_ADVISORY`` is False).
+    """
+    findings = []
+    try:
+        text = final_response or ""
+        if not isinstance(text, str) or not text.strip():
+            return final_response, findings
+
+        claims = [m.group(0).strip() for m in _CLAIM_RE.finditer(text)]
+        if not claims:
+            return final_response, findings
+
+        write_traces = [
+            t for t in (traces or [])
+            if getattr(t, "action_class", "") in
+            ("REVERSIBLE_WRITE", "IRREVERSIBLE_WRITE")
+        ]
+        confirmed = any(
+            getattr(t, "postcondition_status", "") == "succeeded"
+            for t in write_traces
+        )
+
+        for claim in claims:
+            if not write_traces:
+                findings.append({"claim": claim, "status": "unsupported"})
+                logger.warning(
+                    "claim-evidence: unsupported done-claim %r "
+                    "(no write ToolTrace this turn)", claim,
+                )
+            elif not confirmed:
+                findings.append({"claim": claim, "status": "unconfirmed"})
+                logger.warning(
+                    "claim-evidence: unconfirmed done-claim %r "
+                    "(write traces present but none 'succeeded')", claim,
+                )
+
+        if findings and _APPEND_ADVISORY and text.count("```") % 2 == 0:
+            # Skip the splice when an odd fence count means a code block is
+            # still open — the note would render inside it.
+            adjusted = (
+                text.rstrip()
+                + "\n\n_(note: some completion claims above could not be "
+                "confirmed against the execution trace.)_"
+            )
+            return adjusted, findings
+        return final_response, findings
+    except Exception as exc:  # pragma: no cover - defensive, must never raise
+        logger.debug("reconcile_claims failed: %s", exc)
+        return final_response, findings
+
+
 def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     """Rebuild ``_cached_system_prompt_static`` when caching becomes active.
 
@@ -1948,6 +2034,13 @@ def run_conversation(
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
+    # Reset the per-turn execution-fidelity trace list so claim-evidence
+    # reconciliation (below, after the loop) only sees this turn's traces.
+    try:
+        from agent import trajectory as _trajectory
+        _trajectory.reset_turn_traces()
+    except Exception:  # pragma: no cover - monitoring must never break the turn
+        pass
     interrupted = False
     failed = False
     codex_ack_continuations = 0
@@ -8575,7 +8668,7 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -8593,6 +8686,21 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+    # Claim-evidence reconciliation (Task A3) is display-only: it may adjust
+    # result["final_response"] for the caller, but it runs AFTER finalize_turn
+    # has already sealed conversation history. Intentional — do not persist
+    # the advisory into messages (avoids self-poisoning the next turn).
+    try:
+        from agent import trajectory as _trajectory
+        _adjusted, _claim_findings = reconcile_claims(
+            result.get("final_response") if isinstance(result, dict) else final_response,
+            _trajectory.current_turn_traces(),
+        )
+        if isinstance(result, dict) and _adjusted is not result.get("final_response"):
+            result["final_response"] = _adjusted
+    except Exception:  # pragma: no cover - monitoring must never break the turn
+        pass
+    return result
 
 
 __all__ = ["run_conversation"]
