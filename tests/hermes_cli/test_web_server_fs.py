@@ -77,6 +77,51 @@ def test_fs_download_rejects_sensitive_files(client, tmp_path):
     assert response.status_code == 403
 
 
+@pytest.mark.parametrize("route", ["read-text", "read-data-url"])
+@pytest.mark.parametrize(
+    "sensitive_name", [".env", "auth.json", "config.yaml"]
+)
+def test_fs_read_previews_reject_sensitive_files(
+    client, tmp_path, route, sensitive_name
+):
+    """The two preview endpoints must enforce the same #57505 guard as
+    download — without it an authenticated session reads every credential
+    store as text or a whole-file base64 data URL (#95303)."""
+    target = tmp_path / sensitive_name
+    target.write_text("SECRET=1")
+
+    response = client.get(f"/api/fs/{route}", params={"path": str(target)})
+
+    assert response.status_code == 403
+
+
+def test_fs_read_previews_reject_credential_directory(client, tmp_path):
+    """Paths inside a credential directory (mcp-tokens) are sensitive by
+    component, not basename — both preview routes must 403."""
+    cred_dir = tmp_path / "mcp-tokens"
+    cred_dir.mkdir()
+    target = cred_dir / "server.json"
+    target.write_text("{}")
+
+    for route in ("read-text", "read-data-url"):
+        response = client.get(f"/api/fs/{route}", params={"path": str(target)})
+        assert response.status_code == 403, route
+
+
+def test_fs_read_previews_serve_ordinary_files(client, tmp_path):
+    """The guard must not block the normal spot-editor flow."""
+    target = tmp_path / "notes.md"
+    target.write_text("hello")
+
+    text_response = client.get("/api/fs/read-text", params={"path": str(target)})
+    url_response = client.get("/api/fs/read-data-url", params={"path": str(target)})
+
+    assert text_response.status_code == 200
+    assert text_response.json()["text"] == "hello"
+    assert url_response.status_code == 200
+    assert "aGVsbG8=" in url_response.json()["dataUrl"]
+
+
 def test_fs_endpoints_require_auth(tmp_path):
     client = TestClient(web_server.app)
     target = tmp_path / "secret.txt"

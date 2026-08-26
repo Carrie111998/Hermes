@@ -3004,6 +3004,12 @@ async def fs_list(path: str):
 @app.get("/api/fs/read-text")
 async def fs_read_text(path: str):
     target, st = _fs_regular_file(_fs_path(path))
+    # Same #57505 sensitive-file guard as /api/fs/download three routes
+    # below: this is a read surface (full text of any resolvable path), and
+    # without the check an authenticated dashboard session can exfiltrate
+    # every credential store the guard exists to protect (#95303).
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     if st.st_size > _FS_TEXT_SOURCE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     bytes_to_read = min(st.st_size, _FS_TEXT_PREVIEW_MAX_BYTES)
@@ -3075,6 +3081,11 @@ async def fs_write_text(payload: FsWriteText):
 @app.get("/api/fs/read-data-url")
 async def fs_read_data_url(path: str):
     target, st = _fs_regular_file(_fs_path(path))
+    # Same #57505 guard as download/read-text: the data-URL form returns the
+    # WHOLE file base64-encoded (bypassing even the text-preview cap), so an
+    # unguarded route here is the strongest exfil surface of the three (#95303).
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     try:
