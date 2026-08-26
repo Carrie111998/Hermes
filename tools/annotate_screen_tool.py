@@ -152,7 +152,11 @@ _SHAPE_SCHEMA = {
         "from_y": {"type": "number", "description": "Arrow/line start y."},
         "to_x": {"type": "number", "description": "Arrow/line end x (the arrowhead)."},
         "to_y": {"type": "number", "description": "Arrow/line end y (the arrowhead)."},
-        "text": {"type": "string", "description": "For label: the text to draw."},
+        "text": {"type": "string", "description": "For label: the text to draw. Newlines make stacked lines."},
+        "font_size": {
+            "type": "number",
+            "description": "For label: font size in frame pixels. Omit for the default caption size.",
+        },
         "label": {"type": "string", "description": "Optional short caption drawn beside a circle/rect/arrow/line."},
         "color": {
             "type": "string",

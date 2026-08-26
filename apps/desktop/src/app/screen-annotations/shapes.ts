@@ -13,6 +13,9 @@ export interface ScreenAnnotationShapeBase {
   color: ScreenAnnotationColor
   /** Optional short caption drawn beside the mark. */
   label?: string
+  /** Skip the entrance/pulse animation — for shapes that replace each other
+   *  rapidly (live subtitles), where pulsing text is unreadable. */
+  steady?: boolean
 }
 
 export interface ScreenAnnotationCircle extends ScreenAnnotationShapeBase {
@@ -23,6 +26,8 @@ export interface ScreenAnnotationCircle extends ScreenAnnotationShapeBase {
 }
 
 export interface ScreenAnnotationRect extends ScreenAnnotationShapeBase {
+  /** Opaque cover instead of an outline (subtitle backdrop). */
+  fill?: boolean
   height: number
   kind: 'rect'
   width: number
@@ -39,6 +44,8 @@ export interface ScreenAnnotationStroke extends ScreenAnnotationShapeBase {
 }
 
 export interface ScreenAnnotationLabel extends ScreenAnnotationShapeBase {
+  /** DIP font size; the pointing-caption default when absent. */
+  fontSize?: number
   kind: 'label'
   text: string
   x: number

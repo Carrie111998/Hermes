@@ -15,7 +15,9 @@ import { BrowserWindow, ipcMain, screen } from 'electron'
 import { attachRendererConsoleCapture } from './renderer-log'
 import {
   type AnnotationBounds,
+  type AnnotationChannel,
   clampAnnotationTtlSeconds,
+  clampChannelHoldSeconds,
   isScreenTarget,
   mapAnnotationShapes,
   type MappedAnnotationShape,
@@ -40,8 +42,21 @@ interface ScreenAnnotationsOptions {
 export interface ScreenAnnotationsController {
   annotate(request: unknown, senderBounds: AnnotationBounds | null): Promise<Record<string, unknown>>
   clear(): void
+  clearChannel(channel: AnnotationChannel): void
   close(): void
   getState(): { shapes: MappedAnnotationShape[] }
+  /**
+   * Internal (main-process) draw path for a non-agent channel: shapes are
+   * already overlay-local DIP, replace the channel's previous set, and hold
+   * until replaced — bounded by `holdSeconds` so a dead producer cannot park
+   * text on the screen forever.
+   */
+  setChannelShapes(
+    channel: AnnotationChannel,
+    shapes: MappedAnnotationShape[],
+    displayBounds: AnnotationBounds,
+    holdSeconds?: number
+  ): void
 }
 
 const asPositive = (value: unknown): number | null =>
@@ -58,8 +73,8 @@ export function createScreenAnnotationsController({
   wireWindow
 }: ScreenAnnotationsOptions): ScreenAnnotationsController {
   let window: BrowserWindow | null = null
-  let shapes: MappedAnnotationShape[] = []
-  let ttlTimer: NodeJS.Timeout | null = null
+  const channelShapes: Record<AnnotationChannel, MappedAnnotationShape[]> = { agent: [], subtitles: [] }
+  const ttlTimers: Record<AnnotationChannel, NodeJS.Timeout | null> = { agent: null, subtitles: null }
 
   // Draw/clear ordering guard. `annotate` suspends at the window-enumeration
   // await, and requests can overlap (the main window and the HUD each run
@@ -67,6 +82,10 @@ export function createScreenAnnotationsController({
   // clear and overwrite it with stale shapes and a stale TTL. Every request
   // takes a generation at entry; the shared state only accepts the latest.
   let requestGeneration = 0
+
+  // Agent marks first, subtitles last: SVG paints in order, and the subtitle
+  // cover must win if the two ever overlap.
+  const unionShapes = (): MappedAnnotationShape[] => [...channelShapes.agent, ...channelShapes.subtitles]
 
   const url = () => {
     if (devServer) {
@@ -78,14 +97,16 @@ export function createScreenAnnotationsController({
 
   const sendState = () => {
     if (window && !window.isDestroyed()) {
-      window.webContents.send('hermes:screen-annotations:state', { shapes })
+      window.webContents.send('hermes:screen-annotations:state', { shapes: unionShapes() })
     }
   }
 
-  const disarmTtl = () => {
-    if (ttlTimer) {
-      clearTimeout(ttlTimer)
-      ttlTimer = null
+  const disarmTtl = (channel: AnnotationChannel) => {
+    const timer = ttlTimers[channel]
+
+    if (timer) {
+      clearTimeout(timer)
+      ttlTimers[channel] = null
     }
   }
 
@@ -155,7 +176,7 @@ export function createScreenAnnotationsController({
     next.webContents.on('did-finish-load', sendState)
 
     next.once('ready-to-show', () => {
-      if (!next.isDestroyed() && shapes.length > 0) {
+      if (!next.isDestroyed() && unionShapes().length > 0) {
         next.showInactive()
       }
     })
@@ -208,14 +229,44 @@ export function createScreenAnnotationsController({
     window.showInactive()
   }
 
-  const clear = () => {
-    disarmTtl()
-    shapes = []
+  const clearChannel = (channel: AnnotationChannel) => {
+    disarmTtl(channel)
+    channelShapes[channel] = []
     sendState()
 
-    if (window && !window.isDestroyed()) {
+    // The window only hides when every channel is empty — the agent clearing
+    // its marks must not blank the subtitles mid-movie, and vice versa.
+    if (unionShapes().length === 0 && window && !window.isDestroyed()) {
       window.hide()
     }
+  }
+
+  // The agent tool's clear verb: its own marks only.
+  const clear = () => clearChannel('agent')
+
+  const setChannelShapes = (
+    channel: AnnotationChannel,
+    shapes: MappedAnnotationShape[],
+    displayBounds: AnnotationBounds,
+    holdSeconds?: number
+  ) => {
+    if (shapes.length === 0) {
+      clearChannel(channel)
+
+      return
+    }
+
+    const hold = clampChannelHoldSeconds(holdSeconds)
+
+    disarmTtl(channel)
+    channelShapes[channel] = shapes
+    showOn(displayBounds)
+    sendState()
+
+    ttlTimers[channel] = setTimeout(() => {
+      ttlTimers[channel] = null
+      clearChannel(channel)
+    }, hold * 1000)
   }
 
   const annotate = async (
@@ -293,14 +344,14 @@ export function createScreenAnnotationsController({
 
     const ttl = clampAnnotationTtlSeconds(req.ttl_seconds)
 
-    disarmTtl()
-    shapes = mapped.shapes
+    disarmTtl('agent')
+    channelShapes.agent = mapped.shapes
     showOn(display.bounds)
     sendState()
 
-    ttlTimer = setTimeout(() => {
-      ttlTimer = null
-      clear()
+    ttlTimers.agent = setTimeout(() => {
+      ttlTimers.agent = null
+      clearChannel('agent')
     }, ttl * 1000)
 
     const result: Record<string, unknown> = {
@@ -320,25 +371,29 @@ export function createScreenAnnotationsController({
 
   const close = () => {
     // Invalidate any in-flight draw so it cannot respawn the overlay behind a
-    // quitting app. (The TTL's own clear() deliberately does NOT bump the
+    // quitting app. (The TTL's own clear deliberately does NOT bump the
     // generation: it belongs to the shapes it expired, and a newer draw that
     // is mid-enumeration when it fires must still land.)
     requestGeneration += 1
-    disarmTtl()
+    disarmTtl('agent')
+    disarmTtl('subtitles')
 
     if (window && !window.isDestroyed()) {
       window.close()
     }
 
     window = null
-    shapes = []
+    channelShapes.agent = []
+    channelShapes.subtitles = []
   }
 
   return {
     annotate,
     clear,
+    clearChannel,
     close,
-    getState: () => ({ shapes })
+    getState: () => ({ shapes: unionShapes() }),
+    setChannelShapes
   }
 }
 

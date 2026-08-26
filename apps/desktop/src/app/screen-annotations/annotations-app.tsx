@@ -21,9 +21,31 @@ const hexFor = (color: ScreenAnnotationColor): string => SCREEN_ANNOTATION_HEX[c
 const haloFor = (color: ScreenAnnotationColor): string =>
   color === 'black' ? 'rgba(255, 255, 255, 0.85)' : 'rgba(0, 0, 0, 0.55)'
 
-/** Caption text with a paint-order halo so it reads over any background. */
-function Caption({ color, text, x, y }: { color: ScreenAnnotationColor; text?: string; x: number; y: number }) {
+/** Caption text with a paint-order halo so it reads over any background.
+ *  Multiline: `\n` splits into stacked lines growing downward from `y`, each
+ *  centered on `x`. The halo scales with the font so large subtitle text keeps
+ *  its outline weight. */
+function Caption({
+  color,
+  fontSize,
+  text,
+  x,
+  y
+}: {
+  color: ScreenAnnotationColor
+  fontSize?: number
+  text?: string
+  x: number
+  y: number
+}) {
   if (!text) {
+    return null
+  }
+
+  const size = fontSize && fontSize > 0 ? fontSize : LABEL_FONT_SIZE
+  const lines = text.split('\n').filter(line => line.trim().length > 0)
+
+  if (lines.length === 0) {
     return null
   }
 
@@ -31,16 +53,20 @@ function Caption({ color, text, x, y }: { color: ScreenAnnotationColor; text?: s
     <text
       fill={hexFor(color)}
       fontFamily="system-ui, -apple-system, sans-serif"
-      fontSize={LABEL_FONT_SIZE}
+      fontSize={size}
       fontWeight={700}
       paintOrder="stroke"
       stroke={haloFor(color)}
-      strokeWidth={4}
+      strokeWidth={Math.max(4, Math.round(size / 5))}
       textAnchor="middle"
       x={x}
       y={y}
     >
-      {text}
+      {lines.map((line, index) => (
+        <tspan key={index} x={x} dy={index === 0 ? 0 : '1.3em'}>
+          {line}
+        </tspan>
+      ))}
     </text>
   )
 }
@@ -127,6 +153,22 @@ function Shape({ shape }: { shape: ScreenAnnotationShape }) {
   }
 
   if (shape.kind === 'rect') {
+    if (shape.fill) {
+      // Opaque cover (subtitle backdrop): a box that hides what's under it,
+      // not an outline that points at it.
+      return (
+        <rect
+          fill={hexFor(shape.color)}
+          fillOpacity={0.92}
+          height={shape.height}
+          rx={6}
+          width={shape.width}
+          x={shape.x}
+          y={shape.y}
+        />
+      )
+    }
+
     return (
       <g>
         <rect
@@ -159,7 +201,7 @@ function Shape({ shape }: { shape: ScreenAnnotationShape }) {
   }
 
   if (shape.kind === 'label') {
-    return <Caption color={shape.color} text={shape.text} x={shape.x} y={shape.y} />
+    return <Caption color={shape.color} fontSize={shape.fontSize} text={shape.text} x={shape.x} y={shape.y} />
   }
 
   return null
@@ -224,7 +266,7 @@ export function ScreenAnnotationsApp() {
       </style>
       <svg style={{ height: '100vh', left: 0, position: 'fixed', top: 0, width: '100vw' }}>
         {shapes.map((shape, index) => (
-          <g className="hermes-annotation" key={index}>
+          <g className={shape.steady ? undefined : 'hermes-annotation'} key={index}>
             <Shape shape={shape} />
           </g>
         ))}

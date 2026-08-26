@@ -34,7 +34,13 @@ export type AnnotationColor = (typeof ANNOTATION_COLORS)[number]
 const DEFAULT_COLOR: AnnotationColor = 'red'
 
 /** One mark in overlay-local coordinates (DIP, relative to the overlay
- *  window's top-left), ready for the renderer to paint verbatim. */
+ *  window's top-left), ready for the renderer to paint verbatim.
+ *
+ *  `steady` opts a shape out of the entrance/pulse animation — internal
+ *  callers that replace shapes rapidly (live subtitles) need text that sits
+ *  still. `fill` turns a rect from an outline into an opaque cover; it is not
+ *  reachable from the agent schema — covering content is the subtitle
+ *  channel's job, pointing at it is the agent's. */
 export type MappedAnnotationShape =
   | {
       color: AnnotationColor
@@ -42,12 +48,23 @@ export type MappedAnnotationShape =
       fromX: number
       fromY: number
       label?: string
+      steady?: boolean
       toX: number
       toY: number
     }
-  | { color: AnnotationColor; kind: 'circle'; label?: string; radius: number; x: number; y: number }
-  | { color: AnnotationColor; kind: 'label'; text: string; x: number; y: number }
-  | { color: AnnotationColor; kind: 'rect'; height: number; label?: string; width: number; x: number; y: number }
+  | { color: AnnotationColor; kind: 'circle'; label?: string; radius: number; steady?: boolean; x: number; y: number }
+  | { color: AnnotationColor; fontSize?: number; kind: 'label'; steady?: boolean; text: string; x: number; y: number }
+  | {
+      color: AnnotationColor
+      fill?: boolean
+      height: number
+      kind: 'rect'
+      label?: string
+      steady?: boolean
+      width: number
+      x: number
+      y: number
+    }
 
 // Auto-expiry bounds. The default outlives a glance but not a lunch break; the
 // clamp keeps a typo'd ttl from parking marks on the screen for a day.
@@ -59,6 +76,24 @@ export function clampAnnotationTtlSeconds(raw: unknown): number {
   const value = typeof raw === 'number' && Number.isFinite(raw) ? raw : ANNOTATION_TTL_DEFAULT_S
 
   return Math.min(ANNOTATION_TTL_MAX_S, Math.max(ANNOTATION_TTL_MIN_S, value))
+}
+
+/** Independent shape sets sharing the one overlay window. The agent's marks
+ *  and the live-subtitle painter replace/expire on their own clocks; the
+ *  renderer always paints the union (subtitles last, i.e. on top). */
+export type AnnotationChannel = 'agent' | 'subtitles'
+
+// Safety expiry for hold-until-replaced channels. Live subtitle lines replace
+// each other every couple of seconds; if the producer dies mid-movie this is
+// how long its last line survives it. Distinct from the agent TTL clamp above:
+// a held channel has a live producer refreshing it, so it needs no 3s floor.
+export const CHANNEL_HOLD_DEFAULT_S = 15
+export const CHANNEL_HOLD_MAX_S = 60
+
+export function clampChannelHoldSeconds(raw: unknown): number {
+  const value = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : CHANNEL_HOLD_DEFAULT_S
+
+  return Math.min(CHANNEL_HOLD_MAX_S, value)
 }
 
 /** `target: 'screen'` anchors coordinates to the whole display instead of a
@@ -136,6 +171,7 @@ export function resolveAnnotationWindow(
 
 interface RawShape {
   color?: unknown
+  font_size?: unknown
   from_x?: unknown
   from_y?: unknown
   height?: unknown
@@ -172,6 +208,12 @@ const asCaption = (value: unknown): string | undefined => {
 const MIN_CIRCLE_RADIUS = 12
 const DEFAULT_CIRCLE_RADIUS = 36
 const MIN_RECT_SIZE = 8
+
+// Label font-size bounds, in DIP after frame→screen scaling. The floor keeps a
+// tiny-frame coordinate space from producing unreadable text; the ceiling keeps
+// a typo (font_size in thousandths, say) from filling the display.
+const MIN_LABEL_FONT_SIZE = 10
+const MAX_LABEL_FONT_SIZE = 120
 
 export interface MappedAnnotations {
   shapes: MappedAnnotationShape[]
@@ -296,7 +338,17 @@ export function mapAnnotationShapes(
         continue
       }
 
-      shapes.push({ color, kind: 'label', text, x: localX(x), y: localY(y) })
+      const rawFontSize = asNumber(shape.font_size)
+      const mapped: MappedAnnotationShape = { color, kind: 'label', text, x: localX(x), y: localY(y) }
+
+      if (rawFontSize !== null && rawFontSize > 0) {
+        mapped.fontSize = Math.min(
+          MAX_LABEL_FONT_SIZE,
+          Math.max(MIN_LABEL_FONT_SIZE, Math.round(rawFontSize * Math.min(scaleX, scaleY)))
+        )
+      }
+
+      shapes.push(mapped)
 
       continue
     }
