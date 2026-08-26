@@ -603,10 +603,20 @@ def _resolve_cua_driver_app_path(driver_cmd: str) -> Optional[str]:
     app bundle, the caller fails closed with install guidance.
     """
     marker = ".app/Contents/MacOS/"
-    marker_index = driver_cmd.find(marker)
+    # Resolve symlinks first: PATH/manifest lookup commonly returns a symlink
+    # (e.g. ~/.local/bin/cua-driver -> /Applications/CuaDriver.app/Contents/
+    # MacOS/cua-driver). Matching the marker on the raw symlink path fails
+    # closed on a valid install. realpath() still points INSIDE the same
+    # bundle that carries the resolved binary, so the no-fallback guarantee
+    # above stays intact.
+    try:
+        resolved_cmd = os.path.realpath(driver_cmd)
+    except OSError:
+        resolved_cmd = driver_cmd
+    marker_index = resolved_cmd.find(marker)
     if marker_index < 0:
         return None
-    candidate = driver_cmd[: marker_index + len(".app")]
+    candidate = resolved_cmd[: marker_index + len(".app")]
     executable = os.path.join(candidate, "Contents", "MacOS", "cua-driver")
     if os.path.isfile(executable) and os.access(executable, os.X_OK):
         return candidate
