@@ -81,7 +81,6 @@ def test_ensure_docker_available_logs_and_raises_when_not_found(monkeypatch, cap
     )
 
 
-<<<<<<< HEAD
 def test_ensure_docker_available_logs_and_raises_on_timeout(monkeypatch, caplog):
     """When docker version times out, surface a helpful error instead of hanging."""
 
@@ -181,8 +180,6 @@ def test_run_bash_omits_user_flag_when_host_user_disabled(monkeypatch):
     assert "-u" not in captured_cmds[0]
 
 
-=======
->>>>>>> origin/main
 def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     """Opt-in docker cwd mounting should bind the host cwd to /workspace."""
     project_dir = tmp_path / "my-project"
@@ -262,6 +259,7 @@ def _make_execute_only_env(forward_env=None):
     env.timeout = 60
     env._forward_env = forward_env or []
     env._env = {}
+    env._run_as_host_user = False
     env._prepare_command = lambda command: (command, None)
     env._timeout_result = lambda timeout: {"output": f"timed out after {timeout}", "returncode": 124}
     env._container_id = "test-container"
