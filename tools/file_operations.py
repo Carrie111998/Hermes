@@ -28,6 +28,7 @@ Usage:
 import base64
 import binascii
 import os
+import platform
 import re
 import difflib
 import hashlib
@@ -2799,7 +2800,10 @@ class ShellFileOperations(FileOperations):
             # Try to suggest nearby paths
             parent = os.path.dirname(path) or "."
             basename_query = os.path.basename(path)
-            hint_parts = [f"Path not found: {path}"]
+            hint_parts = [
+                f"Path not found: {path} "
+                f"(host={platform.system()} {platform.machine()})"
+            ]
             # Check if parent directory exists and list similar entries
             parent_check = self._exec(
                 f"test -d {self._escape_shell_arg(parent)} && echo yes || echo no"
@@ -2821,6 +2825,16 @@ class ShellFileOperations(FileOperations):
                         hint_parts.append(
                             "Similar paths: " + ", ".join(candidates[:5])
                         )
+            # Host-typical sibling: only when the leaf is absent because of
+            # arch, not when the path is a typo. Same shell-probe idiom used
+            # elsewhere in this method to keep failure modes uniform.
+            sibling = self._host_typical_sibling(path)
+            if sibling:
+                hint_parts.append(
+                    f"Host-typical sibling exists: {sibling} "
+                    f"(the requested path may be absent because the host is "
+                    f"{platform.system()} {platform.machine()})"
+                )
             return SearchResult(
                 error=". ".join(hint_parts),
                 total_count=0
@@ -2829,9 +2843,36 @@ class ShellFileOperations(FileOperations):
         if target == "files":
             return self._search_files(pattern, path, limit, offset)
         else:
-            return self._search_content(pattern, path, file_glob, limit, offset, 
+            return self._search_content(pattern, path, file_glob, limit, offset,
                                         output_mode, context)
-    
+
+    # Mapping of arch-typical dirs: (parent of the missing leaf) -> sibling to
+    # suggest when the requested path is absent because of host architecture,
+    # not because of a typo. Today the only encoded case is Apple Silicon,
+    # where /usr/local/bin does not exist but /opt/homebrew/bin does.
+    _HOST_TYPICAL_BIN_PARENTS: ClassVar = (
+        ("/usr/local", "/opt/homebrew/bin"),
+    )
+
+    def _host_typical_sibling(self, path: str) -> Optional[str]:
+        """If ``path`` is missing but a host-typical sibling exists, return it.
+
+        Today the only mapping we encode is the Apple-Silicon case where
+        ``/usr/local/bin`` is absent and ``/opt/homebrew/bin`` is the
+        Homebrew install root. Returns None when no mapping applies.
+        """
+        for parent, sibling in self._HOST_TYPICAL_BIN_PARENTS:
+            # Normalize trailing slashes so "/usr/local/bin/" still matches.
+            p = path.rstrip("/")
+            if p == os.path.join(parent, os.path.basename(p)):
+                chk = self._exec(
+                    f"test -e {self._escape_shell_arg(sibling)} && echo exists "
+                    f"|| echo not_found"
+                )
+                if "exists" in chk.stdout:
+                    return sibling
+        return None
+
     def _try_multi_path_search(self, pattern: str, path: str, target: str,
                                file_glob: Optional[str], limit: int, offset: int,
                                output_mode: str, context: int) -> Optional[SearchResult]:

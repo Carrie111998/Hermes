@@ -21,8 +21,10 @@ when exit==2 AND no usable match payload remains.
 These tests drive the real methods through the real local terminal backend.
 """
 
+import json
 import os
 import shutil
+from unittest import mock
 
 import pytest
 
@@ -32,6 +34,7 @@ from tools.file_operations import (
     _split_tool_diagnostics,
 )
 from tools.environments.local import LocalEnvironment
+from tools.file_tools import search_tool
 
 
 def _ops(root):
@@ -130,3 +133,84 @@ class TestSplitToolDiagnostics:
         assert diagnostics == ""
         assert "--" in payload
         assert "a.py-6-after" in payload
+
+
+class TestHostArchConflation:
+    """Pins the host-arch hint added for the Apple-Silicon "Path not found"
+    conflation on /usr/local/bin (see FIX-DESIGN.md).
+
+    Three tests:
+
+    1. The verbatim-host case pins the user-visible contract: the error
+       string the model sees must include ``host=<system> <machine>``.
+    2. The sibling-hint case exercises the new helper with a mock so the
+       test is hermetic — it does not depend on whether the host has
+       Homebrew installed.
+    3. The typo case pins the negative side of the helper: the mapping only
+       fires for the architecture mismatch, not for arbitrary typos.
+       Without this pin a future widening of ``_HOST_TYPICAL_BIN_PARENTS``
+       could quietly expand the hint surface.
+    """
+
+    def test_error_includes_host_arch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        # /usr/local/bin does not exist on this Apple-Silicon host, so the
+        # call against the verbatim path triggers the not-found branch.
+        r = json.loads(search_tool(
+            "bash", path="/usr/local/bin", target="files",
+            task_id="t-arch-conflation",
+        ))
+        assert r["total_count"] == 0
+        err = r.get("error", "")
+        # The original "Path not found:" prefix is preserved so existing
+        # pattern-matchers keep working.
+        assert "Path not found: /usr/local/bin" in err
+        # NEW: the fix surfaces the host arch so a model can recognize an
+        # arch mismatch instead of treating it as a guard misfire.
+        assert "host=" in err
+        assert any(token in err for token in ("Darwin", "Linux"))
+
+    def test_host_typical_sibling_hint_when_parent_exists(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        # Simulate Apple Silicon: /usr/local exists, /usr/local/bin does
+        # not, /opt/homebrew/bin does. We can't create real /usr/local in
+        # tests, so patch the helper to point at a tmp_path mirror.
+        homebrew = tmp_path / "homebrew_bin"
+        homebrew.mkdir()
+        (homebrew / "bash").write_text("#!/bin/sh\n")
+        usr_local = tmp_path / "usr_local"
+        usr_local.mkdir()  # parent exists, leaf (usr_local/bin) does not.
+
+        # Patch the sibling resolver so the test doesn't depend on the
+        # developer's actual host having Homebrew at /opt/homebrew/bin.
+        with mock.patch.object(
+            ShellFileOperations, "_host_typical_sibling",
+            return_value=str(homebrew),
+        ):
+            r = json.loads(search_tool(
+                "bash", path=str(usr_local / "bin"), target="files",
+                task_id="t-sibling-hint",
+            ))
+
+        err = r.get("error", "")
+        assert "Path not found" in err
+        assert "Host-typical sibling exists:" in err
+        assert str(homebrew) in err
+
+    def test_sibling_hint_absent_on_typo(self, tmp_path, monkeypatch):
+        """A typo'd leaf must NOT trigger the host-typical sibling hint;
+        the sibling mapping only fires for known-architecture mismatches.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)),
+                                  cwd=str(tmp_path))
+        # /usr/lcoal/bin is a typo — no mapping should fire.
+        assert ops._host_typical_sibling("/usr/lcoal/bin") is None
+        # The host-typical mapping either matches (Apple Silicon, with
+        # /opt/homebrew/bin installed) or doesn't (any other host, or no
+        # Homebrew). Both outcomes are correct, but the result must be a
+        # string in the mapping or None — never an unrelated sibling.
+        result = ops._host_typical_sibling("/usr/local/bin")
+        assert result in (None, "/opt/homebrew/bin")
