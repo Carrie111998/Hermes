@@ -840,3 +840,111 @@ def test_engine_that_never_overrode_the_prune_hook_is_not_a_suppressed_authority
 
     assert _prune_would_have_run(_InheritsTheDefault(), 400_000) is False
     assert _prune_would_have_run(_OccupiesTheHook(), 400_000) is True
+
+
+# --- Init refuse at the engine slot (agent/agent_init.py) -----------------
+
+
+def _init_agent_with_engine(engine, *, checkpoint_required: bool):
+    """Drive a real init_agent() with ``engine`` in the context-engine slot
+    (harness as in tests/run_agent/test_plugin_context_engine_init.py)."""
+    from unittest.mock import patch
+
+    cfg = {
+        "context": {"engine": "stub"},
+        "compression": {"checkpoint_required": checkpoint_required},
+        "agent": {},
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.context_engine.load_context_engine", return_value=engine),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        return AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+
+def test_agent_init_refuses_checkpoint_required_on_uninterceptable_context_engine():
+    """The incompatible configuration fails closed at init; a waiver, a gate
+    that is off and an empty slot stay permitted."""
+    from agent.agent_init import (
+        _refuse_checkpoint_required_on_plugin_context_engine,
+    )
+
+    _compress_only, turn_complete = _engine_stubs()
+
+    with pytest.raises(RuntimeError, match="BLOCKED_MISSING_PREREQUISITE"):
+        _refuse_checkpoint_required_on_plugin_context_engine(True, turn_complete())
+
+    # The resolver's reason survives into the operator-facing text.
+    with pytest.raises(RuntimeError, match="on_turn_complete"):
+        _refuse_checkpoint_required_on_plugin_context_engine(True, turn_complete())
+
+    class _DeclaredObserver(turn_complete):
+        compacts_outside_compress = False
+
+    _refuse_checkpoint_required_on_plugin_context_engine(True, _DeclaredObserver())
+    _refuse_checkpoint_required_on_plugin_context_engine(True, _compress_only())
+    _refuse_checkpoint_required_on_plugin_context_engine(True, None)
+    _refuse_checkpoint_required_on_plugin_context_engine(False, turn_complete())
+
+
+def test_init_refuse_reads_the_local_config_value_not_the_agent_attribute():
+    """The refuse must read the LOCAL config value: the agent attribute is
+    assigned after the engine slot, so only a real init_agent() can observe
+    the ordering. Negative probe (run by hand, reverted): reading
+    ``getattr(agent, "compression_checkpoint_required", False)`` fails only
+    this test."""
+    _compress_only, turn_complete = _engine_stubs()
+
+    with pytest.raises(RuntimeError, match="BLOCKED_MISSING_PREREQUISITE"):
+        _init_agent_with_engine(turn_complete(), checkpoint_required=True)
+
+
+def test_lcm_style_compress_only_engine_still_initializes_with_gate_armed():
+    """The compress()-only third-party shape keeps initializing under the gate."""
+    compress_only, _turn_complete = _engine_stubs()
+
+    engine = compress_only()
+    agent = _init_agent_with_engine(engine, checkpoint_required=True)
+
+    assert agent.context_compressor is engine
+    assert agent.compression_checkpoint_required is True
+    # The slot is fully configured, not merely unrefused (#9071 ordering).
+    assert engine.context_length == 204_800
+
+
+def test_refuse_message_survives_a_hostile_name_property():
+    """The diagnosis uses the class name; ``engine.name`` is an abstract
+    property whose raising getter would replace it. Negative probe (run by
+    hand, reverted): ``getattr(engine, "name", ...)`` fails this test with the
+    getter's RuntimeError."""
+    from agent.agent_init import (
+        _refuse_checkpoint_required_on_plugin_context_engine,
+    )
+
+    _compress_only, turn_complete = _engine_stubs()
+
+    class _HostileNameEngine(turn_complete):
+        @property
+        def name(self) -> str:
+            raise RuntimeError("name getter exploded")
+
+    with pytest.raises(RuntimeError, match="BLOCKED_MISSING_PREREQUISITE") as excinfo:
+        _refuse_checkpoint_required_on_plugin_context_engine(
+            True, _HostileNameEngine()
+        )
+
+    assert "_HostileNameEngine" in str(excinfo.value)
+    assert "name getter exploded" not in str(excinfo.value)

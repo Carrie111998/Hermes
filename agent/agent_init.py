@@ -533,6 +533,41 @@ def _refuse_checkpoint_required_on_codex_app_server(
         )
 
 
+def _refuse_checkpoint_required_on_plugin_context_engine(
+    checkpoint_required: bool, engine: Any
+) -> None:
+    """Fail closed at init when a context engine may compact where no
+    pre-compress checkpoint runs.
+
+    ``compress()`` is dispatched right after ``on_pre_compress()``; an engine
+    compacting from ``on_turn_complete()`` or its own scheduler never crosses
+    that seam. Refused at init rather than at the first compaction so the
+    operator sees the incompatibility before a turn exists.
+    ``checkpoint_required`` must be the LOCAL config value —
+    ``agent.compression_checkpoint_required`` is not assigned yet at this slot.
+    """
+    if checkpoint_required is not True:
+        return
+
+    from agent.context_engine import engine_compacts_outside_compress
+
+    unsafe, reason = engine_compacts_outside_compress(engine)
+    if not unsafe:
+        return
+
+    # Class name, not ``engine.name``: ``name`` is an abstract property on an
+    # object the resolver just declined to trust; a raising getter would
+    # replace the diagnosis.
+    raise RuntimeError(
+        "BLOCKED_MISSING_PREREQUISITE: compression.checkpoint_required is "
+        "incompatible with context engine "
+        f"'{type(engine).__name__}': {reason}. An engine whose only lossy "
+        "authority is compress() may declare compacts_outside_compress = "
+        "False; otherwise disable compression.checkpoint_required or use the "
+        "built-in compressor."
+    )
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -2728,6 +2763,12 @@ def init_agent(
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
     if _selected_engine is not None:
+        # Before the slot assignment and before update_model()/threshold wiring
+        # touch the engine. First argument is the LOCAL config value — the agent
+        # attribute is not assigned yet here.
+        _refuse_checkpoint_required_on_plugin_context_engine(
+            compression_checkpoint_required, _selected_engine
+        )
         agent.context_compressor = _selected_engine
         # External engines own compaction policy: the host compression
         # threshold (including the Codex gpt-5.5 autoraise above) only
