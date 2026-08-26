@@ -89,10 +89,19 @@ def build_services(settings: Settings | None = None) -> Services:
         log.warning("LAW_OC/DATA_GO_KR_KEY unset — 법령·판례 검색 도구 없이 동작합니다")
 
     api_key, base_url = settings.llm_credentials
+    extra_headers: dict[str, str] = {}
+    if settings.llm_provider == "openrouter":
+        # Optional attribution — OpenRouter uses these for its rankings page.
+        if settings.openrouter_referer:
+            extra_headers["HTTP-Referer"] = settings.openrouter_referer
+        if settings.openrouter_title:
+            extra_headers["X-Title"] = settings.openrouter_title
+
     llm = LlmClient(
         provider=settings.llm_provider,
         api_key=api_key,
         base_url=base_url,
+        extra_headers=extra_headers,
         model=settings.llm_model,
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,

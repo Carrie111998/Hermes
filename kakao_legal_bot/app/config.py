@@ -54,6 +54,7 @@ def _env_list(name: str, default: str = "") -> list[str]:
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5",
     "gemini": "gemini-3.7-flash",
+    "openrouter": "google/gemini-3.7-flash",
 }
 
 # Where each provider's credentials and endpoint live.
@@ -61,6 +62,7 @@ PROVIDER_CREDENTIALS = {
     "anthropic": ("anthropic_api_key", "anthropic_base_url", "ANTHROPIC_API_KEY"),
     "openai": ("openai_api_key", "openai_base_url", "OPENAI_API_KEY"),
     "gemini": ("gemini_api_key", "gemini_base_url", "GEMINI_API_KEY"),
+    "openrouter": ("openrouter_api_key", "openrouter_base_url", "OPENROUTER_API_KEY"),
 }
 
 
@@ -148,6 +150,17 @@ class Settings:
     openai_base_url: str = field(
         default_factory=lambda: _env("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     )
+    # OpenRouter speaks the OpenAI wire format, so it reuses that code path.
+    # Only the max-tokens field name and the optional attribution headers
+    # differ — see llm.py.
+    openrouter_api_key: str = field(default_factory=lambda: _env("OPENROUTER_API_KEY"))
+    openrouter_base_url: str = field(
+        default_factory=lambda: _env(
+            "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+        ).rstrip("/")
+    )
+    openrouter_referer: str = field(default_factory=lambda: _env("OPENROUTER_REFERER"))
+    openrouter_title: str = field(default_factory=lambda: _env("OPENROUTER_TITLE", "moa-legal-bot"))
     gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY"))
     gemini_base_url: str = field(
         default_factory=lambda: _env(

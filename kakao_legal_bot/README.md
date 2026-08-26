@@ -111,7 +111,7 @@ python kakao_legal_bot/relay/moa_draft_worker.py \
 |---|---|---|
 | 1 | 루팅된 안드로이드 에뮬레이터 + KakaoTalk + [Iris](https://github.com/dolidolih/Iris) | 블루스택은 알림만 읽혀서 부족합니다 |
 | 2 | 듀얼 번호 (통신사 3,000원) | **본 계정으로 돌리지 마세요.** 정지되면 본 계정이 날아갑니다 |
-| 3 | LLM API 키 | Anthropic 또는 OpenAI |
+| 3 | LLM API 키 | Gemini · Anthropic · OpenRouter 중 하나 (3-1 표 참고) |
 | 4 | Railway 서버 + 볼륨 | 볼륨 없으면 재배포마다 기록이 사라집니다 |
 | 5 | law.go.kr `OC` 아이디, data.go.kr 인증키 | 아래 4장 |
 
@@ -127,11 +127,24 @@ python kakao_legal_bot/relay/moa_draft_worker.py \
 3. Variables 탭에 `.env.example` 의 키를 채웁니다. 최소한 이것들:
 
    ```
-   ANTHROPIC_API_KEY   LLM_MODEL=claude-sonnet-5
+   LLM_PROVIDER=gemini  GEMINI_API_KEY=...      (아래 표 참고)
    IRIS_WEBHOOK_SECRET OUTBOX_TOKEN  ADMIN_TOKEN   (전부 긴 랜덤 문자열)
    LAWYER_NAME  LAWYER_ROOM_ID  LAWYER_KAKAO_IDS
    PUBLIC_BASE_URL=https://<내서비스>.up.railway.app
    ```
+
+   **상담 응답 모델 선택** — `LLM_MODEL` 을 비우면 기본값이 적용됩니다.
+
+   | `LLM_PROVIDER` | 필요한 키 | 기본 모델 |
+   |---|---|---|
+   | `gemini` | `GEMINI_API_KEY` | `gemini-3.7-flash` |
+   | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-5` |
+   | `openrouter` | `OPENROUTER_API_KEY` | `google/gemini-3.7-flash` |
+   | `openai` | `OPENAI_API_KEY` | (`LLM_MODEL` 필수) |
+
+   OpenRouter 는 여러 모델을 한 키로 바꿔가며 시험하거나 자동 페일오버가
+   필요할 때 유용합니다. 다만 **상담 내용이 모델 제공자 외에 OpenRouter 도
+   거칩니다** — 비밀유지 관점에서 판단하시고, 아니라면 직접 연결을 쓰세요.
 4. 배포 후 `https://<주소>/health` 가 `"ok": true` 를 주는지 확인합니다.
    `missing_config` 에 뜬 항목은 아직 그 기능이 꺼져 있다는 뜻입니다.
 
@@ -326,7 +339,7 @@ claude mcp add korean-law -- python kakao_legal_bot/mcp_law_server.py
 ## 8. 개발
 
 ```bash
-python -m pytest tests/kakao_legal_bot -q      # 177개
+python -m pytest tests/kakao_legal_bot -q      # 203개
 ```
 
 네트워크는 전부 목입니다. `test_end_to_end.py` 는 LLM 엔드포인트와 Iris만

@@ -56,8 +56,10 @@ class LlmClient:
         max_tool_rounds: int = 4,
         client: httpx.AsyncClient | None = None,
         timeout_s: float = 120.0,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.provider = provider
+        self.extra_headers = extra_headers or {}
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -87,7 +89,7 @@ class LlmClient:
         model: str = "",
         max_tokens: int = 0,
     ) -> LlmResult:
-        if self.provider == "openai":
+        if self.provider in {"openai", "openrouter"}:
             return await self._complete_openai(system, messages, tools, model, max_tokens)
         if self.provider == "gemini":
             return await self._complete_gemini(system, messages, tools, model, max_tokens)
@@ -200,10 +202,15 @@ class LlmClient:
         convo.extend(_anthropic_to_openai(messages))
         result = LlmResult()
 
+        # OpenRouter follows the classic chat-completions spec: it reads
+        # `max_tokens` and ignores `max_completion_tokens`, which would leave
+        # the output length unbounded — and unbounded output is a bill.
+        limit_field = "max_tokens" if self.provider == "openrouter" else "max_completion_tokens"
+
         for round_index in range(self.max_tool_rounds + 1):
             body: dict[str, Any] = {
                 "model": model or self.model,
-                "max_completion_tokens": max_tokens or self.max_tokens,
+                limit_field: max_tokens or self.max_tokens,
                 "temperature": self.temperature,
                 "messages": convo,
             }
@@ -213,7 +220,7 @@ class LlmClient:
             try:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    headers={"Authorization": f"Bearer {self.api_key}", **self.extra_headers},
                     json=body,
                 )
             except httpx.HTTPError as exc:
