@@ -47,6 +47,7 @@ _PROTOCOL_LITERAL_VALUES = frozenset({
     "user",
 })
 _PROTECTED_REMOTE_PROVIDERS = frozenset({
+    "anthropic",
     "openai-codex",
     "nous",
     "nous-portal",
