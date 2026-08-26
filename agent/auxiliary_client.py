@@ -3408,6 +3408,33 @@ def _relay_auxiliary_metadata(
     }
 
 
+def _auxiliary_middleware_context(
+    client: Any,
+    provider: str | None,
+    api_mode: str | None,
+) -> dict[str, Any]:
+    """Privacy middleware context for one physical auxiliary provider attempt."""
+    context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    task = str(context.get("task") or "unknown")
+    session_id = ""
+    try:
+        from agent import relay_runtime
+
+        turn = relay_runtime.active_turn()
+        if turn is not None:
+            session_id = str(turn.lease.session_id or "")
+    except Exception:
+        pass
+    return {
+        "provider": str(provider or context.get("provider") or "auxiliary"),
+        "base_url": str(getattr(client, "base_url", "") or ""),
+        "api_mode": str(api_mode or context.get("api_mode") or "chat_completions"),
+        "session_id": session_id,
+        "call_role": f"auxiliary:{task}",
+        "auxiliary_task": task,
+    }
+
+
 def _relay_sync_completion(
     client: Any,
     kwargs: dict[str, Any],
@@ -3417,22 +3444,34 @@ def _relay_sync_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    # Protected compression calls isolate only the provider callback and stream
-    # aggregation.  The owning thread remains free to unwind its lease/DB
-    # transaction on hard cancel without touching the process-shared client.
-    if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
+    def terminal(request: dict[str, Any]) -> Any:
+        route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+        # Protected compression calls isolate only the provider callback and stream
+        # aggregation. The owning thread remains free to unwind its lease/DB
+        # transaction on hard cancel without touching the process-shared client.
+        if route is None:
+            return _run_protected_sync_provider_call(callback, request)
+        provider_name, fallback_model, metadata = route
+        from agent import relay_llm
 
-    return relay_llm.execute_current(
+        return relay_llm.execute_current(
+            request,
+            lambda next_request: _run_protected_sync_provider_call(callback, next_request),
+            name=provider_name,
+            model_name=str(request.get("model") or fallback_model),
+            metadata=metadata,
+            defer_logical_completion=True,
+        )
+
+    from hermes_cli.middleware import (
+        llm_execution_middleware_required,
+        run_llm_execution_middleware,
+    )
+    return run_llm_execution_middleware(
         kwargs,
-        lambda request: _run_protected_sync_provider_call(callback, request),
-        name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model),
-        metadata=metadata,
-        defer_logical_completion=True,
+        terminal,
+        required=llm_execution_middleware_required(),
+        **_auxiliary_middleware_context(client, provider, api_mode),
     )
 
 
@@ -3444,6 +3483,14 @@ async def _relay_async_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
+    from hermes_cli.middleware import (
+        RequiredMiddlewareError,
+        llm_execution_middleware_required,
+    )
+    if llm_execution_middleware_required():
+        raise RequiredMiddlewareError(
+            "async auxiliary provider execution is blocked in strict middleware mode"
+        )
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
@@ -3468,6 +3515,14 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
+    from hermes_cli.middleware import (
+        RequiredMiddlewareError,
+        llm_execution_middleware_required,
+    )
+    if llm_execution_middleware_required():
+        raise RequiredMiddlewareError(
+            "streaming auxiliary provider execution is blocked in strict middleware mode"
+        )
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return client.chat.completions.create(**kwargs)

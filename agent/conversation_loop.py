@@ -3206,7 +3206,10 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
+                from hermes_cli.middleware import (
+                    llm_execution_middleware_required,
+                    run_llm_execution_middleware,
+                )
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -3221,6 +3224,7 @@ def run_conversation(
                     response = run_llm_execution_middleware(
                         api_kwargs,
                         _perform_api_call,
+                        required=llm_execution_middleware_required(),
                         original_request=_original_api_kwargs,
                         task_id=effective_task_id,
                         turn_id=turn_id,
