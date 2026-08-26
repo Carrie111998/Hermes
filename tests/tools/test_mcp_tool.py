@@ -921,6 +921,47 @@ class TestMCPServerTask:
 
         asyncio.run(_test())
 
+    def test_stdio_children_dead_false_when_a_tracked_pid_is_alive(self):
+        """Regression test (#81995 fast-fail): a live tracked child must NOT
+        be reported as dead.
+
+        A prior refactor accidentally swapped the return values here — a
+        live PID made this return True ("dead"), which caused every
+        subsequent tools/call RPC on a perfectly healthy stdio server to
+        fail immediately with "MCP stdio subprocess has exited" (visible
+        e.g. against n8n-mcp, whose deeper watchdog->npm->node process
+        chain reliably populates _stdio_child_pids, unlike shallower-spawn
+        servers that happened to dodge the bug).
+        """
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("srv")
+        server._config = {"command": "npx"}
+        server._stdio_child_pids = {12345}
+
+        with patch("psutil.pid_exists", return_value=True):
+            assert server._stdio_children_dead() is False
+
+    def test_stdio_children_dead_true_when_all_tracked_pids_are_gone(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("srv")
+        server._config = {"command": "npx"}
+        server._stdio_child_pids = {12345, 67890}
+
+        with patch("psutil.pid_exists", return_value=False):
+            assert server._stdio_children_dead() is True
+
+    def test_stdio_children_dead_false_when_no_pids_tracked(self):
+        """Best-effort: unknown liveness must never trigger a false fast-fail."""
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("srv")
+        server._config = {"command": "npx"}
+        server._stdio_child_pids = set()
+
+        assert server._stdio_children_dead() is False
+
 
 # ---------------------------------------------------------------------------
 # discover_mcp_tools toolset injection
