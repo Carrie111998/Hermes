@@ -1024,6 +1024,57 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+_CRON_DELIVERY_RE = re.compile(
+    r"^Cronjob Response: (?P<name>[^\n]+)\n"
+    r"\(job_id: (?P<job_id>[^)]+)\)\n"
+    r"-------------\n\n"
+    r"(?P<body>.*?)\n\n"
+    r"To stop or manage this job, send me a new message .*\.?$",
+    re.DOTALL,
+)
+
+
+def _discord_cron_embed_parts(
+    content: str,
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    """Return safe presentation fields for a short wrapped cron delivery."""
+    if not metadata or not metadata.get("job_id"):
+        return None
+    match = _CRON_DELIVERY_RE.match((content or "").strip())
+    if not match:
+        return None
+    body = match.group("body").strip()
+    # Preserve long-form reports as ordinary split Discord messages. Embedding
+    # those would hit Discord's 4096-character description cap and clip data.
+    if not body or len(body) > 3800:
+        return None
+
+    lowered = body.lower()
+    if any(word in lowered for word in ("blocked", "escalat", "🚨")):
+        stage, color = "Self-healing blocked / attention required", "red"
+    elif any(word in lowered for word in ("debounc", "observing", "repairing", "⚠️")):
+        stage, color = "Self-healing observing / repairing", "orange"
+    elif any(word in lowered for word in ("self-healed", "recovered", "healthy", "✅")):
+        if "without intervention" in lowered or "recovered naturally" in lowered:
+            stage = "Transiently self-recovered"
+        else:
+            stage = "Verified self-healing recovery"
+        color = "green"
+    elif any(word in lowered for word in ("failed", "failure", "error")):
+        stage, color = "Self-healing blocked / attention required", "red"
+    else:
+        stage, color = "Cron state changed", "blue"
+
+    return {
+        "name": match.group("name").strip(),
+        "job_id": match.group("job_id").strip(),
+        "body": body,
+        "stage": stage,
+        "color": color,
+    }
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -3493,6 +3544,48 @@ class DiscordAdapter(BasePlatformAdapter):
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=final_delivery,
+                )
+                return result
+
+            cron_embed_parts = _discord_cron_embed_parts(content, metadata)
+            if cron_embed_parts:
+                color_factory = getattr(discord.Color, cron_embed_parts["color"])
+                embed = discord.Embed(
+                    title=f"🔄 {cron_embed_parts['name']}",
+                    description=cron_embed_parts["body"],
+                    color=color_factory(),
+                    timestamp=dt.datetime.now(dt.timezone.utc),
+                )
+                embed.add_field(
+                    name="Self-healing stage",
+                    value=cron_embed_parts["stage"],
+                    inline=False,
+                )
+                embed.add_field(
+                    name="Job",
+                    value=f"`{cron_embed_parts['job_id']}`",
+                    inline=True,
+                )
+                embed.set_footer(text="Hermes Cron Reliability")
+                reference = self._reply_reference_for_send(reply_to, channel)
+                msg = await channel.send(embed=embed, reference=reference)
+                message_id = str(msg.id)
+                _target_id = thread_id or chat_id
+                if nonconversational:
+                    self._nonconversational_messages.mark_many([message_id])
+                else:
+                    self._last_self_message_id[_target_id] = message_id
+                result = SendResult(
+                    success=True,
+                    message_id=message_id,
+                    raw_response={"message_ids": [message_id], "embedded": True},
+                )
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
