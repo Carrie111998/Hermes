@@ -71,6 +71,61 @@ class TestRuntimeTerminalEnv:
         # The overlay is private: the process env still selects local.
         assert os.environ["TERMINAL_ENV"] == "local"
 
+    def test_scoped_turn_sees_profile_dotenv_terminal_settings(
+        self, monkeypatch, _profile_home
+    ):
+        """A TERMINAL_* setting living only in the profile's ``.env`` (carried
+        by the bound secret scope, never in the process env) must reach the
+        overlay. Three-layer precedence: os.environ < profile ``.env`` <
+        config.yaml ``terminal.*``."""
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            is_multiplex_active,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.delenv("TERMINAL_SSH_HOST", raising=False)
+        # Same key in the process env AND the profile .env — the .env wins.
+        monkeypatch.setenv("TERMINAL_SSH_USER", "process-user")
+        (_profile_home / ".env").write_text(
+            # ssh_host: only in .env (the substantive case).
+            "TERMINAL_SSH_HOST=dotenv.example\n"
+            "TERMINAL_SSH_USER=dotenv-user\n"
+            # timeout: .env says 99, config.yaml says 42 — config still wins.
+            "TERMINAL_TIMEOUT=99\n",
+            encoding="utf-8",
+        )
+
+        previous = is_multiplex_active()
+        set_multiplex_active(True)
+        home_token = set_hermes_home_override(str(_profile_home))
+        secret_token = set_secret_scope(build_profile_secret_scope(_profile_home))
+        try:
+            runtime_env = terminal_tool._runtime_terminal_env()
+            config = terminal_tool._get_env_config()
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+            set_multiplex_active(previous)
+
+        assert runtime_env["TERMINAL_SSH_HOST"] == "dotenv.example"
+        assert runtime_env["TERMINAL_SSH_USER"] == "dotenv-user"
+        assert runtime_env["TERMINAL_TIMEOUT"] == "42"
+        assert config["ssh_host"] == "dotenv.example"
+        assert config["ssh_user"] == "dotenv-user"
+        assert config["timeout"] == 42
+        # The overlay never leaks into the process environment.
+        assert "TERMINAL_SSH_HOST" not in os.environ
+        assert os.environ["TERMINAL_SSH_USER"] == "process-user"
+        assert os.environ["TERMINAL_ENV"] == "local"
+
     def test_multiplex_without_scope_keeps_process_env(self, monkeypatch, _profile_home):
         """Multiplex active but no bound secret scope (e.g. process-level
         startup work) keeps the historical process-environment path."""

@@ -1331,10 +1331,18 @@ def _probe_remote_backend(env_type: str) -> str | None:
     operate on a different machine than the host Hermes runs on.
     """
     cwd_hint = os.getenv("TERMINAL_CWD", "")
+    profile_key = ""
     try:
         profile_key = str(get_hermes_home())
+        # The cache key's cwd hint must come from the same profile-aware view
+        # that _get_env_config() below reads — a raw os.getenv could key the
+        # cache on one cwd while a multiplexed turn's probe runs in another.
+        # Lazy import (tools/ is heavy); fail-soft to the os.getenv value.
+        from tools.terminal_tool import _runtime_terminal_env
+
+        cwd_hint = _runtime_terminal_env().get("TERMINAL_CWD", cwd_hint)
     except Exception:
-        profile_key = ""
+        logger.debug("Profile-aware probe cache key resolution failed", exc_info=True)
     cache_key = (env_type, cwd_hint, profile_key)
     cached = _BACKEND_PROBE_CACHE.get(cache_key)
     if cached is not None:
@@ -1483,6 +1491,8 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
+    # Process-global read on purpose: this is the single-profile base value;
+    # the guarded block right below re-resolves it per profile under multiplex.
     backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active

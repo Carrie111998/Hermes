@@ -117,6 +117,8 @@ def _safe_parse_import_env(
 
 
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
+# Deliberately process-global (import-time constant, not a config-bridged
+# per-profile setting) — same for TERMINAL_DISK_WARNING_GB below.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "TERMINAL_MAX_FOREGROUND_TIMEOUT",
     600,
@@ -839,7 +841,9 @@ def _sudo_nopasswd_works() -> bool:
     cache) so an expired sudo timestamp cannot make a later command silently
     block waiting for a password.
     """
-    terminal_env = os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
+    terminal_env = (
+        _runtime_terminal_env().get("TERMINAL_ENV", "local").strip().lower() or "local"
+    )
     if terminal_env != "local":
         return False
 
@@ -1194,9 +1198,10 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     # window. Floor at 60s so an operator with TERMINAL_LIFETIME_SECONDS=0
     # doesn't get an instant-reap that races their own setup.
     # ``container_config`` only carries container_* keys, so read
-    # lifetime_seconds from the env var the rest of the module uses.
+    # lifetime_seconds from the profile-aware env view the rest of the
+    # module uses.
     try:
-        lifetime = int(os.getenv("TERMINAL_LIFETIME_SECONDS", "300"))
+        lifetime = int(_runtime_terminal_env().get("TERMINAL_LIFETIME_SECONDS", "300"))
     except (TypeError, ValueError):
         lifetime = 300
     lifetime = max(60, lifetime)
@@ -1384,13 +1389,13 @@ def _session_isolation_enabled() -> bool:
       under non-persistent mode would let two independent ephemeral runs
       attach one live VM and delete it out from under each other).
     """
-    _ensure_terminal_env_bridged()
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    runtime_env = _runtime_terminal_env()
+    env_type = runtime_env.get("TERMINAL_ENV", "local")
     if env_type != "docker" and not _plugin_env_flag(
         env_type, "session_isolated_when_nonpersistent"
     ):
         return False
-    return os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() not in {"true", "1", "yes"}
+    return runtime_env.get("TERMINAL_CONTAINER_PERSISTENT", "true").lower() not in {"true", "1", "yes"}
 
 
 def _docker_session_isolation_enabled() -> bool:
@@ -1400,7 +1405,7 @@ def _docker_session_isolation_enabled() -> bool:
     selection, session-scoped container teardown) key off it; those must
     not fire for other backends.
     """
-    if os.getenv("TERMINAL_ENV", "local") != "docker":
+    if _runtime_terminal_env().get("TERMINAL_ENV", "local") != "docker":
         return False
     return _session_isolation_enabled()
 
@@ -1419,10 +1424,10 @@ def _docker_persistent_profile_scoped() -> bool:
     profile scoping for exactly this backend/mode; SSH and other backends
     keep the session-scoped cache key that fixed the original leak.
     """
-    _ensure_terminal_env_bridged()
-    if os.getenv("TERMINAL_ENV", "local") != "docker":
+    runtime_env = _runtime_terminal_env()
+    if runtime_env.get("TERMINAL_ENV", "local") != "docker":
         return False
-    return os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"}
+    return runtime_env.get("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"}
 
 
 def _current_session_profile() -> str:
@@ -1516,7 +1521,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
             # Explicit opt-in: trusted profiles configuring the same
             # terminal.docker_shared_container_key share ONE container/cache
             # slot (and sandbox dir) regardless of profile name (#84671).
-            shared = os.getenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
+            shared = _runtime_terminal_env().get("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
             if shared:
                 return f"shared:{shared}"
             profile = _current_session_profile() or "default"
@@ -1529,7 +1534,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     # sessions land in "shared:<key>" — splitting the very container the
     # setting exists to unify.
     if _docker_persistent_profile_scoped():
-        shared = os.getenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
+        shared = _runtime_terminal_env().get("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
         if shared:
             return f"shared:{shared}"
     return "default"
@@ -1635,6 +1640,9 @@ def _safe_getcwd() -> str:
     try:
         return os.getcwd()
     except FileNotFoundError:
+        # Deliberately process-global: an emergency fallback for the HOST
+        # process's deleted cwd (a process-level condition, not a per-profile
+        # setting) that must stay import-light and re-entrant.
         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
@@ -1771,13 +1779,27 @@ def _runtime_terminal_env() -> Dict[str, str]:
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
-        if is_multiplex_active() and current_secret_scope() is not None:
+        scope = current_secret_scope()
+        if is_multiplex_active() and scope is not None:
             from hermes_cli.config import (
                 apply_terminal_config_to_env,
                 load_config_readonly,
             )
 
+            # Three layers, lowest precedence first:
+            #   1. os.environ — process-wide exports for settings the profile
+            #      carries nowhere itself;
+            #   2. the profile's own ``.env`` TERMINAL_* entries — they travel
+            #      in the bound secret scope (never in os.environ, which would
+            #      leak them across profiles), so seed them here or a setting
+            #      that lives only in the profile's ``.env`` is invisible;
+            #   3. the profile's config.yaml ``terminal.*`` section — config
+            #      wins over any (possibly stale) env value, matching the
+            #      ``_ensure_terminal_env_bridged()`` semantics.
             target = dict(os.environ)
+            for name, value in scope.items():
+                if name.startswith("TERMINAL_"):
+                    target[name] = value
             return apply_terminal_config_to_env(
                 env=target,
                 config=load_config_readonly(),
@@ -3885,7 +3907,9 @@ def terminal_tool(
         #   warn (default) — return a structured degraded result the model
         #                    can act on (reason + retry hint, no traceback).
         #   fail           — preserve the historical error+traceback result.
-        degraded_mode = os.getenv("TERMINAL_DEGRADED_MODE", "warn").strip().lower()
+        degraded_mode = (
+            _runtime_terminal_env().get("TERMINAL_DEGRADED_MODE", "warn").strip().lower()
+        )
         if degraded_mode == "fail":
             import traceback
             tb_str = traceback.format_exc()
@@ -4103,6 +4127,8 @@ if __name__ == "__main__":
     print("  result = terminal_tool(command='python server.py', background=True)")
 
     print("\nEnvironment Variables:")
+    # Deliberately process-global reads: this standalone diagnostic prints the
+    # invoking process's own environment and never runs inside a scoped turn.
     default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
     print(
         "  TERMINAL_ENV: "

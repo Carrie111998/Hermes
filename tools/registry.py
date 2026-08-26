@@ -302,6 +302,22 @@ def _prune_check_fn_caches(now: float) -> None:
         _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
 
 
+# check_fn_cache_scope() runs on EVERY availability check in a scope-bound
+# process, and Path.expanduser().resolve() stats the filesystem each time.
+# Memoize the resolution per raw home string — bounded in practice because a
+# process serves a small, fixed set of profile homes.
+_RESOLVED_HOME_CACHE: Dict[str, str] = {}
+
+
+def _resolve_home_cached(raw_home: str) -> str:
+    """Resolve a Hermes home path to its canonical string, memoized."""
+    resolved = _RESOLVED_HOME_CACHE.get(raw_home)
+    if resolved is None:
+        resolved = str(Path(raw_home).expanduser().resolve())
+        _RESOLVED_HOME_CACHE[raw_home] = resolved
+    return resolved
+
+
 def check_fn_cache_scope() -> Optional[str]:
     """Return the active profile key when availability is profile-scoped.
 
@@ -341,11 +357,16 @@ def check_fn_cache_scope() -> Optional[str]:
         override = get_hermes_home_override()
         if not override:
             if multiplex_active:
+                # Deliberate cost: a multiplexed turn with no home override has
+                # no stable profile identity, so availability probes re-run
+                # every time instead of caching under a key that could alias
+                # one profile's tools onto another. Do not "optimize" this
+                # bypass back into a shared cache entry.
                 return CHECK_FN_CACHE_BYPASS
             from hermes_constants import get_hermes_home
 
-            return str(Path(get_hermes_home()).expanduser().resolve())
-        return str(Path(override).expanduser().resolve())
+            return _resolve_home_cached(str(get_hermes_home()))
+        return _resolve_home_cached(str(override))
     except Exception:
         # Fail closed: bypass both cache layers rather than aliasing requests
         # whose multiplex profile identity could not be resolved.
