@@ -385,6 +385,18 @@ $script:ResolvedPathReport = @{
 
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
+# Dot-source the mirror resolver library. Defines Get-HermesPypiMirror,
+# Get-HermesGithubCloneUrl, Test-HermesMirrorReachable, and
+# Get-HermesMirrorStatus. Resolved URL is a *candidate* — install.ps1 probes
+# it with Test-HermesMirrorReachable before depending on it, so a wrong
+# resolver choice never produces a confusing 30-second connect timeout.
+#
+# Why dot-source (not Import-Module): the resolver exports $script:-scoped
+# variables and is consumed by Main directly; dot-sourcing keeps everything
+# in the install.ps1 session and avoids the Windows PowerShell 5.1 module
+# auto-load dance. The library file itself is a flat script with public
+# functions at the top level.
+. (Join-Path $PSScriptRoot "install_mirror.ps1")
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -2255,120 +2267,151 @@ function Install-Repository {
         git config --global windows.appendAtomically false 2>$null
 
         # Try SSH first, then HTTPS, with -c flag for atomic write fix
-        Write-Info "Trying SSH clone..."
-        $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
-        try {
-            Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }
-            if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
-        } catch { }
-        $env:GIT_SSH_COMMAND = $null
+                Write-Info "Trying SSH clone..."
+                $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
+                try {
+                    Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }
+                    if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
+                } catch { }
+                $env:GIT_SSH_COMMAND = $null
 
-        if (-not $cloneSuccess) {
-            if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Info "SSH failed, trying HTTPS..."
-            try {
-                Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }
-                if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
-            } catch { }
-        }
+                if (-not $cloneSuccess) {
+                    if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
+                    # Resolve the HTTPS clone URL through a proxy when the install is
+                    # running from a network where github.com is unreachable (#95167).
+                    # The resolver returns the input unchanged when no proxy is
+                    # reachable, so this is a no-op on healthy networks.
+                    $resolvedHttps = Get-HermesGithubCloneUrl -Url $RepoUrlHttps
+                    if ($resolvedHttps -ne $RepoUrlHttps) {
+                        Write-Info "Using GitHub proxy for clone: $resolvedHttps"
+                    }
+                    Write-Info "SSH failed, trying HTTPS..."
+                    try {
+                        Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $resolvedHttps $InstallDir }
+                        if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
+                    } catch { }
+                }
 
         # Fallback: download ZIP archive (bypasses git file I/O issues entirely)
-        if (-not $cloneSuccess) {
-            if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Warn "Git clone failed -- downloading ZIP archive instead..."
-            try {
-                # Pick the ZIP URL for the most-specific ref the caller asked
-                # for.  GitHub supports archive URLs for commits, tags, and
-                # branches; we honour Commit > Tag > Branch.
-                if ($Commit) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/$Commit.zip"
-                    $zipLabel = $Commit
-                } elseif ($Tag) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/tags/$Tag.zip"
-                    $zipLabel = $Tag
-                } else {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
-                    $zipLabel = $Branch
-                }
-                $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
-                $extractPath = "$env:TEMP\hermes-agent-extract"
-
-                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
-                if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
-                Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-
-                # GitHub ZIPs extract to repo-branch/ subdirectory
-                $extractedDir = Get-ChildItem $extractPath -Directory | Select-Object -First 1
-                if ($extractedDir) {
-                    New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) -ErrorAction SilentlyContinue | Out-Null
-                    Move-Item $extractedDir.FullName $InstallDir -Force
-                    Write-Success "Downloaded and extracted"
-
-                    # Initialize git repo so updates work later. A bare
-                    # `git init` leaves NO HEAD -- desktop's write-build-stamp
-                    # then hard-fails with "could not determine git commit"
-                    # (#50823 / #61657). Fetch the requested ref and force-check
-                    # it out (-f) so untracked ZIP files cannot block checkout.
-                    Push-Location $InstallDir
-                    git -c windows.appendAtomically=false init 2>$null
-                    git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
-                    # Pin autocrlf=false BEFORE the checkout below. Git for Windows
-                    # defaults to core.autocrlf=true, which would renormalize the
-                    # repo's LF text files to CRLF in the working tree during
-                    # `checkout -f FETCH_HEAD` -- leaving this freshly-created
-                    # managed checkout dirty vs HEAD and aborting the next
-                    # `hermes update` (see the notes at the shared clone-path
-                    # config below and install.ps1:1461-1469). The later pin on
-                    # the shared path is idempotent and still covers git clones.
-                    git -c windows.appendAtomically=false config core.autocrlf false 2>$null
-                    git remote add origin $RepoUrlHttps 2>$null
-                    $fetchRef = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
-                    Write-Info "Fetching $fetchRef so the ZIP checkout has a resolvable HEAD..."
-                    $prevZipEAP = $ErrorActionPreference
-                    $ErrorActionPreference = "Continue"
+                if (-not $cloneSuccess) {
+                    if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
+                    Write-Warn "Git clone failed -- downloading ZIP archive instead..."
                     try {
-                        git -c windows.appendAtomically=false fetch --depth 1 origin $fetchRef 2>&1 | Out-Null
-                        if ($LASTEXITCODE -eq 0) {
-                            if ($Commit -or $Tag) {
-                                git -c windows.appendAtomically=false checkout -f --detach FETCH_HEAD 2>&1 | Out-Null
-                            } else {
-                                git -c windows.appendAtomically=false checkout -f -B $Branch FETCH_HEAD 2>&1 | Out-Null
-                            }
-                            if ($LASTEXITCODE -eq 0) {
-                                Write-Success "ZIP checkout pinned to $fetchRef"
-                            } else {
-                                # Checkout blocked, but FETCH_HEAD still has a SHA we can stamp with.
-                                $fetchSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
-                                if ($LASTEXITCODE -eq 0 -and $fetchSha) {
-                                    if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = ("$fetchSha").Trim() }
-                                    Write-Warn "ZIP checkout failed; seeded GITHUB_SHA from FETCH_HEAD for desktop stamp"
-                                } else {
-                                    Write-Warn "ZIP extract succeeded but git checkout failed -- desktop build may need `$env:GITHUB_SHA"
-                                }
-                            }
+                        # Pick the ZIP URL for the most-specific ref the caller asked
+                        # for.  GitHub supports archive URLs for commits, tags, and
+                        # branches; we honour Commit > Tag > Branch.
+                        if ($Commit) {
+                            $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/$Commit.zip"
+                            $zipLabel = $Commit
+                        } elseif ($Tag) {
+                            $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/tags/$Tag.zip"
+                            $zipLabel = $Tag
                         } else {
-                            Write-Warn "ZIP extract succeeded but git fetch of $fetchRef failed -- desktop build may need `$env:GITHUB_SHA"
+                            $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
+                            $zipLabel = $Branch
                         }
-                    } finally {
-                        $ErrorActionPreference = $prevZipEAP
-                    }
-                    Pop-Location
-                    Write-Success "Git repo initialized for future updates"
+                        # If a GitHub proxy was reachable above, route the ZIP
+                        # download through it too (#95167). Same resolver; same
+                        # contract -- unchanged on healthy networks.
+                        $resolvedZip = Get-HermesGithubCloneUrl -Url $zipUrl
+                        if ($resolvedZip -ne $zipUrl) {
+                            Write-Info "Using GitHub proxy for archive download: $resolvedZip"
+                            $zipUrl = $resolvedZip
+                        }
+                        $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
+                        $extractPath = "$env:TEMP\hermes-agent-extract"
 
-                    $cloneSuccess = $true
+                        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+                        if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
+                        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+                        # GitHub ZIPs extract to repo-branch/ subdirectory
+                        $extractedDir = Get-ChildItem $extractPath -Directory | Select-Object -First 1
+                        if ($extractedDir) {
+                            New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) -ErrorAction SilentlyContinue | Out-Null
+                            Move-Item $extractedDir.FullName $InstallDir -Force
+                            Write-Success "Downloaded and extracted"
+
+                            # Initialize git repo so updates work later. A bare
+                            # `git init` leaves NO HEAD -- desktop's write-build-stamp
+                            # then hard-fails with "could not determine git commit"
+                            # (#50823 / #61657). Fetch the requested ref and force-check
+                            # it out (-f) so untracked ZIP files cannot block checkout.
+                            Push-Location $InstallDir
+                            git -c windows.appendAtomically=false init 2>$null
+                            git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
+                            # Pin autocrlf=false BEFORE the checkout below. Git for Windows
+                            # defaults to core.autocrlf=true, which would renormalize the
+                            # repo's LF text files to CRLF in the working tree during
+                            # `checkout -f FETCH_HEAD` -- leaving this freshly-created
+                            # managed checkout dirty vs HEAD and aborting the next
+                            # `hermes update` (see the notes at the shared clone-path
+                            # config below and install.ps1:1461-1469). The later pin on
+                            # the shared path is idempotent and still covers git clones.
+                            git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+                            git remote add origin $RepoUrlHttps 2>$null
+                            $fetchRef = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
+                            Write-Info "Fetching $fetchRef so the ZIP checkout has a resolvable HEAD..."
+                            $prevZipEAP = $ErrorActionPreference
+                            $ErrorActionPreference = "Continue"
+                            try {
+                                git -c windows.appendAtomically=false fetch --depth 1 origin $fetchRef 2>&1 | Out-Null
+                                if ($LASTEXITCODE -eq 0) {
+                                    if ($Commit -or $Tag) {
+                                        git -c windows.appendAtomically=false checkout -f --detach FETCH_HEAD 2>&1 | Out-Null
+                                    } else {
+                                        git -c windows.appendAtomically=false checkout -f -B $Branch FETCH_HEAD 2>&1 | Out-Null
+                                    }
+                                    if ($LASTEXITCODE -eq 0) {
+                                        Write-Success "ZIP checkout pinned to $fetchRef"
+                                    } else {
+                                        # Checkout blocked, but FETCH_HEAD still has a SHA we can stamp with.
+                                        $fetchSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
+                                        if ($LASTEXITCODE -eq 0 -and $fetchSha) {
+                                            if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = ("$fetchSha").Trim() }
+                                            Write-Warn "ZIP checkout failed; seeded GITHUB_SHA from FETCH_HEAD for desktop stamp"
+                                        } else {
+                                            Write-Warn "ZIP extract succeeded but git checkout failed -- desktop build may need `$env:GITHUB_SHA"
+                                        }
+                                    }
+                                } else {
+                                    Write-Warn "ZIP extract succeeded but git fetch of $fetchRef failed -- desktop build may need `$env:GITHUB_SHA"
+                                }
+                            } finally {
+                                $ErrorActionPreference = $prevZipEAP
+                            }
+                            Pop-Location
+                            Write-Success "Git repo initialized for future updates"
+
+                            $cloneSuccess = $true
+                        }
+
+                        # Cleanup temp files
+                        Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+                        Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
+                    } catch {
+                        Write-Err "ZIP download also failed: $_"
+                    }
                 }
 
-                # Cleanup temp files
-                Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
-                Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
-            } catch {
-                Write-Err "ZIP download also failed: $_"
-            }
-        }
-
-        if (-not $cloneSuccess) {
-            throw "Failed to download repository (tried git clone SSH, HTTPS, and ZIP)"
-        }
+                if (-not $cloneSuccess) {
+                    # Surface actionable next-step instead of the bare "we tried
+                    # three things" message (#95167): if the resolver couldn't
+                    # reach any PyPI/GitHub mirror, the user is on a network
+                    # where setting HERMES_PYPI_MIRROR / HERMES_GITHUB_PROXY is
+                    # the actual fix.
+                    $diagLines = @()
+                    $diagLines += "Could not download the Hermes Agent source tree."
+                    $diagLines += ""
+                    $diagLines += "Tried: SSH (git@github.com), HTTPS (https://github.com), and archive ZIP."
+                    $diagLines += ""
+                    $diagLines += "If github.com / pypi.org are blocked from your network, configure a mirror:"
+                    $diagLines += "  `$env:HERMES_GITHUB_PROXY = 'https://ghfast.top/'"
+                    $diagLines += "  `$env:HERMES_PYPI_MIRROR  = 'https://mirrors.aliyun.com/pypi/simple/'"
+                    $diagLines += ""
+                    $diagLines += "Re-run with the env vars exported; the installer resolves PyPI mirrors via the regional fallback list in install_mirror.ps1."
+                    throw ($diagLines -join "`n")
+                }
     }
 
     # Set per-repo config (harmless if it fails)
@@ -2747,23 +2790,34 @@ function Install-Dependencies {
     # tree is deleted only after the imports prove the replacement usable.
     try {
     if (Test-Path "uv.lock") {
-        Write-Info "Trying tier: hash-verified (uv.lock) ..."
-        # Critical flag choice: `--extra all`, NOT `--all-extras`.
-        #   --all-extras = every [project.optional-dependencies] key,
-        #                  bypassing the curated [all] extra. On Windows
-        #                  that means [matrix] -> python-olm (no wheel,
-        #                  needs `make` to build from sdist) and the
-        #                  install fails.
-        #   --extra all  = just the [all] extra's contents (curated).
-        #
-        # UV_PROJECT_ENVIRONMENT pins the sync target to our venv\.
-        # Without it, modern uv (>=0.5) ignores VIRTUAL_ENV for `sync`
-        # and creates a sibling .venv\ inside the repo -- leaving venv\
-        # empty and producing the broken state where `hermes.exe` exists
-        # in the wrong directory and imports fail with ModuleNotFoundError.
-        # (Mirrors the same flag in scripts/install.sh::install_deps.)
-        $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
-        Invoke-NativeWithRelaxedErrorAction { & $UvCmd sync --extra all --locked }
+            Write-Info "Trying tier: hash-verified (uv.lock) ..."
+            # Critical flag choice: `--extra all`, NOT `--all-extras`.
+            #   --all-extras = every [project.optional-dependencies] key,
+            #                  bypassing the curated [all] extra. On Windows
+            #                  that means [matrix] -> python-olm (no wheel,
+            #                  needs `make` to build from sdist) and the
+            #                  install fails.
+            #   --extra all  = just the [all] extra's contents (curated).
+            #
+            # UV_PROJECT_ENVIRONMENT pins the sync target to our venv\.
+            # Without it, modern uv (>=0.5) ignores VIRTUAL_ENV for `sync`
+            # and creates a sibling .venv\ inside the repo -- leaving venv\
+            # empty and producing the broken state where `hermes.exe` exists
+            # in the wrong directory and imports fail with ModuleNotFoundError.
+            # (Mirrors the same flag in scripts/install.sh::install_deps.)
+            $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
+            # Resolve the PyPI index URL through the mirror resolver. Honors
+            # HERMES_PYPI_MIRROR if set, otherwise returns the canonical PyPI
+            # URL or a reachable regional mirror (#95167). --locked does NOT
+            # bypass the index when a hash mismatches -- it fails closed with
+            # "no compatible index" -- which is why we still set UV_INDEX_URL
+            # here. Mirrors that lag PyPI by minutes can produce false
+            # negatives; the resolver only picks one that's actually reachable.
+            $env:UV_INDEX_URL = Get-HermesPypiMirror
+            if ($env:UV_INDEX_URL -ne 'https://pypi.org/simple/') {
+                Write-Info "Using PyPI mirror: $env:UV_INDEX_URL"
+            }
+            Invoke-NativeWithRelaxedErrorAction { & $UvCmd sync --extra all --locked }
         if ($LASTEXITCODE -eq 0) {
             Write-Success "Main package installed (hash-verified via uv.lock)"
             $script:InstalledTier = "hash-verified (uv.lock)"
@@ -2830,27 +2884,45 @@ except Exception:
     $brokenLabel = if ($brokenExtras) { ($brokenExtras -join ", ") } else { "none" }
 
     $installTiers = @(
-        @{ Name = "all"; Spec = ".[all]" },
-        @{ Name = "all minus known-broken ($brokenLabel)"; Spec = ".[$safeAll]" },
-        @{ Name = "core only (no extras)"; Spec = "." }
-    )
-    $installed = $skipPipFallback
-    if (-not $skipPipFallback) {
-        foreach ($tier in $installTiers) {
-        Write-Info "Trying tier: $($tier.Name) ..."
-        Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install -e $tier.Spec }
-        if ($LASTEXITCODE -eq 0) {
-            Write-Success "Main package installed ($($tier.Name))"
-            $script:InstalledTier = $tier.Name
-            $installed = $true
-            break
+            @{ Name = "all"; Spec = ".[all]" },
+            @{ Name = "all minus known-broken ($brokenLabel)"; Spec = ".[$safeAll]" },
+            @{ Name = "core only (no extras)"; Spec = "." }
+        )
+        $installed = $skipPipFallback
+        if (-not $skipPipFallback) {
+            # Make the tiered cascade use the same PyPI mirror the hash-verified
+            # tier selected (#95167). Without this the fallback tier would
+            # silently revert to pypi.org, undoing the user's regional mirror
+            # choice. UV_INDEX_URL is also honoured by `uv pip install`.
+            if (-not $env:UV_INDEX_URL) {
+                $env:UV_INDEX_URL = Get-HermesPypiMirror
+            }
+            foreach ($tier in $installTiers) {
+            Write-Info "Trying tier: $($tier.Name) ..."
+            Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install -e $tier.Spec }
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "Main package installed ($($tier.Name))"
+                $script:InstalledTier = $tier.Name
+                $installed = $true
+                break
+            }
+            Write-Warn "Tier '$($tier.Name)' failed (exit $LASTEXITCODE). Trying next tier..."
+            }
         }
-        Write-Warn "Tier '$($tier.Name)' failed (exit $LASTEXITCODE). Trying next tier..."
+        if (-not $installed) {
+            # Actionable error for the dependency-install failure (#95167): when
+            # the tiered cascade exhausts itself the user is usually staring at
+            # a wall of pip output with no hint that a mirror would fix it.
+            $diagLines = @()
+            $diagLines += "Failed to install hermes-agent package even with no extras."
+            $diagLines += ""
+            $diagLines += "If you're on a network that blocks pypi.org, configure a PyPI mirror:"
+            $diagLines += "  `$env:HERMES_PYPI_MIRROR = 'https://mirrors.aliyun.com/pypi/simple/'"
+            $diagLines += "  (other mirrors: mirrors.tuna.tsinghua.edu.cn, mirrors.ustc.edu.cn, mirrors.cloud.tencent.com)"
+            $diagLines += ""
+            $diagLines += "Re-run from $InstallDir with that env var exported; the installer resolves PyPI mirrors via the regional fallback list in install_mirror.ps1."
+            throw ($diagLines -join "`n")
         }
-    }
-    if (-not $installed) {
-        throw "Failed to install hermes-agent package even with no extras. Inspect the uv pip install output above."
-    }
 
     # Baseline-import gate. Even if a tier reported success above, the
     # actual deps may have landed somewhere other than $InstallDir\venv\
