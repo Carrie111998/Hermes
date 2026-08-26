@@ -4,6 +4,8 @@ The CDP/websocket layer is mocked; only discovery, targeting, JSPB parsing
 and degradation logic run for real.
 """
 
+import json
+
 import agent.gemini_session as gs
 
 # Real wire shapes captured 2026-08-23 from the live apikey page.
@@ -72,7 +74,7 @@ def _patch_discovery(monkeypatch, *, http_url="http://127.0.0.1:9222", target="w
     monkeypatch.setattr(
         gs, "discover_local_cdp_url", lambda port, timeout=None: http_url
     )
-    monkeypatch.setattr(gs, "_find_aistudio_target", lambda http: target)
+    monkeypatch.setattr(gs, "_live_aistudio_target", lambda http: target)
 
 
 def test_fetch_returns_pct_and_budget(monkeypatch):
@@ -132,8 +134,8 @@ def test_fetch_none_on_transport_error(monkeypatch):
 
 # --- wedged-tab recovery -----------------------------------------------------
 #
-# Production incident 2026-08-23: the FIRST aistudio tab (_find_aistudio_target
-# always picks it) wedged -- its page loaded but the lazy RPC chain never
+# Production incident 2026-08-23: the FIRST aistudio tab (_live_aistudio_target
+# still picks the first RESPONSIVE one) wedged -- its page loaded but the lazy RPC chain never
 # completed -- so five consecutive PT5M runs burned the full 30s settle window.
 # A same-target retry is useless against a wedged tab; recovery requires a
 # FRESH tab. These tests pin that behavior.
@@ -370,3 +372,165 @@ def test_usage_rpc_paused_during_a_round_trip_still_yields_limits(monkeypatch):
         14.9896,
         250.0,
     )
+
+
+# --- frozen-tab rejection ----------------------------------------------------
+#
+# Distinct from the wedged tab above, and diagnosed on grok_session 2026-08-25.
+# A WEDGED tab runs JS and merely never completes the RPC chain, so only the
+# full _SETTLE_SECONDS window reveals it. A FROZEN tab (Chrome background-tab
+# freezing) executes nothing -- yet it still appears in /json/list with a valid
+# webSocketDebuggerUrl, and the websocket still CONNECTS, because that handshake
+# is browser-level rather than renderer-level. Only an evaluation tells, and it
+# HANGS to the timeout rather than erroring. Left undetected it costs a whole
+# 30s settle window, which then puts the fresh-tab retry over its
+# backoff+settle budget gate and turns a recoverable state into "unavailable".
+
+
+def test_liveness_probe_is_false_when_evaluate_never_answers(monkeypatch):
+    class _Hanging:
+        def send(self, raw):
+            return None
+
+        def recv(self):
+            raise TimeoutError("Connection timed out")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _Hanging())
+    assert gs._target_is_responsive("ws://frozen") is False
+
+
+def test_liveness_probe_is_true_when_evaluate_answers(monkeypatch):
+    class _Answering:
+        def __init__(self):
+            self.sent = None
+
+        def send(self, raw):
+            self.sent = json.loads(raw)
+
+        def recv(self):
+            return json.dumps({"id": 1, "result": {"result": {"value": 1}}})
+
+        def close(self):
+            return None
+
+    live = _Answering()
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: live)
+
+    assert gs._target_is_responsive("ws://live") is True
+    # It must be a real evaluation -- a mere connection proves nothing.
+    assert live.sent["method"] == "Runtime.evaluate"
+
+
+def test_liveness_probe_skips_interleaved_events_before_the_reply(monkeypatch):
+    frames = [
+        json.dumps({"method": "Page.frameNavigated", "params": {}}),
+        json.dumps({"id": 1, "result": {"result": {"value": 1}}}),
+    ]
+
+    class _Chatty:
+        def send(self, raw):
+            return None
+
+        def recv(self):
+            return frames.pop(0)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _Chatty())
+    assert gs._target_is_responsive("ws://chatty") is True
+
+
+def test_frozen_tab_is_skipped_so_a_fresh_one_is_opened(monkeypatch):
+    """The regression: a frozen tab must not be handed to _attempt."""
+    monkeypatch.setattr(
+        gs, "_find_aistudio_targets",
+        lambda http: [("frozen-id", "ws://frozen"), ("live-id", "ws://live")],
+    )
+    monkeypatch.setattr(
+        gs, "_target_is_responsive",
+        lambda ws, timeout=None: ws == "ws://live",
+    )
+
+    assert gs._live_aistudio_target("http://127.0.0.1:9222") == "ws://live"
+
+
+def test_all_tabs_frozen_reads_as_no_tab(monkeypatch):
+    """None routes the caller into the open-a-fresh-tab branch it already has."""
+    monkeypatch.setattr(
+        gs, "_find_aistudio_targets", lambda http: [("frozen", "ws://frozen")]
+    )
+    monkeypatch.setattr(
+        gs, "_target_is_responsive", lambda ws, timeout=None: False
+    )
+
+    assert gs._live_aistudio_target("http://127.0.0.1:9222") is None
+
+
+def test_a_frozen_tab_recovers_on_a_fresh_tab_within_a_collector_budget(monkeypatch):
+    """End to end, and the point of the whole change.
+
+    budget_seconds=20 is representative of the collector's per-provider fair
+    share. The old path burned _SETTLE_SECONDS on the frozen tab and then
+    refused the retry because 20 < backoff + settle; rejecting it up front
+    means the fresh tab is reached and the snapshot is produced.
+    """
+    _OnceIdle.instances = []
+    monkeypatch.setattr(
+        gs, "discover_local_cdp_url", lambda port, timeout=None: "http://127.0.0.1:9222"
+    )
+    monkeypatch.setattr(
+        gs, "_find_aistudio_targets", lambda http: [("frozen", "ws://frozen")]
+    )
+    monkeypatch.setattr(
+        gs, "_target_is_responsive", lambda ws, timeout=None: False
+    )
+    closed = _patch_fresh_tab(monkeypatch)
+    # No tab is "existing" any more, so the FIRST interceptor is the fresh tab's
+    # and must succeed -- _OnceIdle idles only its first instance.
+    _OnceIdle.instances = [object()]
+    monkeypatch.setattr(gs, "_Interceptor", _OnceIdle._mint)
+    monkeypatch.setattr("websocket.create_connection", lambda *a, **k: _DummyWS())
+    monkeypatch.setattr(gs, "_SETTLE_SECONDS", 0.05)
+
+    result = gs.fetch_gemini_budget_usage(timeout=5.0, budget_seconds=20.0)
+
+    assert result == (14.9896, 250.0)
+    assert closed == ["fresh-tab"]
+
+
+def test_find_targets_returns_ids_and_skips_non_aistudio_pages():
+    payload = [
+        {"type": "page", "url": "https://grok.com/", "id": "a",
+         "webSocketDebuggerUrl": "ws://a"},
+        {"type": "page", "url": "https://aistudio.google.com/apikey", "id": "b",
+         "webSocketDebuggerUrl": "ws://b"},
+        # No id -> cannot be closed if we ever adopted it, so not returned.
+        {"type": "page", "url": "https://aistudio.google.com/", "id": "",
+         "webSocketDebuggerUrl": "ws://c"},
+        {"type": "iframe", "url": "https://aistudio.google.com/", "id": "d",
+         "webSocketDebuggerUrl": "ws://d"},
+    ]
+
+    import urllib.request
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_urlopen(url, timeout=None):
+        class R:
+            def read(self_inner):
+                return json.dumps(payload).encode()
+
+        yield R()
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        found = gs._find_aistudio_targets("http://127.0.0.1:9222")
+    finally:
+        urllib.request.urlopen = orig
+
+    assert found == [("b", "ws://b")]
