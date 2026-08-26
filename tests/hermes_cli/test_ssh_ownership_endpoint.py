@@ -21,6 +21,8 @@ def test_ssh_ownership_endpoint_requires_token_and_returns_exact_nonce(monkeypat
         "ok": True,
         "sshOwnerNonce": nonce,
         "protocolVersion": 1,
+        "runtimeIntact": True,
+        "pid": os.getpid(),
     }
 
 

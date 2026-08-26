@@ -46,8 +46,13 @@ const READY_POLL_INTERVAL_MS = 750
 // Keep startup portable: restricted hosts retain their existing limit.
 const REMOTE_NOFILE_SOFT_LIMIT = 65_536
 
-function isSshOwnershipProof(proof, spawnNonce) {
-  return proof?.ok === true && proof.sshOwnerNonce === spawnNonce && proof.protocolVersion === PROTOCOL_VERSION
+function isSshOwnershipProof(proof, spawnNonce, expectedPid?: number) {
+  return (
+    proof?.ok === true &&
+    proof.sshOwnerNonce === spawnNonce &&
+    proof.protocolVersion === PROTOCOL_VERSION &&
+    (expectedPid === undefined || proof.pid === expectedPid)
+  )
 }
 
 function classifySshReuseProof(proof, spawnNonce) {
@@ -832,6 +837,7 @@ async function connect(deps) {
     forward,
     pickLocalPort,
     waitForHermes,
+    probeOwnershipProof,
     probeReuseProof,
     adoptServedToken,
     rememberLog = () => {},
@@ -871,9 +877,8 @@ async function connect(deps) {
         lock.profile
       ))
 
-    const reusable =
+    const reuseCandidate =
       pidAlive &&
-      owned &&
       lock.port > 0 &&
       lock.profile === profile &&
       Boolean(reuseToken) &&
@@ -881,12 +886,53 @@ async function connect(deps) {
       lock.hermesPath === hermesPath &&
       lock.hermesHome === hermesHome
 
-    if (reusable) {
+    if (reuseCandidate) {
       assertBootstrapNotSuperseded(signal)
       const localPort = await openForward(deps, lock.port)
+      let forwardOpen = true
+
+      const closeForward = async () => {
+        if (!forwardOpen) {
+          return
+        }
+
+        forwardOpen = false
+        await cancelForwardSafe(deps, localPort, lock.port)
+      }
 
       try {
         const baseUrl = `http://127.0.0.1:${localPort}`
+        let authenticatedOwnership = false
+
+        if (!owned) {
+          try {
+            authenticatedOwnership =
+              typeof probeOwnershipProof === 'function' &&
+              (await probeOwnershipProof(baseUrl, reuseToken, lock.spawnNonce, lock.pid)) === true
+          } catch (cause) {
+            const error: any = new Error('Could not verify ownership of the existing SSH backend.')
+
+            error.kind = 'transient-transport-error'
+            error.cause = cause
+            throw error
+          }
+        }
+
+        if (!owned && !authenticatedOwnership) {
+          await closeForward()
+          const stillAlive = await remotePidAlive(ssh, lock.pid)
+          const cleaned = await cleanupStale(ssh, ownershipId, lock, stillAlive, undefined, true)
+
+          if (!cleaned) {
+            const error: any = new Error(
+              'The existing SSH backend is alive but its ownership could not be verified. ' +
+                'Refusing to replace it without a safe teardown.'
+            )
+
+            error.kind = 'foreign-backend'
+            throw error
+          }
+        } else {
         let reuseClassification
 
         try {
@@ -900,8 +946,14 @@ async function connect(deps) {
 
         if (reuseClassification === 'authenticated-stale') {
           assertBootstrapNotSuperseded(signal)
-          await cancelForwardSafe(deps, localPort, lock.port)
-          await cleanupStale(ssh, ownershipId, lock)
+          await closeForward()
+          await cleanupStale(
+            ssh,
+            ownershipId,
+            lock,
+            pidAlive,
+            authenticatedOwnership ? async () => true : undefined
+          )
         } else if (reuseClassification === 'authenticated-ok') {
           const token = await adoptOwnedServedToken(
             adoptServedToken,
@@ -935,8 +987,9 @@ async function connect(deps) {
           error.kind = 'transient-transport-error'
           throw error
         }
+        }
       } catch (error) {
-        await cancelForwardSafe(deps, localPort, lock.port)
+        await closeForward()
         throw error
       }
     } else {

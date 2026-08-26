@@ -64,6 +64,15 @@ test('SSH ownership proof remains valid when the owned backend runtime was repla
     false
   )
   assert.equal(isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 2 }, SPAWN_NONCE), false)
+  assert.equal(
+    isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, pid: 333 }, SPAWN_NONCE, 333),
+    true
+  )
+  assert.equal(
+    isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, pid: 333 }, SPAWN_NONCE, 334),
+    false
+  )
+  assert.equal(isSshOwnershipProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1 }, SPAWN_NONCE, 333), false)
 })
 
 test('SSH reuse proof remains compatible when runtime state is absent', () => {
@@ -927,6 +936,7 @@ function connectDeps(ssh, over: any = {}) {
     cancelForward: async () => {},
     pickLocalPort: async () => 50001,
     waitForHermes: async () => {},
+    probeOwnershipProof: async () => false,
     probeReuseProof: async () => 'authenticated-ok',
     adoptServedToken: async (_baseUrl, spawn) => spawn || 'served-token',
     rememberLog: () => {},
@@ -1021,6 +1031,37 @@ test('connect() reuses a healthy dashboard when fingerprint + probe pass', async
   assert.equal(result.remotePort, 40000)
   // never spawned
   assert.ok(!ssh.calls.some(c => /setsid/.test(c)), 'reuse path must not spawn a new dashboard')
+})
+
+test('connect reuses a live wrapper after authenticated nonce and pid ownership proof', async () => {
+  const reuseToken = 'stored-token'
+  const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+  const ssh = fakeSsh([
+    [/uname/, 'Darwin\narm64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'FOREIGN\n']
+  ])
+
+  const result = await connect(
+    connectDeps(ssh, {
+      reuseToken,
+      probeOwnershipProof: async (baseUrl, token, nonce, pid) => {
+        assert.equal(baseUrl, 'http://127.0.0.1:50001')
+        assert.equal(token, reuseToken)
+        assert.equal(nonce, SPAWN_NONCE)
+        assert.equal(pid, 333)
+
+        return true
+      },
+      adoptServedToken: async (_baseUrl, token) => token
+    })
+  )
+
+  assert.equal(result.reused, true)
+  assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(!ssh.calls.some(command => /setsid|nohup/.test(command)))
 })
 
 test('connect refuses to replace an alive process whose ownership cannot be proved', async () => {

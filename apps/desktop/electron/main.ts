@@ -9485,6 +9485,20 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
   }
 }
 
+async function sshProbeOwnershipProof(baseUrl, token, spawnNonce, pid) {
+  try {
+    const proof: any = await fetchJson(`${baseUrl}/api/ssh/ownership`, token)
+
+    return remoteLifecycle.isSshOwnershipProof(proof, spawnNonce, pid)
+  } catch (error: any) {
+    if (/^(401|403|404):/.test(String(error?.message || ''))) {
+      return false
+    }
+
+    throw error
+  }
+}
+
 async function teardownSshConnection(profile) {
   const scope = sshScopeKey(profile)
   const state = sshConnections.get(scope)
@@ -9530,12 +9544,12 @@ async function teardownSshConnection(profile) {
                   return false
                 }
 
-                const proof: any = await fetchJson(
-                  `http://127.0.0.1:${state.localPort}/api/ssh/ownership`,
-                  state.token
+                return sshProbeOwnershipProof(
+                  `http://127.0.0.1:${state.localPort}`,
+                  state.token,
+                  lock.spawnNonce,
+                  lock.pid
                 )
-
-                return remoteLifecycle.isSshOwnershipProof(proof, lock.spawnNonce)
               })
     }
   )
@@ -9716,6 +9730,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
       pickLocalPort,
       waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token'),
+      probeOwnershipProof: sshProbeOwnershipProof,
       probeReuseProof: sshProbeReuseProof,
       adoptServedToken: adoptServedDashboardToken,
       rememberLog: sshRememberLog,
