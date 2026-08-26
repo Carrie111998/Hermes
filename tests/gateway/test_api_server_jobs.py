@@ -562,6 +562,41 @@ class TestRunJob:
                 )
 
     @pytest.mark.asyncio
+    async def test_run_job_on_a_paused_job_is_409_naming_the_reason(self, adapter):
+        """A held job answers 409, not 200 having quietly un-paused itself.
+
+        ``trigger_job`` shared ``_unpause_updates`` with ``resume_job`` until
+        2026-08-26, so this route could lift a containment barrier as a side
+        effect of "run now". 409 rather than 404 so a client can tell "held"
+        from "gone", and the reason rides on the body so the operator can see
+        WHAT they would be overriding without going to read jobs.json.
+        """
+        from cron.jobs import JobPaused
+
+        app = _create_app(adapter)
+        paused = {
+            **SAMPLE_JOB,
+            "state": "paused",
+            "enabled": False,
+            "paused_at": "2026-08-25T15:38:09-04:00",
+            "paused_reason": "Gate-2 containment barrier",
+        }
+        mock_trigger = MagicMock(side_effect=JobPaused(paused))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 409
+                data = await resp.json()
+
+        assert data["paused_reason"] == "Gate-2 containment barrier"
+        assert data["paused_at"] == "2026-08-25T15:38:09-04:00"
+        assert "Gate-2 containment barrier" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_run_job_refuses_during_gateway_drain(self, adapter):
         app = _create_app(adapter)
         runner = SimpleNamespace(_draining=False, _external_drain_active=True)

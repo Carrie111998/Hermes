@@ -782,14 +782,16 @@ class TestPauseResumeJob:
         assert history[-1]["paused_reason"] == f"cycle {PAUSED_HISTORY_LIMIT + 2}"
         assert history[0]["paused_reason"] == "cycle 3"
 
-    def test_trigger_job_archives_the_pause_reason_too(self, tmp_cron_dir, monkeypatch):
-        """trigger_job is the other path that revives a paused job.
+    def test_trigger_job_refuses_rather_than_archiving_the_pause(self, tmp_cron_dir, monkeypatch):
+        """trigger_job used to be the OTHER path that revived a paused job.
 
-        It cleared paused_reason with no archive, so `cron run` on a paused job
-        silently destroyed the WHY that `cron pause --reason` recorded. Pinned
-        so the two revive paths can't drift apart again.
+        It shared ``_unpause_updates`` with ``resume_job`` so the WHY would be
+        archived rather than destroyed. Since 2026-08-26 it does not revive at
+        all: "run this now" is a request to fire once, and a hold that a
+        one-off trigger can lift is not a hold. ``resume_job`` remains the only
+        way out of a pause, and the only caller of ``_unpause_updates``.
         """
-        from cron.jobs import trigger_job
+        from cron.jobs import JobPaused, trigger_job
         from events.bus import EventBus
 
         bus = EventBus(db_path=tmp_cron_dir / "events.db")
@@ -797,12 +799,19 @@ class TestPauseResumeJob:
 
         job = create_job(prompt="Trigger me", schedule="every 1h")
         pause_job(job["id"], reason="quarantined pending review")
-        triggered = trigger_job(job["id"], caller="test")
 
-        assert triggered["paused_reason"] is None
-        assert triggered["paused_history"][-1]["paused_reason"] == (
-            "quarantined pending review"
-        )
+        with pytest.raises(JobPaused) as exc_info:
+            trigger_job(job["id"], caller="test")
+
+        assert exc_info.value.paused_reason == "quarantined pending review"
+
+        # Nothing archived, because nothing ended: the pause is still live and
+        # still advertising its reason. An entry in paused_history here would
+        # say the hold had been lifted and re-applied.
+        still = get_job(job["id"])
+        assert still["state"] == "paused"
+        assert still["paused_reason"] == "quarantined pending review"
+        assert still.get("paused_history") in (None, [])
 
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
@@ -2888,26 +2897,56 @@ class TestRequestRun:
 
         assert request_run(job["id"], caller="test") is None
 
-    def test_trigger_job_still_revives_a_disabled_job(self, tmp_cron_dir, monkeypatch):
-        """Deliberate contrast, pinned on purpose.
+    def test_trigger_job_refuses_loudly_where_request_run_refuses_quietly(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Deliberate contrast, pinned on purpose — but no longer about reviving.
 
-        The operator paths (CLI `cron run`, api_server, web_server) rely on
-        trigger_job reviving. A refactor that converges the two functions must
-        fail HERE rather than silently removing that behavior.
+        Until 2026-08-26 this test pinned the opposite: ``trigger_job`` REVIVED
+        a paused job while ``request_run`` refused, and the docstring justified
+        it as behaviour "the operator paths (CLI `cron run`, api_server,
+        web_server) rely on". Two thirds of that was wrong. ``hermes cron run``
+        has never called ``trigger_job`` — it routes through
+        ``cronjob_tools._execute_job_now`` → ``claim_job_for_fire``, which
+        rejects paused jobs (see ``console_engine._cron_run``'s comment saying
+        so). Only the two HTTP surfaces reached it, and neither wanted an
+        un-pause; they wanted a fire.
+
+        Both functions now refuse. What is still worth pinning is HOW, because
+        the difference is the audience:
+
+          ``request_run``  automated caller, activating work on a worker's
+                           behalf → returns None, writes nothing, logs INFO.
+                           Not activating is recoverable; there is nobody
+                           waiting on an explanation.
+          ``trigger_job``  an operator asked for this → raises ``JobPaused``
+                           carrying the reason, so the surface can say WHY
+                           rather than leaving them to read jobs.json.
+
+        A refactor that converges the two must fail HERE.
         """
-        from cron.jobs import create_job, pause_job, trigger_job
+        from cron.jobs import (
+            JobPaused, create_job, get_job, pause_job, request_run, trigger_job,
+        )
         from events.bus import EventBus
+        from events.schema import EventType
 
         bus = EventBus(db_path=tmp_cron_dir / "events.db")
         monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
 
         job = create_job(prompt="x", schedule="every 1h")
-        pause_job(job["id"])
-        result = trigger_job(job["id"], caller="test")
+        pause_job(job["id"], reason="held for review")
+        before = get_job(job["id"])
 
-        assert result is not None
-        assert result["enabled"] is True
-        assert result["state"] == "scheduled"
+        assert request_run(job["id"], caller="test") is None
+
+        with pytest.raises(JobPaused) as exc_info:
+            trigger_job(job["id"], caller="test")
+        assert exc_info.value.paused_reason == "held for review"
+
+        # Neither one revived it, and neither one wrote.
+        assert get_job(job["id"]) == before
+        assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
 
     def test_requires_a_non_empty_caller(self, tmp_cron_dir):
         """A new API with no back-compat debt takes the stricter contract."""

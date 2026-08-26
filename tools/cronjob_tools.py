@@ -667,7 +667,21 @@ def _execute_job_now(
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
             elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
-                reason = "Job is paused/disabled; resume it before running."
+                # Name the WHY. "Job is paused" alone sends the operator to
+                # jobs.json to find out whether they hit a routine pause or a
+                # containment barrier — and the barrier is exactly the case
+                # where guessing is expensive (2026-08-26).
+                paused_reason = refreshed.get("paused_reason")
+                paused_at = refreshed.get("paused_at")
+                detail = (
+                    f' — "{paused_reason}"' if paused_reason
+                    else " (no reason recorded)"
+                )
+                since = f" since {paused_at}" if paused_at else ""
+                reason = (
+                    f"Job is paused/disabled{since}{detail}. "
+                    f"Resume it before running."
+                )
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}

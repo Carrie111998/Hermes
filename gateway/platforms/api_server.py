@@ -890,6 +890,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        JobPaused as _CronJobPaused,
     )
     _CRON_AVAILABLE = True
 except ImportError:
@@ -901,6 +902,11 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+
+    class _CronJobPaused(Exception):
+        """Stand-in so the run handler's except clause still binds when
+        cron is unavailable. Unreachable — _check_jobs_available() has
+        already short-circuited the request by then."""
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -4681,6 +4687,12 @@ class APIServerAdapter(BasePlatformAdapter):
         attribution. Closes the postmortem-attribution gap surfaced by the
         2026-04-30 sentinel-vip-morning triple-fire investigation
         (sentinel-vip-burst-rc-2026-04-30.md §5).
+
+        A paused job answers 409 carrying ``paused_reason``/``paused_at``,
+        NOT 200 having quietly un-paused it (2026-08-26). 409 rather than 404
+        so a client can tell "held" from "gone", and rather than 403 because
+        the refusal is about the job's current state, not the caller's rights
+        — the same request succeeds once someone resumes the job on purpose.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -4704,6 +4716,15 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
+        except _CronJobPaused as paused:
+            return web.json_response(
+                {
+                    "error": str(paused),
+                    "paused_reason": paused.paused_reason,
+                    "paused_at": paused.paused_at,
+                },
+                status=409,
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

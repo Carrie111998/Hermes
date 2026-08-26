@@ -28,6 +28,7 @@ from cron.jobs import (
     ResumeBarrierError,
     trigger_job,
     request_run,
+    JobPaused,
     JOBS_FILE,
 )
 from cron.scheduler import tick
@@ -45,6 +46,7 @@ __all__ = [
     "ResumeBarrierError",
     "trigger_job",
     "request_run",
+    "JobPaused",
     "tick",
     "JOBS_FILE",
 ]

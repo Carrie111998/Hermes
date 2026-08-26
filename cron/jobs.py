@@ -1870,6 +1870,30 @@ class AmbiguousJobReference(LookupError):
         )
 
 
+class JobPaused(RuntimeError):
+    """Raised when a run-now caller targets a job held out of the schedule.
+
+    Distinct from the ``None`` that means "no such job" so an HTTP surface can
+    answer 409 rather than 404 — and so the WHY travels with the refusal: a
+    caller that only learns "refused" has to go read ``jobs.json`` to find out
+    whether it hit a routine pause or a containment barrier.
+    """
+
+    def __init__(self, job: Dict[str, Any]):
+        self.job_id = job.get("id")
+        self.job_name = job.get("name") or self.job_id
+        self.paused_at = job.get("paused_at")
+        self.paused_reason = job.get("paused_reason")
+        detail = f' — "{self.paused_reason}"' if self.paused_reason else (
+            " (no reason recorded)"
+        )
+        since = f" since {self.paused_at}" if self.paused_at else ""
+        super().__init__(
+            f"Job '{self.job_name}' ({self.job_id}) is paused{since}{detail}. "
+            f"Resume it explicitly before running it."
+        )
+
+
 def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     """Resolve a job reference (ID or name) to a job record.
 
@@ -2036,11 +2060,13 @@ def _unpause_updates(job: Dict[str, Any]) -> Dict[str, Any]:
     write. It is only touched when the key is already present, so records that
     never carried it stay byte-identical.
 
-    Shared by ``resume_job`` and ``trigger_job``, the two paths that revive a
-    paused job, so the field can never be coherent on one and lossy on the
-    other. Both also emit CRON_RESUMED carrying the archived values, for the
-    same reason and with the same symmetry requirement — see
-    ``emit_cron_lifecycle_safe``.
+    ``resume_job`` is the ONLY caller. Un-pausing is an act an operator has to
+    ask for by name: ``trigger_job`` shared this helper until 2026-08-26,
+    which made "run this once" silently clear a containment hold, and it
+    refuses a paused job outright instead (see ``JobPaused``). That is why the
+    "shared by the two paths that revive a paused job" symmetry this docstring
+    used to assert — including the matching CRON_RESUMED emit — is gone: there
+    is only one such path now.
 
     ``resume_barrier`` is deliberately NOT in here and must never be added.
     Clearing ``paused_reason`` is what turned an authorization condition into
@@ -2633,37 +2659,37 @@ def emit_cron_lifecycle_safe(
 
     The pause/resume counterpart to ``emit_cron_triggered_safe``, and "every
     path" is load-bearing here for the same reason. A job leaves or re-enters
-    the schedule on exactly five paths, and all five emit here:
+    the schedule on exactly four paths, and all four emit here:
 
     ==================  ==========================  ======================
     transition          call site                   action=
     ==================  ==========================  ======================
     operator pause      ``pause_job``               ``"paused"``
     operator resume     ``resume_job``              ``"resumed"``
-    implicit un-pause   ``trigger_job``             ``"resumed"``
     bulk containment    ``pause_jobs_cas``          ``"paused"``
     bulk restore        ``restore_jobs_cas``        ``"resumed"``
     ==================  ==========================  ======================
 
     ``update_job`` itself deliberately stays out of the table. It is the
-    shared writer under all five, and every caller that moves a lifecycle
+    shared writer under all four, and every caller that moves a lifecycle
     field already knows which transition it is making; emitting from there
     instead would mean inferring the transition from a field diff and would
     fire on writes that change no state at all.
 
     The bottom two are the scheduler's bulk containment CAS, which has no
     production caller yet — they emit AFTER their jobs lock is released; see
-    ``pause_jobs_cas``. The third is the one that is easy to forget and
-    expensive to miss:
-    ``trigger_job`` sets ``enabled: True`` and clears the pause fields, so
-    "run this now" silently ends a pause. Without an event there, a reader
-    joining CRON_PAUSED to CRON_RESUMED would see an unterminated pause on a
-    job that has been running all along — worse than no trail, because it
-    reads as a job still contained. It is emitted only when the job actually
-    WAS paused (see ``_is_paused``), and it is emitted BEFORE the
-    CRON_TRIGGERED for the same call so the two read in cause order.
+    ``pause_jobs_cas``.
 
-    Until 2026-08-25 none of the five emitted anything at all. That is what
+    ``trigger_job`` was a fifth row here until 2026-08-26, emitting an
+    implicit ``"resumed"`` because "run this now" used to clear the pause
+    fields on its way past. It no longer revives anything — it raises
+    ``JobPaused`` instead — so there is no transition left for it to report.
+    That is the stronger fix for the same hazard this row was patching: an
+    un-pause nobody asked for is now impossible rather than merely audited.
+    A trigger of an already-running job emits CRON_TRIGGERED only, exactly as
+    it always did.
+
+    Until 2026-08-25 none of these emitted anything at all. That is what
     made the 2026-08-24/25 pause churn on eight jobflow/jaum/tracker rows
     unattributable: two sessions searched ``audit.jsonl`` and the agent
     transcripts for a record that was never written. If a path is added, add
@@ -2713,10 +2739,20 @@ def _trigger_job_admitted(
     """Schedule a job to run on the next scheduler tick.
 
     Sets ``next_run_at = NOW`` and emits a ``cron_triggered`` event capturing
-    the caller (e.g. ``"hermes_cli:cron_run"``, ``"llm:cronjob_tool"``,
-    ``"http_api:web_server"``) and an optional reason string. ``caller=None``
-    is allowed for backward compatibility but logs a WARNING — every internal
-    caller should pass an explicit caller string.
+    the caller (e.g. ``"http_api:api_server"``, ``"http_api:web_server"``) and
+    an optional reason string. ``caller=None`` is allowed for backward
+    compatibility but logs a WARNING — every internal caller should pass an
+    explicit caller string.
+
+    REFUSES a paused/disabled job by raising ``JobPaused`` rather than reviving
+    it. Until 2026-08-26 this path shared ``_unpause_updates`` with
+    ``resume_job``, so an operator asking a held job to "run now" from the
+    dashboard or the HTTP API cleared the hold as an unannounced side effect.
+    The intent behind a manual trigger is a single fire, not a lifecycle
+    change, and once the pause is gone the two are no longer separable. The
+    CLI (``hermes cron run`` → ``cronjob_tools._execute_job_now`` →
+    ``claim_job_for_fire``) has always refused; this makes the remaining
+    surfaces agree with it instead of being the silent exception.
     """
     # v0.15.1 catch-up: resolve by ID or name (upstream resolve_job_ref) so
     # `cron run <name>` works; raises AmbiguousJobReference for an ambiguous
@@ -2726,12 +2762,24 @@ def _trigger_job_admitted(
     if not job:
         return None
 
-    # ``trigger_job`` is the IMPLICIT un-pause: it sets enabled/state and runs
-    # ``_unpause_updates``, so "hermes cron run <job>" on a paused job has
-    # always ended the pause permanently. That makes it a second door onto the
-    # same authorization decision, and a barrier that only ``resume_job``
-    # honoured would be walked around by the shorter command. Refused here for
-    # the same reason and with the same error.
+    # The barrier check comes FIRST, before the paused check below, because the
+    # two answer different questions and the barrier is the durable one: a job
+    # can carry a barrier without being paused, and the scheduler re-reads it
+    # at admission either way.
+    #
+    # This guard arrived describing ``trigger_job`` as "the IMPLICIT un-pause"
+    # that runs ``_unpause_updates``, reached by "hermes cron run" as the
+    # shorter command. Both halves were wrong and are corrected here rather
+    # than left to mislead: ``hermes cron run`` routes through
+    # ``cronjob_tools._execute_job_now`` -> ``claim_job_for_fire`` and has
+    # never touched this function, and this function no longer un-pauses
+    # anything at all (see ``JobPaused`` below and ``_unpause_updates``).
+    # The guard is still exactly right, for a better reason: ``trigger_job``
+    # IS a second door onto the same authorization decision, opened by the two
+    # HTTP run-now controls -- POST /api/jobs/{id}/run and
+    # POST /api/cron/jobs/{id}/trigger, the dashboard's button. A button is a
+    # lower-attention surface than a short command, so covering it matters
+    # more than the original rationale claimed, not less.
     _require_no_resume_barrier(job, "trigger")
 
     if caller is None:
@@ -2742,36 +2790,34 @@ def _trigger_job_admitted(
             job_id, job.get("name"),
         )
 
-    previous_next_run_at = job.get("next_run_at")
-    previous_state = job.get("state")
-    was_paused = _is_paused(job)
-    previous_paused_at = job.get("paused_at")
-    previous_paused_reason = job.get("paused_reason")
+    if _is_paused(job):
+        # Refuse BEFORE any write, so a rejected trigger leaves nothing in
+        # jobs.json to reconcile afterwards. WARNING rather than INFO because
+        # the case worth seeing is a UI or automated caller bouncing off a
+        # barrier nobody is reading.
+        logger.warning(
+            "trigger_job refused job_id=%s name=%s: held out of the schedule "
+            "(state=%s enabled=%s paused_reason=%s) caller=%s reason=%s",
+            job["id"], job.get("name"), job.get("state"),
+            job.get("enabled"), job.get("paused_reason"), caller, reason,
+        )
+        raise JobPaused(job)
 
+    previous_next_run_at = job.get("next_run_at")
+
+    # ``enabled: True`` is a no-op past the guard above — ``_is_paused`` is
+    # true for anything not enabled — and is kept only so a legacy record
+    # carrying no ``enabled`` key materializes one. ``state`` can legitimately
+    # be something other than "scheduled" here ("running", "error"), so it is
+    # still reset.
     updated = update_job(
         job["id"],
         {
             "enabled": True,
             "state": "scheduled",
             "next_run_at": _hermes_now().isoformat(),
-            **_unpause_updates(job),
         },
     )
-
-    if updated is not None and was_paused:
-        # Emitted before the CRON_TRIGGERED below so the pair reads in cause
-        # order: the job came out of its pause, and then it was scheduled.
-        emit_cron_lifecycle_safe(
-            action="resumed",
-            job_id=job["id"],
-            job_name=updated.get("name") or job.get("name") or job["id"],
-            caller=caller,
-            reason=previous_paused_reason,
-            paused_at=previous_paused_at,
-            previous_state=previous_state,
-            new_state=updated.get("state"),
-            next_run_at=updated.get("next_run_at"),
-        )
 
     if updated is not None:
         emit_cron_triggered_safe(

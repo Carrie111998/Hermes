@@ -12127,13 +12127,29 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None, reason: O
     # offload (_run_cron_dashboard_io) with the fork's caller/reason
     # traceability — _call_cron_for_profile forwards **kwargs into
     # cron.jobs.trigger_job, which emits the CRON_TRIGGERED event.
+    from cron.jobs import JobPaused
+
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(
-        selected, "trigger_job", job_id,
-        caller="http_api:web_server", reason=reason,
-    )
+    try:
+        job = _call_cron_for_profile(
+            selected, "trigger_job", job_id,
+            caller="http_api:web_server", reason=reason,
+        )
+    except JobPaused as paused:
+        # 409, not a 200 over a silent un-pause (2026-08-26): run-now on this
+        # dashboard used to clear a containment hold as a side effect. The
+        # reason travels with the refusal so the operator can see WHAT they
+        # would be overriding without leaving the page.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": str(paused),
+                "paused_reason": paused.paused_reason,
+                "paused_at": paused.paused_at,
+            },
+        )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
