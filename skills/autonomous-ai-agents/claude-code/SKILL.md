@@ -74,7 +74,7 @@ Gotchas and drift-prone values (permission modes, model aliases, tool-name synta
 ### One-Shot Task (Print Mode)
 
 ```
-terminal(command="claude -p 'Refactor the auth module to use JWT tokens' --allowedTools 'Read,Edit,Bash' --max-turns 20", workdir="/path/to/repo", timeout=180)
+terminal(command="claude -p 'Refactor the auth module to use JWT tokens' --allowedTools 'Read,Edit' --max-turns 20", workdir="/path/to/repo", timeout=180)
 ```
 
 A turn is one model response plus all the tool calls it issues — a single turn can read several files. Size `--max-turns` to the number of decision rounds, not the file count, and use `--output-format json` to read `num_turns` and `total_cost_usd` and confirm the run didn't die at the cap.
@@ -155,6 +155,7 @@ Run independent tasks in separate PTY sessions (`terminal(pty=true, background=t
 10. **Context-fill thresholds are heuristic.** `/context` shows the grid; `~70%` degradation and `~85%` hallucination figures are community rules of thumb, not documented hard limits. Compact proactively with `/compact`.
 11. **Background sessions persist.** Clean up tmux (`tmux kill-session -t <name>`) or `claude stop` for background agents. `claude rm <id>` deletes the session **and its worktree**, so prefer `claude stop` unless you've confirmed the worktree is disposable.
 12. **Don't kill slow sessions** — a quiet Claude may be mid-multi-step-work. Check `capture-pane` / `process(action="poll")` before assuming a hang.
+13. **`Write` is a separate tool from `Edit`.** Neither `--allowedTools "Read,Edit"` nor `"Read,Edit,Bash"` permits file *creation*: `Edit` only modifies existing files and `Bash` does not grant `Write`, so a task that creates a new file (new module, new test file) gets `permission_denials` on `Write` and the run stalls. When the task creates files, add `Write` (`--allowedTools "Read,Edit,Write"`). Grant `Bash` only when the task must run commands/tests — it is a write backdoor, never a default (see #1). A "read-only review" still uses `--tools "Read,Grep,Glob"`, never `Write`/`Edit`.
 
 ## Verification
 
