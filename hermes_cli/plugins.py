@@ -683,6 +683,7 @@ def _get_enabled_plugins() -> Optional[set]:
 
 _VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
 _API_PLUGIN_ID_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_API_EXECUTABLE_COMMAND_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 
 
 def is_safe_api_server_plugin_id(plugin_id: str) -> bool:
@@ -1098,6 +1099,11 @@ def _resolve_module_source(module_name: str, limit: int = 8192) -> str:
     callers treat as ``standalone`` — the safe default.
     """
     return _read_source_from_origin(resolve_module_origin(module_name), limit)
+
+
+def is_api_executable_plugin_command_name(name: Any) -> bool:
+    """Whether *name* is one URL-safe API command path segment."""
+    return isinstance(name, str) and bool(_API_EXECUTABLE_COMMAND_NAME_RE.fullmatch(name))
 
 
 @dataclass
@@ -2210,6 +2216,8 @@ class PluginContext:
         description: str = "",
         args_hint: str = "",
         argument_mode: str | None = None,
+        category: str = "Plugin",
+        api_executable: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -2231,8 +2239,20 @@ class PluginContext:
         name behaves (``options``, ``text``, or ``mixed``). Omit it to infer
         ``text`` whenever ``args_hint`` is set, so ``/myplugin `` stays typeable.
 
+        ``category`` is optional metadata for API and mobile clients that group
+        commands in their own command pickers.
+
+        ``api_executable`` must be explicitly enabled before the API server may
+        advertise or execute the command. CLI and messaging registrations are
+        local-only by default because their handlers may assume interactive
+        session context.
+
         Names conflicting with built-in commands are rejected with a warning.
         """
+        if not callable(handler):
+            raise TypeError("Plugin command handler must be callable")
+        if not isinstance(api_executable, bool):
+            raise TypeError("api_executable must be a boolean")
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning(
@@ -2240,6 +2260,11 @@ class PluginContext:
                 self.manifest.name,
             )
             return
+        if api_executable and not is_api_executable_plugin_command_name(clean):
+            raise ValueError(
+                "API-executable plugin command name must be a URL-safe single path segment "
+                "of 1-64 lowercase ASCII letters, digits, underscores, or hyphens"
+            )
 
         # Reject if it conflicts with a built-in command
         try:
@@ -2255,6 +2280,12 @@ class PluginContext:
             pass  # If commands module isn't available, skip the check
 
         previous = self._manager._plugin_commands.get(clean)
+        if previous is not None:
+            owner = str(previous.get("plugin") or "unknown")
+            raise ValueError(
+                f"Plugin command '/{clean}' is already registered by plugin '{owner}'"
+            )
+
         hint = (args_hint or "").strip()
         mode = argument_mode if argument_mode in {"options", "text", "mixed"} else (
             "text" if hint else None
@@ -2266,6 +2297,8 @@ class PluginContext:
             "plugin_key": self.manifest.key or self.manifest.name,
             "args_hint": hint,
             "argument_mode": mode,
+            "category": str(category or "Plugin").strip() or "Plugin",
+            "api_executable": api_executable,
         }
         self._manager._plugin_commands[clean] = entry
         handle = self._track_replacement(
@@ -7280,6 +7313,19 @@ def get_plugin_commands() -> Dict[str, dict]:
     before any explicit discover_plugins() call.
     """
     return _ensure_plugins_discovered()._plugin_commands
+
+
+def get_api_executable_plugin_commands() -> Dict[str, dict]:
+    """Return the callable plugin commands explicitly exposed to the API."""
+    return {
+        name: entry
+        for name, entry in (get_plugin_commands() or {}).items()
+        if isinstance(name, str)
+        and is_api_executable_plugin_command_name(name)
+        and isinstance(entry, dict)
+        and entry.get("api_executable") is True
+        and callable(entry.get("handler"))
+    }
 
 
 def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:

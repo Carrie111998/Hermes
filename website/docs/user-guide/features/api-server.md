@@ -441,6 +441,48 @@ Example:
   ]
 }
 ```
+
+When enabled plugins explicitly register slash commands with
+`api_executable=True`, the response also contains a `commands` array. Every
+entry in that array is executable through the authenticated endpoint
+advertised as `endpoints.plugin_command`. Local-only plugin commands and
+gateway built-ins are omitted because the API server does not own their
+interactive messaging-session context. Handler callables are never serialized.
+
+API-executable names are restricted to one URL-safe path segment: 1–64
+lowercase ASCII letters, digits, underscores, or hyphens, beginning with a
+letter or digit. This keeps advertised names and executable routes identical;
+malformed names are neither advertised nor resolved by the endpoint.
+
+In multiplex mode, the process-global command registry belongs to the default
+profile that owns the listener. Named-profile capability responses therefore
+omit `commands` and `endpoints.plugin_command`, and named-profile command
+requests return 404 instead of exposing a command enabled by another profile.
+
+### POST /v1/commands/{name}
+
+Executes a plugin command advertised by `GET /v1/capabilities`. This endpoint
+uses the same bearer authentication as the rest of the API server.
+
+```json
+{"args": "raw command arguments"}
+```
+
+A successful response is stable JSON with a text-or-null result:
+
+```json
+{"command": "/mystatus", "result": "All systems operational"}
+```
+
+Malformed JSON, non-object request bodies, and non-string `args` return 400.
+Commands that are absent or no longer registered return 404. Plugin failures
+return a generic 500 response and are logged server-side without exposing the
+exception to the client. Synchronous handlers and registry discovery run off
+the API event loop on the adapter's bounded plugin executor, and both lookup
+and execution have bounded timeouts. A timed-out synchronous callback retains
+its worker slot until it actually exits, preventing hung plugins from growing
+an unbounded thread or work queue.
+
 ### GET /health
 
 Health check. Returns `{"status": "ok"}`. Also available at **GET /v1/health** for OpenAI-compatible clients that expect the `/v1/` prefix.

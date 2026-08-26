@@ -1215,18 +1215,38 @@ def register(ctx):
         "mystatus",
         handler=_handle_status,
         description="Show plugin status",
+        api_executable=True,
     )
 ```
 
 After registration, users can type `/mystatus` in any session. The command appears in autocomplete, `/help` output, and the Telegram bot menu.
 
-**Signature:** `ctx.register_command(name: str, handler: Callable, description: str = "", args_hint: str = "")`
+**Signature:** `ctx.register_command(name: str, handler: Callable, description: str = "", args_hint: str = "", argument_mode: str | None = None, category: str = "Plugin", api_executable: bool = False)`
+
+`argument_mode` controls how desktop composer text after the command name is treated (`options`, `text`, or `mixed`), defaulting to `text` when `args_hint` is present.
+`category` is optional display metadata for API/mobile command pickers.
+Commands remain local to CLI and messaging sessions by default. Set
+`api_executable=True` only when the handler is safe without interactive
+messaging-session context; those opted-in commands are advertised by
+`GET /v1/capabilities` and can be executed with an authenticated
+`POST /v1/commands/{name}` request whose JSON body is
+`{"args": "raw command arguments"}`.
+
+API-executable command names must normalize to one URL-safe path segment:
+1–64 lowercase ASCII letters, digits, underscores, or hyphens, beginning with
+a letter or digit. Names containing `/`, `.`, Unicode characters, or other
+punctuation are rejected during registration. A command name may have only one
+plugin owner; a second plugin attempting to claim an existing name is rejected
+without replacing the original handler.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `name` | `str` | Command name without the leading slash (e.g. `"lcm"`, `"mystatus"`) |
 | `handler` | `Callable[[str], str \| None]` | Called with the raw argument string. May also be `async`. |
 | `description` | `str` | Shown in `/help`, autocomplete, and Telegram bot menu |
+| `args_hint` | `str` | Optional usage hint appended to API/mobile command metadata |
+| `category` | `str` | Optional API/mobile picker grouping; defaults to `Plugin` |
+| `api_executable` | `bool` | Explicitly expose the command through the authenticated API server; defaults to `False` |
 
 **Key differences from `register_cli_command()`:**
 
@@ -1237,7 +1257,7 @@ After registration, users can type `/mystatus` in any session. The command appea
 | Handler receives | Raw args string | argparse `Namespace` |
 | Use case | Diagnostics, status, quick actions | Complex subcommand trees, setup wizards |
 
-**Conflict protection:** If a plugin tries to register a name that conflicts with a built-in command (`help`, `model`, `new`, etc.), the registration is silently rejected with a log warning. Built-in commands always take precedence.
+**Conflict protection:** If a plugin tries to register a name that conflicts with a built-in command (`help`, `model`, `new`, etc.), the registration is silently rejected with a log warning. Built-in commands always take precedence. Duplicate names across plugins raise `ValueError`; the first registered plugin retains ownership.
 
 **Async handlers:** The gateway dispatch automatically detects and awaits async handlers, so you can use either sync or async functions:
 

@@ -313,6 +313,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/api/model/options", adapter._handle_model_options)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/v1/commands/{name}", adapter._handle_plugin_command)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
@@ -889,6 +890,445 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert all(command["source"] == "plugin" for command in data["commands"])
+            assert all("handler" not in command for command in data["commands"])
+
+    @pytest.mark.asyncio
+    async def test_capabilities_include_mobile_command_registry(self, adapter, monkeypatch):
+        expected_commands = [
+            {
+                "name": "joke",
+                "command": "/joke",
+                "summary": "Generate a joke",
+                "description": "Generate a joke",
+                "category": "Creative",
+                "source": "plugin",
+                "plugin": "jokes-plugin",
+            }
+        ]
+        monkeypatch.setattr(
+            "hermes_cli.commands.api_plugin_command_registry",
+            lambda: list(expected_commands),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["commands"] == expected_commands
+
+    @pytest.mark.asyncio
+    async def test_command_registry_build_runs_off_event_loop(self, adapter, monkeypatch):
+        def _registry():
+            return []
+
+        monkeypatch.setattr(
+            "hermes_cli.commands.api_plugin_command_registry",
+            _registry,
+        )
+        calls = []
+
+        async def _run_plugin_sync(func, *args, timeout, **kwargs):
+            calls.append(func)
+            return func(*args, **kwargs)
+
+        app = _create_app(adapter)
+        with patch.object(adapter, "_run_plugin_sync", new=_run_plugin_sync):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get("/v1/capabilities")
+
+        assert response.status == 200
+        assert calls.count(_registry) == 1
+
+    @pytest.mark.asyncio
+    async def test_command_registry_timeout_preserves_core_capabilities(self, adapter):
+        async def _times_out(func, *args, timeout, **kwargs):
+            raise asyncio.TimeoutError
+
+        app = _create_app(adapter)
+        with (
+            patch.object(adapter, "_run_plugin_sync", new=_times_out),
+            patch(
+                "gateway.platforms.api_server._PLUGIN_COMMAND_REGISTRY_TIMEOUT_SECONDS",
+                0.01,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get("/v1/capabilities")
+                payload = await response.json()
+
+        assert response.status == 200
+        assert payload["commands"] == []
+        assert payload["features"]["chat_completions"] is True
+
+    @pytest.mark.asyncio
+    async def test_advertised_plugin_command_executes_through_authenticated_api(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "joke": {
+                    "handler": lambda raw: f"joke:{raw}",
+                    "description": "Generate a joke",
+                    "plugin": "jokes-plugin",
+                    "api_executable": True,
+                }
+            },
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            capabilities = await cli.get(
+                "/v1/capabilities",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            advertised = (await capabilities.json())["commands"]
+            assert [entry["name"] for entry in advertised] == ["joke"]
+
+            denied = await cli.post("/v1/commands/joke", json={"args": "cats"})
+            assert denied.status == 401
+            response = await cli.post(
+                f"/v1/commands/{advertised[0]['name']}",
+                json={"args": "cats"},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert response.status == 200
+            assert await response.json() == {"command": "/joke", "result": "joke:cats"}
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_rejects_malformed_json_without_invoking_handler(self, adapter, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "joke": {
+                    "handler": lambda raw: calls.append(raw),
+                    "api_executable": True,
+                }
+            },
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/commands/joke",
+                data="{not-json",
+                headers={"Content-Type": "application/json"},
+            )
+            assert response.status == 400
+            assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_serializes_result_as_text(self, adapter, monkeypatch):
+        class DisplayResult:
+            def __str__(self):
+                return "display result"
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "status": {
+                    "handler": lambda raw: DisplayResult(),
+                    "api_executable": True,
+                }
+            },
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/commands/status", json={"args": ""})
+            assert response.status == 200
+            assert await response.json() == {"command": "/status", "result": "display result"}
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_awaits_general_awaitable(self, adapter, monkeypatch):
+        class _AwaitableResult:
+            def __await__(self):
+                async def _resolve():
+                    return "awaited result"
+
+                return _resolve().__await__()
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "awaitable": {
+                    "handler": lambda raw: _AwaitableResult(),
+                    "api_executable": True,
+                }
+            },
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/commands/awaitable",
+                json={"args": ""},
+            )
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload == {
+            "command": "/awaitable",
+            "result": "awaited result",
+        }
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_requires_explicit_api_opt_in(self, adapter, monkeypatch):
+        called = False
+
+        def _handler(raw):
+            nonlocal called
+            called = True
+            return raw
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "local-only": {
+                    "handler": _handler,
+                    "api_executable": False,
+                }
+            },
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            capabilities = await cli.get("/v1/capabilities")
+            assert (await capabilities.json())["commands"] == []
+
+            response = await cli.post(
+                "/v1/commands/local-only",
+                json={"args": "secret"},
+            )
+
+        assert response.status == 404
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_rejects_non_url_safe_route_name(self, adapter, monkeypatch):
+        lookup_called = False
+
+        def _commands():
+            nonlocal lookup_called
+            lookup_called = True
+            return {}
+
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_commands", _commands)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/commands/bad.name",
+                json={"args": ""},
+            )
+
+        assert response.status == 404
+        assert lookup_called is False
+
+    @pytest.mark.asyncio
+    async def test_timed_out_sync_commands_do_not_accumulate_worker_threads(
+        self, adapter, monkeypatch
+    ):
+        release = threading.Event()
+        lock = threading.Lock()
+        calls = 0
+
+        def _handler(raw):
+            nonlocal calls
+            with lock:
+                calls += 1
+            release.wait(timeout=2)
+            return raw
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "bounded": {
+                    "handler": _handler,
+                    "api_executable": True,
+                }
+            },
+        )
+        app = _create_app(adapter)
+
+        try:
+            with (
+                patch("gateway.platforms.api_server.PLUGIN_SYNC_MAX_WORKERS", 2),
+                patch("gateway.platforms.api_server._PLUGIN_COMMAND_TIMEOUT_SECONDS", 0.05),
+                patch(
+                    "gateway.platforms.api_server._PLUGIN_COMMAND_REGISTRY_TIMEOUT_SECONDS",
+                    0.05,
+                ),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    first = await asyncio.gather(
+                        cli.post("/v1/commands/bounded", json={"args": "one"}),
+                        cli.post("/v1/commands/bounded", json={"args": "two"}),
+                    )
+                    assert [response.status for response in first] == [500, 500]
+
+                    third = await cli.post(
+                        "/v1/commands/bounded",
+                        json={"args": "three"},
+                    )
+                    assert third.status == 500
+
+            with lock:
+                assert calls == 2
+        finally:
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_sync_plugin_command_runs_off_event_loop(self, adapter, monkeypatch):
+        def _handler(raw):
+            return f"ok:{raw}"
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "status": {
+                    "handler": _handler,
+                    "api_executable": True,
+                }
+            },
+        )
+        calls = []
+
+        async def _run_plugin_sync(func, *args, timeout, **kwargs):
+            calls.append(func)
+            return func(*args, **kwargs)
+
+        app = _create_app(adapter)
+        with patch.object(adapter, "_run_plugin_sync", new=_run_plugin_sync):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/commands/status",
+                    json={"args": "ready"},
+                )
+
+        assert response.status == 200
+        assert _handler in calls
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_timeout_is_isolated(self, adapter, monkeypatch, caplog):
+        async def _handler(raw):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "hang": {
+                    "handler": _handler,
+                    "api_executable": True,
+                }
+            },
+        )
+        app = _create_app(adapter)
+        with (
+            patch("gateway.platforms.api_server._PLUGIN_COMMAND_TIMEOUT_SECONDS", 0.01),
+            caplog.at_level("WARNING"),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/commands/hang",
+                    json={"args": ""},
+                )
+                payload = await response.json()
+
+        assert response.status == 500
+        assert payload["error"]["code"] == "command_failed"
+        assert "timed out" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_result_conversion_failure_is_redacted(
+        self, adapter, monkeypatch, caplog
+    ):
+        secret = "sk-plugin-command-secret-1234567890"
+
+        class _BadDisplay:
+            def __str__(self):
+                raise RuntimeError(f"OPENAI_API_KEY={secret}")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "bad-display": {
+                    "handler": lambda raw: _BadDisplay(),
+                    "api_executable": True,
+                }
+            },
+        )
+        app = _create_app(adapter)
+        with caplog.at_level("WARNING"):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/commands/bad-display",
+                    json={"args": ""},
+                )
+                payload = await response.json()
+
+        assert response.status == 500
+        assert payload["error"]["code"] == "command_failed"
+        assert secret not in json.dumps(payload)
+        assert secret not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_registry_failure_is_isolated(
+        self, adapter, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: (_ for _ in ()).throw(RuntimeError("private registry detail")),
+        )
+        app = _create_app(adapter)
+        with caplog.at_level("WARNING"):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/commands/status",
+                    json={"args": ""},
+                )
+                payload = await response.json()
+
+        assert response.status == 500
+        assert payload["error"]["code"] == "command_failed"
+        assert "private registry detail" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_rejects_multiplex_profile_context(
+        self, adapter, monkeypatch
+    ):
+        called = False
+
+        def _handler(raw):
+            nonlocal called
+            called = True
+            return raw
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_commands",
+            lambda: {
+                "default-only": {
+                    "handler": _handler,
+                    "api_executable": True,
+                }
+            },
+        )
+        profile_key = "profile-key-for-test"
+        monkeypatch.setattr(adapter, "_expected_api_key", lambda: profile_key)
+        app = _create_app(adapter)
+        token = _api_request_profile.set("coder")
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                headers = {"Authorization": f"Bearer {profile_key}"}
+                capabilities = await cli.get("/v1/capabilities", headers=headers)
+                capabilities_payload = await capabilities.json()
+                response = await cli.post(
+                    "/v1/commands/default-only",
+                    json={"args": ""},
+                    headers=headers,
+                )
+        finally:
+            _api_request_profile.reset(token)
+
+        assert capabilities_payload["commands"] == []
+        assert "plugin_command" not in capabilities_payload["endpoints"]
+        assert response.status == 404
+        assert called is False
 
     @pytest.mark.asyncio
     async def test_capabilities_reports_in_memory_idempotency_fallback(self, adapter):
@@ -969,7 +1409,7 @@ class TestCapabilitiesEndpoint:
             response = await adapter._handle_capabilities(request)
 
         assert response.status == 200
-        assert calls == [adapter._plugin_manager.get_api_server_capabilities]
+        assert calls.count(adapter._plugin_manager.get_api_server_capabilities) == 1
 
     @pytest.mark.asyncio
     async def test_profile_capabilities_do_not_leak_default_plugin_metadata(self, adapter):
