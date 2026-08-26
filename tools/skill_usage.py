@@ -87,6 +87,42 @@ def _usage_file() -> Path:
     return _skills_dir() / ".usage.json"
 
 
+_ARCHIVED_NAMES_CACHE: Dict[
+    tuple[str, Optional[int], Optional[int], Optional[int]], frozenset[str]
+] = {}
+
+
+def archived_skill_names() -> frozenset[str]:
+    """Return archived profile skill names without reparsing unchanged usage data.
+
+    Discovery and slash completion call this on cache-hit paths.  Keep those
+    paths to one ``stat`` while still following the atomic replacements made by
+    :func:`save_usage` immediately.
+    """
+    path = _usage_file()
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+    except OSError:
+        key = (str(path), None, None, None)
+
+    cached = _ARCHIVED_NAMES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    archived = frozenset(
+        name
+        for name, record in load_usage().items()
+        if isinstance(record, dict) and record.get("state") == STATE_ARCHIVED
+    )
+    # Only the active profile's latest sidecar matters.  Bounding this cache to
+    # one entry also prevents long-lived multi-profile gateways from retaining
+    # stale lifecycle maps indefinitely.
+    _ARCHIVED_NAMES_CACHE.clear()
+    _ARCHIVED_NAMES_CACHE[key] = archived
+    return archived
+
+
 @contextmanager
 def _usage_file_lock():
     """Serialize .usage.json read-modify-write cycles across processes."""

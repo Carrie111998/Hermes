@@ -27,6 +27,11 @@ _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
 _skill_commands_archived: frozenset[str] = frozenset()
 _skill_commands_project: tuple[Optional[str], tuple[str, ...]] | None = None
+_project_context_cache: dict[
+    tuple[str, str, Optional[int], Optional[int]],
+    tuple[tuple[tuple[str, Optional[int]], ...], tuple[Optional[str], tuple[str, ...]], list[Path]],
+] = {}
+_project_context_lock = threading.Lock()
 # Guards the (map, platform-tag, home-tag, archive-state, project-context)
 # snapshot so
 # publication and the freshness lookup always see a consistent view. Scanning
@@ -235,13 +240,9 @@ def _resolve_skill_commands_home() -> str:
 def _archived_skill_names() -> frozenset[str]:
     """Return profile-local skill names whose lifecycle state is archived."""
     try:
-        from tools.skill_usage import STATE_ARCHIVED, load_usage
+        from tools.skill_usage import archived_skill_names
 
-        return frozenset(
-            name
-            for name, record in load_usage().items()
-            if isinstance(record, dict) and record.get("state") == STATE_ARCHIVED
-        )
+        return archived_skill_names()
     except Exception:
         return frozenset()
 
@@ -249,9 +250,33 @@ def _archived_skill_names() -> frozenset[str]:
 def _resolve_skill_commands_project_context() -> tuple[
     tuple[Optional[str], tuple[str, ...]], list[Path]
 ]:
-    """Return the current project identity and its effective skill dirs."""
+    """Return project identity and skill dirs with a cheap cache-hit path."""
     try:
         from agent.skill_utils import find_project_root, get_project_skills_dirs
+
+        effective_cwd = os.path.abspath(
+            os.environ.get("TERMINAL_CWD") or os.getcwd()
+        )
+        home = _resolve_skill_commands_home()
+        config_path = Path(home) / "config.yaml"
+        try:
+            config_stat = config_path.stat()
+            config_mtime = config_stat.st_mtime_ns
+            config_size = config_stat.st_size
+        except OSError:
+            config_mtime = None
+            config_size = None
+        cache_key = (effective_cwd, home, config_mtime, config_size)
+
+        with _project_context_lock:
+            cached = _project_context_cache.get(cache_key)
+        if cached is not None:
+            old_watch, identity, project_dirs = cached
+            current_watch = tuple(
+                (path, _path_mtime_ns(Path(path))) for path, _ in old_watch
+            )
+            if current_watch == old_watch:
+                return identity, list(project_dirs)
 
         root = find_project_root()
         project_dirs = list(get_project_skills_dirs())
@@ -259,9 +284,28 @@ def _resolve_skill_commands_project_context() -> tuple[
             str(root.resolve()) if root is not None else None,
             tuple(str(path.resolve()) for path in project_dirs),
         )
+        watch_paths: list[Path] = []
+        if root is not None:
+            watch_paths = [
+                root / ".git",
+                root / ".hermes" / "skills",
+                root / ".agents" / "skills",
+            ]
+        watch = tuple((str(path), _path_mtime_ns(path)) for path in watch_paths)
+        with _project_context_lock:
+            _project_context_cache.clear()
+            _project_context_cache[cache_key] = (watch, identity, list(project_dirs))
         return identity, project_dirs
     except Exception:
         return (None, ()), []
+
+
+def _path_mtime_ns(path: Path) -> Optional[int]:
+    """Return a cheap change token for a project marker or skill directory."""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:

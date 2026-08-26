@@ -221,8 +221,8 @@ class TestFindAllSkills:
         _make_skill(tmp_path, "archived-skill")
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
-            "tools.skill_usage.load_usage",
-            return_value={"archived-skill": {"state": "archived"}},
+            "tools.skill_usage.archived_skill_names",
+            return_value=frozenset({"archived-skill"}),
         ):
             skills_tool_module._SKILLS_CACHE.clear()
             skills = _find_all_skills(skip_disabled=True)

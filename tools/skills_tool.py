@@ -720,15 +720,11 @@ def _find_all_skills(
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
     try:
-        from tools.skill_usage import STATE_ARCHIVED, load_usage
+        from tools.skill_usage import archived_skill_names
 
-        archived = {
-            name
-            for name, record in load_usage().items()
-            if isinstance(record, dict) and record.get("state") == STATE_ARCHIVED
-        }
+        archived = archived_skill_names()
     except Exception:
-        archived = set()
+        archived = frozenset()
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level

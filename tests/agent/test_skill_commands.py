@@ -174,6 +174,34 @@ class TestScanSkillCommands:
         finally:
             reset_hermes_home_override(token)
 
+    def test_project_context_cache_avoids_rewalking_unchanged_project(
+        self, tmp_path, monkeypatch
+    ):
+        import agent.skill_commands as sc_mod
+
+        project = tmp_path / "project"
+        project_skills = project / ".hermes" / "skills"
+        (project / ".git").mkdir(parents=True)
+        project_skills.mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(project))
+        sc_mod._project_context_cache.clear()
+
+        with (
+            patch(
+                "agent.skill_utils.find_project_root", return_value=project
+            ) as find_root,
+            patch(
+                "agent.skill_utils.get_project_skills_dirs",
+                return_value=[project_skills],
+            ) as project_dirs,
+        ):
+            first = sc_mod._resolve_skill_commands_project_context()
+            second = sc_mod._resolve_skill_commands_project_context()
+
+        assert first == second
+        find_root.assert_called_once_with()
+        project_dirs.assert_called_once_with()
+
     def test_get_skill_commands_rescans_when_platform_scope_changes(self, tmp_path):
         """Platform-specific disabled-skill caches must not leak across platforms.
 

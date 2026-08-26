@@ -76,6 +76,29 @@ def test_save_and_load_roundtrip(skills_home):
     assert loaded["skill-a"]["state"] == "active"
 
 
+def test_archived_names_reuses_parse_until_sidecar_changes(skills_home, monkeypatch):
+    import tools.skill_usage as skill_usage
+
+    skill_usage.save_usage({"skill-a": {"state": skill_usage.STATE_ACTIVE}})
+    real_load = skill_usage.load_usage
+    loads = 0
+
+    def counted_load():
+        nonlocal loads
+        loads += 1
+        return real_load()
+
+    monkeypatch.setattr(skill_usage, "load_usage", counted_load)
+
+    assert skill_usage.archived_skill_names() == frozenset()
+    assert skill_usage.archived_skill_names() == frozenset()
+    assert loads == 1
+
+    skill_usage.save_usage({"skill-a": {"state": skill_usage.STATE_ARCHIVED}})
+    assert skill_usage.archived_skill_names() == frozenset({"skill-a"})
+    assert loads == 2
+
+
 def test_get_record_missing_returns_empty_record(skills_home):
     from tools.skill_usage import get_record
     rec = get_record("nonexistent")
