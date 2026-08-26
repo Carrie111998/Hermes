@@ -41,6 +41,7 @@ __all__ = [
     "read_install_method",
     "print_fast_version_info",
     "try_fast_version",
+    "should_load_external_secrets",
 ]
 
 
@@ -78,6 +79,32 @@ def is_termux_fast_version_argv(argv: list[str]) -> bool:
 
 def is_global_fast_version_argv(argv: list[str]) -> bool:
     return argv in (["--version"], ["-V"])
+
+
+def should_load_external_secrets(argv: list[str]) -> bool:
+    """Return whether this CLI invocation needs startup secret hydration.
+
+    External secret sources are intentionally broad: a mapped 1Password
+    source executes one ``op read`` per configured reference.  Purely local
+    administration, help rendering, and public-client OAuth login do not use
+    those values, so hydrating them is both wasteful and capable of exhausting
+    a secret manager's request quota before the requested command starts.
+
+    Keep the allow-to-skip list deliberately narrow.  Runtime commands and MCP
+    discovery/tests still hydrate credentials exactly as before.
+    """
+    args = [arg for arg in argv if isinstance(arg, str)]
+    if any(arg in {"-h", "--help"} for arg in args):
+        return False
+    if not args:
+        return True
+    if args[0] == "update":
+        return False
+    if args[0] == "config" and len(args) >= 2:
+        return args[1] not in {"set", "unset", "path", "env-path", "edit"}
+    if len(args) >= 2 and args[0] == "mcp" and args[1] in {"login", "reauth"}:
+        return False
+    return True
 
 
 def is_container_startup_environment() -> bool:

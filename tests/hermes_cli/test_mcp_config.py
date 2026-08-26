@@ -76,6 +76,56 @@ class FakeTool:
         self.description = description
 
 
+class TestMcpSecretResolution:
+    def test_oauth_probe_skips_external_sources_without_placeholders(self, monkeypatch):
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        calls = []
+        monkeypatch.setattr("agent.secret_scope.current_secret_scope", lambda: None)
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.load_hermes_dotenv",
+            lambda **kwargs: calls.append(kwargs["load_external_secrets"]),
+        )
+
+        resolved = _resolve_mcp_server_config(
+            {"url": "https://mcp.example.com", "auth": "oauth"},
+            load_external_secrets=False,
+        )
+
+        assert resolved["url"] == "https://mcp.example.com"
+        assert calls == [False]
+
+    def test_oauth_probe_falls_back_for_unresolved_explicit_secret_ref(self, monkeypatch):
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        calls = []
+        monkeypatch.delenv("MCP_CLIENT_SECRET", raising=False)
+        monkeypatch.setattr("agent.secret_scope.current_secret_scope", lambda: None)
+
+        def fake_load(**kwargs):
+            load_external = kwargs["load_external_secrets"]
+            calls.append(load_external)
+            if load_external:
+                monkeypatch.setenv("MCP_CLIENT_SECRET", "resolved-secret")
+
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.load_hermes_dotenv",
+            fake_load,
+        )
+
+        resolved = _resolve_mcp_server_config(
+            {
+                "url": "https://mcp.example.com",
+                "auth": "oauth",
+                "oauth": {"client_secret": "${MCP_CLIENT_SECRET}"},
+            },
+            load_external_secrets=False,
+        )
+
+        assert resolved["oauth"]["client_secret"] == "resolved-secret"
+        assert calls == [False, True]
+
+
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_list
 # ---------------------------------------------------------------------------
@@ -737,7 +787,7 @@ class TestMcpLogin:
         # Probe returns tools even though auth never completed.
         monkeypatch.setattr(
             "hermes_cli.mcp_config._probe_single_server",
-            lambda name, cfg, connect_timeout=30: [
+            lambda name, cfg, connect_timeout=30, **kwargs: [
                 ("search_files", "d"), ("read_file_content", "d"),
             ],
         )
@@ -763,8 +813,9 @@ class TestMcpLogin:
         # probe drops a token file, mirroring a successful authorization.
         seen = {}
 
-        def mock_probe(name, cfg, connect_timeout=30):
+        def mock_probe(name, cfg, connect_timeout=30, **kwargs):
             seen["connect_timeout"] = connect_timeout
+            seen["load_external_secrets"] = kwargs.get("load_external_secrets")
             token_dir.mkdir(exist_ok=True)
             (token_dir / "realserver.json").write_text('{"access_token": "x"}')
             return [("a", "d"), ("b", "d"), ("c", "d")]
@@ -782,7 +833,8 @@ class TestMcpLogin:
         assert "no OAuth token" not in out
         # The login path must grant a human enough time to finish the browser
         # OAuth round-trip — far longer than the 30s probe default.
-        assert seen["connect_timeout"] >= 180
+        assert seen["connect_timeout"] >= 315
+        assert seen["load_external_secrets"] is False
 
 
 # ---------------------------------------------------------------------------

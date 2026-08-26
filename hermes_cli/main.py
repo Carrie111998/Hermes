@@ -716,16 +716,16 @@ if sys.platform == "win32":
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-# Updating dependencies must not import optional secret-manager libraries into
-# the updater process before ``uv`` replaces the environment.  On Windows,
-# Bitwarden's cryptography import maps ``_rust.pyd`` and the parent updater then
-# prevents its own child installer from replacing that file (#73381).  Profile
-# flags have already been stripped above, so the first remaining argument is
-# the authoritative argparse subcommand.  Dotenv/managed config still loads;
-# only external secret fetches are unnecessary for installation maintenance.
+# Some CLI paths must not import or query optional secret managers. Updating
+# dependencies can self-lock Bitwarden's mapped cryptography DLL on Windows,
+# while local config/help and public-client MCP OAuth login need no provider
+# credentials and can otherwise exhaust mapped-source request quotas before
+# dispatch. Profile flags have already been stripped above, so the remaining
+# argv is authoritative. Dotenv and managed config still load in every case;
+# only external secret-source hydration is command-scoped.
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
-    load_external_secrets=sys.argv[1:2] != ["update"],
+    load_external_secrets=_startup_fast.should_load_external_secrets(sys.argv[1:]),
 )
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
