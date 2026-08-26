@@ -8,7 +8,10 @@ macOS.
 """
 
 import os
+import sys
 from pathlib import Path
+
+import pytest
 
 import hermes_cli.doctor as doctor
 import hermes_cli.macos_tcc_anchor as tcc
@@ -145,6 +148,38 @@ class TestStagingHelpers:
                 },
             )
         ]
+
+
+@pytest.mark.macos_only
+def test_real_uv_interpreter_survives_relocation(tmp_path):
+    """Exercise dyld with the macOS CI runner's actual uv interpreter."""
+    source = Path(sys.executable).resolve()
+    if not tcc._is_uv_macos_store(source):
+        pytest.skip("test interpreter is not a uv-managed macOS build")
+    runtime_libraries = tcc._runtime_libraries(source)
+    if not runtime_libraries:
+        pytest.skip("test interpreter does not use an adjacent dynamic libpython")
+
+    venv = tmp_path / "venv"
+    venv_bin = venv / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text(f"home = {source.parent}\n", encoding="utf-8")
+    os.symlink(source, venv_bin / "python")
+
+    tcc._install_anchor(venv, source)
+
+    anchored = venv_bin / "python"
+    completed = tcc.subprocess.run(
+        [str(anchored), "-V"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.stdout.startswith("Python ") or completed.stderr.startswith(
+        "Python "
+    )
+    assert all((venv / "lib" / library.name).is_file() for library in runtime_libraries)
 
 
 class TestEnsureTccAnchor:
