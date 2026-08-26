@@ -373,15 +373,20 @@ def _continuation_overlap_length(previous: str, continuation: str) -> int:
     return matched if matched >= _MIN_CONTINUATION_OVERLAP else 0
 
 
-def _join_truncated_parts(parts: List[str]) -> str:
-    """Join continuation fragments without repeating a recovered tail."""
+def _join_truncated_parts(parts: List[str | tuple[str, bool]]) -> str:
+    """Join continuation fragments, deduping only interrupted-stream seams."""
     joined = ""
-    for part in parts:
-        if joined and part:
+    previous_was_partial_stub = False
+    for fragment in parts:
+        part, is_partial_stub = (
+            fragment if isinstance(fragment, tuple) else (fragment, False)
+        )
+        if previous_was_partial_stub and joined and part:
             part = part[_continuation_overlap_length(joined, part):]
         if joined and not joined[-1].isspace() and part and not part[0].isspace():
             joined += "\n"
         joined += part
+        previous_was_partial_stub = is_partial_stub
     return joined
 
 
@@ -1988,7 +1993,7 @@ def run_conversation(
     # Total outer-loop exceptions this turn (#92450) — see _MAX_OUTER_LOOP_ERRORS.
     _outer_error_count = 0
     truncated_tool_call_retries = 0
-    truncated_response_parts: List[str] = []
+    truncated_response_parts: List[tuple[str, bool]] = []
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
@@ -3954,7 +3959,10 @@ def run_conversation(
                                 interim_msg["_length_continuation_fragment"] = True
                                 append_message(messages, interim_msg)
                                 if assistant_message.content:
-                                    truncated_response_parts.append(assistant_message.content)
+                                    truncated_response_parts.append((
+                                        assistant_message.content,
+                                        getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID,
+                                    ))
 
                             if length_continue_retries < 4:
                                 _is_partial_stream_stub = (
@@ -8166,7 +8174,10 @@ def run_conversation(
                 codex_ack_continuations = 0
 
                 if truncated_response_parts:
-                    final_response = _join_truncated_parts([*truncated_response_parts, final_response])
+                    final_response = _join_truncated_parts([
+                        *truncated_response_parts,
+                        (final_response, False),
+                    ])
                     truncated_response_parts = []
                     length_continue_retries = 0
                     # The continuation recovered, so the fragments stay in the transcript.
