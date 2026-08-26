@@ -309,6 +309,15 @@ _LONG_HANDLERS = frozenset(
         "bot_relay.outbox.drain",
         "bot_relay.deliver",
         "bot_relay.reply",
+        # Hosted-room log calls open the shared state database and may wait on
+        # a concurrent room writer. Keep that bounded wait off the WS reader.
+        "groups.list",
+        "groups.capabilities",
+        "groups.create",
+        "groups.state",
+        "groups.send",
+        "groups.log",
+        "groups.disband",
         # image.generate is a multi-second remote API round-trip.
         "image.generate",
         "projects.discover_repos",
@@ -17024,6 +17033,7 @@ from . import (  # noqa: E402
     methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete,
     methods_config as _methods_config,
+    methods_groups as _methods_groups,
     methods_images as _methods_images,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
@@ -17041,6 +17051,7 @@ for _m in (
     _methods_profiles,
     _methods_images,
     _methods_bot_relay,
+    _methods_groups,
 ):
     _m.register(sys.modules[__name__])
 del _m
