@@ -3520,6 +3520,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_shared_container_key": "TERMINAL_DOCKER_SHARED_CONTAINER_KEY",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
     "sandbox_dir": "TERMINAL_SANDBOX_DIR",
+    "windows_network_drives": "TERMINAL_WINDOWS_NETWORK_DRIVES",
     "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
 }
 
