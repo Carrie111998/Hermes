@@ -1685,6 +1685,26 @@ class TestRunJobWakeGate:
         assert "Script gate returned `wakeAgent=false`" in doc
         agent_cls.assert_not_called()
 
+    def test_wake_false_does_not_open_the_session_database(self):
+        """A no-agent cron tick must not allocate a database connection."""
+        import cron.scheduler as scheduler
+        import hermes_state
+
+        class _TrackedSessionDB:
+            constructed = 0
+
+            def __init__(self):
+                type(self).constructed += 1
+
+        with patch.object(
+            scheduler, "_run_job_script", return_value=(True, '{"wakeAgent": false}')
+        ), patch.object(hermes_state, "SessionDB", _TrackedSessionDB):
+            success, _doc, _final, error = scheduler.run_job(self._make_job())
+
+        assert success is True
+        assert error is None
+        assert _TrackedSessionDB.constructed == 0
+
     def test_wake_true_runs_agent_with_injected_output(self):
         """When the script returns {wakeAgent: true, data: ...}, the agent is
         invoked and the data line still shows up in the prompt."""
