@@ -3738,6 +3738,25 @@ def terminal_tool(
                     failure_hint = annotate_masked_success(command, output)
                 except Exception:
                     failure_hint = None
+                if failure_hint is None:
+                    # macOS: an exit-0 `open` may have loaded the file
+                    # BEHIND the Hermes desktop window (#95261) — the tool
+                    # shell is a child of the frontmost Electron app, and
+                    # macOS silently ignores activation hand-off from a
+                    # non-frontmost sender. Verify the observed frontmost
+                    # state and escalate through a raise ladder when the
+                    # target isn't visible. Advisory only — reports from
+                    # the final observed state, never from "a rung
+                    # returned 0", and never touches the exit code.
+                    try:
+                        from tools.macos_open_front import (
+                            annotate_macos_open_success,
+                        )
+                        failure_hint = annotate_macos_open_success(
+                            command, env_type=env_type
+                        )
+                    except Exception:
+                        failure_hint = None
 
             result_dict = {
                 "output": output,
