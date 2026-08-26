@@ -203,6 +203,24 @@ def test_symlink_escape_and_nested_mount_preserved(home: Path, monkeypatch: pyte
     assert report["skipped_by_reason"]["nested_mount"] == 1
 
 
+def test_read_only_nested_directory_is_preserved_before_any_mutation(home: Path) -> None:
+    workspace = _add_task(home, "t_readonly")
+    protected = workspace / "protected"
+    protected.mkdir()
+    marker = protected / "marker.txt"
+    marker.write_text("keep\n", encoding="utf-8")
+    protected.chmod(0o555)
+    try:
+        report, code = _sweep(home)
+    finally:
+        protected.chmod(0o755)
+
+    assert code == 2
+    assert report["removed"] == 0
+    assert report["skipped_by_reason"]["delete_permission"] == 1
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_changed_identity_and_partial_removal_are_unhealthy(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ws = _add_task(home, "t_88888888")
     original = kr._inspect_tree

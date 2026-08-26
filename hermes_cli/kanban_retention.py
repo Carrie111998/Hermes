@@ -202,6 +202,9 @@ def _inspect_tree(path: Path, root: Path) -> TreeInfo:
         if os.path.ismount(path):
             info.reason = "mount_boundary"
             return info
+        if not os.access(path.parent, os.W_OK | os.X_OK) or not os.access(path, os.W_OK | os.X_OK):
+            info.reason = "delete_permission"
+            return info
         info.dev, info.ino = path_lstat.st_dev, path_lstat.st_ino
         stack = [path]
         seen_git: set[Path] = set()
@@ -211,6 +214,10 @@ def _inspect_tree(path: Path, root: Path) -> TreeInfo:
                 st = entry.stat(follow_symlinks=False)
                 info.bytes += st.st_blocks * 512
                 p = Path(entry.path)
+                immutable = getattr(stat, "UF_IMMUTABLE", 0) | getattr(stat, "SF_IMMUTABLE", 0)
+                if immutable and getattr(st, "st_flags", 0) & immutable:
+                    info.reason = "immutable_entry"
+                    return info
                 if stat.S_ISLNK(st.st_mode):
                     try:
                         target = p.resolve(strict=False)
@@ -225,6 +232,9 @@ def _inspect_tree(path: Path, root: Path) -> TreeInfo:
                     info.reason = "nested_mount"
                     return info
                 if stat.S_ISDIR(st.st_mode):
+                    if not os.access(p, os.W_OK | os.X_OK):
+                        info.reason = "delete_permission"
+                        return info
                     if entry.name == ".git":
                         owner = p.parent
                         if owner not in seen_git:
