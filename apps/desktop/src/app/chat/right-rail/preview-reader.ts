@@ -75,10 +75,32 @@ function windowText(
   return { ...base, end: to, start: from, text: text.slice(from, to), total_chars: total }
 }
 
-/** Read the ACTIVE preview tab. Null only when no tab is open at all. */
+/** Read the ACTIVE preview tab. Null only when no tab is open at all.
+ *
+ *  Prefers Browser tabs with live URLs over file/artifact tabs when the
+ *  global active-tab ID points at a non-Browser tab. This fixes the
+ *  active-tab desync where `open_preview(url)` opens the Browser but a
+ *  stale global ID still points at an older file tab (#89272). */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
-  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get()) ?? tabs[0]
+
+  let tab = tabs.find(t => t.id === $rightRailActiveTabId.get())
+
+  // Active-tab desync guard: when the global tracker points at a non-Browser
+  // tab but a Browser tab with a real URL is open, prefer the Browser. The
+  // agent almost always wants the live page it just opened, not a stale file
+  // peek that happens to hold the global ID.
+  if (tab && tab.target.kind !== 'url') {
+    const browserTab = tabs.find(t => t.target.kind === 'url' && t.target.url && t.target.url !== 'about:blank')
+
+    if (browserTab) {
+      tab = browserTab
+    }
+  }
+
+  if (!tab) {
+    tab = tabs[0]
+  }
 
   if (!tab) {
     return null
