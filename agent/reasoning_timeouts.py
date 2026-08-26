@@ -161,7 +161,7 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
 # in each entry for debuggability (log/inspection), even though _match_any
 # only consumes floor + pattern.
 _SORTED_REASONING_FLOORS: list[tuple[str, float, re.Pattern[str]]] = [
-    (slug, floor, re.compile(r"^" + re.escape(slug) + r"(?:$|[\-._])"))
+    (slug, floor, re.compile(r"^" + re.escape(slug) + r"(?:$|[:\-._])"))
     for slug, floor in sorted(
         _REASONING_STALE_TIMEOUT_FLOORS, key=lambda kv: -len(kv[0])
     )
@@ -210,6 +210,8 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     >>> get_reasoning_stale_timeout_floor("deepseek/deepseek-v4-flash")
     600.0
     >>> get_reasoning_stale_timeout_floor("deepseek/deepseek-v4-pro")
+    600.0
+    >>> get_reasoning_stale_timeout_floor("ollama-cloud/deepseek-v4-pro:0813")
     600.0
     >>> get_reasoning_stale_timeout_floor("qwen/qwen3-235b-a22b-thinking")
     180.0
