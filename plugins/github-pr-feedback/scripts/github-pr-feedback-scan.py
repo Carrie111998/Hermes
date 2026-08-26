@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 def _cron_exit_code(stdout: str, process_returncode: int) -> int:
-    """Keep partial repair retries visible without declaring the whole cron crashed."""
+    """Classify durable progress without discarding degraded scan telemetry."""
 
     if process_returncode == 0:
         return 0
@@ -22,7 +22,23 @@ def _cron_exit_code(stdout: str, process_returncode: int) -> int:
         payload = json.loads(lines[-1])
     except (json.JSONDecodeError, TypeError):
         return process_returncode
-    if not isinstance(payload, dict) or payload.get("status") != "ok":
+    if not isinstance(payload, dict):
+        return process_returncode
+    merge = payload.get("merge")
+    if isinstance(merge, dict):
+        merged = merge.get("merged")
+        if isinstance(merged, list) and any(
+            isinstance(receipt, dict)
+            and isinstance(receipt.get("pr_number"), int)
+            and not isinstance(receipt.get("pr_number"), bool)
+            and receipt["pr_number"] > 0
+            for receipt in merged
+        ):
+            # A canonical merge is durable forward progress.  The wrapper only
+            # changes the scheduler exit code; stdout is relayed byte-for-byte,
+            # so degraded repair/maintenance telemetry remains observable.
+            return 0
+    if payload.get("status") != "ok":
         return process_returncode
     repair = payload.get("repair")
     if not isinstance(repair, dict) or repair.get("status") != "degraded":

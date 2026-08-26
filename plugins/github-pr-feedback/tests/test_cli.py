@@ -1402,11 +1402,36 @@ def test_cron_wrapper_invokes_only_the_fixed_scan_argv_with_an_absolute_hermes_e
             1,
             0,
         ),
+        (
+            {
+                "status": "degraded",
+                "repair": {"status": "degraded"},
+                "merge": {
+                    "status": "degraded",
+                    "merged": [
+                        {
+                            "pr_number": 149,
+                            "head_sha": "abc123",
+                            "method": "squash",
+                            "merge_commit_oid": "def456",
+                        }
+                    ],
+                    "blocked": {"133": "ci_receipt_not_passing"},
+                },
+                "release_maintenance": {"status": "degraded"},
+            },
+            1,
+            0,
+        ),
         ({"status": "degraded", "repair": {"status": "ok"}}, 1, 1),
         ({"status": "ok", "merge": {"status": "degraded"}}, 1, 1),
+        ({"status": "degraded", "merge": {"merged": []}}, 1, 1),
+        ({"status": "degraded", "merge": {"merged": "149"}}, 1, 1),
+        ({"status": "degraded", "merge": {"merged": [True]}}, 1, 1),
+        ({"status": "degraded", "merge": {"merged": [{}]}}, 1, 1),
     ],
 )
-def test_cron_wrapper_treats_only_partial_repair_degradation_as_retryable_progress(
+def test_cron_wrapper_classifies_successful_merges_as_partial_success(
     payload: dict[str, object],
     process_returncode: int,
     expected: int,
