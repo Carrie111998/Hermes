@@ -219,6 +219,27 @@ class TestRealProfileCdpLaunch:
         assert cdp is None
         assert err and "not a supported Chromium" in err
 
+    def test_lightpanda_engine_names_the_conflict(self):
+        """agent-browser rejects --profile for Lightpanda; say which setting."""
+        import tools.browser_tool as bt
+        self._reset()
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch.object(bt, "_using_lightpanda_engine", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium") as detect:
+            cdp, err = bt._real_profile_cdp()
+        assert cdp is None
+        assert err and "lightpanda" in err.lower()
+        detect.assert_not_called()
+
+    def test_chrome_engine_does_not_trip_the_lightpanda_guard(self):
+        import tools.browser_tool as bt
+        self._reset()
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch.object(bt, "_using_lightpanda_engine", return_value=False), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value=None):
+            cdp, err = bt._real_profile_cdp()
+        assert err and "lightpanda" not in err.lower()
+
     def test_snapshot_failure_fails_closed(self):
         import tools.browser_tool as bt
         self._reset()

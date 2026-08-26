@@ -1554,6 +1554,18 @@ def _real_profile_cdp() -> tuple:
     if not _use_real_profile():
         return None, None
 
+    if _using_lightpanda_engine():
+        # agent-browser rejects --profile outright for the Lightpanda engine
+        # ("Profiles are not supported with Lightpanda",
+        # cli/src/native/browser.rs), and the launch below is a --profile
+        # launch. Name the conflicting setting instead of surfacing that as a
+        # generic start failure the user cannot act on.
+        return None, (
+            "browser.use_real_profile needs the Chrome engine: agent-browser "
+            "does not support profiles with browser.engine: lightpanda. Set "
+            "browser.engine to auto or chrome, or turn the toggle off."
+        )
+
     from hermes_cli.browser_connect import (
         UNSUPPORTED_CHANNEL,
         detect_default_chromium,
