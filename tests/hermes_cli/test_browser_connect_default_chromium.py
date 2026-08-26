@@ -27,6 +27,24 @@ def _handler(scheme: str, bundle: str) -> str:
     )
 
 
+def _handler_versioned(scheme: str, bundle: str, version: str) -> str:
+    """A handler whose LSHandlerPreferredVersions carries a real version.
+
+    macOS 26 records the preferred version instead of the "-" placeholder
+    older releases wrote, so the nested block holds a value that is not a
+    bundle id but sits under the same key name.
+    """
+    return (
+        "    {\n"
+        "        LSHandlerPreferredVersions =         {\n"
+        f'            LSHandlerRoleAll = "{version}";\n'
+        "        };\n"
+        f'        LSHandlerRoleAll = "{bundle}";\n'
+        f"        LSHandlerURLScheme = {scheme};\n"
+        "    }"
+    )
+
+
 def _content_type_handler(uti: str, bundle: str) -> str:
     return (
         "    {\n"
@@ -55,6 +73,20 @@ class TestLaunchServicesHttpsHandler:
     def test_nested_dictionary_does_not_split_the_entry(self):
         dump = _ls_dump(_handler("https", "com.microsoft.edgemac"))
         assert bc._launchservices_https_handler(dump) == "com.microsoft.edgemac"
+
+    def test_preferred_version_is_not_mistaken_for_the_bundle_id(self):
+        """macOS 26 writes a version string where older releases wrote "-".
+
+        The nested LSHandlerPreferredVersions block repeats LSHandlerRoleAll,
+        so reading the first non-"-" value returns "7559.97" and detection
+        fails closed on a machine that does have Chrome as its default.
+        """
+        dump = _ls_dump(_handler_versioned("https", "com.google.chrome", "7559.97"))
+        assert bc._launchservices_https_handler(dump) == "com.google.chrome"
+
+    def test_preferred_version_block_on_a_non_chromium_default(self):
+        dump = _ls_dump(_handler_versioned("https", "com.apple.safari", "7559.97"))
+        assert bc._launchservices_https_handler(dump) == "com.apple.safari"
 
 
 class TestDetectDefaultDarwin:

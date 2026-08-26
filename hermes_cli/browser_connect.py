@@ -357,9 +357,17 @@ def _launchservices_https_handler(dump: str) -> str | None:
         low = entry.lower()
         if not re.search(r'lshandlerurlscheme\s*=\s*"?https"?\s*;', low):
             continue
-        # The nested LSHandlerPreferredVersions block carries "-" placeholders
-        # under the same key names; the real bundle id is the first non-"-".
-        for role in re.findall(r'lshandlerrole(?:all|viewer)\s*=\s*"?([a-z0-9.\-]+)"?\s*;', low):
+        # Strip nested dictionaries before reading the role. The entry still
+        # carries them (the scanner above only splits at depth 1), and
+        # LSHandlerPreferredVersions repeats the SAME key names one level
+        # down with a value that is not a bundle id. On macOS 26 that value
+        # is a real version string ("7559.97"), so a plain non-"-" scan
+        # returns the version instead of the handler and detection fails
+        # closed on a machine that does have a Chromium default.
+        flat = re.sub(r"\{[^{}]*\}", "", low)
+        while re.search(r"\{[^{}]*\}", flat):
+            flat = re.sub(r"\{[^{}]*\}", "", flat)
+        for role in re.findall(r'lshandlerrole(?:all|viewer)\s*=\s*"?([a-z0-9.\-]+)"?\s*;', flat):
             if role != "-":
                 return role
         return None
