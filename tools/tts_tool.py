@@ -1747,6 +1747,14 @@ def _edge_tts_connector():
                 return None
             return verify
 
+        async def close(self, *, abort_ssl: bool = False) -> None:
+            # edge-tts creates an owning ClientSession for every text chunk.
+            # Keep this shared connector alive until the whole synthesis ends.
+            return None
+
+        async def close_from_hermes(self) -> None:
+            await super().close()
+
     return _HermesCAConnector(ssl=verify)
 
 
@@ -1776,8 +1784,12 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     if connector is not None:
         kwargs["connector"] = connector
 
-    communicate = _edge_tts.Communicate(text, **kwargs)
-    await communicate.save(output_path)
+    try:
+        communicate = _edge_tts.Communicate(text, **kwargs)
+        await communicate.save(output_path)
+    finally:
+        if connector is not None:
+            await connector.close_from_hermes()
     return output_path
 
 
