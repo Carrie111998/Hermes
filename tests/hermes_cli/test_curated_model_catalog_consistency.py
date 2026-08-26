@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import pytest
 
+from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
 from hermes_cli.models import (
     OPENROUTER_MODELS,
     VERCEL_AI_GATEWAY_MODELS,
     _PROVIDER_MODELS,
 )
-from providers import get_provider_profile
+from providers import get_provider_profile, list_providers
+
+# Profiles whose ``fallback_models`` are intentionally not picker rows
+# (e.g. legacy portal aliases). Everything else with both a fallback chain
+# and a curated ``_PROVIDER_MODELS`` list must keep fallback ⊆ curated.
+_FALLBACK_CURATED_EXCEPTIONS = frozenset({"nous"})
 
 
 def _openrouter_ids() -> list[str]:
@@ -20,10 +26,18 @@ def _gateway_ids() -> list[str]:
     return [mid for mid, _ in VERCEL_AI_GATEWAY_MODELS]
 
 
-@pytest.mark.parametrize(
-    "provider",
-    ["zai", "nvidia", "huggingface"],
-)
+def _providers_for_fallback_curated_guard() -> list[str]:
+    """Every registered profile with fallbacks + a curated picker list."""
+    return sorted(
+        p.name
+        for p in list_providers()
+        if p.fallback_models
+        and p.name in _PROVIDER_MODELS
+        and p.name not in _FALLBACK_CURATED_EXCEPTIONS
+    )
+
+
+@pytest.mark.parametrize("provider", _providers_for_fallback_curated_guard())
 def test_provider_fallback_models_in_curated_catalog(provider: str):
     """Plugin fallback chains must only reference picker-visible model ids."""
     profile = get_provider_profile(provider)
@@ -62,6 +76,25 @@ def test_nvidia_expanded_hosted_models_in_curated_catalog():
 def test_huggingface_glm_4_7_flash_in_curated_catalog():
     assert "zai-org/GLM-4.7-Flash" in _PROVIDER_MODELS["huggingface"]
     assert "Qwen/Qwen3.5-72B-Instruct" in _PROVIDER_MODELS["huggingface"]
+
+
+def test_huggingface_curated_models_have_context_length_keys():
+    """Picker Hub IDs must have a case-insensitive DEFAULT_CONTEXT_LENGTHS entry.
+
+    Resolution lowercases the selected model before substring-matching catalog
+    keys, so mixed Hub casing in the picker still needs a matching key under
+    ``.lower()`` (see ``zai-org/glm-4.7-flash`` vs curated ``GLM-4.7-Flash``).
+    """
+    keys_lower = {key.lower() for key in DEFAULT_CONTEXT_LENGTHS}
+    missing = [
+        mid
+        for mid in _PROVIDER_MODELS["huggingface"]
+        if mid.lower() not in keys_lower
+    ]
+    assert not missing, (
+        "huggingface curated models missing case-insensitive "
+        f"DEFAULT_CONTEXT_LENGTHS keys: {missing}"
+    )
 
 
 def test_tencent_tokenhub_hy3_in_curated_catalog():

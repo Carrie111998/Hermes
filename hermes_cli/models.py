@@ -134,9 +134,9 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     ("openrouter/auto-beta",                   "auto-routes to best model for each request"),
     ("openrouter/free",                        "auto-routes to a free model for each request"),
-    # Free tier — keep in sync with live OpenRouter free+tools catalog.
-    # Stale :free ids that OpenRouter retired are dropped so the picker
-    # does not advertise models that fail at request time.
+    # Free tier — keep in sync with the live OpenRouter free+tools catalog.
+    # When OpenRouter retires a :free id, remove it here so the picker does
+    # not advertise models that fail at request time.
     ("stealth/ox-alpha",                       "free"),  # "Ox Alpha" stealth reasoning model — 1M ctx
     ("openrouter/elephant-alpha",              "free"),
     ("z-ai/glm-5.2:free",                      "free"),

@@ -598,7 +598,10 @@ DEFAULT_CONTEXT_LENGTHS = {
     "mimo-v2-omni": 262144,
     "mimo-v2-flash": 262144,
     "zai-org/GLM-5": 202752,
-    "zai-org/glm-4.7-flash": 202752,  # GLM-4.7 Flash on HF Inference Providers
+    # Key is lowercase: get_model_context_length step-8 matches
+    # ``default_model in model.lower()`` without lowercasing catalog keys,
+    # so Hub-canonical ``zai-org/GLM-4.7-Flash`` still hits this entry.
+    "zai-org/glm-4.7-flash": 202752,
     "glm-4.7-flash": 202752,
     "glm-4.6v-flash": 202752,
 }
