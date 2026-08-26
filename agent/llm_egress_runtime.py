@@ -171,29 +171,14 @@ def _approved_sanitized(text: str, *, cap: int) -> SanitizedSegment:
 
 
 def _approved_sanitized_segments(text: str, *, cap: int) -> list[SanitizedSegment]:
-    """Split text without weakening the per-segment admission boundary."""
+    """Admit one independently sourced text segment without cap laundering.
 
-    if not isinstance(text, str):
-        raise TypeError("sanitized segment must be text")
-    if cap <= 0:
-        raise ValueError("sanitized segment cap must be positive")
-    if not text:
-        return [_approved_sanitized(text, cap=cap)]
+    A caller may provide multiple bounded messages or exact-grant-separated
+    segments. Arbitrarily slicing one oversized raw value would manufacture
+    those independent boundaries and bypass the per-segment policy.
+    """
 
-    segments: list[SanitizedSegment] = []
-    start = 0
-    byte_count = 0
-    for index, character in enumerate(text):
-        character_bytes = len(character.encode("utf-8"))
-        if byte_count and byte_count + character_bytes > cap:
-            segments.append(_approved_sanitized(text[start:index], cap=cap))
-            start = index
-            byte_count = 0
-        if character_bytes > cap:
-            raise ValueError("sanitized character exceeds byte cap")
-        byte_count += character_bytes
-    segments.append(_approved_sanitized(text[start:], cap=cap))
-    return segments
+    return [_approved_sanitized(text, cap=cap)]
 
 
 def _segment_text(
