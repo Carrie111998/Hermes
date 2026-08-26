@@ -1,6 +1,15 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
-import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  createContext,
+  type KeyboardEvent,
+  type ReactNode,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -247,6 +256,13 @@ export function ModelCatalogMenu({
   )
 
   const [kbOverride, setKbOverride] = useState<null | number>(null)
+  // The custom row cursor intentionally keeps DOM focus in the search field,
+  // so Radix never sees ArrowRight on the highlighted SubTrigger. Hand focus to
+  // that trigger and replay the key; Radix then opens the submenu and owns its
+  // focus/navigation. Keep the refs here rather than making the shared search
+  // primitive expose a ref just for this one catalog.
+  const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const keyboardSubOpenRef = useRef(false)
   // A parked cursor is not a cursor in use: until the mouse actually moves,
   // hover can't take rows out from under the keyboard.
   const pointerQuiet = usePointerQuiet()
@@ -312,6 +328,45 @@ export function ModelCatalogMenu({
     }
   }
 
+  const openKeyboardSubmenu = (event: KeyboardEvent<HTMLInputElement>) => {
+    const input = event.currentTarget
+    const atEnd = input.selectionStart === input.value.length && input.selectionEnd === input.value.length
+
+    if (
+      !atEnd ||
+      event.altKey ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.shiftKey ||
+      kbIndex < 0 ||
+      kbRows[kbIndex].kind !== 'family'
+    ) {
+      return
+    }
+
+    const trigger = listRef.current?.querySelector<HTMLElement>('[data-kb-active]')
+
+    if (!trigger) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    searchInputRef.current = input
+    keyboardSubOpenRef.current = true
+    trigger.focus({ preventScroll: true })
+    trigger.dispatchEvent(new globalThis.KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'ArrowRight' }))
+
+    // Do not strand focus on the row if a future Radix change declines to open
+    // the submenu for this trigger.
+    window.setTimeout(() => {
+      if (trigger.getAttribute('aria-expanded') !== 'true') {
+        keyboardSubOpenRef.current = false
+        searchInputRef.current?.focus({ preventScroll: true })
+      }
+    })
+  }
+
   // Rows are hover-selectable, so they go inert with the pointer.
   const quietRows = pointerQuiet && 'pointer-events-none'
 
@@ -326,6 +381,8 @@ export function ModelCatalogMenu({
             event.preventDefault()
             event.stopPropagation()
             stepKb(event.key === 'ArrowDown' ? 1 : -1)
+          } else if (event.key === 'ArrowRight') {
+            openKeyboardSubmenu(event)
           } else if (event.key === 'Enter') {
             event.preventDefault()
             event.stopPropagation()
@@ -437,17 +494,29 @@ export function ModelCatalogMenu({
                       closeMenu()
                     }
 
+                    const rowKey = `${group.provider.slug}:${family.id}`
+
                     return (
-                      <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
+                      <DropdownMenuSub
+                        key={rowKey}
+                        onOpenChange={open => {
+                          if (!open && keyboardSubOpenRef.current) {
+                            keyboardSubOpenRef.current = false
+                            searchInputRef.current?.focus({ preventScroll: true })
+                          }
+                        }}
+                      >
                         <DropdownMenuSubTrigger
-                          hideChevron
                           onClick={activate}
                           onKeyDown={event => {
                             if (event.key === 'Enter' || event.key === ' ') {
                               activate()
                             }
                           }}
-                          {...kbRowProps(`${group.provider.slug}:${family.id}`)}
+                          onPointerMove={() => {
+                            keyboardSubOpenRef.current = false
+                          }}
+                          {...kbRowProps(rowKey)}
                         >
                           <span className="min-w-0 flex-1 truncate">
                             <HighlightMatches query={search} text={name} />

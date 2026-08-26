@@ -44,13 +44,14 @@ afterEach(() => {
 // (what it lists, what it offers), not about what any host does with a pick.
 function renderMenu() {
   const select = vi.fn()
+  const setOptions = vi.fn()
 
   const controller: ModelMenuController = {
     applyPreset: vi.fn(),
     current: { effort: '', fast: false, model: '', provider: '' },
     presetFor: () => ({}),
     select,
-    setOptions: vi.fn()
+    setOptions
   }
 
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -65,7 +66,7 @@ function renderMenu() {
     </QueryClientProvider>
   )
 
-  return select
+  return { select, setOptions }
 }
 
 // Curation is ONE global preference, so it belongs to the catalog rather than
@@ -104,5 +105,35 @@ describe('the catalog owns model curation', () => {
     fireEvent.click(screen.getByText('Edit Models…'))
 
     expect($modelVisibilityOpen.get()).toBe(true)
+  })
+
+  it('opens a model row options submenu and changes effort from the keyboard', async () => {
+    const { setOptions } = renderMenu()
+    const input = await screen.findByRole('textbox', { name: 'Search models' })
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+
+    // The custom catalog cursor starts before the first row when no model is
+    // active, so enter the first row before entering its options.
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'ArrowRight' })
+
+    const medium = await screen.findByRole('menuitemradio', { name: 'Medium' })
+    await vi.waitFor(() =>
+      expect(globalThis.document.activeElement?.closest('[data-slot="dropdown-menu-sub-content"]')).toBeTruthy()
+    )
+
+    // ArrowDown enters the first effort item (Minimal), then Enter selects it.
+    fireEvent.keyDown(globalThis.document.activeElement!, { key: 'ArrowDown' })
+    await vi.waitFor(() => expect(globalThis.document.activeElement?.textContent).toContain('Minimal'))
+    fireEvent.keyDown(globalThis.document.activeElement!, { key: 'Enter' })
+
+    expect(medium).toBeTruthy()
+    expect(setOptions).toHaveBeenCalledWith(
+      { effort: 'minimal' },
+      { isActive: false, model: 'gemini-3.1-pro', provider: 'google' }
+    )
+
+    fireEvent.keyDown(globalThis.document.activeElement!, { key: 'ArrowLeft' })
+    await vi.waitFor(() => expect(globalThis.document.activeElement).toBe(input))
   })
 })
