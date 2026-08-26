@@ -2075,44 +2075,48 @@ def switch_model(
             "message": f"Could not validate `{new_model}`: {e}",
         }
 
+    # Determine whether the requested model is DECLARED in the user's saved
+    # provider config (user_providers models block / custom_providers entry).
+    # API /v1/models may not list cloud/aliased models even though the server
+    # supports them, so a declared model is intentional and authoritative.
+    declared_in_config = False
+    if user_providers:
+        from hermes_cli.config import is_provider_enabled
+        # user_providers is a dict: {provider_slug: config_dict}
+        for slug, cfg in user_providers.items():
+            if not is_provider_enabled(cfg):
+                continue
+            if slug == target_provider:
+                if new_model in _declared_model_ids(cfg.get("models", {})):
+                    declared_in_config = True
+                    break
+    # Also check custom_providers list — models declared there should be accepted
+    # even if the remote /v1/models endpoint doesn't list them.
+    if not declared_in_config and custom_providers and isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            # Match by provider slug (custom:<name>) or by base_url
+            entry_name = entry.get("name", "")
+            entry_aliases = custom_provider_aliases(
+                str(entry_name or ""),
+                str(entry.get("provider_key") or ""),
+            )
+            entry_url = entry.get("base_url", "")
+            if target_provider.lower() in entry_aliases or entry_url == base_url:
+                # Check if the requested model matches the entry's model
+                entry_model = entry.get("model", "")
+                entry_models = entry.get("models", {})
+                if new_model == entry_model:
+                    declared_in_config = True
+                    break
+                if new_model in _declared_model_ids(entry_models):
+                    declared_in_config = True
+                    break
+
     # Override rejection if model is in the user's saved provider config.
-    # API /v1/models may not list cloud/aliased models even though the server supports them.
     if not validation.get("accepted"):
-        override = False
-        if user_providers:
-            from hermes_cli.config import is_provider_enabled
-            # user_providers is a dict: {provider_slug: config_dict}
-            for slug, cfg in user_providers.items():
-                if not is_provider_enabled(cfg):
-                    continue
-                if slug == target_provider:
-                    if new_model in _declared_model_ids(cfg.get("models", {})):
-                        override = True
-                        break
-        # Also check custom_providers list — models declared there should be accepted
-        # even if the remote /v1/models endpoint doesn't list them.
-        if not override and custom_providers and isinstance(custom_providers, list):
-            for entry in custom_providers:
-                if not isinstance(entry, dict):
-                    continue
-                # Match by provider slug (custom:<name>) or by base_url
-                entry_name = entry.get("name", "")
-                entry_aliases = custom_provider_aliases(
-                    str(entry_name or ""),
-                    str(entry.get("provider_key") or ""),
-                )
-                entry_url = entry.get("base_url", "")
-                if target_provider.lower() in entry_aliases or entry_url == base_url:
-                    # Check if the requested model matches the entry's model
-                    entry_model = entry.get("model", "")
-                    entry_models = entry.get("models", {})
-                    if new_model == entry_model:
-                        override = True
-                        break
-                    if new_model in _declared_model_ids(entry_models):
-                        override = True
-                        break
-        if override:
+        if declared_in_config:
             validation = {"accepted": True, "persist": True, "recognized": False, "message": validation.get("message", "")}
         else:
             msg = validation.get("message", "Invalid model")
@@ -2125,8 +2129,13 @@ def switch_model(
                 error_message=msg,
             )
 
-    # Apply auto-correction if validation found a closer match
-    if validation.get("corrected_model"):
+    # Apply auto-correction if validation found a closer match.
+    # Skip when the model was explicitly declared in provider config — the
+    # remote /v1/models roster may omit aliased/legacy slugs (e.g. the SG
+    # router does not advertise muse-spark-1.2-contributor-free, so Hermes
+    # would silently "correct" the free model to the PAID
+    # muse-spark-1.2-contributor; verified 2026-08-26).
+    if validation.get("corrected_model") and not declared_in_config:
         new_model = validation["corrected_model"]
 
     # --- Copilot api_mode override ---
@@ -2178,7 +2187,10 @@ def switch_model(
     # --- Collect warnings ---
     warnings: list[str] = []
     if validation.get("message"):
-        warnings.append(validation["message"])
+        # When a declared model skips auto-correction, the "Auto-corrected X → Y"
+        # message is misleading (nothing was corrected) — drop it.
+        if not (declared_in_config and str(validation["message"]).startswith("Auto-corrected")):
+            warnings.append(validation["message"])
     hermes_warn = _check_hermes_model_warning(new_model)
     if hermes_warn:
         warnings.append(hermes_warn)
