@@ -162,6 +162,19 @@ def _task_dict(
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    # Native review routing keeps implementation ownership stable while exposing
+    # the effective reviewer and next authorization gate explicitly to clients.
+    d["effective_reviewer"] = task.review_assignee or (
+        task.assignee if task.status == "review" else None
+    )
+    if task.status == "review":
+        d["next_gate"] = "reviewer_claim"
+    elif task.status == "running" and task.review_artifacts is not None:
+        d["next_gate"] = "review_verdict"
+    elif task.status == "done":
+        d["next_gate"] = None
+    else:
+        d["next_gate"] = "writer_execution"
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -619,6 +632,9 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # UTC Unix epochs; scheduled_for parks the card until dispatcher promotion.
+    scheduled_for: Optional[int] = None
+    due_at: Optional[int] = None
 
 
 @router.post("/tasks")
@@ -647,6 +663,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            scheduled_for=payload.scheduled_for,
+            due_at=payload.due_at,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)

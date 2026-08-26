@@ -28,6 +28,29 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def legacy_review_protocol(monkeypatch: pytest.MonkeyPatch):
+    """Keep this pre-v2 compatibility suite on proven legacy rows.
+
+    Native authenticated lifecycle behavior is covered separately in
+    ``test_kanban_native_review_v2.py``. Ordinary production creation remains
+    native; only this historical compatibility fixture writes the durable
+    migration marker explicitly.
+    """
+    create_task = kb.create_task
+
+    def create_legacy_task(conn, *args, **kwargs):
+        task_id = create_task(conn, *args, **kwargs)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET review_protocol = 'legacy' WHERE id = ?",
+                (task_id,),
+            )
+        return task_id
+
+    monkeypatch.setattr(kb, "create_task", create_legacy_task)
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""

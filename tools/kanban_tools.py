@@ -932,6 +932,16 @@ def _handle_request_review(args: dict, **kw) -> str:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
+    artifacts = args.get("artifacts")
+    if artifacts is None:
+        return tool_error(
+            "artifacts is required for worker review handoff; freeze commit, "
+            "tree, and artifact SHA-256 identities"
+        )
+    if not isinstance(artifacts, dict):
+        return tool_error(
+            f"artifacts must be an object/dict, got {type(artifacts).__name__}"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -949,6 +959,11 @@ def _handle_request_review(args: dict, **kw) -> str:
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
+                artifacts=artifacts,
+                # Worker handoffs always use the authenticated v2 contract.
+                # Compatibility-only legacy transitions remain on operator/CLI
+                # surfaces and cannot be selected by a dispatched worker.
+                actor_profile=os.environ.get("HERMES_PROFILE"),
                 expected_run_id=_worker_run_id(tid),
                 with_reason=True,
             )
@@ -994,10 +1009,16 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
+                actor_profile=(
+                    os.environ.get("HERMES_PROFILE")
+                    if task is not None and task.review_artifacts is not None
+                    else None
+                ),
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1019,6 +1040,54 @@ def _handle_request_changes(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_request_changes failed")
         return tool_error(f"kanban_request_changes: {e}")
+
+
+def _handle_review_pass(args: dict, **kw) -> str:
+    """Submit an authenticated PASS verdict for a native review run."""
+    delegated_err = _reject_delegated_child_mutation("kanban_review_pass")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = args.get("summary")
+    if not summary or not str(summary).strip():
+        return tool_error("summary is required — cite independent review evidence")
+    actor = os.environ.get("HERMES_PROFILE")
+    run_id = _worker_run_id(tid)
+    if not actor or run_id is None:
+        return tool_error(
+            "authenticated dispatcher profile and active reviewer run token are required"
+        )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok, detail = kb.pass_review(
+                conn,
+                tid,
+                summary=redact_sensitive_text(str(summary), force=True),
+                actor_profile=actor,
+                expected_run_id=run_id,
+            )
+            if not ok:
+                return tool_error(
+                    f"could not pass review for {tid}: "
+                    f"{detail or 'invalid review state'}"
+                )
+            return _ok(task_id=tid, run_id=run_id, status="done")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review_pass: {e}")
+    except Exception as e:
+        logger.exception("kanban_review_pass failed")
+        return tool_error(f"kanban_review_pass: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -1397,6 +1466,8 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    scheduled_for = args.get("scheduled_for")
+    due_at = args.get("due_at")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1459,6 +1530,10 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                scheduled_for=(
+                    int(scheduled_for) if scheduled_for is not None else None
+                ),
+                due_at=(int(due_at) if due_at is not None else None),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1942,9 +2017,33 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
                 ),
                 "additionalProperties": True,
             },
+            "artifacts": {
+                "type": "object",
+                "description": (
+                    "Required frozen native-review identity: commit, tree, and "
+                    "artifact path/SHA-256 entries. Worker handoffs always use "
+                    "the authenticated review contract."
+                ),
+                "properties": {
+                    "commit": {"type": "string"},
+                    "tree": {"type": "string"},
+                    "artifacts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "sha256": {"type": "string"},
+                            },
+                            "required": ["path", "sha256"],
+                        },
+                    },
+                },
+                "required": ["commit", "tree", "artifacts"],
+            },
             "board": _board_schema_prop(),
         },
-        "required": ["summary"],
+        "required": ["summary", "artifacts"],
     },
 }
 
@@ -1976,6 +2075,31 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
         "required": ["reason"],
     },
 }
+
+KANBAN_REVIEW_PASS_SCHEMA = {
+    "name": "kanban_review_pass",
+    "description": (
+        "Authenticated reviewer PASS verdict for a native frozen-artifact "
+        "review. Only the bound independent reviewer holding the active "
+        "dispatcher run token can move Review to Done."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "summary": {
+                "type": "string",
+                "description": "Independent verification performed and evidence observed.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary"],
+    },
+}
+
 
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
@@ -2247,6 +2371,18 @@ KANBAN_CREATE_SCHEMA = {
                     "'running', which preserves the usual dispatch path."
                 ),
             },
+            "scheduled_for": {
+                "type": "integer",
+                "description": (
+                    "UTC Unix epoch when the sole dispatcher atomically promotes "
+                    "this card from scheduled to ready (or todo while parents "
+                    "remain open). Emits one T-15 pre-notice event."
+                ),
+            },
+            "due_at": {
+                "type": "integer",
+                "description": "Optional visible deadline as a UTC Unix epoch.",
+            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -2405,6 +2541,15 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+)
+
+registry.register(
+    name="kanban_review_pass",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_PASS_SCHEMA,
+    handler=_handle_review_pass,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
 )
 
 registry.register(

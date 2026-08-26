@@ -139,6 +139,23 @@ class TestReconcileOrphanedRunning:
 
         assert kb.reconcile_orphaned_running(conn) == [tid]
 
+    def test_review_orphan_with_intact_provenance_returns_to_review(self, conn):
+        tid = kb.create_task(conn, title="orphaned reviewer", assignee="writer")
+        writer = kb.claim_task(conn, tid)
+        assert writer is not None
+        frozen = {"commit": "a" * 40, "tree": "b" * 40, "artifacts": []}
+        assert kb.request_review(
+            conn, tid, reviewer="reviewer", artifacts=frozen,
+            actor_profile="writer", expected_run_id=writer.current_run_id,
+        )
+        assert kb.claim_review_task(conn, tid, actor_profile="reviewer") is not None
+        _orphan_running(conn, tid)
+
+        assert kb.reconcile_orphaned_running(conn) == [tid]
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["status"] == "review"
+
     def test_non_running_statuses_ignored(self, conn):
         for status in ("todo", "ready", "blocked", "done"):
             tid = kb.create_task(conn, title=f"s-{status}", assignee="w")

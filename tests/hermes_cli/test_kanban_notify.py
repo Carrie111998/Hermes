@@ -594,6 +594,13 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="review handoff", assignee="builder")
+        # This test exercises notification compatibility for a pre-v2 handoff;
+        # native authenticated wake behavior is covered by the v2 suite.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET review_protocol = 'legacy' WHERE id = ?",
+                (task_id,),
+            )
         kb.add_notify_sub(
             conn,
             task_id=task_id,
