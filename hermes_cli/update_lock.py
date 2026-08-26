@@ -50,8 +50,10 @@ Two mechanisms recognize the orchestrating parent, and either suffices:
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,25 +244,57 @@ class UpdateLock:
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
         """
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.debug(
+                "Could not create update marker directory %s: %s",
+                self.path.parent,
+                exc,
+            )
+            return True
+
+        for _attempt in range(2):
+            existing = read_live_update(path=self.path)
+            if existing is not None:
+                if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                    return True
+                self.holder = existing
+                return False
+            try:
+                claim = self.path.with_name(
+                    f"{self.path.name}.claim-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+                )
+                fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as marker:
+                    marker.write(f"{os.getpid()}\n{int(time.time())}\n")
+                try:
+                    os.link(claim, self.path)
+                finally:
+                    claim.unlink(missing_ok=True)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    # Another process won the create-new race after our read.
+                    # Re-read its claim instead of overwriting it.
+                    continue
+                # Best-effort, exactly like the Rust guard: an unwritable marker
+                # must not block the update itself (that would be a worse failure
+                # than the race it prevents). Degrade to the pre-lock behavior.
+                logger.debug("Could not create update marker %s: %s", self.path, exc)
+                return True
+            self.acquired = True
+            return True
+
         existing = read_live_update(path=self.path)
         if existing is not None:
             if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
                 return True
             self.holder = existing
             return False
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
-            )
-        except OSError as exc:
-            # Best-effort, exactly like the Rust guard: an unwritable marker
-            # must not block the update itself (that would be a worse failure
-            # than the race it prevents). Degrade to the pre-lock behavior.
-            logger.debug("Could not write update marker %s: %s", self.path, exc)
-            return True
-        self.acquired = True
-        return True
+        # A claimant repeatedly created and disappeared between our probes.
+        # Fail closed rather than entering an install with unprovable ownership.
+        logger.warning("Update ownership changed repeatedly while claiming %s", self.path)
+        return False
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""

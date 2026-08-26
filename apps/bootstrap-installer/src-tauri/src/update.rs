@@ -113,7 +113,7 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// `acquire` therefore REFUSES when a live foreign owner holds it rather than
 /// overwriting — the pre-fix clobber is what let a dashboard `hermes update`
 /// keep running while install-mode bootstrap rewrote the tree underneath it.
-struct UpdateMarkerGuard {
+pub(crate) struct UpdateMarkerGuard {
     path: PathBuf,
     /// False when a live foreign updater already owns the marker: we hold no
     /// claim, so `Drop` must not delete their marker.
@@ -128,9 +128,9 @@ struct UpdateMarkerGuard {
 const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
 
 /// The pid + age of a confirmed-live update holding the marker.
-struct MarkerOwner {
-    pid: u32,
-    age_secs: u64,
+pub(crate) struct MarkerOwner {
+    pub(crate) pid: u32,
+    pub(crate) age_secs: u64,
 }
 
 /// Read the marker and report a live owner, if any. `None` for every "no live
@@ -229,30 +229,78 @@ impl UpdateMarkerGuard {
     /// gate degrades to "no marker => proceed", i.e. exactly the pre-marker
     /// behavior), so we log and carry on with a guard that still attempts
     /// cleanup of whatever may exist at the path.
-    fn acquire(path: PathBuf) -> Result<Self, MarkerOwner> {
+    pub(crate) fn acquire(path: PathBuf) -> Result<Self, MarkerOwner> {
         let pid = std::process::id();
-        if let Some(owner) = live_marker_owner(&path) {
-            if owner.pid == pid {
-                // Repeated acquisition in this process is intentionally
-                // re-entrant because the desktop may have pre-written our pid.
-                // The desktop races ahead and pre-writes our pid. Adopt that
-                // claim verbatim: rewriting started_at here lets retries reset
-                // a wedged updater's age before the stale ceiling can clear it.
-                return Ok(Self { path, owned: true });
+        for _attempt in 0..2 {
+            if let Some(owner) = live_marker_owner(&path) {
+                if owner.pid == pid {
+                    // Repeated acquisition in this process is intentionally
+                    // re-entrant because the desktop may have pre-written our pid.
+                    // Adopt that claim verbatim so retries cannot reset its age.
+                    return Ok(Self { path, owned: true });
+                }
+                return Err(owner);
             }
+            let started_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let claim = path.with_file_name(format!(
+                "{}.claim-{pid}-{}",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("update-marker"),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&claim)
+            {
+                Ok(mut marker) => {
+                    use std::io::Write;
+                    if let Err(err) = write!(marker, "{pid}\n{started_at}\n") {
+                        let _ = std::fs::remove_file(&claim);
+                        tracing::warn!(?path, %err, "could not write update-in-progress marker");
+                        return Ok(Self { path, owned: false });
+                    }
+                    drop(marker);
+                    let linked = std::fs::hard_link(&claim, &path);
+                    let _ = std::fs::remove_file(&claim);
+                    match linked {
+                        Ok(()) => return Ok(Self { path, owned: true }),
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(?path, %err, "could not publish update-in-progress marker");
+                            return Ok(Self { path, owned: false });
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Another process won the create-new race. Re-read its
+                    // owner instead of clobbering the claim.
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(?path, %err, "could not create update-in-progress marker");
+                    return Ok(Self { path, owned: false });
+                }
+            }
+        }
+
+        if let Some(owner) = live_marker_owner(&path) {
             return Err(owner);
         }
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(err) = std::fs::write(&path, format!("{pid}\n{started_at}")) {
-            tracing::warn!(?path, %err, "could not write update-in-progress marker");
-        }
-        Ok(Self { path, owned: true })
+        tracing::warn!(?path, "update marker ownership changed repeatedly while claiming");
+        Ok(Self { path, owned: false })
     }
 
     /// Release the marker as soon as every mutating stage has completed.

@@ -17,6 +17,7 @@ disk.
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import pytest
@@ -73,6 +74,30 @@ def test_second_acquire_is_refused_while_the_first_is_live(marker):
     assert second.holder is not None
     assert second.holder.pid == os.getpid()
     assert second.acquired is False
+
+
+def test_simultaneous_claimants_cannot_both_acquire(marker):
+    """Create-new closes the check-then-write race between first claimants."""
+    start = threading.Barrier(8)
+    locks = [UpdateLock(path=marker) for _ in range(8)]
+    outcomes: list[bool] = []
+    outcomes_lock = threading.Lock()
+
+    def claim(lock: UpdateLock) -> None:
+        start.wait()
+        acquired = lock.acquire()
+        with outcomes_lock:
+            outcomes.append(acquired and lock.acquired)
+
+    threads = [threading.Thread(target=claim, args=(lock,)) for lock in locks]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes.count(True) == 1
+    assert marker.exists()
 
 
 def test_refused_lock_does_not_delete_the_live_owners_marker(marker):

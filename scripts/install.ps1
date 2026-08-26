@@ -57,6 +57,11 @@ param(
     [string]$Ensure = "",
     [switch]$PostInstall,
 
+    # Cross-process ownership fixture. Runs the real ownership path without
+    # touching the install and is used only by the Windows regression harness.
+    [switch]$SelfTestUpdateOwnership,
+    [int]$SelfTestHoldSeconds = 0,
+
     # --- Desktop GUI build (opt-in) ---
     # When set, install.ps1 includes Stage-Desktop in the manifest and
     # builds apps/desktop into a launchable Hermes.exe.
@@ -404,9 +409,123 @@ $NpmRange = ">=12.0.0"
 # manifest schema, stage-name set semantics, or stdout JSON shape.  Adding a
 # new stage does NOT bump this -- drivers iterate the manifest dynamically.
 $InstallStageProtocolVersion = 1
+$script:InstallOwnership = $null
 
 # ============================================================================
 # Helper functions
+
+function Get-LiveInstallOwner {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $lines = @([System.IO.File]::ReadAllLines($Path))
+        if ($lines.Count -lt 2) { throw "malformed marker" }
+        $ownerPid = 0
+        $startedAt = 0L
+        if (-not [int]::TryParse($lines[0].Trim(), [ref]$ownerPid)) { throw "malformed pid" }
+        if (-not [int64]::TryParse($lines[1].Trim(), [ref]$startedAt)) { throw "malformed timestamp" }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $age = [Math]::Max(0L, $now - $startedAt)
+        $alive = [bool](Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
+        if ($alive -and $age -le 1200) {
+            return [pscustomobject]@{ Pid = $ownerPid; AgeSeconds = $age }
+        }
+    } catch {}
+
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    return $null
+}
+
+function Get-InstallOwnershipPid {
+    param([bool]$StageDriven)
+
+    if (-not $StageDriven) { return $PID }
+
+    # New bootstrap installers send the owner explicitly. Accept it only when
+    # the process is live; an arbitrary environment value grants nothing.
+    $handoffPid = 0
+    if ([int]::TryParse($env:HERMES_UPDATE_HANDOFF_PID, [ref]$handoffPid) -and $handoffPid -gt 0) {
+        if (Get-Process -Id $handoffPid -ErrorAction SilentlyContinue) { return $handoffPid }
+    }
+
+    # Compatibility for frozen installers that predate the explicit env var:
+    # each stage PowerShell is their direct child while the installer remains
+    # alive for the full stage sequence.
+    try {
+        $self = Get-CimInstance Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop
+        $parentPid = [int]$self.ParentProcessId
+        if ($parentPid -gt 0 -and (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) {
+            return $parentPid
+        }
+    } catch {}
+    return $PID
+}
+
+function Enter-InstallOwnership {
+    param([bool]$StageDriven)
+
+    $marker = Join-Path $HermesHome ".hermes-update-in-progress"
+    $ownerPid = Get-InstallOwnershipPid -StageDriven $StageDriven
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $existing = Get-LiveInstallOwner -Path $marker
+        if ($existing) {
+            if ($existing.Pid -eq $ownerPid) {
+                return [pscustomobject]@{ Path = $marker; OwnerPid = $ownerPid; ReleaseOnExit = $false }
+            }
+            $mins = [Math]::Floor($existing.AgeSeconds / 60)
+            $secs = $existing.AgeSeconds % 60
+            $elapsed = if ($mins -gt 0) { "${mins}m ${secs}s" } else { "${secs}s" }
+            throw "Another Hermes install or update is already running (PID $($existing.Pid), started $elapsed ago). Wait for it to finish, then retry."
+        }
+
+        try {
+            New-Item -ItemType Directory -Path $HermesHome -Force -ErrorAction Stop | Out-Null
+            $claim = "$marker.claim-$PID-$([Guid]::NewGuid().ToString('N'))"
+            $stream = [System.IO.File]::Open(
+                $claim,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $body = "$ownerPid`n$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())`n"
+                $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($body)
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+            } finally {
+                $stream.Dispose()
+            }
+            try {
+                # File.Move never replaces an existing destination on Windows,
+                # so publishing the complete marker is one atomic claim.
+                [System.IO.File]::Move($claim, $marker)
+            } finally {
+                Remove-Item -LiteralPath $claim -Force -ErrorAction SilentlyContinue
+            }
+            return [pscustomobject]@{
+                Path = $marker
+                OwnerPid = $ownerPid
+                ReleaseOnExit = (-not $StageDriven -and $ownerPid -eq $PID)
+            }
+        } catch [System.IO.IOException] {
+            # Another process won CreateNew after our read. Re-read its durable
+            # owner instead of overwriting the marker.
+            continue
+        }
+    }
+    throw "Hermes install/update ownership changed repeatedly while starting. Wait a moment, then retry."
+}
+
+function Exit-InstallOwnership {
+    if (-not $script:InstallOwnership -or -not $script:InstallOwnership.ReleaseOnExit) { return }
+    try {
+        $owner = Get-LiveInstallOwner -Path $script:InstallOwnership.Path
+        if ($owner -and $owner.Pid -eq $script:InstallOwnership.OwnerPid) {
+            Remove-Item -LiteralPath $script:InstallOwnership.Path -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
 
 # Return the real OS processor architecture as a lowercase string suitable for
 # Node.js / electron download URL slugs: "arm64", "x64", or "x86".
@@ -4803,6 +4922,17 @@ function Main {
 # structured JSON error frame instead of a bare exception.
 
 try {
+    if ($SelfTestUpdateOwnership) {
+        $script:InstallOwnership = Enter-InstallOwnership -StageDriven $false
+        if ($SelfTestHoldSeconds -gt 0) { Start-Sleep -Seconds $SelfTestHoldSeconds }
+        @{
+            ok = $true
+            owner_pid = $script:InstallOwnership.OwnerPid
+            marker = $script:InstallOwnership.Path
+        } | ConvertTo-Json -Compress | Write-Output
+        exit 0
+    }
+
     if ($Ensure -ne "") {
         if ($PSBoundParameters.ContainsKey("Stage")) {
             Write-Err "Cannot use -Ensure and -Stage simultaneously"
@@ -4858,6 +4988,7 @@ try {
             $err | ConvertTo-Json -Compress | Write-Output
             exit 2
         }
+        $script:InstallOwnership = Enter-InstallOwnership -StageDriven $true
         Step-OutOfInstallDir
         Invoke-Stage -StageDef $def
         exit 0
@@ -4865,6 +4996,7 @@ try {
 
     # Default: full install (today's behavior, plus optional -NonInteractive
     # and -Json layered on by the params above).
+    $script:InstallOwnership = Enter-InstallOwnership -StageDriven $false
     Main
 } catch {
     if ($Json -or $Stage) {
@@ -4894,4 +5026,6 @@ try {
     Write-Host "  Invoke-WebRequest -Uri 'https://hermes-agent.nousresearch.com/install.ps1' -OutFile install.ps1" -ForegroundColor Yellow
     Write-Host "  .\install.ps1" -ForegroundColor Yellow
     Write-Host ""
+} finally {
+    Exit-InstallOwnership
 }

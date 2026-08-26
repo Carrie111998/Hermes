@@ -770,6 +770,11 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     # encoding from the console codepage when attached to one.
     $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     $psi.EnvironmentVariables["PYTHONUTF8"] = "1"
+    # Explicit ownership hand-off: update_lock.py validates that this PID is
+    # still the live marker owner before allowing the child to run under it.
+    # This avoids relying solely on process ancestry across wrapper/re-exec
+    # shapes and makes retries stay inside the same install transaction.
+    $psi.EnvironmentVariables["HERMES_UPDATE_HANDOFF_PID"] = [string]$PID
     $psi.CreateNoWindow = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
     $outSink = New-Object System.Text.StringBuilder

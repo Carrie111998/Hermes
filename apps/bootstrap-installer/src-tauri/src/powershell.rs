@@ -302,6 +302,10 @@ pub async fn run_script(
     if let Some(home) = hermes_home_override {
         cmd.env("HERMES_HOME", home);
     }
+    // Every stage process is a child of this long-lived installer. Naming the
+    // owner explicitly lets install.ps1 adopt the installer's shared update
+    // claim rather than mistaking its own orchestrator for a competing update.
+    cmd.env("HERMES_UPDATE_HANDOFF_PID", std::process::id().to_string());
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
