@@ -177,3 +177,26 @@ def test_parallel_stdio_spawn_capture_keeps_each_server_pid_owned(monkeypatch):
     asyncio.run(run_both())
 
     assert captured == {101: {101}, 202: {202}}
+
+
+def test_stdio_lifecycle_uses_process_liveness_without_protocol_ping(monkeypatch):
+    server = mcp_tool.MCPServerTask("stdio-no-ping")
+    session = MagicMock()
+    session.send_ping = AsyncMock()
+    server.session = session
+    server._config = {"command": "fake", "keepalive_interval": 0.01}
+    monkeypatch.setattr(mcp_tool, "_MIN_KEEPALIVE_INTERVAL", 0.01)
+    monkeypatch.setattr(
+        mcp_tool.MCPServerTask,
+        "_stdio_children_dead",
+        lambda _self: False,
+    )
+
+    async def scenario():
+        waiter = asyncio.create_task(server._wait_for_lifecycle_event())
+        await asyncio.sleep(0.04)
+        server._shutdown_event.set()
+        return await waiter
+
+    assert asyncio.run(scenario()) == "shutdown"
+    assert session.send_ping.await_count == 0

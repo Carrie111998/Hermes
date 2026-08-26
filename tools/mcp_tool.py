@@ -3043,11 +3043,11 @@ class MCPServerTask:
 
         Shutdown takes precedence if both events are set simultaneously.
 
-        Periodically sends a lightweight keepalive (``ping``, with a
-        ``list_tools`` fallback for servers that don't implement the optional
-        ping utility — see :meth:`_keepalive_probe`) to prevent TCP/session
-        state from going stale during idle periods (#17003). If the keepalive
-        fails, triggers a reconnect.
+        HTTP/SSE sessions periodically send a lightweight keepalive (``ping``,
+        with a ``list_tools`` fallback for servers that do not implement the
+        optional ping utility). Stdio sessions use owned-process liveness
+        instead because local transports have no remote session TTL and some
+        otherwise-valid servers close on the optional ping method.
 
         The cadence is ``keepalive_interval`` from server config (default
         :data:`_DEFAULT_KEEPALIVE_INTERVAL`, floored at
@@ -3094,11 +3094,25 @@ class MCPServerTask:
                     self._mark_stdio_recycled(recycle_reason)
                     return "recycle"
 
-                # Timeout — no lifecycle event fired.  Probe the connection
-                # to detect stale/expired sessions — but NEVER while an RPC
-                # is in flight (#48069): the stdio session is a single
-                # JSON-RPC stream and a concurrent ping/list_tools can wedge
-                # the in-flight request. A busy server is provably alive.
+                # Local stdio servers have no remote session TTL and several
+                # valid SDK servers close their transport when sent the optional
+                # MCP ping utility. Process liveness is the safe idle probe;
+                # protocol health is proved by real tool calls. HTTP/SSE keeps
+                # the protocol ping/list_tools keepalive below.
+                if not self._is_http():
+                    if self._stdio_children_dead():
+                        self.mark_suspect("stdio subprocess exited while idle")
+                        self.session = None
+                        self._ready.clear()
+                        self._reconnect_event.set()
+                        break
+                    continue
+
+                # Timeout — no lifecycle event fired. Probe the remote
+                # connection to detect stale/expired sessions — but NEVER while
+                # an RPC is in flight (#48069): concurrent JSON-RPC liveness
+                # probes can wedge an in-flight request. A busy server is
+                # already provably alive.
                 if self.session:
                     if self._rpc_lock.locked() or any(
                         not t.done() for t in self._inflight_tasks
