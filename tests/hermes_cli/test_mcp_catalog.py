@@ -221,6 +221,32 @@ class TestManifestParsing:
         with pytest.raises(CatalogError, match="MCP_DEMO_API_KEY"):
             _parse_manifest(path)
 
+    def test_stdio_secret_placeholder_rejected_in_args(self, catalog_dir):
+        """Secrets must reach stdio servers through env, never process argv."""
+        body = _basic_manifest(
+            transport={
+                "type": "stdio",
+                "command": "npx",
+                "args": ["-y", "demo-mcp@1.0.0", "--secret", "${DEMO_SECRET}"],
+                "env": {"DEMO_SECRET": "${DEMO_SECRET}"},
+            },
+            auth={
+                "type": "api_key",
+                "env": [
+                    {
+                        "name": "DEMO_SECRET",
+                        "prompt": "secret",
+                        "secret": True,
+                    }
+                ],
+            },
+        )
+        path = _write_manifest(catalog_dir, "demo", body)
+        from hermes_cli.mcp_catalog import CatalogError, _parse_manifest
+
+        with pytest.raises(CatalogError, match="secret.*transport.args"):
+            _parse_manifest(path)
+
 
 
 

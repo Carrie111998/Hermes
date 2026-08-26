@@ -1,0 +1,77 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: tencent-cloudbase
+description: Tencent CloudBase environments, databases, functions, storage, hosting, auth, and logs.
+source: https://github.com/TencentCloudBase/CloudBase-AI-Toolkit
+
+# Official stdio package. v2.26.0 was published on 2026-08-10 and is the newest
+# release satisfying the catalog's two-week stabilization floor on 2026-08-26.
+transport:
+  type: stdio
+  command: npx
+  args:
+    - -y
+    - "@cloudbase/cloudbase-mcp@2.26.0"
+  version: "2.26.0"
+  env:
+    CLOUDBASE_API_KEY: "${CLOUDBASE_API_KEY}"
+    CLOUDBASE_ENV_ID: "${CLOUDBASE_ENV_ID}"
+    TCB_REGION: ap-shanghai
+
+auth:
+  type: api_key
+  env:
+    - name: CLOUDBASE_API_KEY
+      prompt: "CloudBase environment API key"
+      required: true
+      secret: true
+    - name: CLOUDBASE_ENV_ID
+      prompt: "CloudBase environment ID"
+      required: true
+      secret: false
+
+tools:
+  # Exact tools marked readOnlyHint=true by the pinned server. Read-only does
+  # not mean non-sensitive: database rows, logs, permissions, and object lists
+  # may still expose production data, so users should prune further as needed.
+  default_enabled:
+    - queryEnv
+    - readNoSqlDatabaseStructure
+    - readNoSqlDatabaseContent
+    - manageDataModel
+    - queryPgDatabase
+    - queryPgStorage
+    - queryMysqlDatabase
+    - queryFunctions
+    - queryHosting
+    - queryStorage
+    - searchKnowledgeBase
+    - queryCloudRun
+    - queryGateway
+    - queryAppAuth
+    - queryApps
+    - queryPermissions
+    - queryLogs
+    - queryAgents
+
+suggest:
+  keywords:
+    - cloudbase
+    - 云开发
+    - 腾讯云开发
+  hosts:
+    - cloud.tencent.com
+    - cloudbase.net
+
+post_install: |
+  Use a CloudBase environment-level API key and the matching environment ID.
+  The catalog defaults to the mainland-China `ap-shanghai` region and enables
+  only tools the pinned server labels read-only. Those tools may still reveal
+  sensitive database content, logs, identities, permissions, and object names;
+  narrow the selection with `hermes mcp configure tencent-cloudbase` for
+  production environments.
+
+  All mutating manage/write tools and the general `callCloudApi` escape hatch
+  are disabled by default. Start a new Hermes session after installation.

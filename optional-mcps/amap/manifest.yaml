@@ -1,0 +1,59 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: amap
+description: Mainland China geocoding, POI search, weather, distance, and route planning with Amap (Gaode).
+source: https://lbs.amap.com/api/mcp-server/gettingstarted
+
+# Official vendor-hosted Streamable HTTP endpoint. Amap retired its legacy
+# SSE endpoint in March 2026. The Web Service key is required as a query
+# parameter; the ${...} placeholder keeps the literal secret out of config.
+transport:
+  type: http
+  url: "https://mcp.amap.com/mcp?key=${MCP_AMAP_API_KEY}"
+
+auth:
+  type: api_key
+  env:
+    - name: MCP_AMAP_API_KEY
+      prompt: "Amap Web Service API key"
+      required: true
+      secret: true
+
+tools:
+  # The three maps_schema_* tools create Amap app handoff/deep links. Keep the
+  # default surface to data queries and route calculations; users can opt into
+  # navigation, taxi, and personal-map links with `hermes mcp configure amap`.
+  default_enabled:
+    - maps_direction_bicycling
+    - maps_direction_driving
+    - maps_direction_transit_integrated
+    - maps_direction_walking
+    - maps_distance
+    - maps_geo
+    - maps_regeocode
+    - maps_ip_location
+    - maps_around_search
+    - maps_search_detail
+    - maps_text_search
+    - maps_weather
+
+suggest:
+  keywords:
+    - amap
+    - gaode
+    - 高德
+    - 高德地图
+  hosts:
+    - amap.com
+
+post_install: |
+  Create an application in the Amap Open Platform and add a Key whose service
+  platform is "Web 服务" (Web Service), then provide that Key when prompted.
+  The credential is stored in the Hermes profile .env; config.yaml retains
+  only its placeholder.
+
+  Navigation, taxi, and personal-map handoff tools are disabled by default.
+  Enable them later with `hermes mcp configure amap` if needed, then start a
+  new Hermes session so the selected tools load.

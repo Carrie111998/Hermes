@@ -1,0 +1,76 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: feishu
+description: Feishu/Lark messages, documents, Base, contacts, and Wiki through the official OpenAPI MCP server.
+source: https://github.com/larksuite/lark-openapi-mcp
+
+# Official stdio package. v0.5.1 was released on 2025-08-06 and requires
+# Node.js 20+. Application identity is the conservative default; upstream's
+# interactive user OAuth mode is still marked beta.
+transport:
+  type: stdio
+  command: npx
+  args:
+    - -y
+    - "@larksuiteoapi/lark-mcp@0.5.1"
+    - mcp
+    - --tools
+    - preset.light
+    - --tool-name-case
+    - snake
+    - --token-mode
+    - tenant_access_token
+  version: "0.5.1"
+  env:
+    APP_ID: "${APP_ID}"
+    APP_SECRET: "${APP_SECRET}"
+    LARK_DOMAIN: "${LARK_DOMAIN}"
+
+auth:
+  type: api_key
+  env:
+    - name: APP_ID
+      prompt: "Feishu/Lark application App ID"
+      required: true
+      secret: false
+    - name: APP_SECRET
+      prompt: "Feishu/Lark application App Secret"
+      required: true
+      secret: true
+    - name: LARK_DOMAIN
+      prompt: "Open Platform domain"
+      default: "https://open.feishu.cn"
+      required: true
+      secret: false
+
+tools:
+  # preset.light exposes three mutations (record creation, message sending,
+  # document import). Keep the default surface read-only.
+  default_enabled:
+    - bitable_v1_appTableRecord_search
+    - contact_v3_user_batchGetId
+    - docx_v1_document_rawContent
+    - im_v1_chat_search
+    - im_v1_message_list
+    - wiki_v2_space_getNode
+
+suggest:
+  keywords:
+    - feishu
+    - lark
+    - 飞书
+  hosts:
+    - feishu.cn
+    - larksuite.com
+
+post_install: |
+  Requires Node.js 20 or newer. Create the application in the platform matching
+  the configured domain: https://open.feishu.cn for mainland-China Feishu, or
+  https://open.larksuite.com for global Lark. Grant only the OpenAPI permissions
+  required by the enabled tools and publish/enable the app for the tenant.
+
+  The default uses tenant application identity and excludes record creation,
+  message sending, and document import. Enable write tools only deliberately
+  with `hermes mcp configure feishu`, then start a new Hermes session.

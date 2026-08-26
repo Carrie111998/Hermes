@@ -1,0 +1,53 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: baidu-maps
+description: Mainland China geocoding, POI search, routing, weather, and live traffic with Baidu Maps.
+source: https://lbsyun.baidu.com/faq/api?title=mcpserver/quickstart
+
+# Official vendor-hosted Streamable HTTP endpoint. The older /sse transport is
+# legacy. Baidu requires a server-side AK in the `ak` query parameter.
+transport:
+  type: http
+  url: "https://mcp.map.baidu.com/mcp?ak=${MCP_BAIDU_MAPS_API_KEY}"
+
+auth:
+  type: api_key
+  env:
+    - name: MCP_BAIDU_MAPS_API_KEY
+      prompt: "Baidu Maps server-side AK"
+      required: true
+      secret: true
+
+tools:
+  # IP location is privacy-sensitive when called without an explicit IP, and
+  # POI extraction sends free-form text and requires an advanced-service
+  # entitlement. Both remain available through the tool picker.
+  default_enabled:
+    - map_geocode
+    - map_reverse_geocode
+    - map_search_places
+    - map_place_details
+    - map_directions_matrix
+    - map_directions
+    - map_weather
+    - map_road_traffic
+
+suggest:
+  keywords:
+    - baidu maps
+    - 百度地图
+  hosts:
+    - baidu.com
+    - map.baidu.com
+
+post_install: |
+  Create a server-side AK in the Baidu Maps Open Platform console, then provide
+  it when prompted. The credential is stored in the Hermes profile .env;
+  config.yaml retains only its placeholder.
+
+  `map_ip_location` and `map_poi_extract` are disabled by default for privacy
+  and entitlement reasons. Enable them with `hermes mcp configure baidu-maps`
+  if needed. Baidu's server uses BD-09 coordinates; do not mix them directly
+  with Amap's GCJ-02 coordinates.

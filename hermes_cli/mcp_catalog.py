@@ -277,6 +277,18 @@ def _parse_manifest(path: Path) -> CatalogEntry:
                 f"'{_required_key}' (the key the Authorization header references)"
             )
 
+    if t_type == "stdio":
+        # Process arguments are visible to same-host process inspection and may
+        # be captured by launcher diagnostics. Secrets must be delivered via
+        # transport.env instead of interpolated into argv.
+        for spec in env_list:
+            placeholder = "${" + spec.name + "}"
+            if spec.secret and any(placeholder in arg for arg in transport.args):
+                raise CatalogError(
+                    f"{path}: secret auth env '{spec.name}' must not appear in "
+                    "transport.args; pass it through transport.env"
+                )
+
     tools_raw = data.get("tools") or {}
     if not isinstance(tools_raw, dict):
         raise CatalogError(f"{path}: 'tools' must be a mapping")
