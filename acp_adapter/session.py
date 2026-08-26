@@ -166,6 +166,28 @@ def _clear_task_cwd(task_id: str) -> None:
         logger.debug("Failed to clear ACP task cwd override", exc_info=True)
 
 
+_CLOSED_BOOK_TOOL_NAMES = frozenset({"terminal", "process"})
+
+
+def _enforce_closed_book_agent(agent: Any) -> Any:
+    """Pin an ACP agent to the local terminal surface with no learned context helpers."""
+    agent.enabled_toolsets = ["terminal"]
+    agent.disabled_toolsets = ["memory"]
+    agent.skip_context_files = True
+    agent.skip_memory = True
+    tools = getattr(agent, "tools", None)
+    if isinstance(tools, list):
+        agent.tools = [
+            tool
+            for tool in tools
+            if (tool.get("function") or {}).get("name") in _CLOSED_BOOK_TOOL_NAMES
+        ]
+        agent.valid_tool_names = {
+            (tool.get("function") or {}).get("name") for tool in agent.tools
+        }
+    return agent
+
+
 @dataclass
 class SessionState:
     """Tracks per-session state for an ACP-managed Hermes agent."""
@@ -181,6 +203,7 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    closed_book: bool = False
 
 
 class SessionManager:
@@ -207,19 +230,22 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
+    def create_session(self, cwd: str = ".", *, closed_book: bool = False) -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent."""
         import threading
 
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(session_id=session_id, cwd=cwd, closed_book=closed_book)
+        if closed_book:
+            agent = _enforce_closed_book_agent(agent)
         state = SessionState(
             session_id=session_id,
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
             cancel_event=threading.Event(),
+            closed_book=closed_book,
         )
         with self._lock:
             self._sessions[session_id] = state
@@ -608,6 +634,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        closed_book: bool = False,
     ):
         if self._agent_factory is not None:
             return self._agent_factory()
@@ -626,7 +653,7 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
-        configured_mcp_servers = [
+        configured_mcp_servers = [] if closed_book else [
             name
             for name, cfg in (config.get("mcp_servers") or {}).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
@@ -635,9 +662,12 @@ class SessionManager:
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
-                ["hermes-acp"],
+                ["terminal"] if closed_book else ["hermes-acp"],
                 mcp_server_names=configured_mcp_servers,
             ),
+            "disabled_toolsets": ["memory"] if closed_book else None,
+            "skip_context_files": closed_book,
+            "skip_memory": closed_book,
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
@@ -674,15 +704,16 @@ class SessionManager:
         # ``mcp_discovery_timeout`` (config.yaml, default ~1.5s) so a dead
         # server can't block — servers that miss the bound are picked up by
         # the automatic late-refresh (see HermesACPAgent._schedule_mcp_late_refresh).
-        try:
-            from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+        if not closed_book:
+            try:
+                from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-            ensure_mcp_discovery_before_agent_build(
-                logger=logger,
-                thread_name="acp-mcp-discovery",
-            )
-        except Exception:
-            logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
+                ensure_mcp_discovery_before_agent_build(
+                    logger=logger,
+                    thread_name="acp-mcp-discovery",
+                )
+            except Exception:
+                logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
         agent = AIAgent(**kwargs)
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
@@ -692,4 +723,4 @@ class SessionManager:
         # ACP stdio transport requires stdout to remain protocol-only JSON-RPC.
         # Route any incidental human-readable agent output to stderr instead.
         agent._print_fn = _acp_stderr_print
-        return agent
+        return _enforce_closed_book_agent(agent) if closed_book else agent
