@@ -424,12 +424,9 @@ def parse_contract(text: str) -> Tuple[str, GoalContract]:
 # Autonomous-mode + file-goal input resolution
 # ──────────────────────────────────────────────────────────────────────
 
-# Autonomous-mode switches. The DASHED forms (--auto/--autonomous) are
-# unambiguous and accepted anywhere in the argument. The BARE keywords
-# (auto/autonomous) are accepted ONLY as the leading token — a subcommand-style
-# keyword like `/goal draft ...`, matching the `/fast on` toggle feel — so
-# ordinary prose that merely contains "auto"/"autonomous" later on (e.g.
-# "ship the autonomous drone") is never silently altered.
+# Autonomous-mode switches. The dashed forms (--auto/--autonomous) are
+# unambiguous and accepted anywhere in the argument. A bare keyword is accepted
+# only when it is the entire argument. It must never consume part of goal prose.
 _AUTONOMOUS_DASH_FLAGS = {"--auto", "--autonomous"}
 _AUTONOMOUS_BARE_KEYWORDS = {"auto", "autonomous"}
 
@@ -460,11 +457,11 @@ def resolve_goal_input(
 
     Two additive behaviours on top of plain goal text:
 
-      * Autonomous mode: a leading bare keyword (``auto`` / ``autonomous``,
-        subcommand-style like ``/goal auto ship it``) or a ``--auto`` /
-        ``--autonomous`` flag anywhere in the argument opts the goal in and is
-        stripped from the text. A bare keyword that is NOT leading stays part of
-        the goal (so "ship the autonomous drone" is untouched).
+      * Autonomous mode: a ``--auto`` / ``--autonomous`` flag anywhere in the
+        argument opts the goal in and is stripped from the text. For backwards
+        compatibility, a bare ``auto`` / ``autonomous`` keyword is also accepted
+        when it is the entire argument. A bare keyword in goal prose always stays
+        in the goal, including in the leading position.
         ``autonomous_default`` (from config) seeds the flag when no explicit
         switch is present.
       * If what remains is a single path-like token pointing at a readable file,
@@ -480,11 +477,9 @@ def resolve_goal_input(
     autonomous = bool(autonomous_default)
 
     tokens = text.split()
-    # Bare keyword only counts as a switch when it's the LEADING token, so a
-    # subcommand-style `/goal auto ship it` or `/goal autonomous ./GOAL.md`
-    # enables autonomous mode while prose like "ship the autonomous drone" does
-    # not. The token is consumed only in the leading position.
-    if tokens and tokens[0].lower() in _AUTONOMOUS_BARE_KEYWORDS:
+    # A bare keyword is a switch only when it is the entire argument. This keeps
+    # the old shorthand without consuming a leading word from normal goal prose.
+    if len(tokens) == 1 and tokens[0].lower() in _AUTONOMOUS_BARE_KEYWORDS:
         autonomous = True
         tokens = tokens[1:]
 

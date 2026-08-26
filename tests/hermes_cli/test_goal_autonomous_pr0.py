@@ -44,21 +44,31 @@ class TestResolveGoalInputFlags:
         assert text == "ship the widget"
         assert autonomous is True
 
-    def test_leading_bare_keyword_auto_enables(self):
-        # Subcommand-style: `/goal auto ship it` enables autonomous mode and
-        # consumes the leading keyword (like `/goal draft ...`).
+    @pytest.mark.parametrize("keyword", ["auto", "autonomous"])
+    def test_bare_keyword_only_enables_when_it_is_the_entire_argument(self, keyword):
         from hermes_cli.goals import resolve_goal_input
 
-        text, autonomous, _ = resolve_goal_input("auto ship the widget")
-        assert text == "ship the widget"
+        text, autonomous, _ = resolve_goal_input(keyword)
+        assert text == ""
         assert autonomous is True
 
-    def test_leading_bare_keyword_autonomous_enables(self):
+    def test_autonomous_goal_prose_is_literal_and_non_autonomous(self):
         from hermes_cli.goals import resolve_goal_input
 
-        text, autonomous, _ = resolve_goal_input("autonomous do the thing")
-        assert text == "do the thing"
-        assert autonomous is True
+        text, autonomous, note = resolve_goal_input(
+            "autonomous drone surveillance pipeline"
+        )
+        assert text == "autonomous drone surveillance pipeline"
+        assert autonomous is False
+        assert note == ""
+
+    def test_auto_goal_prose_is_literal_and_non_autonomous(self):
+        from hermes_cli.goals import resolve_goal_input
+
+        text, autonomous, note = resolve_goal_input("auto remediation workflow")
+        assert text == "auto remediation workflow"
+        assert autonomous is False
+        assert note == ""
 
     def test_non_leading_bare_autonomous_is_NOT_a_switch(self):
         # Regression: a bare keyword that is not the leading token stays part of
@@ -131,17 +141,16 @@ class TestResolveGoalInputFile:
         assert autonomous is True
         assert "loaded goal from" in note
 
-    def test_leading_keyword_plus_file_loads_and_sets_autonomous(self, tmp_path):
-        # The user-facing combined form: `/goal auto ./GOAL.md`.
+    def test_leading_keyword_plus_file_remains_literal_goal_prose(self, tmp_path):
         from hermes_cli.goals import resolve_goal_input
 
         (tmp_path / "GOAL.md").write_text("keyword file goal")
         text, autonomous, note = resolve_goal_input(
             "auto GOAL.md", cwd=str(tmp_path)
         )
-        assert text == "keyword file goal"
-        assert autonomous is True
-        assert "loaded goal from" in note
+        assert text == "auto GOAL.md"
+        assert autonomous is False
+        assert note == ""
 
     def test_missing_file_path_falls_back_to_literal_text(self):
         # A path-looking token that does not resolve to a file is treated as
