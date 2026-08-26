@@ -42,12 +42,22 @@ async function type(cdp, sel, text) {
 
 async function press(cdp, key) {
   const map = {
-    Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+    Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, commands: ['Enter'] },
     Escape: { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 },
     Backspace: { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 }
   }
   const def = map[key]
   if (!def) throw new Error(`unsupported key: ${key} (try Enter/Escape/Backspace)`)
+
+  // Ensure the composer (or last-focused editable) keeps focus so the key lands
+  // where a human expects. Without this, a click elsewhere between type and press
+  // blurs the composer and Enter is swallowed — exactly the silent-fail class
+  // this server exists to reproduce.
+  await cdp.eval(`(() => {
+    const el = document.querySelector('[data-slot="composer-rich-input"]') || document.activeElement
+    if (el && typeof el.focus === 'function') el.focus()
+    return true
+  })()`).catch(() => {})
 
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...def })
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...def })
