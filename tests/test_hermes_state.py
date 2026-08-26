@@ -4115,6 +4115,157 @@ class TestSessionPinAndStaleArchive:
 
 
 
+class TestSessionDisposition:
+    """Taxonomy disposition: setter + list/count filters (schema columns)."""
+
+    def test_set_disposition_roundtrip(self, db):
+        db.create_session(session_id="s1", source="cli")
+        assert db.set_session_disposition("s1", "project", "Hermes Community Extensions", "Fusion Router") is True
+        rows = db.list_sessions_rich(disposition="project", limit=10)
+        assert len(rows) == 1
+        assert rows[0]["disposition"] == "project"
+        assert rows[0]["project_group"] == "Hermes Community Extensions"
+        assert rows[0]["project"] == "Fusion Router"
+
+    def test_clear_disposition(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.set_session_disposition("s1", "archive", "Hermes infra", None)
+        assert db.set_session_disposition("s1", clear=True) is True
+        rows = db.list_sessions_rich(disposition="archive", limit=10)
+        assert rows == []
+        # Row still exists, just unclassified.
+        assert db.get_session("s1")["disposition"] is None
+
+    def test_list_filters_by_disposition(self, db):
+        for sid, disp in [("a", "project"), ("b", "archive"), ("c", "transient"), ("d", "junk")]:
+            db.create_session(session_id=sid, source="cli")
+            db.set_session_disposition(sid, disp, None, None)
+
+        assert [s["id"] for s in db.list_sessions_rich(disposition="project", limit=10)] == ["a"]
+        # Unclassified rows (disposition NULL) survive the exclusion filter.
+        db.create_session(session_id="e", source="cli")
+        assert [s["id"] for s in db.list_sessions_rich(exclude_dispositions=["transient", "junk"], limit=10)] == ["e", "b", "a"]
+
+    def test_count_matches_list_filters(self, db):
+        for sid, disp in [("a", "project"), ("b", "archive"), ("c", "transient"), ("d", "junk")]:
+            db.create_session(session_id=sid, source="cli")
+            db.set_session_disposition(sid, disp, None, None)
+
+        assert db.session_count(disposition="project") == 1
+        assert db.session_count(exclude_dispositions=["transient", "junk"]) == 2
+
+    def test_disposition_flows_through_compact_rows(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.set_session_disposition("s1", "project", "Hermes infra", None)
+        rows = db.list_sessions_rich(compact_rows=True, disposition="project", limit=10)
+        assert rows[0]["disposition"] == "project"
+        assert rows[0]["project_group"] == "Hermes infra"
+
+    def test_pinned_transient_survives_disposition_exclusion(self, db):
+        """A pin is explicit user intent and overrides derived taxonomy.
+
+        The sidebar fetches recents excluding transient/junk; a session the
+        user pinned MUST still reach the Pinned section even when its
+        disposition would hide it from Projects/Archives.
+        """
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="probe")
+        db.set_session_disposition("s1", "transient", None, None)
+        db.set_session_pinned("s1", True)
+
+        rows = db.list_sessions_rich(
+            limit=3,
+            min_message_count=1,
+            order_by_last_active=True,
+            exclude_dispositions=["transient", "junk"],
+            include_pinned=True,
+        )
+        ids = [s["id"] for s in rows]
+        assert "s1" in ids, "pinned transient session must survive the exclusion"
+        assert rows[0]["pinned"] is True or any(s["pinned"] for s in rows)
+
+    def test_pinned_transient_still_excluded_without_backfill(self, db):
+        """Without include_pinned, the disposition exclusion applies normally."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="probe")
+        db.set_session_disposition("s1", "transient", None, None)
+        db.set_session_pinned("s1", True)
+
+        rows = db.list_sessions_rich(
+            limit=3,
+            min_message_count=1,
+            order_by_last_active=True,
+            exclude_dispositions=["transient", "junk"],
+            include_pinned=False,
+        )
+        assert all(s["id"] != "s1" for s in rows)
+
+    def test_set_disposition_validates_allowlist(self, db):
+        """Unknown dispositions are rejected at the setter, not stored."""
+        db.create_session(session_id="s1", source="cli")
+        with pytest.raises(ValueError):
+            db.set_session_disposition("s1", "banana", None, None)
+        with pytest.raises(ValueError):
+            db.set_session_disposition("s1", "PROJECT", None, None)
+
+    def test_set_disposition_rejects_project_without_disposition(self, db):
+        """project_group/project require a disposition (unless clearing)."""
+        db.create_session(session_id="s1", source="cli")
+        with pytest.raises(ValueError):
+            db.set_session_disposition("s1", None, "Hermes", None)
+        with pytest.raises(ValueError):
+            db.set_session_disposition("s1", None, None, "Fusion Router")
+
+    def test_set_disposition_rejects_oversized_fields(self, db):
+        """project_group/project are bounded to 120 chars."""
+        db.create_session(session_id="s1", source="cli")
+        with pytest.raises(ValueError):
+            db.set_session_disposition("s1", "project", "x" * 121, None)
+        with pytest.raises(ValueError):
+            db.set_session_disposition("s1", "project", None, "y" * 121)
+
+    def test_set_disposition_clear_ignores_validation(self, db):
+        """clear=True resets to NULL and must not trip field validation."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_session_disposition("s1", "project", "Hermes", "Fusion Router")
+        assert db.set_session_disposition("s1", clear=True) is True
+        assert db.get_session("s1")["disposition"] is None
+
+    def test_count_include_pinned_mirrors_list_backfill(self, db):
+        """session_count(include_pinned=True) agrees with list_sessions_rich.
+
+        A pinned transient session survives the exclusion in both the list
+        back-fill and the count, so the sidebar total never disagrees with the
+        rows it renders.
+        """
+        db.create_session(session_id="pinned_transient", source="cli")
+        db.append_message(session_id="pinned_transient", role="user", content="probe")
+        db.set_session_disposition("pinned_transient", "transient", None, None)
+        db.set_session_pinned("pinned_transient", True)
+
+        db.create_session(session_id="normal_project", source="cli")
+        db.append_message(session_id="normal_project", role="user", content="real work")
+        db.set_session_disposition("normal_project", "project", "Hermes", None)
+
+        rows = db.list_sessions_rich(
+            limit=10,
+            min_message_count=1,
+            order_by_last_active=True,
+            disposition="project",
+            include_pinned=True,
+        )
+        ids = [s["id"] for s in rows]
+        assert set(ids) == {"pinned_transient", "normal_project"}, (
+            "pinned back-fill must surface the pinned transient row"
+        )
+        assert db.session_count(
+            disposition="project", include_pinned=True, exclude_children=True
+        ) == 2, "count must include the pinned back-filled row"
+        assert db.session_count(
+            disposition="project", include_pinned=False, exclude_children=True
+        ) == 1
+
+
 class TestSessionIdSearch:
     """Session id search backs Desktop's Search Sessions UX."""
 

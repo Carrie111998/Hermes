@@ -477,6 +477,53 @@ class TestWebServerEndpoints:
             "sidebar-stale"
         ]
 
+    def test_profiles_sidebar_returns_taxonomy_slices(self):
+        """The batched sidebar route returns projects + archives slices.
+
+        The taxonomy-driven sidebar renders Projects (disposition=project) and
+        Archives (disposition=archive) as the primary organization; transient
+        and junk never surface as their own slice, and recents/messaging can
+        exclude them via the disposition exclusion params.
+        """
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("proj-a", source="cli")
+            seed.append_message(session_id="proj-a", role="user", content="Build the fusion router plugin")
+            seed.set_session_disposition("proj-a", "project", "Hermes Community Extensions", "Fusion Router")
+
+            seed.create_session("proj-b", source="telegram")
+            seed.append_message(session_id="proj-b", role="user", content="Thin remote PWA grid")
+            seed.set_session_disposition("proj-b", "project", "Hermes Community Extensions", "Thin Remote")
+
+            seed.create_session("arch-a", source="cli")
+            seed.append_message(session_id="arch-a", role="user", content="Old finished work")
+            seed.set_session_disposition("arch-a", "archive", "Hermes infra", None)
+
+            seed.create_session("noise-a", source="cron")
+            seed.append_message(session_id="noise-a", role="user", content="scheduled run")
+            seed.set_session_disposition("noise-a", "transient", None, None)
+        finally:
+            seed.close()
+
+        # Recents: transient/junk are always excluded server-side (review #11).
+        response = self.client.get("/api/profiles/sessions/sidebar?recents_limit=50")
+        assert response.status_code == 200
+        payload = response.json()
+        assert {row["id"] for row in payload["projects"]["sessions"]} == {"proj-a", "proj-b"}
+        assert [row["id"] for row in payload["archives"]["sessions"]] == ["arch-a"]
+        # Taxonomy rows carry the grouping fields to the renderer.
+        proj = next(row for row in payload["projects"]["sessions"] if row["id"] == "proj-a")
+        assert proj["project_group"] == "Hermes Community Extensions"
+        assert proj["project"] == "Fusion Router"
+        assert proj["disposition"] == "project"
+        recents_ids = {row["id"] for row in payload["recents"]["sessions"]}
+        assert "noise-a" not in recents_ids
+        assert "proj-a" in recents_ids
+
     def test_startup_eager_reconcile_heals_stale_store(self):
         """The lifespan's eager reconcile brings a stale store current.
 
@@ -5053,3 +5100,154 @@ class TestSessionPatchUnread:
         # a string outside the accepted set to prove validation rejects it.
         resp = self.auth_client.patch("/api/sessions/s1", json={"unread": "maybe"})
         assert resp.status_code == 422  # pydantic validation
+
+
+class TestSessionPatchDisposition:
+    """PATCH /api/sessions/{id} taxonomy writer (disposition/project_group/project)."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        monkeypatch.setattr(
+            hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db"
+        )
+
+        self.client = TestClient(app)
+        self.auth_client = TestClient(app)
+        self.auth_client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message(session_id="s1", role="user", content="hi")
+        finally:
+            db.close()
+
+    def _rows(self):
+        return self.auth_client.get("/api/sessions?limit=100").json()["sessions"]
+
+    def test_patch_classifies_session(self):
+        resp = self.auth_client.patch(
+            "/api/sessions/s1",
+            json={
+                "disposition": "project",
+                "project_group": "Hermes Community Extensions",
+                "project": "Fusion Router",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["disposition"] == "project"
+        assert body["project_group"] == "Hermes Community Extensions"
+        assert body["project"] == "Fusion Router"
+
+        row = next(s for s in self._rows() if s["id"] == "s1")
+        assert row["disposition"] == "project"
+        assert row["project_group"] == "Hermes Community Extensions"
+        assert row["project"] == "Fusion Router"
+
+    def test_patch_rejects_unknown_disposition(self):
+        resp = self.auth_client.patch("/api/sessions/s1", json={"disposition": "banana"})
+        assert resp.status_code == 400
+
+    def test_patch_rejects_project_without_disposition(self):
+        resp = self.auth_client.patch(
+            "/api/sessions/s1", json={"project_group": "Hermes"}
+        )
+        assert resp.status_code == 400
+
+    def test_patch_disposition_alone_accepted(self):
+        resp = self.auth_client.patch("/api/sessions/s1", json={"disposition": "archive"})
+        assert resp.status_code == 200
+        assert resp.json()["disposition"] == "archive"
+        assert resp.json()["project_group"] is None
+
+    def test_patch_disposition_only_writes_when_set(self):
+        """A PATCH with only title must not touch disposition (leave-alone)."""
+        self.auth_client.patch(
+            "/api/sessions/s1",
+            json={
+                "disposition": "project",
+                "project_group": "Hermes",
+                "project": "Agora",
+            },
+        )
+        resp = self.auth_client.patch("/api/sessions/s1", json={"title": "renamed"})
+        assert resp.status_code == 200
+        row = next(s for s in self._rows() if s["id"] == "s1")
+        assert row["disposition"] == "project"
+        assert row["project"] == "Agora"
+        assert row["title"] == "renamed"
+
+    def test_patch_rejects_oversized_project(self):
+        resp = self.auth_client.patch(
+            "/api/sessions/s1", json={"disposition": "project", "project": "y" * 121}
+        )
+        assert resp.status_code == 400
+
+
+class TestProfilesSessionsDispositionValidation:
+    """GET /api/profiles/sessions disposition param validation."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        monkeypatch.setattr(
+            hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db"
+        )
+
+        self.client = TestClient(app)
+        self.auth_client = TestClient(app)
+        self.auth_client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message(session_id="s1", role="user", content="hi")
+        finally:
+            db.close()
+
+    def test_unknown_disposition_400(self):
+        resp = self.auth_client.get(
+            "/api/profiles/sessions?disposition=banana&profile=default"
+        )
+        assert resp.status_code == 400
+
+    def test_unknown_exclude_disposition_400(self):
+        resp = self.auth_client.get(
+            "/api/profiles/sessions?exclude_dispositions=transient,nope&profile=default"
+        )
+        assert resp.status_code == 400
+
+    def test_oversized_csv_400(self):
+        values = ",".join(f"v{i}" for i in range(9))
+        resp = self.auth_client.get(
+            f"/api/profiles/sessions?exclude_sources={values}&profile=default"
+        )
+        assert resp.status_code == 400
+
+    def test_valid_disposition_ok(self):
+        resp = self.auth_client.get(
+            "/api/profiles/sessions?disposition=project&profile=default"
+        )
+        assert resp.status_code == 200

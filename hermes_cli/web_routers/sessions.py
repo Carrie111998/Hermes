@@ -710,8 +710,10 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
     restores the session; ``pinned`` sets the durable keep flag (exempts the
     session from the auto-archive sweep); ``unread`` toggles the read-state
     watermark (True = explicitly unread, False = read up to now — see
-    ``SessionDB.set_session_read``). Any field may be omitted. ``profile``
-    targets another profile's session.
+    ``SessionDB.set_session_read``); ``disposition`` / ``project_group`` /
+    ``project`` assign the session taxonomy (see
+    ``SessionDB.set_session_disposition``). Any field may be omitted.
+    ``profile`` targets another profile's session.
     """
     db = _open_session_db_for_profile(body.profile, read_only=False)
     try:
@@ -723,10 +725,13 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             and body.archived is None
             and body.pinned is None
             and body.unread is None
+            and body.disposition is None
+            and body.project_group is None
+            and body.project is None
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Nothing to update; provide 'title', 'archived', 'pinned', and/or 'unread'.",
+                detail="Nothing to update; provide 'title', 'archived', 'pinned', 'unread', 'disposition', 'project_group', and/or 'project'.",
             )
         if body.title is not None:
             try:
@@ -740,6 +745,22 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             db.set_session_pinned(sid, body.pinned)
         if body.unread is not None:
             db.set_session_read(sid, read=not body.unread)
+        if (
+            body.disposition is not None
+            or body.project_group is not None
+            or body.project is not None
+        ):
+            try:
+                db.set_session_disposition(
+                    sid,
+                    body.disposition,
+                    body.project_group,
+                    body.project,
+                )
+            except ValueError as e:
+                # Invalid disposition, oversized fields, or project_group/
+                # project without a disposition.
+                raise HTTPException(status_code=400, detail=str(e))
         result = {"ok": True, "title": db.get_session_title(sid) or ""}
         if body.archived is not None:
             result["archived"] = bool(body.archived)
@@ -747,6 +768,14 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             result["pinned"] = bool(body.pinned)
         if body.unread is not None:
             result["unread"] = bool(body.unread)
+        if (
+            body.disposition is not None
+            or body.project_group is not None
+            or body.project is not None
+        ):
+            result["disposition"] = body.disposition
+            result["project_group"] = body.project_group
+            result["project"] = body.project
         return result
     finally:
         db.close()

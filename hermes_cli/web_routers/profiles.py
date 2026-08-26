@@ -43,6 +43,53 @@ from hermes_cli.web_models import (
     SessionPrScanBody,
 )
 
+# Session taxonomy allowlist (must match hermes_state.SessionDB
+# set_session_disposition). Unknown dispositions silently vanish from every
+# sidebar bucket, so reject them at the boundary instead.
+_DISPOSITION_ALLOWLIST = {"project", "archive", "transient", "junk"}
+_MAX_CSV_ENTRIES = 8
+
+
+def _parse_csv_param(value: Optional[str], param_name: str) -> List[str]:
+    """Parse a comma-separated query param into a stripped, bounded list.
+
+    Filters on the stripped value but stores the stripped value (the old
+    behavior filtered untrimmed entries yet kept the raw string, so a caller
+    passing ``a , b`` would filter on ``a``/``b`` but store ``a ``/`` b``).
+    Bounds the list so a hostile query can't explode the WHERE clause.
+    """
+    if not value:
+        return []
+    items = [s.strip() for s in value.split(",") if s.strip()]
+    if len(items) > _MAX_CSV_ENTRIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{param_name}: at most {_MAX_CSV_ENTRIES} comma-separated values",
+        )
+    return items
+
+
+def _validate_dispositions(
+    disposition: Optional[str], exclude_dispositions: Optional[str]
+) -> None:
+    """400 on unknown disposition values (single or CSV)."""
+    for raw, param_name in (
+        (disposition, "disposition"),
+        (exclude_dispositions, "exclude_dispositions"),
+    ):
+        if not raw:
+            continue
+        values = _parse_csv_param(raw, param_name)
+        unknown = [v for v in values if v not in _DISPOSITION_ALLOWLIST]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{param_name}: unknown disposition(s) {', '.join(unknown)}; "
+                    f"must be one of project/archive/transient/junk"
+                ),
+            )
+
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
 
@@ -234,6 +281,8 @@ def get_profiles_sessions(
     sources: str = None,
     exclude_sources: str = None,
     full: bool = False,
+    disposition: str = None,
+    exclude_dispositions: str = None,
 ):
     """Unified, read-only session list aggregated across ALL profiles.
 
@@ -251,6 +300,7 @@ def get_profiles_sessions(
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
+    _validate_dispositions(disposition, exclude_dispositions)
 
     from hermes_cli import profiles as profiles_mod
 
@@ -276,8 +326,10 @@ def get_profiles_sessions(
     # the cron-jobs section passes source=cron — two independent lists so
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
-    source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
-    exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
+    source_list = _parse_csv_param(sources, "sources")
+    exclude_list = _parse_csv_param(exclude_sources, "exclude_sources")
+    disposition_filter = disposition.strip() if disposition else None
+    exclude_dispositions_list = _parse_csv_param(exclude_dispositions, "exclude_dispositions")
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -319,6 +371,8 @@ def get_profiles_sessions(
                 # Same SQL-level blob skip as /api/sessions (see above).
                 compact_rows=not full,
                 include_pinned=True,
+                disposition=disposition_filter,
+                exclude_dispositions=exclude_dispositions_list or None,
             )
             profile_total = db.session_count(
                 source=source_filter,
@@ -328,6 +382,9 @@ def get_profiles_sessions(
                 include_archived=include_archived,
                 archived_only=archived_only,
                 exclude_children=True,
+                include_pinned=True,
+                disposition=disposition_filter,
+                exclude_dispositions=exclude_dispositions_list or None,
             )
             total += profile_total
             profile_totals[name] = profile_total
@@ -376,6 +433,8 @@ def get_profiles_sessions_sidebar(
     cron_limit: int = 50,
     messaging_limit: int = 100,
     messaging_exclude: str = None,
+    projects_limit: int = 300,
+    archives_limit: int = 300,
 ):
     """Batched sidebar session slices — one profile-DB open per refresh.
 
@@ -397,7 +456,9 @@ def get_profiles_sessions_sidebar(
     ``messaging_exclude`` CSV, ``source=cron`` is implicit) so this stays
     taxonomy-agnostic like the per-slice endpoint. All three slices use
     ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
-    desktop's per-slice calls.
+    desktop's per-slice calls. Transient and junk are operational noise
+    (probes, cron echoes, tool runs) and are always excluded from the recents
+    and messaging slices server-side — they never surface in the sidebar.
     """
     from hermes_cli import profiles as profiles_mod
 
@@ -412,16 +473,24 @@ def get_profiles_sessions_sidebar(
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
     recents_scope = (recents_profile or "all").strip() or "all"
-    recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
-    messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
+    recents_exclude_list = _parse_csv_param(recents_exclude, "recents_exclude")
+    messaging_exclude_list = _parse_csv_param(messaging_exclude, "messaging_exclude")
+    # Transient + junk are operational noise and never surface in the sidebar
+    # (review #11: hardcode server-side instead of two always-constant request
+    # fields). Projects/archives slices are disposition-filtered by design.
+    _SIDEBAR_HIDDEN_DISPOSITIONS = ("transient", "junk")
 
     recents_cap = min(max(recents_limit, 1), 500)
     cron_cap = min(max(cron_limit, 1), 500)
     messaging_cap = min(max(messaging_limit, 1), 500)
+    projects_cap = min(max(projects_limit, 1), 500)
+    archives_cap = min(max(archives_limit, 1), 500)
 
     recents_rows: List[Dict[str, Any]] = []
     cron_rows: List[Dict[str, Any]] = []
     messaging_rows: List[Dict[str, Any]] = []
+    projects_rows: List[Dict[str, Any]] = []
+    archives_rows: List[Dict[str, Any]] = []
     recents_truncated: Dict[str, bool] = {}
     profile_totals: Dict[str, Dict[str, float]] = {}
     errors: List[Dict[str, str]] = []
@@ -441,7 +510,7 @@ def get_profiles_sessions_sidebar(
             s["pinned"] = bool(s.get("pinned"))
         return rows
 
-    def _slice(db, *, source=None, exclude=None, cap):
+    def _slice(db, *, source=None, exclude=None, cap, disposition=None, exclude_dispositions=None):
         return db.list_sessions_rich(
             source=source,
             exclude_sources=exclude or None,
@@ -455,6 +524,8 @@ def get_profiles_sessions_sidebar(
             # A pinned conversation must reach the sidebar even when it has
             # aged past the window — otherwise its Pinned row renders empty.
             include_pinned=True,
+            disposition=disposition,
+            exclude_dispositions=exclude_dispositions or None,
         )
 
     for name, home in targets:
@@ -472,6 +543,8 @@ def get_profiles_sessions_sidebar(
             cron_cap,
             messaging_cap,
             tuple(messaging_exclude_list),
+            projects_cap,
+            archives_cap,
         )
         slices = _sidebar_profile_cache_get(profile_cache_key)
         if slices is None:
@@ -486,7 +559,12 @@ def get_profiles_sessions_sidebar(
                 continue
             try:
                 slices = {
-                    "recents": _slice(db, exclude=recents_exclude_list, cap=recents_cap),
+                    "recents": _slice(
+                        db,
+                        exclude=recents_exclude_list,
+                        cap=recents_cap,
+                        exclude_dispositions=list(_SIDEBAR_HIDDEN_DISPOSITIONS),
+                    ),
                     # Aggregated in SQL rather than over the recents window: the
                     # window is a page, and a total that shrank when you scrolled
                     # would be worse than no total at all.
@@ -496,7 +574,16 @@ def get_profiles_sessions_sidebar(
                         db,
                         exclude=messaging_exclude_list,
                         cap=messaging_cap,
+                        exclude_dispositions=list(_SIDEBAR_HIDDEN_DISPOSITIONS),
                     ),
+                    # Taxonomy slices: active PROJECT sessions (grouped
+                    # client-side by project_group -> project) and finished
+                    # ARCHIVE sessions. TRANSIENT/JUNK never surface here —
+                    # they are hidden from the sidebar by the caller passing
+                    # them as exclusions on recents/messaging, and never
+                    # requested as their own slice.
+                    "projects": _slice(db, cap=projects_cap, disposition="project"),
+                    "archives": _slice(db, cap=archives_cap, disposition="archive"),
                 }
                 _sidebar_profile_cache_put(profile_cache_key, slices)
             except Exception as exc:
@@ -518,6 +605,8 @@ def get_profiles_sessions_sidebar(
         profile_totals[name] = slices["usage"]
         cron_rows.extend(_tag(slices["cron"], name))
         messaging_rows.extend(_tag(slices["messaging"], name))
+        projects_rows.extend(_tag(slices.get("projects", []), name))
+        archives_rows.extend(_tag(slices.get("archives", []), name))
 
     def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
         rows.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)
@@ -542,6 +631,8 @@ def get_profiles_sessions_sidebar(
             "sessions": _window(messaging_rows, messaging_cap),
             "total": len(messaging_rows),
         },
+        "projects": {"sessions": _window(projects_rows, projects_cap)},
+        "archives": {"sessions": _window(archives_rows, archives_cap)},
         "errors": errors,
     }
 

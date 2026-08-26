@@ -9571,6 +9571,102 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    def set_session_disposition(
+        self,
+        session_id: str,
+        disposition: str = None,
+        project_group: str = None,
+        project: str = None,
+        *,
+        clear: bool = False,
+    ) -> bool:
+        """Assign the taxonomy disposition for a session (and its lineage).
+
+        ``disposition`` is one of ``project`` / ``archive`` / ``transient`` /
+        ``junk`` per the approved session taxonomy; ``project_group`` is the
+        category bucket (e.g. ``Hermes Community Extensions``) and ``project``
+        the named project (e.g. ``Fusion Router``). Passing ``clear=True``
+        resets all three fields to NULL (unclassified) for the lineage.
+
+        Validation: an unknown ``disposition``, ``project_group`` /
+        ``project`` longer than 120 characters, or ``project_group`` /
+        ``project`` supplied without a ``disposition`` (and not clearing)
+        raise :class:`ValueError`.
+
+        Like :meth:`set_session_archived` / :meth:`set_session_pinned` the
+        whole compression chain is stamped as a unit, so classifying the
+        surfaced tip classifies the root (and vice-versa) no matter which id
+        the caller holds. Returns True when at least one row changed.
+        """
+        if not clear:
+            if disposition is not None and disposition not in (
+                "project",
+                "archive",
+                "transient",
+                "junk",
+            ):
+                raise ValueError(
+                    "disposition must be one of project/archive/transient/junk"
+                )
+            if disposition is None and (project_group or project):
+                raise ValueError(
+                    "project_group/project require a disposition"
+                )
+            for label, value in (
+                ("project_group", project_group),
+                ("project", project),
+            ):
+                if value is not None and len(value) > 120:
+                    raise ValueError(f"{label} must be at most 120 characters")
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET disposition = ?,
+                    project_group = ?,
+                    project = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (
+                    session_id,
+                    session_id,
+                    None if clear else disposition,
+                    None if clear else project_group,
+                    None if clear else project,
+                ),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            return rowcount
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
     def set_session_read(self, session_id: str, read: bool = True) -> bool:
         """Mark a session read or unread (and its whole compression lineage).
 
@@ -9843,6 +9939,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_pinned: bool = False,
         session_key: str = None,
         include_hidden: bool = False,
+        disposition: str = None,
+        exclude_dispositions: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -9947,6 +10045,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 0")
         if not include_hidden:
             where_clauses.append("s.hidden = 0")
+        # Disposition clauses are DERIVED taxonomy. A pin is an explicit user
+        # statement ("always reachable"), so the pinned back-fill must ignore
+        # them: a pinned transient/junk session still belongs in the Pinned
+        # section even though the taxonomy would hide it from Projects/Archives.
+        # Record where the disposition clauses start so the back-fill can build
+        # a WHERE without them.
+        disposition_clause_start = len(where_clauses)
+        disposition_param_start = len(params)
+        if disposition:
+            where_clauses.append("s.disposition = ?")
+            params.append(disposition)
+        if exclude_dispositions:
+            placeholders = ",".join("?" for _ in exclude_dispositions)
+            where_clauses.append(f"COALESCE(s.disposition, '') NOT IN ({placeholders})")
+            params.extend(exclude_dispositions)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         # Snapshot the filter params before the query builders below extend
@@ -10112,8 +10225,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # number of pins (a handful), never N+1 per pin.
         if include_pinned:
             seen_ids = {s["id"] for s in sessions}
+            # Pins override derived taxonomy: build the pinned WHERE from the
+            # same clauses MINUS the disposition filters, so a pinned
+            # transient/junk session stays in the Pinned section even when the
+            # page excludes those dispositions. The param slice matches.
+            pinned_clauses = where_clauses[:disposition_clause_start]
+            pinned_params = params[:disposition_param_start]
             pinned_where = (
-                f"{where_sql} AND s.pinned = 1" if where_sql else "WHERE s.pinned = 1"
+                f"WHERE {' AND '.join(pinned_clauses)} AND s.pinned = 1"
+                if pinned_clauses
+                else "WHERE s.pinned = 1"
             )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             pinned_query = f"""
@@ -10136,7 +10257,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ORDER BY s.started_at DESC
             """
             with self._read_ctx() as conn:
-                pinned_cursor = conn.execute(pinned_query, base_where_params)
+                pinned_cursor = conn.execute(pinned_query, pinned_params)
                 pinned_rows = pinned_cursor.fetchall()
             for row in pinned_rows:
                 s = self._session_row_dict(row)
@@ -12637,6 +12758,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        disposition: str = None,
+        exclude_dispositions: List[str] = None,
+        include_pinned: bool = False,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -12651,6 +12775,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (e.g. ``["cron"]`` so the recents "load more" total matches a
         cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
         stuck on for buried scheduler sessions).
+
+        Pass ``include_pinned=True`` to mirror ``list_sessions_rich``'s pinned
+        back-fill: pins override derived taxonomy, so pinned rows that the
+        disposition filters would have excluded still count. Keeps the count
+        consistent with the rows the matching list call returns (filter and
+        total never disagree).
         """
         where_clauses = []
         params = []
@@ -12663,11 +12793,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
         include_sources = [source] if source else list(sources or [])
         if include_sources:
-            placeholders = ",".join("?" for _ in include_sources)
+            placeholders = ", ".join("?" for _ in include_sources)
             where_clauses.append(f"s.source IN ({placeholders})")
             params.extend(include_sources)
         if exclude_sources:
-            placeholders = ",".join("?" for _ in exclude_sources)
+            placeholders = ", ".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
         if cwd_prefix:
@@ -12681,12 +12811,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if disposition:
+            where_clauses.append("s.disposition = ?")
+            params.append(disposition)
+        if exclude_dispositions:
+            placeholders = ", ".join("?" for _ in exclude_dispositions)
+            where_clauses.append(f"COALESCE(s.disposition, '') NOT IN ({placeholders})")
+            params.extend(exclude_dispositions)
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-        with self._lock:
-            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
-            return cursor.fetchone()[0]
+        def _count(clauses: list, count_params: list) -> int:
+            sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            with self._lock:
+                cursor = self._conn.execute(
+                    f"SELECT COUNT(*) FROM sessions s{sql}", count_params
+                )
+                return cursor.fetchone()[0]
+
+        total = _count(where_clauses, params)
+        if not include_pinned:
+            return total
+
+        # Mirror list_sessions_rich's pinned back-fill: pinned rows the
+        # disposition filters would have excluded still count (pins override
+        # derived taxonomy), and rows already counted by the filtered query are
+        # not double-counted.
+        disposition_clause_start = len(where_clauses) - (
+            1 if disposition else 0
+        ) - (1 if exclude_dispositions else 0)
+        disposition_param_start = len(params) - (
+            1 if disposition else 0
+        ) - len(exclude_dispositions or [])
+        pinned_clauses = where_clauses[:disposition_clause_start] + ["s.pinned = 1"]
+        pinned_params = params[:disposition_param_start]
+        pinned_total = _count(pinned_clauses, pinned_params)
+        overlap_clauses = where_clauses + ["s.pinned = 1"]
+        overlap_params = params[:]
+        overlap = _count(overlap_clauses, overlap_params)
+        return total + pinned_total - overlap
 
     def session_count_ge(self, n: int = 1) -> bool:
         """Check if at least N sessions exist (archived included).
