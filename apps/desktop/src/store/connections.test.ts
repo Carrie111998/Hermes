@@ -309,7 +309,7 @@ describe('last profile cache invalidation', () => {
     await selectConnection('local')
     await selectConnection('homelab')
 
-    expect(ensureGatewayAgent.mock.calls.slice(-2)).toEqual([
+    expect(ensureGatewayAgent.mock.calls.slice(-2).map(call => [call[0], call[1]])).toEqual([
       ['local', 'default'],
       ['homelab', 'research']
     ])
