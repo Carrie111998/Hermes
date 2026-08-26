@@ -4487,8 +4487,11 @@ _LAUNCHD_JOB_UNLOADED_EXIT_CODES = frozenset({3, 113, 125})
 #      cannot supervise the gateway at all and we degrade to a detached
 #      background process (the `nohup hermes gateway run` workaround). See #23387.
 # `_launchctl_bootstrap()` disambiguates by trying the bootout+retry (case 1)
-# first; only when that retry ALSO returns 5/125 do callers treat the domain as
-# unsupported (case 2) via `_launchctl_domain_unsupported`.
+# first; only when that retry ALSO returns 5/125 does it make one more attempt
+# through the legacy ``launchctl load -w`` (which still works on hosts where
+# the modern bootstrap is EIO-broken even with nothing loaded — measured on
+# macOS 26.5.2). Only when the legacy loader ALSO fails do callers treat the
+# domain as unsupported (case 2) via `_launchctl_domain_unsupported`.
 _LAUNCHCTL_DOMAIN_UNSUPPORTED_CODES = frozenset({5, 125})
 
 
@@ -4515,6 +4518,22 @@ def _launchctl_domain_unsupported(returncode: int) -> bool:
 _LAUNCHCTL_BOOTSTRAP_EIO = 5
 
 
+def _launchctl_load_legacy(plist_path, *, timeout: int = 30) -> None:
+    """Load a LaunchAgent via the legacy ``launchctl load -w`` command.
+
+    On some macOS 26.x hosts the modern ``launchctl bootstrap`` fails with
+    ``5: Input/output error`` (EIO) even when the label is registered in no
+    domain — the legacy loader, however, still works and registers the job in
+    ``gui/<uid>`` (measured 2026-08-27 on macOS 26.5.2, follow-up to #23387).
+    ``-w`` persists the enabled state so the job auto-starts at login.
+    """
+    subprocess.run(
+        ["launchctl", "load", "-w", str(plist_path)],
+        check=True,
+        timeout=timeout,
+    )
+
+
 def _launchctl_bootstrap(
     domain: str, plist_path, label: str, *, timeout: int = 30
 ) -> None:
@@ -4530,8 +4549,11 @@ def _launchctl_bootstrap(
     to a detached process, silently losing auto-start and crash-restart.
 
     Recover by booting the stale label out and bootstrapping once more. If the
-    retry still fails, the ``CalledProcessError`` propagates so callers apply
-    their domain-unsupported fallback for a genuinely broken domain.
+    retry still fails with 5/125, fall back to the legacy ``launchctl load -w``
+    (which works on hosts where the modern bootstrap is EIO-broken, see
+    :func:`_launchctl_load_legacy`). Only when the legacy loader also fails does
+    the ``CalledProcessError`` propagate so callers apply their
+    domain-unsupported fallback for a genuinely broken domain.
     """
     try:
         subprocess.run(
@@ -4549,11 +4571,22 @@ def _launchctl_bootstrap(
             check=False,
             timeout=timeout,
         )
-        subprocess.run(
-            ["launchctl", "bootstrap", domain, str(plist_path)],
-            check=True,
-            timeout=timeout,
-        )
+        try:
+            subprocess.run(
+                ["launchctl", "bootstrap", domain, str(plist_path)],
+                check=True,
+                timeout=timeout,
+            )
+        except subprocess.CalledProcessError as retry_exc:
+            if not _launchctl_domain_unsupported(retry_exc.returncode):
+                raise
+            # Persistent EIO with nothing loaded: the modern bootstrap is
+            # broken on this host but the domain is fine — try the legacy
+            # loader before declaring the domain unmanageable.
+            try:
+                _launchctl_load_legacy(plist_path, timeout=timeout)
+            except subprocess.CalledProcessError:
+                raise retry_exc from None
 
 
 def _launchd_reload_log_path() -> Path:
@@ -4632,7 +4665,15 @@ def _retry_launchctl_bootstrap_until_registered(
         attempt += 1
         try:
             _launchctl_bootstrap(domain, plist_path, label, timeout=30)
-            if _launchctl_label_supervising_process(label):
+            # Judge success by a live supervised PID after a short settle
+            # window, not a one-shot check: the job registers instantly but the
+            # gateway takes a few seconds to start, and on hosts where the
+            # bootstrap only succeeds via the legacy `load -w` rung an
+            # immediate miss would retry and boot the still-starting instance
+            # out again, churning it until the deadline.
+            if _wait_for_launchd_service_pid(
+                label, None, timeout=10.0, domain=domain
+            ):
                 return True
             _append_launchd_reload_log(
                 f"bootstrap attempt {attempt} exited 0 but {domain}/{label} "
@@ -5030,7 +5071,10 @@ def refresh_launchd_plist_if_needed() -> bool:
             f"sleep 1; "
             f"_deadline=$(($(date +%s) + {_reload_budget})); "
             f"while :; do "
-            f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
+            # Legacy `load -w` rung: on macOS 26.x hosts where the modern
+            # bootstrap is EIO-broken (exit 5 even with nothing loaded), the
+            # legacy loader still registers the job — mirrors _launchctl_bootstrap.
+            f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null || launchctl load -w {shlex.quote(str(plist_path))} 2>/dev/null; "
             # Require a POSITIVE PID, not just exit 0: a bare `launchctl list`
             # also succeeds for a registered-but-not-running definition, and a
             # recently-crashed job reports `"PID" = -1` — both must keep the
@@ -5439,18 +5483,16 @@ def launchd_restart():
             # Restart is the one path where the job is almost always still
             # registered (we just drained it), so a plain bootstrap would hit
             # EIO on the common case. Boot the stale label out first — cheaper
-            # and clearer here than routing through _launchctl_bootstrap's
-            # bootstrap-first/retry-on-EIO flow. See #23387, #42914.
+            # and clearer here than a bootstrap-first flow. The reload itself
+            # still routes through _launchctl_bootstrap so hosts with an
+            # EIO-broken modern bootstrap get its EIO-recovery + legacy
+            # `load -w` rungs. See #23387, #42914.
             subprocess.run(
                 ["launchctl", "bootout", target],
                 check=False,
                 timeout=90,
             )
-            subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-                check=True,
-                timeout=30,
-            )
+            _launchctl_bootstrap(_launchd_domain(), plist_path, label, timeout=30)
             subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         except subprocess.CalledProcessError as e2:
             if not _launchctl_domain_unsupported(e2.returncode):
