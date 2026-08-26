@@ -1076,47 +1076,59 @@ GET    /api/v1/outreach/campaigns/:campaignId/activity
 
 # 8. Frontend Structure
 
-## 8.1 Recommended repo structure
+This section describes the interface that exists. It previously specified a
+React application under `apps/web/src/features/*` with one route and one
+component folder per API area. That was never built, and the interface that
+shipped in its place is a different shape — so the spec is written from the
+code rather than kept as a plan nobody is following.
+
+## 8.1 Repo structure
 
 ```text
 interfaze-agent/
-  apps/
-    web/
-      src/
-        app/
-        assets/
-        components/
-        config/
-        features/
-        hooks/
-        layouts/
-        lib/
-        pages/
-        routes/
-        services/
-        stores/
-        styles/
-        types/
-
-  agent/
-    company_brain/
-    lead_discovery/
-    research/
-    contact_discovery/
-    outreach/
-    integrations/
-
-  gateway/
-  tools/
-  skills/
-  providers/
   server/
-  docs/
+    webui/            the customer and admin interface
+      index.html
+      css/            tokens.css, fonts.css, app.css, caret.css
+      fonts/          self-hosted woff2, Turkish diacritics verified
+      js/
+        main.js       route table, auth wiring, legacy redirects
+        router.js     hash router
+        shell.js      nav, header, run/approval badges
+        api.js        every endpoint, as a named method -> [verb, path] map
+        adapters.js   API payloads -> view models
+        state.js      view-model store
+        real-state.js live backend state
+        research-state.js
+        session.js    token, company scope, home route
+        ui.js         primitives, status vocabulary
+        icons.js  catalog.js  caret.js  oauth-popup.js
+        agent-bridge.js  hermes-client.js
+        pages/        one module per route, plus shared page parts
+      PRODUCT.md      design context: register, users, brand, principles
+      DESIGN.md       type, colour, spacing, component rules
+
+  agent/              agent runtime
+  server/lead_research/  discovery, scoring, evidence, facts
+  server/routes/      the /api/v1 surface in section 7
+  server/email_providers/
+  gateway/  tools/  skills/  providers/  docs/
 ```
 
-Since this is built from Hermes, preserve the useful Hermes folders, but create a clean product boundary around the SaaS web app.
+Two deliberate choices, both of which the earlier plan got wrong:
 
----
+**No build step and no framework.** The interface is vanilla ES modules served
+straight from FastAPI, so a page is a file the browser fetches. There is no
+bundler, no `node_modules` in the serving path, and no compile stage between
+editing a page and reloading it. What buys that is a small enough surface — six
+customer routes — that a component framework would cost more in machinery than
+it returns in leverage.
+
+**The design spec lives next to the interface, not here.** This file is an
+engineering spec: routes, contracts, order of work. Register, users, brand,
+voice, accessibility commitments and component rules are in
+`server/webui/PRODUCT.md` and `server/webui/DESIGN.md`, which is where the
+design tooling looks for them.
 
 ## 8.2 Frontend route structure
 
@@ -1126,22 +1138,12 @@ Since this is built from Hermes, preserve the useful Hermes folders, but create 
   /access-pending
 
 /app
-  /dashboard
-  /onboarding
-  /company-brain
-  /lead-map
-  /leads
-  /leads/:leadId
-  /contacts
-  /contacts/:contactId
-  /outreach
-  /outreach/campaigns/:campaignId
-  /custom-outreach
-  /analytics
-  /agent-runs
-  /agent-runs/:runId
-  /integrations
-  /settings
+  /today                    the operator's morning: what ran, what needs them
+  /approvals                the outbound queue; nothing leaves without it
+  /research                 campaign results, evidence-first
+  /research/new             the brief: markets, sector, what a good lead weighs
+  /setup                    company, brain, products, markets, mailbox, sending
+  /analytics                reachable from Today, deliberately off the nav
 
 /admin
   /dashboard
@@ -1149,354 +1151,148 @@ Since this is built from Hermes, preserve the useful Hermes folders, but create 
   /companies/:companyId
   /users
   /agent-runs
+  /agent-runs/:runId
+  /documents
+  /documents/:documentId
   /analytics
   /integrations
   /errors
   /logs
   /data-sources
+  /research-quality
+  /research
+  /research/new
+  /research/:campaignId
+  /research/:campaignId/edit
 ```
+
+**Four customer destinations, not sixteen.** The nav is Today, Approvals,
+Research, Setup. The earlier route list gave every API area its own page, which
+produced a menu longer than the job: an export sales director does not navigate
+to "Contacts" and then to "Leads" and then to "Outreach", he works one queue in
+the morning and reads results in the afternoon. Analytics is a real page but
+answers a question asked occasionally, so it is linked from Today rather than
+holding a permanent nav slot.
+
+What the collapse absorbed, and where each thing went:
+
+```text
+/app/dashboard          -> /app/today
+/app/onboarding         -> /app/setup
+/app/company-brain      -> /app/setup?section=brain
+/app/integrations       -> /app/setup?section=mailbox
+/app/email-templates    -> /app/setup?section=email-style
+/app/settings           -> /app/setup?section=sending
+/app/leads              -> /app/research
+/app/leads/:leadId      -> /app/research
+/app/contacts           -> /app/research
+/app/contacts/:id       -> /app/research
+/app/buyers             -> /app/research
+/app/custom-outreach    -> /app/research
+/app/lead-map           -> /app/research
+/app/outreach           -> /app/approvals
+/app/outreach/campaigns/:id -> /app/approvals
+/app/agent-runs         -> /app/today   (the log viewer is admin-only now)
+```
+
+These redirects are shipped, not documentation: `LEGACY_REDIRECTS` in
+`main.js`, each carrying whatever context the new destination can use — a
+message id opens that email in the review queue, a lead id expands that
+company.
+
+**The map is a component, not a page.** Section 2 promises map-based country
+selection and it is delivered, but as the target-markets control inside Setup
+and the country strip on Today, rendered by `pages/lead-map.js`. A whole screen
+whose only job is picking at most five countries did not earn a nav slot. The
+`/lead-map` API routes in section 7.9 are unchanged and still back it.
+
+**Research configuration is admin machinery.** Scoring weights, enrichment
+profiles and model profiles sit under `/admin/research`, because they are
+operator settings rather than customer decisions. What the customer owns is the
+brief at `/app/research/new` — which markets, which sector, what a good lead
+weighs — and the results.
 
 ---
 
-# 9. Frontend Feature Modules
+# 9. Frontend Modules
 
-## 9.1 Auth feature
+One module per route under `server/webui/js/pages/`, plus shared parts. This
+replaces the per-feature `components/hooks/services` folders specified earlier:
+with no framework there are no hooks, and the services layer is one file
+(`api.js`) for the whole application rather than one per feature.
 
-```text
-features/auth/
-  components/
-    LoginForm.tsx
-    AccessPending.tsx
-    ProtectedRoute.tsx
-    RoleGate.tsx
-  hooks/
-    useAuth.ts
-  services/
-    authApi.ts
-  types.ts
-```
-
----
-
-## 9.2 Dashboard feature
+## 9.1 Page modules
 
 ```text
-features/dashboard/
-  components/
-    DashboardHeader.tsx
-    CompanyBrainSummaryCard.tsx
-    SalesPipelineCards.tsx
-    MarketIntelligenceCards.tsx
-    RecentAgentActivity.tsx
-    RecommendedActions.tsx
-    CountryOpportunityMapPreview.tsx
-  hooks/
-    useDashboard.ts
-  services/
-    dashboardApi.ts
+pages/
+  login.js               credentials, error states
+  access-pending.js      a user with no active company
+  today.js               run activity, recommended actions, country strip
+  approvals.js           the outbound queue, fully keyboard-operable
+  research-results.js    campaign results, scores, evidence, contact discovery
+  research-brief.js      the customer's lead-search brief
+  setup.js               company, positioning, products, documents, brain,
+                         markets, mailbox, email style, sending rules
+  analytics.js           sales pipeline and market intelligence
+  admin.js               dashboard, companies, users, analytics, integrations,
+                         errors, logs, data sources, research quality
+  admin-documents.js     cross-tenant document list and detail
+  agent-runs.js          run detail for admins
+  research.js            admin campaign list
+  research-editor.js     admin campaign create/edit
+  research-detail.js     admin campaign detail
 ```
 
-Dashboard should show both sales and market intelligence:
+## 9.2 Shared page parts
 
 ```text
-Sales:
-- leads found
-- contacts found
-- emails sent
-- replies
-- interested leads
-- WhatsApp messages
-- campaign status
-
-Market intelligence:
-- best countries
-- product-market fit
-- top industries
-- source performance
-- opportunity score by country
+pages/
+  _components.js            tables, filters, badges, drawers
+  _page-utils.js            formatting, query-state, polling helpers
+  lead-map.js               the world map renderer (Setup, Today)
+  research-evidence.js      claim + source rendering (Approvals, Research)
+  research-scoring.js       weight editor (brief, admin editor)
+  research-enrichment.js    enrichment settings (admin editor)
+  research-source-picker.js source selection (admin editor)
 ```
 
----
+A shared part is a file that more than one page imports. A page module that
+nothing routes to and nothing imports is dead code, and is deleted rather than
+kept for a future that has not asked for it.
 
-## 9.3 Onboarding feature
+## 9.3 The layers under the pages
 
 ```text
-features/onboarding/
-  components/
-    OnboardingStepper.tsx
-    CompanyIdentityStep.tsx
-    PositioningStep.tsx
-    ProductCatalogStep.tsx
-    InternalSalesDataStep.tsx
-    CurrentContactsStep.tsx
-    TargetMarketsStep.tsx
-    IntegrationSetupStep.tsx
-    CompanyBrainReviewStep.tsx
-  hooks/
-    useOnboarding.ts
-  services/
-    onboardingApi.ts
-  types.ts
+api.js          one named method per endpoint, e.g.
+                'leadMap.selectCountry': ['POST', '/lead-map/selected-countries']
+adapters.js     API payloads -> view models; the only place field names are
+                translated between the backend contract and the interface
+state.js        view-model store, reset on sign-out
+real-state.js   live backend state and its subscriptions
+research-state.js  campaign-scoped state
+session.js      token, refresh, company scope, home route by role
+shell.js        nav, header, badges for pending runs and approvals
+ui.js           primitives and the shared status vocabulary
 ```
 
-Internal data upload should be a major step, not hidden under documents.
+Two rules hold across all of it, both of them product commitments rather than
+style preferences:
 
----
+**Unknown renders as unknown.** `ui.js` owns the status vocabulary
+(`unknown: 'Not known'`), and no page substitutes a zero or a plausible guess
+for a value the backend reported as missing. This is the interface half of the
+honesty rule in the scoring engine.
 
-## 9.4 Company Brain feature
+**Evidence is always reachable.** Any score, claim or lead can be opened to the
+source it came from, in the original language alongside the English. That is
+what the customer is paying for, and it is why `research-evidence.js` is shared
+by both the queue and the results rather than reimplemented in each.
 
-```text
-features/company-brain/
-  components/
-    CompanyBrainOverview.tsx
-    ProductUnderstandingPanel.tsx
-    IdealCustomerProfilePanel.tsx
-    BuyerRolesPanel.tsx
-    MarketAssumptionsPanel.tsx
-    SalesArgumentsPanel.tsx
-    MissingDataPanel.tsx
-    BrainSnapshotHistory.tsx
-  hooks/
-    useCompanyBrain.ts
-  services/
-    companyBrainApi.ts
-```
+## 9.4 Where the product UI lives
 
----
-
-## 9.5 Lead Map feature
-
-```text
-features/lead-map/
-  components/
-    WorldCountrySelector.tsx
-    CountrySidePanel.tsx
-    SelectedCountriesBar.tsx
-    LeadScanConfigModal.tsx
-    ScanDepthSelector.tsx
-    DataSourceSelector.tsx
-    ProductSelector.tsx
-    IndustrySelector.tsx
-  hooks/
-    useLeadMap.ts
-    useSelectedCountries.ts
-  services/
-    leadMapApi.ts
-```
-
-MVP behavior:
-
-```text
-Map only selects countries.
-Maximum 5 countries.
-No complex heatmap required in MVP.
-```
-
----
-
-## 9.6 Leads feature
-
-```text
-features/leads/
-  components/
-    LeadsTable.tsx
-    LeadFilters.tsx
-    LeadScoreBadge.tsx
-    LeadStatusBadge.tsx
-    LeadDetailHeader.tsx
-    LeadResearchPanel.tsx
-    LeadContactsPanel.tsx
-    LeadOutreachPanel.tsx
-    LeadActivityTimeline.tsx
-    ManualLeadCreateModal.tsx
-  hooks/
-    useLeads.ts
-    useLeadDetail.ts
-  services/
-    leadsApi.ts
-```
-
-Manual lead creation is required for custom-lead cold emails.
-
----
-
-## 9.7 Contacts feature
-
-```text
-features/contacts/
-  components/
-    ContactsTable.tsx
-    ContactFilters.tsx
-    ContactScoreBadge.tsx
-    BuyerRoleBadge.tsx
-    ContactDetailPanel.tsx
-    ContactVerificationStatus.tsx
-    ManualContactCreateModal.tsx
-  hooks/
-    useContacts.ts
-  services/
-    contactsApi.ts
-```
-
----
-
-## 9.8 Outreach feature
-
-```text
-features/outreach/
-  components/
-    OutreachCampaignsTable.tsx
-    OutreachMessageQueue.tsx
-    EmailEditor.tsx
-    EmailPreview.tsx
-    ApprovalControls.tsx
-    SendModeSelector.tsx
-    CCRuleSelector.tsx
-    LanguageSelector.tsx
-    RegenerateMessageButton.tsx
-    CustomLeadColdEmailFlow.tsx
-  hooks/
-    useOutreach.ts
-    useEmailDrafts.ts
-    useEmailSending.ts
-  services/
-    outreachApi.ts
-    emailApi.ts
-```
-
-Send modes:
-
-```text
-create_draft
-approved_send
-```
-
----
-
-## 9.9 Custom Outreach feature
-
-```text
-features/custom-outreach/
-  components/
-    CustomLeadForm.tsx
-    CustomContactForm.tsx
-    CustomLeadResearchStep.tsx
-    CustomEmailGenerator.tsx
-    CustomEmailApproval.tsx
-    CustomEmailSendResult.tsx
-  hooks/
-    useCustomOutreach.ts
-  services/
-    customOutreachApi.ts
-```
-
-Flow:
-
-```text
-Create lead
-Add/find contact
-Research company
-Generate email
-Approve email
-Create draft or send
-```
-
----
-
-## 9.10 Analytics feature
-
-```text
-features/analytics/
-  components/
-    AnalyticsOverview.tsx
-    SalesPipelineAnalytics.tsx
-    MarketIntelligenceAnalytics.tsx
-    LeadsByCountryChart.tsx
-    LeadsByIndustryChart.tsx
-    ProductMarketFitChart.tsx
-    SourcePerformanceChart.tsx
-    OutreachPerformanceChart.tsx
-    ContactabilityChart.tsx
-    ExportAnalyticsButton.tsx
-  hooks/
-    useAnalytics.ts
-  services/
-    analyticsApi.ts
-```
-
-Both analytics types are MVP:
-
-```text
-Sales pipeline analytics
-Market intelligence analytics
-```
-
----
-
-## 9.11 Integrations feature
-
-```text
-features/integrations/
-  components/
-    IntegrationsOverview.tsx
-    EmailIntegrationCard.tsx
-    GoogleConnectButton.tsx
-    MicrosoftConnectButton.tsx
-    ZohoConnectButton.tsx
-    SMTPConnectForm.tsx
-    WhatsAppBusinessConnectForm.tsx
-    IntegrationStatusBadge.tsx
-    TestIntegrationButton.tsx
-  hooks/
-    useIntegrations.ts
-  services/
-    integrationsApi.ts
-```
-
----
-
-## 9.12 Agent Runs feature
-
-```text
-features/agent-runs/
-  components/
-    AgentRunsTable.tsx
-    AgentRunDetail.tsx
-    AgentRunStatusBadge.tsx
-    AgentRunLogs.tsx
-    AgentRunTimeline.tsx
-    AgentRunRetryButton.tsx
-    AgentRunCancelButton.tsx
-  hooks/
-    useAgentRuns.ts
-  services/
-    agentRunsApi.ts
-```
-
----
-
-## 9.13 Admin feature
-
-```text
-features/admin/
-  components/
-    AdminDashboard.tsx
-    CompaniesTable.tsx
-    CompanyDetailAdmin.tsx
-    UsersTable.tsx
-    UserCreateModal.tsx
-    AdminAgentRunsTable.tsx
-    AdminAnalytics.tsx
-    IntegrationHealthTable.tsx
-    ErrorLogsTable.tsx
-    DataSourcesTable.tsx
-  hooks/
-    useAdminCompanies.ts
-    useAdminUsers.ts
-    useAdminAnalytics.ts
-  services/
-    adminApi.ts
-```
+`server/webui` is the interface this repository serves and the upstream source
+of record for it. The customer-facing deployment is built from it in
+`interagent-web`; changes belong here first.
 
 ---
 

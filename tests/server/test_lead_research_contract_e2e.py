@@ -441,7 +441,11 @@ def test_real_zero_lead_outcome_has_named_explanation(contract_app, scenario, ex
                     "C": {"min_fit": 98, "min_confidence": 0},
                 },
             }
-        countries = ["AE"] if scenario == "missing_market_mapping" else ["DE"]
+        # A market whose language no sector playbook covers. AE used to serve
+        # here and no longer can: Arabic is mapped now, so the scenario has to
+        # name a language we genuinely have no terms for or it stops testing
+        # anything. Japanese is the same market the unit test uses.
+        countries = ["JP"] if scenario == "missing_market_mapping" else ["DE"]
         if scenario == "cancelled":
             created = client.post(
                 "/api/v1/research-campaigns",

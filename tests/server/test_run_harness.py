@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 from fastapi import HTTPException
 
 from server.agent_service import (AgentRunService, BaseRunExecutor, StubRunExecutor,
-                                  extract_json)
+                                  _last_lines, extract_json)
 from server.db import Database, json_dump, new_id, now
 from server.run_types import READ_ONLY, REGISTRY
 
@@ -91,6 +91,20 @@ def test_six_country_scan_rejected_in_service():
 def test_structured_output_extraction():
     value = extract_json("progress\n```json\n{\"leads\": []}\n```\n")
     assert value == {"leads": []}
+
+
+def test_agent_transcript_tail_is_kept_for_the_error_message():
+    """`hermes -z` exits 0 on its own failures, so the reason is on stdout.
+
+    Without the tail every such run reads as "output did not contain a JSON
+    object", which is true of an unset provider, an expired key and a model the
+    account cannot reach alike.
+    """
+    assert _last_lines("") == "(no output)"
+    assert _last_lines("   \n\n  ") == "(no output)"
+    assert _last_lines("a\nb\nc\nd") == "b | c | d"
+    assert _last_lines("only one line") == "only one line"
+    assert _last_lines("a\n\n  b  \n", limit=2) == "a | b"
 
 
 class BlockingExecutor(BaseRunExecutor):

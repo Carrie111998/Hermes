@@ -9,7 +9,6 @@ from server.agent_service import AgentRunService, StubRunExecutor
 from server.db import Database, json_dump, now
 from server.lead_research.agentic import AgenticResearchService
 from server.lead_research.models import (
-    AgenticResearchBudget,
     AgenticResearchRequest,
     AgenticResearchResult,
     CampaignConfig,
@@ -189,38 +188,3 @@ def test_low_current_fit_does_not_prune_missing_weighted_research(harness):
     assert ref.run_id.startswith("run_")
 
 
-class NeverCalledSource:
-    def __init__(self):
-        self.called = False
-
-    def research_gaps(self, request):
-        self.called = True
-        raise AssertionError("budget exhaustion must stop before source work")
-
-
-def test_page_request_time_and_token_limits_stop_new_work(harness):
-    db, runs, _ = harness
-    source = NeverCalledSource()
-    agentic = AgenticResearchService(db, runs=runs, source=source)
-    request = AgenticResearchRequest(
-        campaign_id="rc_1",
-        organization_id="org_1",
-        company_name="Acme GmbH",
-        canonical_domain="acme.test",
-        batches=gap_plan().batches,
-        market_terms={},
-        decision_model="model-decision",
-    )
-    exhausted = AgenticResearchBudget(
-        page_limit=1,
-        request_limit=1,
-        time_limit_seconds=10,
-        token_limit=100,
-        pages_used=1,
-    )
-
-    result = agentic.execute(request, exhausted)
-
-    assert result.stop_reason == "page_limit"
-    assert result.requests_started == 0
-    assert source.called is False

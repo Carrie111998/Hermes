@@ -21,15 +21,36 @@ from .sectors import REFERENCE_DIR, load_sectors
 DisplayLocale = Literal["en", "tr"]
 TranslationFunction = Callable[[str, str, str], str]
 
+# The search language for a market, which is not the same question as its
+# official languages: this picks the one language a buyer's own site is most
+# likely written in. Anglophone markets are listed explicitly rather than left
+# out, because a missing entry is reported as an unmapped market — and an
+# English-language market is served perfectly by the canonical terms, so a UK
+# campaign warning about "missing local mapping" is a false alarm.
+#
+# Genuinely split markets (BE, CH, CA, MA) are deliberately absent: guessing
+# one half wrong searches the wrong language, and being listed as unmapped is
+# the honest answer until a playbook covers both.
 COUNTRY_LANGUAGE = {
     "AE": "ar",
     "AT": "de",
+    "AU": "en",
+    "BH": "ar",
     "DE": "de",
+    "EG": "ar",
     "FR": "fr",
+    "GB": "en",
+    "IE": "en",
+    "KW": "ar",
     "NL": "nl",
+    "NZ": "en",
+    "OM": "ar",
     "PL": "pl",
+    "QA": "ar",
     "RO": "ro",
+    "SA": "ar",
     "TR": "tr",
+    "US": "en",
 }
 
 # Fixed product vocabulary is dictionary-backed. Free text goes through the

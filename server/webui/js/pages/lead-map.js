@@ -1,8 +1,8 @@
 /* World map component.
-   Phase 5 removed the standalone Lead Map page: country selection now lives as a
-   collapsed filter inside Buyers and as the target-markets step inside Setup.
-   Only the shared map renderer survives — imported by today.js, buyers.js and
-   setup.js. */
+   Phase 5 removed the standalone Lead Map page, and the Buyers page that
+   replaced it went with the research workspace. Country selection now lives as
+   the target-markets step inside Setup, with the map itself surviving as the
+   shared renderer imported by today.js and setup.js. */
 
 import { el } from '../ui.js';
 import { COUNTRY_NAMES } from '../catalog.js';

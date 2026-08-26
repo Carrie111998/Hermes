@@ -3,9 +3,11 @@ from __future__ import annotations
 from server.db import Database, now
 from server.lead_research.candidates import CandidateRepository
 from server.lead_research.discovery import CandidateDiscoveryService
-from server.lead_research.languages import TranslationCache, build_market_terms
+from server.lead_research.languages import (COUNTRY_LANGUAGE, TranslationCache,
+                                            _equivalents, build_market_terms)
 from server.lead_research.models import CompanyResearchProfile, DiscoveryQuery
 from server.lead_research.registry import ProviderRegistry
+from server.lead_research.sectors import load_sectors
 
 
 def _profile(*, target_countries=None, languages=None):
@@ -34,6 +36,54 @@ def test_market_terms_expand_product_and_buyer_language_without_changing_canonic
     assert terms.canonical == ["industrial valve"]
     assert "Industriearmatur" in terms.by_language["de"]
     assert "Einkaufsleiter" in terms.by_language["de"]
+    assert terms.unmapped_markets == []
+
+
+def test_every_mapped_market_language_has_playbook_terms_in_every_sector():
+    """No configured market may fall back to searching in English.
+
+    `oven` matches nothing in Poland — the web there says `piekarnik` — and a
+    term that finds nothing is indistinguishable from a market with no buyers
+    in it. So every language `COUNTRY_LANGUAGE` will ever ask for has to be
+    answerable from the playbooks, in every sector we sell into.
+    """
+    wanted = {value for value in COUNTRY_LANGUAGE.values() if value != "en"}
+
+    missing = {
+        (sector.sector_id, language)
+        for sector in load_sectors()
+        for language in wanted
+        if not _equivalents(sector.market_terms, language)
+    }
+
+    assert not missing, f"sector/language pairs with no local terms: {sorted(missing)}"
+
+
+def test_anglophone_markets_are_not_reported_as_unmapped():
+    """The canonical terms already are the local terms there.
+
+    GB was absent from `COUNTRY_LANGUAGE`, so a UK campaign resolved to no
+    language at all and every run warned `product_terms_missing_local_mapping`
+    over a market that was being searched correctly.
+    """
+    terms = build_market_terms(
+        {"product_terms": ["industrial valve"], "sector_ids": ["industrial-machinery"]},
+        _profile(target_countries=["GB", "US"], languages=["en"]),
+    )
+
+    assert terms.unmapped_markets == []
+
+
+def test_arabic_and_polish_markets_search_in_their_own_language():
+    terms = build_market_terms(
+        {"product_terms": ["oven"], "sector_ids": ["household-appliances"]},
+        _profile(target_countries=["PL", "SA"], languages=[]),
+    )
+
+    assert "piekarnik" in terms.by_language["pl"]
+    assert "فرن" in terms.by_language["ar"]
+    # Storage stays English whatever we searched with.
+    assert terms.canonical == ["oven"]
     assert terms.unmapped_markets == []
 
 

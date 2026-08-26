@@ -148,6 +148,12 @@ def validate_payload(run_type: str, payload: dict, db: Database, company_id: str
         raise HTTPException(422, {"message": "Missing run payload fields", "fields": missing})
 
 
+def _last_lines(transcript: str, limit: int = 3) -> str:
+    """The tail of an agent transcript, for an error a human has to act on."""
+    lines = [line.strip() for line in transcript.strip().splitlines() if line.strip()]
+    return " | ".join(lines[-limit:]) if lines else "(no output)"
+
+
 def extract_json(text: str) -> dict:
     text = text.strip()
     if not text:
@@ -300,9 +306,20 @@ class HermesProcessExecutor(BaseRunExecutor):
                 if output_closed and process.poll() is not None:
                     break
             returncode = process.wait(timeout=5)
+            transcript = "".join(lines)
             if returncode != 0:
-                raise RuntimeError(f"Hermes exited with status {returncode}")
-            return extract_json("".join(lines))
+                raise RuntimeError(
+                    f"Hermes exited with status {returncode}: {_last_lines(transcript)}"
+                )
+            try:
+                return extract_json(transcript)
+            except ValueError as exc:
+                # `hermes -z` reports its own failures on stdout and still
+                # exits 0 — an unset provider, an expired key, a model the
+                # account cannot reach. Without the transcript those all
+                # surface as "agent output did not contain a JSON object",
+                # which is true and tells an operator nothing.
+                raise RuntimeError(f"{exc}: {_last_lines(transcript)}") from exc
         finally:
             with self._lock:
                 self._processes.pop(run["id"], None)

@@ -10,11 +10,33 @@
   applicable_features: [locations, countries_served, procurement_intent, relevant_import_value, certifications]
   sourcing_terms: [project supplier, distributor wanted, approved vendor]
   market_terms:
+    ar:
+      construction materials: [مواد بناء, مواد البناء]
+      building materials distributor: [موزع مواد البناء]
+      procurement manager: [مدير المشتريات]
     de:
       construction materials: [Baustoffe, Baumaterialien]
+      building materials distributor: [Baustoffhändler, Baustoffhandel]
       procurement manager: [Einkaufsleiter]
+    fr:
+      construction materials: [matériaux de construction]
+      building materials distributor: [négociant en matériaux, distributeur de matériaux]
+      procurement manager: [responsable des achats]
+    nl:
+      construction materials: [bouwmaterialen]
+      building materials distributor: [bouwmaterialenhandel, groothandel bouwmaterialen]
+      procurement manager: [inkoopmanager]
+    pl:
+      construction materials: [materiały budowlane]
+      building materials distributor: [hurtownia budowlana, dystrybutor materiałów budowlanych]
+      procurement manager: [kierownik zakupów]
+    ro:
+      construction materials: [materiale de construcții]
+      building materials distributor: [distribuitor materiale de construcții, depozit materiale de construcții]
+      procurement manager: [manager achiziții]
     tr:
       construction materials: [yapı malzemeleri, inşaat malzemeleri]
+      building materials distributor: [yapı malzemeleri distribütörü]
       procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: food-and-beverage
@@ -29,11 +51,33 @@
   applicable_features: [store_count, countries_served, relevant_import_value, certifications, brands_carried]
   sourcing_terms: [private label, food importer, retail supplier]
   market_terms:
+    ar:
+      food importer: [مستورد مواد غذائية, مستورد أغذية]
+      food wholesaler: [تاجر جملة مواد غذائية]
+      procurement manager: [مدير المشتريات]
     de:
       food importer: [Lebensmittelimporteur]
+      food wholesaler: [Lebensmittelgroßhandel, Getränkegroßhandel]
       procurement manager: [Einkaufsleiter]
+    fr:
+      food importer: [importateur alimentaire, importateur de produits alimentaires]
+      food wholesaler: [grossiste alimentaire]
+      procurement manager: [responsable des achats]
+    nl:
+      food importer: [levensmiddelenimporteur, voedingsmiddelenimporteur]
+      food wholesaler: [groothandel levensmiddelen]
+      procurement manager: [inkoopmanager]
+    pl:
+      food importer: [importer żywności]
+      food wholesaler: [hurtownia spożywcza]
+      procurement manager: [kierownik zakupów]
+    ro:
+      food importer: [importator alimente, importator produse alimentare]
+      food wholesaler: [distribuitor alimente]
+      procurement manager: [manager achiziții]
     tr:
       food importer: [gıda ithalatçısı]
+      food wholesaler: [gıda toptancısı]
       procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: household-appliances
@@ -47,14 +91,66 @@
   buyer_types: [importer, distributor, retailer, brand, wholesaler]
   applicable_features: [store_count, countries_served, relevant_import_value, brands_carried]
   sourcing_terms: [OEM, private label, distributor wanted]
+  # The built-in kitchen vocabulary the product launched on, written out per
+  # market. `oven` alone selects nothing in Poland — the web there says
+  # `piekarnik` — and an English term matched against a foreign corpus reads
+  # exactly like a market with no buyers in it.
   market_terms:
+    ar:
+      household appliances: [أجهزة منزلية, الأجهزة المنزلية]
+      oven: [فرن, أفران]
+      hob: [سطح طهي, موقد]
+      cooker hood: [شفاط مطبخ]
+      built-in: [مدمج]
+      cooker: [بوتاجاز, طباخ]
+      procurement manager: [مدير المشتريات]
     de:
-      household appliances: [Haushaltsgeräte, Hausgeräte]
+      household appliances: [Haushaltsgeräte, Hausgeräte, Weiße Ware]
       oven: [Backofen, Backöfen]
+      hob: [Kochfeld, Kochfelder]
+      cooker hood: [Dunstabzugshaube, Abzugshaube]
+      built-in: [Einbaugeräte, Einbau]
+      cooker: [Herd, Herde]
       procurement manager: [Einkaufsleiter]
+    fr:
+      household appliances: [électroménager, appareils électroménagers]
+      oven: [four, fours]
+      hob: [table de cuisson, plaque de cuisson]
+      cooker hood: [hotte aspirante, hotte de cuisine]
+      built-in: [encastrable, encastrables]
+      cooker: [cuisinière, cuisinières]
+      procurement manager: [responsable des achats]
+    nl:
+      household appliances: [huishoudelijke apparaten, witgoed]
+      oven: [oven, ovens]
+      hob: [kookplaat, kookplaten]
+      cooker hood: [afzuigkap, afzuigkappen]
+      built-in: [inbouw, inbouwapparatuur]
+      cooker: [fornuis, fornuizen]
+      procurement manager: [inkoopmanager]
+    pl:
+      household appliances: [sprzęt AGD, artykuły AGD]
+      oven: [piekarnik, piekarniki]
+      hob: [płyta grzewcza, płyta indukcyjna]
+      cooker hood: [okap kuchenny, okap]
+      built-in: [do zabudowy, zabudowa]
+      cooker: [kuchenka, kuchenki]
+      procurement manager: [kierownik zakupów]
+    ro:
+      household appliances: [electrocasnice, aparate electrocasnice]
+      oven: [cuptor, cuptoare]
+      hob: [plită, plite]
+      cooker hood: [hotă, hote]
+      built-in: [încorporabil, încorporabile]
+      cooker: [aragaz, aragazuri]
+      procurement manager: [manager achiziții]
     tr:
       household appliances: [ev aletleri, beyaz eşya]
-      oven: [fırın]
+      oven: [fırın, fırınlar]
+      hob: [ocak, set üstü ocak]
+      cooker hood: [davlumbaz, davlumbazlar]
+      built-in: [ankastre]
+      cooker: [kuzine]
       procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: industrial-machinery
@@ -69,13 +165,33 @@
   applicable_features: [countries_served, facilities, relevant_import_value, certifications, procurement_intent]
   sourcing_terms: [equipment tender, machinery distributor, industrial procurement]
   market_terms:
+    ar:
+      industrial valve: [صمامات صناعية]
+      industrial machinery: [آلات صناعية, معدات صناعية]
+      procurement manager: [مدير المشتريات]
     de:
-      industrial valve: [Industriearmatur]
-      industrial machinery: [Industriemaschinen]
+      industrial valve: [Industriearmatur, Industriearmaturen]
+      industrial machinery: [Industriemaschinen, Industrieanlagen]
       procurement manager: [Einkaufsleiter]
+    fr:
+      industrial valve: [robinetterie industrielle, vanne industrielle]
+      industrial machinery: [machines industrielles, équipements industriels]
+      procurement manager: [responsable des achats]
+    nl:
+      industrial valve: [industriële afsluiter, industriële afsluiters]
+      industrial machinery: [industriële machines, industriële apparatuur]
+      procurement manager: [inkoopmanager]
+    pl:
+      industrial valve: [armatura przemysłowa, zawory przemysłowe]
+      industrial machinery: [maszyny przemysłowe, urządzenia przemysłowe]
+      procurement manager: [kierownik zakupów]
+    ro:
+      industrial valve: [armături industriale, robinete industriale]
+      industrial machinery: [utilaje industriale, echipamente industriale]
+      procurement manager: [manager achiziții]
     tr:
-      industrial valve: [endüstriyel vana]
-      industrial machinery: [endüstriyel makineler]
+      industrial valve: [endüstriyel vana, endüstriyel vanalar]
+      industrial machinery: [endüstriyel makineler, endüstriyel ekipmanlar]
       procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, procurement, exhibition, web]
 - sector_id: textiles-and-apparel
@@ -90,10 +206,32 @@
   applicable_features: [store_count, countries_served, relevant_import_value, certifications, private_label_fit]
   sourcing_terms: [private label, sourcing office, apparel importer]
   market_terms:
+    ar:
+      apparel importer: [مستورد ملابس]
+      textile wholesaler: [تاجر جملة أقمشة]
+      procurement manager: [مدير المشتريات]
     de:
       apparel importer: [Bekleidungsimporteur]
+      textile wholesaler: [Textilgroßhandel, Bekleidungsgroßhandel]
       procurement manager: [Einkaufsleiter]
+    fr:
+      apparel importer: [importateur de vêtements, importateur textile]
+      textile wholesaler: [grossiste textile, grossiste en vêtements]
+      procurement manager: [responsable des achats]
+    nl:
+      apparel importer: [kledingimporteur]
+      textile wholesaler: [textielgroothandel, kledinggroothandel]
+      procurement manager: [inkoopmanager]
+    pl:
+      apparel importer: [importer odzieży]
+      textile wholesaler: [hurtownia odzieży, hurtownia tekstyliów]
+      procurement manager: [kierownik zakupów]
+    ro:
+      apparel importer: [importator îmbrăcăminte]
+      textile wholesaler: [angrosist textile, distribuitor textile]
+      procurement manager: [manager achiziții]
     tr:
       apparel importer: [giyim ithalatçısı]
+      textile wholesaler: [tekstil toptancısı]
       procurement manager: [satın alma müdürü]
   default_source_categories: [trade, registry, exhibition, matchmaking, web]

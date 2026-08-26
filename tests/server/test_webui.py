@@ -152,32 +152,81 @@ def test_self_hosted_fonts_serve_with_the_woff2_media_type():
         assert res.content[:4] == b"wOF2", f"{path} is not a valid woff2"
 
 
+def test_documented_frontend_routes_are_the_routes_that_exist():
+    """PRODUCT.md 8.2 against `main.js`, the way 7.x is checked against OpenAPI.
+
+    The frontend spec had drifted a whole architecture: it described a React
+    app under `apps/web/src/features/*` with sixteen customer routes, while the
+    shipped interface is vanilla ES modules with four. A route list nobody
+    verifies is a route list that stops being true, so this fails when either
+    side moves without the other.
+
+    Legacy redirects are deliberately excluded — they are compatibility for
+    bookmarks, not destinations, and 8.2 documents them separately.
+    """
+    documented: set[str] = set()
+    block = re.search(
+        r"## 8\.2 Frontend route structure.*?```text\n(.*?)```",
+        (ROOT / "PRODUCT.md").read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert block, "PRODUCT.md 8.2 no longer contains a route block"
+    prefix = ""
+    for line in block.group(1).splitlines():
+        if not line.strip():
+            continue
+        path = line.split()[0]
+        if not path.startswith("/"):
+            continue
+        if line[0] != " ":            # an unindented path opens a section
+            prefix = "" if path == "/" else path
+            continue
+        documented.add(prefix + path)
+
+    main = (ROOT / "server/webui/js/main.js").read_text(encoding="utf-8")
+    redirects = re.search(r"LEGACY_REDIRECTS = \[(.*?)\n\];", main, re.DOTALL)
+    assert redirects, "main.js no longer declares LEGACY_REDIRECTS"
+    legacy = set(re.findall(r"path: '([^']+)'", redirects.group(1)))
+    registered = set(re.findall(r"\{ path: '([^']+)'", main)) - legacy
+
+    assert documented == registered, {
+        "documented but not routed": sorted(documented - registered),
+        "routed but undocumented": sorted(registered - documented),
+    }
+
+
 def test_legacy_buyers_workspace_redirects_to_customer_research_results():
+    """The buyer ledger is gone; its bookmarks still have to land somewhere real.
+
+    This used to assert against `buyers.js` itself, which outlived its own
+    route: nothing imported it, so the file was 40 KB of unreachable code that
+    a test kept alive. What matters is the redirect and that its destination
+    actually loads results.
+    """
     _, client = make_client()
     for path in (
-        "/js/pages/buyers.js",
+        "/js/pages/research-results.js",
         "/js/pages/_components.js",
         "/js/pages/research-evidence.js",
     ):
         assert client.get(path).status_code == 200, path
+    assert client.get("/js/pages/buyers.js").status_code == 404
 
     main = client.get("/js/main.js").text
     shell = client.get("/js/shell.js").text
-    buyers = client.get("/js/pages/buyers.js").text
+    results = client.get("/js/pages/research-results.js").text
     ui = client.get("/js/ui.js").text
     evidence = client.get("/js/pages/research-evidence.js").text
 
     assert "{ path: '/app/buyers'" in main
     assert "to: () => '/app/research'" in main
     assert "path: '/app/research'" in shell
-    assert all(call in buyers for call in (
-        "call('leads.list')",
-        "call('contacts.list')",
-        "call('messages.list')",
+    assert "buyers.js" not in main
+    assert all(call in results for call in (
+        "call('researchCampaigns.list')",
+        "call('researchCampaigns.results'",
+        "call('contacts.discover'",
     ))
-    assert "pipelineRail(counts" in buyers
-    assert "companyRow(model.lead, model.contacts" in buyers
-    assert "Buyer companies CSV" in buyers and "People CSV" in buyers
     assert "qa_failed: 'error'" in ui
     assert "unknown: 'Not known'" in ui
     assert "Not known" in evidence
@@ -868,8 +917,9 @@ def test_admin_documents_ui_is_wired_and_customer_copy_hides_implementation_term
     # into setup.js, so that is where the upload copy now lives. Each file is
     # fetched and asserted 200 first: a typo'd path would otherwise "pass" by
     # scanning a 404 body.
-    customer_pages = ("setup.js", "today.js", "buyers.js", "research-results.js",
-                      "approvals.js", "analytics.js", "_components.js")
+    customer_pages = ("setup.js", "today.js", "research-results.js",
+                      "research-brief.js", "approvals.js", "analytics.js",
+                      "_components.js")
     customer_sources = ""
     for page in customer_pages:
         response = client.get(f"/js/pages/{page}")

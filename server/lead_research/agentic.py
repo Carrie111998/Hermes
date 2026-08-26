@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 from ..db import json_load, new_id, now
 from .facts import FIELD_TTL_DAYS, FactRepository, FreshnessPolicy
@@ -13,7 +13,6 @@ from .models import (
     AgenticResearchResult,
     AgentRunRef,
     CampaignConfig,
-    DatasetDefinition,
     EvidenceEnvelope,
     LeadCandidate,
     ProposedFact,
@@ -41,14 +40,6 @@ SCHEMA_KNOWN_FACT_FIELDS = frozenset({
     "trade_activity", "contactability", "facility_event", "private_label_fit",
     "facilities", "address", "description", "market_position", "trade_fair_presence",
 })
-
-
-class AgenticResearchSource(Protocol):
-    definition: DatasetDefinition
-
-    def research_gaps(self, request: AgenticResearchRequest) -> AgenticResearchResult:
-        """Research one resolved organization without contacting it."""
-        raise NotImplementedError
 
 
 def _stable_hash(value) -> str:
@@ -79,13 +70,11 @@ class AgenticResearchService:
         db,
         *,
         runs: AgentRunService,
-        source: AgenticResearchSource | None = None,
         facts: FactRepository | None = None,
         freshness: FreshnessPolicy | None = None,
     ) -> None:
         self.db = db
         self.runs = runs
-        self.source = source
         self.facts = facts or FactRepository(db)
         self.freshness = freshness or FreshnessPolicy()
 
@@ -196,55 +185,6 @@ class AgenticResearchService:
             decision_model=campaign.enrichment.model_profile or "",
             extractor_model=campaign.enrichment.extractor_model_profile,
         )
-
-    @staticmethod
-    def _exhausted(budget: AgenticResearchBudget) -> str | None:
-        for used, limit, reason in (
-            (budget.pages_used, budget.page_limit, "page_limit"),
-            (budget.requests_used, budget.request_limit, "request_limit"),
-            (budget.elapsed_seconds, budget.time_limit_seconds, "time_limit"),
-            (budget.tokens_used, budget.token_limit, "token_limit"),
-        ):
-            if used >= limit:
-                return reason
-        return None
-
-    def execute(
-        self,
-        request: AgenticResearchRequest,
-        budget: AgenticResearchBudget,
-    ) -> AgenticResearchResult:
-        request = AgenticResearchRequest.model_validate(request)
-        budget = AgenticResearchBudget.model_validate(budget)
-        reason = self._exhausted(budget)
-        if reason or self.source is None:
-            return AgenticResearchResult(
-                pages=[], facts=[], unresolved_fields=sorted({
-                    field for batch in request.batches for field in batch.fields
-                }),
-                requests_started=0,
-                tokens_used=0,
-                stop_reason=reason or "source_exhausted",
-            )
-        result = AgenticResearchResult.model_validate(self.source.research_gaps(request))
-        pages_left = budget.page_limit - budget.pages_used
-        kept_pages = result.pages[:pages_left]
-        page_ids = {page.page_id for page in kept_pages}
-        updates = {
-            "pages": kept_pages,
-            "facts": [fact for fact in result.facts if fact.page_id in page_ids],
-            "requests_started": min(
-                result.requests_started, budget.request_limit - budget.requests_used,
-            ),
-            "tokens_used": min(result.tokens_used, budget.token_limit - budget.tokens_used),
-        }
-        if len(kept_pages) < len(result.pages):
-            updates["stop_reason"] = "page_limit"
-        elif result.requests_started > updates["requests_started"]:
-            updates["stop_reason"] = "request_limit"
-        elif result.tokens_used > updates["tokens_used"]:
-            updates["stop_reason"] = "token_limit"
-        return result.model_copy(update=updates)
 
     @staticmethod
     def _fact_visibility(page: ResearchPage) -> tuple[str, str]:
