@@ -16,6 +16,7 @@ import re
 import uuid
 from collections import OrderedDict
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -55,6 +56,30 @@ _BLUEBUBBLES_AUDIO_EXT_OVERRIDES = {
     "audio/mp4": ".m4a",
     "audio/aac": ".m4a",  # preserves historical bluebubbles mapping (shared table says .aac)
 }
+
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +173,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self.server_url = _normalize_server_url(
             extra.get("server_url") or os.getenv("BLUEBUBBLES_SERVER_URL", "")
         )
-        self.password = extra.get("password") or os.getenv("BLUEBUBBLES_PASSWORD", "")
+        self.password = extra.get("password") or _get_scoped_secret("BLUEBUBBLES_PASSWORD", "")
         self.webhook_host = (
             extra.get("webhook_host")
             or os.getenv("BLUEBUBBLES_WEBHOOK_HOST", DEFAULT_WEBHOOK_HOST)
@@ -575,7 +600,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         """Send a file attachment via BlueBubbles multipart upload."""
         if not self.client:
             return SendResult(success=False, error="Not connected")
-        if not os.path.isfile(file_path):
+        if not await asyncio.to_thread(os.path.isfile, file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
 
         guid = await self._resolve_chat_guid(chat_id)
@@ -584,23 +609,26 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         fname = filename or os.path.basename(file_path)
         try:
-            with open(file_path, "rb") as f:
-                files = {"attachment": (fname, f, "application/octet-stream")}
-                data: Dict[str, str] = {
-                    "chatGuid": guid,
-                    "name": fname,
-                    "tempGuid": uuid.uuid4().hex,
-                }
-                if is_audio_message:
-                    data["isAudioMessage"] = "true"
-                res = await self.client.post(
-                    self._api_url("/api/v1/message/attachment"),
-                    files=files,
-                    data=data,
-                    timeout=120,
-                )
-                res.raise_for_status()
-                result = res.json()
+            # httpx's async multipart iterator reads file-like objects through
+            # a synchronous chunk generator. Read the file off the event-loop
+            # thread before handing bytes to the client.
+            payload = await asyncio.to_thread(Path(file_path).read_bytes)
+            files = {"attachment": (fname, payload, "application/octet-stream")}
+            data: Dict[str, str] = {
+                "chatGuid": guid,
+                "name": fname,
+                "tempGuid": uuid.uuid4().hex,
+            }
+            if is_audio_message:
+                data["isAudioMessage"] = "true"
+            res = await self.client.post(
+                self._api_url("/api/v1/message/attachment"),
+                files=files,
+                data=data,
+                timeout=120,
+            )
+            res.raise_for_status()
+            result = res.json()
 
             if caption:
                 await self.send(chat_id, caption)

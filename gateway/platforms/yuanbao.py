@@ -1150,7 +1150,7 @@ class RecallGuardMiddleware(InboundMiddleware):
                     if entry.get("role") == "user" and entry.get("content") == recalled_text:
                         entry["content"] = cls._REDACTED
                         try:
-                            store.rewrite_transcript(sid, transcript)
+                            store.rewrite_transcript(sid, transcript, active_only=True)
                             logger.info("[%s] Recall redact: session %s", adapter.name, session_key[:30])
                         except Exception as exc:
                             logger.warning("[%s] Recall redact failed: %s", adapter.name, exc)
@@ -1210,7 +1210,7 @@ class RecallGuardMiddleware(InboundMiddleware):
         if target is not None:
             target["content"] = cls._REDACTED
             try:
-                store.rewrite_transcript(sid, transcript)
+                store.rewrite_transcript(sid, transcript, active_only=True)
                 logger.info("[%s] Recall: redacted msg_id=%s (%s)", adapter.name, recalled_id, branch_label)
             except Exception as exc:
                 logger.warning("[%s] Recall: rewrite_transcript failed: %s", adapter.name, exc)
@@ -1261,6 +1261,27 @@ class ChatRoutingMiddleware(InboundMiddleware):
         await next_fn()
 
 
+def _yb_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Resolve a per-profile ``YUANBAO_*`` / gateway setting honoring the
+    active secret scope (#93522).
+
+    Under ``gateway.multiplex_profiles`` every secondary profile is
+    constructed inside ``_profile_runtime_scope`` (``gateway/run.py``) and
+    its ``.env`` lives in that scope — raw ``os.getenv`` misses it and
+    leaks the default profile's values instead. The primary/active profile
+    is constructed without a scope and legitimately owns ``os.environ``,
+    so fall back to it there (same canonical shape as QQ's
+    ``_resolve_qq_secret``).
+    """
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        val = get_secret(name, default)
+    except UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
+
 class AccessPolicy:
     """Platform-level DM / Group access control policy.
 
@@ -1282,9 +1303,9 @@ class AccessPolicy:
         self._group_allow_from = group_allow_from
 
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if (_yb_secret("GATEWAY_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}:
             return True
-        return os.getenv("YUANBAO_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        return (_yb_secret("YUANBAO_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}
 
     def is_dm_allowed(self, sender_id: str) -> bool:
         """Strict DM authorization — pairing does not imply access."""
@@ -4588,7 +4609,11 @@ class MessageSender:
         cached = self._adapter._member_cache.get(group_code)
         if cached:
             ts, member_list = cached
-            members = member_list if (time.time() - ts < self._adapter.MEMBER_CACHE_TTL_S) else []
+            if time.time() - ts < self._adapter.MEMBER_CACHE_TTL_S:
+                members = member_list
+            else:
+                del self._adapter._member_cache[group_code]
+                members = []
         else:
             members = []
         if not members:
@@ -4938,27 +4963,29 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # ------------------------------------------------------------------
-        # Access control policy (DM / Group)
+        # Access control policy (DM / Group) — scoped reads (#93522)
         # ------------------------------------------------------------------
         dm_policy: str = (
             _extra.get("dm_policy")
-            or os.getenv("YUANBAO_DM_POLICY", "pairing")
+            or _yb_secret("YUANBAO_DM_POLICY")
+            or "pairing"
         ).strip().lower()
 
         _dm_allow_from_raw: str = (
             _extra.get("dm_allow_from")
-            or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
+            or _yb_secret("YUANBAO_DM_ALLOW_FROM", "")
         )
         dm_allow_from: list[str] = [x.strip() for x in _dm_allow_from_raw.split(",") if x.strip()]
 
         group_policy: str = (
             _extra.get("group_policy")
-            or os.getenv("YUANBAO_GROUP_POLICY", "pairing")
+            or _yb_secret("YUANBAO_GROUP_POLICY")
+            or "pairing"
         ).strip().lower()
 
         _group_allow_from_raw: str = (
             _extra.get("group_allow_from")
-            or os.getenv("YUANBAO_GROUP_ALLOW_FROM", "")
+            or _yb_secret("YUANBAO_GROUP_ALLOW_FROM", "")
         )
         group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
 
@@ -5116,6 +5143,19 @@ class YuanbaoAdapter(BasePlatformAdapter):
             await super()._process_message_background(event, session_key)
         finally:
             self._outbound.cancel_slow_notifier(chat_id)
+            # Clear the RecallGuard tracking entries for this message only if
+            # our msg_id is still current.  A concurrent pending message may
+            # have already overwritten the entry in _dispatch_inbound_event
+            # while we were running; in that case the drain task owns it and
+            # we must not clear it.  Id-less events (internal/synthetic
+            # messages, pushes without a msg_id) never wrote a tracking entry
+            # in _dispatch_inbound_event, so they must never pop either — the
+            # entry they see belongs to a concurrently-queued id-bearing
+            # message whose drain task still needs it for recall matching.
+            msg_id = event.message_id
+            if msg_id and self._processing_msg_ids.get(session_key) == msg_id:
+                self._processing_msg_ids.pop(session_key, None)
+                self._processing_msg_texts.pop(session_key, None)
 
     # ------------------------------------------------------------------
     # Group query (delegate to GroupQueryService)

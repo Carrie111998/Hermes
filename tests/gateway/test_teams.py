@@ -4,7 +4,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -168,8 +168,20 @@ _ensure_teams_mock()
 # (plugin_adapter_teams) so it cannot collide with sibling plugin adapters.
 _teams_mod = load_plugin_adapter("teams")
 
-_teams_mod.TEAMS_SDK_AVAILABLE = True
 _teams_mod.AIOHTTP_AVAILABLE = True
+# SDK import is deferred (#62935); bind mocked symbols the same way connect()
+# does, but skip the real lazy-installer so collection does not pip-install
+# microsoft-teams-apps.
+
+
+def _bind_mock_sdk(feature, importer, target_globals, **kwargs):
+    target_globals.update(importer())
+    return True
+
+
+with patch("tools.lazy_deps.ensure_and_bind", _bind_mock_sdk):
+    assert _teams_mod.check_teams_requirements() is True
+_teams_mod.TEAMS_SDK_AVAILABLE = True
 
 # Ensure SDK symbols that were None (import failed on Python <3.12) are
 # replaced with the mocked versions so runtime calls don't silently no-op.
@@ -207,9 +219,9 @@ class TestTeamsRequirements:
         assert check_requirements() is True
 
     def test_check_teams_requirements_shortcircuits_when_present(self, monkeypatch):
-        # When the SDK + aiohttp are already importable, the active lazy-
-        # installer returns True immediately without attempting an install.
-        monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", True)
+        # When SDK symbols are already bound and aiohttp is available, the
+        # active lazy-installer returns True immediately without re-importing.
+        monkeypatch.setattr(_teams_mod, "App", object())
         monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", True)
         called = {"ensure_and_bind": 0}
 
@@ -223,6 +235,29 @@ class TestTeamsRequirements:
         assert check_teams_requirements() is True
         assert called["ensure_and_bind"] == 0
 
+    def test_check_teams_requirements_lazy_installs_when_missing(self, monkeypatch):
+        # When deps are missing, the active installer delegates to
+        # ensure_and_bind("platform.teams", ...) — parity with Slack/Discord.
+        monkeypatch.setattr(_teams_mod, "App", None)
+        monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", False)
+        monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", False)
+        seen = {}
+
+        def _fake_ensure_and_bind(feature, importer, target_globals, **kwargs):
+            seen["feature"] = feature
+            return True
+
+        monkeypatch.setattr(
+            "tools.lazy_deps.ensure_and_bind", _fake_ensure_and_bind
+        )
+        assert check_teams_requirements() is True
+        assert seen["feature"] == "platform.teams"
+
+    def test_validate_config_with_env(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "test-id")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "test-secret")
+        monkeypatch.setenv("TEAMS_TENANT_ID", "test-tenant")
+        assert validate_config(_make_config()) is True
 
     def test_validate_config_from_extra(self, monkeypatch):
         monkeypatch.delenv("TEAMS_CLIENT_ID", raising=False)
@@ -274,6 +309,16 @@ class TestTeamsPluginRegistration:
         kwargs = ctx.register_platform.call_args[1]
         assert kwargs["name"] == "teams"
 
+    def test_register_splits_passive_probe_from_active_installer(self):
+        # check_fn is the PASSIVE probe (status displays call it freely);
+        # the ACTIVE lazy-installer rides on ensure_deps_fn, which
+        # create_adapter() invokes when the passive probe fails (#79812).
+        ctx = MagicMock()
+        register(ctx)
+        kwargs = ctx.register_platform.call_args[1]
+        assert kwargs["check_fn"] is check_requirements
+        assert kwargs["ensure_deps_fn"] is check_teams_requirements
+
     def test_register_auth_env_vars(self):
         ctx = MagicMock()
         register(ctx)
@@ -314,9 +359,11 @@ class TestTeamsConnect:
     @pytest.mark.anyio
     async def test_connect_fails_without_sdk(self, monkeypatch):
         monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", False)
+        monkeypatch.setattr(_teams_mod, "App", None)
+        monkeypatch.setattr(_teams_mod, "ClientOptions", None)
         # Simulate the SDK being unavailable AND not installable (offline /
         # locked-down env): the lazy-installer can't rebind the globals, so
-        # TEAMS_SDK_AVAILABLE stays False and connect() must fail.
+        # App stays None and connect() must fail without calling it.
         monkeypatch.setattr(
             "tools.lazy_deps.ensure_and_bind",
             lambda *_a, **_k: False,
@@ -326,6 +373,27 @@ class TestTeamsConnect:
         ))
         result = await adapter.connect()
         assert result is False
+
+    @pytest.mark.anyio
+    async def test_connect_fails_when_namespace_exists_but_app_unbound(self, monkeypatch):
+        """find_spec('microsoft_teams') can be true from sibling packages
+        without microsoft-teams-apps. connect() must not call App() while
+        it is still None — that was ``'NoneType' object is not callable``.
+        """
+        monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", True)
+        monkeypatch.setattr(_teams_mod, "App", None)
+        monkeypatch.setattr(_teams_mod, "ClientOptions", None)
+        monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(
+            "tools.lazy_deps.ensure_and_bind",
+            lambda *_a, **_k: False,
+        )
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        result = await adapter.connect()
+        assert result is False
+        assert adapter._app is None
 
 
 # ---------------------------------------------------------------------------
