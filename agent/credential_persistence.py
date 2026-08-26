@@ -130,8 +130,11 @@ def _fingerprint_value(value: Any) -> str | None:
     return f"sha256:{digest[:16]}"
 
 
+_PREFERRED_SECRET_KEYS = ("agent_key", "access_token", "refresh_token", "api_key", "token", "secret")
+
+
 def _credential_secret_fingerprint(payload: Mapping[str, Any]) -> str | None:
-    for key in ("agent_key", "access_token", "refresh_token", "api_key", "token", "secret"):
+    for key in _PREFERRED_SECRET_KEYS:
         fingerprint = _fingerprint_value(payload.get(key))
         if fingerprint:
             return fingerprint
@@ -146,6 +149,35 @@ def _credential_secret_fingerprint(payload: Mapping[str, Any]) -> str | None:
     if isinstance(existing, str) and existing.startswith("sha256:"):
         return existing
     return None
+
+
+def credential_secret_fingerprints(payload: Mapping[str, Any]) -> set[str]:
+    """Every fingerprint the secret-bearing fields of *payload* could produce.
+
+    :func:`_credential_secret_fingerprint` persists exactly one of these —
+    whichever field it prefers.  A caller comparing a stored fingerprint
+    against a fresh payload must accept a match on *any* of them: the preferred
+    field can drift (a borrowed source that starts carrying an ``agent_key``
+    alongside its ``access_token`` fingerprints a different field than the
+    stored entry did), and a set comparison keeps that drift from reading as a
+    secret rotation on every single load.
+    """
+    fingerprints: set[str] = set()
+    for key in _PREFERRED_SECRET_KEYS:
+        fingerprint = _fingerprint_value(payload.get(key))
+        if fingerprint:
+            fingerprints.add(fingerprint)
+
+    for key, value in payload.items():
+        if _is_secret_payload_key(key):
+            fingerprint = _fingerprint_value(value)
+            if fingerprint:
+                fingerprints.add(fingerprint)
+
+    existing = payload.get("secret_fingerprint")
+    if isinstance(existing, str) and existing.startswith("sha256:"):
+        fingerprints.add(existing)
+    return fingerprints
 
 
 def sanitize_borrowed_credential_payload(
