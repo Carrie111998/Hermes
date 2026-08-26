@@ -1,6 +1,6 @@
 import { App } from '@capacitor/app'
 import { useStore } from '@nanostores/react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 // The REAL desktop app (DesktopController) — its AppShell already collapses to a
 // drawer on narrow viewports, so mounting it on a phone gives the desktop chat
@@ -22,6 +22,7 @@ type View = 'loading' | 'connect' | 'login' | 'token' | 'connected'
 export function MobileRoot() {
   const [view, setView] = useState<View>('loading')
   const [probe, setProbe] = useState<ProbeResult | null>(null)
+  const initialNotificationRequest = useRef(false)
   const reauthNonce = useStore($reauthNonce)
 
   // Boot: configure native chrome (status bar), then restore a saved gateway
@@ -63,6 +64,17 @@ export function MobileRoot() {
   useEffect(() => {
     if (reauthNonce > 0 && probe) setView(probe.authMode === 'token' ? 'token' : 'login')
   }, [reauthNonce, probe])
+
+  // Steven explicitly wants notification permission offered on first successful
+  // mobile connection, rather than burying the basic alert path in Settings.
+  // This requests ONLY notifications — microphone and camera remain tied to the
+  // explicit actions that use them — and never re-prompts during this app run.
+  useEffect(() => {
+    if (view !== 'connected' || initialNotificationRequest.current) return
+
+    initialNotificationRequest.current = true
+    void window.hermesDesktop?.requestNotificationPermission?.()
+  }, [view])
 
   async function onProbeResult(p: ProbeResult) {
     setProbe(p)

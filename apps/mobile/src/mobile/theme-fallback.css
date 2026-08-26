@@ -221,6 +221,13 @@ html:has([data-overlay-surface]) .mobile-settings-trigger {
   min-height: 2.75rem;
 }
 
+/* The desktop intro wordmark intentionally fills broad windows. On a Fold it
+   should stay recognisable without becoming a billboard that crowds the first
+   useful task affordance below it. */
+[data-slot='aui_intro'] .fit-text {
+  --fit-max: clamp(2.75rem, 7vw, 4.5rem);
+}
+
 /* Bottom actions retain full 44px targets. The old horizontal strip made an
    off-screen action effectively invisible; a compact primary cluster plus More
    keeps the full Desktop status surface reachable without relying on swiping. */
