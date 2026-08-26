@@ -238,6 +238,11 @@ def ensure_profile_dir(path: Path) -> Path:
     return target
 
 
+def cron_store_requires_existing_home() -> bool:
+    """Whether the active cron scope must not recreate its profile home."""
+    return _current_cron_store().require_existing_home
+
+
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
 # the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
 # in which case no finite run bound exists to derive from. Also acts as the
