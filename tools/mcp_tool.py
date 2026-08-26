@@ -3020,6 +3020,13 @@ class MCPServerTask:
                 return
             await asyncio.sleep(0.25)
 
+    def _retire_dead_stdio_transport(self, reason: str) -> None:
+        """Drop a dead stdio session and wake the transport rebuild loop."""
+        self.mark_suspect(reason)
+        self.session = None
+        self._ready.clear()
+        self._reconnect_event.set()
+
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
 
@@ -3277,8 +3284,6 @@ class MCPServerTask:
         # exist, which would otherwise stall the shared MCP event loop.
         await asyncio.to_thread(_kill_orphaned_mcp_children)
 
-        # Snapshot child PIDs before spawning so we can track the new one.
-        pids_before = _snapshot_child_pids()
         new_pids: set = set()
         # Redirect subprocess stderr into a shared log file so MCP servers
         # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
@@ -3287,20 +3292,12 @@ class MCPServerTask:
         _write_stderr_log_header(self.name)
         _errlog = _get_mcp_stderr_log()
         try:
-            async with stdio_client(server_params, errlog=_errlog) as (
-                read_stream,
-                write_stream,
-            ):
-                # Capture the newly spawned subprocess PID for force-kill cleanup.
-                # Filter out non-MCP children that race into the snapshot window:
-                # slash_worker and LSP servers (jdtls/pyright/yaml-ls) are spawned
-                # directly by the gateway without start_new_session, so their pgid
-                # equals the TUI parent PID. If they leak into _stdio_pgids, the
-                # shutdown sweep's killpg() kills the TUI parent itself.
-                # See agent/lsp/client.py for the complementary start_new_session fix.
-                new_pids = _filter_mcp_children(
-                    _snapshot_child_pids() - pids_before
-                )
+            async with _tracked_stdio_spawn(
+                stdio_client(server_params, errlog=_errlog)
+            ) as ((read_stream, write_stream), owned_pids):
+                # The spawn guard serializes only process creation and PID
+                # attribution. The session itself remains fully concurrent.
+                new_pids = set(owned_pids)
                 if new_pids:
                     # Capture pgid while the child is alive — once it exits we
                     # can no longer call ``os.getpgid`` on it, and the cleanup
@@ -5401,6 +5398,36 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 # (``os.getpgid`` is POSIX-only).
 _stdio_pgids: Dict[int, int] = {}  # pid -> pgid
 
+# Only the stdio process-spawn window is serialized. Sessions run concurrently
+# after their direct child PID has been attributed to the owning server.
+_stdio_spawn_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _tracked_stdio_spawn(client_context):
+    """Enter one stdio client and attribute only its own child processes."""
+    await _stdio_spawn_lock.acquire()
+    try:
+        pids_before = _snapshot_child_pids()
+        streams = await client_context.__aenter__()
+        try:
+            owned_pids = _filter_mcp_children(
+                _snapshot_child_pids() - pids_before
+            )
+        except BaseException:
+            await client_context.__aexit__(*sys.exc_info())
+            raise
+    finally:
+        _stdio_spawn_lock.release()
+
+    try:
+        yield streams, owned_pids
+    except BaseException:
+        if not await client_context.__aexit__(*sys.exc_info()):
+            raise
+    else:
+        await client_context.__aexit__(None, None, None)
+
 
 def _snapshot_child_pids() -> set:
     """Return a set of current child process PIDs.
@@ -6165,6 +6192,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         and isinstance(_stdio_dead_result := _stdio_dead(), bool)
                         and _stdio_dead_result
                     ):
+                        server._retire_dead_stdio_transport(
+                            f"stdio subprocess exited before tools/call {tool_name}"
+                        )
                         raise TimeoutError(
                             f"MCP stdio subprocess for '{server_name}' has "
                             f"exited; failing the call fast instead of "
@@ -6201,6 +6231,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             )
                             if watch_task in done and not rpc_task.done():
                                 rpc_task.cancel()
+                                server._retire_dead_stdio_transport(
+                                    f"stdio subprocess exited during tools/call {tool_name}"
+                                )
                                 raise TimeoutError(
                                     f"MCP stdio subprocess for '{server_name}' "
                                     f"exited mid-call; failing the call fast "
