@@ -514,13 +514,14 @@ def test_do_audit_repairs_stale_hub_path(hub_env, monkeypatch, tmp_path):
     import tools.skills_hub as hub
 
     skills_dir = tmp_path / "skills"
-    _make_skill(skills_dir / "mlops" / "alpha", "alpha")
+    installed = _make_skill(skills_dir / "mlops" / "alpha", "alpha")
+    from tools.skills_guard import content_hash
 
     lock = hub.HubLockFile()
     lock.record_install(
         name="alpha", source="github", identifier="x",
         trust_level="trusted", scan_verdict="pass",
-        skill_hash="h", install_path="alpha", files=["SKILL.md"],
+        skill_hash=content_hash(installed), install_path="alpha", files=["SKILL.md"],
     )
 
     monkeypatch.setattr("tools.skills_guard.scan_skill", lambda path, source=None: "R")
@@ -541,14 +542,15 @@ def test_do_audit_refuses_ambiguous_stale_path(hub_env, monkeypatch, tmp_path):
     import tools.skills_hub as hub
 
     skills_dir = tmp_path / "skills"
-    _make_skill(skills_dir / "mlops" / "alpha", "alpha", body="one")
-    _make_skill(skills_dir / "research" / "alpha", "alpha", body="two")
+    first = _make_skill(skills_dir / "mlops" / "alpha", "alpha", body="same")
+    _make_skill(skills_dir / "research" / "alpha", "alpha", body="same")
+    from tools.skills_guard import content_hash
 
     lock = hub.HubLockFile()
     lock.record_install(
         name="alpha", source="github", identifier="x",
         trust_level="trusted", scan_verdict="pass",
-        skill_hash="h", install_path="alpha", files=["SKILL.md"],
+        skill_hash=content_hash(first), install_path="alpha", files=["SKILL.md"],
     )
 
     monkeypatch.setattr("tools.skills_guard.scan_skill", lambda path, source=None: "R")

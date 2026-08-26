@@ -3867,9 +3867,10 @@ def find_installed_skill_dir_by_name(
     skills_dir = _skills_dir() if skills_dir is None else skills_dir
 
     exact = skills_dir / name / "SKILL.md"
-    if exact.exists():
+    if exact.exists() and not expected_hash:
         # A direct <skills_dir>/<name> hit is the canonical location; treat it as
-        # the unambiguous answer without scanning for shadow copies.
+        # the unambiguous answer without scanning for shadow copies. A recorded
+        # hash still has to be enforced, so hashed lookups continue below.
         return exact.parent, False
 
     candidates: List[Path] = []
@@ -3898,8 +3899,10 @@ def find_installed_skill_dir_by_name(
                     hashed.append(cand)
             except Exception:
                 continue
-        if hashed:
-            candidates = hashed
+        # Replace the candidate set even when no hashes match. Falling back to
+        # the same-named candidates would repair a stale lock to different
+        # content than the lock recorded.
+        candidates = hashed
 
     # Deduplicate (rglob + name/frontmatter can list the same dir twice).
     unique = sorted({c.resolve(): c for c in candidates}.values(), key=str)

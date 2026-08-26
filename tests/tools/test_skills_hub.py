@@ -593,6 +593,44 @@ class TestHubPathRepair:
         assert found == real
         assert ambiguous is False
 
+    def test_single_wrong_content_candidate_does_not_repair(self, tmp_path):
+        from tools.skills_guard import content_hash
+        from tools.skills_hub import (
+            HubLockFile,
+            find_installed_skill_dir_by_name,
+            resolve_installed_skill_path,
+        )
+
+        skills_dir = tmp_path / "skills"
+        _write_skill(
+            skills_dir / "mlops" / "impostor", "alpha", body="wrong content"
+        )
+        recorded = _write_skill(
+            tmp_path / "recorded" / "alpha", "alpha", body="recorded content"
+        )
+        expected = content_hash(recorded)
+
+        found, ambiguous = find_installed_skill_dir_by_name(
+            "alpha", skills_dir, expected_hash=expected
+        )
+        assert found is None
+        assert ambiguous is False
+
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="alpha", source="github", identifier="x",
+            trust_level="community", scan_verdict="pass",
+            skill_hash=expected, install_path="alpha", files=["SKILL.md"],
+        )
+        entry = lock.get_installed("alpha")
+        assert entry is not None
+        path, repaired = resolve_installed_skill_path(entry, skills_dir, lock=lock)
+        assert path == skills_dir / "alpha"
+        assert repaired is False
+        unchanged = lock.get_installed("alpha")
+        assert unchanged is not None
+        assert unchanged["install_path"] == "alpha"
+
     def test_no_candidate_returns_missing_unrepaired(self, tmp_path):
         from tools.skills_hub import resolve_installed_skill_path
 
