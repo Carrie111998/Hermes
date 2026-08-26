@@ -70,6 +70,7 @@ import {
   setShowAllProfiles,
   sortByProfileOrder
 } from '@/store/profile'
+import { $profilesBreathing } from '@/store/profile-breath'
 import {
   $profileRemoteOverrides,
   openRemoteOverrideDialog,
@@ -132,6 +133,7 @@ export function ProfileRail() {
   const colors = useStore($profileColors)
   const remoteOverrides = useStore($profileRemoteOverrides)
   const multipleConnections = useStore($hasMultipleConnections)
+  const breathing = useStore($profilesBreathing)
   const navigate = useNavigate()
 
   const [createOpen, setCreateOpen] = useState(false)
@@ -319,6 +321,7 @@ export function ProfileRail() {
                   {named.map(profile => (
                     <ProfileSquare
                       active={!isAll && normalizeProfileKey(profile.name) === activeKey}
+                      breathing={Boolean(breathing[normalizeProfileKey(profile.name)])}
                       color={resolveProfileColor(profile.name, colors)}
                       key={profile.name}
                       label={profileLabel(profile)}
@@ -633,6 +636,9 @@ function ProfilePill({ active, glyph, label, onSelect }: ProfilePillProps) {
 
 interface ProfileSquareProps {
   active: boolean
+  // A finished-but-unseen turn exists in this profile's sessions (#95502):
+  // paints the breathing pulse until any of them is opened.
+  breathing: boolean
   color: null | string
   label: string
   onSelect: () => void
@@ -659,6 +665,7 @@ const LONG_PRESS_MS = 450
 // dnd listeners, hover tip, and right-click menu.
 function ProfileSquare({
   active,
+  breathing,
   color,
   label,
   onConnectRemote,
@@ -774,7 +781,20 @@ function ProfileSquare({
                     }}
                     onPointerUp={clearPress}
                   >
-                    {label.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
+                    {/* The breathing initial (#95502): a finished-but-unseen turn
+                        in this profile's sessions. Only the LETTER breathes its
+                        luminance (brightness) between dim and bright — the square's
+                        own background color stays at its resting unselected state,
+                        so no glow, no ring, no extra visual noise. The dim trough
+                        keeps the letter visible (still on-screen, just darker). */}
+                    <span
+                      aria-hidden="true"
+                      className="relative"
+                      data-profile-breathing={breathing || undefined}
+                      data-slot="profile-breath-badge"
+                    >
+                      {label.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
+                    </span>
                     {/* The "remote" badge: a tiny globe pinned to the corner of an
                         overridden profile's square, so which profiles leave this
                         machine is visible at a glance (#91349). */}
