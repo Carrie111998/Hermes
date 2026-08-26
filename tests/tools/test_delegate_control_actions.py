@@ -240,10 +240,61 @@ def test_inspect_redacts_url_credentials_and_never_keeps_result_or_thinking_text
         assert "supersecret-body" not in serialized
         assert "PRIVATE CHAIN OF THOUGHT" not in serialized
         assert "RAW-SECRET-RESULT" not in serialized
-        assert out["recent_events"][0]["tool_input"]["targets"]["url"] == "https://example.com/path"
+        assert out["recent_events"][0]["tool_input"]["targets"]["url"] == "https://example.com"
         assert out["recent_events"][1]["status"] == "error"
     finally:
         _unregister_subagent(sid)
+
+
+def test_inspect_fails_closed_on_path_secret_urls():
+    """Slack webhook + Telegram bot-token paths must never reach the model."""
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-inspect-path-secrets"
+    _register(sid, child)
+    cb = _wrap_subagent_inspect_callback(None, sid)
+    secrets = [
+        "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
+        "https://api.telegram.org/bot123456789:AAExampleSecret/sendMessage",
+        "https://user:pass@example.com/path?token=query-secret#frag",
+    ]
+    try:
+        for url in secrets:
+            cb("tool.started", "web_fetch", args=json.dumps({"url": url}))
+            cb("tool.started", "http_request", args=json.dumps({"endpoint": url}))
+        out = json.loads(_handle_control_action("inspect", sid, None, parent))
+        serialized = json.dumps(out)
+        # None of the credential-bearing fragments survive anywhere in the
+        # complete serialized inspect response.
+        for fragment in (
+            "/services/T00000000",
+            "XXXXXXXXXXXXXXXXXXXXXXXX",
+            "bot123456789:AAExampleSecret",
+            "sendMessage",
+            "user:pass",
+            "query-secret",
+            "/path",
+        ):
+            assert fragment not in serialized, fragment
+        targets = [e["tool_input"]["targets"] for e in out["recent_events"]]
+        expected_origins = [
+            "https://hooks.slack.com",
+            "https://api.telegram.org",
+            "https://example.com",
+        ]
+        # Events alternate web_fetch(url)/http_request(endpoint) per secret.
+        for i, origin in enumerate(expected_origins):
+            assert targets[2 * i]["url"] == origin
+            assert targets[2 * i + 1]["endpoint"] == origin
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_inspect_url_path_allowlist_is_empty_by_default():
+    """The path-preserving allowlist ships empty (fail closed)."""
+    from tools import delegate_inspect
+
+    assert delegate_inspect._TOOL_INPUT_PATH_PRESERVING_HOSTS == frozenset()
 
 
 def test_inspect_event_ring_is_bounded_and_tool_count_is_total():
@@ -281,7 +332,9 @@ def test_inspect_capture_failure_is_reported_without_breaking_inner_callback(mon
     def _boom(_arguments):
         raise RuntimeError("do not retain this secret exception")
 
-    monkeypatch.setattr(dt, "_summarize_tool_arguments", _boom)
+    import tools.delegate_inspect as di
+
+    monkeypatch.setattr(di, "summarize_tool_arguments", _boom)
     cb = _wrap_subagent_inspect_callback(_inner, sid)
     try:
         cb("tool.started", "terminal", args='{"command":"secret"}')

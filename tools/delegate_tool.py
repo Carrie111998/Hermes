@@ -33,7 +33,17 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit, urlunsplit
+from tools import delegate_inspect
+from tools.delegate_inspect import (
+    DelegateEvent,
+    SUBAGENT_INSPECT_EVENT_LIMIT as _SUBAGENT_INSPECT_EVENT_LIMIT,
+    _LEGACY_EVENT_MAP,
+    bind_registry as _bind_inspect_registry,
+    sanitize_input_summary as _sanitize_tool_input_summary,
+    sanitize_target as _sanitize_tool_target,
+    summarize_tool_arguments as _summarize_tool_arguments,
+    wrap_inspect_callback as _wrap_subagent_inspect_callback,
+)
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
@@ -152,6 +162,11 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
+
+# The live inspect subsystem records through this same registry + lock; the
+# privacy boundary (URL sanitization), bounded event ring, and strict
+# serializer are owned by tools/delegate_inspect.py.
+_bind_inspect_registry(_active_subagents_lock, _active_subagents)
 
 # subagent_id -> {goal, delegation_id, parent_session_id} retained AFTER the
 # child finishes (bounded FIFO). Child-started background processes routinely
@@ -547,9 +562,11 @@ def _handle_control_action(
             agent = live_record.get("agent")
             started = live_record.get("started_at")
             base_snapshot = {
+                "subagent_id": sid,
                 "goal": live_record.get("goal"),
                 "model": live_record.get("model"),
                 "status": live_record.get("status"),
+                "started_at": started,
                 "accepting_steer": bool(live_record.get("accepting_steer", False)),
                 "last_tool": live_record.get("last_tool"),
                 "tool_count": live_record.get("tool_count", 0),
@@ -585,50 +602,7 @@ def _handle_control_action(
                 "Retry while the child is still live or use action='list'."
             )
 
-        def _nonnegative_int(value: Any) -> int:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return 0
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError, OverflowError):
-                return 0
-            if not math.isfinite(numeric) or numeric < 0:
-                return 0
-            return int(numeric)
-
         now = time.time()
-        last_activity_ts = activity_raw.get("last_activity_ts")
-        seconds_since_activity = None
-        if (
-            isinstance(last_activity_ts, (int, float))
-            and not isinstance(last_activity_ts, bool)
-            and math.isfinite(float(last_activity_ts))
-        ):
-            seconds_since_activity = round(
-                max(0.0, now - float(last_activity_ts)), 1
-            )
-
-        current_tool = activity_raw.get("current_tool")
-        if not isinstance(current_tool, str) or not current_tool:
-            current_tool = None
-        else:
-            current_tool = current_tool[:256]
-
-        last_tool = base_snapshot.get("last_tool")
-        if not isinstance(last_tool, str) or not last_tool:
-            last_tool = None
-        else:
-            last_tool = last_tool[:256]
-
-        cost_value = getattr(agent, "session_estimated_cost_usd", 0.0)
-        try:
-            cost_float = float(cost_value)
-            estimated_cost_usd = (
-                max(0.0, cost_float) if math.isfinite(cost_float) else 0.0
-            )
-        except (TypeError, ValueError, OverflowError):
-            estimated_cost_usd = 0.0
-
         # A child can finish or a public id can be replaced during sampling.
         # Revalidate exact record identity + ownership before returning a live
         # capability. Stale state fails closed instead of leaking old evidence.
@@ -647,51 +621,10 @@ def _handle_control_action(
                     "completion message). Use action='list' to see live children."
                 )
 
-        running_seconds = (
-            round(max(0.0, now - float(started)), 1)
-            if isinstance(started, (int, float))
-            and not isinstance(started, bool)
-            and math.isfinite(float(started))
-            else None
-        )
-        capture_errors = _nonnegative_int(base_snapshot.get("capture_errors"))
-        return json.dumps(
-            {
-                "action": "inspect",
-                "subagent_id": sid,
-                "goal": base_snapshot.get("goal"),
-                "model": base_snapshot.get("model"),
-                "status": base_snapshot.get("status"),
-                "running_seconds": running_seconds,
-                "activity": {
-                    "current_tool": current_tool,
-                    "last_tool": last_tool,
-                    "tool_count": _nonnegative_int(base_snapshot.get("tool_count")),
-                    "api_calls": _nonnegative_int(activity_raw.get("api_call_count", 0)),
-                    "max_iterations": _nonnegative_int(
-                        activity_raw.get("max_iterations", 0)
-                    ),
-                    "seconds_since_activity": seconds_since_activity,
-                },
-                "usage": {
-                    "input_tokens": _nonnegative_int(
-                        getattr(agent, "session_prompt_tokens", 0)
-                    ),
-                    "output_tokens": _nonnegative_int(
-                        getattr(agent, "session_completion_tokens", 0)
-                    ),
-                    "estimated_cost_usd": round(estimated_cost_usd, 6),
-                },
-                "recent_events": base_snapshot.get("recent_events", []),
-                "telemetry": {
-                    "capture_degraded": capture_errors > 0,
-                    "capture_errors": capture_errors,
-                    "recent_event_limit": _SUBAGENT_INSPECT_EVENT_LIMIT,
-                },
-                "accepting_steer": base_snapshot.get("accepting_steer", False),
-            },
-            ensure_ascii=False,
-            allow_nan=False,
+        # Strict serialization + counter normalization are owned by the
+        # inspect subsystem so the privacy boundary has a single module.
+        return delegate_inspect.serialize_inspect_response(
+            base_snapshot, agent, activity_raw, now=now
         )
 
     if action == "stop":
@@ -832,246 +765,11 @@ def _stringify_tool_content(content: Any) -> str:
     return str(content)
 
 
-_TOOL_INPUT_TARGET_KEYS = frozenset({
-    "cwd",
-    "destination_path",
-    "directory",
-    "dst",
-    "endpoint",
-    "file_path",
-    "new_path",
-    "old_path",
-    "path",
-    "source_path",
-    "src",
-    "target_path",
-    "url",
-    "urls",
-})
-_TOOL_INPUT_URL_KEYS = frozenset({"endpoint", "url", "urls"})
-
-
-def _sanitize_tool_target(key: str, value: Any) -> Any:
-    """Keep bounded side-effect targets while dropping URL secrets."""
-    if isinstance(value, list):
-        cleaned = [
-            item for item in (_sanitize_tool_target(key, item) for item in value[:16])
-            if item is not None
-        ]
-        return cleaned or None
-    if not isinstance(value, str) or not value:
-        return None
-    bounded = value[:1024]
-    if key in _TOOL_INPUT_URL_KEYS:
-        try:
-            parsed = urlsplit(bounded)
-            if parsed.scheme and parsed.netloc:
-                hostname = parsed.hostname
-                if not hostname:
-                    return None
-                # ``SplitResult.netloc`` includes ``user:password@``. Rebuild
-                # the authority from parsed host/port so hook-visible history
-                # cannot carry URL credentials. Bracket IPv6 literals before
-                # appending a validated port.
-                host = f"[{hostname}]" if ":" in hostname else hostname
-                port = parsed.port
-                netloc = f"{host}:{port}" if port is not None else host
-                return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-        except ValueError:
-            return None
-    return bounded
-
-
-def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
-    """Summarize argument names and side-effect targets without raw payloads."""
-    if not isinstance(arguments, str):
-        return {"argument_keys": [], "targets": {}}
-    try:
-        parsed = json.loads(arguments)
-    except (TypeError, ValueError):
-        return {"argument_keys": [], "targets": {}}
-    if not isinstance(parsed, dict):
-        return {"argument_keys": [], "targets": {}}
-
-    keys = sorted(str(key)[:128] for key in parsed)[:64]
-    targets: Dict[str, Any] = {}
-    for raw_key, value in parsed.items():
-        key = str(raw_key).lower()
-        if key not in _TOOL_INPUT_TARGET_KEYS:
-            continue
-        cleaned = _sanitize_tool_target(key, value)
-        if cleaned is not None:
-            targets[key] = cleaned
-    return {"argument_keys": keys, "targets": targets}
-
-
-def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
-    if not isinstance(summary, dict):
-        return {"argument_keys": [], "targets": {}}
-    keys = summary.get("argument_keys")
-    safe_keys = (
-        [str(key)[:128] for key in keys[:64]]
-        if isinstance(keys, list)
-        else []
-    )
-    targets = summary.get("targets")
-    safe_targets: Dict[str, Any] = {}
-    if isinstance(targets, dict):
-        for raw_key, value in targets.items():
-            key = str(raw_key).lower()
-            if key not in _TOOL_INPUT_TARGET_KEYS:
-                continue
-            cleaned = _sanitize_tool_target(key, value)
-            if cleaned is not None:
-                safe_targets[key] = cleaned
-    return {"argument_keys": safe_keys, "targets": safe_targets}
-
-
-_SUBAGENT_INSPECT_EVENT_LIMIT = 12
-_SUBAGENT_INSPECT_CAPTURE_ERROR_LIMIT = 2_147_483_647
-
-
-def _record_subagent_tool_started(subagent_id: str, tool_name: Any) -> None:
-    """Update the existing canonical live-registry tool activity fields."""
-    safe_tool = str(tool_name or "unknown")[:256]
-    with _active_subagents_lock:
-        record = _active_subagents.get(subagent_id)
-        if record is None:
-            return
-        count = record.get("tool_count", 0)
-        if isinstance(count, bool) or not isinstance(count, int):
-            count = 0
-        record["tool_count"] = max(0, count) + 1
-        record["last_tool"] = safe_tool
-
-
-def _record_subagent_inspect_capture_error(subagent_id: str) -> None:
-    """Mark supplementary inspect capture degraded without retaining error text."""
-    with _active_subagents_lock:
-        record = _active_subagents.get(subagent_id)
-        if record is None:
-            return
-        value = record.get("_inspect_capture_errors", 0)
-        if isinstance(value, bool) or not isinstance(value, int):
-            value = 0
-        record["_inspect_capture_errors"] = min(
-            _SUBAGENT_INSPECT_CAPTURE_ERROR_LIMIT, max(0, value) + 1
-        )
-
-
-def _append_subagent_inspect_event(
-    subagent_id: str, event: Dict[str, Any]
-) -> None:
-    """Append one bounded metadata-only event to a live child's inspect ring.
-
-    This is deliberately not a transcript: reasoning, assistant text, raw
-    arguments, and raw tool results never enter this ring.
-    """
-    kind = str(event.get("type") or "")
-    if kind not in {"tool_started", "tool_completed"}:
-        return
-    tool_name = str(event.get("tool") or "unknown")[:256]
-    safe_event: Dict[str, Any] = {"type": kind, "tool": tool_name}
-    if kind == "tool_started":
-        safe_event["tool_input"] = _sanitize_tool_input_summary(
-            event.get("tool_input")
-        )
-    else:
-        status = str(event.get("status") or "unknown").lower()
-        safe_event["status"] = status if status in {"ok", "error"} else "unknown"
-        duration = event.get("duration_seconds")
-        if (
-            isinstance(duration, (int, float))
-            and not isinstance(duration, bool)
-            and math.isfinite(float(duration))
-        ):
-            safe_event["duration_seconds"] = round(max(0.0, float(duration)), 3)
-
-    with _active_subagents_lock:
-        record = _active_subagents.get(subagent_id)
-        if record is None:
-            return
-        events = record.setdefault("_inspect_events", [])
-        if not isinstance(events, list):
-            events = []
-            record["_inspect_events"] = events
-        events.append(safe_event)
-        if len(events) > _SUBAGENT_INSPECT_EVENT_LIMIT:
-            del events[:-_SUBAGENT_INSPECT_EVENT_LIMIT]
-
-
-def _wrap_subagent_inspect_callback(inner_cb, subagent_id: str):
-    """Tee tool lifecycle into a bounded model-safe inspect ring.
-
-    The tee is always installed for live children, including headless hosts, so
-    canonical registry tool_count/last_tool no longer depend on a display
-    callback. Supplementary ring-capture failures never break execution; they
-    increment a bounded degradation counter surfaced by action='inspect'.
-    """
-
-    def _cb(event_type, tool_name=None, preview=None, args=None, **kwargs):
-        try:
-            if isinstance(event_type, DelegateEvent):
-                event = event_type
-            else:
-                event = _LEGACY_EVENT_MAP.get(event_type)
-                if event is None:
-                    try:
-                        event = DelegateEvent(event_type)
-                    except (ValueError, TypeError):
-                        event = None
-
-            if event == DelegateEvent.TASK_TOOL_STARTED:
-                # Update canonical live activity before optional argument
-                # summarization so a sanitizer failure cannot lose the count.
-                _record_subagent_tool_started(subagent_id, tool_name)
-                if isinstance(args, str):
-                    serialized_args = args
-                elif args is None:
-                    serialized_args = ""
-                else:
-                    serialized_args = json.dumps(
-                        args, ensure_ascii=False, default=str
-                    )
-                _append_subagent_inspect_event(
-                    subagent_id,
-                    {
-                        "type": "tool_started",
-                        "tool": tool_name,
-                        "tool_input": _summarize_tool_arguments(serialized_args),
-                    },
-                )
-            elif event == DelegateEvent.TASK_TOOL_COMPLETED:
-                _append_subagent_inspect_event(
-                    subagent_id,
-                    {
-                        "type": "tool_completed",
-                        "tool": tool_name,
-                        "status": "error" if kwargs.get("is_error") else "ok",
-                        "duration_seconds": kwargs.get("duration"),
-                    },
-                )
-        except Exception:
-            _record_subagent_inspect_capture_error(subagent_id)
-            logger.debug(
-                "Subagent inspect capture failed for %s", subagent_id, exc_info=True
-            )
-
-        # Preserve the original callback's exception semantics: only inspect
-        # capture is isolated; existing display/transcript callback failures are
-        # handled exactly where they were before this tee existed.
-        if inner_cb is not None:
-            return inner_cb(event_type, tool_name, preview, args, **kwargs)
-        return None
-
-    def _flush():
-        inner_flush = getattr(inner_cb, "_flush", None)
-        if callable(inner_flush):
-            return inner_flush()
-        return None
-
-    _cb._flush = _flush
-    return _cb
+_record_subagent_tool_started = delegate_inspect.record_tool_started
+_record_subagent_inspect_capture_error = (
+    delegate_inspect.record_capture_error
+)
+_append_subagent_inspect_event = delegate_inspect.append_inspect_event
 
 
 def _subagent_stop_tool_call_history(tool_trace: Any) -> List[Dict[str, Any]]:
@@ -1447,36 +1145,8 @@ DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 # ---------------------------------------------------------------------------
 
 
-class DelegateEvent(str, enum.Enum):
-    """Formal event types emitted during delegation progress.
-
-    _build_child_progress_callback normalises incoming legacy strings
-    (``tool.started``, ``_thinking``, …) to these enum values via
-    ``_LEGACY_EVENT_MAP``.  External consumers (gateway SSE, ACP adapter,
-    CLI) still receive the legacy strings during the deprecation window.
-
-    TASK_SPAWNED / TASK_COMPLETED / TASK_FAILED are reserved for
-    future orchestrator lifecycle events and are not currently emitted.
-    """
-
-    TASK_SPAWNED = "delegate.task_spawned"
-    TASK_PROGRESS = "delegate.task_progress"
-    TASK_COMPLETED = "delegate.task_completed"
-    TASK_FAILED = "delegate.task_failed"
-    TASK_THINKING = "delegate.task_thinking"
-    TASK_TOOL_STARTED = "delegate.tool_started"
-    TASK_TOOL_COMPLETED = "delegate.tool_completed"
-
-
-# Legacy event strings → DelegateEvent mapping.
-# Incoming child-agent events use the old names; the callback normalises them.
-_LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
-    "_thinking": DelegateEvent.TASK_THINKING,
-    "reasoning.available": DelegateEvent.TASK_THINKING,
-    "tool.started": DelegateEvent.TASK_TOOL_STARTED,
-    "tool.completed": DelegateEvent.TASK_TOOL_COMPLETED,
-    "subagent_progress": DelegateEvent.TASK_PROGRESS,
-}
+# DelegateEvent and _LEGACY_EVENT_MAP live in tools.delegate_inspect and are
+# re-exported above for backward compatibility (gateway SSE, ACP adapter, CLI).
 
 
 def check_delegate_requirements() -> bool:
