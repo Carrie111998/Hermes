@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,9 +89,11 @@ def _usage_file() -> Path:
 
 
 _ARCHIVED_NAMES_CACHE: Dict[
-    tuple[str, Optional[int], Optional[int], Optional[int]], frozenset[str]
+    str,
+    tuple[tuple[Optional[int], Optional[int], Optional[int]], frozenset[str]],
 ] = {}
 _ARCHIVED_NAMES_CACHE_MAX_PROFILES = 32
+_ARCHIVED_NAMES_CACHE_LOCK = threading.Lock()
 
 
 def archived_skill_names() -> frozenset[str]:
@@ -101,15 +104,17 @@ def archived_skill_names() -> frozenset[str]:
     :func:`save_usage` immediately.
     """
     path = _usage_file()
+    path_key = str(path)
     try:
         stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        fingerprint = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
     except OSError:
-        key = (str(path), None, None, None)
+        fingerprint = (None, None, None)
 
-    cached = _ARCHIVED_NAMES_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _ARCHIVED_NAMES_CACHE_LOCK:
+        cached = _ARCHIVED_NAMES_CACHE.get(path_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
 
     usage, loaded = _load_usage_with_status()
     archived = frozenset(
@@ -121,9 +126,13 @@ def archived_skill_names() -> frozenset[str]:
     # recoverable on the next lookup rather than pinning a fail-open empty set.
     if not loaded:
         return archived
-    if len(_ARCHIVED_NAMES_CACHE) >= _ARCHIVED_NAMES_CACHE_MAX_PROFILES:
-        _ARCHIVED_NAMES_CACHE.pop(next(iter(_ARCHIVED_NAMES_CACHE)))
-    _ARCHIVED_NAMES_CACHE[key] = archived
+    with _ARCHIVED_NAMES_CACHE_LOCK:
+        if (
+            path_key not in _ARCHIVED_NAMES_CACHE
+            and len(_ARCHIVED_NAMES_CACHE) >= _ARCHIVED_NAMES_CACHE_MAX_PROFILES
+        ):
+            _ARCHIVED_NAMES_CACHE.pop(next(iter(_ARCHIVED_NAMES_CACHE)))
+        _ARCHIVED_NAMES_CACHE[path_key] = (fingerprint, archived)
     return archived
 
 

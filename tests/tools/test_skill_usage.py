@@ -97,6 +97,7 @@ def test_archived_names_reuses_parse_until_sidecar_changes(skills_home, monkeypa
     skill_usage.save_usage({"skill-a": {"state": skill_usage.STATE_ARCHIVED}})
     assert skill_usage.archived_skill_names() == frozenset({"skill-a"})
     assert loads == 2
+    assert len(skill_usage._ARCHIVED_NAMES_CACHE) == 1
 
 
 def test_archived_names_retries_transient_read_failure(skills_home, monkeypatch):
