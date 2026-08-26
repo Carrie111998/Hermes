@@ -106,13 +106,22 @@ def main() -> int:
                 return open(f"/proc/{pid}/cmdline","rb").read().replace(b"\0"," ".encode()).decode(errors="replace")
             except Exception:
                 return ""
+        def _role(pid):
+            try:
+                raw = open(f"/proc/{pid}/environ", "rb").read()
+                env = dict(chunk.split(b"=", 1) for chunk in raw.split(b"\0") if b"=" in chunk)
+                return env.get(b"HERMES_TUI_ORCH_ROLE", b"").decode(errors="replace")
+            except Exception:
+                return ""
+
         renderer = None
         gateway = None
         for p in desc:
+            role = _role(p)
             c = _cmd(p)
-            if "ws_host" in c:
+            if role == "gateway" or "ws_host" in c:
                 gateway = p
-            elif "entry.js" in c or "bun" in c or "node" in c or "tsx" in c:
+            elif role == "renderer" or "entry.js" in c or "bun" in c or "node" in c or "tsx" in c:
                 renderer = p
         print(f"[ids] gateway={gateway} ({_cmd(gateway)[:50] if gateway else '?'}) renderer={renderer} ({_cmd(renderer)[:50] if renderer else '?'})")
         assert gateway, "no gateway ws_host child found"
@@ -132,7 +141,10 @@ def main() -> int:
         assert gw_alive, "gateway died when renderer was killed (anchor not durable!)"
         # a new renderer should have been respawned
         new_desc = _descendants(orch.pid)
-        new_renderers = [p for p in new_desc if ("entry.js" in _cmd(p) or "bun" in _cmd(p) or "node" in _cmd(p) or "tsx" in _cmd(p))]
+        new_renderers = [
+            p for p in new_desc
+            if _role(p) == "renderer" or "entry.js" in _cmd(p) or "bun" in _cmd(p) or "node" in _cmd(p) or "tsx" in _cmd(p)
+        ]
         print(f"[respawn] descendants now {new_desc}, renderer candidates {new_renderers}")
         assert new_renderers and new_renderers[0] != renderer, "renderer was NOT respawned after kill"
         print(f"[respawn] fresh renderer {new_renderers[0]} attached to surviving gateway {gateway}")

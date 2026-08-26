@@ -111,7 +111,10 @@ def main() -> int:
         plan = reaper.plan_reap(
             snap,
             my_orchestrator_pid=me,
-            live_pids=[me],  # NOT listing bun.pid as live → eligible
+            # Match production semantics exactly: the supervised renderer is a
+            # live pid, with its identity passed separately for heartbeat checks.
+            live_pids=[me, bun.pid],
+            current_renderer_pid=bun.pid,
             alive_orchestrator_pids={me},
             heartbeat_stale_s=2.0,  # short threshold for the test
         )

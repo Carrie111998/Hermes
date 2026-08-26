@@ -25,7 +25,9 @@ scan_processes() feeds it from /proc; execute_reap() does the actual kills, and
 is the only part with side effects.
 
 SAFETY INVARIANTS (encoded + tested):
-  - NEVER reap our own current gateway/renderer/orchestrator pids.
+  - NEVER reap our current gateway/orchestrator or any unrelated live pid.
+  - The one exception is the explicitly identified current renderer. It may be
+    reaped only when it is marked as our renderer and its heartbeat is stale.
   - NEVER reap a process we cannot positively identify as Hermes-TUI debris
     (must carry our marker env key). No PID-pattern guessing, no pgrep
     self-match [durable-long-run-orchestration footgun].
@@ -87,6 +89,7 @@ def plan_reap(
     my_orchestrator_pid: int,
     live_pids: Iterable[int],
     alive_orchestrator_pids: Iterable[int],
+    current_renderer_pid: Optional[int] = None,
     heartbeat_stale_s: float = DEFAULT_HEARTBEAT_STALE_S,
 ) -> ReapPlan:
     """Pure decision function. Returns a ReapPlan; performs NO side effects.
@@ -95,9 +98,13 @@ def plan_reap(
       snapshot: all candidate processes (already filtered to carry MARKER_ENV;
         scan_processes guarantees this, but plan_reap re-checks owner_pid).
       my_orchestrator_pid: this orchestrator's pid — its children are NEVER orphans.
-      live_pids: pids this orchestrator currently owns+tracks (its gateway +
-        current renderer). NEVER reaped, regardless of heartbeat (the orchestrator
-        owns their lifecycle; the reaper must not race it).
+      live_pids: pids known to be alive and therefore protected from orphan and
+        dedup cleanup. The exact ``current_renderer_pid`` is the sole exception:
+        it remains protected while healthy, but may be selected by the frozen
+        heartbeat rule. This exception never applies to another live pid.
+      current_renderer_pid: the renderer process currently supervised by this
+        orchestrator. It is eligible only for frozen-heartbeat reaping, and only
+        when its marker owner and role both match the expected values.
       alive_orchestrator_pids: pids of orchestrators currently alive on the host
         (including ours). A child whose owner_pid is NOT in this set is orphaned.
       heartbeat_stale_s: a tracked renderer older than this is "frozen".
@@ -115,11 +122,30 @@ def plan_reap(
         # as orchestrator children. owner_pid None ⇒ not ours ⇒ never touched.
         if p.owner_pid is None:
             continue
-        # NEVER touch a pid the orchestrator owns/tracks right now.
-        if p.pid in live:
-            continue
         # NEVER touch our own orchestrator process.
         if p.pid == my_orchestrator_pid:
+            continue
+
+        # The current supervised renderer is normally a protected live pid, but
+        # heartbeat reaping exists specifically for the case where poll() still
+        # reports that renderer alive while its event loop is frozen. Only this
+        # exact pid may cross the live-pid boundary, and only after validating
+        # both ownership markers. A healthy current renderer remains protected.
+        if p.pid == current_renderer_pid:
+            if (
+                p.owner_pid == my_orchestrator_pid
+                and p.role == "renderer"
+                and p.heartbeat_age_s is not None
+                and p.heartbeat_age_s > heartbeat_stale_s
+            ):
+                plan.frozen.append(
+                    (p.pid, f"frozen: heartbeat {p.heartbeat_age_s:.0f}s > {heartbeat_stale_s:.0f}s")
+                )
+            continue
+
+        # Every other pid reported live is unconditionally protected, including
+        # unrelated marked processes and stale renderer leftovers.
+        if p.pid in live:
             continue
 
         # (1) ORPHAN: its owning orchestrator is gone.

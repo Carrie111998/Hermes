@@ -18,6 +18,7 @@ class FakeProc:
     """Minimal Popen stand-in. poll() returns None until .die(code) is called."""
 
     def __init__(self, label: str):
+        self.pid = 0
         self.label = label
         self._rc = None
         self.returncode = None
@@ -49,11 +50,13 @@ def make_orch(monkeypatch_attrs=None):
 
     def spawn_gateway(host, port, cred):
         p = FakeProc(f"gateway@{host}:{port}")
+        p.pid = 50000 + len(spawned["gateway"])
         spawned["gateway"].append(p)
         return p
 
     def spawn_renderer(url, resume_sid=None):
         p = FakeProc(f"renderer->{url}")
+        p.pid = 60000 + len(spawned["renderer"])
         p.resume_sid = resume_sid
         spawned["renderer"].append(p)
         return p
@@ -68,7 +71,7 @@ def make_orch(monkeypatch_attrs=None):
     return orch, spawned
 
 
-def run_for(orch, *, steps, mutate):
+def run_for(orch, *, steps, mutate, gateway_ready=None):
     """Drive the loop manually: we can't call run() (it blocks), so we replicate
     its body deterministically by stepping the same transitions the loop uses.
     Instead we monkeypatch time.sleep to fire `mutate(i)` each tick and stop
@@ -77,6 +80,7 @@ def run_for(orch, *, steps, mutate):
 
     state = {"i": 0}
     orig_sleep = m.time.sleep
+    orig_wait_for_port = m._wait_for_port
 
     def fake_sleep(_):
         i = state["i"]
@@ -86,12 +90,12 @@ def run_for(orch, *, steps, mutate):
             orch.request_stop()
 
     m.time.sleep = fake_sleep
-    # Stub gateway-ready wait so _start_gateway succeeds without a real port.
-    m._wait_for_port = lambda *a, **k: True
+    m._wait_for_port = gateway_ready or (lambda *a, **k: True)
     try:
         return orch.run()
     finally:
         m.time.sleep = orig_sleep
+        m._wait_for_port = orig_wait_for_port
 
 
 def test_kill_renderer_keeps_gateway():
@@ -133,8 +137,9 @@ def test_clean_quit_tears_down():
         if i == 1:
             o._renderer.die(0)
 
-    run_for(orch, steps=10, mutate=mutate)
+    status = run_for(orch, steps=10, mutate=mutate)
 
+    assert status == 0
     assert len(spawned["renderer"]) == 1, f"respawned after clean quit: {len(spawned['renderer'])}"
     assert orch._renderer_quit is True
     print("PASS test_clean_quit_tears_down: no respawn after exit 0")
@@ -150,11 +155,106 @@ def test_respawn_budget_bounds_crashloop():
         if o._renderer is not None and o._renderer.poll() is None:
             o._renderer.die(1)
 
-    run_for(orch, steps=50, mutate=mutate)
+    from tui_gateway.orchestrator import RESPAWN_EXHAUSTED_EXIT_CODE
 
-    # initial + at most `limit` respawns, then bail.
-    assert len(spawned["renderer"]) <= 1 + 3, f"crashloop not bounded: {len(spawned['renderer'])}"
+    status = run_for(orch, steps=50, mutate=mutate)
+
+    assert len(spawned["renderer"]) == 1 + 3
+    assert status == RESPAWN_EXHAUSTED_EXIT_CODE == 75
     print(f"PASS test_respawn_budget_bounds_crashloop: renderer spawns bounded at {len(spawned['renderer'])}")
+
+
+def test_gateway_respawn_budget_exhaustion_returns_nonzero():
+    from tui_gateway.orchestrator import RESPAWN_EXHAUSTED_EXIT_CODE
+
+    orch, _ = make_orch()
+    orch.cfg.gateway_respawn = _RespawnBudget(limit=0, window_s=1000.0)
+
+    def mutate(i, o):
+        if i == 1:
+            o._gateway.die(1)
+
+    status = run_for(orch, steps=10, mutate=mutate)
+    assert status == RESPAWN_EXHAUSTED_EXIT_CODE == 75
+
+
+def test_gateway_restart_failure_returns_nonzero():
+    from tui_gateway.orchestrator import GATEWAY_FAILURE_EXIT_CODE
+
+    orch, spawned = make_orch()
+    ready_calls = [True, False]
+
+    def mutate(i, o):
+        if i == 1:
+            o._gateway.die(1)
+
+    status = run_for(
+        orch,
+        steps=10,
+        mutate=mutate,
+        gateway_ready=lambda *_a, **_k: ready_calls.pop(0),
+    )
+    assert len(spawned["gateway"]) == 2
+    assert status == GATEWAY_FAILURE_EXIT_CODE == 70
+
+
+def test_frozen_current_renderer_is_reaped_and_respawned(monkeypatch):
+    import os
+
+    from tui_gateway import reaper
+    from tui_gateway.reaper import ProcInfo
+
+    orch, spawned = make_orch()
+    orch.cfg.reaper_interval_s = 0.000001
+    scans = 0
+    reaped = []
+
+    def scan_processes():
+        nonlocal scans
+        scans += 1
+        renderer = orch._renderer
+        assert renderer is not None
+        return [ProcInfo(renderer.pid, os.getpid(), "renderer", 999.0 if scans == 1 else 0.0)]
+
+    def execute_reap(plan, *, log):
+        renderer = orch._renderer
+        assert isinstance(renderer, FakeProc)
+        reaped.extend(plan.all_pids)
+        renderer.die(-15)
+        return plan.all_pids
+
+    monkeypatch.setattr(reaper, "scan_processes", scan_processes)
+    monkeypatch.setattr(reaper, "execute_reap", execute_reap)
+    status = run_for(orch, steps=4, mutate=lambda _i, _o: None)
+
+    assert status == 0
+    assert reaped == [60000]
+    assert len(spawned["renderer"]) == 2
+    assert len(spawned["gateway"]) == 1
+
+
+def test_healthy_current_renderer_is_not_reaped_or_respawned(monkeypatch):
+    import os
+
+    from tui_gateway import reaper
+    from tui_gateway.reaper import ProcInfo
+
+    orch, spawned = make_orch()
+    orch.cfg.reaper_interval_s = 0.000001
+    execute_calls = []
+
+    def scan_processes():
+        renderer = orch._renderer
+        assert renderer is not None
+        return [ProcInfo(renderer.pid, os.getpid(), "renderer", 0.0)]
+
+    monkeypatch.setattr(reaper, "scan_processes", scan_processes)
+    monkeypatch.setattr(reaper, "execute_reap", lambda plan, *, log: execute_calls.append(plan))
+    status = run_for(orch, steps=4, mutate=lambda _i, _o: None)
+
+    assert status == 0
+    assert execute_calls == []
+    assert len(spawned["renderer"]) == 1
 
 
 def test_budget_unit():
@@ -223,6 +323,7 @@ def test_recycle_exit_code_preserves_session():
     from tui_gateway.orchestrator import RECYCLE_EXIT_CODE
 
     orch, spawned = make_orch()
+    assert RECYCLE_EXIT_CODE == 97
 
     def mutate(i, o):
         if i == 1:
@@ -304,6 +405,8 @@ if __name__ == "__main__":
     test_recycle_respawn_resumes_live_sid()
     test_only_exit_zero_tears_down()
     test_respawn_budget_bounds_crashloop()
+    test_gateway_respawn_budget_exhaustion_returns_nonzero()
+    test_gateway_restart_failure_returns_nonzero()
     test_respawn_reads_resume_sid_from_active_file()
     test_corrupt_active_file_yields_no_resume()
     print("\nALL ORCHESTRATOR LOGIC TESTS PASSED")

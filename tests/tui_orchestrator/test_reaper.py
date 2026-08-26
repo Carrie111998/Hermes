@@ -28,13 +28,49 @@ def test_orphan_reaped_when_owner_orchestrator_gone():
     print("PASS orphan: owner-gone child reaped")
 
 
-def test_live_pid_never_reaped_even_if_frozen():
-    # A tracked renderer with a very stale heartbeat — but it's a LIVE pid the
-    # orchestrator owns. The reaper must NOT race the orchestrator: keep it.
-    snap = [P(2002, owner=MY, role="renderer", hb=9999)]
-    plan = plan_reap(snap, my_orchestrator_pid=MY, live_pids=[2002], alive_orchestrator_pids=[MY])
-    assert plan.is_empty(), f"live pid was reaped: {plan.all_pids}"
-    print("PASS safety: live tracked pid never reaped (even frozen)")
+def test_frozen_current_renderer_is_the_only_live_pid_reaped():
+    snap = [
+        P(2002, owner=MY, role="renderer", hb=9999),
+        P(2007, owner=MY, role="renderer", hb=9999),
+        P(2008, owner=MY, role="gateway", hb=9999),
+    ]
+    plan = plan_reap(
+        snap,
+        my_orchestrator_pid=MY,
+        live_pids=[2002, 2007, 2008],
+        current_renderer_pid=2002,
+        alive_orchestrator_pids=[MY],
+    )
+    assert plan.all_pids == [2002], f"wrong live pid selected: {plan.all_pids}"
+    assert plan.frozen[0][0] == 2002
+
+
+def test_healthy_current_renderer_is_not_reaped():
+    snap = [P(2009, owner=MY, role="renderer", hb=5)]
+    plan = plan_reap(
+        snap,
+        my_orchestrator_pid=MY,
+        live_pids=[2009],
+        current_renderer_pid=2009,
+        alive_orchestrator_pids=[MY],
+        heartbeat_stale_s=90,
+    )
+    assert plan.is_empty(), f"healthy current renderer was reaped: {plan.all_pids}"
+
+
+def test_current_renderer_identity_requires_owner_and_role_markers():
+    for proc in (
+        P(2010, owner=9999, role="renderer", hb=9999),
+        P(2010, owner=MY, role="gateway", hb=9999),
+    ):
+        plan = plan_reap(
+            [proc],
+            my_orchestrator_pid=MY,
+            live_pids=[2010],
+            current_renderer_pid=2010,
+            alive_orchestrator_pids=[MY, 9999],
+        )
+        assert plan.is_empty(), f"unvalidated current pid was reaped: {proc}"
 
 
 def test_own_orchestrator_pid_never_reaped():
@@ -125,7 +161,9 @@ def test_execute_reap_skips_on_permission_error():
 
 if __name__ == "__main__":
     test_orphan_reaped_when_owner_orchestrator_gone()
-    test_live_pid_never_reaped_even_if_frozen()
+    test_frozen_current_renderer_is_the_only_live_pid_reaped()
+    test_healthy_current_renderer_is_not_reaped()
+    test_current_renderer_identity_requires_owner_and_role_markers()
     test_own_orchestrator_pid_never_reaped()
     test_unmarked_process_never_touched()
     test_frozen_renderer_reaped()

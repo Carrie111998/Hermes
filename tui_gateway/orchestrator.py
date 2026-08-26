@@ -73,6 +73,11 @@ RESPAWN_WINDOW_S = 60.0
 # unambiguous in `poll()`/`returncode` and in the manual tester.
 RECYCLE_EXIT_CODE = 97
 
+# Supervisor failures use sysexits-compatible values and must never look like a
+# clean user quit or the renderer's recycle protocol status.
+GATEWAY_FAILURE_EXIT_CODE = 70  # EX_SOFTWARE
+RESPAWN_EXHAUSTED_EXIT_CODE = 75  # EX_TEMPFAIL
+
 
 @dataclass
 class _RespawnBudget:
@@ -180,7 +185,12 @@ class Orchestrator:
         self._last_reap = 0.0
 
     def _live_pids(self) -> list[int]:
-        """Pids the orchestrator currently owns + tracks — NEVER reaped."""
+        """Pids known alive and protected from orphan/dedup cleanup.
+
+        The current renderer is included, but plan_reap receives its exact pid
+        separately. That one pid may cross the protection boundary only when its
+        ownership markers match and its heartbeat is stale.
+        """
         pids = [os.getpid()]
         for proc in (self._gateway, self._renderer):
             if proc is not None and proc.poll() is None and proc.pid is not None:
@@ -214,6 +224,11 @@ class Orchestrator:
                 snapshot,
                 my_orchestrator_pid=os.getpid(),
                 live_pids=self._live_pids(),
+                current_renderer_pid=(
+                    self._renderer.pid
+                    if self._renderer is not None and self._renderer.poll() is None
+                    else None
+                ),
                 alive_orchestrator_pids=alive_orchs,
             )
             if not plan.is_empty():
@@ -300,8 +315,9 @@ class Orchestrator:
         """
         if not self._start_gateway():
             self._terminate(self._gateway)
-            return 70  # EX_SOFTWARE: gateway never came up
+            return GATEWAY_FAILURE_EXIT_CODE
         self._start_renderer()
+        exit_code = 0
 
         try:
             while not self._stop.is_set():
@@ -334,6 +350,7 @@ class Orchestrator:
                     if self.cfg.renderer_respawn.allow(time.monotonic()):
                         self._start_renderer(resume=True)
                     else:
+                        exit_code = RESPAWN_EXHAUSTED_EXIT_CODE
                         break  # renderer crash-looping; bail so it's noticed
 
                 elif gw_dead:
@@ -341,15 +358,17 @@ class Orchestrator:
                     # renderer (its ws dropped). The renderer resumes by sid.
                     self._terminate(self._renderer)
                     if not self.cfg.gateway_respawn.allow(time.monotonic()):
+                        exit_code = RESPAWN_EXHAUSTED_EXIT_CODE
                         break
                     if not self._start_gateway():
+                        exit_code = GATEWAY_FAILURE_EXIT_CODE
                         break
                     self._start_renderer(resume=True)
         finally:
             self._terminate(self._renderer)
             self._terminate(self._gateway)
 
-        return 0 if self._renderer_quit else 0
+        return 0 if self._renderer_quit else exit_code
 
 
 def _default_spawn_gateway(host: str, port: int, internal_credential: str) -> "subprocess.Popen[bytes]":
@@ -412,11 +431,11 @@ def _make_default_spawn_renderer(active_session_file: str, heartbeat_file: str =
             root = env.get("HERMES_PYTHON_SRC_ROOT") or os.getcwd()
             entry = os.path.join(root, "ui-tui", "dist", "entry.js")
             renderer_argv = [bun, entry]
-        # The renderer is a bun child that must NOT inherit the gateway's
-        # JSON-RPC stdin (fd-inheritance would let it steal protocol bytes).
-        # Detach stdin explicitly; the repo-wide subprocess-stdin guard
-        # (scripts/check_subprocess_stdin.py) enforces this invariant.
-        return subprocess.Popen(renderer_argv, env=env, stdin=subprocess.DEVNULL)
+        # The orchestrated renderer is the interactive TUI, so it must inherit
+        # the orchestrator's terminal input. The gateway is a sibling WebSocket
+        # host and does not own this fd. Passing sys.stdin explicitly satisfies
+        # the subprocess guard without detaching the renderer from the user.
+        return subprocess.Popen(renderer_argv, env=env, stdin=sys.stdin)
 
     return _spawn
 
