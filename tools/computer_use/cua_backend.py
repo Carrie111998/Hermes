@@ -220,6 +220,26 @@ _NON_APP_WINDOW_TITLE_PREFIXES = (
 # (telemetry ON upstream).
 _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
+# On GNOME, advertising ScreenReaderEnabled=true is not a passive AT-SPI
+# capability hint: GNOME persists screen-reader-enabled=true and starts Orca.
+# Cinnamon must not receive even the reduced IsEnabled-only advertisement.
+# Keep cua-driver's desktop-specific policy intact even when a system gateway
+# lacks the graphical session's XDG desktop variables.
+_CUA_LINUX_A11Y_ADVERTISE_ENV_VAR = "CUA_DRIVER_RS_A11Y_ADVERTISE_MODE"
+_CUA_LINUX_A11Y_ADVERTISE_SAFE_MODE = "is_enabled_only"
+_CUA_LINUX_A11Y_ADVERTISE_NONE_MODE = "none"
+_CUA_LINUX_DESKTOP_ENV_VARS = (
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "DESKTOP_SESSION",
+)
+_CUA_SYSTEMCTL_SEARCH_PATH = os.pathsep.join(
+    ("/usr/bin", "/bin", "/usr/local/bin", "/run/current-system/sw/bin")
+)
+_CUA_LINUX_DESKTOP_CACHE_SECONDS = 5.0
+_cua_linux_desktop_cache: Tuple[float, Optional[str]] = (0.0, None)
+_cua_linux_desktop_cache_lock = threading.Lock()
+
 
 def _computer_use_cfg() -> Dict[str, Any]:
     """The ``computer_use`` config block, or ``{}`` when config is unreadable."""
@@ -404,18 +424,147 @@ def _computer_use_max_image_dimension() -> Optional[int]:
     return dim if dim > 0 else None
 
 
+def _desktop_identity_from(env: Dict[str, str]) -> Optional[str]:
+    """Return the first non-empty identity in cua-driver's variable order."""
+    for key in _CUA_LINUX_DESKTOP_ENV_VARS:
+        value = env.get(key)
+        if value:
+            return value
+    return None
+
+
+def _trusted_systemctl_path() -> Optional[str]:
+    """Resolve a root-owned, non-writable systemctl outside the inherited PATH."""
+    candidate = shutil.which("systemctl", path=_CUA_SYSTEMCTL_SEARCH_PATH)
+    if not candidate:
+        return None
+    resolved = os.path.realpath(candidate)
+    try:
+        metadata = os.stat(resolved)
+    except OSError:
+        return None
+    if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        return None
+    return resolved
+
+
+def _probe_linux_desktop_from_user_manager() -> Optional[str]:
+    """Recover the graphical desktop identity for a system-service gateway.
+
+    A system-level Hermes gateway does not normally inherit the user's XDG
+    desktop variables. The per-user systemd manager does, and its D-Bus socket
+    has a stable runtime path. Query only the desktop identity; do not merge the
+    manager's full environment into a third-party child process.
+    """
+    try:
+        getuid = getattr(os, "getuid", None)
+        if not callable(getuid):
+            return None
+        systemctl = _trusted_systemctl_path()
+        if not systemctl:
+            return None
+        runtime_dir = f"/run/user/{getuid()}"
+        probe_env = {
+            "PATH": os.pathsep.join(
+                dict.fromkeys((os.path.dirname(systemctl), "/usr/bin", "/bin"))
+            ),
+            "LC_ALL": "C",
+            "XDG_RUNTIME_DIR": runtime_dir,
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+        }
+        proc = subprocess.run(
+            [systemctl, "--user", "show-environment"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.0,
+            check=False,
+            env=probe_env,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    if proc.returncode != 0:
+        return None
+    manager_env: Dict[str, str] = {}
+    for line in getattr(proc, "stdout", "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in _CUA_LINUX_DESKTOP_ENV_VARS:
+            manager_env[key] = value
+    return _desktop_identity_from(manager_env)
+
+
+def _linux_desktop_from_user_manager() -> Optional[str]:
+    """Return the briefly cached user-manager desktop identity."""
+    global _cua_linux_desktop_cache
+    with _cua_linux_desktop_cache_lock:
+        now = time.monotonic()
+        expires_at, cached = _cua_linux_desktop_cache
+        if now < expires_at:
+            return cached
+        desktop = _probe_linux_desktop_from_user_manager()
+        _cua_linux_desktop_cache = (
+            now + _CUA_LINUX_DESKTOP_CACHE_SECONDS,
+            desktop,
+        )
+        return desktop
+
+
+def _is_systemd_service_process(env: Dict[str, str]) -> bool:
+    """Return true only in the exact process systemd launched for the service."""
+    return env.get("SYSTEMD_EXEC_PID") == str(os.getpid())
+
+
+def _linux_a11y_advertise_mode(
+    desktop: Optional[str], configured: Optional[str]
+) -> Optional[str]:
+    """Return a safety override, or None to preserve cua-driver's default."""
+    tokens = {
+        part.strip().lower()
+        for part in re.split(r"[:;]", desktop or "")
+        if part.strip()
+    }
+    if tokens.intersection({"cinnamon", "x-cinnamon"}):
+        return _CUA_LINUX_A11Y_ADVERTISE_NONE_MODE
+    if tokens.intersection({"gnome", "cosmic"}):
+        if (configured or "").strip().lower() == _CUA_LINUX_A11Y_ADVERTISE_NONE_MODE:
+            return _CUA_LINUX_A11Y_ADVERTISE_NONE_MODE
+        return _CUA_LINUX_A11Y_ADVERTISE_SAFE_MODE
+    return None
+
+
 def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Return the environment dict for spawning cua-driver.
 
     Starts from ``base_env`` (defaults to ``os.environ``) and, when telemetry
     is disabled (the default), injects ``CUA_DRIVER_RS_TELEMETRY_ENABLED=0``.
-    When the user has opted in, the var is left untouched so cua-driver uses
-    its own default. Used by every cua-driver spawn site (MCP backend, status,
-    doctor, install) so the policy is applied consistently.
+    On Linux, recover a missing graphical desktop identity from the user
+    manager, then enforce cua-driver's safe GNOME/COSMIC/Cinnamon policies.
+    KDE and unknown desktops retain cua-driver's Chromium-compatible default.
+    When the user opts into cua telemetry, the telemetry variable is left
+    untouched so cua-driver uses its own default. Used by every cua-driver
+    spawn site (MCP backend, status, doctor, install) so the policy is applied
+    consistently.
     """
+    use_process_env = base_env is None
     env = dict(base_env if base_env is not None else os.environ)
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
+    if sys.platform.startswith("linux"):
+        desktop = _desktop_identity_from(env)
+        if (
+            desktop is None
+            and use_process_env
+            and _is_systemd_service_process(env)
+        ):
+            desktop = _linux_desktop_from_user_manager()
+            if desktop:
+                env["XDG_CURRENT_DESKTOP"] = desktop
+        mode = _linux_a11y_advertise_mode(
+            desktop, env.get(_CUA_LINUX_A11Y_ADVERTISE_ENV_VAR)
+        )
+        if mode is not None:
+            env[_CUA_LINUX_A11Y_ADVERTISE_ENV_VAR] = mode
     return env
 
 
