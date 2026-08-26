@@ -915,6 +915,24 @@ class CredentialPool:
             self._persist()
         return updated
 
+    def _mark_healthy(self, entry: PooledCredential, *, persist: bool = True) -> PooledCredential:
+        """Clear a stale exhausted/dead verdict after a served request succeeds (#95166)."""
+        if entry.last_status is None:
+            return entry
+        updated = replace(
+            entry,
+            last_status=STATUS_OK,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+        self._replace_entry(entry, updated)
+        if persist:
+            self._persist()
+        return updated
+
     def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
         """Sync a claude_code pool entry from ~/.claude/.credentials.json if tokens differ.
 
