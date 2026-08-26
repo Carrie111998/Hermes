@@ -263,7 +263,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "block_loop_detected",
+            "review_requested", "changes_requested", "decomposed",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -633,6 +637,14 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind == "decomposed":
+                            child_ids = ev.payload.get("child_ids") if ev.payload else []
+                            worker_count = len(child_ids) if isinstance(child_ids, list) else 0
+                            plural = "s" if worker_count != 1 else ""
+                            msg = (
+                                f"🧭 {board_tag}Kanban {sub['task_id']} planned "
+                                f"{worker_count} coordinated worker{plural}"
+                            )
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
                             # first-class review lane. Wake the origin thread.
