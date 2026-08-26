@@ -108,6 +108,11 @@ def _supports_budget(fetch_usage: Callable[..., object]) -> bool:
 # unbounded one.
 DEADLINE_EPOCH_ENV = "HERMES_AI_USAGE_DEADLINE_EPOCH"
 FALLBACK_DEADLINE_SECONDS = 90.0
+#: Slack, ON TOP of a full deadline, that must remain before the httpx warm-up is
+#: worth paying. The warm-up measured ~48s at the task's BelowNormal priority
+#: (import prefix 96.35s alone vs 144.17s with it); 90s leaves room for that plus
+#: the variance that BelowNormal contention produces on this box.
+WARMUP_HEADROOM_SECONDS = 90.0
 
 
 def _derive_deadline_seconds(
@@ -132,6 +137,60 @@ def _derive_deadline_seconds(
         return FALLBACK_DEADLINE_SECONDS
     remaining = finish_by - clock()
     return max(0.0, min(remaining, FALLBACK_DEADLINE_SECONDS))
+
+
+def _raw_remaining_seconds(
+    now_epoch: Optional[Callable[[], float]] = None,
+) -> Optional[float]:
+    """Seconds left before the TASK must finish -- UNCAPPED, unlike the deadline.
+
+    ``_derive_deadline_seconds`` clamps to FALLBACK_DEADLINE_SECONDS, which is
+    right for budgeting providers but destroys exactly the signal needed here:
+    a clamped 90.0 cannot distinguish "240s of slack" from "91s of slack".
+    ``None`` means the runner published no finish instant (a hand-run
+    ``python -m ai_usage``, or an older wrapper), i.e. there is no
+    ExecutionTimeLimit to overrun.
+    """
+    clock = now_epoch or time.time
+    raw = (os.environ.get(DEADLINE_EPOCH_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        finish_by = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(finish_by):
+        return None
+    return finish_by - clock()
+
+
+def _warmup_is_affordable(
+    now_epoch: Optional[Callable[[], float]] = None,
+) -> bool:
+    """Whether paying the httpx warm-up still leaves the task able to finish.
+
+    Warming does NOT shorten the run -- and the first version of this shipped
+    on the mistaken belief that it was wall-clock neutral. It is not. The 90s
+    budget is a CAP, so moving ~48s of import cost OUT of it and into the
+    uncapped prefix does not shrink the budget by 48s; it simply adds 48s to the
+    process. Measured effect on AIUsageCollector's PT6M ExecutionTimeLimit:
+    terminations went from 3.3% of launches (16/491 over the 48h before) to
+    19.3% (17/88 after), and a terminated run writes NOTHING -- no snapshot, no
+    diagnostics -- which is strictly worse than the ordered starvation the
+    warm-up was introduced to cure.
+
+    So warm only out of genuine slack. Below that, skip it and let the first
+    provider pay the import inside its budget (the pre-warm-up behaviour): some
+    rows go stale, but the run COMPLETES and writes a snapshot instead of being
+    killed. Note this is a different question from whether a thinly-budgeted
+    provider can survive the import -- it cannot either way, since a Python
+    import is not interruptible by an httpx timeout. What is being protected
+    here is the task, not the provider.
+    """
+    remaining = _raw_remaining_seconds(now_epoch)
+    if remaining is None:
+        return True
+    return remaining >= FALLBACK_DEADLINE_SECONDS + WARMUP_HEADROOM_SECONDS
 
 
 def _episode_model_for(finding: dict) -> str:
@@ -308,7 +367,7 @@ def collect(
     now = now or datetime.now(timezone.utc)
     # MUST precede `started`: see _default_warmup. Swallowing the exception is
     # deliberate -- a warm-up is an optimisation and may not cost a collection.
-    if warmup is not None:
+    if warmup is not None and _warmup_is_affordable():
         try:
             warmup()
         except Exception:  # noqa: BLE001 - advisory; never fatal to collection
