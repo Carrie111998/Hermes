@@ -24,6 +24,36 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def _parser():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    return parser
+
+
+def test_create_cli_accepts_explicit_routing_metadata(kanban_home, capsys):
+    metadata = {"enabled": True, "risk_level": "low", "cross_file": True}
+    args = _parser().parse_args(
+        [
+            "kanban",
+            "create",
+            "routed task",
+            "--assignee",
+            "worker",
+            "--routing-metadata",
+            json.dumps(metadata),
+            "--json",
+        ]
+    )
+
+    assert kc.kanban_command(args) == 0
+    task_id = json.loads(capsys.readouterr().out)["id"]
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.routing_metadata == metadata
+
+
 # ---------------------------------------------------------------------------
 # Workspace flag parsing
 # ---------------------------------------------------------------------------
@@ -177,5 +207,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

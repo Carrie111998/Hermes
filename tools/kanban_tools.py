@@ -1411,6 +1411,7 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    routing_metadata = args.get("routing_metadata")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1454,6 +1455,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                routing_metadata=routing_metadata,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1470,6 +1472,9 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                routing_metadata=(
+                    new_task.routing_metadata if new_task else None
+                ),
                 subscribed=subscribed,
             )
         finally:
@@ -2302,6 +2307,30 @@ KANBAN_CREATE_SCHEMA = {
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
                 ),
+            },
+            "routing_metadata": {
+                "type": "object",
+                "additionalProperties": False,
+                "description": (
+                    "Optional explicit metadata for the opt-in worker model "
+                    "router. Never derive this from title/body prose. "
+                    "Omit to preserve the existing profile route."
+                ),
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "risk_level": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                    },
+                    "external_send_requested": {"type": "boolean"},
+                    "cross_file": {"type": "boolean"},
+                    "tool_count": {"type": "integer", "minimum": 0},
+                    "multi_step_verification": {"type": "boolean"},
+                    "luna_insufficiency": {"type": "boolean"},
+                    "high_value": {"type": "boolean"},
+                    "terra_insufficient": {"type": "boolean"},
+                    "deep_reasoning_required": {"type": "boolean"},
+                },
             },
             "board": _board_schema_prop(),
         },

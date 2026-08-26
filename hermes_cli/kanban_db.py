@@ -91,6 +91,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from agent.task_model_router import validate_routing_metadata
 
 _log = logging.getLogger(__name__)
 
@@ -1141,6 +1142,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Optional, explicit task metadata used by the opt-in model router.
+    # This is never derived from title/body prose. Invalid legacy values are
+    # treated as absent by ``from_row`` so dispatch fails closed.
+    routing_metadata: Optional[dict[str, object]] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1154,6 +1159,16 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        routing_metadata_value: Optional[dict[str, object]] = None
+        if "routing_metadata" in keys and row["routing_metadata"]:
+            try:
+                parsed = json.loads(row["routing_metadata"])
+                routing_metadata_value = validate_routing_metadata(parsed)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                # A hand-edited/legacy row must never make dispatch infer a
+                # route. Treat malformed metadata as absent and preserve the
+                # existing worker path.
+                routing_metadata_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1235,6 +1250,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            routing_metadata=routing_metadata_value,
         )
 
 
@@ -1383,6 +1399,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Optional explicit metadata for the opt-in worker model router. This is
+    -- never inferred from title/body prose and remains NULL by default.
+    routing_metadata     TEXT,
     -- Per-task reasoning effort for the worker (minimal|low|medium|high|
     -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
     -- passes --reasoning <level> so the worker runs at that depth regardless
@@ -2633,6 +2652,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "routing_metadata" not in cols:
+        # Optional strict JSON object for the opt-in worker model router.
+        # Existing rows remain NULL and therefore preserve their old route.
+        _add_column_if_missing(
+            conn, "tasks", "routing_metadata", "routing_metadata TEXT"
+        )
+
     if "reasoning_effort" not in cols:
         # Per-task thinking depth for the worker. NULL = the worker profile's
         # own agent.reasoning_effort, which is what existing rows were getting.
@@ -3175,6 +3201,7 @@ def create_task(
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    routing_metadata: Optional[Mapping[str, object]] = None,
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
@@ -3225,6 +3252,7 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
+    routing_metadata = validate_routing_metadata(routing_metadata)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
@@ -3496,9 +3524,10 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
+                        routing_metadata,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3520,6 +3549,10 @@ def create_task(
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
+                        (
+                            json.dumps(routing_metadata, ensure_ascii=False, sort_keys=True)
+                            if routing_metadata is not None else None
+                        ),
                         reasoning_effort,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
@@ -3552,6 +3585,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "routing_metadata": routing_metadata,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -10257,10 +10291,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "conn" in sig.parameters:
+                    spawn_kwargs["conn"] = conn
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -10389,10 +10425,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "conn" in sig.parameters:
+                    spawn_kwargs["conn"] = conn
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -10706,11 +10744,84 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _resolve_worker_model_baseline(
+    hermes_home: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Read the effective worker profile's provider/model without writing.
+
+    Routing is only eligible when this exact profile configuration resolves to
+    the Luna baseline.  Unknown, missing, or ``auto`` provider state fails
+    closed and leaves the existing worker argv untouched.
+    """
+    if not hermes_home:
+        return None, None
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config_readonly
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config_readonly()
+        finally:
+            reset_hermes_home_override(token)
+        model_cfg = cfg.get("model") if isinstance(cfg, Mapping) else None
+        if isinstance(model_cfg, Mapping):
+            provider = model_cfg.get("provider")
+            model = model_cfg.get("default") or model_cfg.get("model")
+        else:
+            provider = cfg.get("provider") if isinstance(cfg, Mapping) else None
+            model = model_cfg
+        if not isinstance(provider, str) or not isinstance(model, str):
+            return None, None
+        return provider.strip(), model.strip()
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: model baseline resolution skipped for %r (%s)",
+            hermes_home,
+            exc,
+        )
+        return None, None
+
+
+def _resolve_task_model_route(
+    task: Task,
+    hermes_home: Optional[str],
+):
+    """Return a routed decision for an explicitly opted-in task, if any."""
+    if task.routing_metadata is None:
+        return None
+    # Existing pins are handled by the unchanged argv branch below. Do not
+    # even consult profile routing for them: explicit task pins are highest
+    # precedence and must preserve their exact historical path.
+    if task.model_override or task.provider_override:
+        return None
+    try:
+        routing_metadata = validate_routing_metadata(task.routing_metadata)
+    except ValueError:
+        # Task.from_row already fails closed for malformed stored JSON. This
+        # guard also protects direct Task instances used by integrations/tests.
+        return None
+    if routing_metadata is None:
+        return None
+
+    provider, model = _resolve_worker_model_baseline(hermes_home)
+    from agent.task_model_router import BASE_PROVIDER, LUNA_MODEL, route_task_model
+
+    if provider != BASE_PROVIDER or model != LUNA_MODEL:
+        return None
+    router_metadata = dict(routing_metadata)
+    # These two fields are dispatcher-observed baseline facts, not task input.
+    router_metadata.update(provider=provider, model=model)
+    decision = route_task_model(router_metadata)
+    return decision if decision.routed else None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10759,6 +10870,7 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    route_decision = _resolve_task_model_route(task, env.get("HERMES_HOME"))
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -10857,7 +10969,9 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
+    if route_decision is not None:
+        cmd.extend(["-m", route_decision.selected_model, "--provider", route_decision.selected_provider])
+    elif task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
@@ -10884,6 +10998,17 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    if route_decision is not None and conn is not None:
+        # Record the allowlisted route before spawning. A failed event write
+        # aborts this spawn, so routed work cannot run without its audit row.
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task.id,
+                "model_routed",
+                route_decision.to_event_payload(),
+                run_id=task.current_run_id,
+            )
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

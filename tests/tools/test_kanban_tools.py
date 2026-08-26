@@ -416,6 +416,42 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_accepts_explicit_routing_metadata(worker_env):
+    from tools import kanban_tools as kt
+
+    metadata = {"enabled": True, "risk_level": "low", "cross_file": True}
+    out = kt._handle_create({
+        "title": "routed child",
+        "assignee": "peer",
+        "routing_metadata": metadata,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["routing_metadata"] == metadata
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        assert child.routing_metadata == metadata
+    finally:
+        conn.close()
+
+
+def test_create_rejects_invalid_routing_metadata(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "invalid routed child",
+        "assignee": "peer",
+        "routing_metadata": {"prompt": "must not be accepted"},
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "unknown key" in d["error"]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
