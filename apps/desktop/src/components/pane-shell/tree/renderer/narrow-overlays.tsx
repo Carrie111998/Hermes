@@ -34,7 +34,8 @@ export function NarrowOverlays() {
 
   const closeReveal = useCallback(() => {
     const current = revealRef.current
-    if (!current) return
+
+    if (!current) {return}
     // The Android bridge maps this close intent back to its drawer store; on a
     // desktop the same event only closes this visual overlay.
     window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: current.id, mode: 'close' } }))
@@ -45,10 +46,11 @@ export function NarrowOverlays() {
   const revealActive = reveal !== null
   useEffect(() => (revealActive ? pushEscapeLayer(ESCAPE_PRIORITY.narrowOverlay) : undefined), [revealActive])
   useEffect(() => {
-    if (!revealActive) return
+    if (!revealActive) {return}
 
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null
     window.requestAnimationFrame(() => overlayRef.current?.focus())
+
     return () => previous?.focus()
   }, [revealActive])
 
@@ -172,29 +174,29 @@ export function NarrowOverlays() {
       )}
       {revealed && (
         <div
+          // Floats OVER the layout, so under glass its surface must mask the
+          // panes beneath it — a see-through overlay reads as text bleeding
+          // through text. Contract: `[data-glass-opaque]` in styles.css.
+          aria-label={revealed.title ?? revealed.id}
+          aria-modal="true"
           className={cn(
             'absolute inset-y-0 z-40 flex flex-col overflow-hidden bg-(--ui-sidebar-surface-background) shadow-2xl',
             sideOf(revealed) === 'left'
               ? 'left-0 border-r border-(--ui-stroke-secondary)'
               : 'right-0 border-l border-(--ui-stroke-secondary)'
           )}
-          // Floats OVER the layout, so under glass its surface must mask the
-          // panes beneath it — a see-through overlay reads as text bleeding
-          // through text. Contract: `[data-glass-opaque]` in styles.css.
-          aria-label={revealed.title ?? revealed.id}
-          aria-modal="true"
           data-glass-opaque=""
           data-narrow-pane-overlay=""
           data-narrow-pane-side={sideOf(revealed)}
           onMouseLeave={() => {
-            if (!revealRef.current?.pinned) closeReveal()
+            if (!revealRef.current?.pinned) {closeReveal()}
           }}
           ref={overlayRef}
           role="dialog"
-          tabIndex={-1}
           // Match the pane's docked width (sessions ~237px, files its rail
           // width) instead of a fat fixed 20rem — capped for tiny screens.
           style={{ width: `min(${(revealed.data as { width?: string } | undefined)?.width ?? '18rem'}, 85vw)` }}
+          tabIndex={-1}
         >
           <button
             aria-label={`Close ${revealed.title ?? revealed.id}`}

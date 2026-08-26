@@ -122,6 +122,7 @@ describe('mobile statusbar navigation', () => {
   it('keeps every visible action reachable through an explicit More control instead of a clipped strip', async () => {
     document.documentElement.setAttribute('data-hermes-mobile', '')
     $statusbarHiddenIds.set([])
+
     const statusbar = bar([
       item('gateway-health', 'Gateway'),
       item('agents', 'Agents'),

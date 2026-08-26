@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { SIDEBAR_COLLAPSE_MEDIA_QUERY, shouldUseNarrowPaneLayout } from './layout-constants'
+import { shouldUseNarrowPaneLayout, SIDEBAR_COLLAPSE_MEDIA_QUERY } from './layout-constants'
 
 describe('sidebar collapse breakpoint', () => {
   it('collapses both rails before a Fold-class mobile viewport becomes a squeezed desktop', () => {

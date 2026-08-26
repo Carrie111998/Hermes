@@ -519,6 +519,7 @@ export function ChatBar({
         void onAttachImageBlob(blob)
       }
     }
+
     if (files.length > 0 && onAttachDroppedItems) {
       void onAttachDroppedItems(files.map(file => ({ file, path: '' })))
     }
@@ -994,10 +995,10 @@ export function ChatBar({
 
   const contextMenu = (
     <ContextMenu
+      onCapturePhoto={onCapturePhoto}
       onInsertText={insertText}
       onOpenUrlDialog={openUrlDialog}
       onPasteClipboardImage={onPasteClipboardImage}
-      onCapturePhoto={onCapturePhoto}
       onPickFiles={onPickFiles}
       onPickFolders={onPickFolders}
       onPickImages={onPickImages}
@@ -1254,6 +1255,7 @@ export function ChatBar({
               }
 
               const submitter = (e.nativeEvent as SubmitEvent).submitter as HTMLElement | null
+
               if (mobileRenderer && !submitter?.hasAttribute('data-composer-send')) {
                 return
               }

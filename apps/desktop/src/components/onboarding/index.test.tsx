@@ -31,6 +31,7 @@ afterEach(() => {
   } catch {
     // jsdom localStorage should always be present; ignore if not.
   }
+
   document.documentElement.removeAttribute('data-hermes-mobile')
 
   $desktopOnboarding.set({
