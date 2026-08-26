@@ -120,7 +120,7 @@ describe('project scope', () => {
     // setActiveProject fires best-effort (no gateway in test → it rejects and is
     // swallowed); the synchronous scope change is what matters here.
     enterProject('p_123')
-    expect($projectScope.get()).toBe('p_123')
+    expect($projectScope.get()).toBe('local\u001fdefault\u001fp_123')
   })
 
   it('exitProjectScope returns to the overview', () => {
@@ -136,7 +136,7 @@ describe('project scope', () => {
 
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
-    expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+    expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('local\u001fdefault\u001fp_abc')
   })
 })
 
@@ -585,10 +585,56 @@ describe('createProject', () => {
       'projects.create',
       expect.objectContaining({ name: 'Remote', folders: ['/mimir/demo'] })
     )
-    expect($projectConnectionById.get().p_mimir).toBe('mimir')
+    expect($projectConnectionById.get()['mimir\u001fdefault\u001fp_mimir']).toBe('mimir')
     expect($projectTree.get().find(node => node.id === 'p_mimir')?.connectionId).toBe('mimir')
     // Foreign create must not flip chrome active-project pointer.
     expect($activeProjectId.get()).toBeNull()
+  })
+
+  it('isolates the same backend project id across two profiles on one connection', async () => {
+    const { $projectTree, enterProject, findProjectByAddress, projectNodeScopeKey, resolveProjectAddress } =
+      await import('./projects')
+
+    const { makeProjectAddress, projectAddressKey, sameProjectAddress } = await import('@/lib/project-address')
+
+    const defaultAddr = makeProjectAddress('mimir', 'default', 'p_same')
+    const altAddr = makeProjectAddress('mimir', 'alt', 'p_same')
+
+    $projectTree.set([
+      {
+        id: 'p_same',
+        label: 'Default profile',
+        path: '/mimir/default',
+        connectionId: 'mimir',
+        profile: 'default',
+        repos: [],
+        sessionCount: 0
+      },
+      {
+        id: 'p_same',
+        label: 'Alt profile',
+        path: '/mimir/alt',
+        connectionId: 'mimir',
+        profile: 'alt',
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+
+    expect(sameProjectAddress(defaultAddr, altAddr)).toBe(false)
+    expect(projectAddressKey(defaultAddr)).not.toBe(projectAddressKey(altAddr))
+
+    enterProject(defaultAddr)
+    expect($projectScope.get()).toBe(projectAddressKey(defaultAddr))
+    expect(findProjectByAddress(defaultAddr)?.label).toBe('Default profile')
+    expect(findProjectByAddress(altAddr)?.label).toBe('Alt profile')
+
+    enterProject(altAddr)
+    expect($projectScope.get()).toBe(projectAddressKey(altAddr))
+    expect(resolveProjectAddress($projectScope.get())?.profile).toBe('alt')
+
+    const nodes = $projectTree.get()
+    expect(projectNodeScopeKey(nodes[0]!)).not.toBe(projectNodeScopeKey(nodes[1]!))
   })
 
   it('marks the backend stale and surfaces a friendly error when projects.create is missing', async () => {

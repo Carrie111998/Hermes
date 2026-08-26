@@ -6,6 +6,7 @@ import { ConnectionOriginTag } from '@/app/chat/connection-origin-tag'
 import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { scopeKeyFromProjectFields } from '@/lib/project-address'
 import { cn } from '@/lib/utils'
 import { $connectionsRegistry } from '@/store/connections'
 
@@ -93,7 +94,8 @@ export function ProjectOverviewRow({
   const { t } = useI18n()
   const s = t.sidebar
   const rowRef = useRef<HTMLDivElement>(null)
-  const [open, toggleOpen] = useWorkspaceNodeOpen(project.id, false)
+  const scopeKey = scopeKeyFromProjectFields(project)
+  const [open, toggleOpen] = useWorkspaceNodeOpen(scopeKey, false)
   const isActive = project.id === activeProjectId
   const registry = useStore($connectionsRegistry)
 
@@ -142,7 +144,7 @@ export function ProjectOverviewRow({
         <SidebarRowLink
           aria-label={s.projects.enter(project.label)}
           labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
-          onClick={() => onEnter?.(project.id)}
+          onClick={() => onEnter?.(scopeKey)}
         >
           <span className="inline-flex min-w-0 items-center gap-1.5">
             <span className="min-w-0 truncate">{project.label}</span>
@@ -178,7 +180,7 @@ export function ProjectOverviewRow({
     // project in the overview — the parallel to the entered-project wrapper's
     // `data-sessions-project` (index.tsx), which only fires once you've drilled
     // in. Here it's present on every row of the list.
-    <div className={cn(dragging && 'relative z-10')} data-sessions-project={project.id} ref={ref} style={style}>
+    <div className={cn(dragging && 'relative z-10')} data-sessions-project={scopeKey} ref={ref} style={style}>
       {/* Home has no per-project actions, so it gets no right-click menu. */}
       {project.isNoProject ? (
         shell

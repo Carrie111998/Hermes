@@ -28,6 +28,7 @@ import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/he
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
+import { projectAddressKey } from '@/lib/project-address'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
@@ -92,14 +93,17 @@ import {
   $projectTreeLoading,
   $removedSessionIds,
   $reposScanning,
+  addressOfProjectNode,
   ALL_PROJECTS,
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
+  findProjectByAddress,
   openProjectCreate,
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  resolveProjectAddress,
   scanAndRecordRepos
 } from '@/store/projects'
 import {
@@ -962,11 +966,29 @@ export function ChatSidebar({
   // The overview node for the entered project (structure + counts, empty lanes).
   const overviewEnteredProject =
     projectsActive && projectScope !== ALL_PROJECTS
-      ? agentProjectTree?.find(node => node.id === projectScope)
+      ? (() => {
+          const addr = resolveProjectAddress(projectScope)
+
+          return addr
+            ? findProjectByAddress(addr) ||
+                agentProjectTree?.find(node => {
+                  const nodeAddr = addressOfProjectNode(node)
+
+                  return nodeAddr ? projectAddressKey(nodeAddr) === projectScope : false
+                })
+            : agentProjectTree?.find(node => node.id === projectScope)
+        })()
       : undefined
 
   const inProject = Boolean(overviewEnteredProject)
-  const enteredProjectId = overviewEnteredProject?.id
+
+  const enteredProjectId = overviewEnteredProject
+    ? (() => {
+        const addr = addressOfProjectNode(overviewEnteredProject)
+
+        return addr ? projectAddressKey(addr) : overviewEnteredProject.id
+      })()
+    : undefined
 
   // Entering a project lazily hydrates its full lanes (repo -> lane -> sessions)
   // from the backend — same grouping/ids as the overview, just with rows.
@@ -1139,14 +1161,22 @@ export function ChatSidebar({
   )
 
   const onEnterProject = useCallback(
-    (id: string) => {
-      const project = projectModel.find(node => node.id === id)
+    (idOrAddress: string) => {
+      const addr = resolveProjectAddress(idOrAddress)
+
+      const project = addr
+        ? projectModel.find(node => {
+            const nodeAddr = addressOfProjectNode(node)
+
+            return nodeAddr ? projectAddressKey(nodeAddr) === projectAddressKey(addr) : false
+          })
+        : projectModel.find(node => node.id === idOrAddress)
 
       if (project) {
         syncProjectCwd(project)
       }
 
-      enterProject(id)
+      enterProject(idOrAddress)
     },
     [projectModel, syncProjectCwd]
   )
@@ -1161,6 +1191,7 @@ export function ChatSidebar({
     enteredProject?.connectionId && enteredProject.connectionId !== 'local'
       ? (connectionsRegistry?.connections.find(connection => connection.id === enteredProject.connectionId) ?? null)
       : null
+
   const enteredProjectOriginTag =
     enteredProjectOrigin && enteredProjectOrigin.kind !== 'local' ? (
       <ConnectionOriginTag connection={enteredProjectOrigin} quiet />

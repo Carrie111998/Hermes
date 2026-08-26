@@ -58,6 +58,11 @@ export interface SidebarProjectTree {
   isNoProject?: boolean
   /** Registry connection that owns this project. Local / chrome-active omit. */
   connectionId?: string
+  /**
+   * Profile namespace for this row's projects.db. Required for multi-profile
+   * ownership — same backend id can exist under two profiles on one gateway.
+   */
+  profile?: string
   repos: SidebarWorkspaceTree[]
   sessionCount: number
   // Tokens and spend over the same sessions `sessionCount` counts, summed by

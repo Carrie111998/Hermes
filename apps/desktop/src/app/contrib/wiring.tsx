@@ -59,7 +59,7 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
-import { $startWorkSessionRequest, connectionIdForProjectPath, followActiveSessionCwd } from '@/store/projects'
+import { $startWorkSessionRequest, connectionIdForProjectPath, followActiveSessionCwd, profileForProjectPath } from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -1054,10 +1054,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onNewSessionInWorkspace: path => {
       const start = () => startSessionInWorkspace(path, { openTab: true })
       const connectionId = connectionIdForProjectPath(path)
+      const profile = profileForProjectPath(path)
       const activeId = $activeConnectionId.get() || 'local'
 
-      if (connectionId && connectionId !== activeId && connectionId !== 'local') {
-        void startSessionOnSource(connectionId, start).catch(err =>
+      // Reciprocal: route through the project's stored source even when that
+      // source is local and chrome is remote (skipping local previously broke +).
+      if (connectionId && connectionId !== activeId) {
+        void startSessionOnSource(connectionId, start, profile ? { profile } : undefined).catch(err =>
           notify({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
         )
 

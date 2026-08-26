@@ -259,7 +259,8 @@ export async function selectConnection(connectionId: string): Promise<void> {
  */
 export async function startSessionOnSource(
   connectionId: string,
-  startFreshSessionDraft: () => void
+  startFreshSessionDraft: () => void,
+  options?: { profile?: string }
 ): Promise<void> {
   if (connectionId === $activeConnectionId.get()) {
     $newChatRoute.set(null)
@@ -276,7 +277,10 @@ export async function startSessionOnSource(
   }
 
   const profile = normalizeProfileKey(
-    $lastProfileByConnection.get()[connectionId] ?? targetConnection.remoteProfile ?? 'default'
+    options?.profile ||
+      $lastProfileByConnection.get()[connectionId] ||
+      targetConnection.remoteProfile ||
+      'default'
   )
 
   // Warm the secondary socket. Must not call ensureGatewayAgent: that applyActive
