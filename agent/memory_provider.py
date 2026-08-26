@@ -268,6 +268,17 @@ class MemoryProvider(ABC):
 
         NOT called after every turn — only at actual session boundaries
         (CLI exit, /reset, gateway session expiry).
+
+        ``messages`` MAY be empty.  Surfaces that own an agent for a single
+        request — the API server tears its per-request agent down through
+        ``shutdown_memory_provider()`` with no transcript — end the session
+        purely to release provider resources, because the per-turn sync has
+        already run and re-extracting the transcript would repeat that work on
+        every call.  Treat an empty list as "release resources, nothing new to
+        extract" and return without summarizing; do not interpret it as a
+        session with no content.  Implementations that unconditionally
+        summarize whatever they are handed will run junk extraction on every
+        such request.
         """
 
     def on_session_switch(

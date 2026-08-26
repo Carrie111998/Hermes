@@ -26,6 +26,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.memory_manager import MemoryManager
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -39,6 +40,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from run_agent import AIAgent
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +440,21 @@ class TestMemoryProviderTeardown:
     ~5 threads per request for the life of the gateway process."""
 
     def _mock_agent(self):
-        mock_agent = MagicMock()
+        # spec'd against the real classes deliberately.  The teardown in
+        # _run_agent probes agent.shutdown_memory_provider and
+        # _memory_manager.flush_pending through hasattr, and a bare
+        # MagicMock() answers every hasattr with True and auto-creates the
+        # call.  Renaming either symbol in run_agent.py would therefore turn
+        # production teardown into a silent no-op while these tests stayed
+        # green — the exact regression they exist to catch.  Under spec the
+        # rename raises AttributeError here instead.
+        mock_agent = MagicMock(spec=AIAgent)
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        # Attached explicitly: these are assigned at runtime (agent_init and
+        # memory_manager) rather than declared on AIAgent, so they are not in
+        # the spec.  Plain spec restricts reads of attributes that were never
+        # set, not writes, so assigning them here is what makes them readable.
+        mock_agent._memory_manager = MagicMock(spec=MemoryManager)
         mock_agent.session_prompt_tokens = 0
         mock_agent.session_completion_tokens = 0
         mock_agent.session_total_tokens = 0
