@@ -7601,6 +7601,17 @@ class TestSuspendAwareTimeouts:
 
 
 
+# Every test here drives the REAL run_job, which lazily imports the agent and
+# MCP machinery (`from tools.mcp_tool import discover_mcp_tools`) and walks the
+# plugin manifests. The first test in the process to do that pays the whole
+# cold-import tax, and on a loaded host it exceeds the 30s addopts cap — which
+# --timeout-method=thread reports as a bare `Timeout (>30.0s)`, easily misread
+# as a hang in the poll loop these tests fake. In a full-file run
+# TestRunJobSessionPersistence pays it first; under `-k SuspendAware` this class
+# does. Same honest-budget mark, and same reason, as TestResolveDeliveryTarget
+# above: it hides no failure — every assertion below is unchanged and still
+# fails if the wiring breaks.
+@pytest.mark.timeout(180)
 @pytest.mark.usefixtures("_tick_lock_isolated")
 class TestSuspendAwareTimeoutWiring:
     """Covers the poll-loop WIRING, which the pure-helper tests above cannot.
