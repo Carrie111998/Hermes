@@ -32,9 +32,11 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { ChatVoiceControl } from "@/components/ChatVoiceControl";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
+import { speakAssistantFinal } from "@/lib/assistant-voice-output";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
@@ -66,6 +68,7 @@ import {
   resolvePtyKeyboardShortcut,
   sendPtyShortcutSequence,
 } from "@/lib/pty-keyboard-shortcuts";
+import { submitVoiceTranscriptToPty } from "@/lib/pty-voice-submit";
 import {
   isViewportPinnedToBottom,
   parseResumeControlMessage,
@@ -180,6 +183,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const voiceTurnRef = useRef(false);
+  const voicePlaybackRef = useRef<{ cancel(): void } | null>(null);
   const stickToBottomRef = useRef(true);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
@@ -505,6 +510,32 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
     termRef.current?.focus();
   };
+
+  const submitVoiceTranscript = useCallback((transcript: string) => {
+    if (!submitVoiceTranscriptToPty(() => wsRef.current, transcript)) {
+      setBanner("Chat disconnected before the voice transcript could be sent.");
+      return;
+    }
+    voiceTurnRef.current = true;
+    termRef.current?.focus();
+  }, []);
+
+  const cancelVoicePlayback = useCallback(() => {
+    voicePlaybackRef.current?.cancel();
+    voicePlaybackRef.current = null;
+  }, []);
+
+  const speakVoiceResponse = useCallback((text: string) => {
+    if (!voiceTurnRef.current || !("speechSynthesis" in window)) return;
+    voiceTurnRef.current = false;
+    cancelVoicePlayback();
+    const playback = speakAssistantFinal(window.speechSynthesis, text, () => {
+      if (voicePlaybackRef.current === playback) voicePlaybackRef.current = null;
+    });
+    voicePlaybackRef.current = playback;
+  }, [cancelVoicePlayback]);
+
+  useEffect(() => cancelVoicePlayback, [cancelVoicePlayback]);
 
   useEffect(() => {
     // Don't spawn the chat PTY (and the TUI/agent bootstrap it triggers)
@@ -1789,6 +1820,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onAssistantFinal={speakVoiceResponse}
               />
             </div>
             <ChatSessionList
@@ -1826,6 +1858,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
           }}
         >
+          <ChatVoiceControl
+            connected={ptyState === "open"}
+            submit={submitVoiceTranscript}
+            onBargeIn={cancelVoicePlayback}
+          />
           <div
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
@@ -1961,6 +1998,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onAssistantFinal={speakVoiceResponse}
               />
             </div>
 
