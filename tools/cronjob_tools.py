@@ -461,6 +461,36 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
     return notes
 
 
+def _split_monitor_arg(
+    monitor: Optional[str],
+    monitor_script: Optional[str],
+    monitor_url: Optional[str],
+) -> tuple:
+    """Resolve the model-facing ``monitor`` field into the stored pair.
+
+    The schema advertises ONE ``monitor`` field; the value's shape decides the
+    transport: ``http(s)://...`` is a URL source, anything else is a script
+    path (a legal script path can never start with a URL scheme). Jobs keep
+    storing ``monitor_script``/``monitor_url`` separately — this is an
+    interface merge, not a storage migration — and the legacy field names are
+    still accepted as aliases so older transcripts/replays keep working.
+
+    Returns ``(monitor_script, monitor_url)`` with update semantics:
+    ``None`` = leave unchanged, ``''`` = clear. Setting one source via
+    ``monitor`` clears the other, so switching transports in one call never
+    trips the mutual-exclusion invariant. An explicit ``monitor`` wins over
+    the legacy aliases.
+    """
+    if monitor is None:
+        return monitor_script, monitor_url
+    value = monitor.strip()
+    if not value:
+        return "", ""  # clear both sources
+    if value.lower().startswith(("http://", "https://")):
+        return "", value
+    return value, ""
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
@@ -1844,13 +1874,9 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": f"Optional script run each tick; stdout is injected into the agent's prompt as context (with no_agent=True the script IS the job). Relative paths resolve under {display_hermes_home()}/scripts/; .sh/.bash via bash, else Python. On update, '' clears."
             },
-            "monitor_script": {
+            "monitor": {
                 "type": "string",
-                "description": "Optional change-detection source (same path rules as `script`): runs first each tick; unchanged output skips the agent run entirely, changed output injects a diff and runs normally. Mutually exclusive with monitor_url; incompatible with no_agent. On update, '' clears."
-            },
-            "monitor_url": {
-                "type": "string",
-                "description": "Optional http(s) URL as the monitor source instead of a script (bounded GET). Same change-detection semantics as monitor_script. On update, '' clears."
+                "description": "Optional change-detector that gates the agent: an http(s) URL (fetched each tick) or a script path (same rules as `script`, run each tick) — cheap, no LLM. Output identical to the previous tick skips the agent run entirely; changed output wakes the agent with a diff injected into the prompt. First tick always runs (baseline). Output must be deterministic (no timestamps) or every tick looks changed. Incompatible with no_agent. On update, '' clears."
             },
             "no_agent": {
                 "type": "boolean",
@@ -1910,11 +1936,18 @@ def check_cronjob_requirements() -> bool:
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="cronjob",
-    toolset="cronjob",
-    schema=CRONJOB_SCHEMA,
-    handler=lambda args, **kw: cronjob(
+
+def _cronjob_handler(args, **kw):
+    """Model-tool dispatch for ``cronjob``.
+
+    Resolves the one model-facing ``monitor`` field into the stored
+    ``monitor_script``/``monitor_url`` pair (legacy field names still accepted
+    as aliases so older transcripts/replays keep working).
+    """
+    _mon_script, _mon_url = _split_monitor_arg(
+        args.get("monitor"), args.get("monitor_script"), args.get("monitor_url")
+    )
+    return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
         prompt=args.get("prompt"),
@@ -1937,11 +1970,18 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
-        monitor_script=args.get("monitor_script"),
-        monitor_url=args.get("monitor_url"),
+        monitor_script=_mon_script,
+        monitor_url=_mon_url,
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
-    ),
+    )
+
+
+registry.register(
+    name="cronjob",
+    toolset="cronjob",
+    schema=CRONJOB_SCHEMA,
+    handler=_cronjob_handler,
     check_fn=check_cronjob_requirements,
     emoji="⏰",
 )
