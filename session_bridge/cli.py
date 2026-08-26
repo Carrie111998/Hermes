@@ -161,7 +161,18 @@ _CHARACTERIZATION_PROVIDER_SELECTIONS: dict[str, tuple[str, ...]] = {
     "claude": ("claude",),
     "codex": ("codex",),
 }
-_CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.216"
+# Bumped 2026-08-26 from 2.1.216. The pin was pinned to the npm global, which
+# had silently drifted to 2.1.216 while the Desktop app ran 2.1.237; that npm
+# copy was UNINSTALLED 2026-08-25 (see resolve_claude_command), so the resolver
+# correctly began returning the Desktop-shipped CLI and every preflight refused
+# version_unpinned from then on -- 46 of 50 continuous cycles in one 49-minute
+# window, with the whole visibility lane dying at cli.py raise ProviderDegraded
+# BEFORE discovery. A stale pin does not announce itself: the status blob kept
+# serving a 21-hour-old degraded/bridge_conflict, which reads as a registrar
+# fault. 2.1.246 is what claude_registrar's screen model was actually measured
+# against -- the two live TUI frames it was built on were captured 2026-08-25
+# and 2026-08-26 through this repo's own isolation argv on this CLI.
+_CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.246"
 _CLAUDE_VISIBILITY_VERSION_OUTPUTS = frozenset({
     _CLAUDE_VISIBILITY_PINNED_VERSION,
     f"{_CLAUDE_VISIBILITY_PINNED_VERSION} (Claude Code)",
@@ -584,7 +595,7 @@ def _claude_visibility_preflight(
 
 
 def _resolve_default_claude_global_config_path() -> Path:
-    """Resolve Claude 2.1.216 global state for the fixed default config root."""
+    """Resolve Claude 2.1.246 global state for the fixed default config root."""
 
     home = Path.home()
     modern = home / ".claude" / ".config.json"
