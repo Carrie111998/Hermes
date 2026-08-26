@@ -32,7 +32,11 @@ Event type routing
 Inbound envelope carries ``type`` in [MESSAGE, ADDED_TO_SPACE, REMOVED_FROM_SPACE,
 CARD_CLICKED]. Only MESSAGE dispatches to the agent. ADDED_TO_SPACE caches the
 bot's resource name (belt-and-suspenders on top of eager resolution in connect()).
-CARD_CLICKED is ACK'd only in v1 (follow-up PR implements interactivity).
+CARD_CLICKED resolves only server-created approval records. The callback is
+authenticated by Google before it reaches the Pub/Sub subscription; the
+adapter additionally checks the literal email in the event against the
+configured approval roster, the source space, TTL, and one-time status before
+unblocking a command.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ import random
 import re
 import threading
 import time
+import uuid
 from pathlib import Path as _Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -622,6 +627,132 @@ class _ThreadCountStore:
             )
 
 
+class _ApprovalStore:
+    """Small, write-through approval ledger for Google Chat card actions.
+
+    The gateway's in-memory waiter is necessarily lost on restart, but the
+    decision record must not be: it prevents a replayed card click from being
+    mistaken for a new approval and gives operators an auditable outcome.  The
+    store only records metadata needed to bind the click to a gateway wait;
+    it never writes OAuth credentials or arbitrary card payloads.
+    """
+
+    def __init__(self, path: _Path) -> None:
+        self._path = path
+        self._records: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+            data = json.loads(raw) if raw.strip() else {}
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("[GoogleChat] could not load approval store %s: %s", self._path, exc)
+            return
+        if not isinstance(data, dict):
+            return
+        for approval_id, record in data.items():
+            if isinstance(approval_id, str) and isinstance(record, dict):
+                self._records[approval_id] = record
+
+    def create(self, record: Dict[str, Any]) -> None:
+        approval_id = str(record["approval_id"])
+        with self._lock:
+            previous = self._records.get(approval_id)
+            self._records[approval_id] = dict(record)
+            try:
+                self._save_locked()
+            except OSError:
+                # A card must never be sent for a record that only exists in
+                # volatile memory. Restore the pre-write state before
+                # surfacing the error to the sender.
+                if previous is None:
+                    self._records.pop(approval_id, None)
+                else:
+                    self._records[approval_id] = previous
+                raise
+
+    def discard(self, approval_id: str) -> None:
+        """Remove an undispatched record after its card could not be sent."""
+        with self._lock:
+            if approval_id not in self._records:
+                return
+            removed = self._records.pop(approval_id)
+            try:
+                self._save_locked()
+            except OSError:
+                self._records[approval_id] = removed
+                logger.error("[GoogleChat] could not discard unsent approval record")
+
+    def get(self, approval_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            record = self._records.get(approval_id)
+            return dict(record) if record else None
+
+    def resolve(
+        self, approval_id: str, *, action: str, approver_email: str,
+        approver_role: str, chat_id: str, now: Optional[float] = None,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Atomically settle a pending record. Return (outcome, record)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            record = self._records.get(approval_id)
+            if not record:
+                return "unknown", None
+            if str(record.get("chat_id") or "") != chat_id:
+                return "wrong_space", dict(record)
+            if str(record.get("status") or "") != "pending":
+                return "already_resolved", dict(record)
+            if float(record.get("expires_at") or 0) <= now:
+                record["status"] = "expired"
+                record["resolved_at"] = now
+                self._save_locked()
+                return "expired", dict(record)
+            record.update({
+                "status": "approved" if action == "approve" else "denied",
+                "action": action,
+                "approver_email": approver_email,
+                "approver_role": approver_role,
+                "resolved_at": now,
+            })
+            self._save_locked()
+            return "resolved", dict(record)
+
+    def set_execution_result(self, approval_id: str, *, resolved: bool) -> None:
+        """Record whether the gateway still had a waiter to unblock."""
+        with self._lock:
+            record = self._records.get(approval_id)
+            if not record:
+                return
+            record["execution_resolved"] = resolved
+            if not resolved and record.get("status") == "approved":
+                # An approval card can arrive after the gateway waiter has
+                # timed out or restarted. It must never imply the operation
+                # ran in that case.
+                record["status"] = "expired"
+            self._save_locked()
+
+    def _save_locked(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._records, separators=(",", ":")), encoding="utf-8")
+            if os.name != "nt":
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, self._path)
+            if os.name != "nt":
+                os.chmod(self._path, 0o600)
+        except OSError as exc:
+            # Fail closed: callers only receive a successful send once the
+            # record has been created. A failed write is visible in logs and
+            # cannot silently grant an unrecorded operation.
+            logger.error("[GoogleChat] could not persist approval store %s: %s", self._path, exc)
+            raise
+
+
 class GoogleChatAdapter(BasePlatformAdapter):
     """
     Google Chat bot adapter using Pub/Sub pull + Chat REST API.
@@ -633,6 +764,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
 
     Optional:
       GOOGLE_CHAT_ALLOWED_USERS, GOOGLE_CHAT_ALLOW_ALL_USERS
+      GOOGLE_CHAT_APPROVAL_LEAD_APPROVERS, GOOGLE_CHAT_APPROVAL_EXECUTIVE_APPROVERS
       GOOGLE_CHAT_HOME_CHANNEL
       GOOGLE_CHAT_MAX_MESSAGES (FlowControl, default 1)
       GOOGLE_CHAT_MAX_BYTES    (FlowControl, default 16_777_216 = 16 MiB)
@@ -726,6 +858,21 @@ class GoogleChatAdapter(BasePlatformAdapter):
         self._thread_count_store = _ThreadCountStore(
             _hermes_home / "google_chat_thread_counts.json"
         )
+        # KIRA approval records deliberately live beside the existing
+        # adapter state, not in an ephemeral card/action cache.  The gateway
+        # still fails closed after a restart because its command waiter is
+        # gone, but a replayed card can never become a second approval.
+        self._approval_store = _ApprovalStore(
+            _hermes_home / "google_chat_approval_records.json"
+        )
+        try:
+            self._approval_ttl_seconds = max(
+                30, int(self.config.extra.get("approval_ttl_seconds")
+                        or os.getenv("GOOGLE_CHAT_APPROVAL_TTL_SECONDS", "600"))
+            )
+        except (TypeError, ValueError):
+            self._approval_ttl_seconds = 600
+        self._approval_roles = self._load_approval_roles()
         # In-flight typing-card creates per chat_id. send_typing() reserves
         # an Event here BEFORE starting the API call so concurrent calls
         # from base.py's _keep_typing wait instead of duplicating cards.
@@ -760,6 +907,42 @@ class GoogleChatAdapter(BasePlatformAdapter):
             or os.getenv("GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL", "")
             or ""
         ).strip().lower()
+
+    def _load_approval_roles(self) -> Dict[str, set[str]]:
+        """Return literal-email approval allowlists; no sender-ID inference.
+
+        Operators configure each role with a comma-separated config value or
+        environment variable. The safe default is an empty roster: no address
+        gets approval power merely by installing the platform plugin.
+        """
+        def _emails(key: str, env_key: str, default: str) -> set[str]:
+            raw = self.config.extra.get(key)
+            if raw is None:
+                raw = os.getenv(env_key, default)
+            return {
+                item.strip().lower() for item in str(raw).split(",")
+                if item.strip() and "@" in item
+            }
+
+        return {
+            "lead": _emails(
+                "approval_lead_approvers",
+                "GOOGLE_CHAT_APPROVAL_LEAD_APPROVERS",
+                "",
+            ),
+            "executive": _emails(
+                "approval_executive_approvers",
+                "GOOGLE_CHAT_APPROVAL_EXECUTIVE_APPROVERS",
+                "",
+            ),
+        }
+
+    def _approval_role_for_email(self, email: str) -> Optional[str]:
+        email = email.strip().lower()
+        for role, emails in self._approval_roles.items():
+            if email in emails:
+                return role
+        return None
 
     # ------------------------------------------------------------------
     # Configuration loading and validation
@@ -1438,11 +1621,18 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 message.ack()
                 return
 
-            # --- Card-click events (v2 follow-up) ---
+            # --- Card-click events ---
             if "widget" in ce_type or "card" in ce_type.lower():
-                logger.info(
-                    "[GoogleChat] Card/widget event ack'd (v2 feature, deferred)"
-                )
+                payload = self._card_clicked_payload(envelope)
+                action = payload.get("action") or {}
+                if action.get("function") == "hermes_kira_approval":
+                    # Ack the upstream event after scheduling. The record
+                    # state machine rejects redeliveries and double-clicks;
+                    # holding the Pub/Sub callback open risks retries that
+                    # provide no additional safety.
+                    self._submit_on_loop(self._handle_kira_card_click(envelope))
+                else:
+                    logger.debug("[GoogleChat] ignored unrecognized card action")
                 message.ack()
                 return
 
@@ -1493,6 +1683,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 pass
 
     async def dispatch_http_event(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._card_clicked_payload(envelope)
+        action = payload.get("action") or {}
+        if action.get("function") == "hermes_kira_approval":
+            # HTTP callbacks are an equal ingress path to Pub/Sub. Await the
+            # handler so the callback cannot report success before the
+            # decision has been made durable or rejected.
+            await self._handle_kira_card_click(envelope)
+            return {}
         extracted = self._extract_message_payload(envelope)
         if extracted is None:
             return {}
@@ -2050,6 +2248,152 @@ class GoogleChatAdapter(BasePlatformAdapter):
         else:
             local = cache_document_from_bytes(data, filename)
         return local, mime
+
+    # ------------------------------------------------------------------
+    # KIRA approval gate
+    # ------------------------------------------------------------------
+    async def send_exec_approval(
+        self, chat_id: str, command: str, session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Send a KIRA approval card for a single gateway operation.
+
+        ``allow_permanent`` and ``allow_session`` are accepted for the shared
+        adapter contract but intentionally ignored: KIRA v2 only supports a
+        one-time Approve or Decline.  A card never grants a standing command
+        permission.
+        """
+        del allow_permanent, allow_session, smart_denied
+        approval_id = uuid.uuid4().hex
+        created_at = time.time()
+        card = card_spec_to_cards_v2({
+            "card_id": "kira-approval",
+            "header": {"title": "KIRA approval required", "subtitle": "Expires in 10 minutes"},
+            "sections": [{"widgets": [
+                {"type": "text", "text": self._format_exec_approval(command, description, False)},
+                {"type": "buttons", "buttons": [
+                    {"text": "Approve", "action": "hermes_kira_approval", "parameters": {
+                        "approval_id": approval_id, "decision": "approve",
+                    }},
+                    {"text": "Decline", "action": "hermes_kira_approval", "parameters": {
+                        "approval_id": approval_id, "decision": "decline",
+                    }},
+                ]},
+            ]}],
+        })
+        try:
+            self._approval_store.create({
+                "approval_id": approval_id,
+                "chat_id": chat_id,
+                "session_key": session_key,
+                "command": command,
+                "description": description,
+                "created_at": created_at,
+                "expires_at": created_at + self._approval_ttl_seconds,
+                "status": "pending",
+                "message_id": "",
+            })
+        except OSError as exc:
+            # The record is the authorization boundary. Do not send a usable
+            # card unless durable state exists first.
+            logger.error("[GoogleChat] KIRA approval record persistence failed: %s", exc)
+            return SendResult(success=False, error="approval record persistence failed")
+        result = await self.send_card(chat_id, card, metadata=metadata)
+        if not result.success:
+            self._approval_store.discard(approval_id)
+            return result
+        # The record predates the card so callbacks can never beat durable
+        # state. Keep the provider message ID when it is available for audit.
+        if result.message_id:
+            record = self._approval_store.get(approval_id)
+            if record:
+                record["message_id"] = result.message_id
+                try:
+                    self._approval_store.create(record)
+                except OSError:
+                    logger.warning("[GoogleChat] could not update KIRA approval message ID")
+        return result
+
+    @staticmethod
+    def _card_clicked_payload(envelope: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a normalized card payload for each supported event wrapper."""
+        chat_payload = (envelope.get("chat") or {}).get("cardClickedPayload")
+        if isinstance(chat_payload, dict):
+            return chat_payload
+        payload = envelope.get("cardClickedPayload")
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _card_clicked_fields(envelope: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
+        """Extract (function, approval_id, decision, literal_email) safely."""
+        payload = GoogleChatAdapter._card_clicked_payload(envelope)
+        action = payload.get("action") or {}
+        function = str(action.get("function") or "")
+        parameters = action.get("parameters") or []
+        values = {
+            str(item.get("key")): str(item.get("value"))
+            for item in parameters if isinstance(item, dict)
+        }
+        # Do not synthesize an email from resource IDs or display names.
+        email = str((payload.get("user") or {}).get("email") or "").strip().lower()
+        approval_id = values.get("approval_id", "")
+        decision = values.get("decision", "")
+        if not (function and approval_id and decision and email):
+            return None
+        return function, approval_id, decision, email
+
+    async def _handle_kira_card_click(self, envelope: Dict[str, Any]) -> None:
+        fields = self._card_clicked_fields(envelope)
+        if not fields:
+            logger.warning("[GoogleChat] rejected malformed card-click event")
+            return
+        function, approval_id, decision, email = fields
+        if function != "hermes_kira_approval" or decision not in {"approve", "decline"}:
+            return
+        payload = self._card_clicked_payload(envelope)
+        chat_id = str(
+            (payload.get("space") or {}).get("name")
+            or (envelope.get("space") or {}).get("name")
+            or ""
+        )
+        if not chat_id:
+            logger.warning("[GoogleChat] rejected KIRA click without a source space")
+            return
+        role = self._approval_role_for_email(email)
+        if role is None:
+            logger.warning("[GoogleChat] rejected KIRA click from unauthorized email")
+            return
+        outcome, record = self._approval_store.resolve(
+            approval_id, action=decision, approver_email=email,
+            approver_role=role, chat_id=chat_id,
+        )
+        if outcome == "unknown":
+            logger.warning("[GoogleChat] rejected unknown KIRA approval id")
+            return
+        if outcome in {"wrong_space", "already_resolved", "expired"}:
+            await self.send(chat_id, f"KIRA approval {outcome.replace('_', ' ')}; no operation ran.")
+            return
+        if not record:  # Defensive; resolve only returns resolved with a record.
+            return
+        try:
+            from tools.approval import resolve_gateway_approval
+            resolution = "once" if decision == "approve" else "deny"
+            resolved = bool(resolve_gateway_approval(record["session_key"], resolution))
+        except Exception:
+            logger.exception("[GoogleChat] could not resolve KIRA gateway approval")
+            resolved = False
+        self._approval_store.set_execution_result(approval_id, resolved=resolved)
+        if decision == "decline":
+            message = f"KIRA approval declined by {role} approver; operation was not run."
+        elif resolved:
+            message = f"KIRA approval approved by {role} approver; operation released once."
+        else:
+            message = "KIRA approval expired before the gateway could release it; operation was not run."
+        await self.send(chat_id, message)
 
     # ------------------------------------------------------------------
     # Outbound send paths

@@ -164,7 +164,7 @@ def adapter(tmp_path):
     don't pollute (or read state from) the developer's real
     ~/.hermes/google_chat_thread_counts.json.
     """
-    from plugins.platforms.google_chat.adapter import _ThreadCountStore
+    from plugins.platforms.google_chat.adapter import _ApprovalStore, _ThreadCountStore
     a = GoogleChatAdapter(_base_config())
     a._loop = asyncio.get_event_loop_policy().new_event_loop()
     a._chat_api = MagicMock()
@@ -179,6 +179,11 @@ def adapter(tmp_path):
     a._thread_count_store = _ThreadCountStore(
         tmp_path / "google_chat_thread_counts.json"
     )
+    a._approval_store = _ApprovalStore(tmp_path / "google_chat_approval_records.json")
+    a._approval_roles = {
+        "lead": {"richard@goldentouchremodeling.com"},
+        "executive": {"jadkins@clearplanconsulting.com"},
+    }
     yield a
     try:
         a._loop.close()
@@ -1786,4 +1791,93 @@ class TestGoogleChatStandaloneSend:
         assert url == "https://chat.googleapis.com/v1/spaces/AAAA-BBBB/messages"
         assert kwargs["headers"]["Authorization"] == "Bearer the-token"
         assert kwargs["json"] == {"text": "hello cron"}
+
+
+class TestKiraApprovalGate:
+    def _event(self, approval_id, decision="approve", email="richard@goldentouchremodeling.com"):
+        return {
+            "chat": {"cardClickedPayload": {
+                "space": {"name": "spaces/APPROVAL"},
+                "user": {"email": email},
+                "action": {"function": "hermes_kira_approval", "parameters": [
+                    {"key": "approval_id", "value": approval_id},
+                    {"key": "decision", "value": decision},
+                ]},
+            }}
+        }
+
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_creates_one_time_card_and_persistent_record(self, adapter):
+        adapter.send_card = AsyncMock(return_value=_gc_mod.SendResult(success=True, message_id="m1"))
+
+        result = await adapter.send_exec_approval("spaces/APPROVAL", "rm -rf tmp", "session-1")
+
+        assert result.success is True
+        card = adapter.send_card.await_args.args[1]
+        buttons = card["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
+        assert [button["text"] for button in buttons] == ["Approve", "Decline"]
+        assert {button["onClick"]["action"]["function"] for button in buttons} == {"hermes_kira_approval"}
+        approval_id = buttons[0]["onClick"]["action"]["parameters"][0]["value"]
+        record = adapter._approval_store.get(approval_id)
+        assert record["status"] == "pending"
+        assert record["session_key"] == "session-1"
+
+    @pytest.mark.asyncio
+    async def test_approver_identity_is_literal_and_replay_only_resolves_once(self, adapter, monkeypatch):
+        adapter._approval_store.create({
+            "approval_id": "a1", "chat_id": "spaces/APPROVAL", "session_key": "session-1",
+            "created_at": 0, "expires_at": 9999999999, "status": "pending",
+        })
+        adapter.send = AsyncMock(return_value=_gc_mod.SendResult(success=True))
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr("tools.approval.resolve_gateway_approval", resolver)
+
+        await adapter._handle_kira_card_click(self._event("a1"))
+        await adapter._handle_kira_card_click(self._event("a1"))
+
+        resolver.assert_called_once_with("session-1", "once")
+        assert adapter._approval_store.get("a1")["status"] == "approved"
+        assert adapter.send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unapproved_or_expired_click_never_releases_operation(self, adapter, monkeypatch):
+        adapter._approval_store.create({
+            "approval_id": "a2", "chat_id": "spaces/APPROVAL", "session_key": "session-2",
+            "created_at": 0, "expires_at": 1, "status": "pending",
+        })
+        adapter.send = AsyncMock(return_value=_gc_mod.SendResult(success=True))
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr("tools.approval.resolve_gateway_approval", resolver)
+
+        await adapter._handle_kira_card_click(self._event("a2"))
+        await adapter._handle_kira_card_click(self._event("a2", email="attacker@example.com"))
+
+        resolver.assert_not_called()
+        assert adapter._approval_store.get("a2")["status"] == "expired"
+
+    @pytest.mark.asyncio
+    async def test_http_card_click_uses_the_same_guarded_handler(self, adapter):
+        adapter._handle_kira_card_click = AsyncMock()
+
+        result = await adapter.dispatch_http_event(self._event("a3"))
+
+        assert result == {}
+        adapter._handle_kira_card_click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_card_send_discards_precreated_record(self, adapter):
+        adapter.send_card = AsyncMock(return_value=_gc_mod.SendResult(success=False, error="network"))
+
+        result = await adapter.send_exec_approval("spaces/APPROVAL", "rm -rf tmp", "session-3")
+
+        assert result.success is False
+        buttons = adapter.send_card.await_args.args[1]["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
+        approval_id = buttons[0]["onClick"]["action"]["parameters"][0]["value"]
+        assert adapter._approval_store.get(approval_id) is None
+
+    def test_approval_ledger_is_private_on_posix(self, adapter):
+        adapter._approval_store.create({"approval_id": "private", "status": "pending"})
+
+        if os.name != "nt":
+            assert adapter._approval_store._path.stat().st_mode & 0o777 == 0o600
 
