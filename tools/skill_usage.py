@@ -90,6 +90,7 @@ def _usage_file() -> Path:
 _ARCHIVED_NAMES_CACHE: Dict[
     tuple[str, Optional[int], Optional[int], Optional[int]], frozenset[str]
 ] = {}
+_ARCHIVED_NAMES_CACHE_MAX_PROFILES = 32
 
 
 def archived_skill_names() -> frozenset[str]:
@@ -110,15 +111,18 @@ def archived_skill_names() -> frozenset[str]:
     if cached is not None:
         return cached
 
+    usage, loaded = _load_usage_with_status()
     archived = frozenset(
         name
-        for name, record in load_usage().items()
+        for name, record in usage.items()
         if isinstance(record, dict) and record.get("state") == STATE_ARCHIVED
     )
-    # Only the active profile's latest sidecar matters.  Bounding this cache to
-    # one entry also prevents long-lived multi-profile gateways from retaining
-    # stale lifecycle maps indefinitely.
-    _ARCHIVED_NAMES_CACHE.clear()
+    # A transient sharing violation or partial external write must remain
+    # recoverable on the next lookup rather than pinning a fail-open empty set.
+    if not loaded:
+        return archived
+    if len(_ARCHIVED_NAMES_CACHE) >= _ARCHIVED_NAMES_CACHE_MAX_PROFILES:
+        _ARCHIVED_NAMES_CACHE.pop(next(iter(_ARCHIVED_NAMES_CACHE)))
     _ARCHIVED_NAMES_CACHE[key] = archived
     return archived
 
@@ -751,24 +755,29 @@ def _empty_record() -> Dict[str, Any]:
     }
 
 
-def load_usage() -> Dict[str, Dict[str, Any]]:
-    """Read the entire .usage.json map. Returns empty dict on missing/corrupt."""
+def _load_usage_with_status() -> tuple[Dict[str, Dict[str, Any]], bool]:
+    """Read usage data and say whether the result is safe to memoize."""
     path = _usage_file()
     if not path.exists():
-        return {}
+        return {}, True
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("Failed to read %s: %s", path, e)
-        return {}
+        return {}, False
     if not isinstance(data, dict):
-        return {}
+        return {}, False
     # Defensive: coerce any non-dict values to a fresh empty record
     clean: Dict[str, Dict[str, Any]] = {}
     for k, v in data.items():
         if isinstance(v, dict):
             clean[str(k)] = v
-    return clean
+    return clean, True
+
+
+def load_usage() -> Dict[str, Dict[str, Any]]:
+    """Read the entire .usage.json map. Returns empty dict on missing/corrupt."""
+    return _load_usage_with_status()[0]
 
 
 def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:

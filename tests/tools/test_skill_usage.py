@@ -80,7 +80,7 @@ def test_archived_names_reuses_parse_until_sidecar_changes(skills_home, monkeypa
     import tools.skill_usage as skill_usage
 
     skill_usage.save_usage({"skill-a": {"state": skill_usage.STATE_ACTIVE}})
-    real_load = skill_usage.load_usage
+    real_load = skill_usage._load_usage_with_status
     loads = 0
 
     def counted_load():
@@ -88,7 +88,7 @@ def test_archived_names_reuses_parse_until_sidecar_changes(skills_home, monkeypa
         loads += 1
         return real_load()
 
-    monkeypatch.setattr(skill_usage, "load_usage", counted_load)
+    monkeypatch.setattr(skill_usage, "_load_usage_with_status", counted_load)
 
     assert skill_usage.archived_skill_names() == frozenset()
     assert skill_usage.archived_skill_names() == frozenset()
@@ -97,6 +97,27 @@ def test_archived_names_reuses_parse_until_sidecar_changes(skills_home, monkeypa
     skill_usage.save_usage({"skill-a": {"state": skill_usage.STATE_ARCHIVED}})
     assert skill_usage.archived_skill_names() == frozenset({"skill-a"})
     assert loads == 2
+
+
+def test_archived_names_retries_transient_read_failure(skills_home, monkeypatch):
+    import tools.skill_usage as skill_usage
+
+    skill_usage.save_usage({"skill-a": {"state": skill_usage.STATE_ARCHIVED}})
+    real_load = skill_usage._load_usage_with_status
+    attempts = 0
+
+    def flaky_load():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return {}, False
+        return real_load()
+
+    monkeypatch.setattr(skill_usage, "_load_usage_with_status", flaky_load)
+
+    assert skill_usage.archived_skill_names() == frozenset()
+    assert skill_usage.archived_skill_names() == frozenset({"skill-a"})
+    assert attempts == 2
 
 
 def test_get_record_missing_returns_empty_record(skills_home):

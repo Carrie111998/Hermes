@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -29,9 +30,15 @@ _skill_commands_archived: frozenset[str] = frozenset()
 _skill_commands_project: tuple[Optional[str], tuple[str, ...]] | None = None
 _project_context_cache: dict[
     tuple[str, str, Optional[int], Optional[int]],
-    tuple[tuple[tuple[str, Optional[int]], ...], tuple[Optional[str], tuple[str, ...]], list[Path]],
+    tuple[
+        float,
+        tuple[tuple[str, Optional[int]], ...],
+        tuple[Optional[str], tuple[str, ...]],
+        list[Path],
+    ],
 ] = {}
 _project_context_lock = threading.Lock()
+_PROJECT_CONTEXT_CACHE_TTL_SECONDS = 1.0
 # Guards the (map, platform-tag, home-tag, archive-state, project-context)
 # snapshot so
 # publication and the freshness lookup always see a consistent view. Scanning
@@ -271,11 +278,15 @@ def _resolve_skill_commands_project_context() -> tuple[
         with _project_context_lock:
             cached = _project_context_cache.get(cache_key)
         if cached is not None:
-            old_watch, identity, project_dirs = cached
+            cached_at, old_watch, identity, project_dirs = cached
             current_watch = tuple(
                 (path, _path_mtime_ns(Path(path))) for path, _ in old_watch
             )
-            if current_watch == old_watch:
+            if (
+                current_watch == old_watch
+                and time.monotonic() - cached_at
+                < _PROJECT_CONTEXT_CACHE_TTL_SECONDS
+            ):
                 return identity, list(project_dirs)
 
         root = find_project_root()
@@ -294,7 +305,12 @@ def _resolve_skill_commands_project_context() -> tuple[
         watch = tuple((str(path), _path_mtime_ns(path)) for path in watch_paths)
         with _project_context_lock:
             _project_context_cache.clear()
-            _project_context_cache[cache_key] = (watch, identity, list(project_dirs))
+            _project_context_cache[cache_key] = (
+                time.monotonic(),
+                watch,
+                identity,
+                list(project_dirs),
+            )
         return identity, project_dirs
     except Exception:
         return (None, ()), []

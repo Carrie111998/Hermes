@@ -202,6 +202,43 @@ class TestScanSkillCommands:
         find_root.assert_called_once_with()
         project_dirs.assert_called_once_with()
 
+    def test_project_context_cache_rechecks_missing_root_after_ttl(
+        self, tmp_path, monkeypatch
+    ):
+        import agent.skill_commands as sc_mod
+
+        project = tmp_path / "project"
+        project_skills = project / ".hermes" / "skills"
+        project.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(project))
+        sc_mod._project_context_cache.clear()
+
+        with (
+            patch(
+                "agent.skill_utils.find_project_root",
+                side_effect=[None, project],
+            ) as find_root,
+            patch(
+                "agent.skill_utils.get_project_skills_dirs",
+                side_effect=[[], [project_skills]],
+            ),
+            patch(
+                "agent.skill_commands.time.monotonic",
+                side_effect=[10.0, 12.0, 12.0],
+            ),
+        ):
+            first = sc_mod._resolve_skill_commands_project_context()
+            (project / ".git").mkdir()
+            project_skills.mkdir(parents=True)
+            second = sc_mod._resolve_skill_commands_project_context()
+
+        assert first == ((None, ()), [])
+        assert second == (
+            (str(project.resolve()), (str(project_skills.resolve()),)),
+            [project_skills],
+        )
+        assert find_root.call_count == 2
+
     def test_get_skill_commands_rescans_when_platform_scope_changes(self, tmp_path):
         """Platform-specific disabled-skill caches must not leak across platforms.
 
