@@ -1,4 +1,0 @@
-PR: NousResearch/hermes-agent#93042
-Purpose: emit one ordinary branch synchronization after removing unrelated workflow changes.
-Corrected tree: 8f62eb13608cdef7dad04ce53404949dc245b2f5
-Delete immediately after event verification.
