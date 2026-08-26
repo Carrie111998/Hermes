@@ -6171,6 +6171,8 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    allow_session: bool = True
+    allow_permanent: bool = True
     modified_args: Optional[Dict[str, Any]] = None
 
 
@@ -6204,6 +6206,7 @@ def _get_pre_tool_call_directive_details(
         {"action": "block",   "message": "Reason the tool was blocked"}
         {"action": "approve", "message": "Why this needs human confirmation"}
         {"action": "approve", "message": "...", "rule_key": "write_file:ssh"}
+        {"action": "approve", "message": "...", "allow_permanent": False}
 
     from their ``pre_tool_call`` callback.
 
@@ -6218,6 +6221,12 @@ def _get_pre_tool_call_directive_details(
       :func:`tools.approval.request_tool_approval`).
     - ``rule_key`` is optional and only honored for ``approve`` directives. It
       lets plugins choose the allowlist grain for `[a]lways` approvals.
+    - ``allow_session`` / ``allow_permanent`` are optional and only honored
+      for ``approve`` directives. Set either to ``False`` to drop that scope
+      from the prompt — for a rule whose key already names one subject, an
+      `[a]lways` answer can only widen a decision the human meant to make
+      once. Anything other than an explicit ``False`` leaves the scope
+      offered, so existing plugins are unaffected.
 
     The first valid directive wins. Invalid or irrelevant hook return values
     are silently ignored so existing observer-only hooks are unaffected.
@@ -6275,8 +6284,18 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
+        # Only an explicit False narrows the offered scopes. A missing or
+        # malformed value keeps every scope, so a plugin written against the
+        # older contract behaves exactly as it did.
+        def _scope(name: str) -> bool:
+            if action != "approve":
+                return True
+            return result.get(name) is not False
+
         return _PreToolCallDirective(
             action=action, message=message, rule_key=rule_key,
+            allow_session=_scope("allow_session"),
+            allow_permanent=_scope("allow_permanent"),
             modified_args=modified_args,
         )
 
@@ -6409,6 +6428,8 @@ def _resolve_block_from_details(
                     tool_name,
                     details.message or "",
                     rule_key=details.rule_key or tool_name,
+                    allow_session=details.allow_session,
+                    allow_permanent=details.allow_permanent,
                 )
             finally:
                 if approval_tokens is not None:

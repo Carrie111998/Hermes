@@ -3617,6 +3617,28 @@ def _smart_approve(command: str, description: str) -> str:
         return "escalate"
 
 
+def _clamp_choice_to_offered_scopes(
+    choice: Optional[str], *, allow_session: bool, allow_permanent: bool
+) -> Optional[str]:
+    """Narrow a decision to a scope the human was actually offered.
+
+    Surfaces are told which scopes to render, but the answer travels back as
+    a plain string — over a CLI callback, a button payload, or a queued
+    ``/approve``. A scope that was never on screen is a stale client or a
+    bug, not consent, and persisting it would widen an allowlist nobody
+    agreed to widen. Narrowing to ``once`` keeps the action approved, since
+    a human did answer yes, without remembering an answer they were never
+    asked for. The plugin-transport path already refuses an unoffered scope
+    (``hermes_cli.approval_transport``); this is the same rule for the
+    built-in surfaces.
+    """
+    if choice == "always" and not allow_permanent:
+        return "once"
+    if choice == "session" and not allow_session:
+        return "once"
+    return choice
+
+
 def _run_approval_gate(
     *,
     pattern_key: str,
@@ -3628,6 +3650,8 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    allow_session: bool = True,
+    allow_permanent: bool = True,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3666,6 +3690,14 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        allow_session: When False, ``[s]ession`` is not offered and is not
+            persisted if a surface returns it anyway.
+        allow_permanent: When False, ``[a]lways`` is not offered and is not
+            persisted if a surface returns it anyway. A gate whose key
+            describes something narrower than the rule — one file, one
+            record, one event — has nothing useful to remember, and offering
+            a permanent answer there teaches people to widen an allowlist
+            they only meant to answer once.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3769,8 +3801,8 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
-                "allow_session": True,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -3785,7 +3817,11 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
             resolved = decision["resolved"]
-            choice = decision["choice"]
+            choice = _clamp_choice_to_offered_scopes(
+                decision["choice"],
+                allow_session=allow_session,
+                allow_permanent=allow_permanent,
+            )
             deny_reason = decision.get("reason")
 
             if not resolved or choice is None or choice == "deny":
@@ -3859,8 +3895,16 @@ def _run_approval_gate(
         session_key=session_key,
         surface="cli",
     )
-    choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+    choice = _clamp_choice_to_offered_scopes(
+        prompt_dangerous_approval(
+            display_target, description,
+            allow_permanent=allow_permanent,
+            approval_callback=approval_callback,
+            allow_session=allow_session,
+        ),
+        allow_session=allow_session,
+        allow_permanent=allow_permanent,
+    )
     _fire_approval_hook(
         "post_approval_response",
         command=display_target,
@@ -4007,6 +4051,8 @@ def request_tool_approval(
     reason: str,
     *,
     rule_key: str = "",
+    allow_session: bool = True,
+    allow_permanent: bool = True,
     approval_callback=None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
@@ -4033,6 +4079,17 @@ def request_tool_approval(
             on the same tool persist independently (answering ``[a]lways`` to
             "write to ~/.ssh" does NOT auto-approve a later "send email" rule
             on the same tool).
+        allow_session: Offer ``[s]ession``. Pass False for a rule that must
+            be answered every time.
+        allow_permanent: Offer ``[a]lways``. Pass False when remembering the
+            answer would be meaningless or unsafe — typically when
+            ``rule_key`` already names a single subject (one file, one
+            recipient, one record), so there is no future call a stored
+            answer could correctly apply to. Without this a plugin can choose
+            the allowlist *grain* but never opt out of the allowlist, so a
+            per-subject key still renders an ``always`` button whose only
+            possible effect is to widen a decision the human meant to make
+            once.
         approval_callback: Optional CLI callback for interactive prompts
             (same contract as ``check_dangerous_command``).
 
@@ -4070,6 +4127,8 @@ def request_tool_approval(
         description=description,
         display_target=display_target,
         approval_callback=approval_callback,
+        allow_session=allow_session,
+        allow_permanent=allow_permanent,
         cron_deny_message=(
             f"BLOCKED: Tool '{tool_name}' requires approval ({description}) "
             "but cron jobs run without a user present to approve it. Find an "

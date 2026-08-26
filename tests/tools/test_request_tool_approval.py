@@ -151,3 +151,126 @@ class TestRequestToolApproval:
         )
         res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
         assert res == {"approved": True, "message": None}
+
+
+class TestOfferedApprovalScopes:
+    """A plugin rule may drop [s]ession / [a]lways from the prompt.
+
+    ``rule_key`` already lets a plugin choose the allowlist *grain*, but a key
+    that names a single subject — one file, one recipient, one event — has no
+    future call a stored answer could correctly apply to. Before this, such a
+    rule still rendered an ``always`` button whose only possible effect was to
+    widen a decision the human meant to make once.
+    """
+
+    def test_cli_prompt_is_told_which_scopes_to_offer(self, monkeypatch):
+        seen = {}
+
+        def _prompt(command, description, *a, **kw):
+            seen.update(kw)
+            return "once"
+
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", _prompt)
+
+        res = request_tool_approval(
+            "terminal", "delete one record", rule_key="rec:42",
+            allow_session=False, allow_permanent=False,
+        )
+        assert res["approved"] is True
+        assert seen["allow_permanent"] is False
+        assert seen["allow_session"] is False
+
+    def test_scopes_are_offered_by_default(self, monkeypatch):
+        seen = {}
+
+        def _prompt(command, description, *a, **kw):
+            seen.update(kw)
+            return "once"
+
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", _prompt)
+
+        request_tool_approval("terminal", "smtp send")
+        assert seen["allow_permanent"] is True
+        assert seen["allow_session"] is True
+
+    def test_unoffered_always_is_not_persisted(self, monkeypatch):
+        """A scope that was never on screen is a stale client, not consent.
+
+        The action still goes through — a human did answer yes — but nothing
+        is written to the permanent allowlist.
+        """
+        calls = {"session": [], "permanent": []}
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "always")
+        monkeypatch.setattr(
+            approval, "approve_session", lambda sk, pk: calls["session"].append(pk)
+        )
+        monkeypatch.setattr(
+            approval, "approve_permanent", lambda pk: calls["permanent"].append(pk)
+        )
+        monkeypatch.setattr(approval, "save_permanent_allowlist", lambda *a, **k: None)
+
+        res = request_tool_approval(
+            "terminal", "delete one record", rule_key="rec:42", allow_permanent=False,
+        )
+        assert res["approved"] is True
+        assert calls["permanent"] == []
+        assert calls["session"] == []
+
+    def test_gateway_payload_carries_the_offered_scopes(self, monkeypatch):
+        """The gateway surface renders buttons straight from this payload."""
+        sent = {}
+
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda *a, **k: True)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda session_key, notify_cb, approval_data, surface="gateway": (
+                sent.update(approval_data)
+                or {"resolved": True, "choice": "once", "reason": None}
+            ),
+        )
+        res = request_tool_approval(
+            "terminal", "delete one record", rule_key="rec:42",
+            allow_session=False, allow_permanent=False,
+        )
+        assert res["approved"] is True
+        assert sent["allow_permanent"] is False
+        assert sent["allow_session"] is False
+
+    def test_gateway_unoffered_always_is_not_persisted(self, monkeypatch):
+        calls = {"permanent": []}
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda *a, **k: True)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda *a, **kw: {"resolved": True, "choice": "always", "reason": None},
+        )
+        monkeypatch.setattr(approval, "approve_session", lambda sk, pk: None)
+        monkeypatch.setattr(
+            approval, "approve_permanent", lambda pk: calls["permanent"].append(pk)
+        )
+        monkeypatch.setattr(approval, "save_permanent_allowlist", lambda *a, **k: None)
+
+        res = request_tool_approval(
+            "terminal", "delete one record", rule_key="rec:42", allow_permanent=False,
+        )
+        assert res["approved"] is True
+        assert calls["permanent"] == []
+
+    def test_deny_is_never_reinterpreted(self, monkeypatch):
+        """Clamping narrows a scope; it must never turn a refusal into a yes."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "deny")
+        res = request_tool_approval(
+            "terminal", "delete one record", allow_session=False, allow_permanent=False,
+        )
+        assert res["approved"] is False

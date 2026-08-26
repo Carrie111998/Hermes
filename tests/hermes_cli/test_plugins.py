@@ -2104,3 +2104,61 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+class TestPreToolCallApprovalScopes:
+    """``allow_session`` / ``allow_permanent`` on an ``approve`` directive."""
+
+    def _directive(self, monkeypatch, result):
+        from hermes_cli import lifecycle, plugins
+
+        monkeypatch.setattr(lifecycle, "invoke_hook", lambda *a, **k: [result])
+        return plugins._get_pre_tool_call_directive_details("terminal", {})
+
+    def test_scopes_default_to_offered(self, monkeypatch):
+        d = self._directive(monkeypatch, {"action": "approve", "message": "why"})
+        assert d.allow_session is True
+        assert d.allow_permanent is True
+
+    def test_explicit_false_narrows_the_prompt(self, monkeypatch):
+        d = self._directive(monkeypatch, {
+            "action": "approve", "message": "why",
+            "allow_session": False, "allow_permanent": False,
+        })
+        assert d.allow_session is False
+        assert d.allow_permanent is False
+
+    def test_only_an_explicit_false_narrows(self, monkeypatch):
+        """A missing or malformed value must not silently drop a scope."""
+        d = self._directive(monkeypatch, {
+            "action": "approve", "message": "why",
+            "allow_permanent": "no", "allow_session": None,
+        })
+        assert d.allow_permanent is True
+        assert d.allow_session is True
+
+    def test_block_directives_ignore_the_scope_keys(self, monkeypatch):
+        d = self._directive(monkeypatch, {
+            "action": "block", "message": "no", "allow_permanent": False,
+        })
+        assert d.action == "block"
+        assert d.allow_permanent is True
+
+    def test_scopes_reach_the_approval_gate(self, monkeypatch):
+        from hermes_cli import lifecycle, plugins
+
+        seen = {}
+
+        def _approve(tool_name, reason, **kw):
+            seen.update(kw)
+            return {"approved": True}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+        monkeypatch.setattr(lifecycle, "invoke_hook", lambda *a, **k: [{
+            "action": "approve", "message": "delete one record",
+            "rule_key": "rec:42", "allow_permanent": False,
+        }])
+        assert plugins.resolve_pre_tool_block("terminal", {}) is None
+        assert seen["rule_key"] == "rec:42"
+        assert seen["allow_permanent"] is False
+        assert seen["allow_session"] is True
