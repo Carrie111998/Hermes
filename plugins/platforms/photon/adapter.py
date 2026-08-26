@@ -259,6 +259,14 @@ _PHOTON_RETRYABLE_PATTERNS = (
     "upstream_unavailable",
 )
 
+# Sidecar error classes for which neither the retry loop nor the plain-text
+# fallback resend may fire: retrying can only double-send (permanent classes,
+# #50971) or double-deliver (ambiguous post-handoff failures, #94117). Keep
+# the docstring of _should_suppress_resend_and_retry in sync with this set.
+_RESEND_SUPPRESSED_CLASSES = frozenset(
+    {"auth_or_config", "target_not_allowed", "sidecar_internal"}
+)
+
 # iMessage may emit the Open Graph preview art for a rich link as one or more
 # image attachments immediately after the URL/richlink message. Suppress those
 # artifacts so Hermes sees the link once, not a follow-up "(attachment)" prompt.
@@ -2398,7 +2406,7 @@ class PhotonAdapter(BasePlatformAdapter):
         return any(pat in lowered for pat in _PHOTON_RETRYABLE_PATTERNS)
 
     @staticmethod
-    def _is_permanent_sidecar_failure(result: SendResult) -> bool:
+    def _should_suppress_resend_and_retry(result: SendResult) -> bool:
         """True when the sidecar failure must not be retried or re-sent.
 
         ``auth_or_config`` and ``target_not_allowed`` cannot be fixed by
@@ -2412,13 +2420,19 @@ class PhotonAdapter(BasePlatformAdapter):
         the plain-text resend then duplicated the reply (issue #94117).
         For a personal channel one silent failure beats one duplicate per
         message, so the ambiguous class suppresses the resend too.
+
+        The ``retryable is False`` precondition means the guard can only
+        fire on classes the sidecar itself declared un-retryable — the
+        in-repo sidecar classifies ``sidecar_internal`` exactly that way
+        (``classifySidecarError`` in ``sidecar/index.mjs``), while the
+        genuinely transient upstream classes come back ``retryable=true``
+        and keep their retry loop.
         """
         raw = result.raw_response
         return (
             isinstance(raw, dict)
             and raw.get("retryable") is False
-            and raw.get("error_class")
-            in ("auth_or_config", "target_not_allowed", "sidecar_internal")
+            and raw.get("error_class") in _RESEND_SUPPRESSED_CLASSES
         )
 
     async def _send_with_retry(
@@ -2446,7 +2460,7 @@ class PhotonAdapter(BasePlatformAdapter):
         if result.success:
             return result
 
-        if self._is_permanent_sidecar_failure(result):
+        if self._should_suppress_resend_and_retry(result):
             # Permanent failure classes: retrying cannot succeed and the
             # unconditional plain-text fallback below would double-send the
             # same doomed request. For ``sidecar_internal`` the send may
@@ -2478,7 +2492,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 if result.success:
                     return result
                 error_str = result.error or ""
-                if self._is_permanent_sidecar_failure(result):
+                if self._should_suppress_resend_and_retry(result):
                     # A retry surfaced a permanent class — don't fall through
                     # to the plain-text resend either.
                     return result

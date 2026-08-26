@@ -166,7 +166,7 @@ def test_sidecar_internal_in_permanent_failure_tuple() -> None:
             "retryable": False,
         },
     )
-    assert PhotonAdapter._is_permanent_sidecar_failure(suppressed) is True
+    assert PhotonAdapter._should_suppress_resend_and_retry(suppressed) is True
 
     transient = SendResult(
         success=False,
@@ -176,10 +176,10 @@ def test_sidecar_internal_in_permanent_failure_tuple() -> None:
             "retryable": True,
         },
     )
-    assert PhotonAdapter._is_permanent_sidecar_failure(transient) is False
+    assert PhotonAdapter._should_suppress_resend_and_retry(transient) is False
 
     unstructured = SendResult(success=False, error="boom", raw_response=None)
-    assert PhotonAdapter._is_permanent_sidecar_failure(unstructured) is False
+    assert PhotonAdapter._should_suppress_resend_and_retry(unstructured) is False
 
 
 async def _noop_sleep(delay: float) -> None:
