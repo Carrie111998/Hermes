@@ -9,6 +9,7 @@ import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { decideLivenessForceClose, LIVENESS_REPROBE_DELAY_MS } from '@/lib/gateway-liveness-policy'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { BACKEND_BOOT_WAIT_TIMEOUT_MS, RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import { browserSpectatorConnection, isBrowserSpectator } from '@/platform/browser-spectator'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -173,6 +174,107 @@ export function useGatewayBoot({
   }
 
   useEffect(() => {
+    if (!isBrowserSpectator()) return
+
+    let cancelled = false
+    let reconnecting = false
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let reconnectAttempt = 0
+    const gateway = new HermesGateway()
+
+    const publish = (connection: HermesConnection | null) => {
+      callbacksRef.current.onConnectionReady(connection)
+      setConnection(connection)
+    }
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer)
+        reconnectTimer = null
+      }
+    }
+
+    const connect = async () => {
+      if (cancelled || reconnecting || gateway.connectionState === 'open') return
+      reconnecting = true
+
+      try {
+        setDesktopBootStep({
+          phase: 'renderer.spectator.connect',
+          message: 'Connecting secure spectator…',
+          progress: 90
+        })
+        const connection = await browserSpectatorConnection()
+        if (cancelled) return
+
+        publish(connection)
+        await gateway.connect(connection.wsUrl)
+        if (cancelled) return
+
+        reconnectAttempt = 0
+        $activeGatewayProfile.set('default')
+        setPrimaryGateway(gateway, 'default')
+        await Promise.all([
+          callbacksRef.current.refreshHermesConfig().catch(() => undefined),
+          callbacksRef.current.refreshSessions().catch(() => setSessionsLoading(false))
+        ])
+        completeDesktopBoot('Spectator connected')
+      } catch (error) {
+        if (cancelled) return
+        const message = error instanceof Error ? error.message : String(error)
+        failDesktopBoot(message)
+        setSessionsLoading(false)
+      } finally {
+        reconnecting = false
+      }
+    }
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnecting || reconnectTimer !== null || gateway.connectionState === 'open') return
+      const delay = reconnectBackoffDelayMs(reconnectAttempt)
+      reconnectAttempt += 1
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null
+        void connect()
+      }, delay)
+    }
+
+    callbacksRef.current.onGatewayReady(gateway)
+    setPrimaryGateway(gateway, 'default')
+
+    const offState = gateway.onState(state => {
+      reportPrimaryGatewayState(state)
+      if (state === 'open') {
+        reconnectAttempt = 0
+        clearReconnectTimer()
+      } else if (state === 'closed' || state === 'error') {
+        scheduleReconnect()
+      }
+    })
+    const offEvent = gateway.onEvent(event => callbacksRef.current.handleGatewayEvent({ ...event, profile: 'default' }))
+    const onOnline = () => void connect()
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void connect()
+    }
+
+    window.addEventListener('online', onOnline)
+    document.addEventListener('visibilitychange', onVisible)
+    void connect()
+
+    return () => {
+      cancelled = true
+      clearReconnectTimer()
+      offState()
+      offEvent()
+      window.removeEventListener('online', onOnline)
+      document.removeEventListener('visibilitychange', onVisible)
+      gateway.close()
+      publish(null)
+      callbacksRef.current.onGatewayReady(null)
+    }
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
     const desktop = window.hermesDesktop
 
@@ -191,9 +293,6 @@ export function useGatewayBoot({
     }
 
     if (!desktop) {
-      failDesktopBoot('Desktop IPC bridge is unavailable.')
-      setSessionsLoading(false)
-
       return () => void (cancelled = true)
     }
 

@@ -24,6 +24,7 @@ import {
 } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
@@ -916,6 +917,35 @@ export function useSessionActions({
       const sessionProfile = storedForProfile?.profile
 
       if (resumeRequestRef.current !== requestId) {
+        return
+      }
+
+      // Browser spectators are observers, never runtime owners. A normal
+      // Desktop resume rebinds the live event transport to the caller, which
+      // would steal deltas and completion from the Studio window. Hydrate from
+      // the durable transcript and let spectator events refresh it instead.
+      if (isBrowserSpectator()) {
+        try {
+          const persisted = await getLatestSessionMessages(storedSessionId, sessionProfile)
+
+          if (!isCurrentResume()) return
+
+          const messages = toChatMessages(persisted.messages)
+          setMessages(messages)
+          setActiveSessionId(null)
+          activeSessionIdRef.current = null
+          busyRef.current = false
+          setBusy(false)
+          setAwaitingResponse(false)
+          setSessionStartedAt(Date.now())
+
+          if (storedForProfile) applyStoredUsage(storedForProfile)
+        } catch (error) {
+          if (!isCurrentResume()) return
+          setMessages([])
+          notifyError(error, 'Could not load this conversation in spectator mode')
+        }
+
         return
       }
 

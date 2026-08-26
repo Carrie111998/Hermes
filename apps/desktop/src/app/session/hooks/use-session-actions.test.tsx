@@ -982,6 +982,38 @@ describe('resumeSession failure recovery', () => {
     expect(state?.streamId).toBe(state?.messages.find(message => message.pending)?.id)
   })
 
+  it('hydrates a browser spectator through REST without binding the live runtime transport', async () => {
+    const desktop = window.hermesDesktop
+    const spectator = window.__HERMES_SPECTATOR__
+    delete (window as { hermesDesktop?: typeof window.hermesDesktop }).hermesDesktop
+    window.__HERMES_SPECTATOR__ = true
+    const requestGateway = vi.fn(async () => {
+      throw new Error('spectator must not issue a gateway RPC')
+    })
+
+    setSessions([storedSession({ message_count: 2, profile: 'default' })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'observed prompt', role: 'user', timestamp: 1 },
+        { content: 'observed answer', role: 'assistant', timestamp: 2 }
+      ],
+      session_id: 'stored-1'
+    } as never)
+
+    try {
+      await runResume(requestGateway)
+
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-1', 'default')
+      expect(JSON.stringify($messages.get())).toContain('observed prompt')
+      expect(JSON.stringify($messages.get())).toContain('observed answer')
+      expect($activeSessionId.get()).toBeNull()
+    } finally {
+      window.hermesDesktop = desktop
+      window.__HERMES_SPECTATOR__ = spectator
+    }
+  })
+
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...
     const requestGateway = vi.fn(async (method: string) => {

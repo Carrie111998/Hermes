@@ -1,6 +1,7 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
 import type { HermesApiRequest } from '@/global'
+import { browserSpectatorApi } from '@/platform/browser-spectator'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
 // model info/options, cron) the moment the backend passes readiness. On a
@@ -96,6 +97,10 @@ export function connectionScoped(): { connectionId?: string } {
  *  underneath it. (It used to omit the key for 'local', which made the pin
  *  unable to beat the ambient tag; helpers then had to bypass this wrapper.) */
 export function hermesApi<T>(request: HermesApiRequest): Promise<T> {
+  if (!window.hermesDesktop?.api) {
+    return browserSpectatorApi<T>({ ...connectionScoped(), ...request })
+  }
+
   return window.hermesDesktop.api<T>({ ...connectionScoped(), ...request })
 }
 
