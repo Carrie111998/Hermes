@@ -23,6 +23,12 @@ Optional env vars:
       sanitized - content with secret-pattern redaction + truncation
       full      - raw content (truncated only); explicit opt-in
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
+
+Exported (not read) while a turn is traced:
+  HERMES_LANGFUSE_TRACE_ID    - the current turn's trace id, published into the
+      environment of subprocesses spawned during the turn so a child run (the
+      terminal tool's claude shim, execute_code) can stamp its own telemetry
+      and join back to the exact spawning turn.
 """
 from __future__ import annotations
 
@@ -880,10 +886,47 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
         return {}, {}
 
 
+def _publish_turn_trace_id(trace_id: str) -> None:
+    """Export this turn's trace id to subprocesses spawned during the turn.
+
+    Routed through ``gateway.session_context`` rather than written straight to
+    ``os.environ``: that layer owns the task-local ContextVar and the
+    subprocess-env bridge, so concurrent turns (MoA fan-out, gateway message
+    tasks) each publish their own id instead of racing one process-global slot.
+
+    Fail-open like every other path here — a Hermes build without the setter
+    must still trace.
+    """
+    try:
+        from gateway.session_context import set_current_turn_trace_id
+
+        set_current_turn_trace_id(trace_id)
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"publishing turn trace id failed: {exc}")
+
+
+def _unpublish_turn_trace_id(trace_id: str) -> None:
+    """Withdraw a finished turn's trace id (see :func:`_publish_turn_trace_id`).
+
+    Only clears when *trace_id* is still the published one, so a cleanup pass
+    that reaps another key's dangling trace (``on_session_end``) cannot
+    unpublish the id a live turn is still handing to its subprocesses.
+    """
+    try:
+        from gateway.session_context import get_session_env, set_current_turn_trace_id
+
+        if get_session_env("HERMES_LANGFUSE_TRACE_ID", "") != trace_id:
+            return
+        set_current_turn_trace_id("")
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"clearing turn trace id failed: {exc}")
+
+
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
                       turn_id: str = "", api_request_id: str = "") -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
+    _publish_turn_trace_id(trace_id)
     trace_input = _extract_last_user_message(messages)
     metadata = {
         "source": "hermes",
@@ -1129,6 +1172,9 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
         except Exception:
             pass
     finally:
+        # Withdraw before the flush so a finished turn's id can never reach a
+        # subprocess spawned by whatever runs next in this context.
+        _unpublish_turn_trace_id(state.trace_id)
         try:
             client.flush()
         except Exception:
