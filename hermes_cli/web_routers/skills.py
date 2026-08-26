@@ -441,7 +441,7 @@ async def get_skills(profile: Optional[str] = None):
         with _profile_scope(profile):
             config = load_config()
             disabled = get_disabled_skills(config)
-            skills = _find_all_skills(skip_disabled=True)
+            skills = _find_all_skills(skip_disabled=True, include_source=True)
             usage = load_usage()
             # Set-based provenance (same classification as skill_usage.provenance,
             # without a per-skill manifest read): hub > bundled > agent, where
@@ -450,11 +450,16 @@ async def get_skills(profile: Optional[str] = None):
             bundled_names = _read_bundled_provenance_names()
             hub_names = _read_hub_installed_names()
         for s in skills:
+            source_tier = s.pop("_source_tier", "profile")
+            s.pop("_source_path", None)
+            is_profile_copy = source_tier == "profile"
             s["enabled"] = s["name"] not in disabled
-            s["usage"] = activity_count(usage.get(s["name"], {}))
+            s["usage"] = (
+                activity_count(usage.get(s["name"], {})) if is_profile_copy else 0
+            )
             s["provenance"] = (
-                "hub" if s["name"] in hub_names
-                else "bundled" if s["name"] in bundled_names
+                "hub" if is_profile_copy and s["name"] in hub_names
+                else "bundled" if is_profile_copy and s["name"] in bundled_names
                 else "agent"
             )
         return skills

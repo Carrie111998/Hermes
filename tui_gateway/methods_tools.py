@@ -343,7 +343,10 @@ def _(rid, params: dict) -> dict:
                 d = str(info.get("description", "Skill"))
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 name = str(info.get("name") or k.lstrip("/"))
-                skills[k] = {"usage": usage(name), "origin": origin_of(name)}
+                if info.get("source_tier", "profile") == "profile":
+                    skills[k] = {"usage": usage(name), "origin": origin_of(name)}
+                else:
+                    skills[k] = {"usage": 0, "origin": "local"}
                 skill_count += 1
         except Exception as e:
             warning = f"skill discovery unavailable: {e}"

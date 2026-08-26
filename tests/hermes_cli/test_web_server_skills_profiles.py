@@ -87,6 +87,61 @@ class TestProfileScopedSkills:
         assert worker.status_code == 200
         assert "worker-skill" not in {skill["name"] for skill in worker.json()}
 
+    def test_project_override_does_not_inherit_profile_history(
+        self, client, isolated_profiles, tmp_path, monkeypatch
+    ):
+        from agent import skill_utils
+        from tools import skill_usage, skills_tool
+
+        home = isolated_profiles["default"]
+        profile_skills = home / "skills"
+        profile_skills.joinpath(".bundled_history").write_text(
+            "dashboard-skill\n", encoding="utf-8"
+        )
+        skill_usage.save_usage(
+            {
+                "dashboard-skill": {
+                    "state": skill_usage.STATE_ARCHIVED,
+                    "use_count": 172,
+                }
+            }
+        )
+
+        project = tmp_path / "project"
+        (project / ".git").mkdir(parents=True)
+        project_skills = project / ".hermes" / "skills"
+        _write_skill(project_skills, "dashboard-skill", "trusted project copy")
+        home.joinpath("config.yaml").write_text(
+            "skills:\n"
+            "  external_dirs: []\n"
+            f"  trusted_project_dirs: ['{project.as_posix()}']\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+        skill_utils._external_dirs_cache_clear()
+        skills_tool._SKILLS_CACHE.clear()
+
+        selected = skills_tool._find_all_skills(
+            skip_disabled=True, include_source=True
+        )
+        selected_skill = next(
+            skill for skill in selected if skill["name"] == "dashboard-skill"
+        )
+        assert selected_skill["_source_tier"] == "project"
+        assert selected_skill["_source_path"] == str(
+            project_skills / "dashboard-skill" / "SKILL.md"
+        )
+
+        response = client.get("/api/skills")
+        assert response.status_code == 200
+        by_name = {skill["name"]: skill for skill in response.json()}
+        dashboard = by_name["dashboard-skill"]
+        assert dashboard["description"] == "trusted project copy"
+        assert dashboard["provenance"] == "agent"
+        assert dashboard["usage"] == 0
+        assert "_source_tier" not in dashboard
+        assert "_source_path" not in dashboard
+
 
     def test_toggle_writes_into_target_profile_only(self, client, isolated_profiles):
         resp = client.put(

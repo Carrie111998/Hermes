@@ -341,8 +341,9 @@ def _(rid, params: dict) -> dict:
         from agent.skill_commands import get_skill_commands
         from agent.skill_bundles import get_skill_bundles
 
+        skill_commands = get_skill_commands()
         completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: get_skill_commands(),
+            skill_commands_provider=lambda: skill_commands,
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
         doc = Document(text, len(text))
@@ -352,7 +353,7 @@ def _(rid, params: dict) -> dict:
         # uses — no sniffing the ⚡/▣ meta glyphs, which are display text.
         skill_names = {
             key.lstrip("/").lower()
-            for key in (*get_skill_commands(), *get_skill_bundles())
+            for key in (*skill_commands, *get_skill_bundles())
         }
         items = [
             {
@@ -409,8 +410,29 @@ def _(rid, params: dict) -> dict:
                 )
 
             usage, origin_of = _skill_usage_lookup()
+            selected_tiers = {
+                key.lstrip("/").lower(): info.get("source_tier", "profile")
+                for key, info in skill_commands.items()
+            }
+
+            def selected_usage(name: str) -> int:
+                if selected_tiers.get(name, "profile") == "profile":
+                    return usage(name)
+                return 0
+
+            def selected_origin(name: str) -> str:
+                return (
+                    origin_of(name)
+                    if selected_tiers.get(name, "profile") == "profile"
+                    else "local"
+                )
+
             items = _rank_slash_completions(
-                items, usage, origin_of, browsing=text == "/", score_of=score_of
+                items,
+                selected_usage,
+                selected_origin,
+                browsing=text == "/",
+                score_of=score_of,
             )
         else:
             items = items[:_SLASH_COMPLETION_LIMIT]

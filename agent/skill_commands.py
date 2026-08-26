@@ -551,6 +551,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
+                        "source_tier": (
+                            "project" if scan_dir in project_dirs
+                            else "profile" if scan_dir == active_skills_dir
+                            else "external"
+                        ),
                     }
                 except Exception:
                     continue

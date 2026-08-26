@@ -684,7 +684,11 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(
+    *,
+    skip_disabled: bool = False,
+    include_source: bool = False,
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
@@ -694,7 +698,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             presentation toggle. Default False filters config-disabled skills.
 
     Returns:
-        List of skill metadata dicts (name, description, category).
+        List of skill metadata dicts (name, description, category). When
+        ``include_source`` is true, each result also carries private
+        ``_source_tier`` and ``_source_path`` fields for callers that annotate
+        the selected copy with profile-local lifecycle metadata.
 
     Results are cached per-session; the cache is invalidated when the scan
     signature changes (dir/category mtimes or the disabled-set) and expires
@@ -747,7 +754,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # Per-call shallow copies: callers mutate the returned dicts
         # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
         # out the cached objects would poison the cache for everyone else.
-        return [dict(s) for s in cached[2]]
+        result = [dict(s) for s in cached[2]]
+        if not include_source:
+            for skill in result:
+                skill.pop("_source_tier", None)
+                skill.pop("_source_path", None)
+        return result
 
     skills = []
     seen_names: set = set()
@@ -807,6 +819,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "_source_tier": (
+                        "project" if _is_project
+                        else "profile" if scan_dir == active_skills_dir
+                        else "external"
+                    ),
+                    "_source_path": str(skill_md),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -823,7 +841,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
-    return [dict(s) for s in skills]
+    result = [dict(s) for s in skills]
+    if not include_source:
+        for skill in result:
+            skill.pop("_source_tier", None)
+            skill.pop("_source_path", None)
+    return result
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

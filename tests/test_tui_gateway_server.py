@@ -10685,6 +10685,71 @@ def test_commands_catalog_tracks_profile_local_archive_state(tmp_path):
         reset_hermes_home_override(token_b)
 
 
+def test_commands_catalog_project_override_has_independent_metadata(
+    tmp_path, monkeypatch
+):
+    """A trusted project copy must not inherit an archived local identity."""
+    import agent.skill_commands as sc_mod
+    from agent import skill_utils
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import skill_usage
+
+    home = tmp_path / "profile"
+    profile_skill = home / "skills" / "shared-lifecycle"
+    profile_skill.mkdir(parents=True)
+    profile_skill.joinpath("SKILL.md").write_text(
+        "---\nname: shared-lifecycle\ndescription: Profile copy.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+    home.joinpath("skills", ".bundled_history").write_text(
+        "shared-lifecycle\n", encoding="utf-8"
+    )
+
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    project_skill = project / ".hermes" / "skills" / "shared-lifecycle"
+    project_skill.mkdir(parents=True)
+    project_skill.joinpath("SKILL.md").write_text(
+        "---\nname: shared-lifecycle\ndescription: Project copy.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+    home.joinpath("config.yaml").write_text(
+        "skills:\n"
+        "  external_dirs: []\n"
+        f"  trusted_project_dirs: ['{project.as_posix()}']\n",
+        encoding="utf-8",
+    )
+
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.chdir(project)
+        skill_utils._external_dirs_cache_clear()
+        skill_usage.save_usage(
+            {
+                "shared-lifecycle": {
+                    "state": skill_usage.STATE_ARCHIVED,
+                    "use_count": 172,
+                }
+            }
+        )
+        with patch.object(sc_mod, "_skill_commands", {}):
+            commands = sc_mod.scan_skill_commands()
+            response = server.handle_request(
+                {"id": "1", "method": "commands.catalog", "params": {}}
+            )
+    finally:
+        reset_hermes_home_override(token)
+        skill_utils._external_dirs_cache_clear()
+
+    selected = commands["/shared-lifecycle"]
+    assert selected["skill_dir"] == str(project_skill)
+    assert selected["source_tier"] == "project"
+    assert response["result"]["skills"]["/shared-lifecycle"] == {
+        "usage": 0,
+        "origin": "local",
+    }
+
+
 def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
     """Skill entries carry the usage + origin the `/` menu ranks on.
 
