@@ -307,9 +307,11 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     allowed = tuple(_allowed_rpc_origins(peer))
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
-    # The card is fetched WITHOUT credential-bearing headers: it is served at
-    # the configured base URL (same origin), but keeping the fetch bare keeps
-    # the credential surface exactly where the operator pinned it.
+    # The card is fetched AT the configured origin with the full credential
+    # map — same destination the operator pinned the credentials for (a
+    # Cloudflare-Access-fronted peer otherwise 403s the card and streaming
+    # discovery is lost). The egress bound is enforced on the RPC destination
+    # after the fetch: a card-advertised cross-origin URL never receives them.
     card = None
     try:
         card = _fetch_card(base_url, headers, min(timeout, 30), allowed)
@@ -348,7 +350,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
-    resp = _http_post_json(rpc_url, rpc_body, headers, timeout, retry_524=idempotency)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout, retry_524=idempotency, allowed_origins=allowed)
     if "error" in resp:
         err = resp["error"]
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
