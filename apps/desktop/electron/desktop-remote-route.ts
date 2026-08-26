@@ -47,6 +47,21 @@ export interface DesktopRemoteRouteInput {
   registry: ConnectionRegistry
 }
 
+/**
+ * SSH transport scope owned by the primary backend before a hard profile
+ * re-home. Global SSH uses the shared null scope; a profile override owns its
+ * named scope. Undefined means the old primary route was not SSH-backed.
+ */
+export function primaryProfileSshScope(input: DesktopRemoteRouteInput): null | string | undefined {
+  const route = resolveDesktopRemoteRoute(input)
+
+  if (route?.kind !== 'ssh') {
+    return undefined
+  }
+
+  return route.source === 'profile' ? connectionScopeKey(input.profile) || 'default' : null
+}
+
 function withConnectionId<T extends object>(route: T, connectionId?: string): T & { connectionId?: string } {
   return connectionId ? { ...route, connectionId } : route
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import { normalizeRegistry, REGISTRY_VERSION } from './connection-registry'
-import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import { primaryProfileSshScope, resolveDesktopRemoteRoute } from './desktop-remote-route'
 
 const tokenA = { encoding: 'plain', value: 'token-a' }
 const tokenB = { encoding: 'plain', value: 'token-b' }
@@ -151,6 +151,28 @@ test('global SSH treats an omitted port as 22 and checks the primary route', () 
 
   assert.equal(route?.kind, 'ssh')
   assert.equal(route?.connectionId, 'ssh-primary')
+})
+
+test('primary profile re-home selects the SSH scope that owns the old tunnel', () => {
+  const globalConfig = { mode: 'ssh', remote: { mode: 'ssh', host: 'global-box.test', user: 'hermes' } }
+
+  const profileConfig = {
+    mode: 'local',
+    profiles: { worker: { mode: 'ssh', host: 'worker-box.test', user: 'hermes' } }
+  }
+
+  assert.equal(
+    primaryProfileSshScope({ config: globalConfig, profile: 'worker', registry: registry('local', []) }),
+    null
+  )
+  assert.equal(
+    primaryProfileSshScope({ config: profileConfig, profile: 'worker', registry: registry('local', []) }),
+    'worker'
+  )
+  assert.equal(
+    primaryProfileSshScope({ config: { mode: 'local' }, profile: 'worker', registry: registry('local', []) }),
+    undefined
+  )
 })
 
 test('profile route omits identity when two registry entries match exactly', () => {

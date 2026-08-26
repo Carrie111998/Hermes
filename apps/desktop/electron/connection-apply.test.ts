@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  applyPrimaryProfileChange,
+  commitConnectionFailure,
+  resolveTerminalConnection
+} from './connection-apply'
 
 function deferred() {
   let resolve!: () => void
@@ -63,6 +68,51 @@ describe('applyConnectionChange', () => {
       }
     })
     expect(events).toEqual(['cancel:worker', 'ssh:worker', 'pool:worker'])
+  })
+})
+
+describe('applyPrimaryProfileChange', () => {
+  it('drains and tears down the old SSH tunnel before the primary backend and reload', async () => {
+    const events: string[] = []
+
+    await expect(
+      applyPrimaryProfileChange({
+        cancelAndWait: async scope => events.push(`cancel:${scope}`),
+        nextProfile: 'worker',
+        previousSshScope: null,
+        reload: () => events.push('reload'),
+        resetPreviewReach: async () => events.push('preview'),
+        teardownPrimary: async () => events.push('primary'),
+        teardownSsh: async scope => events.push(`ssh:${scope}`),
+        writeProfile: profile => {
+          events.push(`write:${profile}`)
+
+          return profile
+        }
+      })
+    ).resolves.toBe('worker')
+    expect(events).toEqual(['write:worker', 'cancel:', 'preview', 'ssh:null', 'primary', 'reload'])
+  })
+
+  it('leaves SSH lifecycle untouched when the old profile route was not SSH', async () => {
+    const cancelAndWait = vi.fn()
+    const resetPreviewReach = vi.fn()
+    const teardownSsh = vi.fn()
+
+    await applyPrimaryProfileChange({
+      cancelAndWait,
+      nextProfile: 'worker',
+      previousSshScope: undefined,
+      reload: vi.fn(),
+      resetPreviewReach,
+      teardownPrimary: vi.fn(),
+      teardownSsh,
+      writeProfile: profile => profile
+    })
+
+    expect(cancelAndWait).not.toHaveBeenCalled()
+    expect(resetPreviewReach).not.toHaveBeenCalled()
+    expect(teardownSsh).not.toHaveBeenCalled()
   })
 })
 

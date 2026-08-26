@@ -27,6 +27,30 @@ async function applyConnectionChange({
   sendApplied()
 }
 
+async function applyPrimaryProfileChange({
+  cancelAndWait,
+  nextProfile,
+  previousSshScope,
+  reload,
+  resetPreviewReach,
+  teardownPrimary,
+  teardownSsh,
+  writeProfile
+}) {
+  const next = writeProfile(nextProfile)
+
+  if (previousSshScope !== undefined) {
+    await cancelAndWait(previousSshScope || '')
+    await resetPreviewReach()
+    await teardownSsh(previousSshScope)
+  }
+
+  await teardownPrimary()
+  reload()
+
+  return next
+}
+
 function commitConnectionFailure(current, starting, commit) {
   if (current !== starting) {
     return false
@@ -61,4 +85,10 @@ async function resolveTerminalConnectionForSender(webContentsId, getTarget, ensu
   )
 }
 
-export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection, resolveTerminalConnectionForSender }
+export {
+  applyConnectionChange,
+  applyPrimaryProfileChange,
+  commitConnectionFailure,
+  resolveTerminalConnection,
+  resolveTerminalConnectionForSender
+}

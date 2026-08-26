@@ -85,7 +85,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { applyConnectionChange } from './connection-apply'
+import { applyConnectionChange, applyPrimaryProfileChange } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
@@ -149,7 +149,7 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
-import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import { primaryProfileSshScope, resolveDesktopRemoteRoute } from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -14069,13 +14069,33 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
 
 ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
-  const next = writeActiveDesktopProfile(name)
+  const previousProfile = primaryProfileKey()
 
+  const previousSshScope = primaryProfileSshScope({
+    config: readDesktopConnectionConfig(),
+    env: {
+      token: process.env.HERMES_DESKTOP_REMOTE_TOKEN,
+      url: process.env.HERMES_DESKTOP_REMOTE_URL
+    },
+    profile: previousProfile,
+    registry: readDesktopConnectionsRegistry()
+  })
   // Switching profiles is a backend re-home: relaunch the dashboard under the
-  // new HERMES_HOME. Pool backends keep their own homes, so only the primary
-  // is torn down.
-  await teardownPrimaryBackendAndWait()
-  mainWindow?.reload()
+  // new HERMES_HOME. An SSH-backed primary also owns a local forward to that
+  // backend; drain and close the OLD scope before the new profile can reuse or
+  // replace its remote serve process. Otherwise the forward survives while its
+  // remote port dies and every request through it resets (#95532).
+
+  const next = await applyPrimaryProfileChange({
+    cancelAndWait: scope => sshBootstrapCoordinator.cancelAndWait(scope),
+    nextProfile: name,
+    previousSshScope,
+    reload: () => mainWindow?.reload(),
+    resetPreviewReach: () => resetPreviewReach(),
+    teardownPrimary: () => teardownPrimaryBackendAndWait(),
+    teardownSsh: scope => teardownSshConnection(scope),
+    writeProfile: profile => writeActiveDesktopProfile(profile)
+  })
 
   return { profile: next }
 })
