@@ -5249,6 +5249,65 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
+    # Async hook callbacks are awaited with a bounded resolver.  Mirrors the
+    # slash-command timeout (_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS) so a hung
+    # callback cannot wedge the caller.
+    _HOOK_AWAIT_TIMEOUT_SECS = 30.0
+
+    @staticmethod
+    def _resolve_hook_coroutine(coro):
+        """Await a hook coroutine from a sync call site, whichever thread we're on.
+
+        Both paths bound the hook with ``asyncio.wait_for`` so the coroutine is
+        actually *cancelled* on timeout (not merely abandoned):
+
+        - No running loop on this thread (the common thread-pool path) →
+          ``asyncio.run(wait_for(...))`` directly.
+        - Already ON the loop thread → run it in a helper thread with its own
+          loop.  Scheduling onto *this* loop and blocking on the result would
+          deadlock: ``get_running_loop()`` succeeding means this thread IS the
+          loop thread, so ``run_coroutine_threadsafe(...).result()`` would wait
+          on a coroutine the blocked loop can never execute.  ``wait_for``
+          inside the helper cancels the hook and lets the thread exit, so a
+          hung hook cannot leak one thread per invocation; the outer
+          ``done.wait`` is only a backstop for a wedged helper loop.
+        """
+        timeout = PluginManager._HOOK_AWAIT_TIMEOUT_SECS
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                return asyncio.run(asyncio.wait_for(coro, timeout))
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"hook coroutine exceeded {timeout}s")
+
+        outcome: Dict[str, Any] = {}
+        failure: Dict[str, BaseException] = {}
+        done = threading.Event()
+
+        def _runner() -> None:
+            try:
+                outcome["value"] = asyncio.run(asyncio.wait_for(coro, timeout))
+            except BaseException as exc:  # re-raised below
+                failure["exc"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(
+            target=_runner, name="hermes-hook-await", daemon=True
+        )
+        thread.start()
+        if not done.wait(timeout=timeout + 5.0):
+            raise TimeoutError(
+                f"hook coroutine exceeded {timeout}s (helper thread wedged)"
+            )
+        if "exc" in failure:
+            exc = failure["exc"]
+            if isinstance(exc, asyncio.TimeoutError):
+                raise TimeoutError(f"hook coroutine exceeded {timeout}s")
+            raise exc
+        return outcome.get("value")
+
     @staticmethod
     def _invoke_hook_callback(callback: Callable, payload: Dict[str, Any]) -> Any:
         """Invoke a hook while withholding additive fields from old callbacks."""
@@ -5311,6 +5370,8 @@ class PluginManager:
         for cb in callbacks:
             try:
                 ret = self._invoke_hook_callback(cb, kwargs)
+                if asyncio.iscoroutine(ret):
+                    ret = self._resolve_hook_coroutine(ret)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
@@ -5633,6 +5694,8 @@ class PluginManager:
         for cb in callbacks:
             try:
                 ret = cb(**kwargs)
+                if asyncio.iscoroutine(ret):
+                    ret = self._resolve_hook_coroutine(ret)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
