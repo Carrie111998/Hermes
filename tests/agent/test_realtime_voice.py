@@ -7,6 +7,7 @@ import pytest
 
 from agent import realtime_voice_registry
 from agent.realtime_voice import (
+    HeardAudioBoundary,
     RealtimeEvent,
     RealtimeEventType,
     RealtimeSession,
@@ -21,6 +22,8 @@ class FakeSession(RealtimeSession):
         self.audio: list[bytes] = []
         self.tool_results: list[tuple[str, str]] = []
         self.cancelled = False
+        self.cancellation_boundaries: list[HeardAudioBoundary | None] = []
+        self.cancellation_operations: list[str] = []
         self.closed = False
 
     async def send_audio(self, pcm: bytes) -> None:
@@ -35,6 +38,7 @@ class FakeSession(RealtimeSession):
 
     async def cancel_response(self) -> None:
         self.cancelled = True
+        self.cancellation_operations.append("cancel")
 
     async def close(self) -> None:
         self.closed = True
@@ -53,6 +57,18 @@ class FakeProvider(RealtimeVoiceProvider):
     async def open_session(self, *, instructions, tools, voice=None):
         self.opened_with = {"instructions": instructions, "tools": tools, "voice": voice}
         return self.session
+
+
+class BoundarySession(FakeSession):
+    async def truncate_response(self, boundary: HeardAudioBoundary) -> None:
+        self.cancellation_boundaries.append(boundary)
+        self.cancellation_operations.append("truncate")
+
+
+class LegacyCancelSession(FakeSession):
+    async def cancel_response(self) -> None:
+        self.cancelled = True
+        self.cancellation_boundaries.append(None)
 
 
 @pytest.fixture(autouse=True)
@@ -120,6 +136,81 @@ async def test_coordinator_keeps_tool_dispatch_in_hermes(provider_name: str):
         RealtimeEventType.TOOL_CALL,
     ]
     assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_coordinator_cancels_at_the_latest_heard_output_boundary_once():
+    session = BoundarySession([RealtimeEvent.audio(b"reply-pcm", item_id="item-1")])
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=lambda _name, _args: "ok"
+    )
+    await coordinator.open(instructions="", tools=[])
+    [output] = [event async for event in coordinator.events()]
+
+    assert output.item_id == "item-1"
+    assert coordinator.report_audio_heard(output, audio_end_ms=240) is True
+    await coordinator.cancel_response()
+
+    assert session.cancellation_boundaries == [
+        HeardAudioBoundary(item_id="item-1", audio_end_ms=240)
+    ]
+    assert session.cancellation_operations == ["truncate", "cancel"]
+
+
+@pytest.mark.asyncio
+async def test_coordinator_rejects_foreign_stale_and_regressing_heard_boundaries():
+    first = RealtimeEvent.audio(b"first", item_id="item-1")
+    second = RealtimeEvent.audio(b"second", item_id="item-2")
+    session = FakeSession([first, second])
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=lambda _name, _args: "ok"
+    )
+    await coordinator.open(instructions="", tools=[])
+    observed = [event async for event in coordinator.events()]
+
+    assert coordinator.report_audio_heard(first, audio_end_ms=100) is False
+    assert coordinator.report_audio_heard(
+        RealtimeEvent.audio(b"foreign", item_id="item-2"), audio_end_ms=100
+    ) is False
+    assert coordinator.report_audio_heard(observed[1], audio_end_ms=100) is True
+    assert coordinator.report_audio_heard(observed[1], audio_end_ms=90) is False
+
+
+@pytest.mark.asyncio
+async def test_zero_heard_and_legacy_cancel_remain_compatible_across_reconnect():
+    old_output = RealtimeEvent.audio(b"old", item_id="reused-item")
+    session = LegacyCancelSession([old_output])
+    provider = FakeProvider("legacy", session)
+    coordinator = RealtimeVoiceCoordinator(
+        provider, dispatch_tool=lambda _name, _args: "ok"
+    )
+    await coordinator.open(instructions="", tools=[])
+    [observed_old] = [event async for event in coordinator.events()]
+    await coordinator.close()
+
+    replacement = LegacyCancelSession([])
+    provider.session = replacement
+    await coordinator.open(instructions="", tools=[])
+    assert coordinator.report_audio_heard(observed_old, audio_end_ms=0) is False
+    await coordinator.cancel_response()
+
+    assert replacement.cancellation_boundaries == [None]
+
+
+@pytest.mark.asyncio
+async def test_zero_heard_boundary_truncates_to_start_before_cancel():
+    session = BoundarySession([RealtimeEvent.audio(b"reply", item_id="item-zero")])
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=lambda _name, _args: "ok"
+    )
+    await coordinator.open(instructions="", tools=[])
+    [output] = [event async for event in coordinator.events()]
+    assert coordinator.report_audio_heard(output, audio_end_ms=0) is True
+
+    await coordinator.cancel_response()
+
+    assert session.cancellation_boundaries == [HeardAudioBoundary("item-zero", 0)]
+    assert session.cancellation_operations == ["truncate", "cancel"]
 
 
 @pytest.mark.asyncio

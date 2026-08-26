@@ -24,6 +24,14 @@ class RealtimeEventType(str, Enum):
 
 
 @dataclass(frozen=True)
+class HeardAudioBoundary:
+    """Provider output position that the playback surface actually rendered."""
+
+    item_id: str
+    audio_end_ms: int
+
+
+@dataclass(frozen=True)
 class RealtimeEvent:
     """One ordered event emitted by a :class:`RealtimeSession`."""
 
@@ -33,11 +41,12 @@ class RealtimeEvent:
     final: bool = False
     call_id: str | None = None
     tool_name: str | None = None
+    item_id: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def audio(cls, pcm: bytes) -> "RealtimeEvent":
-        return cls(type=RealtimeEventType.AUDIO, audio_bytes=pcm)
+    def audio(cls, pcm: bytes, *, item_id: str | None = None) -> "RealtimeEvent":
+        return cls(type=RealtimeEventType.AUDIO, audio_bytes=pcm, item_id=item_id)
 
     @classmethod
     def transcript(cls, text: str, *, final: bool = False) -> "RealtimeEvent":
@@ -69,6 +78,9 @@ class RealtimeSession(abc.ABC):
     @abc.abstractmethod
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         """Return a Hermes-dispatched tool result to the voice model."""
+
+    async def truncate_response(self, boundary: HeardAudioBoundary) -> None:
+        """Truncate provider history to heard audio when supported."""
 
     @abc.abstractmethod
     async def cancel_response(self) -> None:

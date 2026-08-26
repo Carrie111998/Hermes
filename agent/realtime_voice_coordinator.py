@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from agent.realtime_voice import (
+    HeardAudioBoundary,
     RealtimeEvent,
     RealtimeEventType,
     RealtimeSession,
@@ -25,6 +26,9 @@ class RealtimeVoiceCoordinator:
         self._provider = provider
         self._dispatch_tool = dispatch_tool
         self._session: RealtimeSession | None = None
+        self._current_item_id: str | None = None
+        self._current_audio_events: set[int] = set()
+        self._heard_boundary: HeardAudioBoundary | None = None
 
     async def open(
         self,
@@ -38,6 +42,7 @@ class RealtimeVoiceCoordinator:
         self._session = await self._provider.open_session(
             instructions=instructions, tools=tools, voice=voice
         )
+        self._reset_output_state()
 
     def _require_session(self) -> RealtimeSession:
         if self._session is None:
@@ -47,12 +52,39 @@ class RealtimeVoiceCoordinator:
     async def send_audio(self, pcm: bytes) -> None:
         await self._require_session().send_audio(pcm)
 
+    def report_audio_heard(self, event: RealtimeEvent, *, audio_end_ms: int) -> bool:
+        """Record playback progress only for audio emitted by this open epoch."""
+        if (
+            self._session is None
+            or event.type is not RealtimeEventType.AUDIO
+            or not event.item_id
+            or event.item_id != self._current_item_id
+            or id(event) not in self._current_audio_events
+            or audio_end_ms < 0
+        ):
+            return False
+        boundary = HeardAudioBoundary(event.item_id, audio_end_ms)
+        if self._heard_boundary and audio_end_ms < self._heard_boundary.audio_end_ms:
+            return False
+        self._heard_boundary = boundary
+        return True
+
     async def cancel_response(self) -> None:
-        await self._require_session().cancel_response()
+        session = self._require_session()
+        boundary, self._heard_boundary = self._heard_boundary, None
+        if boundary is not None:
+            await session.truncate_response(boundary)
+        await session.cancel_response()
 
     async def events(self) -> AsyncIterator[RealtimeEvent]:
         session = self._require_session()
         async for event in session.events():
+            if event.type is RealtimeEventType.AUDIO and event.item_id:
+                if event.item_id != self._current_item_id:
+                    self._current_item_id = event.item_id
+                    self._current_audio_events.clear()
+                    self._heard_boundary = None
+                self._current_audio_events.add(id(event))
             if event.type is RealtimeEventType.TOOL_CALL:
                 await self._dispatch(event, session)
             yield event
@@ -73,5 +105,11 @@ class RealtimeVoiceCoordinator:
 
     async def close(self) -> None:
         session, self._session = self._session, None
+        self._reset_output_state()
         if session is not None:
             await session.close()
+
+    def _reset_output_state(self) -> None:
+        self._current_item_id = None
+        self._current_audio_events.clear()
+        self._heard_boundary = None
