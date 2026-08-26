@@ -32,6 +32,18 @@ def _remote_kanban_private_work(provider: str | None) -> bool:
     return provider_uses_egress_firewall(provider)
 
 
+def _remote_kanban_toolsets(_configured: list[str] | None) -> list[str]:
+    """Return the bounded capability set for protected-remote workers.
+
+    Kanban lifecycle tools are injected by ``model_tools`` from the task
+    environment. Keeping this list explicit prevents profile-loading drift
+    from exposing desktop, memory, delegation, and skill-management schemas
+    to a short-lived reviewer or repair worker.
+    """
+
+    return ["terminal", "file", "web"]
+
+
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 
@@ -502,6 +514,15 @@ class CLIAgentSetupMixin:
             remote_kanban_private_work = _remote_kanban_private_work(
                 runtime.get("provider")
             )
+            effective_toolsets = (
+                _remote_kanban_toolsets(self.enabled_toolsets)
+                if remote_kanban_private_work
+                else self.enabled_toolsets
+            )
+            if remote_kanban_private_work:
+                os.environ["HERMES_KANBAN_PROTECTED_REMOTE"] = "1"
+            else:
+                os.environ.pop("HERMES_KANBAN_PROTECTED_REMOTE", None)
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -515,7 +536,7 @@ class CLIAgentSetupMixin:
                 max_tokens=self.max_tokens,
                 max_iterations=self.max_turns,
                 run_budget_seconds=getattr(self, "run_budget_seconds", None),
-                enabled_toolsets=self.enabled_toolsets,
+                enabled_toolsets=effective_toolsets,
                 disabled_toolsets=self.disabled_toolsets,
                 verbose_logging=self.verbose,
                 quiet_mode=not self.verbose,

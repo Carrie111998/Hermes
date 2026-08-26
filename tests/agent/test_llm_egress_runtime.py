@@ -232,3 +232,169 @@ def test_provider_callback_cannot_mutate_authorized_request(tmp_path):
             },
             mutate,
         )
+
+
+def test_protected_kanban_runtime_sanitizes_tool_paths_before_egress(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "managed" / "t_12345678"
+    profile_home = tmp_path / "profiles" / "worker"
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    agent = _agent(tmp_path / "egress")
+
+    authorized, _ = authorize_agent_sdk_kwargs(
+        agent,
+        {
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "tool",
+                    "content": (
+                        f"pwd={workspace} home={profile_home} "
+                        "other=/Users/private/repository/file.py"
+                    ),
+                }
+            ],
+        },
+    )
+
+    content = authorized["messages"][0]["content"]
+    assert str(tmp_path) not in content
+    assert "pwd=." in content
+    assert "$HERMES_PROFILE_HOME" in content
+    assert "<private-path>" in content
+
+
+def test_protected_kanban_runtime_does_not_hide_encoded_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+
+    with pytest.raises((EgressBlocked, SanitizedTextRejected)):
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "test-model",
+                "messages": [{"role": "tool", "content": "c2VjcmV0LXBheWxvYWQ="}],
+            },
+        )
+
+
+def test_protected_kanban_types_only_recognized_terminal_result_syntax(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    output = (
+        "origin https://github.com/acme/widget.git\n"
+        "run_id=1129 --force-with-lease refs/heads/codex/fix-135\n"
+        "_force_close_actionable_pending_routes_for_cycle"
+    )
+    kwargs = {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_terminal123",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_terminal123",
+                "content": output,
+            },
+        ],
+    }
+
+    authorized, receipt = authorize_agent_sdk_kwargs(agent, kwargs)
+
+    assert authorized == kwargs
+    assert json.loads(receipt.payload_bytes) == kwargs
+
+
+def test_tool_syntax_without_recognized_terminal_call_remains_blocked(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+
+    with pytest.raises((EgressBlocked, SanitizedTextRejected)):
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "test-model",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_unbound123",
+                        "content": "https://github.com/acme/widget.git run_id=1129",
+                    }
+                ],
+            },
+        )
+
+
+def test_recognized_terminal_syntax_does_not_exempt_adjacent_base64(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+
+    with pytest.raises((EgressBlocked, SanitizedTextRejected)):
+        authorize_agent_sdk_kwargs(
+            agent,
+            {
+                "model": "test-model",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_terminal123",
+                                "type": "function",
+                                "function": {"name": "terminal", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_terminal123",
+                        "content": "--branch c2VjcmV0LXBheWxvYWQ=",
+                    },
+                ],
+            },
+        )
+
+
+def test_protected_kanban_recognizes_direct_codex_function_items(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_PROTECTED_REMOTE", "1")
+    agent = _agent(tmp_path)
+    kwargs = {
+        "model": "test-model",
+        "input": [
+            {
+                "id": "call_terminal123",
+                "call_id": "call_terminal123",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_terminal123",
+                "output": "origin https://github.com/acme/widget.git run_id=1129",
+            },
+        ],
+    }
+
+    authorized, receipt = authorize_agent_sdk_kwargs(agent, kwargs)
+
+    assert authorized == kwargs
+    assert json.loads(receipt.payload_bytes) == kwargs

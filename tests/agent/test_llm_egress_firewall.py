@@ -26,6 +26,7 @@ from agent.llm_egress_firewall import (
     SourceGrant,
     SourceBoundSegment,
     TypedOutboundRequest,
+    ValidatedToolSyntaxSegment,
     classify_destination,
     source_grant_digest,
     static_literal_sha256,
@@ -694,6 +695,11 @@ def test_json_protocol_acronym_is_not_a_base64_false_positive(tmp_path):
         "HERMES_KANBAN_WORKSPACE",
         "max_runtime_seconds",
         "optional-profile",
+        "HERMES_CONTROL_HOME",
+        "HERMES_HOME=",
+        "--repository",
+        "already-resolved",
+        "protected-remote",
     ],
 )
 def test_builtin_tool_schema_atoms_are_not_base64_false_positives(
@@ -735,6 +741,26 @@ def test_fixed_prompt_cache_key_is_not_a_base64_false_positive(tmp_path):
         tmp_path,
         static_literals={"parallel_tool_calls", "prompt_cache_key", "true"},
     ).preflight(request, _route()).allowed
+
+
+@pytest.mark.parametrize(
+    "tool_result",
+    [
+        '{"id":1117,"run_id":1125}',
+        "HEAD OPEN/MERGEABLE/CLEAN d3b218473cc --noEmit n_error_",
+    ],
+)
+def test_kanban_protocol_evidence_is_not_a_base64_false_positive(
+    tmp_path, tool_result
+):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment(tool_result)]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    assert firewall(tmp_path).preflight(request, _route()).allowed
 
 
 def test_content_free_violation_locations_never_return_keys_or_values():
@@ -1028,3 +1054,52 @@ def test_unknown_destination_fails_closed_even_with_source_grant(tmp_path):
         firewall(tmp_path).preflight(_request("private source"), _route(base_url=None), grants=(grant,))
     assert exc_info.value.decision.destination_class == DestinationClass.UNKNOWN
     assert "unknown_destination" in exc_info.value.decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    "protocol_id",
+    (
+        "call_eYMMaSP2Uc5AeCO4Y7x4vHz4",
+        "call_UDcmjiJYYhXKVbOvZL6dW1VC",
+        "fc_0123456789abcdefghijklmnop",
+    ),
+)
+def test_provider_protocol_ids_are_not_misclassified_as_base64(
+    tmp_path, protocol_id
+):
+    decision = firewall(tmp_path).preflight(
+        _sanitized_request(protocol_id),
+        _route(),
+    )
+    assert decision.allowed is True
+
+
+def test_arbitrary_base64_remains_blocked_after_protocol_id_exemption(tmp_path):
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).preflight(
+            _sanitized_request("c2VjcmV0LXBheWxvYWQ="),
+            _route(),
+        )
+    assert "base64_payload" in exc_info.value.decision.reason_codes
+
+
+def test_forged_validated_tool_syntax_segment_fails_closed(tmp_path):
+    request = TypedOutboundRequest(
+        payload={
+            "messages": [
+                {
+                    "role": LiteralSegment("tool"),
+                    "content": ValidatedToolSyntaxSegment(
+                        "https://evil.example/payload", "github_url"
+                    ),
+                }
+            ]
+        },
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path, static_literals={"tool"}).preflight(request, _route())
+    assert "invalid_tool_syntax_segment" in exc_info.value.decision.reason_codes

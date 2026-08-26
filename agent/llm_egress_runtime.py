@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import re
 from pathlib import Path
 from types import MappingProxyType
 from types import SimpleNamespace
@@ -20,12 +22,14 @@ from agent.llm_egress_firewall import (
     SourceBoundSegment,
     SourceGrant,
     TypedOutboundRequest,
+    ValidatedToolSyntaxSegment,
     DestinationClass,
     classify_destination,
     source_grant_digest,
     static_literal_sha256,
     validate_sanitized_text,
     content_free_violation_locations,
+    validate_tool_syntax,
 )
 from agent.source_provenance import DEFAULT_POLICY_DIGEST, SourceProvenanceRegistry
 
@@ -57,6 +61,76 @@ _PROTECTED_REMOTE_PROVIDERS = frozenset({
     "nousresearch",
 })
 logger = logging.getLogger(__name__)
+
+_TOOL_SYNTAX_TOKEN = re.compile(
+    r"(?P<github_url>https://github\.com/[A-Za-z0-9_.-]{1,100}/"
+    r"[A-Za-z0-9_.-]{1,100}(?:\.git|/(?:pull|issues)/[0-9]{1,10})?)"
+    r"|(?P<safe_env_counter>HERMES_(?:KANBAN_RUN_ID|TURN_LEASE_TIMEOUT|"
+    r"STREAM_STALE_GIVEUP)=[0-9]{1,10})"
+    r"|(?P<run_counter>\b(?:run|run_id|attempt|attempt_id)(?:\s+|=)[0-9]{1,10}\b)"
+    r"|(?P<cli_option>--[a-z0-9][a-z0-9-]{0,63})"
+    r"|(?P<git_ref>(?:refs/(?:heads|tags)/)?[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){1,8})"
+    r"|(?P<source_identifier>\b(?:[A-Za-z0-9_.-]{1,100}/"
+    r"[A-Za-z0-9_.-]{1,100}#[0-9]{1,10}|[0-9a-f]{40}|[0-9a-f]{64})\b)"
+)
+_VALIDATED_SYNTAX_TOOL_NAMES = frozenset({"terminal"})
+
+_PRIVATE_PATH_IN_TEXT = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"/(?:Users|home|private|var/folders|root|Volumes)/[^\s\"'`)]+"
+    r"|~(?:/|\\)[^\s\"'`)]+"
+    r"|[A-Za-z]:\\+(?:Users|Documents and Settings)\\+[^\s\"'`)]+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_protected_kanban_body(value: Any) -> Any:
+    """Remove host paths from protected Kanban tool results before typing.
+
+    This deliberately does not rewrite secrets or arbitrary encoded content;
+    those remain visible to the fail-closed firewall scans and are denied.
+    """
+
+    if isinstance(value, str):
+        text = value
+        for name in (
+            "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_SESSION_ID",
+            "HERMES_STREAM_STALE_GIVEUP",
+            "HERMES_TURN_LEASE_TIMEOUT",
+        ):
+            raw = os.environ.get(name)
+            if raw:
+                text = re.sub(
+                    rf"(?m)^(?P<label>{re.escape(name)}=){re.escape(raw)}$",
+                    rf"\g<label>${name}",
+                    text,
+                )
+        replacements = (
+            (os.environ.get("HERMES_KANBAN_WORKSPACE"), "."),
+            (os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT"), "$HERMES_KANBAN_WORKSPACES_ROOT"),
+            (os.environ.get("HERMES_KANBAN_DB"), "$HERMES_KANBAN_DB"),
+            (os.environ.get("HERMES_CONTROL_HOME"), "$HERMES_CONTROL_HOME"),
+            (os.environ.get("HERMES_HOME"), "$HERMES_PROFILE_HOME"),
+        )
+        for raw, token in sorted(
+            ((raw, token) for raw, token in replacements if raw),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            text = text.replace(raw, token)
+        return _PRIVATE_PATH_IN_TEXT.sub("<private-path>", text)
+    if isinstance(value, Mapping):
+        return {
+            _sanitize_protected_kanban_body(key): _sanitize_protected_kanban_body(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_protected_kanban_body(item) for item in value]
+    return value
 
 
 def provider_uses_egress_firewall(provider: Any) -> bool:
@@ -165,6 +239,90 @@ def _segment_text(
     return segments[0] if len(segments) == 1 else OutboundText(tuple(segments))
 
 
+def _recognized_syntax_tool_call_ids(value: Any) -> frozenset[str]:
+    """Bind output admission to a preceding call of an exact recognized tool."""
+
+    recognized: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            direct_function = item.get("function")
+            direct_name = (
+                direct_function.get("name")
+                if isinstance(direct_function, Mapping)
+                else item.get("name")
+            )
+            if (
+                item.get("type") in {"function", "function_call"}
+                and direct_name in _VALIDATED_SYNTAX_TOOL_NAMES
+            ):
+                call_id = item.get("call_id") or item.get("id")
+                if isinstance(call_id, str):
+                    recognized.add(call_id)
+            tool_calls = item.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, Mapping):
+                        continue
+                    function = call.get("function")
+                    if (
+                        isinstance(function, Mapping)
+                        and function.get("name") in _VALIDATED_SYNTAX_TOOL_NAMES
+                        and isinstance(call.get("id"), str)
+                    ):
+                        recognized.add(call["id"])
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return frozenset(recognized)
+
+
+def _segment_protected_tool_result(
+    text: str,
+    grant_texts: Sequence[tuple[str, SourceGrant]],
+    used_grants: dict[str, SourceGrant],
+    *,
+    sanitized_cap: int,
+) -> SanitizedSegment | SourceBoundSegment | ValidatedToolSyntaxSegment | OutboundText:
+    """Type only complete, firewall-revalidated local terminal syntax spans."""
+
+    segments: list[SanitizedSegment | SourceBoundSegment | ValidatedToolSyntaxSegment] = []
+    cursor = 0
+    for match in _TOOL_SYNTAX_TOKEN.finditer(text):
+        if match.start() > cursor:
+            prefix = _segment_text(
+                text[cursor : match.start()],
+                grant_texts,
+                used_grants,
+                sanitized_cap=sanitized_cap,
+            )
+            segments.extend(prefix.segments if isinstance(prefix, OutboundText) else (prefix,))
+        kind = match.lastgroup or ""
+        token = validate_tool_syntax(match.group(0), kind)
+        segments.append(ValidatedToolSyntaxSegment(token, kind))
+        cursor = match.end()
+    if cursor < len(text):
+        suffix = _segment_text(
+            text[cursor:],
+            grant_texts,
+            used_grants,
+            sanitized_cap=sanitized_cap,
+        )
+        segments.extend(suffix.segments if isinstance(suffix, OutboundText) else (suffix,))
+    if not segments:
+        return _segment_text(
+            text,
+            grant_texts,
+            used_grants,
+            sanitized_cap=sanitized_cap,
+        )
+    return segments[0] if len(segments) == 1 else OutboundText(tuple(segments))
+
+
 def _typed_payload(
     value: Any,
     grant_texts: Sequence[tuple[str, SourceGrant]],
@@ -172,10 +330,19 @@ def _typed_payload(
     *,
     sanitized_cap: int,
     field_name: str | None = None,
+    syntax_tool_call_ids: frozenset[str] = frozenset(),
+    protected_tool_content: bool = False,
 ) -> Any:
     if isinstance(value, str):
         if field_name in _PROTOCOL_LITERAL_FIELDS and value in _PROTOCOL_LITERAL_VALUES:
             return LiteralSegment(value)
+        if protected_tool_content:
+            return _segment_protected_tool_result(
+                value,
+                grant_texts,
+                used_grants,
+                sanitized_cap=sanitized_cap,
+            )
         return _segment_text(
             value,
             grant_texts,
@@ -183,6 +350,15 @@ def _typed_payload(
             sanitized_cap=sanitized_cap,
         )
     if isinstance(value, Mapping):
+        output_call_id = value.get("tool_call_id") or value.get("call_id")
+        is_recognized_tool_result = (
+            isinstance(output_call_id, str)
+            and output_call_id in syntax_tool_call_ids
+            and (
+                value.get("role") == "tool"
+                or value.get("type") == "function_call_output"
+            )
+        )
         return {
             key: _typed_payload(
                 item,
@@ -190,6 +366,10 @@ def _typed_payload(
                 used_grants,
                 sanitized_cap=sanitized_cap,
                 field_name=key,
+                syntax_tool_call_ids=syntax_tool_call_ids,
+                protected_tool_content=(
+                    is_recognized_tool_result and key in {"content", "output"}
+                ),
             )
             for key, item in value.items()
         }
@@ -201,6 +381,8 @@ def _typed_payload(
                 used_grants,
                 sanitized_cap=sanitized_cap,
                 field_name=field_name,
+                syntax_tool_call_ids=syntax_tool_call_ids,
+                protected_tool_content=protected_tool_content,
             )
             for item in value
         ]
@@ -264,6 +446,8 @@ def authorize_agent_sdk_kwargs(
 ) -> tuple[dict[str, Any], AuthorizedEgress]:
     controls = {key: kwargs[key] for key in sdk_control_keys if key in kwargs}
     body = {key: value for key, value in kwargs.items() if key not in controls}
+    if os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1":
+        body = _sanitize_protected_kanban_body(body)
     session_id = str(getattr(agent, "session_id", "") or "")
     turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     request_id = str(getattr(agent, "_current_api_request_id", "") or "")
@@ -290,6 +474,11 @@ def authorize_agent_sdk_kwargs(
         _grant_texts(grants),
         used_grants,
         sanitized_cap=sanitized_segment_cap,
+        syntax_tool_call_ids=(
+            _recognized_syntax_tool_call_ids(body)
+            if os.environ.get("HERMES_KANBAN_PROTECTED_REMOTE") == "1"
+            else frozenset()
+        ),
     )
     request = TypedOutboundRequest(
         payload=typed_body,
