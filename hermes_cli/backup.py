@@ -330,6 +330,8 @@ def _should_exclude(rel_path: Path) -> bool:
         # ``hermes-agent`` only matches at the root level (first component).
         # Nested directories with the same name — e.g.
         # ``skills/autonomous-ai-agents/hermes-agent/`` — must be preserved.
+        # NB: ``part != parts[0]`` compares against the first component's NAME
+        # (a value compare, not a positional one).
         if part == "hermes-agent" and part != parts[0]:
             continue
         return True

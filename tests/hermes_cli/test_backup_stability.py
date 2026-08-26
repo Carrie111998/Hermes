@@ -182,3 +182,9 @@ def test_full_backup_excludes_retained_quick_snapshots_and_keeps_nested_skill_re
     # user content: this walk must not prune it where ``_should_exclude`` keeps it.
     assert "hermes-agent/run_agent.py" not in names
     assert "skills/autonomous-ai-agents/hermes-agent/README.md" in names
+
+    # Tripwire BOTH predicates: the archive assertions above pin the full-zip
+    # walk; pin the incremental path's ``_should_exclude`` directly so the two
+    # implementations cannot silently drift apart.
+    assert backup._should_exclude(Path("hermes-agent/run_agent.py")) is True
+    assert backup._should_exclude(Path("skills/x/hermes-agent/y")) is False
