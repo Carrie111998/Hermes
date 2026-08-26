@@ -112,7 +112,8 @@ class TestBuiltinSkins:
         assert skin.get_color("ui_accent") == "#0069FF"
         assert skin.get_color("status_bar_bg") == status_bar_bg
         assert skin.get_branding("agent_name") == "DigitalOcean Sammy"
-        assert "DIGITALOCEAN" in skin.banner_logo
+        assert "███████╗" in skin.banner_logo
+        assert "⣿" in skin.banner_hero
 
     def test_unknown_skin_falls_back_to_default(self):
         from hermes_cli.skin_engine import load_skin
