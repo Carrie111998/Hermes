@@ -183,6 +183,18 @@ def test_save_platform_tools_preserves_mcp_server_names():
     assert "terminal" not in saved_toolsets
 
 
+def test_apply_toolset_change_does_not_persist_runtime_injected_toolsets(monkeypatch):
+    config = {"platform_toolsets": {"cli": ["web", "terminal"]}}
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda *args, **kwargs: {"web", "terminal", "kanban"},
+    )
+
+    _apply_toolset_change(config, "cli", ["homeassistant"], "disable")
+
+    assert config["platform_toolsets"]["cli"] == ["terminal", "web"]
+
+
 
 
 
