@@ -5,8 +5,11 @@ import { Codicon } from '@/components/ui/codicon'
 import type { MobileToolbarContextAction } from './mobile-toolbar-model'
 import type { MobileWorkspacePane } from './mobile-workspace-menu'
 
+export type MobileToolbarActionGroup = 'session' | 'system' | 'view'
+
 export interface MobileToolbarAction {
   disabled?: boolean
+  group: MobileToolbarActionGroup
   id: string
   label: string
   onSelect: () => void
@@ -29,6 +32,12 @@ function runAction(onClose: () => void, action: MobileToolbarAction | MobileTool
   onClose()
   action.onSelect?.()
 }
+
+const ACTION_GROUPS: ReadonlyArray<{ id: MobileToolbarActionGroup; label: string }> = [
+  { id: 'session', label: 'Session' },
+  { id: 'view', label: 'View' },
+  { id: 'system', label: 'System' }
+]
 
 /**
  * The only persistent mobile navigation chrome: sessions remain one tap/left
@@ -128,19 +137,26 @@ export function MobileToolbar({
                   </button>
                 ))}
               </section>
-              <section aria-label="Interface" role="group">
-                <p>Interface</p>
-                {appActions.map(action => (
-                  <button
-                    disabled={action.disabled}
-                    key={action.id}
-                    onClick={() => runAction(onClose, action)}
-                    type="button"
-                  >
-                    {action.label}
-                  </button>
-                ))}
-              </section>
+              {ACTION_GROUPS.map(group => {
+                const actions = appActions.filter(action => action.group === group.id)
+                if (!actions.length) return null
+
+                return (
+                  <section aria-label={group.label} key={group.id} role="group">
+                    <p>{group.label}</p>
+                    {actions.map(action => (
+                      <button
+                        disabled={action.disabled}
+                        key={action.id}
+                        onClick={() => runAction(onClose, action)}
+                        type="button"
+                      >
+                        {action.label}
+                      </button>
+                    ))}
+                  </section>
+                )
+              })}
               {contextActions.length > 0 && (
                 <section aria-label="Context actions" role="group">
                   <p>Context</p>
