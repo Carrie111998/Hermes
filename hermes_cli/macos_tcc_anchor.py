@@ -209,6 +209,35 @@ def _repoint_aliases(venv_bin: Path, anchor: Path) -> None:
             continue
 
 
+def _link_store_libpython(venv_dir: Path, source_file: Path) -> None:
+    """Materialise the store's libpython next to the anchored interpreter.
+
+    A copied CPython executable keeps its build-time ``LC_RPATH`` of
+    ``@executable_path/../lib``, valid inside the uv store but not inside a
+    venv whose ``lib/`` only holds ``python3.x/site-packages``.  Without the
+    dylib present the anchored interpreter dies in dyld before ``main`` —
+    bricking the whole CLI, ``hermes update`` included.  A symlink back into
+    the store keeps the anchor working and stays stable across checkouts on
+    the same machine.
+    """
+    venv_py = venv_python_path(venv_dir)
+    store_lib = source_file.parent.parent / "lib"
+    if not store_lib.is_dir():
+        return
+    for dylib in store_lib.glob("libpython3.*.dylib"):
+        target = venv_dir / "lib" / dylib.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            existing = target.parent / target.name
+            if existing.is_symlink() and os.readlink(existing) == str(dylib):
+                continue
+            tmp = target.parent / f".{target.name}.tcc-tmp"
+            os.symlink(dylib, tmp)
+            os.replace(tmp, existing)
+        except OSError:
+            continue
+
+
 def _install_anchor(venv_dir: Path, source_file: Path) -> None:
     """Replace ``bin/python`` with a real-file copy of *source_file*.
 
@@ -226,6 +255,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
         shutil.copy2(source_file, tmp_path)
         os.chmod(tmp_path, source_file.stat().st_mode | 0o111)
         os.replace(tmp_path, venv_py)
+        _link_store_libpython(venv_dir, source_file)
         _anchor_marker(venv_bin).write_text(str(source_file), encoding="utf-8")
         _repoint_aliases(venv_bin, venv_py)
     except Exception:
@@ -266,6 +296,7 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
             if marker.is_file() and marker.read_text(encoding="utf-8").strip() == str(
                 source_file
             ):
+                _link_store_libpython(venv_dir, source_file)
                 return venv_py
         except OSError:
             pass

@@ -40,6 +40,9 @@ def _build_store(tmp_path, version: str = "3.11.15") -> Path:
     store_py = store_bin / "python3.11"
     store_py.write_bytes(f"#!fake interpreter {version}".encode())
     store_py.chmod(0o755)
+    store_lib = store / "lib"
+    store_lib.mkdir()
+    (store_lib / "libpython3.11.dylib").write_bytes(b"#!fake dylib")
     return store_bin
 
 
@@ -131,6 +134,11 @@ class TestEnsureTccAnchor:
         assert venv_py.is_file() and not venv_py.is_symlink()
         assert venv_py.read_bytes() == (store_bin / "python3.11").read_bytes()
         assert os.access(venv_py, os.X_OK)
+        # The copied interpreter's rpath is @executable_path/../lib, so the
+        # store's libpython must exist inside the venv for dyld to resolve it.
+        libpython = root / ".venv" / "lib" / "libpython3.11.dylib"
+        assert libpython.is_symlink()
+        assert os.readlink(libpython) == str(store_bin.parent / "lib" / "libpython3.11.dylib")
         # Marker records the store binary the copy came from.
         marker = venv_py.parent / ".tcc-anchor-source"
         assert marker.read_text(encoding="utf-8").strip() == str(
@@ -175,6 +183,32 @@ class TestEnsureTccAnchor:
         assert venv_py.read_bytes() == new_py.read_bytes()
         marker = venv_py.parent / ".tcc-anchor-source"
         assert marker.read_text(encoding="utf-8").strip() == str(new_py)
+        # The reanchored copy resolves libpython against the new store.
+        libpython = root / ".venv" / "lib" / "libpython3.11.dylib"
+        assert libpython.is_symlink()
+        assert os.readlink(libpython) == str(
+            new_bin.parent / "lib" / "libpython3.11.dylib"
+        )
+
+    def test_anchor_links_libpython_idempotently(self, tmp_path, monkeypatch):
+        _darwin(monkeypatch)
+        store_bin = _build_store(tmp_path)
+        root = _build_checkout(tmp_path, store_bin=store_bin)
+
+        first = tcc.ensure_tcc_anchor(root)
+        libpython = root / ".venv" / "lib" / "libpython3.11.dylib"
+        assert first is not None and libpython.is_symlink()
+
+        # A stale foreign file (e.g. a leftover copy from an earlier repair
+        # attempt) is replaced by the store symlink, not left in place.
+        libpython.unlink()
+        libpython.write_bytes(b"stale copy")
+        second = tcc.ensure_tcc_anchor(root)
+        assert second is not None
+        assert libpython.is_symlink()
+        assert os.readlink(libpython) == str(
+            store_bin.parent / "lib" / "libpython3.11.dylib"
+        )
 
     def test_skips_homebrew_interpreter(self, tmp_path, monkeypatch):
         _darwin(monkeypatch)
