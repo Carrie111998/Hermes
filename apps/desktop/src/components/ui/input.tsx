@@ -37,7 +37,7 @@ function Input({ className, containerClassName, prefix, suffix, size, type, ...p
         className
       )}
       data-slot="input"
-      spellCheck={true}
+      spellCheck={false}
       type={type}
       {...props}
     />

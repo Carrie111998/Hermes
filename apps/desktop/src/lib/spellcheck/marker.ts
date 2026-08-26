@@ -25,7 +25,7 @@ const WORD_RE = /(?<![0-9])[A-Za-z][A-Za-z''’]*(?![0-9])/g
  *  composerPlainText reads through it transparently. */
 export const MISS_ATTR = 'data-hermes-miss'
 
-let dictPromise: Promise<ReadonlySet<string>> | null = null
+let dictPromise: Promise<ReadonlySet<string> | null> | null = null
 
 function markerClass(): string {
   // Class matches the .hermes-miss rule in src/styles.css.
@@ -219,6 +219,12 @@ export async function refreshMisspellMarks(editor: HTMLElement, options: MarkOpt
 
   dictPromise ??= getDictionary()
   const dict = await dictPromise
+
+  // Dictionary failed to load — don't underline EVERYTHING, just back off.
+  if (!dict) {
+    return 0
+  }
+
   const userWords = getUserWords()
   const known = (word: string): boolean => userWords.has(word) || isKnownWord(word, dict)
 

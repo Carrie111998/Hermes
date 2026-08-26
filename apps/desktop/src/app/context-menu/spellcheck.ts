@@ -14,7 +14,7 @@ import { addUserWord, getDictionary, getUserWords, isKnownWord } from './diction
 import type { SpellcheckContext } from './store'
 import { matchCase, suggest } from './suggestions'
 
-const WORD_CHAR = /[A-Za-z0-9''’]/
+const WORD_CHAR = /[A-Za-z''’]/
 
 /** Where the click word lives, kept so the "replace" action can find it
  *  again after the menu closes (the menu's focus trap steals the caret). */
@@ -29,6 +29,10 @@ export interface SpellAnchor {
 
 function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && WORD_CHAR.test(ch)
+}
+
+function isDigit(ch: string | undefined): boolean {
+  return ch !== undefined && ch >= '0' && ch <= '9'
 }
 
 /** Word + indices around a caret index inside a plain string. */
@@ -47,6 +51,12 @@ function expandAt(value: string, caret: number): { word: string; start: number; 
   }
 
   if (end <= start) {
+    return null
+  }
+
+  // Reject words adjacent to digits — parity with the composer marker
+  // tokenizer: "v2" or "abc123" should not yield a suggestion word.
+  if (isDigit(value[start - 1]) || isDigit(value[end])) {
     return null
   }
 
@@ -143,6 +153,11 @@ export async function computeSpellcheck(
 
   const lower = word.toLowerCase()
   const [dict, userWords] = await Promise.all([getDictionary(), Promise.resolve(getUserWords())])
+
+  if (!dict) {
+    // Dictionary failed to load — nothing to suggest against.
+    return null
+  }
 
   if (lower.length < 2 || userWords.has(lower) || isKnownWord(lower, dict)) {
     return null

@@ -14,7 +14,7 @@ function Textarea({ className, size, ...props }: React.ComponentProps<'textarea'
       autoCorrect="off"
       className={cn(controlVariants({ size }), 'min-h-16', className)}
       data-slot="textarea"
-      spellCheck={true}
+      spellCheck={false}
       {...props}
     />
   )

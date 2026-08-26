@@ -68,8 +68,10 @@ describe('renderer spell-check engine', () => {
   })
 
   it('recognizes inflected forms of a stem', () => {
-    // boxes -> box, running -> run, happier -> happy, faster -> fast
+    // boxes -> box, running -> run, happier -> happy, faster -> fast,
+    // cities -> city (pins the -ies/-s inflection path)
     expect(isKnownWord('boxes', DICT)).toBe(true)
+    expect(isKnownWord('cities', DICT)).toBe(true)
     expect(isKnownWord('running', DICT)).toBe(true)
     expect(isKnownWord('happier', DICT)).toBe(true)
     expect(isKnownWord('faster', DICT)).toBe(true)

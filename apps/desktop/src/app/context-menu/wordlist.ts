@@ -2,6 +2,30 @@
 // Offline English word list for renderer-side spell-check suggestions.
 // Regenerate: node scripts/generate-wordlist.mjs  (sources: /usr/share/hunspell/en_US.dic + /usr/share/dict/american-english)
 // 139271 unique words.
+//
+// WORD DATA LICENSE
+// -----------------
+// Generated from two Debian packages installed at build time:
+//   - /usr/share/hunspell/en_US.dic  (package: hunspell-en-us)
+//   - /usr/share/dict/american-english  (package: wamerican)
+// Both derive from SCOWL (Spell Checker Oriented Word Lists),
+// Copyright (C) 2000-2011 by Kevin Atkinson <kevina@users.sourceforge.net>
+// and other contributors (see /usr/share/doc/hunspell-en-us/copyright and
+// /usr/share/doc/wamerican/copyright). The operative permission notice,
+// quoted from those files, is:
+//
+//   Permission to use, copy, modify, distribute and sell these word lists,
+//   the associated scripts, the output created from the scripts, and its
+//   documentation for any purpose is hereby granted without fee, provided
+//   that the above copyright notice appears in all copies and that both
+//   that copyright notice and this permission notice appear in supporting
+//   documentation. Kevin Atkinson makes no representations about the
+//   suitability of this array for any purpose. It is provided "as is"
+//   without express or implied warranty.
+//
+// Individual components within SCOWL are public domain where noted (Moby
+// lexicon project, UK English Wordlist With Frequency Classification,
+// 12Dicts / ENABLE word lists), per the package copyright files.
 export const wordList: readonly string[] = [
   "a",
   "a's",

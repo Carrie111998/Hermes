@@ -1,25 +1,38 @@
 /**
  * Offline English dictionary for spell-check suggestions.
  *
- * The word list is ~77k words and code-split by Vite: it is imported lazily
+ * The word list is ~139k words and code-split by Vite: it is imported lazily
  * (dynamic import) the first time a context menu opens over an editable, then
  * cached for the session. This avoids the flaky main-process `context-menu`
  * spell-check facts (Chromium reports an empty misspelled word for
  * contenteditable on Linux) and computes suggestions directly in the renderer.
  */
 
-let wordSetPromise: Promise<ReadonlySet<string>> | null = null
+let wordSetPromise: Promise<ReadonlySet<string> | null> | null = null
 
-function loadWordSet(): Promise<ReadonlySet<string>> {
-  wordSetPromise ??= import('./wordlist').then(m => new Set(m.wordList))
+function loadWordSet(): Promise<ReadonlySet<string> | null> {
+  if (!wordSetPromise) {
+    wordSetPromise = import('./wordlist')
+      .then(m => new Set(m.wordList))
+      .catch(err => {
+        // A rejected import would otherwise poison the per-session cache and
+        // silently kill the context-menu suggestions (plus an unhandled
+        // rejection). Reset so a later call can retry, and surface it.
+        wordSetPromise = null
+        console.error('[spell-check] failed to load the word list:', err)
+
+        return null
+      })
+  }
 
   return wordSetPromise
 }
 
 export const USER_WORDS_KEY = 'hermes.spellcheck.userWords.v1'
 
-/** The full dictionary (lowercased). Loads on first call; cached after. */
-export function getDictionary(): Promise<ReadonlySet<string>> {
+/** The full dictionary (lowercased). Loads on first call; cached after.
+ *  Resolves to null on a load failure so callers can degrade gracefully. */
+export function getDictionary(): Promise<ReadonlySet<string> | null> {
   return loadWordSet()
 }
 
@@ -112,6 +125,9 @@ export function isKnownWord(word: string, dict: ReadonlySet<string>): boolean {
     return anyKnown(flexCandidates(word, 1)) || anyKnown(flexCandidates(word, 2))
   } // jumps, boxes
 
+  // Defensive: every "-ies" word also ends in plain "s", so the branch above
+  // (strip 2 → ste... "citi" → y-conversion → "city") already handles these.
+  // Kept explicitly so a future reader sees the intent and a test pins it.
   if (word.endsWith('ies')) {
     return anyKnown(flexCandidates(word, 3))
   } // cities -> city
