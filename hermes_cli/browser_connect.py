@@ -7,6 +7,7 @@ import ntpath
 import os
 import platform
 import posixpath
+import re
 import shlex
 import shutil
 import subprocess
@@ -103,13 +104,29 @@ _WINDOWS_PROGID_MAP = (
 )
 
 # Linux xdg default-web-browser .desktop name fragments → canonical key.
+# Includes the Flatpak application ids (``com.google.Chrome.desktop`` etc.),
+# which share none of the native package name fragments.
 _LINUX_DESKTOP_MAP = (
     ("google-chrome", "chrome"),
+    ("com.google.chrome", "chrome"),
     ("chromium", "chromium"),
     ("brave", "brave"),
     ("microsoft-edge", "edge"),
+    ("com.microsoft.edge", "edge"),
     ("msedge", "edge"),
 )
+
+# Where sandboxed Linux packages keep the profile instead of $XDG_CONFIG_HOME.
+_LINUX_FLATPAK_IDS = {
+    "chrome": "com.google.Chrome",
+    "chromium": "org.chromium.Chromium",
+    "brave": "com.brave.Browser",
+    "edge": "com.microsoft.Edge",
+}
+_LINUX_SNAP_PROFILE_PARTS = {
+    "chromium": ("snap", "chromium", "common", "chromium"),
+    "brave": ("snap", "brave", "current", ".config", "BraveSoftware", "Brave-Browser"),
+}
 
 # macOS LaunchServices bundle-id fragments → canonical key.
 _DARWIN_BUNDLE_MAP = (
@@ -149,10 +166,12 @@ def _real_profile_relparts(browser: str) -> tuple:
 def real_profile_data_dir(browser: str, system: str | None = None) -> str | None:
     """Return the default user-data-dir for a Chromium ``browser`` on ``system``.
 
-    Returns None for unknown browsers. Does not check existence — callers that
-    need that should stat the result. Paths are built with the TARGET system's
-    separator (posix for Darwin/Linux, backslash for Windows) so an explicit
-    ``system`` argument resolves correctly regardless of the host OS.
+    Returns None for unknown browsers. On Linux the native ($XDG_CONFIG_HOME),
+    snap and Flatpak locations are tried and the first existing one wins; the
+    native path is returned when none exists so the caller's error names it.
+    Darwin/Windows paths are not stat'ed. Paths are built with the TARGET
+    system's separator (posix for Darwin/Linux, backslash for Windows) so an
+    explicit ``system`` argument resolves correctly regardless of the host OS.
     """
     if browser not in _CHROMIUM_BROWSERS:
         return None
@@ -166,7 +185,19 @@ def real_profile_data_dir(browser: str, system: str | None = None) -> str | None
         return ntpath.join(local, *win_parts)
     # Linux / other POSIX
     config = os.environ.get("XDG_CONFIG_HOME") or posixpath.join(home, ".config")
-    return posixpath.join(config, *linux_name.split("/"))
+    candidates = [posixpath.join(config, *linux_name.split("/"))]
+    snap_parts = _LINUX_SNAP_PROFILE_PARTS.get(browser)
+    if snap_parts:
+        candidates.append(posixpath.join(home, *snap_parts))
+    flatpak_id = _LINUX_FLATPAK_IDS.get(browser)
+    if flatpak_id:
+        candidates.append(
+            posixpath.join(home, ".var", "app", flatpak_id, "config", *linux_name.split("/"))
+        )
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
 
 
 def chromium_executable(browser: str, system: str | None = None) -> str | None:
@@ -223,7 +254,56 @@ def chromium_executable(browser: str, system: str | None = None) -> str | None:
     return None
 
 
-def _detect_default_windows() -> str | None:
+# Pre-release channels are separate installs with their own profile
+# directories and their own identifiers: Chrome Beta/Dev/Canary register
+# ChromeBHTML / ChromeDHTML / ChromeSSHTM (chrome/install_static/
+# google_chrome_install_modes.h), Edge Beta/Dev MSEdgeBHTML / MSEdgeDHTML, and
+# on macOS/Linux the channel id merely extends the stable one
+# (com.google.chrome.canary, google-chrome-beta.desktop). The stable maps must
+# not swallow those — that would drive stable's profile while the user's
+# default browser is the channel build — so they are recognised first and
+# reported by name; the caller fails closed.
+_UNSUPPORTED_CHANNELS = (
+    ("chromebhtml", "Google Chrome Beta"),
+    ("chromedhtml", "Google Chrome Dev"),
+    ("chromesshtm", "Google Chrome Canary"),
+    ("msedgebhtml", "Microsoft Edge Beta"),
+    ("msedgedhtml", "Microsoft Edge Dev"),
+    ("msedgesshtm", "Microsoft Edge Canary"),
+    ("com.google.chrome.beta", "Google Chrome Beta"),
+    ("com.google.chrome.dev", "Google Chrome Dev"),
+    ("com.google.chrome.canary", "Google Chrome Canary"),
+    ("com.microsoft.edgemac.beta", "Microsoft Edge Beta"),
+    ("com.microsoft.edgemac.dev", "Microsoft Edge Dev"),
+    ("com.microsoft.edgemac.canary", "Microsoft Edge Canary"),
+    ("com.brave.browser.beta", "Brave Beta"),
+    ("com.brave.browser.dev", "Brave Dev"),
+    ("com.brave.browser.nightly", "Brave Nightly"),
+    ("google-chrome-beta", "Google Chrome Beta"),
+    ("google-chrome-unstable", "Google Chrome Dev"),
+    ("microsoft-edge-beta", "Microsoft Edge Beta"),
+    ("microsoft-edge-dev", "Microsoft Edge Dev"),
+    ("brave-browser-beta", "Brave Beta"),
+    ("brave-browser-dev", "Brave Dev"),
+    ("brave-browser-nightly", "Brave Nightly"),
+)
+
+
+def unsupported_channel(identifier: str | None) -> str | None:
+    """Name the pre-release channel behind a default-browser identifier.
+
+    ``identifier`` is the raw OS value (Windows ProgId, macOS bundle id,
+    Linux .desktop name). Returns e.g. ``"Google Chrome Beta"`` or None for
+    stable builds and non-Chromium browsers.
+    """
+    low = (identifier or "").lower()
+    for fragment, name in _UNSUPPORTED_CHANNELS:
+        if fragment in low:
+            return name
+    return None
+
+
+def _default_windows_progid() -> str | None:
     try:
         import winreg  # type: ignore
     except Exception:
@@ -237,40 +317,102 @@ def _detect_default_windows() -> str | None:
         winreg.CloseKey(key)
     except Exception:
         return None
-    low = str(prog_id or "").lower()
+    return str(prog_id or "") or None
+
+
+def _classify_windows_progid(prog_id: str | None) -> str | None:
+    if unsupported_channel(prog_id):
+        return None
+    low = (prog_id or "").lower()
     for prefix, browser in _WINDOWS_PROGID_MAP:
         if low.startswith(prefix):
             return browser
     return None
 
 
-def _detect_default_darwin() -> str | None:
-    # LaunchServices handler for the https scheme.
-    for reader in (
-        ["defaults", "read", "com.apple.LaunchServices/com.apple.launchservices.secure", "LSHandlers"],
-    ):
-        try:
-            out = subprocess.run(
-                reader,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-            ).stdout.lower()
-        except Exception:
-            out = ""
-        for frag, browser in _DARWIN_BUNDLE_MAP:
-            if frag in out and "https" in out:
-                return browser
-    # Fallback: first installed Chromium app wins.
-    for browser in _CHROMIUM_BROWSERS:
-        if chromium_executable(browser, "Darwin"):
-            return browser
+def _detect_default_windows() -> str | None:
+    return _classify_windows_progid(_default_windows_progid())
+
+
+_LS_HANDLERS_READER = (
+    "defaults",
+    "read",
+    "com.apple.LaunchServices/com.apple.launchservices.secure",
+    "LSHandlers",
+)
+
+
+def _launchservices_https_handler(dump: str) -> str | None:
+    """Return the bundle id registered for the ``https`` URL scheme.
+
+    ``dump`` is the ``defaults read … LSHandlers`` output: an array of
+    ``{ … }`` dictionaries, one per handler. Only the entry whose
+    ``LSHandlerURLScheme`` is ``https`` counts — a browser registered for
+    another scheme or a file type must not be mistaken for the default.
+    Returns None when no https handler is recorded, which is what macOS
+    stores while Safari (the implicit default) has never been replaced.
+    """
+    entries: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in dump:
+        if ch == "{":
+            depth += 1
+            if depth == 1:
+                buf = []
+                continue
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                entries.append("".join(buf))
+                continue
+        if depth >= 1:
+            buf.append(ch)
+    for entry in entries:
+        low = entry.lower()
+        if not re.search(r'lshandlerurlscheme\s*=\s*"?https"?\s*;', low):
+            continue
+        # The nested LSHandlerPreferredVersions block carries "-" placeholders
+        # under the same key names; the real bundle id is the first non-"-".
+        for role in re.findall(r'lshandlerrole(?:all|viewer)\s*=\s*"?([a-z0-9.\-]+)"?\s*;', low):
+            if role != "-":
+                return role
+        return None
     return None
 
 
-def _detect_default_linux() -> str | None:
+def _default_darwin_bundle() -> str | None:
+    try:
+        out = subprocess.run(
+            list(_LS_HANDLERS_READER),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    return _launchservices_https_handler(out)
+
+
+def _classify_darwin_bundle(bundle: str | None) -> str | None:
+    if not bundle or unsupported_channel(bundle):
+        return None
+    for frag, browser in _DARWIN_BUNDLE_MAP:
+        if bundle.startswith(frag):
+            return browser
+    # A non-Chromium https handler (Safari, Firefox, Arc, …): fail closed.
+    # No "first installed Chromium wins" fallback — that would drive a
+    # browser the user never made their default.
+    return None
+
+
+def _detect_default_darwin() -> str | None:
+    return _classify_darwin_bundle(_default_darwin_bundle())
+
+
+def _default_linux_desktop() -> str | None:
     try:
         out = subprocess.run(
             ["xdg-settings", "get", "default-web-browser"],
@@ -279,20 +421,48 @@ def _detect_default_linux() -> str | None:
             encoding="utf-8",
             errors="replace",
             timeout=5,
-        ).stdout.strip().lower()
+        ).stdout.strip()
     except Exception:
-        out = ""
+        return None
+    return out or None
+
+
+def _classify_linux_desktop(desktop: str | None) -> str | None:
+    if unsupported_channel(desktop):
+        return None
+    low = (desktop or "").lower()
     for frag, browser in _LINUX_DESKTOP_MAP:
-        if frag in out:
+        if frag in low:
             return browser
     return None
+
+
+def _detect_default_linux() -> str | None:
+    return _classify_linux_desktop(_default_linux_desktop())
+
+
+def default_browser_identifier(system: str | None = None) -> str | None:
+    """Return the raw OS identifier of the default https handler, or None.
+
+    Windows: the UserChoice ProgId; macOS: the LaunchServices bundle id;
+    Linux: the xdg .desktop name. Meant for diagnostics (e.g. naming an
+    unsupported channel in an error); ``detect_default_chromium`` is the
+    classifier.
+    """
+    system = system or platform.system()
+    if system == "Windows":
+        return _default_windows_progid()
+    if system == "Darwin":
+        return _default_darwin_bundle()
+    return _default_linux_desktop()
 
 
 def detect_default_chromium(system: str | None = None) -> str | None:
     """Return the canonical key of the default Chromium browser, or None.
 
-    None means the default browser is non-Chromium (Firefox, Safari) or could
-    not be determined — the caller fails closed rather than guessing.
+    None means the default browser is non-Chromium (Firefox, Safari), a
+    pre-release channel (see ``unsupported_channel``), or could not be
+    determined — the caller fails closed rather than guessing.
     """
     system = system or platform.system()
     if system == "Windows":
