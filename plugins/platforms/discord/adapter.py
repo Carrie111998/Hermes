@@ -138,6 +138,20 @@ except ImportError:
     Intents = Any
     commands = None
 
+def _is_discord_channel_lookup_error(exc: BaseException) -> bool:
+    """Return whether ``exc`` is Discord's inaccessible-channel response.
+
+    Resolve the optional Discord exception classes at call time. Besides
+    keeping the adapter importable without the messaging extra, this avoids
+    freezing an empty exception tuple when another test imports the optional
+    adapter before discord.py is available.
+    """
+    for error_name in ("Forbidden", "NotFound"):
+        error_type = getattr(discord, error_name, None)
+        if isinstance(error_type, type) and isinstance(exc, error_type):
+            return True
+    return False
+
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
@@ -3433,6 +3447,55 @@ class DiscordAdapter(BasePlatformAdapter):
         kept.append(notice)
         return kept
 
+    async def _resolve_exact_origin_dm_channel(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        stale_channel: Optional[Any] = None,
+    ) -> Optional[Any]:
+        """Resolve or create the exact user's DM channel for origin delivery.
+
+        This is deliberately narrower than a generic channel fallback: only a
+        caller-authenticated origin DM carrying an exact user id is eligible.
+        Guild, group, thread, and fan-out delivery must continue to fail closed.
+        """
+        if not self._client or not metadata:
+            return None
+        user_id = metadata.get("_cron_origin_dm_user_id")
+        if user_id is None:
+            return None
+        try:
+            discord_user_id = int(user_id)
+        except (TypeError, ValueError):
+            return None
+
+        user = self._client.get_user(discord_user_id)
+        if user is None:
+            user = await self._client.fetch_user(discord_user_id)
+        if user is None:
+            return None
+        channel = getattr(user, "dm_channel", None)
+        if channel is not None and stale_channel is not None:
+            channel_id = getattr(channel, "id", None)
+            stale_channel_id = getattr(stale_channel, "id", None)
+            same_cached_channel = channel is stale_channel or (
+                channel_id is not None and channel_id == stale_channel_id
+            )
+            if same_cached_channel:
+                state = getattr(user, "_state", None)
+                remove_private_channel = getattr(
+                    state,
+                    "_remove_private_channel",
+                    None,
+                )
+                if not callable(remove_private_channel):
+                    return None
+                remove_private_channel(channel)
+                channel = None
+        if channel is None:
+            channel = await user.create_dm()
+        return channel
+
     async def send(
         self,
         chat_id: str,
@@ -3493,7 +3556,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Get the parent channel
                 channel = self._client.get_channel(int(chat_id))
                 if not channel:
-                    channel = await self._client.fetch_channel(int(chat_id))
+                    try:
+                        channel = await self._client.fetch_channel(int(chat_id))
+                    except Exception as exc:
+                        if not _is_discord_channel_lookup_error(exc):
+                            raise
+                        channel = await self._resolve_exact_origin_dm_channel(metadata)
+                        if channel is None:
+                            raise
+                if not channel:
+                    channel = await self._resolve_exact_origin_dm_channel(metadata)
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
@@ -3531,7 +3603,24 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                 except Exception as e:
                     err_text = str(e)
-                    if (
+                    if not message_ids and _is_discord_channel_lookup_error(e):
+                        recovered_channel = await self._resolve_exact_origin_dm_channel(
+                            metadata,
+                            stale_channel=channel,
+                        )
+                        if recovered_channel is None:
+                            raise
+                        channel = recovered_channel
+                        reference = self._reply_reference_for_send(reply_to, channel)
+                        if self._reply_to_mode == "all":
+                            chunk_reference = reference
+                        else:
+                            chunk_reference = reference if i == 0 else None
+                        msg = await channel.send(
+                            content=chunk,
+                            reference=chunk_reference,
+                        )
+                    elif (
                         chunk_reference is not None
                         and (
                             (

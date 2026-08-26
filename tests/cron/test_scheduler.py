@@ -452,6 +452,69 @@ class TestDeliverResultWrapping:
         standalone_send.assert_not_awaited()
 
 
+    def test_discord_origin_dm_passes_exact_user_identity_to_live_adapter(self):
+        """Cron origin delivery gives Discord enough identity to refresh a stale DM."""
+        from concurrent.futures import Future
+
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True, message_id="msg-1")
+        adapter.supports_inchannel_continuable = False
+        adapter.supports_inchannel_continuable_for_platform = None
+        config = GatewayConfig(
+            platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+        )
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "discord-origin-dm",
+            "name": "Merge ready",
+            "deliver": "origin,discord:999",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "555",
+                "chat_type": "dm",
+                "user_id": "42",
+            },
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+        ):
+            result = _deliver_result(
+                job,
+                "Merge-ready packet",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        assert adapter.send.await_count == 2
+        sends_by_chat = {
+            call.args[0]: call.kwargs["metadata"]
+            for call in adapter.send.await_args_list
+        }
+        origin_metadata = sends_by_chat["555"]
+        assert origin_metadata["_cron_origin_dm_user_id"] == "42"
+        assert "user_id" not in origin_metadata
+        assert "chat_type" not in origin_metadata
+        assert "_cron_origin_dm_user_id" not in sends_by_chat["999"]
+
+
     def test_live_adapter_sends_media_as_attachments(self, tmp_path, monkeypatch):
         """When a live adapter is available, MEDIA files should be sent as native
         platform attachments (e.g., Discord voice, Telegram audio) rather than

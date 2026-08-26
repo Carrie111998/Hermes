@@ -3307,6 +3307,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            # Discord DM channel ids are not durable authorities: an old DM
+            # channel can become inaccessible even though the exact scheduling
+            # user is still valid.  Preserve the origin identity only for an
+            # origin-matching 1:1 DM so the adapter may safely recreate that
+            # user's channel.  Never stamp fan-out, guild, or group targets.
+            if (
+                platform == Platform.DISCORD
+                and origin_target
+                and origin_chat_type == "dm"
+                and origin_user_id
+            ):
+                route_metadata["_cron_origin_dm_user_id"] = str(origin_user_id)
+
             # Relay egress needs a tenant discriminator on the frame: the
             # connector's fail-closed guard resolves the workspace/guild from
             # metadata.scope_id, and after a gateway restart the RelayAdapter's
