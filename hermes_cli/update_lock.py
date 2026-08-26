@@ -50,7 +50,7 @@ Two mechanisms recognize the orchestrating parent, and either suffices:
 
 from __future__ import annotations
 
-import errno
+import contextlib
 import logging
 import os
 import threading
@@ -67,6 +67,42 @@ logger = logging.getLogger(__name__)
 UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
+_OWNERSHIP_MUTEX_NAME = "Global\\HermesUpdateMarkerOwnership"
+_fallback_mutex = threading.RLock()
+
+
+@contextlib.contextmanager
+def _ownership_transaction():
+    """Serialize marker inspect/reclaim/publish across Windows entrypoints."""
+    if os.name != "nt":
+        with _fallback_mutex:
+            yield
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.CreateMutexW(None, False, _OWNERSHIP_MUTEX_NAME)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "Could not create update ownership mutex")
+    acquired = False
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        if result not in (0, 0x80):
+            raise OSError(ctypes.get_last_error(), "Could not acquire update ownership mutex")
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
 
 # Set by an orchestrating updater (the Tauri `hermes-setup --update` flow) to
 # its own pid before spawning `hermes update` as a child stage. The parent
@@ -170,7 +206,7 @@ class UpdateHolder:
     age_seconds: float
 
 
-def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
+def _read_live_update_unlocked(marker: Path) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
     Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
@@ -178,7 +214,6 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     update", and a stale marker file is deleted so it can't strand future runs.
     Never raises.
     """
-    marker = path or update_marker_path()
     try:
         raw = marker.read_text(encoding="utf-8")
     except OSError:
@@ -203,6 +238,13 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
         return None
 
     return UpdateHolder(pid=pid, age_seconds=age)
+
+
+def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
+    """Return the live owner while atomically pruning stale diagnostics."""
+    marker = path or update_marker_path()
+    with _ownership_transaction():
+        return _read_live_update_unlocked(marker)
 
 
 def describe_holder(holder: UpdateHolder) -> str:
@@ -252,10 +294,10 @@ class UpdateLock:
                 self.path.parent,
                 exc,
             )
-            return True
+            return False
 
-        for _attempt in range(2):
-            existing = read_live_update(path=self.path)
+        with _ownership_transaction():
+            existing = _read_live_update_unlocked(self.path)
             if existing is not None:
                 if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
                     return True
@@ -273,47 +315,28 @@ class UpdateLock:
                 finally:
                     claim.unlink(missing_ok=True)
             except OSError as exc:
-                if exc.errno == errno.EEXIST:
-                    # Another process won the create-new race after our read.
-                    # Re-read its claim instead of overwriting it.
-                    continue
-                # Best-effort, exactly like the Rust guard: an unwritable marker
-                # must not block the update itself (that would be a worse failure
-                # than the race it prevents). Degrade to the pre-lock behavior.
-                logger.debug("Could not create update marker %s: %s", self.path, exc)
-                return True
+                logger.warning("Could not publish update marker %s: %s", self.path, exc)
+                return False
             self.acquired = True
             return True
-
-        existing = read_live_update(path=self.path)
-        if existing is not None:
-            if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
-                return True
-            self.holder = existing
-            return False
-        # A claimant repeatedly created and disappeared between our probes.
-        # Fail closed rather than entering an install with unprovable ownership.
-        logger.warning("Update ownership changed repeatedly while claiming %s", self.path)
-        return False
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""
         if not self.acquired:
             return
         self.acquired = False
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
-            return
-        if owner != os.getpid():
-            # A handoff partner took ownership (e.g. the Tauri updater wrote
-            # its own pid). Leave it alone — it's still a live update.
-            return
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        with _ownership_transaction():
+            try:
+                raw = self.path.read_text(encoding="utf-8")
+                owner = int(raw.splitlines()[0].strip())
+            except (OSError, IndexError, ValueError):
+                return
+            if owner != os.getpid():
+                return
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

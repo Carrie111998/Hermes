@@ -127,6 +127,48 @@ pub(crate) struct UpdateMarkerGuard {
 /// others still consider live.
 const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
 
+#[cfg(windows)]
+struct MarkerTransaction(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl MarkerTransaction {
+    fn acquire() -> std::io::Result<Self> {
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE};
+
+        let name: Vec<u16> = "Global\\HermesUpdateMarkerOwnership\0".encode_utf16().collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if result != 0 && result != 0x80 {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(handle))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MarkerTransaction {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct MarkerTransaction;
+
+#[cfg(not(windows))]
+impl MarkerTransaction {
+    fn acquire() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
 /// The pid + age of a confirmed-live update holding the marker.
 pub(crate) struct MarkerOwner {
     pub(crate) pid: u32,
@@ -231,6 +273,13 @@ impl UpdateMarkerGuard {
     /// cleanup of whatever may exist at the path.
     pub(crate) fn acquire(path: PathBuf) -> Result<Self, MarkerOwner> {
         let pid = std::process::id();
+        let _transaction = match MarkerTransaction::acquire() {
+            Ok(transaction) => transaction,
+            Err(err) => {
+                tracing::warn!(?path, %err, "could not acquire update ownership mutex");
+                return Err(MarkerOwner { pid: 0, age_secs: 0 });
+            }
+        };
         for _attempt in 0..2 {
             if let Some(owner) = live_marker_owner(&path) {
                 if owner.pid == pid {
@@ -240,6 +289,12 @@ impl UpdateMarkerGuard {
                     return Ok(Self { path, owned: true });
                 }
                 return Err(owner);
+            }
+            if path.exists() {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    tracing::warn!(?path, %err, "could not reclaim stale update marker");
+                    return Err(MarkerOwner { pid: 0, age_secs: 0 });
+                }
             }
             let started_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -300,7 +355,7 @@ impl UpdateMarkerGuard {
             return Err(owner);
         }
         tracing::warn!(?path, "update marker ownership changed repeatedly while claiming");
-        Ok(Self { path, owned: false })
+        Err(MarkerOwner { pid: 0, age_secs: 0 })
     }
 
     /// Release the marker as soon as every mutating stage has completed.
@@ -313,6 +368,16 @@ impl UpdateMarkerGuard {
     /// and tolerates an already-removed marker.
     fn complete(&self) {
         if !self.owned {
+            return;
+        }
+        let _transaction = match MarkerTransaction::acquire() {
+            Ok(transaction) => transaction,
+            Err(err) => {
+                tracing::warn!(path = ?self.path, %err, "could not acquire update ownership mutex for release");
+                return;
+            }
+        };
+        if !marker_owned_by_self(&self.path) {
             return;
         }
         if let Err(err) = std::fs::remove_file(&self.path) {
@@ -1683,6 +1748,12 @@ mod tests {
 
         let guard = UpdateMarkerGuard::acquire(marker.clone())
             .unwrap_or_else(|_| panic!("a marker past the ceiling must be reclaimable"));
+        let body = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            body.lines().next().unwrap().trim().parse::<u32>().unwrap(),
+            std::process::id(),
+            "reclaiming rewrites the stale marker with our pid"
+        );
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }

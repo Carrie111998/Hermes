@@ -10,6 +10,10 @@ $secondOut = Join-Path $root 'second.out'
 $secondErr = Join-Path $root 'second.err'
 $thirdOut = Join-Path $root 'third.out'
 $thirdErr = Join-Path $root 'third.err'
+$staleAOut = Join-Path $root 'stale-a.out'
+$staleAErr = Join-Path $root 'stale-a.err'
+$staleBOut = Join-Path $root 'stale-b.out'
+$staleBErr = Join-Path $root 'stale-b.err'
 $marker = Join-Path $root '.hermes-update-in-progress'
 $powershell = Join-Path $PSHOME 'powershell.exe'
 
@@ -70,8 +74,27 @@ try {
     $thirdCode = Invoke-Probe $thirdOut $thirdErr
     Assert-True ($thirdCode -eq 0) 'a later installer could not acquire after release'
 
+    # Two processes discovering the same dead marker must serialize cleanup
+    # and publication. Exactly one may enter; the stale loser must not delete
+    # the fresh owner's marker and proceed unlocked.
+    "4294967294`n$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())`n" |
+        Set-Content -LiteralPath $marker -NoNewline -Encoding ASCII
+    $staleA = Start-Probe 2 $staleAOut $staleAErr
+    $staleB = Start-Probe 2 $staleBOut $staleBErr
+    $staleA.WaitForExit()
+    $staleB.WaitForExit()
+    $staleResults = @(
+        (Get-Content -LiteralPath $staleAOut -Raw | ConvertFrom-Json),
+        (Get-Content -LiteralPath $staleBOut -Raw | ConvertFrom-Json)
+    )
+    $staleSummary = $staleResults | ConvertTo-Json -Compress
+    Assert-True (@($staleResults | Where-Object { $_.ok }).Count -eq 1) "dead-marker reclaim owner count was not one: $staleSummary"
+    Assert-True (@($staleResults | Where-Object { -not $_.ok }).Count -eq 1) "dead-marker reclaim refusal count was not one: $staleSummary"
+
     Write-Host 'INSTALL OWNERSHIP SELF-TEST: PASS'
 } finally {
     if ($first -and -not $first.HasExited) { Stop-Process -Id $first.Id -Force -ErrorAction SilentlyContinue }
+    if ($staleA -and -not $staleA.HasExited) { Stop-Process -Id $staleA.Id -Force -ErrorAction SilentlyContinue }
+    if ($staleB -and -not $staleB.HasExited) { Stop-Process -Id $staleB.Id -Force -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }

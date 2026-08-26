@@ -410,6 +410,7 @@ $NpmRange = ">=12.0.0"
 # new stage does NOT bump this -- drivers iterate the manifest dynamically.
 $InstallStageProtocolVersion = 1
 $script:InstallOwnership = $null
+$InstallOwnershipMutexName = "Global\HermesUpdateMarkerOwnership"
 
 # ============================================================================
 # Helper functions
@@ -467,7 +468,13 @@ function Enter-InstallOwnership {
 
     $marker = Join-Path $HermesHome ".hermes-update-in-progress"
     $ownerPid = Get-InstallOwnershipPid -StageDriven $StageDriven
-    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+    $transaction = [System.Threading.Mutex]::new($false, $InstallOwnershipMutexName)
+    $transactionHeld = $false
+    try {
+        try { $transactionHeld = $transaction.WaitOne() }
+        catch [System.Threading.AbandonedMutexException] { $transactionHeld = $true }
+        if (-not $transactionHeld) { throw "Could not acquire update ownership mutex" }
+
         $existing = Get-LiveInstallOwner -Path $marker
         if ($existing) {
             if ($existing.Pid -eq $ownerPid) {
@@ -509,22 +516,31 @@ function Enter-InstallOwnership {
                 ReleaseOnExit = (-not $StageDriven -and $ownerPid -eq $PID)
             }
         } catch [System.IO.IOException] {
-            # Another process won CreateNew after our read. Re-read its durable
-            # owner instead of overwriting the marker.
-            continue
+            throw "Could not prove Hermes install/update ownership: $($_.Exception.Message)"
         }
+    } finally {
+        if ($transactionHeld) { $transaction.ReleaseMutex() }
+        $transaction.Dispose()
     }
-    throw "Hermes install/update ownership changed repeatedly while starting. Wait a moment, then retry."
 }
 
 function Exit-InstallOwnership {
     if (-not $script:InstallOwnership -or -not $script:InstallOwnership.ReleaseOnExit) { return }
+    $transaction = [System.Threading.Mutex]::new($false, $InstallOwnershipMutexName)
+    $transactionHeld = $false
     try {
+        try { $transactionHeld = $transaction.WaitOne() }
+        catch [System.Threading.AbandonedMutexException] { $transactionHeld = $true }
+        if (-not $transactionHeld) { return }
         $owner = Get-LiveInstallOwner -Path $script:InstallOwnership.Path
         if ($owner -and $owner.Pid -eq $script:InstallOwnership.OwnerPid) {
             Remove-Item -LiteralPath $script:InstallOwnership.Path -Force -ErrorAction SilentlyContinue
         }
     } catch {}
+    finally {
+        if ($transactionHeld) { $transaction.ReleaseMutex() }
+        $transaction.Dispose()
+    }
 }
 
 # Return the real OS processor architecture as a lowercase string suitable for

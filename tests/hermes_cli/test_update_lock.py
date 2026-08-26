@@ -190,16 +190,12 @@ def test_describe_holder_names_the_pid_and_elapsed_time(marker):
     assert "already running" in message
 
 
-def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
-    """Degrade to pre-lock behavior rather than refusing to update at all.
-
-    An unwritable marker path is a worse reason to block an update than the
-    race the lock prevents.
-    """
+def test_unwritable_marker_location_fails_closed(tmp_path):
+    """Never enter a mutating update without proven ownership."""
     lock = UpdateLock(path=tmp_path / "nonexistent-file" / "marker")
     (tmp_path / "nonexistent-file").write_text("i am a file, not a dir", encoding="utf-8")
 
-    assert lock.acquire() is True
+    assert lock.acquire() is False
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
 
 
