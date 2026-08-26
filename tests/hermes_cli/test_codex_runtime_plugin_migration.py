@@ -9,12 +9,17 @@ from hermes_cli.codex_runtime_plugin_migration import (
     MIGRATION_MARKER,
     MIGRATION_END_MARKER,
     _build_hermes_tools_mcp_entry,
+    _find_unmanaged_mcp_servers,
     _format_toml_value,
+    _looks_like_table_header,
     _looks_like_test_tempdir,
+    _parse_toml_table_header,
+    _reconcile_unmanaged_tables,
     _strip_existing_managed_block,
     _strip_unmanaged_plugin_tables,
     _translate_one_server,
     migrate,
+    migrate_codex_config,
     render_codex_toml_section,
 )
 
@@ -277,6 +282,31 @@ class TestMigrate:
         assert "- a" in summary
         assert "- b" in summary
 
+    def test_multiline_array_at_top_level_not_split(self, tmp_path):
+        """Top-level multi-line arrays like `trusted_pairs = [ ['a', 'b'] ]` must
+        not be falsely identified as table headers by `_insert_managed_block_at_top_level`."""
+        target = tmp_path / "config.toml"
+        target.write_text("""\
+model = "gpt-5.6-sol"
+trusted_pairs = [
+    ["user1", "read"],
+    ["user2", "write"],
+]
+
+[features]
+memories = true
+""")
+        report = migrate({"mcp_servers": {"mcp1": {"command": "cmd1"}}},
+                         codex_home=tmp_path, discover_plugins=False,
+                         expose_hermes_tools=False)
+        assert report.written
+        assert report.errors == []
+        import tomllib
+        loaded = tomllib.loads(target.read_text())
+        assert loaded["trusted_pairs"] == [["user1", "read"], ["user2", "write"]]
+        assert loaded["features"]["memories"] is True
+        assert loaded["mcp_servers"]["mcp1"]["command"] == "cmd1"
+
 
 # ---- Bug B: duplicate [plugins.X] tables ----
 
@@ -421,3 +451,283 @@ class TestHermesHomeLeakGuard:
             f"HERMES_HOME should not be set when env var is unset, got: "
             f"{env.get('HERMES_HOME')!r}"
         )
+
+
+# ---- Robust Table Parser & Sub-table Reconciliation Tests ----
+
+
+class TestParseTomlTableHeader:
+    def test_bare_keys(self):
+        assert _parse_toml_table_header("[features]") == (("features",), False)
+        assert _parse_toml_table_header("[mcp_servers.filesystem]") == (("mcp_servers", "filesystem"), False)
+
+    def test_quoted_keys(self):
+        assert _parse_toml_table_header('[mcp_servers."second-brain"]') == (("mcp_servers", "second-brain"), False)
+        assert _parse_toml_table_header("[mcp_servers.'second-brain']") == (("mcp_servers", "second-brain"), False)
+        assert _parse_toml_table_header('[mcp_servers."foo.bar".env]') == (("mcp_servers", "foo.bar", "env"), False)
+        assert _parse_toml_table_header(r'[mcp_servers."nested \"quote\""]') == (("mcp_servers", 'nested "quote"'), False)
+
+    def test_array_of_tables(self):
+        assert _parse_toml_table_header('[[plugins."linear@openai-curated"]]') == (("plugins", "linear@openai-curated"), True)
+
+    def test_whitespace_and_comments(self):
+        assert _parse_toml_table_header("  [  mcp_servers  .  'second-brain'  .  env  ]  # comment with ] bracket ") == (
+            ("mcp_servers", "second-brain", "env"), False
+        )
+
+    def test_non_header_lines(self):
+        assert _parse_toml_table_header("key = [1, 2, 3]") is None
+        assert _parse_toml_table_header("  ['array_item'],  ") is None
+        assert _parse_toml_table_header("# [commented_header]") is None
+        assert _parse_toml_table_header("") is None
+
+
+class TestReconcileUnmanagedTables:
+    def test_cascading_subtable_reconciliation(self):
+        toml_text = """\
+[projects]
+active = true
+
+[mcp_servers.second-brain]
+command = "node"
+args = ["/path/index.js"]
+
+[mcp_servers.second-brain.env]
+FOO = "1"
+
+[mcp_servers.second-brain.settings]
+mode = "auto"
+
+[mcp_servers.node_repl]
+command = "/path/node_repl"
+
+[mcp_servers.node_repl.env]
+BAR = "2"
+"""
+        reconciled = _reconcile_unmanaged_tables(toml_text, {"second-brain"})
+        assert "second-brain" not in reconciled
+        assert "[mcp_servers.second-brain.env]" not in reconciled
+        assert "[mcp_servers.second-brain.settings]" not in reconciled
+        # User-owned node_repl and its sub-table must be preserved intact
+        assert "[mcp_servers.node_repl]" in reconciled
+        assert "[mcp_servers.node_repl.env]" in reconciled
+        assert 'BAR = "2"' in reconciled
+        assert "[projects]" in reconciled
+
+    def test_strips_bare_mcp_servers_header(self):
+        toml_text = """\
+[projects]
+active = true
+
+[mcp_servers]
+
+[mcp_servers.second-brain]
+command = "node"
+"""
+        reconciled = _reconcile_unmanaged_tables(toml_text, {"second-brain"})
+        assert "[mcp_servers]" not in reconciled
+        assert "second-brain" not in reconciled
+        assert "[projects]" in reconciled
+
+
+class TestMigrateConflictPolicies:
+    def test_replace_with_managed_default(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""\
+model = "gpt-5.6-sol"
+
+[mcp_servers.second-brain]
+command = "old-node"
+args = ["/old/path.js"]
+
+[mcp_servers.second-brain.env]
+OLD_KEY = "old_val"
+
+[mcp_servers.user_custom]
+command = "custom-bin"
+""")
+        hermes_cfg = {
+            "mcp_servers": {
+                "second-brain": {
+                    "command": "new-node",
+                    "args": ["/new/path.js"],
+                }
+            }
+        }
+        report = migrate(
+            hermes_cfg,
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+            default_permission_profile=None,
+            conflict_policy="replace_with_managed",
+        )
+        assert report.written is True
+        assert report.errors == []
+        assert "second-brain" in report.reconciled_user_servers
+
+        import tomllib
+        loaded = tomllib.loads(config_path.read_text())
+        assert loaded["mcp_servers"]["second-brain"]["command"] == "new-node"
+        assert loaded["mcp_servers"]["user_custom"]["command"] == "custom-bin"
+        assert "OLD_KEY" not in str(config_path.read_text())
+        assert config_path.read_text().count("[mcp_servers.second-brain]") == 1
+
+    def test_preserve_user_policy(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""\
+model = "gpt-5.6-sol"
+
+[mcp_servers.second-brain]
+command = "user-node"
+args = ["/user/path.js"]
+
+[mcp_servers.second-brain.env]
+USER_ENV = "1"
+""")
+        hermes_cfg = {
+            "mcp_servers": {
+                "second-brain": {
+                    "command": "hermes-node",
+                    "args": ["/hermes/path.js"],
+                },
+                "new-server": {
+                    "command": "new-bin",
+                }
+            }
+        }
+        report = migrate(
+            hermes_cfg,
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+            default_permission_profile=None,
+            conflict_policy="preserve_user",
+        )
+        assert report.written is True
+        assert report.errors == []
+        assert "second-brain" in report.preserved_user_servers
+
+        import tomllib
+        loaded = tomllib.loads(config_path.read_text())
+        # Preserved user-owned command
+        assert loaded["mcp_servers"]["second-brain"]["command"] == "user-node"
+        assert loaded["mcp_servers"]["new-server"]["command"] == "new-bin"
+        assert config_path.read_text().count("[mcp_servers.second-brain]") == 1
+
+
+class TestTomlSyntaxValidationGuard:
+    def test_tomllib_guard_aborts_write_on_invalid_toml(self, tmp_path, monkeypatch):
+        from hermes_cli import codex_runtime_plugin_migration as crpm
+        # Simulate a bug in rendering that would produce broken TOML
+        monkeypatch.setattr(crpm, "render_codex_toml_section", lambda *a, **kw: "invalid toml = [ unclosed\n")
+        report = crpm.migrate(
+            {"mcp_servers": {"x": {"command": "y"}}},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+            default_permission_profile=None,
+        )
+        assert report.written is False
+        assert any("syntax validation" in e for e in report.errors)
+        assert not (tmp_path / "config.toml").exists()
+
+
+class TestEndToEndRealWorldRepro:
+    def test_duplicate_second_brain_reproduction_and_idempotency(self, tmp_path):
+        """Replay the exact failure scenario where ~/.codex/config.toml had an
+        existing [mcp_servers.second-brain] in unmanaged section and another in
+        managed section. Migration must deduplicate it into a valid config and
+        remain completely idempotent upon successive runs."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""\
+model = "gpt-5.6-sol"
+model_reasoning_effort = "ultra"
+service_tier = "priority"
+notify = ["/Applications/SkyComputerUseClient", "turn-ended"]
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+model_provider = "custom"
+
+# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section
+
+default_permissions = ":workspace"
+
+[mcp_servers.hermes-tools]
+command = "/venv/bin/python3"
+args = ["-m", "agent.transports.hermes_tools_mcp_server"]
+env = { HERMES_QUIET = "1", HERMES_REDACT_SECRETS = "true" }
+
+[mcp_servers.second-brain]
+command = "node"
+args = ["/Users/mac/second-brain-mcp/index.js"]
+
+# end hermes-agent managed section
+
+[plugins]
+
+[projects."/Users/mac/personal-dev"]
+trust_level = "trusted"
+
+[features]
+memories = true
+
+[mcp_servers]
+
+[mcp_servers.second-brain]
+command = "node"
+args = ["/Users/mac/second-brain-mcp/index.js"]
+
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+NODE_REPL_TIMEOUT = "1000"
+""")
+
+        hermes_cfg = {
+            "mcp_servers": {
+                "second-brain": {
+                    "command": "node",
+                    "args": ["/Users/mac/second-brain-mcp/index.js"],
+                }
+            }
+        }
+
+        # Run 1: Migrate
+        report1 = migrate_codex_config(
+            hermes_cfg,
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=True,
+            default_permission_profile=":workspace",
+        )
+        assert report1.written is True
+        assert report1.errors == []
+        assert "second-brain" in report1.reconciled_user_servers
+
+        import tomllib
+        content1 = config_path.read_text()
+        loaded1 = tomllib.loads(content1)
+        assert content1.count("[mcp_servers.second-brain]") == 1
+        assert content1.count("[mcp_servers.node_repl]") == 1
+        assert content1.count("[mcp_servers.node_repl.env]") == 1
+        assert loaded1["mcp_servers"]["second-brain"]["command"] == "node"
+        assert loaded1["mcp_servers"]["node_repl"]["command"] == "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+        assert loaded1["features"]["memories"] is True
+        assert loaded1["projects"]["/Users/mac/personal-dev"]["trust_level"] == "trusted"
+
+        # Run 2: Idempotent re-run
+        report2 = migrate_codex_config(
+            hermes_cfg,
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=True,
+            default_permission_profile=":workspace",
+        )
+        assert report2.written is True
+        assert report2.errors == []
+        content2 = config_path.read_text()
+        assert content2 == content1
+
