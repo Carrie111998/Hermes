@@ -132,6 +132,50 @@ class TestReasoningCommand:
 
         assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "xhigh"}
 
+    def test_session_override_clears_skill_record_no_stale_fire(self, tmp_path, monkeypatch):
+        """Review blocker #3 regression: with a session override active, a
+        skill record viewed during the override period must be consumed
+        (cleared), not left to fire stale once the override is removed.
+
+        Sequence from the review:
+          1. Session override active.
+          2. A turn views a skill; its record is written.
+          3. The override is cleared.
+          4. The next resolution must NOT apply the stale skill from the
+             override period.
+        """
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: medium\n  reasoning_by_skill_optin: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        from tools import skills_tool as st
+
+        runner = _make_runner()
+        source = _make_event("/reasoning").source
+        session_key = runner._session_key_for_source(source)
+        # Active session override.
+        runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "xhigh"}
+
+        # A turn views a skill with an xhigh suggestion (the task id = session key).
+        st.record_active_skill(session_key, "plan", "xhigh")
+
+        # Resolve while the override is active: override wins, skill is consumed.
+        result = runner._resolve_session_reasoning_config(source=source, task_id=session_key)
+        assert result == {"enabled": True, "effort": "xhigh"}
+
+        # The skill record must have been consumed (cleared) by the above call.
+        assert st.active_skill_reasoning(session_key) is None
+
+        # Clear the override; the next resolve must fall back to global (medium),
+        # NOT fire the stale plan skill.
+        del runner._session_reasoning_overrides[session_key]
+        result = runner._resolve_session_reasoning_config(source=source, task_id=session_key)
+        assert result == {"enabled": True, "effort": "medium"}
+
 
     def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"

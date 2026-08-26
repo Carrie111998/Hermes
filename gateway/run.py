@@ -9463,7 +9463,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _load_reasoning_config(
-        model: str = "", task_id: Optional[str] = None
+        model: str = "",
+        active_skill: Optional[Tuple[str, Optional[str]]] = None,
     ) -> dict | None:
         """Load reasoning effort from config.yaml, respecting per-model overrides.
 
@@ -9472,32 +9473,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         global ``agent.reasoning_effort``; YAML boolean False = disabled).
         Closes #21256.
 
-        When ``task_id`` is supplied (== session id) and that session has a
-        currently active skill declaring a reasoning suggestion, the skill's
-        suggestion (and any user ``agent.reasoning_by_skill`` override) are
-        honored per the chokepoint's priority.
+        ``active_skill`` is an already-consumed ``(skill_name, reasoning)``
+        pair (or None) for the current turn. It is NOT consumed here — the
+        atomic consume happens exactly once at turn admission in
+        :meth:`_resolve_session_reasoning_config`, regardless of which
+        precedence rung wins (addresses review blocker #3: a session override
+        must not leave an unconsumed skill record to fire stale on a later turn).
 
         Args:
             model: The effective model for the calling session. When empty,
                    the config's ``model.default`` is used.
-            task_id: The session's task id (== session id). When set, the
-                     active-skill suggestion is looked up and passed through.
+            active_skill: Consumed ``(skill_name, reasoning)`` for this turn.
         """
         from hermes_constants import resolve_reasoning_config
         cfg = _load_gateway_runtime_config()
-        active_skill = None
-        if task_id:
-            try:
-                from tools.skills_tool import active_skill_reasoning, reset_active_skill_reasoning
-                active_skill = active_skill_reasoning(str(task_id))
-                # Consume-and-clear: skill views recorded during the PREVIOUS
-                # turn are read here (the one-turn lag), then cleared so a
-                # skill viewed once does not stick for every future turn of the
-                # session. Without this the registry never resets and the
-                # suggestion lingers until restart (review comment on #93378).
-                reset_active_skill_reasoning(str(task_id))
-            except Exception:
-                active_skill = None
         return resolve_reasoning_config(cfg, model, active_skill=active_skill)
 
     @staticmethod
@@ -9543,9 +9532,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``model`` should be the session's *effective* model (session ``/model``
         override included) so per-model overrides track what the session
         actually runs — when empty, the config's ``model.default`` is used.
-        ``task_id`` (== session id) is passed through to look up the active
-        skill's suggestion.
+        ``task_id`` (== session id) is used to atomically consume (pop) the
+        active-skill suggestion for this turn, exactly once, at admission —
+        before the session-override check — so no precedence rung can leave a
+        stale skill record for a later turn (addresses review blocker #3).
         """
+        # Atomic consume-once at turn admission: pop the active-skill record
+        # (single locked op) regardless of which precedence rung wins. If a
+        # session override is present below, the consumed skill is ignored for
+        # THIS turn but still cleared so it cannot fire stale later.
+        active_skill = None
+        if task_id:
+            try:
+                from tools.skills_tool import pop_active_skill_reasoning
+                active_skill = pop_active_skill_reasoning(str(task_id))
+            except Exception:
+                active_skill = None
+
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -9557,7 +9560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
-        return self._load_reasoning_config(model, task_id=task_id)
+        return self._load_reasoning_config(model, active_skill=active_skill)
 
     def _set_session_reasoning_override(
         self,

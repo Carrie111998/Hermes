@@ -2214,6 +2214,27 @@ def reset_active_skill_reasoning(task_id: str | None = None) -> None:
             _active_skill_reasoning.pop(str(task_id), None)
 
 
+def pop_active_skill_reasoning(
+    task_id: str | None,
+) -> Optional[Tuple[str, Optional[str]]]:
+    """Atomically return AND clear the most-recently-viewed skill for a task.
+
+    Single locked ``pop`` so consume-and-reset is one operation — a record
+    arriving between a separate read() and reset() can no longer be discarded.
+    Returns ``(skill_name, reasoning)`` or None when no skill was recorded.
+    (Addresses review blocker #3: the consume must be atomic, not read-then-reset.)
+    """
+    if not task_id:
+        return None
+    with _active_skill_reasoning_lock:
+        task_list = _active_skill_reasoning.get(str(task_id))
+        if not task_list:
+            return None
+        item = task_list[-1]
+        del task_list[:]
+        return item
+
+
 def _record_active_skill_from_view(task_id, name, parsed_payload: dict) -> None:
     """Record the active skill + reasoning from a successful skill_view payload."""
     if not isinstance(parsed_payload, dict) or not parsed_payload.get("success"):
