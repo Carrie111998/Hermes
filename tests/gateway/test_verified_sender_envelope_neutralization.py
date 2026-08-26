@@ -125,6 +125,16 @@ def test_default_ignorable_marker_intrusions_are_removed_from_fields(intrusion):
 
 
 @pytest.mark.parametrize(
+    "intrusion", ["\t", "\v", "\f", "\r", "\x1c", "\x1d", "\x1e", "\x1f", "\x85"]
+)
+def test_reader_whitespace_controls_are_folded_in_authenticated_fields(intrusion):
+    """Display-name fields use the body's reader-equivalent whitespace set."""
+    result = neutralize_untrusted_envelope_field(f"Mallory{intrusion}Boss")
+
+    assert result == "Mallory Boss"
+
+
+@pytest.mark.parametrize(
     "opener",
     ["<@U_BOSS>", "<!subteam^S0BOSS>", "<#C0BOSS>", "<!here>", "<!channel>"],
 )

@@ -224,7 +224,7 @@ async def test_shared_discord_turn_includes_trusted_sender_id_without_dm_noise()
 
 
 @pytest.mark.asyncio
-async def test_shared_turn_without_trusted_sender_id_uses_unverified_name_prefix():
+async def test_shared_turn_without_trusted_sender_id_marks_identity_unavailable():
     runner = _shared_runner(Platform.DISCORD)
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -244,7 +244,10 @@ async def test_shared_turn_without_trusted_sender_id_uses_unverified_name_prefix
         history=[],
     )
 
-    assert text == "[Anonymous Admin] status update"
+    assert text == (
+        "[Verified sender: unavailable | no authenticated sender ID] status update"
+    )
+    assert "Anonymous Admin" not in text
 
 
 @pytest.mark.asyncio

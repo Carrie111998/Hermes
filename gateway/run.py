@@ -1623,12 +1623,26 @@ def _fold_envelope_match_character(character: str) -> Optional[str]:
     return character.translate(_ENVELOPE_LOOKALIKE_FOLD)
 
 
-def _iter_verified_sender_marker_starts(text: str):
+def _iter_verified_sender_marker_starts(
+    text: str, *, reset_at_line_breaks: bool = True
+):
     """Yield original offsets of look-alike/ignorable-tolerant markers."""
     marker_state = 0
     marker_start: Optional[int] = None
     marker_length = len(_VERIFIED_SENDER_MARKER)
     for original_index, original_character in enumerate(text):
+        # Newline-like Cc whitespace is reader-equivalent to a break, not an
+        # inline gap. Reset before folding so an envelope marker can never
+        # straddle a rendered line boundary. The production reduction applies
+        # the same rule after normalizing _ENVELOPE_LINE_BREAKS to ``\n``.
+        if original_character == "\n":
+            marker_state = 0
+            marker_start = None
+            continue
+        if reset_at_line_breaks and original_character in _ENVELOPE_LINE_BREAKS:
+            marker_state = 0
+            marker_start = None
+            continue
         folded_character = _fold_envelope_match_character(original_character)
         if folded_character is None:
             continue
@@ -1675,17 +1689,39 @@ def _strip_verified_sender_envelopes(text: str) -> str:
     without rescanning the retained prefix. Every character is appended once and
     removed at most once, so arbitrary nesting is handled in amortized O(n) time.
 
-    Matching folds fullwidth structure and Unicode space separators, and skips
-    default-ignorable marker intrusions. Deletion still uses offsets recorded
-    against the original stream, so benign text is returned byte-identically.
+    Matching folds fullwidth structure plus reader-equivalent ``Zs``/``Cc``
+    whitespace, and skips default-ignorable marker intrusions. Newline-like
+    whitespace resets the marker state after normalization rather than acting
+    as an inline gap, so a forgery cannot straddle a line. Deletion still uses
+    offsets recorded against the original stream, so benign text is returned
+    byte-identically.
 
     Content that legitimately quotes the envelope shape loses only the quoted
     envelope, exactly as it already does when quoted at the top of a message.
     """
     if not text:
         return text
-    if next(_iter_verified_sender_marker_starts(text), None) is None:
-        return text
+    marker_start = next(_iter_verified_sender_marker_starts(text), None)
+    if marker_start is None:
+        # The strict scanner resets at renderer line breaks so deletion can
+        # never capture across lines. A second, relaxed detection pass exists
+        # only to make normalization unconditional for a marker split by a raw
+        # VT/FF/CR/record-separator/NEL control. Without it, the early-out would
+        # leak that control verbatim unless an unrelated valid envelope later
+        # in the turn happened to activate normalization. The relaxed pass does
+        # not authorize deletion: after normalization the strict scanner below
+        # still resets at the resulting ``\n``. Benign text with no marker-like
+        # candidate therefore remains byte-identical.
+        has_line_split_marker = (
+            any(ch in text for ch in _ENVELOPE_LINE_BREAKS)
+            and next(
+                _iter_verified_sender_marker_starts(text, reset_at_line_breaks=False),
+                None,
+            )
+            is not None
+        )
+        if not has_line_split_marker:
+            return text
     normalized = text.replace("\r\n", "\n")
     if any(ch in normalized for ch in _ENVELOPE_LINE_BREAKS):
         normalized = normalized.translate(
@@ -18794,6 +18830,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
+        _verified_sender_envelope: Optional[str] = None
         if _is_shared_multi_user:
             _has_trusted_sender_id = bool(source.user_id or source.user_id_alt)
             # Strip any user-supplied copy of Hermes' canonical sender envelope
@@ -18848,15 +18885,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _sender_parts.append(
                         f"user_id_alt {_envelope_sender_id(source.user_id_alt)}"
                     )
-                message_text = (
-                    f"[Verified sender: {' | '.join(_sender_parts)}] {message_text}"
+                _verified_sender_envelope = (
+                    f"[Verified sender: {' | '.join(_sender_parts)}]"
                 )
-            elif source.user_name:
-                message_text = f"[{_safe_user_name}] {message_text}"
+            else:
+                # A display name without either stable sender namespace is not
+                # an authenticated identity. Shared sessions still require one
+                # leading gateway envelope so the wire contract is invariant,
+                # but it must state the absence rather than vouch for the name.
+                _verified_sender_envelope = (
+                    "[Verified sender: unavailable | no authenticated sender ID]"
+                )
 
-        # Prepend channel context from history backfill (if any).  This
-        # happens after sender-prefix so the prefix only applies to the
-        # trigger message, not the backfill block.
+        # Prepend channel context from history backfill (if any). The verified
+        # sender envelope is deliberately deferred until every enrichment is
+        # complete, so this untrusted block can never displace it from the true
+        # leading position.
         #
         # The backfill is other participants' verbatim text, so it must go
         # through the same envelope strip as the trigger body: it is
@@ -19217,15 +19261,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return None
                 if _ctx_result.expanded:
                     # Expansion appends fetched file/folder/URL content to the
-                    # turn AFTER the gateway minted its envelope, so the
-                    # attached block is untrusted text on the trusted side of
-                    # the strip. Only the appended tail is filtered: the
-                    # already-sanitized prefix (which carries our genuine
-                    # attestation) is preserved byte-identically. If the
-                    # expander ever stops preserving that prefix, the fallback
-                    # filters the whole message — losing our own envelope is a
-                    # fail-CLOSED degradation, whereas keeping a forged one
-                    # would not be.
+                    # turn before the gateway attaches its envelope. Only the
+                    # appended tail is filtered when the expander preserves the
+                    # already-sanitized prefix; otherwise filter the whole
+                    # expanded message fail-closed.
                     _expanded_message = _ctx_result.message
                     _sanitized_prefix = message_text.strip()
                     if _expanded_message.startswith(_sanitized_prefix):
@@ -19241,6 +19280,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.warning("@ context reference expansion failed: %s", exc)
                 logger.debug("@ context reference expansion failure detail", exc_info=True)
+
+        if _verified_sender_envelope is not None:
+            message_text = f"{_verified_sender_envelope} {message_text}"
 
         return message_text
 

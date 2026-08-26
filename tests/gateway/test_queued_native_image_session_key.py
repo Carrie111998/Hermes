@@ -147,7 +147,9 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     queued_message = CaptureQueuedNativeImageAgent.calls[1]
     assert isinstance(queued_message, list)
     assert queued_message[0]["type"] == "text"
-    assert queued_message[0]["text"].startswith("describe this")
+    assert queued_message[0]["text"].startswith(
+        "[Verified sender: unavailable | no authenticated sender ID] describe this"
+    )
     assert any(part.get("type") == "image_url" for part in queued_message)
 
 
