@@ -15,6 +15,21 @@
  * bot-initiated sends use `hermes -p <bot> chat --in ~ -c "Bot Chat"`.
  */
 
+// Blobatar's motion sheet. The SDK exports the COMPONENT but deliberately not
+// this stylesheet, so every consumer that wants moving faces pulls it itself
+// and consumers that render none pay nothing. Without it `animate` is a no-op
+// and the faces render correct but static — no error, so the symptom is
+// "nothing moves", not a crash.
+//
+// This plugin is a BUNDLED one (vite glob in contrib/plugins.ts), which is the
+// only reason it can say this at all: runtime plugins loaded from the disk
+// door may import `@hermes/plugin-sdk` and `react` and nothing else
+// (contrib/runtime-loader.ts), so they cannot pull the sheet themselves. That
+// makes this import load-bearing beyond this plugin — while Bot Mode is
+// enabled, it is what animates any runtime plugin's faces too, and disabling
+// Bot Mode stops them. See the `Blobatar` export docs in the SDK.
+import 'blobatar/motion.css'
+
 import * as sdk from '@hermes/plugin-sdk'
 import {
   atom,
@@ -79,6 +94,50 @@ const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
 // Deterministic blob avatars (name → face). Feature-detected: older SDKs
 // without the export fall back to the legacy math-face shapes below.
 const blobatarSvg = typeof sdk === 'undefined' ? undefined : sdk.blobatarSvg
+// The React component is the only renderer that animates — `blobatarSvg`
+// ignores `animate` by design (it has no element to hang the motion classes
+// and custom properties on). Feature-detected the same way: SDKs that export
+// the string renderer but not the component still get static faces.
+const Blobatar = typeof sdk === 'undefined' ? undefined : sdk.Blobatar
+// Stored ids of every chat that is mid-turn, not just the focused one —
+// `host.state.busy` is a single bit and `host.state.gateway` is socket state
+// that never reads 'busy'. Feature-detected: older desktops get worker
+// liveness only.
+const $workingChats = host.state.workingStoredSessionIds || atom([])
+/** Stored ids whose busy bit has gone silent past the stream watchdog. A turn
+ *  that dies without a terminal frame and without dropping its socket strands
+ *  `busy` true forever; this is the witness that says so. Older desktops
+ *  publish no such atom and fall back to the flag alone. */
+const $stalledChats = host.state.stalledStoredSessionIds || atom([])
+
+/** Stored ids this bot's own chats answer to — registry row and lineage tip
+ *  both, since a surface holds whichever one it opened. */
+function botChatIds(bot) {
+  return [
+    bot?.canonical_session?.id,
+    bot?.canonical_session?.resolved_id,
+    bot?.last_session?.id,
+    bot?.last_session?.resolved_id
+  ]
+    .filter(Boolean)
+    .map(String)
+}
+
+/** True when any of this bot's own chats is in `ids`. */
+function botOwnsChat(bot, ids) {
+  return Boolean(ids?.length) && botChatIds(bot).some(id => ids.includes(id))
+}
+
+/** True when one of this bot's own chats is mid-turn. */
+function botOwnsWorkingChat(bot, workingIds) {
+  return botOwnsChat(bot, workingIds)
+}
+
+/** True when one of this bot's own chats is busy-but-silent (see
+ *  $stalledChats): the flag still claims a turn, the stream stopped agreeing. */
+function botOwnsStalledChat(bot, stalledIds) {
+  return botOwnsChat(bot, stalledIds)
+}
 // Budgeted render loop (fps cap + observability pause + dormancy + teardown).
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
@@ -113,10 +172,58 @@ const $lastSources = atom([])
  *  delivery path: RPC, CLI (bot-to-bot), cron runs, other machines. */
 const $botUnread = atom({})
 
-// last_active watermark per source-qualified bot, seeded on first poll so a
-// fresh mount doesn't mark ancient history unread.
+// SEEN watermark per source-qualified bot: the newest last_active this bot
+// has been acknowledged at — on screen, opened, or already badged. Seeded on
+// the first poll so a fresh mount doesn't badge ancient history.
+//
+// Seen, not merely observed: advancing this before deciding whether to badge
+// let one wrong suppression eat the edge for good. Only the paths that
+// account for the activity advance it (see trackInboundActivity).
 const rosterWatermarks = new Map()
 let watermarksSeeded = false
+
+/** The bot whose chat is on screen (as its botSelectionKey), or null.
+ *
+ *  Two tiers, both keyed by ID rather than by profile. Canonical Bot Chats are
+ *  hidden sessions, so every profile atom degrades to the gateway socket's
+ *  home — a different bot than the one on screen whenever focus moved without
+ *  swapping the socket, which is the whole bug.
+ *
+ *  1. the plugin's own open claim, when a roster click placed it;
+ *  2. the focused stored session id, for focus that arrived any other way
+ *     (a tab) — the claim is released on that edge, so tier 1 is empty. */
+function onScreenBotKey(roster) {
+  const rows = roster || []
+  const claim = $openBotChat.get()?.key
+  const claimed = claim ? rows.find(row => botRosterKey(row) === claim) : null
+
+  if (claimed) {
+    return botSelectionKey(claimed)
+  }
+
+  const focused = host.state.focusedStoredSessionId?.get?.()
+  const focusedId = focused ? String(focused) : ''
+  const owner = focusedId ? rows.find(row => botChatIds(row).includes(focusedId)) : null
+
+  return owner ? botSelectionKey(owner) : null
+}
+
+/** Fallback when the open claim is empty. $selectedBot follows the socket's
+ *  home and roster clicks, so treat a true here as unconfirmed — and require
+ *  that SOME chat owns the center, or the Bots home would suppress a badge
+ *  with no chat on screen at all. */
+function isGuessedOnScreen(key) {
+  return $botChatFocused.get() && $selectedBot.get() === key
+}
+
+/** Mark this bot's known activity as seen. Clearing the unread flag alone is
+ *  not enough: a pending edge would be re-raised by the next poll. */
+function acknowledgeBotActivity(bot) {
+  const key = botSelectionKey(bot)
+  const ts = botActivitySession(bot)?.last_active || 0
+
+  rosterWatermarks.set(key, Math.max(rosterWatermarks.get(key) || 0, ts))
+}
 
 /** User pref: toast on every new bot activity. Default OFF — a busy roster
  *  (cron runs, bot-to-bot chatter) turns the toasts into a firehose, and the
@@ -143,23 +250,48 @@ function trackInboundActivity(roster) {
   const seeding = !watermarksSeeded
   watermarksSeeded = true
 
+  // Resolved once per poll: the open claim is authoritative when it lands.
+  const onScreen = onScreenBotKey(roster)
+
   for (const bot of roster) {
     const key = botSelectionKey(bot)
     const activity = botActivitySession(bot)
     const ts = activity?.last_active || 0
     const prev = rosterWatermarks.get(key) || 0
-    rosterWatermarks.set(key, Math.max(prev, ts))
+    const acknowledge = () => rosterWatermarks.set(key, Math.max(prev, ts))
 
     if (seeding || ts <= prev) {
+      acknowledge()
       continue
     }
 
-    // Activity in the exact bot owner the user is currently looking at is
-    // already visible — never badge the open chat or its same-named twin.
-    if ($selectedBot.get() === key) {
+    // Never badge the chat that is already on screen. The open claim is
+    // exclusive: once a bot chat owns the workspace every other bot is off
+    // screen. $selectedBot is only the fallback when none does.
+    if (onScreen !== null ? onScreen === key : isGuessedOnScreen(key)) {
+      // Only a trusted verdict acknowledges. A wrong guess that stays
+      // pending costs one stale badge; one that advances costs the reply.
+      if (onScreen !== null) {
+        acknowledge()
+      }
+
       continue
     }
 
+    // The user's own message moves `last_active` too, so a watermark alone
+    // badges an agent the instant you write TO it — "new" on a reply that
+    // hasn't happened. Only somebody else's message is unread: the agent's
+    // own turn, or another bot's delivery (stored with role 'user' behind
+    // the A2A prefix). Older gateways omit last_role; there the watermark
+    // is all there is and the previous behavior stands.
+    const lastRole = String(activity?.last_role || '').toLowerCase()
+
+    if (lastRole === 'user' && !A2A_PREFIX_RE.test((activity?.preview || '').trim())) {
+      acknowledge()
+      continue
+    }
+
+    acknowledge()
     $botUnread.set({ ...$botUnread.get(), [key]: true })
 
     // Roster-hidden bots stay quiet: the unread flag above accumulates
@@ -2719,16 +2851,38 @@ async function deleteBot(bot) {
 // the root's overflow:hidden clips it, and NOTHING scrolls (#88). Capping
 // the viewport itself (inheriting the root's max-height) makes it the real
 // scroll container; lists shorter than the cap still shrink to fit.
-if (typeof document !== 'undefined' && !document.getElementById('hermes-bots-roster-css')) {
-  const style = document.createElement('style')
+// Written every time this module evaluates, not only when the tag is missing:
+// guarding on `getElementById` meant a reload kept whatever CSS the previous
+// evaluation had installed, so an edited rule silently never took effect until
+// the whole app restarted.
+if (typeof document !== 'undefined') {
+  const style = document.getElementById('hermes-bots-roster-css') || document.createElement('style')
   style.id = 'hermes-bots-roster-css'
-  style.textContent =
+  const css =
     '.hermes-bots-roster [data-radix-scroll-area-viewport] > div {' +
     ' display: block !important; width: 100%; min-width: 0; }' +
     '.hermes-scroll-cap > [data-radix-scroll-area-viewport] { max-height: inherit; }' +
-    '@keyframes hermes-bots-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }' +
-    '.hermes-bots-pulse { animation: hermes-bots-pulse 1.2s ease-in-out infinite; }'
-  document.head.appendChild(style)
+    // Typing indicator under a working bot's face. Three dots on one clock,
+    // staggered by delay — the chat-composer idiom, so "this bot is mid-turn"
+    // reads without a legend. The blanket prefers-reduced-motion rule in the
+    // app's stylesheet parks all three at their resting opacity.
+    '@keyframes hermes-bots-typing {' +
+    ' 0%,70%,100% { opacity: 0.35; transform: translateY(0); }' +
+    ' 35% { opacity: 1; transform: translateY(-2px); } }' +
+    '.hermes-bots-typing > span { animation: hermes-bots-typing 1.25s ease-in-out infinite; }' +
+    '.hermes-bots-typing > span:nth-child(2) { animation-delay: 0.16s; }' +
+    '.hermes-bots-typing > span:nth-child(3) { animation-delay: 0.32s; }'
+
+  // Compared rather than assigned blind: an unchanged sheet skips a re-parse
+  // on every HMR cycle, and an EDITED one still differs, so the reload
+  // guarantee above is untouched.
+  if (style.textContent !== css) {
+    style.textContent = css
+  }
+
+  if (!style.isConnected) {
+    document.head.appendChild(style)
+  }
 }
 
 const AVATAR_SHAPES = ['circle', 'squircle', 'pill', 'triangle', 'hexagon', 'cloud', 'drop']
@@ -2858,6 +3012,28 @@ function blobShapeString(seedPart, kind) {
   return seedPart ? `blobatar:${seedPart}` : 'blobatar'
 }
 
+/** The blob's core body spans ~62–76 of its 100-unit frame, so a blobatar drawn
+ *  at the avatar box size reads noticeably smaller than the legacy math face,
+ *  which fills its own viewBox. Overdraw it and let the frame's empty margin
+ *  fall outside the layout box: same slot in every row, a creature that matches
+ *  the old faces' visual weight.
+ *
+ *  1.25 and not more: measured against a 34px row slot, it puts the drawn ink
+ *  at 21–32px across the ten silhouettes, bracketing the legacy face's 27.5px
+ *  with a margin left on every side. At 1.34 the widest silhouette (capsule)
+ *  measured 33.8px — flush against both edges of its own box, which is what
+ *  made a mixed roster look ragged. */
+const BLOB_OVERDRAW = 1.25
+
+const blobPx = size => Math.round(size * BLOB_OVERDRAW)
+
+/** Trait pins for a shape string — the silhouette when one is pinned, nothing
+ *  when the name still decides. */
+function blobOpts(shape, name) {
+  const { seed, kind } = parseBlobShape(shape, name)
+  return { seed, traits: kind ? { shape: BLOB_KIND_TRAIT[kind] } : undefined }
+}
+
 /** Static SVG markup for a blob face, tagged data-bot-face so the roster's
  *  PNG backfill (pushLocalAvatars → rasterizeSvgToPng) still finds it. */
 function blobMarkup(shape, name, size) {
@@ -2865,11 +3041,11 @@ function blobMarkup(shape, name, size) {
     return null
   }
 
-  const { seed, kind } = parseBlobShape(shape, name)
+  const { seed, traits } = blobOpts(shape, name)
   const opts = { size }
 
-  if (kind) {
-    opts.traits = { shape: BLOB_KIND_TRAIT[kind] }
+  if (traits) {
+    opts.traits = traits
   }
 
   try {
@@ -3480,7 +3656,7 @@ function stopFaceClock() {
  * Live math face. Photos still use <img>. Shape avatars stay SVG so
  * the clock can move them (a baked PNG cannot).
  */
-function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle' }) {
+function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle', overdraw = true, animate = 'hover' }) {
   startFaceClock()
 
   if (image) {
@@ -3493,11 +3669,67 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
   }
 
   // Blobatar shapes: the library draws the whole face (body + eyes + its own
-  // name-derived palette). Inline SVG via innerHTML so the roster PNG
-  // backfill's `svg[data-bot-face=…]` query still finds it; the math clock
-  // ignores it (no data-hb-math). Falls back to the legacy math face when the
-  // SDK predates the export.
+  // name-derived palette) and owns its own motion — the math clock ignores it
+  // (no data-hb-math). The library gates the whole layer on
+  // prefers-reduced-motion.
+  //
+  // `animate` defaults to 'hover' — one creature alive at a time, the
+  // library's own recommendation, and the right call at the sizes most call
+  // sites draw at. Callers that own a face big enough to read as an identity
+  // rather than a swatch pass 'always': the roster rows and the create/edit
+  // preview.
+  //
+  // No mid-turn pose: the roster's typing dots already say "working", and a
+  // creature that also changes expression under them is two motions competing
+  // for the same beat. The dots win — they read faster and they read the same
+  // on every silhouette. `mood` still drives the legacy math face below.
+  //
+  // `data-bot-face` rides along so the roster PNG backfill's
+  // `svg[data-bot-face=…]` query still finds it. Serializing an animated blob
+  // is safe: the pose lives in CSS custom properties and the base fills stay on
+  // the markup, so the rasterized still is the idle face.
   if (isBlobShape(shape)) {
+    if (Blobatar) {
+      const { seed, traits } = blobOpts(shape, name)
+      // `overdraw: false` for callers whose frame hugs the face — the group
+      // row's ringed avatar stack, where a creature drawn past its box has the
+      // next member's ring cutting across it.
+      const drawn = overdraw ? blobPx(size) : size
+
+      // Centering is absolute, NOT grid/flex `place-items: center`: when a
+      // child overflows its alignment container, Chrome falls back to `start`
+      // to protect the overflowing edge from being scrolled away — so an
+      // overdrawn blob sat down-and-right of its slot, crowding the name text
+      // by the full overdraw instead of spilling evenly.
+      return jsx('span', {
+        'aria-hidden': true,
+        style: {
+          width: size,
+          height: size,
+          display: 'block',
+          position: 'relative',
+          lineHeight: 0,
+          // The hover lift and the overdraw both reach past the box.
+          overflow: 'visible'
+        },
+        children: jsx(Blobatar, {
+          name: seed,
+          size: drawn,
+          traits,
+          animate,
+          'data-bot-face': name,
+          style: {
+            display: 'block',
+            position: 'absolute',
+            left: '50%',
+            top: '50%',
+            transform: 'translate(-50%, -50%)',
+            overflow: 'visible'
+          }
+        })
+      })
+    }
+
     const markup = blobMarkup(shape, name, size)
 
     if (markup) {
@@ -5839,9 +6071,16 @@ async function openRosterBot(bot) {
 
   $groupChatWorkspace.set(null)
 
-  if ($botUnread.get()[key]) {
+  // botSelectionKey, not botRosterKey — that is what sets and reads the flag,
+  // and the two differ for a plain local bot.
+  const unreadKey = botSelectionKey(bot)
+
+  // Unconditional: a pending edge would otherwise badge the chat just opened.
+  acknowledgeBotActivity(bot)
+
+  if ($botUnread.get()[unreadKey]) {
     const next = { ...$botUnread.get() }
-    delete next[key]
+    delete next[unreadKey]
     $botUnread.set(next)
   }
 
@@ -8220,7 +8459,7 @@ const BOT_ROSTER_SEARCH_THRESHOLD = 8
  *  Canonical Bot Chats are hidden from the session list by design, so
  *  last_session alone never sees them: a bot you talk to all day through its
  *  Bot Chat reads "6d ago" because its newest VISIBLE session is a week old.
- *  Every activity signal (age label, pulse dot, unread watermark, recency
+ *  Every activity signal (age label, typing dots, unread watermark, recency
  *  sort) keys off this helper. Older gateways without the canonical_session
  *  field degrade to last_session unchanged. */
 function botActivitySession(bot) {
@@ -8339,22 +8578,57 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
   const { shape, color, image } = botAppearance(bot.name, meta)
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
-  const gatewayState = useValue(host.state.gateway)
+  const workingChats = useValue($workingChats)
+  const stalledChats = useValue($stalledChats)
   // Preview identity must match click identity (#88200): when the backend
   // resolved the pinned canonical chat, preview THAT session — not the
   // profile's most recent (but unrelated) activity. Activity signals
-  // (age label, pulse dot) follow the same rule via botActivitySession:
+  // (age label, typing dots) follow the same rule via botActivitySession:
   // the canonical Bot Chat is hidden from last_session, so keying age off
   // last_session alone shows "6d ago" on a bot you just messaged.
   const previewSession = bot.canonical_session || last
   const activitySession = botActivitySession(bot)
   // A live kanban/tool worker counts as activity (#90268): fresh age while it
   // runs, falling back to chat activity when it ends.
-  const workerActive = workerActiveAt(bot)
-  const rowAgeTs = workerActive
-    ? Math.max(activitySession?.last_active || 0, bot.worker_session?.last_active || 0)
-    : activitySession?.last_active || 0
-  const botMood = workerActive || (isGatewayHome && gatewayState === 'busy') ? 'work' : 'idle'
+  const chatTs = activitySession?.last_active || 0
+  const workerTs = bot.worker_session?.last_active || 0
+  const workerLive = workerActiveAt(bot)
+  const rowAgeTs = workerLive ? Math.max(chatTs, workerTs) : chatTs
+  // A worker only means "still working" while it is fresher than the bot's own
+  // last message. The gateway reports the newest tool/kanban row whether or not
+  // it is alive, and WORKER_ACTIVE_WINDOW_S is heartbeat tolerance, not proof —
+  // so a finished turn's tool row would otherwise hold the dots for 150s.
+  const workerWorking = workerLive && workerTs > chatTs
+  // MID-TURN, not "recently active". Keyed to this bot's OWN chat, not to
+  // focus: every earlier cut pinned one global turn bit to one bot, so only
+  // the focused row could ever show work.
+  //
+  // `busy` alone is not enough, because it is only OBSERVABLE for the bot
+  // whose gateway the renderer is streaming. Every bot runs its own `serve`
+  // process, so a background bot's turn-end (and its session.reclaimed) never
+  // arrives and its busy flag is stranded true forever — the same stranding
+  // reconcileBusyStatesOnReconnect describes for dead runtime ids.
+  //
+  // The roster poll reaches every profile every 5s, so it is the witness that
+  // always arrives: once it reports the newest message is the assistant's,
+  // the turn that produced it is over. An older gateway sends no last_role,
+  // and there the flag still governs on its own.
+  const answered = String(activitySession?.last_role || '').toLowerCase() === 'assistant'
+  // The roster poll only witnesses turns that PRODUCED something. A turn that
+  // dies before any assistant message — no terminal frame, no socket drop, so
+  // neither the stream's error path nor reconcileBusyStatesOnReconnect fires —
+  // leaves `last_role` on 'user' and `busy` stranded true, and the dots run
+  // forever. The stream watchdog is the witness that always arrives there.
+  //
+  // Deliberately NOT a timeout on message age: a healthy long turn (typecheck,
+  // full test run) is silent in the transcript for minutes and is exactly the
+  // turn worth indicating. Stalled means the STREAM went quiet, not the
+  // transcript.
+  const stalled = botOwnsStalledChat(bot, stalledChats)
+  const working = workerWorking || (!answered && !stalled && botOwnsWorkingChat(bot, workingChats))
+  // Legacy math face follows the same signal; blobatars stay idle and let
+  // the dots carry it.
+  const botMood = working ? 'work' : 'idle'
   // Subscribe on every render. A source switch turns the same keyed row from
   // thin to rich; conditionally calling useValue here breaks React hook order.
   const unreadByName = useValue($botUnread)
@@ -8429,16 +8703,51 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
     ),
     'aria-label': rowTooltip,
     children: [
-      jsx('div', {
-        className: cn('shrink-0', !sourceStatus.available && 'grayscale opacity-60'),
-        children: jsx(BotFace, {
-          shape,
-          color,
-          image: photo ? image : null,
-          size: 34,
-          name: bot.name,
-          mood: botMood
-        })
+      jsxs('div', {
+        // `relative` anchors the unread dot and typing pill to the face; the
+        // graying rides the same wrapper so marks dim with the creature.
+        className: cn('relative shrink-0', !sourceStatus.available && 'grayscale opacity-60'),
+        children: [
+          jsx(BotFace, {
+            shape,
+            color,
+            image: photo ? image : null,
+            size: 34,
+            name: bot.name,
+            mood: botMood,
+            animate: 'always'
+          }),
+          // Unread rides the face, not the title line, where it read as
+          // punctuation between the name and the age. Top-right clears the
+          // typing dots under the chin.
+          unread
+            ? jsx('span', {
+                // Ring uses the roster's own surface: the translucent
+                // washes let the creature show through the outline.
+                className:
+                  'absolute -right-0.5 -top-0.5 size-2 rounded-full bg-(--ui-accent,#4f9cf9) ' +
+                  'ring-2 ring-(--ui-sidebar-surface-background,#111)',
+                'aria-label': 'unread',
+                title: 'New activity'
+              })
+            : null,
+          // Three dots under the chin — the composer's typing idiom. Opaque
+          // pill, or loose dots read as part of the creature.
+          working
+            ? jsxs('span', {
+                className: cn(
+                  'hermes-bots-typing absolute -bottom-1 left-1/2 flex -translate-x-1/2 items-center gap-0.5',
+                  'rounded-full bg-(--ui-sidebar-surface-background,#111) px-1 py-[3px]'
+                ),
+                title: workerWorking ? 'Working on a task right now' : 'Running a turn right now',
+                children: [
+                  jsx('span', { className: 'size-[3px] rounded-full bg-(--ui-accent,#4f9cf9)' }),
+                  jsx('span', { className: 'size-[3px] rounded-full bg-(--ui-accent,#4f9cf9)' }),
+                  jsx('span', { className: 'size-[3px] rounded-full bg-(--ui-accent,#4f9cf9)' })
+                ]
+              })
+            : null
+        ]
       }),
       jsxs('div', {
         className: 'min-w-0 flex-1',
@@ -8476,6 +8785,10 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                   }),
                 ]
               }),
+              // Attention keeps its place on this line: it is a FAILURE, and
+              // the name it belongs to is the thing that failed. Unread moved
+              // to the face — two marks on one line read as punctuation
+              // between the name and the age, and the face already carries it.
               attention
                 ? jsx(Tip, {
                     label: BOT_ATTENTION_HINTS[attention.reason] || 'Needs attention',
@@ -8484,12 +8797,6 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                       className: 'shrink-0 text-[0.6875rem] text-(--ui-warning,#f59e0b)',
                       'aria-label': 'needs attention'
                     })
-                  })
-                : null,
-              unread
-                ? jsx('span', {
-                    className: 'size-2 shrink-0 rounded-full bg-(--ui-accent)',
-                    'aria-label': 'unread'
                   })
                 : null,
               rowAgeTs
@@ -9611,7 +9918,7 @@ function EditProfileDialog({ bot, open, onClose }) {
           children: [
             jsx('div', {
               className: 'flex justify-center py-1',
-              children: jsx(BotFace, { shape, color, image, size: 64, name: bot.name })
+              children: jsx(BotFace, { shape, color, image, size: 64, name: bot.name, animate: 'always' })
             }),
             jsx(AvatarPicker, {
               shape,
@@ -10050,7 +10357,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
           children: [
             jsx('div', {
               className: 'flex justify-center py-1',
-              children: jsx(BotFace, { shape, color, image, size: 56, name: slug || 'agent' })
+              children: jsx(BotFace, { shape, color, image, size: 56, name: slug || 'agent', animate: 'always' })
             }),
             jsx(AvatarPicker, {
               shape,

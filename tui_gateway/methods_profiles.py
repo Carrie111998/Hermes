@@ -32,19 +32,31 @@ def _(rid, params: dict) -> dict:
     """
 
     def _latest_message_preview(db, session_id):
-        """Short excerpt of the NEWEST user/assistant message in a session.
+        """Excerpt, role and time of the NEWEST user/assistant message.
 
-        Rosters show this under each agent's name — messaging-app semantics
-        (latest exchange), unlike the shared first-message preview that
-        session lists use for recognition. Tool rows, inactive rows, and
-        empty content are skipped; agent-delivery prefixes are kept
-        (callers style them). Same query shape as
+        Returns ``(text, role, timestamp)``. Rosters show the text under each
+        agent's name — messaging-app semantics (latest exchange), unlike the
+        shared first-message preview that session lists use for recognition.
+        Tool rows, inactive rows, and empty content are skipped; agent-delivery
+        prefixes are kept (callers style them). Same query shape as
         SessionDB.latest_message_row_id.
+
+        The role rides along because "the newest message" and "the newest
+        message somebody else wrote" are different questions, and only the
+        second one is unread-worthy: without it a client watching
+        ``last_active`` badges an agent the moment the USER writes to it,
+        before the agent has said anything back.
+
+        The timestamp rides along because ``sessions.last_activity_at`` tracks
+        the TURN, not the transcript: it is stamped when a prompt starts and is
+        not moved when the assistant's reply is persisted. A roster keyed off
+        it alone therefore sees an edge for the user's own send and NO edge for
+        the answer — which is exactly the signal an unread badge needs.
         """
         try:
             with db._lock:
                 row = db._conn.execute(
-                    "SELECT content FROM messages"
+                    "SELECT content, role, timestamp FROM messages"
                     " WHERE session_id = ? AND role IN ('user', 'assistant')"
                     " AND active = 1"
                     " AND content IS NOT NULL AND TRIM(content) != ''"
@@ -52,13 +64,18 @@ def _(rid, params: dict) -> dict:
                     (session_id,),
                 ).fetchone()
         except Exception:
-            return ""
+            return "", "", 0
         if not row:
-            return ""
+            return "", "", 0
         text = " ".join(str(row[0] or "").split()).strip()
+        role = str(row[1] or "").strip().lower()
+        try:
+            at = float(row[2] or 0)
+        except (TypeError, ValueError):
+            at = 0
         if len(text) > 80:
-            return text[:80] + "..."
-        return text
+            return text[:80] + "...", role, at
+        return text, role, at
 
     def _canonical_session_row(profile_path):
         """Summary of the profile's canonical "Bot Chat" registry row, or None.
@@ -116,8 +133,10 @@ def _(rid, params: dict) -> dict:
                     tip = session_id
                 tip_row = db.get_session(tip) or row
                 preview = ""
+                last_role = ""
+                last_message_at = 0
                 try:
-                    preview = _latest_message_preview(db, tip)
+                    preview, last_role, last_message_at = _latest_message_preview(db, tip)
                 except Exception:
                     pass
                 return {
@@ -126,12 +145,20 @@ def _(rid, params: dict) -> dict:
                     "root_title": row.get("title") or "",
                     "title": tip_row.get("title") or "",
                     "preview": preview,
+                    # Who wrote `preview` — 'user', 'assistant', or "" when
+                    # unknown. See _latest_message_preview.
+                    "last_role": last_role,
                     "started_at": tip_row.get("started_at") or row.get("started_at") or 0,
-                    "last_active": (
+                    # max(), not either alone: last_activity_at moves on turn
+                    # start (and on activity that writes no message at all),
+                    # the message stamp moves on the reply. Only the later of
+                    # the two answers "when did anything last happen here".
+                    "last_active": max(
                         tip_row.get("last_activity_at")
                         or tip_row.get("started_at")
                         or row.get("started_at")
-                        or 0
+                        or 0,
+                        last_message_at,
                     ),
                     "message_count": tip_row.get("message_count") or 0,
                 }
@@ -198,9 +225,11 @@ def _(rid, params: dict) -> dict:
                     # preview with the newest user/assistant text. Best-
                     # effort — any failure keeps the first-message preview.
                     try:
-                        latest = _latest_message_preview(db, s["id"])
+                        latest, latest_role, latest_at = _latest_message_preview(db, s["id"])
                         if latest:
                             row["preview"] = latest
+                            row["last_role"] = latest_role
+                            row["last_active"] = max(row["last_active"], latest_at)
                     except Exception:
                         pass
                     human = row

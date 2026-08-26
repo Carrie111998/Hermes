@@ -73,6 +73,32 @@ function writeReactStubs(root) {
   writeFileSync(join(packageRoot, 'jsx-runtime.js'), proxyModule(['jsx', 'jsxs']))
 }
 
+// The plugin pulls blobatar's motion sheet directly (the SDK exports the
+// component but not the stylesheet). Vite resolves that in the real app; node
+// has no CSS loader, so the stub maps the subpath onto an empty ES module.
+// Its presence is the point: this test links plugin.js for real, so it is what
+// catches a non-SDK import that the bundler would resolve but a bare runtime
+// cannot.
+function writeBlobatarStub(root) {
+  const packageRoot = join(root, 'node_modules', 'blobatar')
+
+  mkdirSync(packageRoot, { recursive: true })
+  writeFileSync(
+    join(packageRoot, 'package.json'),
+    `${JSON.stringify(
+      {
+        name: 'blobatar',
+        type: 'module',
+        sideEffects: ['*.css'],
+        exports: { './motion.css': './motion.css.js' }
+      },
+      null,
+      2
+    )}\n`
+  )
+  writeFileSync(join(packageRoot, 'motion.css.js'), 'export {}\n')
+}
+
 test('legacy SDK without optional capability exports still links Bot Mode', async t => {
   const root = mkdtempSync(join(tmpdir(), 'hermes-bot-mode-legacy-sdk-'))
   const pluginPath = join(root, 'plugin.js')
@@ -83,6 +109,7 @@ test('legacy SDK without optional capability exports still links Bot Mode', asyn
   writeFileSync(pluginPath, pluginSource)
   writeLegacySdk(root)
   writeReactStubs(root)
+  writeBlobatarStub(root)
 
   const loaded = await import(pathToFileURL(pluginPath).href)
 

@@ -361,3 +361,65 @@ def test_canonical_session_scoped_per_profile_db(home):
     rows = _profiles({})
     assert "default profile content" in _row(rows, "default")["canonical_session"]["preview"]
     assert "ops profile content" in _row(rows, "ops")["canonical_session"]["preview"]
+
+
+# ---------------------------------------------------------------------------
+# last_active must move on the REPLY, not only on the user's send
+# ---------------------------------------------------------------------------
+
+
+def test_last_active_covers_the_assistant_reply(home):
+    """``sessions.last_activity_at`` tracks the TURN, not the transcript.
+
+    It is stamped when a prompt starts and is NOT moved when the assistant's
+    reply is persisted. A roster keyed off it alone therefore sees an edge for
+    the user's own send and no edge at all for the answer — so an unread badge
+    watching ``last_active`` could never fire (observed: capsule's reply landed
+    24s after its last_activity_at and the badge never appeared).
+    """
+    db = _db(home)
+    _add_session(db, "forever1", title="Bot Chat", ts=1000, text="wait 5s then respond")
+    # The reply lands later, and (as in production) nothing moves the session
+    # row's own activity stamp with it.
+    db.append_message("forever1", "assistant", "Done — waited 5 seconds!", timestamp=1024)
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET last_activity_at = ? WHERE id = ?", (1000, "forever1"))
+    db.close()
+
+    canonical = _row(_profiles({}), "default")["canonical_session"]
+
+    assert canonical["last_active"] == 1024, "the reply must move last_active"
+    assert canonical["last_role"] == "assistant", "and identify who wrote it"
+    assert "Done" in canonical["preview"]
+
+
+def test_last_active_never_regresses_below_the_session_stamp(home):
+    """Activity that writes no message at all still counts.
+
+    last_active is the LATER of the two stamps, so a session whose activity
+    tracking ran ahead of its transcript keeps its own value.
+    """
+    db = _db(home)
+    _add_session(db, "forever1", title="Bot Chat", ts=1000, text="hello")
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET last_activity_at = ? WHERE id = ?", (5000, "forever1"))
+    db.close()
+
+    canonical = _row(_profiles({}), "default")["canonical_session"]
+
+    assert canonical["last_active"] == 5000
+
+
+def test_last_session_last_active_covers_the_reply_too(home):
+    """The human-facing row keys the same signals off the same field."""
+    db = _db(home)
+    _add_session(db, "chat1", title="Scratch", ts=1000, text="question")
+    db.append_message("chat1", "assistant", "answer", timestamp=1042)
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET last_activity_at = ? WHERE id = ?", (1000, "chat1"))
+    db.close()
+
+    last = _row(_profiles({}), "default")["last_session"]
+
+    assert last["last_active"] == 1042
+    assert last["last_role"] == "assistant"
