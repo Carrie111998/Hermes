@@ -1,8 +1,9 @@
 import type { MutableRefObject } from 'react'
 
-import type { SlashHandlerContext, UiState } from '../interfaces.js'
+import type { AttachmentDraftScope, SlashHandlerContext, UiState } from '../interfaces.js'
 
 export interface SlashRunCtx extends SlashHandlerContext {
+  attachmentScope?: AttachmentDraftScope
   flight: number
   guarded: <T>(fn: (r: T) => void) => (r: null | T) => void
   guardedErr: (e: unknown) => void

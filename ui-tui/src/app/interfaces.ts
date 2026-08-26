@@ -367,11 +367,18 @@ export interface ComposerPasteResult {
 
 export type MaybePromise<T> = Promise<T> | T
 
+export interface AttachmentDraftScope {
+  draftVersion: number
+  sid: string
+}
+
 export interface ComposerActions {
   /** Pull an image off the system clipboard in as a token. */
-  attachClipboardImage: () => void
+  attachClipboardImage: (scope?: AttachmentDraftScope) => void
   /** Attach an image by path in as a token. */
-  attachImagePath: (path: string) => void
+  attachImagePath: (path: string, scope?: AttachmentDraftScope) => void
+  /** Open the synchronous slash-dispatch window paired with the next clear. */
+  beginSlashClear: () => AttachmentDraftScope | null
   clearIn: () => void
   dequeue: () => string | undefined
   enqueue: (text: string, display?: string) => void
@@ -505,8 +512,8 @@ export interface GatewayEventHandlerContext {
 
 export interface SlashHandlerContext {
   composer: {
-    attachClipboardImage: () => void
-    attachImagePath: (path: string) => void
+    attachClipboardImage: (scope?: AttachmentDraftScope) => void
+    attachImagePath: (path: string, scope?: AttachmentDraftScope) => void
     enqueue: (text: string, display?: string) => void
     hasSelection: boolean
     openEditor: () => Promise<void>

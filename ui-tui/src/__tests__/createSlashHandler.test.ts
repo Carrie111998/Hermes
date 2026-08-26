@@ -837,6 +837,35 @@ describe('createSlashHandler', () => {
     })
   })
 
+  it('carries the originating attachment scope through an async command alias', async () => {
+    const scope = { draftVersion: 1, sid: 'sid-a' }
+
+    const ctx = buildCtx({
+      gateway: {
+        gw: {
+          getLogTail: vi.fn(() => ''),
+          request: vi.fn((method: string) => {
+            if (method === 'slash.exec') {
+              return Promise.reject(new Error('use command.dispatch'))
+            }
+
+            if (method === 'command.dispatch') {
+              return Promise.resolve({ type: 'alias', target: 'image' })
+            }
+
+            return Promise.resolve({})
+          })
+        },
+        rpc: vi.fn(() => Promise.resolve({}))
+      }
+    })
+
+    expect(createSlashHandler(ctx)('/img /tmp/screenshot.png', scope)).toBe(true)
+    await vi.waitFor(() => {
+      expect(ctx.composer.attachImagePath).toHaveBeenCalledWith('/tmp/screenshot.png', scope)
+    })
+  })
+
   it('resolves unique local aliases through the catalog', () => {
     const ctx = buildCtx({
       local: {
@@ -851,6 +880,21 @@ describe('createSlashHandler', () => {
 
     expect(createSlashHandler(ctx)('/h')).toBe(true)
     expect(ctx.transcript.panel).toHaveBeenCalledWith(expect.any(String), expect.any(Array))
+  })
+
+  it('routes an unambiguous image prefix through the canonical attachment command', () => {
+    const ctx = buildCtx({
+      local: {
+        catalog: {
+          canon: {
+            '/image': '/image'
+          }
+        }
+      }
+    })
+
+    expect(createSlashHandler(ctx)('/imag /tmp/screenshot.png')).toBe(true)
+    expect(ctx.composer.attachImagePath).toHaveBeenCalledWith('/tmp/screenshot.png', undefined)
   })
 
   it('lets exact catalog commands win over longer prefix matches', async () => {
@@ -1113,6 +1157,8 @@ const buildCtx = (overrides: Partial<Ctx> = {}): Ctx => ({
 })
 
 const buildComposer = () => ({
+  attachClipboardImage: vi.fn(),
+  attachImagePath: vi.fn(),
   enqueue: vi.fn(),
   hasSelection: false,
   openEditor: vi.fn(async () => {}),

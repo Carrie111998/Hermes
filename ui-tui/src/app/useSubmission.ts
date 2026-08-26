@@ -10,7 +10,7 @@ import { asRpcResult } from '../lib/rpc.js'
 import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js'
 import type { Msg } from '../types.js'
 
-import type { ComposerActions, ComposerRefs, ComposerState, ComposerToken } from './interfaces.js'
+import type { AttachmentDraftScope, ComposerActions, ComposerRefs, ComposerState, ComposerToken } from './interfaces.js'
 import { submitPrompt } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
@@ -253,7 +253,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
           composerActions.enqueue(queued.text, queued.display)
           sys(`queued: "${queued.display.slice(0, 50)}${queued.display.length > 50 ? '…' : ''}"`)
         } else {
-          slashRef.current(full)
+          const attachmentScope = composerActions.beginSlashClear()
+
+          slashRef.current(full, attachmentScope ?? undefined)
         }
 
         composerActions.clearIn()
@@ -394,7 +396,7 @@ export interface UseSubmissionOptions {
   composerState: ComposerState
   gw: GatewayClient
   setLastUserMsg: (value: string) => void
-  slashRef: MutableRefObject<(cmd: string) => boolean>
+  slashRef: MutableRefObject<(cmd: string, attachmentScope?: AttachmentDraftScope) => boolean>
   submitRef: MutableRefObject<(value: string) => void>
   sys: (text: string) => void
 }

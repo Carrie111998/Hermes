@@ -191,7 +191,7 @@ export const sessionCommands: SlashCommand[] = [
   {
     help: 'attach an image',
     name: 'image',
-    run: (arg, ctx) => ctx.composer.attachImagePath(arg)
+    run: (arg, ctx) => ctx.composer.attachImagePath(arg, ctx.attachmentScope)
   },
 
   {
