@@ -1,9 +1,10 @@
 import { QueryClient } from '@tanstack/react-query'
-import { cleanup, render, renderHook } from '@testing-library/react'
+import { cleanup, render, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelInfo } from '@/hermes'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { $confirmRequest, settleConfirm } from '@/store/confirm'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
@@ -81,6 +82,7 @@ describe('useModelControls', () => {
   })
 
   afterEach(() => {
+    settleConfirm(false)
     cleanup()
     vi.restoreAllMocks()
     $activeGatewayProfile.set('default')
@@ -299,6 +301,63 @@ describe('useModelControls', () => {
     await controls.selectModel({ model: 'grok-4.5', provider: 'xai' })
 
     expect(invalidate).toHaveBeenCalled()
+  })
+
+  it('confirms and retries a guarded live-session model switch', async () => {
+    $activeSessionId.set('session-1')
+    const requestGateway = vi
+      .fn()
+      .mockResolvedValueOnce({
+        confirm_message: 'This tier trains on your prompts.',
+        confirm_required: true,
+        value: 'muse-spark-1.2-contributor'
+      })
+      .mockResolvedValueOnce({
+        confirm_required: false,
+        scope: 'global',
+        value: 'muse-spark-1.2-contributor'
+      })
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    const pending = controls.selectModel({ model: 'muse-spark-1.2-contributor', provider: 'opencode-go' })
+
+    await waitFor(() => expect($confirmRequest.get()?.description).toBe('This tier trains on your prompts.'))
+    settleConfirm(true)
+
+    await expect(pending).resolves.toBe(true)
+    expect(requestGateway).toHaveBeenNthCalledWith(2, 'config.set', {
+      confirm_expensive_model: true,
+      session_id: 'session-1',
+      key: 'model',
+      value: 'muse-spark-1.2-contributor --provider opencode-go --global'
+    })
+  })
+
+  it('rolls back a guarded live-session model switch when confirmation is cancelled', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+    const requestGateway = vi.fn().mockResolvedValue({
+      confirm_message: 'This tier trains on your prompts.',
+      confirm_required: true,
+      value: 'muse-spark-1.2-contributor'
+    })
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    const pending = controls.selectModel({ model: 'muse-spark-1.2-contributor', provider: 'opencode-go' })
+
+    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
+    settleConfirm(false)
+
+    await expect(pending).resolves.toBe(false)
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect($currentModel.get()).toBe('fable-5')
+    expect($currentProvider.get()).toBe('nous')
+    expect(notifyError).not.toHaveBeenCalled()
   })
 
   it('keeps the pick when an OLDER gateway refuses a mid-turn switch', async () => {

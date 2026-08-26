@@ -9,6 +9,7 @@ import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
+import { $confirmRequest, settleConfirm } from '@/store/confirm'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
@@ -1688,6 +1689,7 @@ describe('usePromptActions desktop slash pickers', () => {
   })
 
   afterEach(() => {
+    settleConfirm(false)
     cleanup()
     vi.useRealTimers()
     vi.restoreAllMocks()
@@ -1710,6 +1712,45 @@ describe('usePromptActions desktop slash pickers', () => {
     await handle!.submitText('/resume 20260610_130000_123abc')
 
     expect(resumeStoredSession).toHaveBeenCalledWith('20260610_130000_123abc')
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+  })
+
+  it('confirms and retries a guarded typed /model switch through config.set', async () => {
+    const requestGateway = vi
+      .fn()
+      .mockResolvedValueOnce({
+        confirm_message: 'This tier trains on your prompts.',
+        confirm_required: true,
+        value: 'muse-spark-1.2-contributor'
+      })
+      .mockResolvedValueOnce({
+        confirm_required: false,
+        scope: 'session',
+        value: 'muse-spark-1.2-contributor'
+      })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    const pending = handle!.submitText('/model muse-spark-1.2-contributor --provider opencode-go')
+
+    await waitFor(() => expect($confirmRequest.get()?.description).toBe('This tier trains on your prompts.'))
+    settleConfirm(true)
+    await pending
+
+    expect(requestGateway).toHaveBeenNthCalledWith(1, 'config.set', {
+      session_id: RUNTIME_SESSION_ID,
+      key: 'model',
+      value: 'muse-spark-1.2-contributor --provider opencode-go'
+    })
+    expect(requestGateway).toHaveBeenNthCalledWith(2, 'config.set', {
+      confirm_expensive_model: true,
+      session_id: RUNTIME_SESSION_ID,
+      key: 'model',
+      value: 'muse-spark-1.2-contributor --provider opencode-go'
+    })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
 

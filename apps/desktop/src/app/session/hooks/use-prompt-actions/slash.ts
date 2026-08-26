@@ -15,6 +15,7 @@ import {
   resolveDesktopCommand
 } from '@/lib/desktop-slash-commands'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { requestConfirmedModelSwitch } from '@/lib/model-switch-confirmation'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
@@ -1013,8 +1014,36 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          // Power users can still type `/model <name>` — run it on the backend.
-          await runExec(ctx)
+          const resolved = await withSlashOutput(ctx)
+
+          if (!resolved) {
+            return
+          }
+
+          try {
+            const outcome = await requestConfirmedModelSwitch(requestGateway, {
+              session_id: resolved.sessionId,
+              key: 'model',
+              value: ctx.arg.trim()
+            })
+
+            if (outcome.status === 'cancelled') {
+              resolved.render('model switch cancelled')
+
+              return
+            }
+
+            const { result } = outcome
+            if (!result.value) {
+              resolved.render('error: invalid response: model switch')
+
+              return
+            }
+
+            resolved.render(result.deferred ? `model → ${result.value} (applies next turn)` : `model → ${result.value}`)
+          } catch (error) {
+            resolved.render(`error: ${error instanceof Error ? error.message : String(error)}`)
+          }
 
           return
         }

@@ -12689,11 +12689,36 @@ def _(rid, params: dict) -> dict:
                         pending_model = parsed.model_input
                     except Exception:
                         pending_model = str(value)
+                    confirmed = bool(params.get("confirm_expensive_model", False))
+                    if not confirmed:
+                        try:
+                            from hermes_cli.model_selection_guards import (
+                                combined_selection_warning,
+                            )
+
+                            warning = combined_selection_warning(
+                                pending_model,
+                                provider=(
+                                    getattr(parsed, "explicit_provider", "") or ""
+                                ).strip(),
+                            )
+                        except Exception:
+                            warning = None
+                        if warning is not None:
+                            return _ok(
+                                rid,
+                                {
+                                    "key": key,
+                                    "value": pending_model,
+                                    "warning": warning.message,
+                                    "confirm_required": True,
+                                    "confirm_message": warning.message,
+                                    "scope": "session",
+                                },
+                            )
                     session["pending_model_switch"] = {
                         "raw": value,
-                        "confirm_expensive_model": bool(
-                            params.get("confirm_expensive_model", False)
-                        ),
+                        "confirm_expensive_model": confirmed,
                         # The resolved model/provider the next turn will run on.
                         # _session_info reports these while the switch is pending
                         # so the end-of-turn settle keeps showing the user's pick

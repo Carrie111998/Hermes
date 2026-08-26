@@ -6,6 +6,7 @@ import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
+import { requestConfirmedModelSwitch } from '@/lib/model-switch-confirmation'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
@@ -235,11 +236,37 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
         const scope = persistsAsDefault ? '--global' : '--session'
 
-        const result = await requestGateway<{ deferred?: boolean }>('config.set', {
+        const outcome = await requestConfirmedModelSwitch(requestGateway, {
           session_id: liveSessionId,
           key: 'model',
           value: `${selection.model} --provider ${selection.provider} ${scope}`
         })
+
+        if (outcome.status === 'cancelled') {
+          if (touchesPrimary) {
+            setCurrentModel(prevModel)
+            setCurrentProvider(prevProvider)
+            setCurrentModelSource(prevSource)
+          } else {
+            sessionTileDelegate()?.updateSession(liveSessionId, state => ({
+              ...state,
+              model: prevModel,
+              provider: prevProvider
+            }))
+          }
+
+          updateModelOptionsCache(
+            liveSessionId,
+            prevProvider,
+            prevModel,
+            touchesPrimary && !liveSessionId,
+            liveGatewayProfile
+          )
+
+          return false
+        }
+
+        const { result } = outcome
 
         // A pick made DURING a turn is queued by the gateway and applied at the
         // next turn start (`deferred`). Re-fetching now would answer with the

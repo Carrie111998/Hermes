@@ -13323,6 +13323,38 @@ def test_config_set_model_defers_while_running(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_config_set_guarded_model_confirms_before_deferring_while_running():
+    server._sessions["sid"] = _session(running=True)
+    params = {
+        "session_id": "sid",
+        "key": "model",
+        "value": "muse-spark-1.2-contributor --provider opencode-go",
+    }
+    try:
+        unconfirmed = server.handle_request(
+            {"id": "1", "method": "config.set", "params": params}
+        )
+
+        assert unconfirmed["result"]["confirm_required"] is True
+        assert "TRAINS ON YOUR DATA" in unconfirmed["result"]["confirm_message"]
+        assert "pending_model_switch" not in server._sessions["sid"]
+
+        confirmed = server.handle_request(
+            {
+                "id": "2",
+                "method": "config.set",
+                "params": {**params, "confirm_expensive_model": True},
+            }
+        )
+
+        assert confirmed["result"]["confirm_required"] is False
+        assert confirmed["result"]["deferred"] is True
+        pending = server._sessions["sid"]["pending_model_switch"]
+        assert pending["confirm_expensive_model"] is True
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_apply_pending_model_switch_runs_queued_pick(monkeypatch):
     """The queued pick is consumed once, on the turn thread, via
     _apply_model_switch — and cleared so it can't re-fire next turn."""
