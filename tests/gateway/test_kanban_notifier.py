@@ -2,9 +2,17 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
 
 
@@ -18,6 +26,42 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+
+class BusySessionTelegramAdapter(BasePlatformAdapter):
+    """Minimal Telegram-shaped adapter that exercises Base.handle_message()."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True), Platform.TELEGRAM)
+        self.sent = []
+
+    @property
+    def name(self) -> str:
+        return "telegram"
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "text": content,
+                "reply_to": reply_to,
+                "metadata": metadata or {},
+            }
+        )
+        return SendResult(success=True, message_id=f"sent-{len(self.sent)}")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "private"}
+
+
+async def _empty_handler(_event):
+    return ""
 
 
 class DisconnectedAdapters(dict):
@@ -46,6 +90,119 @@ def _make_runner(adapter):
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
     return runner
+
+
+@pytest.mark.parametrize("terminal_kind", ["completed", "blocked"])
+def test_kanban_notifier_wakes_active_telegram_dm_without_user_auth(
+    tmp_path, monkeypatch, terminal_kind,
+):
+    """Trusted Kanban wake events have user_id=None but are internal.
+
+    Regression for the live Telegram failure where the notifier logged a
+    successful wake, then the active-session busy auth gate rejected the
+    synthetic MessageEvent as user=None. The event must be queued behind the
+    active DM session without weakening authorization for real inbound messages.
+    """
+    db_path = tmp_path / f"active-dm-{terminal_kind}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    session_key = "agent:main:telegram:dm:8867257956"
+    chat_id = "8867257956"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title=f"{terminal_kind} wake",
+            assignee="worker",
+            session_id=session_key,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id=chat_id,
+            chat_type="dm",
+            notifier_profile="default",
+            delivery_metadata={"chat_type": "dm", "thread_id": "topic-1"},
+        )
+        if terminal_kind == "completed":
+            kb.complete_task(conn, tid, summary="done")
+        else:
+            kb.block_task(conn, tid, reason="needs operator", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = BusySessionTelegramAdapter()
+    adapter.set_message_handler(_empty_handler)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "default"
+    auth_calls = []
+
+    def deny_external_users(source):
+        auth_calls.append(source)
+        return False
+
+    runner._is_user_authorized = deny_external_users
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert chat_id == adapter.sent[0]["chat_id"]
+    assert terminal_kind in adapter.sent[0]["text"].lower()
+
+    queued = adapter._pending_messages.get(session_key)
+    assert queued is not None, "internal Kanban wake must queue behind active DM"
+    assert queued.internal is True
+    assert queued.source.platform == Platform.TELEGRAM
+    assert queued.source.chat_id == chat_id
+    assert queued.source.chat_type == "dm"
+    assert queued.source.profile == "default"
+    assert queued.source.user_id is None
+    assert auth_calls == [], "internal Kanban wake must not hit user auth"
+
+
+@pytest.mark.asyncio
+async def test_active_telegram_dm_unknown_user_messages_remain_blocked():
+    """Real inbound user=None messages are still rejected while a DM is active."""
+    session_key = "agent:main:telegram:dm:8867257956"
+    adapter = BusySessionTelegramAdapter()
+    adapter.set_message_handler(_empty_handler)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    runner = _make_runner(adapter)
+    auth_calls = []
+
+    def deny_external_users(source):
+        auth_calls.append(source)
+        return False
+
+    runner._is_user_authorized = deny_external_users
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8867257956",
+        chat_type="dm",
+        user_id=None,
+    )
+    for _ in range(2):
+        await adapter.handle_message(
+            MessageEvent(
+                text="external follow-up",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=False,
+            )
+        )
+
+    assert auth_calls == [source, source]
+    assert session_key not in adapter._pending_messages
+    assert len(adapter.sent) == 0
 
 
 def _create_completed_subscription(summary="done once"):
