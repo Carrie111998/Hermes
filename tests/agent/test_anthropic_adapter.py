@@ -78,6 +78,10 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
             assert "interleaved-thinking-2025-05-14" in betas
+            headers = kwargs["default_headers"]
+            assert headers["Copilot-Integration-Id"] == "vscode-chat"
+            assert headers["User-Agent"] == "HermesAgent/1.0"
+            assert headers["Editor-Version"] == "vscode/1.104.1"
 
     def test_copilot_enterprise_host_also_uses_bearer(self):
         """Plan-scoped Copilot hosts (business/enterprise) must be recognized

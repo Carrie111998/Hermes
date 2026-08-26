@@ -1980,6 +1980,7 @@ def _model_flow_copilot(config, current_model=""):
             selected,
             catalog=catalog,
             api_key=api_key,
+            base_url=effective_base,
         )
         clear_model_endpoint_credentials(model, clear_api_mode=False)
         if selected_effort is not None:

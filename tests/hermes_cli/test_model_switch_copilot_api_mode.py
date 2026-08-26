@@ -26,6 +26,7 @@ def _run_copilot_switch(
     current_model: str = "gpt-5.4",
     explicit_provider: str = "",
     runtime_api_mode: str = "codex_responses",
+    base_url: str = "https://api.githubcopilot.com",
 ):
     """Run switch_model with Copilot mocks and return the result."""
     with (
@@ -35,7 +36,7 @@ def _run_copilot_switch(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             return_value={
                 "api_key": "ghu_test_token",
-                "base_url": "https://api.githubcopilot.com",
+                "base_url": base_url,
                 "api_mode": runtime_api_mode,
             },
         ),
@@ -56,7 +57,12 @@ def _run_copilot_switch(
 
 
 def test_same_provider_copilot_switch_recomputes_api_mode():
-    """GPT-5 → Claude on copilot: api_mode must flip to chat_completions."""
+    """GPT-5 to Claude must select Copilot's Anthropic Messages contract.
+
+    The switch targets ``POST /v1/messages`` through ``anthropic_messages``.
+    The Anthropic adapter supplies Copilot's required Bearer authentication
+    and identity headers instead of native Anthropic ``x-api-key`` auth.
+    """
     result = _run_copilot_switch(
         raw_input="claude-opus-4.6",
         current_provider="copilot",
@@ -66,6 +72,17 @@ def test_same_provider_copilot_switch_recomputes_api_mode():
     assert result.success, f"switch_model failed: {result.error_message}"
     assert result.new_model == "claude-opus-4.6"
     assert result.target_provider == "copilot"
+    assert result.api_mode == "anthropic_messages"
+
+
+def test_copilot_switch_rejects_lookalike_host_for_messages_routing():
+    """A Copilot-labelled custom runtime cannot broaden host trust by path."""
+    result = _run_copilot_switch(
+        raw_input="claude-opus-4.6",
+        base_url="https://evil.example/api.githubcopilot.com",
+    )
+
+    assert result.success, f"switch_model failed: {result.error_message}"
     assert result.api_mode == "chat_completions"
 
 

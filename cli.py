@@ -7407,7 +7407,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     current_model = canonical
                     changed = True
 
-                resolved_mode = copilot_model_api_mode(current_model, api_key=self.api_key)
+                resolved_mode = copilot_model_api_mode(
+                    current_model,
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                )
                 if resolved_mode != self.api_mode:
                     self.api_mode = resolved_mode
                     changed = True
