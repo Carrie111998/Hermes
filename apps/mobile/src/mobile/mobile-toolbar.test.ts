@@ -14,7 +14,7 @@ describe('MobileToolbar', () => {
 
     const { container } = render(
       createElement(MobileToolbar, {
-        appActions: [{ id: 'settings', label: 'Settings', onSelect: vi.fn() }],
+        appActions: [{ group: 'system', id: 'settings', label: 'Settings', onSelect: vi.fn() }],
         contextActions: [{ id: 'refresh', label: 'Refresh preview', onSelect: vi.fn() }],
         menuOpen: false,
         onClose: vi.fn(),
@@ -43,7 +43,7 @@ describe('MobileToolbar', () => {
 
     render(
       createElement(MobileToolbar, {
-        appActions: [{ id: 'settings', label: 'Settings', onSelect: onSettings }],
+        appActions: [{ group: 'system', id: 'settings', label: 'Settings', onSelect: onSettings }],
         contextActions: [{ id: 'refresh', label: 'Refresh preview', onSelect: onRefresh }],
         menuOpen: true,
         onClose,
@@ -68,6 +68,33 @@ describe('MobileToolbar', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh preview' }))
     expect(onRefresh).toHaveBeenCalledOnce()
     expect(onClose).toHaveBeenCalledTimes(3)
+  })
+
+  it('orders the action sheet like the Desktop: workspace, session, view, system, then active-pane controls', () => {
+    render(
+      createElement(MobileToolbar, {
+        appActions: [
+          { group: 'system', id: 'settings', label: 'Settings', onSelect: vi.fn() },
+          { group: 'view', id: 'layout', label: 'Layout', onSelect: vi.fn() },
+          { group: 'session', id: 'new-chat', label: 'New chat', onSelect: vi.fn() },
+        ],
+        contextActions: [{ id: 'reload', label: 'Reload preview', onSelect: vi.fn() }],
+        menuOpen: true,
+        onClose: vi.fn(),
+        onOpenSessions: vi.fn(),
+        onToggleMenu: vi.fn(),
+        sessionsOpen: false,
+        workspacePanes: [{ id: 'files', title: 'Files' }],
+      }),
+    )
+
+    expect(screen.getAllByRole('group').map(group => group.getAttribute('aria-label'))).toEqual([
+      'Workspace',
+      'Session',
+      'View',
+      'System',
+      'Context actions',
+    ])
   })
 
   it('moves focus into the modal sheet and returns it to the overflow trigger when dismissed', () => {

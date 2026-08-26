@@ -104,8 +104,9 @@ export function MobileBehaviors() {
   const rightTitlebarTools = useTitlebarToolContributions('right')
   const appActions = useMemo<MobileToolbarAction[]>(
     () => [
-      { id: 'new-chat', label: t.commandCenter.nav.newChat.title, onSelect: () => navigate(NEW_CHAT_ROUTE) },
+      { group: 'session', id: 'new-chat', label: t.commandCenter.nav.newChat.title, onSelect: () => navigate(NEW_CHAT_ROUTE) },
       {
+        group: 'view',
         id: 'preview',
         label: t.preview.openPreview,
         onSelect: () => {
@@ -113,22 +114,24 @@ export function MobileBehaviors() {
           setMobilePreviewOpen(true)
         },
       },
-      { id: 'command-center', label: t.commandCenter.commandCenter, onSelect: () => navigate(COMMAND_CENTER_ROUTE) },
-      { id: 'command-palette', label: t.commandCenter.paletteTitle, onSelect: openCommandPalette },
-      { id: 'settings', label: t.titlebar.openSettings, onSelect: () => navigate(SETTINGS_ROUTE) },
-      { id: 'layout', label: t.titlebar.layoutEditor, onSelect: toggleLayoutEditMode },
-      { id: 'hud', label: t.titlebar.enterHud, onSelect: () => toggleHud(hudTargetSessionId()) },
+      { group: 'session', id: 'command-center', label: t.commandCenter.commandCenter, onSelect: () => navigate(COMMAND_CENTER_ROUTE) },
+      { group: 'session', id: 'command-palette', label: t.commandCenter.paletteTitle, onSelect: openCommandPalette },
+      { group: 'view', id: 'layout', label: t.titlebar.layoutEditor, onSelect: toggleLayoutEditMode },
+      { group: 'view', id: 'hud', label: t.titlebar.enterHud, onSelect: () => toggleHud(hudTargetSessionId()) },
       {
+        group: 'system',
         id: 'haptics',
         label: hapticsMuted ? t.titlebar.unmuteHaptics : t.titlebar.muteHaptics,
         onSelect: toggleHapticsMuted,
       },
-      { id: 'flip-panes', label: t.titlebar.swapSidebarSides, onSelect: togglePanesFlipped },
+      { group: 'view', id: 'flip-panes', label: t.titlebar.swapSidebarSides, onSelect: togglePanesFlipped },
       {
+        group: 'system',
         id: 'keybinds',
         label: t.settings.nav.keybinds,
         onSelect: () => window.dispatchEvent(new CustomEvent('hermes:open-keybinds')),
       },
+      { group: 'system', id: 'settings', label: t.titlebar.openSettings, onSelect: () => navigate(SETTINGS_ROUTE) },
     ],
     [hapticsMuted, navigate, previewTabs.length, t],
   )
