@@ -32,17 +32,17 @@ Install the MCP catalog entry:
 hermes mcp install youdotcom
 ```
 
-Free mode requires no API key and exposes search only. To unlock page extraction and research tools, set `YDC_API_KEY` in `~/.hermes/.env`, then reinstall or reconfigure the MCP entry:
+Free mode requires no API key and exposes search only. To unlock page extraction and research tools, set `MCP_YOUDOTCOM_API_KEY` in `~/.hermes/.env`, then reinstall or reconfigure the MCP entry:
 
 ```bash
-YDC_API_KEY=your-key-here
+MCP_YOUDOTCOM_API_KEY=your-key-here
 hermes mcp install youdotcom
 ```
 
 `you-finance` is optional and not included in You.com's default full endpoint. To opt into it, set `YDC_ALLOWED_TOOLS` with the exact tool set you want to expose, then reinstall:
 
 ```bash
-YDC_API_KEY=your-key-here
+MCP_YOUDOTCOM_API_KEY=your-key-here
 YDC_ALLOWED_TOOLS=you-search,you-research,you-contents,you-finance
 hermes mcp install youdotcom
 ```

@@ -42,7 +42,7 @@ def test_description_matches_skill_standard(frontmatter: dict[str, object]) -> N
 
 def test_required_api_key_setup_metadata_present(skill_text: str) -> None:
     assert "hermes mcp install youdotcom" in skill_text
-    assert "YDC_API_KEY" in skill_text
+    assert "MCP_YOUDOTCOM_API_KEY" in skill_text
     assert "YDC_ALLOWED_TOOLS" in skill_text
     assert "free search-only mode" in skill_text
 

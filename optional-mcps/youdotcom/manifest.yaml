@@ -10,19 +10,17 @@ transport:
   type: http
   # Free profile exposes unauthenticated you-search only.
   url: https://api.you.com/mcp?profile=free
-  # When YDC_API_KEY is present, switch to the full remote endpoint and send
-  # the bearer token. Set YDC_ALLOWED_TOOLS to opt into a scoped tool set,
-  # including optional tools like you-finance.
+  # When MCP_YOUDOTCOM_API_KEY is present, switch to the full remote endpoint
+  # and send the bearer token. Set YDC_ALLOWED_TOOLS to opt into a scoped tool
+  # set, including optional tools like you-finance.
   url_env_overrides:
-    YDC_API_KEY+YDC_ALLOWED_TOOLS: https://api.you.com/mcp?tools=${YDC_ALLOWED_TOOLS}
-    YDC_API_KEY: https://api.you.com/mcp
-  headers:
-    Authorization: "Bearer ${YDC_API_KEY}"
+    MCP_YOUDOTCOM_API_KEY+YDC_ALLOWED_TOOLS: https://api.you.com/mcp?tools=${YDC_ALLOWED_TOOLS}
+    MCP_YOUDOTCOM_API_KEY: https://api.you.com/mcp
 
 auth:
   type: api_key
   env:
-    - name: YDC_API_KEY
+    - name: MCP_YOUDOTCOM_API_KEY
       prompt: "You.com API key (optional; blank uses free search-only mode)"
       required: false
       secret: true
@@ -32,9 +30,9 @@ auth:
       secret: false
 
 post_install: |
-  Without YDC_API_KEY, You.com runs in the free search-only profile.
-  Add YDC_API_KEY from https://you.com/platform and reinstall this catalog entry
-  to enable content extraction and research tools.
+  Without MCP_YOUDOTCOM_API_KEY, You.com runs in the free search-only profile.
+  Add MCP_YOUDOTCOM_API_KEY from https://you.com/platform and reinstall this
+  catalog entry to enable content extraction and research tools.
   Add YDC_ALLOWED_TOOLS, for example
   you-search,you-research,you-contents,you-finance, to opt into you-finance.
 
