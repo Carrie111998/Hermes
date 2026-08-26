@@ -619,14 +619,7 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
             "help_header": "▌ Available Commands",
         },
         "tool_prefix": "│",
-        "banner_logo": """[bold #0069FF]          ████████[/]  [bold #E5ECEB]DIGITALOCEAN[/]
-[#0069FF]       ███        ███[/]
-[#0069FF]     ██              ██[/]
-[#0069FF]    ██                ██[/]
-[#0069FF]   ██       ███        ██[/]
-[#0069FF]  ██   ███  ███         ██[/]
-[#0069FF]  ████████████████████████[/]
-[#0069FF]       ███[/]""",
+        "banner_logo": "[bold #E5ECEB]DIGITALOCEAN[/]",
         "banner_hero": """[#325553]┌──────────────────────────────┐[/]
 [#325553]│[/][#E5ECEB] build and deploy            [/][#325553]│[/]
 [#325553]│[/][#0069FF] the cloud for builders       [/][#325553]│[/]
@@ -685,14 +678,7 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
             "help_header": "▌ Available Commands",
         },
         "tool_prefix": "│",
-        "banner_logo": """[bold #0069FF]          ████████[/]  [bold #000C2A]DIGITALOCEAN[/]
-[#0069FF]       ███        ███[/]
-[#0069FF]     ██              ██[/]
-[#0069FF]    ██                ██[/]
-[#0069FF]   ██       ███        ██[/]
-[#0069FF]  ██   ███  ███         ██[/]
-[#0069FF]  ████████████████████████[/]
-[#0069FF]       ███[/]""",
+        "banner_logo": "[bold #000C2A]DIGITALOCEAN[/]",
         "banner_hero": """[#D6DCEA]┌──────────────────────────────┐[/]
 [#D6DCEA]│[/][#000C2A] build and deploy            [/][#D6DCEA]│[/]
 [#D6DCEA]│[/][#0069FF] the cloud for builders       [/][#D6DCEA]│[/]
