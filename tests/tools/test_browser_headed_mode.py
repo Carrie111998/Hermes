@@ -117,6 +117,7 @@ class TestHeadedFlagInjection:
             '"- heading \\"Hi\\" [ref=e1]", "refs": {"e1": {}}}}'
         )
         with patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.browser_tool._prepare_headed_env", return_value={}), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \
@@ -377,16 +378,18 @@ class TestTryStartXvfb:
 
     @pytest.mark.linux_only
     def test_returns_display_when_xvfb_starts(self, monkeypatch):
-        """When Xvfb is on PATH and -fp succeeds, we get a fresh display back."""
+        """When Xvfb is on PATH and keeps running, we get a display back."""
+        import subprocess
+
         from tools.browser_tool import _try_start_xvfb
 
         # Force the helper to take the "Xvfb launched" branch without
-        # actually invoking the binary.
+        # actually invoking the binary: a proc whose wait() times out is
+        # exactly the success path (Xvfb is still running and healthy).
         monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(
-            "tools.browser_tool._xvfb_parse_display",
-            lambda _stdout: ":77",
-        )
+        mock_proc = MagicMock()
+        mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd=None, timeout=2)
+        monkeypatch.setattr("subprocess.Popen", lambda *a, **k: mock_proc)
         ok, display = _try_start_xvfb()
         assert ok is True
-        assert display == ":77"
+        assert display == ":99"
