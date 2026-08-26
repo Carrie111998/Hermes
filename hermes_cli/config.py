@@ -4090,11 +4090,14 @@ def _sanitize_env_lines(lines: list) -> list:
     embedded in that value must never be reinterpreted as another assignment;
     concatenated assignments are ambiguous and therefore remain on one line.
 
-    One deliberate exception: an assignment whose *complete* value is the
-    ``***`` mask (optionally quoted) is a placeholder echoed by masked
-    secret displays, not a credential. Copy-pasting such a display block
-    into .env must not install ``"***"`` as a live value, so those lines
-    are dropped entirely. Values merely containing the mask pass through.
+    Deliberate exceptions for ``***`` masks echoed by masked secret displays
+    (copy-pasting such a block into .env must not install ``"***"``):
+
+    - an assignment whose *complete* value is the mask is dropped entirely;
+    - a concatenated value ending in ``KNOWN_NAME=***`` loses that trailing
+      placeholder row while the live prefix is preserved
+      (``ANTHROPIC_API_KEY=liveTAVILY_API_KEY=***`` keeps ``live``);
+      unknown names stay opaque, and masks elsewhere pass through.
     """
     sanitized: list[str] = []
     for line in lines:
@@ -4107,13 +4110,55 @@ def _sanitize_env_lines(lines: list) -> list:
             continue
 
         if "=" in stripped:
-            _, _, value = stripped.partition("=")
-            if value.strip().strip("\"'") == "***":
+            key, _, value = stripped.partition("=")
+            cleaned = _strip_trailing_mask_entry(value.strip())
+            if cleaned is None:
                 continue
+            if cleaned != value.strip():
+                stripped = f"{key}={cleaned}"
 
         sanitized.append(stripped + "\n")
 
     return sanitized
+
+
+_MASK_TAIL_VARIANTS = ("***", '"***"', "'***'")
+
+# Lazily populated union of known env-var names (OPTIONAL_ENV_VARS +
+# _EXTRA_ENV_KEYS) used by _strip_trailing_mask_entry.
+_MASK_KNOWN_KEYS = None
+
+
+def _strip_trailing_mask_entry(value: str):
+    """Drop a trailing ``KNOWN_NAME=***`` entry from a concatenated .env value.
+
+    Glued paste rows have no separator, so disambiguation searches for a
+    *known* Hermes env-var name as the suffix entry:
+    ``ANTHROPIC_API_KEY=liveTAVILY_API_KEY=***`` keeps ``live`` because
+    ``TAVILY_API_KEY`` is a known var whose masked display row was pasted
+    without its newline. Unknown ``name=***`` tails stay opaque — values
+    merely containing the mask elsewhere pass through untouched.
+    Returns ``None`` when nothing live remains (whole-line drop).
+    """
+    global _MASK_KNOWN_KEYS
+    if _MASK_KNOWN_KEYS is None:
+        _MASK_KNOWN_KEYS = (
+            frozenset(OPTIONAL_ENV_VARS.keys()) | set(_EXTRA_ENV_KEYS)
+        )
+
+    if value.strip("\"'") == "***":
+        return None
+
+    best_cut = 0
+    for name in _MASK_KNOWN_KEYS:
+        for mask in _MASK_TAIL_VARIANTS:
+            candidate = f"{name}={mask}"
+            if value.endswith(candidate) and len(candidate) > best_cut:
+                best_cut = len(candidate)
+    if not best_cut:
+        return value
+    rest = value[: -best_cut].rstrip()
+    return rest if rest else None
 
 
 def sanitize_env_file() -> int:

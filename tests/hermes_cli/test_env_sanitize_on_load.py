@@ -150,13 +150,76 @@ def test_sanitize_keeps_values_merely_containing_mask():
 
 
 def test_sanitize_drops_only_placeholder_entries():
-    """partition('=') semantics: empty values and suffixed keys survive."""
+    """partition('=') semantics: empty values and plain values survive."""
     from hermes_cli.config import _sanitize_env_lines
 
     lines = [
         "EMPTY_KEY=\n",
-        "KNOWN=value=***\n",
         "GONE=***\n",
     ]
     out = _sanitize_env_lines(lines)
-    assert out == ["EMPTY_KEY=\n", "KNOWN=value=***\n"]
+    assert out == ["EMPTY_KEY=\n"]
+
+
+def test_sanitize_trims_trailing_mask_entry_keeps_live_prefix():
+    """Concatenated paste: live prefix survives, trailing NAME=*** row goes.
+
+    The sweeper case (#12690): a masked display block pasted without
+    newlines glues the live credential with the next display row.
+    """
+    from hermes_cli.config import _sanitize_env_lines
+
+    lines = ["ANTHROPIC_API_KEY=liveTAVILY_API_KEY=***\n"]
+    out = _sanitize_env_lines(lines)
+    assert out == ["ANTHROPIC_API_KEY=live\n"]
+
+
+def test_sanitize_trailing_mask_entry_quoted_variant():
+    from hermes_cli.config import _sanitize_env_lines
+
+    out = _sanitize_env_lines(['KNOWN=valueTAVILY_API_KEY="***"\n'])
+    assert out == ["KNOWN=value\n"]
+
+
+def test_sanitize_unknown_name_mask_tail_stays_opaque():
+    """Unknown ``name=***`` tails stay opaque — only KNOWN names disambiguate."""
+    from hermes_cli.config import _sanitize_env_lines
+
+    out = _sanitize_env_lines(["GONE=value=***\n"])
+    assert out == ["GONE=value=***\n"]
+
+
+def test_sanitize_mask_elsewhere_still_untouched():
+    """Masks that are not trailing NAME=*** entries stay opaque."""
+    from hermes_cli.config import _sanitize_env_lines
+
+    lines = [
+        "SECRET_KEY=abc***def\n",
+        "MASKED_IN_MIDDLE=x***y=z\n",
+        "TRAILING_2STARS=key=**\n",
+    ]
+    out = _sanitize_env_lines(lines)
+    assert out == lines
+
+
+def test_load_env_concatenated_placeholder_preserves_live_credential():
+    """End-to-end: load_env() returns the live credential; no mask leaks."""
+    import os
+
+    from hermes_cli.config import load_env
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".env", delete=False, encoding="utf-8"
+    ) as f:
+        f.write("ANTHROPIC_API_KEY=liveTAVILY_API_KEY=***\n")
+        env_path = Path(f.name)
+
+    try:
+        with patch("hermes_cli.config.get_env_path", return_value=env_path):
+            result = load_env()
+        assert result["ANTHROPIC_API_KEY"] == "live"
+        assert "TAVILY_API_KEY" not in result
+        assert "***" not in result["ANTHROPIC_API_KEY"]
+    finally:
+        env_path.unlink(missing_ok=True)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
