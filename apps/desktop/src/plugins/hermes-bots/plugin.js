@@ -2627,6 +2627,417 @@ async function duplicateBot(bot, roster) {
   return name
 }
 
+// ── blueprints: one description → a whole roster ─────────────────────────────
+
+/**
+ * Bot blueprints: turn one plain-text description of a team into N bot specs,
+ * then create every one of them in a single pass.
+ *
+ * Building a roster today is one dialog per bot — name, title, description,
+ * avatar, submit, repeat — so a six-bot team is six trips through the same
+ * form. Describing that team out loud takes one sentence, so the dialog now
+ * accepts the sentence.
+ *
+ * Parsing is deterministic and offline on purpose: no model call, so there is
+ * no latency, no token cost, no provider key requirement, and the preview the
+ * user confirms is exactly what gets created. Three input shapes are
+ * recognised, most explicit first:
+ *
+ *   1. JSON  — `[{ "name": "ada", "title": "Researcher", "description": "…" }]`
+ *   2. lines — `- Ada — Researcher: reviews the literature`
+ *   3. prose — `a researcher named Ada who reads papers, and Bob who writes`
+ */
+
+/** Every spec becomes a real gateway profile over its own RPC, so the batch is
+ *  capped — a pasted wall of text must not spawn hundreds of profiles. */
+const BLUEPRINT_LIMIT = 24
+
+/** List-item lead-in: "- ", "* ", "• ", "1. ", "2) ". */
+const BLUEPRINT_BULLET_RE = /^\s*(?:[-*•]|\d{1,2}[.)])\s+/
+
+/** Strongest name signal in prose: "…named Ada", "…called Ada". */
+const BLUEPRINT_NAMED_RE = /\b(?:named|called)\s+([A-Za-z][A-Za-z0-9_'-]{0,63})/i
+
+/** "Ada (Researcher) …" / "Ada [Researcher] …" — a name with a bracketed role. */
+const BLUEPRINT_PAREN_RE = /^([^([]{1,64}?)\s*[([]([^)\]]{1,64})[)\]]\s*(.*)$/
+
+/** "Ada who reviews the literature" — a relative clause after a bare name. */
+const BLUEPRINT_RELATIVE_RE = /^([A-Za-z][A-Za-z0-9_'-]{0,63})\s+(?:who|that|which)\s+(.+)$/i
+
+/** Field separators inside one entry: em/en dash, pipe, colon, spaced hyphen. */
+const BLUEPRINT_SEP_RE = /\s+[—–]\s+|\s+\|\s+|:\s+|\s+-\s+/
+
+/** Clause breaks in prose mode: semicolons, commas, and a conjoining "and". */
+const BLUEPRINT_CLAUSE_RE = /\s*;\s*|\s*,\s*(?:and\s+)?|\s+and\s+/i
+
+/** Instruction filler an entry may open with — "I need a bot named Ada" and
+ *  "a bot named Ada" describe the same bot, so the lead-in is dropped before
+ *  the role is read off the front of the clause. */
+const BLUEPRINT_LEAD_RE =
+  /^(?:i\s+(?:need|want|would\s+like)|we\s+(?:need|want)|please|create|add|make|build|set\s+up|also|then|plus|with|an?|the|one|some)\b[\s:,]*/i
+
+/** An instruction preamble that introduces the roster rather than describing a
+ *  bot: "I want a support team:", "Create three bots:", "Build me a newsroom:".
+ *  Bounded to a single line so a bullet's own "Ada: reads papers" colon is safe. */
+const BLUEPRINT_PREAMBLE_RE =
+  /^\s*(?:i\s+(?:need|want|would\s+like)|we\s+(?:need|want)|please|create|build|make|add|set\s+up|here(?:'s| is| are)|these\s+are|the\s+team\s+is)\b[^:\n]{0,60}:[ \t]*/i
+
+/** A bare proper noun standing alone — "Alpha" in "Alpha, Beta and Gamma".
+ *  Capitalisation is what separates it from a continuation fragment like the
+ *  "drafts" in "writes summaries, drafts, and release notes". */
+const BLUEPRINT_BARE_NAME_RE = /^[A-Z][A-Za-z0-9_'-]{0,63}$/
+
+/** Leading relative pronoun on a mission fragment: "who reads papers". */
+const BLUEPRINT_RELATIVE_LEAD_RE = /^(?:who|whom|that|which|and)\s+/i
+
+/** Punctuation left dangling when a fragment is sliced out of a sentence. */
+const BLUEPRINT_EDGE_PUNCT_RE = /^[\s\-–—:,.|]+|[\s\-–—:,.|]+$/g
+
+/** Strip stacked lead-ins: BLUEPRINT_LEAD_RE only eats one, so "I need a
+ *  researcher" would keep the article and read the role as "a researcher". */
+function stripBlueprintLead(text) {
+  let out = String(text || '').trim()
+
+  for (let pass = 0; pass < 4; pass++) {
+    const next = out.replace(BLUEPRINT_LEAD_RE, '').trim()
+
+    if (next === out) {
+      break
+    }
+
+    out = next
+  }
+
+  return out
+}
+
+function blueprintWordCount(text) {
+  return text.trim().split(/\s+/).filter(Boolean).length
+}
+
+function trimBlueprintField(text, max) {
+  return String(text || '')
+    .replace(BLUEPRINT_EDGE_PUNCT_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max)
+}
+
+/**
+ * A prose clause opens a NEW bot only if it carries a name signal. Anything
+ * else is a continuation of the previous bot's mission — otherwise the commas
+ * in "writes summaries, drafts, and reports" would each spawn their own bot.
+ */
+function opensBlueprintEntry(clause) {
+  const text = stripBlueprintLead(clause)
+
+  if (!text) {
+    return false
+  }
+
+  return (
+    BLUEPRINT_NAMED_RE.test(text) ||
+    BLUEPRINT_PAREN_RE.test(text) ||
+    BLUEPRINT_RELATIVE_RE.test(text) ||
+    BLUEPRINT_SEP_RE.test(text) ||
+    BLUEPRINT_BARE_NAME_RE.test(text)
+  )
+}
+
+/** One entry (a bullet line or a prose clause) → a spec, or null when no
+ *  usable handle can be read out of it. */
+function parseBlueprintEntry(raw) {
+  const text = trimBlueprintField(String(raw || '').replace(BLUEPRINT_BULLET_RE, ''), 400)
+
+  if (!text) {
+    return null
+  }
+
+  // Keep the original when the lead-in IS the whole entry ("the reviewer").
+  const body = stripBlueprintLead(text) || text
+  const named = body.match(BLUEPRINT_NAMED_RE)
+  const paren = body.match(BLUEPRINT_PAREN_RE)
+  const relative = body.match(BLUEPRINT_RELATIVE_RE)
+  let name = ''
+  let title = ''
+  let description = ''
+
+  if (named) {
+    // "a research assistant named Ada who reads papers" — the role sits in
+    // front of the name signal, the mission behind it.
+    name = named[1]
+    title = body.slice(0, named.index)
+    description = body.slice(named.index + named[0].length)
+  } else if (paren) {
+    name = paren[1]
+    title = paren[2]
+    description = paren[3]
+  } else if (relative) {
+    name = relative[1]
+    description = relative[2]
+  } else {
+    const parts = body
+      .split(BLUEPRINT_SEP_RE)
+      .map(part => part.trim())
+      .filter(Boolean)
+
+    if (parts.length > 1 && blueprintWordCount(parts[0]) <= 4) {
+      // "Ada — Researcher: reads papers" → handle, role, mission.
+      const hasRole = parts.length > 2
+      name = parts[0]
+      title = hasRole ? parts[1] : ''
+      description = parts.slice(hasRole ? 2 : 1).join(' — ')
+    } else {
+      // No name signal at all. Make the leading words the handle and keep the
+      // whole clause as the mission: "triages the inbox" → `triages-the-inbox`.
+      name = body.split(/\s+/).slice(0, 3).join(' ')
+      // When the handle already IS the whole clause ("Alpha"), repeating it as
+      // the mission just prints the same words twice in the preview.
+      description = name === body ? '' : body
+    }
+  }
+
+  const slug = slugify(trimBlueprintField(name, 64))
+
+  if (!slug || !NAME_RE.test(slug)) {
+    return null
+  }
+
+  return {
+    name: slug,
+    title: trimBlueprintField(stripBlueprintLead(title), 64),
+    // Trim first: the fragment is sliced mid-sentence, so the relative pronoun
+    // sits behind a leading space and an anchored strip would miss it.
+    description: trimBlueprintField(trimBlueprintField(description, 400).replace(BLUEPRINT_RELATIVE_LEAD_RE, ''), 280),
+    source: text
+  }
+}
+
+/** Explicit JSON in, specs out — the shape a model or a script would emit. */
+function parseBlueprintJson(text) {
+  const trimmed = text.trim()
+
+  if (!trimmed.startsWith('[') && !trimmed.startsWith('{')) {
+    return null
+  }
+
+  let data = null
+
+  try {
+    data = JSON.parse(trimmed)
+  } catch {
+    return null // not JSON after all — fall through to the text parsers
+  }
+
+  const rows = Array.isArray(data) ? data : Array.isArray(data?.bots) ? data.bots : null
+
+  if (!rows) {
+    return null
+  }
+
+  const specs = []
+
+  for (const row of rows) {
+    if (typeof row === 'string') {
+      const parsed = parseBlueprintEntry(row)
+
+      if (parsed) {
+        specs.push(parsed)
+      }
+
+      continue
+    }
+
+    const slug = slugify(trimBlueprintField(row?.name ?? row?.handle ?? row?.title ?? row?.role ?? '', 64))
+
+    if (!slug || !NAME_RE.test(slug)) {
+      continue
+    }
+
+    specs.push({
+      name: slug,
+      title: trimBlueprintField(row?.title ?? row?.role ?? '', 64),
+      description: trimBlueprintField(row?.description ?? row?.mission ?? row?.purpose ?? '', 280),
+      soul: typeof row?.soul === 'string' ? row.soul : '',
+      model: trimBlueprintField(row?.model ?? '', 64),
+      provider: trimBlueprintField(row?.provider ?? '', 64),
+      source: slug
+    })
+  }
+
+  return specs.length ? specs : null
+}
+
+/** First free handle for `base`, counting up like the duplicate flow does. */
+function freeBlueprintName(base, taken) {
+  if (!taken.has(base)) {
+    return base
+  }
+
+  for (let n = 2; n < 100; n++) {
+    // Truncate the BASE, never the suffix — slicing the joined string chops
+    // the "-2" off a max-length name and the candidate collides forever (#19).
+    const suffix = `-${n}`
+    const candidate = base.slice(0, 64 - suffix.length) + suffix
+
+    if (!taken.has(candidate)) {
+      return candidate
+    }
+  }
+
+  return null
+}
+
+/**
+ * Free text → `{ specs, warnings }`. Pure and synchronous: the create dialog
+ * runs this on every keystroke to render the preview, and again on submit, so
+ * what is previewed is exactly what is created.
+ */
+function parseBotBlueprint(text, roster = []) {
+  const warnings = []
+  const raw = String(text || '')
+
+  if (!raw.trim()) {
+    return { specs: [], warnings }
+  }
+
+  let entries = parseBlueprintJson(raw)
+
+  if (!entries) {
+    // "Build me a newsroom:" heads the list, it is not a member of it.
+    const body = raw.replace(BLUEPRINT_PREAMBLE_RE, '')
+    const lines = body
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+    const bulleted = lines.filter(line => BLUEPRINT_BULLET_RE.test(line))
+    const separated = lines.filter(line => BLUEPRINT_SEP_RE.test(line))
+
+    if (bulleted.length || (lines.length > 1 && separated.length * 2 >= lines.length)) {
+      // Line mode: one bot per line, no clause splitting — a mission is free
+      // to contain commas. Once ANY line is bulleted the list IS the roster and
+      // the unbulleted lines around it are headers or trailing prose.
+      entries = (bulleted.length ? bulleted : lines).map(parseBlueprintEntry).filter(Boolean)
+    } else {
+      // Prose mode: split into clauses, then re-join the ones that do not
+      // introduce a bot of their own.
+      const grouped = []
+
+      for (const clause of body.replace(/\s+/g, ' ').split(BLUEPRINT_CLAUSE_RE)) {
+        const trimmed = clause.trim()
+
+        if (!trimmed) {
+          continue
+        }
+
+        if (!grouped.length || opensBlueprintEntry(trimmed)) {
+          grouped.push(trimmed)
+        } else {
+          grouped[grouped.length - 1] += `, ${trimmed}`
+        }
+      }
+
+      entries = grouped.map(parseBlueprintEntry).filter(Boolean)
+    }
+  }
+
+  // Handles must be unique against the live roster AND within the batch — a
+  // blueprint naming two bots "ada" still has to produce two profiles.
+  const taken = new Set(roster.map(bot => bot?.name).filter(Boolean))
+  const specs = []
+
+  for (const entry of entries) {
+    if (specs.length >= BLUEPRINT_LIMIT) {
+      warnings.push(`Only the first ${BLUEPRINT_LIMIT} bots were kept — the description listed more.`)
+      break
+    }
+
+    const name = freeBlueprintName(entry.name, taken)
+
+    if (!name) {
+      warnings.push(`Skipped “${entry.source}” — no free handle left for “${entry.name}”.`)
+      continue
+    }
+
+    taken.add(name)
+    specs.push({ ...entry, name, renamedFrom: name === entry.name ? null : entry.name })
+  }
+
+  if (!specs.length) {
+    warnings.push('No bots found in that description. Try one per line, like “Ada — Researcher: reads papers”.')
+  }
+
+  return { specs, warnings }
+}
+
+/** Deterministic look for a blueprint bot: a blobatar seeded from the handle
+ *  (no image RPC, no network) and a colour cycled across the batch so a
+ *  freshly created team is tellable apart at a glance. The cycle starts on the
+ *  same orange the single-bot create dialog defaults to. */
+function blueprintLook(spec, index) {
+  return {
+    shape: blobatarSvg ? 'blobatar' : defaultShapeFor(spec.name),
+    color: AVATAR_COLORS[(index + 3) % AVATAR_COLORS.length],
+    imageKind: 'shape',
+    title: spec.title || '',
+    created: Date.now()
+  }
+}
+
+/**
+ * Create every spec in order, reporting progress as it goes.
+ *
+ * One failure never aborts the batch: a partly-created roster whose gaps are
+ * named back to the user is recoverable, an exception thrown at bot 3 of 8
+ * leaves them guessing which 2 exist. The look is best-effort on top — the
+ * profile is what counts as created, the avatar is cosmetic.
+ */
+async function createBotsFromBlueprint({ specs, roster = [], onProgress }) {
+  const created = []
+  const failed = []
+
+  for (let index = 0; index < specs.length; index++) {
+    const spec = specs[index]
+
+    onProgress?.({ phase: 'creating', index, total: specs.length, name: spec.name })
+
+    try {
+      await host.request('profiles.create', {
+        name: spec.name,
+        description: [spec.title, spec.description].filter(Boolean).join(' — '),
+        clone_from: 'default',
+        soul: composeSoul({
+          name: spec.name,
+          title: spec.title,
+          description: spec.description,
+          roster,
+          customSoul: spec.soul || ''
+        }),
+        ...(spec.model && spec.provider ? { model: spec.model, provider: spec.provider } : {})
+      })
+    } catch (err) {
+      failed.push({ name: spec.name, message: err?.message || String(err) })
+      onProgress?.({ phase: 'failed', index, total: specs.length, name: spec.name })
+      continue
+    }
+
+    try {
+      await saveBotMeta(spec.name, blueprintLook(spec, index))
+    } catch {
+      /* look is cosmetic — the profile exists, so it still counts as created */
+    }
+
+    created.push(spec.name)
+    onProgress?.({ phase: 'created', index, total: specs.length, name: spec.name })
+  }
+
+  if (created.length) {
+    queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+  }
+
+  return { created, failed }
+}
+
 /** Permanently delete a bot's Hermes profile, then remove plugin-local state
  * that would otherwise leave stale appearance/unread data behind.
  *
@@ -9671,6 +10082,199 @@ function EditProfileDialog({ bot, open, onClose }) {
   })
 }
 
+// ── blueprint dialog ─────────────────────────────────────────────────────────
+
+const BLUEPRINT_PLACEHOLDER = [
+  'Describe the team — one per line:',
+  '',
+  '  scout — Researcher: finds and ranks sources',
+  '  scribe — Writer: drafts the weekly summary',
+  '',
+  'or in a sentence: “a researcher named Scout who finds sources,',
+  'and a writer called Scribe who drafts the summary”'
+].join('\n')
+
+/** Create a whole roster from one description. The preview is re-parsed on
+ *  every keystroke and IS the plan — what the list shows is exactly what
+ *  Create makes, handles included. */
+function CreateBlueprintDialog({ open, onClose, roster }) {
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState(null)
+
+  // Reset per open so a cancelled draft doesn't leak into the next one.
+  useEffect(() => {
+    if (open) {
+      setText('')
+      setBusy(false)
+      setProgress(null)
+    }
+  }, [open])
+
+  const { specs, warnings } = useMemo(() => parseBotBlueprint(text, roster), [text, roster])
+
+  const create = async () => {
+    setBusy(true)
+
+    try {
+      const { created, failed } = await createBotsFromBlueprint({
+        specs,
+        roster,
+        onProgress: setProgress
+      })
+
+      if (created.length && !failed.length) {
+        host.notify({ kind: 'success', message: `Created ${created.length} bots — ${created.join(', ')}` })
+      } else if (created.length) {
+        host.notify({
+          kind: 'info',
+          message: `Created ${created.length} of ${specs.length} — ${failed.map(entry => entry.name).join(', ')} failed`
+        })
+      } else {
+        host.notify({ kind: 'error', message: `No bots created — ${failed[0]?.message || 'unknown error'}` })
+      }
+
+      if (created.length) {
+        onClose()
+      }
+    } catch (err) {
+      host.notifyError(err, 'Blueprint failed')
+    } finally {
+      setBusy(false)
+      setProgress(null)
+    }
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value && !busy) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-lg',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'New Bots from a Description' }),
+            jsx(DialogDescription, {
+              children:
+                'Describe the team in plain text and every bot in it gets created — handle, role, mission, and avatar. Parsed on this machine; no model call.'
+            })
+          ]
+        }),
+        jsx(Textarea, {
+          'aria-label': 'Team description',
+          autoFocus: true,
+          className: 'min-h-32 font-mono text-xs',
+          disabled: busy,
+          placeholder: BLUEPRINT_PLACEHOLDER,
+          value: text,
+          onChange: event => setText(event.target.value)
+        }),
+        specs.length
+          ? jsxs('div', {
+              className: 'grid gap-1.5',
+              children: [
+                jsx('div', {
+                  className: 'text-xs font-medium text-(--ui-text-secondary)',
+                  children: `${specs.length} ${specs.length === 1 ? 'bot' : 'bots'} to create`
+                }),
+                jsx(ScrollArea, {
+                  className: 'max-h-56 min-h-0',
+                  children: jsx('div', {
+                    className: 'grid gap-0.5 pr-2',
+                    children: specs.map((spec, index) => {
+                      const look = blueprintLook(spec, index)
+
+                      return jsxs(
+                        'div',
+                        {
+                          className: 'flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1',
+                          children: [
+                            jsx(BotFace, { shape: look.shape, color: look.color, size: 28, name: spec.name }),
+                            jsxs('div', {
+                              className: 'grid min-w-0 flex-1 gap-0.5',
+                              children: [
+                                jsxs('div', {
+                                  className: 'flex min-w-0 items-baseline gap-1.5',
+                                  children: [
+                                    jsx('span', {
+                                      className: 'truncate text-xs font-medium text-foreground',
+                                      children: spec.title || spec.name
+                                    }),
+                                    jsx('span', {
+                                      className: 'shrink-0 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                                      children: spec.name
+                                    }),
+                                    spec.renamedFrom
+                                      ? jsx(Tip, {
+                                          label: `“${spec.renamedFrom}” is already taken — this bot gets the next free handle`,
+                                          children: jsx('span', {
+                                            className:
+                                              'shrink-0 rounded bg-(--chrome-action-hover) px-1 text-[0.5625rem] text-(--ui-text-tertiary)',
+                                            children: 'renamed'
+                                          })
+                                        })
+                                      : null
+                                  ]
+                                }),
+                                spec.description
+                                  ? jsx('span', {
+                                      className: 'truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                                      children: spec.description
+                                    })
+                                  : null
+                              ]
+                            })
+                          ]
+                        },
+                        spec.name
+                      )
+                    })
+                  })
+                })
+              ]
+            })
+          : null,
+        warnings.length && text.trim()
+          ? jsx('div', {
+              className: 'grid gap-1',
+              children: warnings.map(warning =>
+                jsxs(
+                  'div',
+                  {
+                    className: 'flex items-start gap-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+                    children: [
+                      jsx(Codicon, { name: 'warning', className: 'mt-px shrink-0 text-[0.625rem]' }),
+                      jsx('span', { children: warning })
+                    ]
+                  },
+                  warning
+                )
+              )
+            })
+          : null,
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'ghost', disabled: busy, onClick: onClose, children: 'Cancel' }),
+            jsx(Button, {
+              disabled: busy || !specs.length,
+              onClick: create,
+              children: busy
+                ? progress
+                  ? `Creating ${progress.name}… (${progress.index + 1}/${progress.total})`
+                  : 'Creating…'
+                : `Create ${specs.length || ''} ${specs.length === 1 ? 'bot' : 'bots'}`.replace(/\s+/g, ' ').trim()
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 // ── create dialog ────────────────────────────────────────────────────────────
 
 function CreateAgentDialog({ open, onClose, roster }) {
@@ -14093,6 +14697,7 @@ function BotsPane() {
   const gatewayUp = gatewayState === 'open'
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
   const [createOpen, setCreateOpen] = useState(false)
+  const [blueprintOpen, setBlueprintOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
@@ -14489,6 +15094,10 @@ function BotsPane() {
                         children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), 'New Bot']
                       }),
                       jsxs(DropdownMenuItem, {
+                        onSelect: () => setBlueprintOpen(true),
+                        children: [jsx(Codicon, { name: 'sparkle', className: 'mr-1.5' }), 'New Bots from Description…']
+                      }),
+                      jsxs(DropdownMenuItem, {
                         disabled: activeSourceRoster.length < 2,
                         onSelect: () => setGroupCreateOpen(true),
                         children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
@@ -14791,6 +15400,14 @@ function BotsPane() {
                       ]
                     })
                   }),
+      jsx(CreateBlueprintDialog, {
+        open: blueprintOpen,
+        onClose: () => {
+          setBlueprintOpen(false)
+          void refetch()
+        },
+        roster: activeSourceRoster
+      }),
       jsx(CreateAgentDialog, {
         open: createOpen,
         onClose: () => {
