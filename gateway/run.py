@@ -31626,6 +31626,46 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                # Per-profile live-adapter maps so each profile's scheduled
+                # deliveries are offered ONLY its own adapters: runner.adapters
+                # is the ACTIVE profile's flat map, while secondary profiles
+                # live in runner._profile_adapters. Passing only
+                # runner.adapters made every secondary-profile delivery
+                # resolve the active profile's adapter for the whole logical
+                # platform — e.g. one profile's bot DM sent by ANOTHER
+                # profile's bot, which Discord rejects with 403 50001 because
+                # the sender is not a DM participant. Maps are shared by
+                # REFERENCE, so reconnect / swap bookkeeping on the runner
+                # stays visible to the ticker.
+                _active_home = None
+                try:
+                    from hermes_constants import get_hermes_home
+
+                    _active_home = Path(get_hermes_home()).resolve()
+                except Exception:
+                    pass
+                profile_adapters: Dict[str, Dict[Any, Any]] = {}
+                for _entry in profile_homes:
+                    _p_name = _entry[0] if isinstance(_entry, tuple) else None
+                    _p_home = _entry[1] if isinstance(_entry, tuple) else None
+                    if not _p_name:
+                        continue
+                    # The ACTIVE profile owns the flat runner map; every other
+                    # served profile owns its per-profile secondary map.
+                    _is_active = (
+                        _p_home is not None
+                        and _active_home is not None
+                        and Path(_p_home).resolve() == _active_home
+                    ) or (_p_home is None and _p_name == "default")
+                    if _is_active:
+                        profile_adapters[_p_name] = runner.adapters
+                    elif _p_name in runner._profile_adapters:
+                        profile_adapters[_p_name] = runner._profile_adapters[_p_name]
+                    else:
+                        # Secondary not up yet / disabled: resolve NO live
+                        # transport for it rather than another profile's.
+                        profile_adapters[_p_name] = {}
+                cron_start_kwargs["profile_adapters"] = profile_adapters
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),

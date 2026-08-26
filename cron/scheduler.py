@@ -3065,6 +3065,51 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+@contextlib.contextmanager
+def _delivery_secret_scope():
+    """Re-install the current profile's secret scope around delivery.
+
+    ``run_one_job`` resets the job's secret scope once the agent turn ends,
+    BEFORE delivery runs — the agent's credential scope must not leak past
+    the conversation turn. But the standalone delivery fallback (no live
+    gateway lane available, or the fallback attempt after a live-lane send
+    fails) reads platform tokens from the ambient credential resolution;
+    inside a multiplexed ticker thread that would otherwise mean whichever
+    profile started the PROCESS. Secondary-profile cron deliveries then
+    authenticate as a foreign bot, and platforms like Discord reject DMs
+    from a non-participant with 403 50001 Missing Access.
+
+    Mirrors ``run_job``'s per-job scope so standalone delivery resolves the
+    OWNING profile's ``<home>/.env`` (plus its configured external secret
+    sources). Gated on multiplexing being active: single-profile processes
+    keep the exact legacy behavior (no scope, ``os.environ`` reads).
+    """
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        is_multiplex_active,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    if not is_multiplex_active():
+        yield
+        return
+
+    token = set_secret_scope(build_profile_secret_scope(_get_hermes_home()))
+    try:
+        yield
+    finally:
+        reset_secret_scope(token)
+
+
+def _deliver_result_with_profile_scope(
+    job: dict, content: str, adapters=None, loop=None
+) -> Optional[str]:
+    """Call ``_deliver_result`` under the owning profile's secret scope."""
+    with _delivery_secret_scope():
+        return _deliver_result(job, content, adapters=adapters, loop=loop)
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -7265,7 +7310,7 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
-                        delivery_error = _deliver_result(
+                        delivery_error = _deliver_result_with_profile_scope(
                             job,
                             deliver_content,
                             adapters=adapters,
@@ -7423,7 +7468,7 @@ def _run_one_job_body(
             else:
                 try:
                     delivery_attempted = True
-                    delivery_error = _deliver_result(
+                    delivery_error = _deliver_result_with_profile_scope(
                         job,
                         # Composed exactly like the normal failure delivery above.
                         # mark_job_run below records THIS run in failure_streak
@@ -7551,6 +7596,24 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
 # to None to force a reap on the next tick.
 _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
+
+
+def _adapters_for_profile(base_adapters, profile_adapters, profile_name):
+    """Resolve the live-adapter map for ONE profile's cron tick.
+
+    ``profile_adapters`` maps profile name → {Platform: live adapter} and is
+    composed by the multiplexed gateway (see ``gateway/run.py``). The active
+    profile keeps ``base_adapters`` (the runner's own flat map); every other
+    profile resolves ONLY its own entry — a profile whose adapters are not
+    connected gets an EMPTY map, so its deliveries fall back to standalone
+    sends under that profile's own credentials instead of riding whatever
+    other identity happens to hold the platform slot in the shared process.
+    """
+    if not profile_adapters:
+        return base_adapters
+    if not profile_name:
+        return base_adapters
+    return profile_adapters.get(profile_name) or {}
 
 
 def tick(

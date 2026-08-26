@@ -532,6 +532,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -559,6 +560,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_adapters=profile_adapters,
             )
             return
 
@@ -630,6 +632,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_adapters=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -638,9 +641,22 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``profile_adapters`` maps profile name → {Platform: live adapter}. It
+        keeps delivery identity aligned with the job's owning profile: each
+        tick is offered ONLY that profile's adapters. A profile whose adapter
+        is not connected resolves no live transport at all — its deliveries
+        then fall back to standalone sends under that profile's own
+        credentials (see ``cron.scheduler._delivery_secret_scope``) — never
+        onto another profile's bot. Sharing one flat map across profiles
+        meant a secondary profile's DM-bound cron delivery could go out as
+        whichever OTHER identity happened to win the platform slot; Discord
+        (like most platforms) rejects DMs from a non-participant with 403
+        50001 Missing Access. Per-profile maps make that class of
+        cross-profile send structurally impossible.
         """
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import _adapters_for_profile, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -682,13 +698,16 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=_adapters_for_profile(
+                                        adapters, profile_adapters, profile_name
+                                    ),
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
