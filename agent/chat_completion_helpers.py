@@ -1822,6 +1822,34 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _sanitize_xai_tool_schemas(agent, tools_for_api: list) -> list:
+    """Return the xAI-compatible tool schemas, reusing an unchanged snapshot.
+
+    xAI requires two destructive schema sanitizers.  Keep their deep-copy
+    result on the agent so repeated Responses calls do not copy and sanitize
+    the same tool catalog on every turn.  Tool refreshes publish a new
+    ``_tool_snapshot_generation``; the list identity/shape also invalidates
+    the cache for direct in-place appends used by a few tool injectors.
+    """
+    generation = getattr(agent, "_tool_snapshot_generation", None)
+    key = (id(tools_for_api), generation, tuple(id(tool) for tool in tools_for_api))
+    cached = getattr(agent, "_xai_tool_schema_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    import copy as _copy
+    from tools.schema_sanitizer import (
+        strip_pattern_and_format,
+        strip_slash_enum,
+    )
+
+    sanitized = _copy.deepcopy(tools_for_api)
+    sanitized, _ = strip_pattern_and_format(sanitized)
+    sanitized, _ = strip_slash_enum(sanitized)
+    agent._xai_tool_schema_cache = (key, sanitized)
+    return sanitized
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
@@ -1921,14 +1949,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # main-model swap) sees the already-stripped schema.  See #27907.
         if is_xai_responses:
             try:
-                import copy as _copy
-                from tools.schema_sanitizer import (
-                    strip_pattern_and_format,
-                    strip_slash_enum,
-                )
-                tools_for_api = _copy.deepcopy(tools_for_api)
-                tools_for_api, _ = strip_pattern_and_format(tools_for_api)
-                tools_for_api, _ = strip_slash_enum(tools_for_api)
+                tools_for_api = _sanitize_xai_tool_schemas(agent, tools_for_api)
             except Exception as exc:
                 logger.warning(
                     "%s⚠️ Failed to sanitize tool schemas for xAI: %s",
