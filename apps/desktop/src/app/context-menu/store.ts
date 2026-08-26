@@ -4,12 +4,23 @@ import type { TerminalMenuHandle } from '@/app/right-sidebar/terminal/terminal-c
 
 import type { ContextMenuDomTarget } from './target'
 
-/** Spell-check facts for the open editable menu. They arrive AFTER the menu
- *  opens: Chromium reports them on the main-process `context-menu` event,
- *  which fires after the DOM gesture that opened the menu. */
+/** Spell-check facts for the open editable menu. They can arrive AFTER the
+ *  menu opens by two routes: (a) the main-process `context-menu` event, which
+ *  fires after the DOM gesture (native path — flaky on Linux for
+ *  contenteditable), or (b) the renderer-side engine, which computes the
+ *  click word and suggestions directly. `anchor` rides only the renderer
+ *  path and is never sent over IPC. */
 export interface SpellcheckContext {
   misspelledWord: string
   suggestions: string[]
+  /** Where the click word lives, for the replace action after the menu
+   *  closes. Kept out of IPC: main only ever sees the serializable fields. */
+  anchor?: {
+    editable: HTMLElement
+    start: number
+    end: number
+    textNode?: Text | null
+  }
 }
 
 /** What the guest page reported for the click, straight off the webview's
@@ -118,12 +129,26 @@ export function closeContextMenu(): void {
 }
 
 /** Attach late-arriving spell-check facts to the open editable menu. Ignored
- *  when the menu already closed or the click was not in an editable — the
- *  forward always belongs to the gesture that opened the current menu. */
-export function augmentSpellcheck(payload: SpellcheckContext): void {
+ *  when the menu already closed or the click was not in an editable. A
+ *  `isCurrent` guard ties the async renderer-side compute to the exact open
+ *  gesture (a fast second right-click must not pollute a newer menu).
+ *  When the open menu already carries richer facts (renderer engine with
+ *  suggestions + anchor), a bare native payload never clobbers it. */
+export function augmentSpellcheck(payload: SpellcheckContext, isCurrent?: () => boolean): void {
   const open = $contextMenu.get()
 
+  if (isCurrent && !isCurrent()) {
+    return
+  }
+
   if (!open || open.kind !== 'dom' || !open.target.editable || !payload.misspelledWord) {
+    return
+  }
+
+  const existing = open.spellcheck
+
+  if (existing?.suggestions?.length) {
+    // Keep the richer renderer-side facts (suggestions + anchor).
     return
   }
 

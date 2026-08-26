@@ -29,6 +29,7 @@ import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '../routes'
 
+import { addToDictionary, computeSpellcheck, replaceWord } from './spellcheck'
 import {
   $contextMenu,
   augmentSpellcheck,
@@ -189,7 +190,18 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
   }
 
   const spellcheckAction = (action: { kind: 'add' | 'replace'; word: string }) => {
-    withEditableFocus(() => void window.hermesDesktop?.contextMenuSpellcheck?.(action))
+    if (action.kind === 'replace') {
+      // Renderer-side replace: Chromium's replaceMisspelling only works when
+      // it happened to report a misspelled word for the gesture (it often
+      // doesn't on Linux contenteditable), so we edit the DOM directly using
+      // the anchor captured at menu-open time.
+      withEditableFocus(() => replaceWord(action.word, spellcheck?.anchor))
+
+      return
+    }
+
+    // Add to dictionary: persist locally AND teach Chromium's spellchecker.
+    withEditableFocus(() => addToDictionary(action.word, target.editable))
   }
 
   if (linkUrl) {
@@ -656,6 +668,19 @@ export function AppContextMenu() {
 
       event.stopPropagation()
       openDomContextMenu(event.clientX, event.clientY, target)
+
+      if (target.editable) {
+        // Renderer-side spell-check: compute the click word + suggestions
+        // directly from the DOM. The native main-process path reports an
+        // empty misspelled word for contenteditable on Linux, so relying on
+        // it left the menu with no spell-check section at all.
+        const opened = $contextMenu.get()
+        void computeSpellcheck(event.clientX, event.clientY, target.editable).then(payload => {
+          if (payload) {
+            augmentSpellcheck(payload, () => $contextMenu.get() === opened)
+          }
+        })
+      }
     }
 
     window.addEventListener('contextmenu', onContextMenu, true)

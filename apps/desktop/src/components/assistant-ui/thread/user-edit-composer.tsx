@@ -867,7 +867,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               onPaste={handlePaste}
               ref={editorRef}
               role="textbox"
-              spellCheck={false}
+              spellCheck={true}
               suppressContentEditableWarning
             />
             <ComposerDirectiveActions editorRef={editorRef} />
@@ -884,7 +884,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
                 autoComplete="off"
                 autoCorrect="off"
                 className="sr-only"
-                spellCheck={false}
+                spellCheck={true}
                 tabIndex={-1}
               />
             </ComposerPrimitive.Input>
