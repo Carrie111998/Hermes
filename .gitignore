@@ -222,3 +222,5 @@ native/fts5_cjk/*.so
 .probe-home*/
 .probe-adapter/
 .probe-dbg*/
+.c5b-home/
+.c5b-matrix/
