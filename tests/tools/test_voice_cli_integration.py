@@ -902,6 +902,22 @@ class TestEnableVoiceModeReal:
         assert cli._voice_mode is False
 
     @patch("cli._cprint")
+    @patch("tools.voice_mode.check_voice_requirements",
+           return_value={"available": False, "details": "Missing",
+                         "missing_packages": ["sounddevice"]})
+    @patch("tools.voice_mode.detect_audio_environment",
+           return_value={"available": True, "warnings": []})
+    def test_requirements_fail_guidance_mentions_record_key(self, _env, _req, _cp):
+        cli = _make_voice_cli()
+        cli._enable_voice_mode()
+        combined = " ".join(
+            args[0] for args, _kwargs in _cp.call_args_list if args
+        )
+        assert "no restart needed" in combined
+        assert "record_key" in combined
+        assert "use /voice on instead" not in combined
+
+    @patch("cli._cprint")
     @patch("hermes_cli.config.load_config", return_value={"voice": {"auto_tts": True}})
     @patch("tools.voice_mode.check_voice_requirements",
            return_value={"available": True, "details": "OK"})
