@@ -158,6 +158,26 @@ def cron_list(show_all: bool = False):
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+
+        # The per-job inference pin. This is the highest-precedence and most
+        # durable model override on the box — it beats HERMES_MODEL and
+        # config.yaml, is re-read from storage every tick, and lives in the
+        # untracked cron store, so no git checkout can revert it. Rendering it
+        # here is the only way an operator can SEE which jobs are pinned; a
+        # job silently running on a stale pin is otherwise indistinguishable
+        # from one following the global default. base_url is shown alongside
+        # because provider+base_url is a single security-relevant pair (F8),
+        # not two independent fields.
+        model = job.get("model")
+        provider = job.get("provider")
+        base_url = job.get("base_url")
+        if model:
+            print(f"    Model:     {model}")
+        if provider:
+            print(f"    Provider:  {provider}")
+        if base_url:
+            print(f"    Base URL:  {base_url}")
+
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")
@@ -340,6 +360,12 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        # Pin at creation. Beyond setting the override, a pinned axis carries no
+        # provider_snapshot/model_snapshot (cron.jobs._compute_provider_model_snapshots),
+        # so the job is exempt from the unpinned-drift guard that otherwise
+        # refuses to fire once global inference config moves.
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -350,6 +376,12 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     job_data = result.get("job", {})
+    if job_data.get("model"):
+        print(f"  Model: {job_data['model']}")
+    if job_data.get("provider"):
+        print(f"  Provider: {job_data['provider']}")
+    if job_data.get("base_url"):
+        print(f"  Base URL: {job_data['base_url']}")
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
     if job_data.get("no_agent"):
@@ -403,6 +435,15 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        # The per-job model/provider pin. `cronjob` treats None as "not
+        # supplied" and an empty string as "clear", so the argparse default
+        # leaves an existing pin untouched. Routing through the tool (rather
+        # than update_job directly) is deliberate: `action="update"` re-runs
+        # _validate_cron_base_url on the EFFECTIVE provider/base_url pair, so a
+        # provider change on a job that already carries a base_url cannot
+        # quietly create a credential-exfil pair (F8).
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -416,6 +457,16 @@ def cron_edit(args):
         print(f"  Skills: {', '.join(updated['skills'])}")
     else:
         print("  Skills: none")
+    # Echo the inference pin whenever THIS edit touched it, even when the new
+    # value is empty. A clear that printed nothing would be indistinguishable
+    # from a no-op, and this is the pin that survives a git checkout — the
+    # operator needs to read back what the store now holds, not what was typed.
+    if getattr(args, "model", None) is not None or updated.get("model"):
+        print(f"  Model: {updated.get('model') or '(inherited from env/config)'}")
+    if getattr(args, "provider", None) is not None or updated.get("provider"):
+        print(f"  Provider: {updated.get('provider') or '(inherited from env/config)'}")
+    if updated.get("base_url"):
+        print(f"  Base URL: {updated['base_url']}")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
     if updated.get("no_agent"):

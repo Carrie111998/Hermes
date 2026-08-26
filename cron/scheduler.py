@@ -5301,8 +5301,9 @@ def _run_job_impl(
                 f"HERMES_MODEL={os.getenv('HERMES_MODEL', '')!r}, "
                 "config.yaml model.default missing or empty). "
                 f"Set a per-job model via "
-                f"`cronjob action=update job_id={job_id} model=<name>` or set a "
-                "default with `hermes model <name>`."
+                f"`hermes cron edit {job_id} --model <name>` (or, from the "
+                f"agent, `cronjob action=update job_id={job_id} model=<name>`), "
+                "or set a default with `hermes model <name>`."
             )
 
         # Apply IPv4 preference if configured.
@@ -5504,18 +5505,22 @@ def _run_job_impl(
                 "Job '%s': SKIPPED — global inference config drifted since "
                 "creation (%s) and this job is unpinned. Skipped to prevent "
                 "unintended spend. Pin explicitly to proceed: "
-                "`cronjob action=update job_id=%s provider=<p> model=<m>`.",
+                "`hermes cron edit %s --provider <p> --model <m>` "
+                "(or `cronjob action=update job_id=%s provider=<p> model=<m>`).",
                 job_id,
                 _changes,
+                job_id,
                 job_id,
             )
             raise RuntimeError(
                 f"Skipped to prevent unintended spend: global inference config "
                 f"drifted since this job was created ({_changes}), and this job "
                 f"is unpinned. No inference call was made. To run on the new "
-                f"config, pin it explicitly: `cronjob action=update "
-                f"job_id={job_id} provider=<provider> model=<model>` "
-                f"(or pin the original values to keep them). See #44585."
+                f"config, pin it explicitly: `hermes cron edit {job_id} "
+                f"--provider <provider> --model <model>` (or, from the agent, "
+                f"`cronjob action=update job_id={job_id} provider=<provider> "
+                f"model=<model>`) — or pin the original values to keep them. "
+                f"See #44585."
             )
 
         fallback_model = get_fallback_chain(_cfg) or None

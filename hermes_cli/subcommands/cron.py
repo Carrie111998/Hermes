@@ -70,6 +70,24 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--model",
+        help=(
+            "Pin the model this job runs on. Highest-precedence override — "
+            "beats HERMES_MODEL and config.yaml `model:` — and is re-read from "
+            "the cron store every tick. Pinning at creation also exempts the "
+            "job from the unpinned-drift skip, which otherwise refuses to run "
+            "a job whose global config changed since it was created."
+        ),
+    )
+    cron_create.add_argument(
+        "--provider",
+        help=(
+            "Pin the inference provider this job runs on (anthropic, openai, "
+            "a configured custom provider, ...). Same precedence and "
+            "drift-exemption as --model."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -133,6 +151,25 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--model",
+        help=(
+            "Pin the model this job runs on. Highest-precedence override — "
+            "beats HERMES_MODEL and config.yaml `model:` — and is re-read from "
+            "the cron store every tick, so it takes effect without a restart. "
+            "Pass empty string to clear (job falls back to env/config)."
+        ),
+    )
+    cron_edit.add_argument(
+        "--provider",
+        help=(
+            "Pin the inference provider this job runs on (anthropic, openai, "
+            "a configured custom provider, ...). Pass empty string to clear. "
+            "A job that already carries a base_url is re-validated against the "
+            "new provider and the edit is refused if the pair would send that "
+            "provider's stored credential off-host."
+        ),
     )
 
     # lifecycle actions

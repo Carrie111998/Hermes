@@ -10,6 +10,23 @@ from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
 
 
+def _parse_cron_args(argv):
+    """Parse ``argv`` through the REAL ``hermes cron`` parser.
+
+    A hand-built ``Namespace`` sets the attribute the handler reads, so it
+    passes whether or not the flag exists on the parser — which is exactly how
+    a missing ``--reason`` survived until d786a92f78. Anything asserting that a
+    FLAG works must come through here.
+    """
+    import argparse
+
+    from hermes_cli.subcommands.cron import build_cron_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_cron_parser(parser.add_subparsers(dest="command"), cmd_cron=lambda a: 0)
+    return parser.parse_args(argv)
+
+
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
@@ -175,6 +192,230 @@ class TestCronCommandLifecycle:
         events = bus.query(event_type=EventType.CRON_TRIGGERED)
         assert len(events) == 1
         assert events[0].payload["reason"] is None
+
+    def test_edit_model_and_provider_from_the_real_parser_reach_the_store(
+        self, tmp_cron_dir, capsys
+    ):
+        """`hermes cron edit <id> --model ... --provider ...` pins the job.
+
+        The per-job model/provider pair is the highest-precedence and most
+        durable inference override on the box, but `cron edit` defined no flags
+        for it, so an operator could not set it from a terminal at all. Driven
+        through the REAL parser on purpose — a hand-built Namespace supplies
+        `args.model` itself and so cannot catch a missing flag.
+        """
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        assert get_job(job["id"]).get("model") is None
+
+        args = _parse_cron_args(
+            ["cron", "edit", job["id"], "--model", "claude-opus-5",
+             "--provider", "anthropic"]
+        )
+        assert args.model == "claude-opus-5"
+        assert args.provider == "anthropic"
+
+        assert cron_command(args) == 0
+
+        pinned = get_job(job["id"])
+        assert pinned["model"] == "claude-opus-5"
+        assert pinned["provider"] == "anthropic"
+
+        out = capsys.readouterr().out
+        assert "Model: claude-opus-5" in out
+        assert "Provider: anthropic" in out
+
+    def test_edit_leaves_an_existing_pin_alone_when_the_flags_are_omitted(
+        self, tmp_cron_dir
+    ):
+        """A bare edit must not silently unpin the job."""
+        job = create_job(
+            prompt="Check server status",
+            schedule="every 1h",
+            model="claude-opus-5",
+            provider="anthropic",
+        )
+
+        assert cron_command(
+            _parse_cron_args(["cron", "edit", job["id"], "--name", "Renamed"])
+        ) == 0
+
+        still = get_job(job["id"])
+        assert still["name"] == "Renamed"
+        assert still["model"] == "claude-opus-5"
+        assert still["provider"] == "anthropic"
+
+    def test_edit_clears_the_pin_with_an_empty_value_and_says_so(
+        self, tmp_cron_dir, capsys
+    ):
+        """`--model ""` unpins, and the clear is echoed.
+
+        Same empty-string-clears convention as --script/--workdir. The echo
+        matters: a clear that printed nothing would be indistinguishable from
+        a no-op on the one field a git checkout cannot restore.
+        """
+        job = create_job(
+            prompt="Check server status",
+            schedule="every 1h",
+            model="claude-opus-5",
+            provider="anthropic",
+        )
+
+        assert cron_command(
+            _parse_cron_args(
+                ["cron", "edit", job["id"], "--model", "", "--provider", ""]
+            )
+        ) == 0
+
+        cleared = get_job(job["id"])
+        assert cleared["model"] is None
+        assert cleared["provider"] is None
+
+        out = capsys.readouterr().out
+        assert "Model: (inherited from env/config)" in out
+        assert "Provider: (inherited from env/config)" in out
+
+    def test_edit_pin_with_no_base_url_passes_the_exfil_guard(self, tmp_cron_dir):
+        """Setting model/provider alone (base_url None) must not trip F8.
+
+        `_validate_cron_base_url` re-runs on every update; with no base_url on
+        either side of the merge there is nothing to refuse, and a false
+        refusal here would make the new flags unusable for their main case.
+        """
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        assert get_job(job["id"]).get("base_url") is None
+
+        assert cron_command(
+            _parse_cron_args(["cron", "edit", job["id"], "--provider", "anthropic"])
+        ) == 0
+        assert get_job(job["id"])["provider"] == "anthropic"
+
+    def test_edit_provider_is_refused_when_the_stored_base_url_would_leak(
+        self, tmp_cron_dir, capsys
+    ):
+        """The new flags do not open a hole around the F8 credential guard.
+
+        A job persisted with an off-host base_url plus a named provider would,
+        on fire, send that provider's stored API key to the attacker endpoint
+        (CWE-200). `cron edit` routes through `cronjob(action="update")`, which
+        validates the EFFECTIVE pair — so naming a real provider from the CLI
+        is refused and the stored record is left untouched.
+        """
+        job = create_job(
+            prompt="Check server status",
+            schedule="every 1h",
+            base_url="https://evil.example",
+        )
+
+        assert cron_command(
+            _parse_cron_args(["cron", "edit", job["id"], "--provider", "anthropic"])
+        ) == 1
+
+        unchanged = get_job(job["id"])
+        assert unchanged.get("provider") is None
+        assert "not allowed for provider" in capsys.readouterr().out
+
+    def test_list_renders_the_model_and_provider_pin(self, tmp_cron_dir, capsys):
+        """An operator must be able to SEE which jobs carry a pin."""
+        create_job(
+            prompt="Pinned job",
+            schedule="every 1h",
+            model="claude-opus-5",
+            provider="anthropic",
+            base_url="https://api.anthropic.com",
+        )
+
+        cron_command(Namespace(cron_command="list"))
+
+        out = capsys.readouterr().out
+        assert "Model:     claude-opus-5" in out
+        assert "Provider:  anthropic" in out
+        assert "Base URL:  https://api.anthropic.com" in out
+
+    def test_list_omits_the_pin_lines_for_an_unpinned_job(self, tmp_cron_dir, capsys):
+        """No pin, no line — an empty label would read as a pin to nothing."""
+        create_job(prompt="Unpinned job", schedule="every 1h")
+
+        cron_command(Namespace(cron_command="list"))
+
+        out = capsys.readouterr().out
+        assert "Model:" not in out
+        assert "Provider:" not in out
+        assert "Base URL:" not in out
+
+    def test_create_model_and_provider_from_the_real_parser_pin_the_new_job(
+        self, tmp_cron_dir, capsys
+    ):
+        """`hermes cron create ... --model X --provider Y` pins at creation.
+
+        Same missing-argparse-surface gap as `cron edit`: `cronjob(action=
+        "create")` already accepted model/provider, but the create subparser
+        defined neither, so a job could only be pinned by creating it unpinned
+        and editing it afterwards.
+        """
+        args = _parse_cron_args(
+            ["cron", "create", "every 1h", "Pinned at birth",
+             "--name", "born-pinned",
+             "--model", "claude-opus-5", "--provider", "anthropic"]
+        )
+        assert args.model == "claude-opus-5"
+        assert args.provider == "anthropic"
+
+        assert cron_command(args) == 0
+
+        job = next(j for j in list_jobs() if j["name"] == "born-pinned")
+        assert job["model"] == "claude-opus-5"
+        assert job["provider"] == "anthropic"
+
+        out = capsys.readouterr().out
+        assert "Model: claude-opus-5" in out
+        assert "Provider: anthropic" in out
+
+    def test_create_pinned_axes_carry_no_drift_snapshot(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A pinned axis must not also record a snapshot.
+
+        `_compute_provider_model_snapshots` snapshots only UNPINNED axes; the
+        drift guard then skips an unpinned job whose global config moved. So
+        pinning at creation is not merely cosmetic — it is what exempts the job
+        from that skip. Asserting the snapshot is absent pins that contract.
+
+        The default-model resolver is stubbed rather than left to the host:
+        under pytest it resolves to None anyway, which would make the control
+        below vacuously true and the whole test unable to fail.
+        """
+        monkeypatch.setattr(
+            "cron.jobs._resolve_default_model_snapshot", lambda: "sentinel-model"
+        )
+
+        assert cron_command(
+            _parse_cron_args(
+                ["cron", "create", "every 1h", "Pinned", "--name", "pinned",
+                 "--model", "claude-opus-5", "--provider", "anthropic"]
+            )
+        ) == 0
+        pinned = next(j for j in list_jobs() if j["name"] == "pinned")
+        assert pinned.get("provider_snapshot") is None
+        assert pinned.get("model_snapshot") is None
+
+        # Control: an unpinned job on the same store DOES get snapshotted, so
+        # the assertion above cannot pass merely because snapshotting is off.
+        assert cron_command(
+            _parse_cron_args(
+                ["cron", "create", "every 1h", "Unpinned", "--name", "unpinned"]
+            )
+        ) == 0
+        unpinned = next(j for j in list_jobs() if j["name"] == "unpinned")
+        assert unpinned.get("model_snapshot") == "sentinel-model"
+
+    def test_create_without_the_flags_leaves_the_job_unpinned(self, tmp_cron_dir):
+        """The new flags must not invent a pin on a plain create."""
+        assert cron_command(
+            _parse_cron_args(["cron", "create", "every 1h", "Plain", "--name", "plain"])
+        ) == 0
+        job = next(j for j in list_jobs() if j["name"] == "plain")
+        assert job.get("model") is None
+        assert job.get("provider") is None
 
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
