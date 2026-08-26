@@ -1556,6 +1556,7 @@ def _real_profile_cdp() -> tuple:
 
     from hermes_cli.browser_connect import (
         UNSUPPORTED_CHANNEL,
+        chromium_executable,
         detect_default_chromium,
         snapshot_real_profile,
     )
@@ -1634,6 +1635,18 @@ def _real_profile_cdp() -> tuple:
             "--session", _REAL_PROFILE_SESSION,
             "--profile", copy_dir,
         ]
+        # Launch the user's REAL browser binary (not the packaged Chromium) so
+        # the process identity matches the cookies' encryption. On macOS the
+        # Keychain "<Browser> Safe Storage" item is ACL'd to that binary's code
+        # signature, and on Linux the libsecret key is keyed to the browser's
+        # application id — a different-branded Chromium reaches neither, so the
+        # copied cookies would not decrypt. Fall back to the packaged Chromium
+        # only when the real binary can't be located. (Windows is already
+        # refused above: App-Bound Encryption defeats the copy even for the
+        # real binary.)
+        _exe = chromium_executable(browser)
+        if _exe:
+            argv += ["--executable-path", _exe]
         # Do NOT pass agent-browser's ``--headless``: it maps to Chrome's legacy
         # headless mode, which uses a SEPARATE cookie store and loads none of the
         # copied profile's cookies (verified: --headless → 0 cookies, default →
