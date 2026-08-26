@@ -1,20 +1,22 @@
 """Twilio Email platform adapter — outbound-only.
 
-Sends messages through Twilio's Email API — SendGrid's Mail Send API under
-the hood. Twilio's Email product uses a completely separate credential
-surface from core Twilio (SMS/Voice): a bearer ``SG.``-prefixed SendGrid
-API key, not the ``TWILIO_ACCOUNT_SID``/``TWILIO_AUTH_TOKEN`` pair the
-built-in SMS platform uses.
+Sends messages through Twilio's Email API (One Console): a REST API at
+``comms.twilio.com``, distinct from the older SendGrid ``api.sendgrid.com``
+v3 Mail Send API. Auth is the same core Twilio credential pair used by
+SMS/Voice — ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` via HTTP Basic
+Auth — not a separate SendGrid API key.
+
+Docs: https://www.twilio.com/docs/email/api/overview
 
 Env vars:
-  - SENDGRID_API_KEY        (starts with SG.)
-  - SENDGRID_FROM_EMAIL     (default sender — must be a Verified Sender or
-                              part of an authenticated domain in SendGrid)
-  - SENDGRID_FROM_NAME      (optional sender display name)
-  - SENDGRID_API_BASE       (optional; defaults to the public SendGrid API —
-                              override to a staging host for a
-                              progenitor/go_user staging test account)
-  - SENDGRID_HOME_CHANNEL   (optional — destination for cron delivery)
+  - TWILIO_ACCOUNT_SID      (shared with the sms plugin/telephony skill)
+  - TWILIO_AUTH_TOKEN       (shared with the sms plugin/telephony skill)
+  - TWILIO_EMAIL_FROM       (default sender — must be a verified sender
+                              identity for the Email product in the Twilio
+                              Console)
+  - TWILIO_EMAIL_FROM_NAME  (optional sender display name)
+  - TWILIO_EMAIL_API_BASE   (optional; defaults to the public Email API)
+  - TWILIO_EMAIL_HOME_CHANNEL  (optional — destination for cron delivery)
 
 There is no inbound channel, so connect()/disconnect() are readiness checks
 only. Delivery always goes through send() (live gateway) or
@@ -22,22 +24,43 @@ _standalone_send() (out-of-process `hermes send` / cron delivery); in
 practice `_standalone_send()` is the one that actually runs, since
 `hermes send` and cron jobs run in their own process.
 
+**Async by design, not a delivery guarantee.** A successful call returns
+``202`` with an ``operationId`` — the send was accepted for processing, not
+delivered. Actual delivery status lives behind the Email Operation resource
+(``GET .../Operations/{operationId}``), which this adapter does not poll;
+``SendResult.message_id`` / the standalone dict's ``message_id`` carry the
+``operationId`` for anyone who wants to check later.
+
 Every other platform this adapter sits alongside passes a single `content`
 string with no subject concept. By convention here: the first line of
 `content` is the subject and the remainder (after the first newline) is the
 body; single-line content gets a generic default subject rather than
 guessing one. Callers with more control (e.g. our own standalone CLI use)
-can override via `metadata={"subject": ..., "html": True}`.
+can override via `metadata={"subject": ..., "html": True, "attachments":
+[...]}`.
+
+Attachments: `send_image()`/`send_document()`/`send_multiple_images()` (live
+gateway) and `media_files` on `_standalone_send()` (the `hermes send`/cron
+path) all attach local files as base64 content in the request's
+`content.attachments` array. Remote (http/https) image URLs are not
+downloaded — they're linked in the body text instead, matching the built-in
+`email` plugin's own convention for remote images.
+
+Known gaps (unconfirmed API shape or out of scope for this pass): no cc/bcc,
+no scheduled send (`schedule.sendAt`), no inline `cid` image references —
+add these once their exact request shape is confirmed against the live API.
 
 Unlike the SMS adapter's `send()`, this adapter never splits a message into
 multiple chunks/sends: an email is one document, not a multi-part SMS train,
 so `truncate_message()` is deliberately not called here.
 """
 
+import base64
 import logging
+import mimetypes
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
@@ -47,11 +70,15 @@ from agent.secret_scope import get_secret as _scoped_get_secret
 
 logger = logging.getLogger(__name__)
 
-SENDGRID_API_BASE_DEFAULT = "https://api.sendgrid.com/v3"
-# Generous — SendGrid's real cap is far larger than any agent-generated
-# message; this just guards against something pathological.
+TWILIO_EMAIL_API_BASE_DEFAULT = "https://comms.twilio.com/v1/Emails"
+# Generous — the real cap is far larger than any agent-generated message;
+# this just guards against something pathological.
 MAX_EMAIL_LENGTH = 200_000
 DEFAULT_SUBJECT = "Message from Hermes Agent"
+# Raw bytes, before base64 (~4/3 inflation). The API caps the whole request
+# (JSON + base64 attachments) at 10 MB; this leaves headroom for that
+# overhead rather than let a near-the-limit send 400 server-side.
+MAX_ATTACHMENT_BYTES_RAW = 7 * 1024 * 1024
 
 # Mirrors tools/send_message_tool._E164_TARGET_RE's role for phone
 # platforms — this platform isn't in core's hardcoded phone-platform set
@@ -83,9 +110,19 @@ def _get_scoped_secret(name, default=None):
     return val if val is not None else default
 
 
-def _sendgrid_api_base() -> str:
-    override = (_get_scoped_secret("SENDGRID_API_BASE") or "").strip()
-    return (override or SENDGRID_API_BASE_DEFAULT).rstrip("/")
+def _twilio_email_api_base() -> str:
+    override = (_get_scoped_secret("TWILIO_EMAIL_API_BASE") or "").strip()
+    return (override or TWILIO_EMAIL_API_BASE_DEFAULT).rstrip("/")
+
+
+def _basic_auth_header(account_sid: str, auth_token: str) -> str:
+    """Build the HTTP Basic auth header value for Twilio.
+
+    Mirrors plugins/platforms/sms/adapter.py::SmsAdapter._basic_auth_header.
+    """
+    creds = f"{account_sid}:{auth_token}"
+    encoded = base64.b64encode(creds.encode("ascii")).decode("ascii")
+    return f"Basic {encoded}"
 
 
 def _mask_email(address: str) -> str:
@@ -105,8 +142,8 @@ _EMAIL_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 
 def _redact_emails_in_text(text: str) -> str:
     """Mask any email addresses inside arbitrary text before it is logged or
-    handed back to a caller. SendGrid's own validation errors commonly echo
-    the offending to/from address back in ``errors[].message`` -- unlike
+    handed back to a caller. The API's own validation errors can echo the
+    offending to/from address back in the response body -- unlike
     ``chat_id``, that text was never run through ``_mask_email`` before, so
     a bad address could reach application logs, and from there
     ``tools/send_message_tool.py``'s ``{"error": f"Adapter send failed:
@@ -136,6 +173,41 @@ def _split_subject_and_body(content: str) -> tuple:
     return DEFAULT_SUBJECT, content.strip()
 
 
+def _build_attachments(
+    file_paths: List[str],
+) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """Read local files into the API's attachment shape (base64 content).
+
+    Returns ``(attachments, error)``. On any missing/unreadable file or a
+    combined size over ``MAX_ATTACHMENT_BYTES_RAW``, returns ``([], error)``
+    -- the whole send is refused rather than going out with only some of
+    its attachments, which would silently misrepresent what was sent.
+    """
+    attachments: List[Dict[str, str]] = []
+    total_bytes = 0
+    for file_path in file_paths:
+        if not os.path.isfile(file_path):
+            return [], f"Attachment not found: {file_path}"
+        try:
+            with open(file_path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            return [], f"Could not read attachment {file_path}: {e}"
+        total_bytes += len(raw)
+        if total_bytes > MAX_ATTACHMENT_BYTES_RAW:
+            return [], (
+                f"Attachments too large ({total_bytes} bytes) -- Twilio Email caps "
+                "the whole request (including base64-encoded attachments) at 10 MB"
+            )
+        content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        attachments.append({
+            "filename": os.path.basename(file_path),
+            "contentType": content_type,
+            "content": base64.b64encode(raw).decode("ascii"),
+        })
+    return attachments, None
+
+
 def check_email_requirements() -> bool:
     """Passive probe: dependencies + minimal config present right now."""
     try:
@@ -143,38 +215,42 @@ def check_email_requirements() -> bool:
     except ImportError:
         return False
     return bool(
-        _get_scoped_secret("SENDGRID_API_KEY")
-        and _get_scoped_secret("SENDGRID_FROM_EMAIL")
+        _get_scoped_secret("TWILIO_ACCOUNT_SID")
+        and _get_scoped_secret("TWILIO_AUTH_TOKEN")
+        and _get_scoped_secret("TWILIO_EMAIL_FROM")
     )
 
 
 class TwilioEmailAdapter(BasePlatformAdapter):
-    """Outbound-only Twilio Email adapter (SendGrid Mail Send API)."""
+    """Outbound-only Twilio Email adapter (comms.twilio.com Email API)."""
 
     MAX_MESSAGE_LENGTH = MAX_EMAIL_LENGTH
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("twilio_email"))
-        self._api_key: str = _get_scoped_secret("SENDGRID_API_KEY", "") or ""
-        self._from_email: str = _get_scoped_secret("SENDGRID_FROM_EMAIL", "") or ""
-        self._from_name: str = _get_scoped_secret("SENDGRID_FROM_NAME", "") or ""
+        self._account_sid: str = _get_scoped_secret("TWILIO_ACCOUNT_SID", "") or ""
+        self._auth_token: str = _get_scoped_secret("TWILIO_AUTH_TOKEN", "") or ""
+        self._from_email: str = _get_scoped_secret("TWILIO_EMAIL_FROM", "") or ""
+        self._from_name: str = _get_scoped_secret("TWILIO_EMAIL_FROM_NAME", "") or ""
         self._http_session: Optional[Any] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        if not self._api_key:
+        if not (self._account_sid and self._auth_token):
             msg = (
-                "[twilio_email] SENDGRID_API_KEY not set -- cannot send. "
-                "Create an API key with Mail Send permission in the SendGrid "
-                "dashboard and set it here."
+                "[twilio_email] TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set -- "
+                "cannot send. These are the same core Twilio credentials used for "
+                "SMS/Voice -- find them on the Twilio Console dashboard."
             )
             logger.error(msg)
-            self._set_fatal_error("twilio_email_missing_api_key", msg, retryable=False)
+            self._set_fatal_error(
+                "twilio_email_missing_credentials", msg, retryable=False
+            )
             return False
         if not self._from_email:
             msg = (
-                "[twilio_email] SENDGRID_FROM_EMAIL not set -- cannot send. "
-                "Verify a sender (Single Sender or Domain Authentication) in "
-                "the SendGrid dashboard and set its address here."
+                "[twilio_email] TWILIO_EMAIL_FROM not set -- cannot send. Verify a "
+                "sender identity for the Email product in the Twilio Console and "
+                "set its address here."
             )
             logger.error(msg)
             self._set_fatal_error(
@@ -192,42 +268,44 @@ class TwilioEmailAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[twilio_email] Disconnected")
 
-    async def send(
+    async def _send_email_request(
         self,
         chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        subject: str,
+        body: str,
+        *,
+        html: bool = False,
+        attachments: Optional[List[Dict[str, str]]] = None,
     ) -> SendResult:
+        """Shared POST + response handling for send()/send_image()/
+        send_document()/send_multiple_images()."""
         import aiohttp
 
-        explicit_subject = (metadata or {}).get("subject")
-        html = bool((metadata or {}).get("html"))
-        if isinstance(explicit_subject, str) and explicit_subject:
-            subject, body = explicit_subject, content
-        else:
-            subject, body = _split_subject_and_body(content)
         subject = _sanitize_subject(subject)
         body = self.format_message(body)
-
-        if not body.strip():
+        if not body.strip() and not attachments:
             return SendResult(
                 success=False, error="Refusing to send an email with an empty body"
             )
 
-        url = f"{_sendgrid_api_base()}/mail/send"
+        url = _twilio_email_api_base()
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": _basic_auth_header(self._account_sid, self._auth_token),
             "Content-Type": "application/json",
         }
+        content: Dict[str, Any] = {
+            "subject": subject,
+            ("html" if html else "text"): body,
+        }
+        if attachments:
+            content["attachments"] = attachments
         payload: Dict[str, Any] = {
-            "personalizations": [{"to": [{"email": chat_id}]}],
             "from": {
-                "email": self._from_email,
+                "address": self._from_email,
                 **({"name": self._from_name} if self._from_name else {}),
             },
-            "subject": subject,
-            "content": [{"type": "text/html" if html else "text/plain", "value": body}],
+            "to": [{"address": chat_id}],
+            "content": content,
         }
 
         session = self._http_session or aiohttp.ClientSession(
@@ -238,6 +316,8 @@ class TwilioEmailAdapter(BasePlatformAdapter):
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status >= 400:
                     error_body = _redact_emails_in_text(await resp.text())
+                    retry_after = resp.headers.get("Retry-After")
+                    suffix = f" (retry after {retry_after}s)" if retry_after else ""
                     logger.error(
                         "[twilio_email] send failed to %s: %s %s",
                         _mask_email(chat_id),
@@ -245,17 +325,158 @@ class TwilioEmailAdapter(BasePlatformAdapter):
                         error_body,
                     )
                     return SendResult(
-                        success=False, error=f"SendGrid {resp.status}: {error_body}"
+                        success=False,
+                        error=f"Twilio Email {resp.status}: {error_body}{suffix}",
                     )
-                return SendResult(
-                    success=True, message_id=resp.headers.get("X-Message-Id", "")
+                data = await resp.json()
+                operation_id = data.get("operationId", "")
+                logger.info(
+                    "[twilio_email] Queued to %s (operationId=%s)",
+                    _mask_email(chat_id),
+                    operation_id,
                 )
+                return SendResult(success=True, message_id=operation_id)
         except Exception as e:
             logger.error("[twilio_email] send error to %s: %s", _mask_email(chat_id), e)
             return SendResult(success=False, error=str(e))
         finally:
             if not self._http_session and session:
                 await session.close()
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        meta = metadata or {}
+        explicit_subject = meta.get("subject")
+        html = bool(meta.get("html"))
+        if isinstance(explicit_subject, str) and explicit_subject:
+            subject, body = explicit_subject, content
+        else:
+            subject, body = _split_subject_and_body(content)
+
+        attachment_paths = meta.get("attachments") or []
+        attachments: List[Dict[str, str]] = []
+        if attachment_paths:
+            attachments, attach_error = _build_attachments(list(attachment_paths))
+            if attach_error:
+                return SendResult(success=False, error=attach_error)
+
+        return await self._send_email_request(
+            chat_id, subject, body, html=html, attachments=attachments
+        )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Attach a local image directly; link remote images in the body.
+
+        Remote images are not downloaded here -- same convention the
+        built-in `email` plugin uses for remote image URLs.
+        """
+        if image_url.startswith("file://"):
+            from urllib.parse import unquote
+
+            local_path = unquote(image_url[7:])
+            attachments, attach_error = _build_attachments([local_path])
+            if attach_error:
+                return SendResult(success=False, error=attach_error)
+            subject, body = _split_subject_and_body(caption or "")
+            return await self._send_email_request(
+                chat_id, subject, body, attachments=attachments
+            )
+
+        text = f"{caption}\n\nImage: {image_url}" if caption else f"Image: {image_url}"
+        subject, body = _split_subject_and_body(text)
+        return await self._send_email_request(chat_id, subject, body)
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        """Send a batch of images as one email with multiple attachments.
+
+        Local files are attached directly (one API call, multiple
+        attachments); remote URLs are linked in the body instead of
+        downloaded, matching send_image()'s convention.
+        """
+        if not images:
+            return
+
+        from urllib.parse import unquote
+
+        local_paths: List[str] = []
+        body_lines: List[str] = []
+        for image_url, alt_text in images:
+            if image_url.startswith("file://"):
+                local_paths.append(unquote(image_url[7:]))
+                if alt_text:
+                    body_lines.append(alt_text)
+            else:
+                body_lines.append(
+                    f"{alt_text}\nImage: {image_url}"
+                    if alt_text
+                    else f"Image: {image_url}"
+                )
+
+        try:
+            attachments: List[Dict[str, str]] = []
+            if local_paths:
+                attachments, attach_error = _build_attachments(local_paths)
+                if attach_error:
+                    logger.error(
+                        "[twilio_email] multi-image send failed: %s", attach_error
+                    )
+                    await super().send_multiple_images(
+                        chat_id, images, metadata, human_delay
+                    )
+                    return
+            result = await self._send_email_request(
+                chat_id,
+                DEFAULT_SUBJECT,
+                "\n\n".join(body_lines),
+                attachments=attachments,
+            )
+            if not result.success:
+                logger.error("[twilio_email] multi-image send failed: %s", result.error)
+        except Exception as e:
+            logger.error(
+                "[twilio_email] multi-image send failed, falling back: %s",
+                e,
+                exc_info=True,
+            )
+            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        attachments, attach_error = _build_attachments([file_path])
+        if attach_error:
+            return SendResult(success=False, error=attach_error)
+        if file_name:
+            attachments[0]["filename"] = file_name
+        subject, body = _split_subject_and_body(caption or "")
+        return await self._send_email_request(
+            chat_id, subject, body, attachments=attachments
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
@@ -276,20 +497,36 @@ async def _standalone_send(
 ):
     """Out-of-process Email delivery for `hermes send` and cron
     `deliver=twilio_email` when no live gateway adapter is present in this
-    process."""
+    process.
+
+    `force_document` has no effect -- the Email API's attachments have no
+    inline-vs-document distinction (unlike Telegram/WhatsApp document mode).
+    """
     import aiohttp
 
-    api_key = _get_scoped_secret("SENDGRID_API_KEY", "") or ""
-    from_email = _get_scoped_secret("SENDGRID_FROM_EMAIL", "") or ""
-    from_name = _get_scoped_secret("SENDGRID_FROM_NAME", "") or ""
-    if not (api_key and from_email):
+    account_sid = _get_scoped_secret("TWILIO_ACCOUNT_SID", "") or ""
+    auth_token = _get_scoped_secret("TWILIO_AUTH_TOKEN", "") or ""
+    from_email = _get_scoped_secret("TWILIO_EMAIL_FROM", "") or ""
+    from_name = _get_scoped_secret("TWILIO_EMAIL_FROM_NAME", "") or ""
+    if not (account_sid and auth_token and from_email):
         return {
-            "error": "Twilio Email not configured (SENDGRID_API_KEY, SENDGRID_FROM_EMAIL required)"
+            "error": (
+                "Twilio Email not configured (TWILIO_ACCOUNT_SID, "
+                "TWILIO_AUTH_TOKEN, TWILIO_EMAIL_FROM required)"
+            )
         }
 
     subject, body = _split_subject_and_body(message)
     subject = _sanitize_subject(subject)
-    if not body.strip():
+
+    attachments: List[Dict[str, str]] = []
+    media_paths = [path for path, _is_voice in (media_files or [])]
+    if media_paths:
+        attachments, attach_error = _build_attachments(media_paths)
+        if attach_error:
+            return {"error": attach_error}
+
+    if not body.strip() and not attachments:
         return {"error": "Refusing to send an email with an empty body"}
 
     try:
@@ -297,16 +534,21 @@ async def _standalone_send(
 
         proxy = resolve_proxy_url()
         sess_kw, req_kw = proxy_kwargs_for_aiohttp(proxy)
-        url = f"{_sendgrid_api_base()}/mail/send"
+        url = _twilio_email_api_base()
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": _basic_auth_header(account_sid, auth_token),
             "Content-Type": "application/json",
         }
+        content: Dict[str, Any] = {"subject": subject, "text": body}
+        if attachments:
+            content["attachments"] = attachments
         payload: Dict[str, Any] = {
-            "personalizations": [{"to": [{"email": chat_id}]}],
-            "from": {"email": from_email, **({"name": from_name} if from_name else {})},
-            "subject": subject,
-            "content": [{"type": "text/plain", "value": body}],
+            "from": {
+                "address": from_email,
+                **({"name": from_name} if from_name else {}),
+            },
+            "to": [{"address": chat_id}],
+            "content": content,
         }
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **sess_kw
@@ -322,14 +564,13 @@ async def _standalone_send(
                         resp.status,
                         error_body,
                     )
-                    return {
-                        "error": f"SendGrid API error ({resp.status}): {error_body}"
-                    }
+                    return {"error": f"Twilio Email {resp.status}: {error_body}"}
+                data = await resp.json()
                 return {
                     "success": True,
                     "platform": "twilio_email",
                     "chat_id": chat_id,
-                    "message_id": resp.headers.get("X-Message-Id", ""),
+                    "message_id": data.get("operationId", ""),
                 }
     except Exception as e:
         logger.error(
@@ -339,8 +580,10 @@ async def _standalone_send(
 
 
 def _is_connected(config) -> bool:
-    return bool((_get_scoped_secret("SENDGRID_FROM_EMAIL") or "").strip()) and bool(
-        (_get_scoped_secret("SENDGRID_API_KEY") or "").strip()
+    return bool(
+        (_get_scoped_secret("TWILIO_ACCOUNT_SID") or "").strip()
+        and (_get_scoped_secret("TWILIO_AUTH_TOKEN") or "").strip()
+        and (_get_scoped_secret("TWILIO_EMAIL_FROM") or "").strip()
     )
 
 
@@ -356,9 +599,9 @@ def register(ctx) -> None:
         adapter_factory=_build_adapter,
         check_fn=check_email_requirements,
         is_connected=_is_connected,
-        required_env=["SENDGRID_API_KEY", "SENDGRID_FROM_EMAIL"],
+        required_env=["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_EMAIL_FROM"],
         install_hint="pip install aiohttp",
-        cron_deliver_env_var="SENDGRID_HOME_CHANNEL",
+        cron_deliver_env_var="TWILIO_EMAIL_HOME_CHANNEL",
         parse_target_ref_fn=parse_target_ref,
         validate_target_ref_fn=validate_target_ref,
         standalone_sender_fn=_standalone_send,
@@ -367,8 +610,8 @@ def register(ctx) -> None:
         emoji="📧",
         allow_update_command=False,
         platform_hint=(
-            "You are sending via Twilio Email (SendGrid). The first line of your "
-            "message becomes the subject; the rest becomes the body. Plain text "
-            "unless the caller explicitly requests HTML."
+            "You are sending via Twilio Email. The first line of your "
+            "message becomes the subject; the rest becomes the body. Plain "
+            "text unless the caller explicitly requests HTML."
         ),
     )
