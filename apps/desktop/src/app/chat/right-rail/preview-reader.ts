@@ -51,6 +51,9 @@ export const PREVIEW_READ_MAX_CHARS = 24_000
 
 const readers = new Map<string, PageReader>()
 
+/** Owning session for each registered reader (tabId -> sessionId). */
+const readerSessions = new Map<string, string>()
+
 /** True when at least one preview tab has a registered live page reader
  *  AND that tab is still open in `$previewTabs` (guards against stale
  *  registrations outliving their tab). Used by the desktop bridge to
@@ -67,13 +70,58 @@ export function hasLivePreviewReaders(): boolean {
   return false
 }
 
-/** Register a live preview's page reader; returns an idempotent unregister. */
-export function registerPreviewPageReader(tabId: string, reader: PageReader): () => void {
+/** Session-scoped variant: true when the given session owns at least one
+ *  live preview reader whose tab is still open. Prefer this over the
+ *  global {@link hasLivePreviewReaders} — a global gate lets any
+ *  background session drive interactions on the interactive session's
+ *  visible preview (review #95475). */
+export function hasLivePreviewForSession(sessionId: string): boolean {
+  if (!sessionId) {
+    return false
+  }
+
+  const openIds = new Set($previewTabs.get().map(t => t.id))
+
+  for (const [tabId, owner] of readerSessions.entries()) {
+    if (owner === sessionId && openIds.has(tabId) && readers.has(tabId)) {
+      return true
+    }
+  }
+
+  // Legacy fallback: registrations made before session-scoped tracking
+  // (readerSessions empty for that tabId) still count, but only as a
+  // global signal — remove this fallback once every registration site
+  // passes a sessionId.
+  for (const tabId of readers.keys()) {
+    if (!readerSessions.has(tabId) && openIds.has(tabId)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+/** Register a live preview's page reader; returns an idempotent unregister.
+ *
+ *  When `sessionId` is provided, the registration is session-scoped and
+ *  participates in {@link hasLivePreviewForSession}; otherwise it is
+ *  treated as a legacy global registration and only counts for
+ *  {@link hasLivePreviewReaders}. */
+export function registerPreviewPageReader(
+  tabId: string,
+  reader: PageReader,
+  sessionId?: string
+): () => void {
   readers.set(tabId, reader)
+
+  if (sessionId) {
+    readerSessions.set(tabId, sessionId)
+  }
 
   return () => {
     if (readers.get(tabId) === reader) {
       readers.delete(tabId)
+      readerSessions.delete(tabId)
     }
   }
 }

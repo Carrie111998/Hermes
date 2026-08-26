@@ -1,4 +1,4 @@
-import { hasLivePreviewReaders, readActivePreview } from '@/app/chat/right-rail/preview-reader'
+import { hasLivePreviewForSession, readActivePreview } from '@/app/chat/right-rail/preview-reader'
 import { writeAgentTerminalChunk } from '@/app/right-sidebar/terminal/agent-terminal-stream'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
@@ -99,12 +99,15 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
           text: result ? JSON.stringify(result) : ''
         })
 
-      // Allow preview actions when the session is active OR when the preview
-      // pane has live registered readers (proving the agent opened it).
-      // After a restart, activeSessionIdRef points at whichever session the
-      // user has open — not the bot's session — so isActiveEvent alone
-      // rejects valid preview interactions (#95459).
-      const previewAllowed = isActiveEvent || hasLivePreviewReaders()
+      // Allow preview actions when the session is active OR when that
+      // session owns a live preview reader. After a restart,
+      // activeSessionIdRef points at whichever session the user has open
+      // — not the bot's session — so isActiveEvent alone rejects valid
+      // preview interactions. Session-scoped reader check prevents a
+      // background session from driving the interactive session's preview
+      // (#95459 review: a live reader proves availability, not authority).
+      const previewAllowed =
+        isActiveEvent || hasLivePreviewForSession(ctx.sessionId ?? '')
 
       if (previewAllowed) {
         void loadPreviewEngine()
