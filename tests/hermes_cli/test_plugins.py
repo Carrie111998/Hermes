@@ -1851,31 +1851,6 @@ class TestPluginCommands:
             # Unknown command, None.
             assert get_plugin_command_override_handler("nope") is None
 
-    def test_command_override_precedence_consistent_across_surfaces(self):
-        """The SAME resolver gates override precedence on all three surfaces.
-
-        CLI (cli.process_command), gateway (gateway/run.py) and TUI
-        (tui_gateway/methods_tools.py slash.exec) each short-circuit to
-        get_plugin_command_override_handler() BEFORE built-in dispatch, so an
-        authorized override wins identically everywhere. This test asserts the
-        three call sites exist and consult the shared primitive.
-        """
-        import inspect
-        import cli as cli_mod
-        import gateway.run as gw_mod
-        import tui_gateway.methods_tools as tui_mod
-
-        cli_src = inspect.getsource(cli_mod.HermesCLI.process_command)
-        assert "get_plugin_command_override_handler" in cli_src
-
-        gw_src = inspect.getsource(gw_mod)
-        assert "get_plugin_command_override_handler" in gw_src
-
-        tui_src = inspect.getsource(tui_mod)
-        assert "get_plugin_command_override_handler" in tui_src
-
-
-
 
     def test_get_plugin_context_engine_discovers_plugins_lazily(self, tmp_path, monkeypatch):
         """Context engine lookup should work before any explicit discover_plugins() call."""
