@@ -2221,6 +2221,16 @@ def _build_skills_system_prompt_inner(
     # category except keep_full_categories (matched on the full category path
     # OR its top-level segment). keep_full never rescues an explicitly named
     # demotion — an explicit name is deliberate.
+    #
+    # Matching widened here: a category used to be demoted only when its
+    # top-level segment was listed, so "social-media/twitter" in the set hit
+    # nothing. It now also matches the full nested path. That is a real
+    # semantic change for compact_categories, not just for the new operator
+    # pins — but a no-op for every in-repo caller, because the sole producer of
+    # compact_categories is coding_context._NON_CODING_SKILL_CATEGORIES, whose
+    # entries are all top-level segments with no "/" in them. Pinned by
+    # test_posture_compact_categories_are_top_level_only, so adding a nested
+    # entry there is a deliberate opt-in rather than a silent behavior flip.
     _named = set(compact_categories or frozenset()) | set(
         pinned_categories or frozenset()
     )

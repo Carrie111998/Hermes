@@ -520,6 +520,42 @@ class TestResolveOperatorSkillDemotions:
         assert demote_all is True
         assert keep == frozenset({"hermes"})
 
+    def test_posture_compact_categories_are_top_level_only(self):
+        """The nested-path widening must stay a no-op for in-repo callers.
+
+        _build_skills_system_prompt_inner used to demote a category only when
+        its top-level segment was listed; it now also matches the full nested
+        path. compact_categories is the posture set, and its sole producer is
+        coding_context._NON_CODING_SKILL_CATEGORIES — every entry there is a
+        top-level segment, so the widening changes nothing today. Adding a
+        nested entry would silently start relying on the new semantics, so make
+        that a deliberate edit to this test rather than an invisible flip.
+        """
+        from agent.coding_context import _NON_CODING_SKILL_CATEGORIES
+        nested = [c for c in _NON_CODING_SKILL_CATEGORIES if "/" in c]
+        assert nested == [], (
+            f"nested posture categories now depend on the widened match: {nested}"
+        )
+
+    def test_config_read_failure_is_logged_not_swallowed(self, caplog):
+        """A broken config surface must leave a trace, not a silent full index.
+
+        resolve_operator_skill_demotions warns about malformed values itself;
+        this covers the outer guard, where an unexpected raise used to drop the
+        operator's pins with no diagnostic at all.
+        """
+        import logging
+        from unittest.mock import patch
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            side_effect=RuntimeError("config surface exploded"),
+        ):
+            with caplog.at_level(logging.WARNING):
+                parts = _build(build_system_prompt_parts)
+        assert parts["volatile"]  # the build still succeeds
+        assert "operator pins ignored" in caplog.text
+        assert "config surface exploded" in caplog.text
+
     def test_malformed_values_warn_not_silence(self, caplog):
         import logging
         from agent.system_prompt import resolve_operator_skill_demotions as r

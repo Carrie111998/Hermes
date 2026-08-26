@@ -623,8 +623,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _pinned, _demote_all, _keep_full = resolve_operator_skill_demotions(
                 _skills_cfg
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # resolve_operator_skill_demotions warns about malformed *values*
+            # itself, so anything reaching here is unexpected — an import
+            # failure, or a config shape that raises before it is inspected.
+            # Silently dropping the operator's pins leaves no trace of why the
+            # index came back full. exc_info only under debug: this is a
+            # per-build path, and a persistently broken config would otherwise
+            # print a traceback every turn.
+            logger.warning(
+                "skills.compact_categories/keep_full_categories could not be "
+                "resolved; operator pins ignored for this build: %s",
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
