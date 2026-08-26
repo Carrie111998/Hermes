@@ -561,6 +561,36 @@ class TestRegisteredHandlerForwardsAttachToSession:
         listed = next(j for j in listing["jobs"] if j["job_id"] == created["job_id"])
         assert listed.get("attach_to_session") is False
 
+    @pytest.mark.parametrize("invalid", ["false", 0, 1, [], {}])
+    def test_update_rejects_non_boolean_attach_to_session(self, invalid):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "schedule": "1h",
+                    "prompt": "fire and forget",
+                },
+            )
+        )
+        result = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "update",
+                    "job_id": created["job_id"],
+                    "attach_to_session": invalid,
+                },
+            )
+        )
+
+        assert result["success"] is False
+        assert "boolean" in result["error"].lower()
+        assert "attach_to_session" not in (get_job(created["job_id"]) or {})
+
     def test_omitted_create_leaves_field_absent(self):
         from cron.jobs import get_job
         from tools.registry import registry

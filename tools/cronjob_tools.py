@@ -1834,7 +1834,13 @@ def cronjob(
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
-                updates["attach_to_session"] = bool(attach_to_session)
+                if type(attach_to_session) is not bool:
+                    return tool_error(
+                        "attach_to_session must be a boolean.",
+                        success=False,
+                        error_kind="invalid_argument",
+                    )
+                updates["attach_to_session"] = attach_to_session
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
