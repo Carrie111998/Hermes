@@ -121,7 +121,10 @@ def _can_import_hermes_cli(interpreter: Path) -> bool:
         # Unprobeable (missing binary, spawn failure, timeout): do not
         # punish the entry on infra hiccups — assume capable and let the
         # existing fallback chain handle a genuinely broken interpreter.
-        ok = True
+        # This error-derived answer is deliberately NOT cached: one
+        # transient hiccup must not freeze the "capable" assumption for
+        # the whole session; the next install attempt re-probes.
+        return True
     _probe_cache[key] = ok
     return ok
 
@@ -264,16 +267,12 @@ def _resolve_hermes_bin_for_desktop_entry(
             return False
         return candidate.parent.name in {"bin", "scripts"}
 
-    # Only reroute when argv[0] actually drove the resolution: re-run the
-    # resolver with argv[0] hidden and compare. If PATH yields nothing,
-    # keep the resolver's original answer (its fallback chain stays
-    # authoritative; #90492 semantics preserved).
-    sys.argv[0] = ""
-    try:
-        rerouted = resolve_fn()
-    finally:
-        sys.argv[0] = original_argv0
-
+    # Resolve the primary FIRST and only rerun the resolver with argv[0]
+    # hidden when the primary could actually be checkout-internal: for an
+    # already-external primary the comparison can never change the
+    # outcome, so skipping the rerun saves a resolver call and shortens
+    # the window in which a concurrent reader could see the mutated
+    # sys.argv.
     primary = resolve_fn()
 
     # A primary that is NOT checkout-internal and not the invoking
@@ -285,6 +284,16 @@ def _resolve_hermes_bin_for_desktop_entry(
     if primary and not _inside_checkout(primary):
         return primary
 
+    # Only reroute when argv[0] actually drove the resolution: re-run the
+    # resolver with argv[0] hidden and compare. If PATH yields nothing,
+    # keep the resolver's original answer (its fallback chain stays
+    # authoritative; #90492 semantics preserved).
+    sys.argv[0] = ""
+    try:
+        rerouted = resolve_fn()
+    finally:
+        sys.argv[0] = original_argv0
+
     if primary and _inside_checkout(primary) and rerouted:
         return rerouted
 
@@ -294,18 +303,52 @@ def _resolve_hermes_bin_for_desktop_entry(
         # The installer's wrapper lives at known locations; probe them
         # directly before giving up, otherwise we'd silently persist the
         # checkout-internal form this fix exists to prevent. The probe
-        # runs only after the primary was proven non-durable above.
+        # runs only after the primary was proven non-durable above, and
+        # each candidate must itself target THIS checkout (a wrapper
+        # from another install would make the entry stable-but-wrong —
+        # same failure class the external-primary-first rule avoids).
         probe = _known_wrapper_candidates()
         for candidate in probe:
             if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate)
-        # No durable wrapper exists anywhere (PATH miss, known locations
-        # miss). Persisting the checkout-internal primary would produce
-        # an entry that regenerates itself or dies on the venv escape;
+                if _wrapper_targets_checkout(candidate, checkout_root):
+                    return str(candidate)
+        # No durable wrapper for THIS checkout exists anywhere (PATH
+        # miss, known locations miss or belong to another install).
+        # Persisting the checkout-internal primary would produce an
+        # entry that regenerates itself or dies on the venv escape;
         # dropping to None lets resolve_exec_command emit its runnable
         # module fallback.
         return None
     return primary
+
+
+def _wrapper_targets_checkout(wrapper: Path, checkout_root: Path) -> bool:
+    """Whether a candidate launcher script actually launches THIS checkout.
+
+    The installer's shim is a small bash script that execs
+    ``<checkout>/venv/bin/python <checkout>/hermes``; a venv console
+    script carries the venv interpreter in its shebang. Either way, a
+    text launcher belonging to this installation references the
+    checkout path (or its venv) somewhere in its first few KB. A
+    binary launcher (PyInstaller & friends) cannot be inspected that
+    way — accept it, since binary installs are self-contained and the
+    external-primary-first rule has already had its say.
+    """
+    try:
+        head = wrapper.read_bytes()[:4096]
+    except OSError:
+        return False
+    if b"\x7fELF" in head[:4] or head.startswith(b"MZ"):
+        # Native binary: cannot verify, and cannot be another checkout's
+        # bash shim either — accept.
+        return True
+    try:
+        text = head.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - defensive decode
+        return False
+    checkout_str = str(checkout_root)
+    venv_str = str(checkout_root / "venv")
+    return checkout_str in text or venv_str in text
 
 
 def _known_wrapper_candidates():

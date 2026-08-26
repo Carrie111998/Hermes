@@ -315,9 +315,15 @@ def test_exec_uses_known_wrapper_when_path_lookup_misses(
     repo_script.chmod(0o755)
 
     # The wrapper exists at the known location but is NOT on PATH.
+    # Realistic installer shim: execs this checkout's venv python on the
+    # checkout's hermes script (the aidiyet check requires it to target
+    # the writing checkout).
     known_wrapper = tmp_path / "known-home" / ".local" / "bin" / "hermes"
     known_wrapper.parent.mkdir(parents=True)
-    known_wrapper.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    known_wrapper.write_text(
+        f'#!/bin/bash\nexec {root / "venv" / "bin" / "python"} {root / "hermes"} "$@"\n',
+        encoding="utf-8",
+    )
     known_wrapper.chmod(0o755)
     monkeypatch.setenv("HOME", str(tmp_path / "known-home"))
 
@@ -335,6 +341,56 @@ def test_exec_uses_known_wrapper_when_path_lookup_misses(
 
     # The probe found the wrapper despite the PATH miss.
     assert exec_line == f"{known_wrapper} desktop"
+
+
+def test_exec_rejects_known_wrapper_from_another_checkout(
+    tmp_path, xdg_home, monkeypatch
+):
+    """A known-location wrapper that targets a DIFFERENT checkout is skipped.
+
+    On machines with multiple installs over time, ~/.local/bin/hermes may
+    belong to another checkout. Persisting it would make the entry stable
+    but silently point at that other installation — the failure class the
+    aidiyet check exists to prevent. The runnable module fallback must win
+    instead.
+    """
+    import sys
+
+    root = _make_project(tmp_path)
+    repo_script = root / "hermes"
+    repo_script.write_text(
+        "#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
+    repo_script.chmod(0o755)
+
+    # A shim belonging to a DIFFERENT checkout.
+    other_root = tmp_path / "other-install"
+    other_root.mkdir()
+    foreign_wrapper = tmp_path / "known-home" / ".local" / "bin" / "hermes"
+    foreign_wrapper.parent.mkdir(parents=True)
+    foreign_wrapper.write_text(
+        f"#!/bin/bash\nexec {other_root / 'venv' / 'bin' / 'python'} "
+        f'{other_root / "hermes"} "$@"\n',
+        encoding="utf-8",
+    )
+    foreign_wrapper.chmod(0o755)
+    monkeypatch.setenv("HOME", str(tmp_path / "known-home"))
+
+    _argv0_context(monkeypatch, str(repo_script))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    def fake_resolve():
+        return sys.argv[0] if sys.argv[0] else None
+
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", fake_resolve)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # The foreign wrapper was rejected; the runnable module fallback won.
+    assert str(foreign_wrapper) not in exec_line
+    assert exec_line.endswith("-m hermes_cli.main desktop")
 
 
 @pytest.mark.parametrize(
