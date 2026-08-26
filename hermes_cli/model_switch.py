@@ -2337,13 +2337,14 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     """Fetch model catalogs for multiple providers in parallel.
 
     Only providers the serial build would otherwise *block* on are fetched.
-    That means missing, fingerprint-mismatched, empty, and hard-expired
-    entries — not merely TTL-expired ones, which
-    :func:`cached_provider_model_ids` already serves from disk while
-    revalidating off-thread.  Each worker uses
-    :func:`update_provider_cache_entry` (thread-safe) to persist its result,
-    so concurrent writes to ``provider_models_cache.json`` don't clobber each
-    other.
+    That means missing, fingerprint-mismatched, and hard-expired entries —
+    not merely TTL-expired ones, which :func:`cached_provider_model_ids`
+    already serves from disk while revalidating off-thread, and not an empty
+    local-ollama catalog inside its own short TTL, which that function also
+    serves without a round-trip.  Each worker lets
+    :func:`cached_provider_model_ids` persist its own result, which it does
+    under the shared cache write lock, so concurrent writes to
+    ``provider_models_cache.json`` don't clobber each other.
 
     :param provider_slugs: Hermes provider IDs to prefetch (e.g. ``["openrouter",
         "anthropic", "deepseek"]``).  Unknown providers are silently skipped.
@@ -2358,9 +2359,10 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     # revalidates on a background thread.  Prefetching a slug in that second
     # tier trades a non-blocking serial call for a blocking parallel one —
     # the picker waits on the slowest provider's /v1/models round-trip to
-    # avoid work that would not have blocked it.  Since the disk cache holds
-    # a week of stale-serve but only an hour of TTL, that is what every
-    # picker open more than an hour after the last one pays.
+    # avoid work that would not have blocked it.  _PROVIDER_MODELS_STALE_SERVE_MAX
+    # is far longer than _PROVIDER_MODELS_CACHE_TTL, so that second tier is
+    # where a picker open lands whenever the previous one was more than a TTL
+    # ago — which is to say, most of the time.
     #
     # So gate on usability, not freshness: fetch what
     # cached_provider_model_ids cannot serve from disk at all, and let the
@@ -2370,29 +2372,57 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     from hermes_cli.models import (
         _load_provider_models_cache,
         _credential_fingerprint,
+        _OLLAMA_LOCAL_MODELS_CACHE_TTL,
         _PROVIDER_MODELS_STALE_SERVE_MAX,
         normalize_provider,
     )
 
     now = time.time()
+
+    def _cache_key(slug: str) -> str:
+        """The row :func:`cached_provider_model_ids` would read for *slug*.
+
+        It keeps a bare ``ollama`` as its own key rather than letting
+        ``normalize_provider`` fold it into ``custom`` (the alias means "local
+        ollama"), because the local native catalog has its own TTL and its own
+        empty-is-authoritative rule.  Answering from a different row than the
+        serial call would read — and then warming that other row — is worse
+        than not gating at all.
+        """
+        requested = str(slug or "").strip().lower()
+        if requested == "ollama":
+            return requested
+        return normalize_provider(slug) or (slug or "")
+
+    def _servable_from_disk(key: str, entry) -> bool:
+        """True when the serial call for *key* would not go to the network."""
+        if not (
+            isinstance(entry, dict)
+            and entry.get("fp") == _credential_fingerprint(key)
+            and isinstance(entry.get("models"), list)
+        ):
+            return False
+        age = now - float(entry.get("at", 0))
+        if entry["models"]:
+            # Fresh, or expired but inside the stale-serve window where the
+            # serial path returns the entry and revalidates off-thread.
+            return age < _PROVIDER_MODELS_STALE_SERVE_MAX
+        # An empty catalog is authoritative for local ollama only, and only
+        # inside the short native TTL — cached_provider_model_ids returns it
+        # with no round-trip there, so prefetching it is pure redundant work.
+        # Past that TTL an empty row gets no stale-serve window at all, so it
+        # really does block and really does belong in the prefetch.
+        return key == "ollama" and age < _OLLAMA_LOCAL_MODELS_CACHE_TTL
+
     stale_slugs: list[str] = []
     cache = _load_provider_models_cache()
     for slug in provider_slugs:
-        normalized = normalize_provider(slug) or (slug or "")
-        if not normalized:
+        key = _cache_key(slug)
+        if not key:
             continue
-        entry = cache.get(normalized)
-        fp = _credential_fingerprint(normalized)
-        if (
-            isinstance(entry, dict)
-            and entry.get("fp") == fp
-            and isinstance(entry.get("models"), list)
-            and entry["models"]
-        ):
-            age = now - float(entry.get("at", 0))
-            if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
-                continue  # servable from disk without blocking
-        stale_slugs.append(normalized)
+        if _servable_from_disk(key, cache.get(key)):
+            continue
+        stale_slugs.append(key)
 
     if not stale_slugs:
         return
