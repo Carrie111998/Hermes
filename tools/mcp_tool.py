@@ -2976,6 +2976,7 @@ class MCPServerTask:
             )
             self._suspect_reason = None
             self.mark_suspect(f"health check failed after {reason}")
+            self._close_rpc_admission()
             self.session = None
             self._ready.clear()
             self._reconnect_event.set()
@@ -3413,24 +3414,29 @@ class MCPServerTask:
                     # handler that sees a live session also sees an open gate
                     # (#48069 residual).
                     self._publish_session(session)
-                    self._mark_lifecycle_started()
-                    await self._discover_tools()
-                    self._ready.set()
-                    self._ever_connected = True
-                    # Session is live again: clear any breaker state from a
-                    # prior outage so the first call after recovery isn't
-                    # gated on a stale consecutive-failure count (#16788).
-                    _reset_server_error(self.name)
-                    # A completed handshake alone is NOT proof of health: a
-                    # flapping transport can handshake fine and drop moments
-                    # later, forever (#62212). The session must prove itself
-                    # (keepalive success or a successful tool call) before the
-                    # reconnect budget is cleared — see _mark_session_proven.
-                    self._session_proven = False
-                    # stdio transport does not use OAuth, but we still honor
-                    # _reconnect_event (e.g. future manual /mcp refresh) for
-                    # consistency with _run_http.
-                    return await self._wait_for_lifecycle_event()
+                    try:
+                        self._mark_lifecycle_started()
+                        await self._discover_tools()
+                        self._ready.set()
+                        self._ever_connected = True
+                        # Session is live again: clear any breaker state from a
+                        # prior outage so the first call after recovery isn't
+                        # gated on a stale consecutive-failure count (#16788).
+                        _reset_server_error(self.name)
+                        # A completed handshake alone is NOT proof of health: a
+                        # flapping transport can handshake fine and drop moments
+                        # later, forever (#62212). The session must prove itself
+                        # (keepalive success or a successful tool call) before the
+                        # reconnect budget is cleared — see _mark_session_proven.
+                        self._session_proven = False
+                        # stdio transport does not use OAuth, but we still honor
+                        # _reconnect_event (e.g. future manual /mcp refresh) for
+                        # consistency with _run_http.
+                        return await self._wait_for_lifecycle_event()
+                    finally:
+                        # Close before ClientSession.__aexit__ starts draining
+                        # the transport. No RPC may enter during context cleanup.
+                        self._close_rpc_admission()
         finally:
             # Runs on clean exit, exceptions, AND asyncio cancellation.
             # If any of the spawned PIDs are still alive, the SDK's
@@ -3791,21 +3797,24 @@ class MCPServerTask:
                         )
                         # Publish through the admission gate (#48069 residual).
                         self._publish_session(session)
-                        await self._discover_tools()
-                        self._ready.set()
-                        self._ever_connected = True
-                        # Session is live again: clear any breaker state from a
-                        # prior outage so the first call after recovery isn't
-                        # gated on a stale consecutive-failure count (#16788).
-                        _reset_server_error(self.name)
-                        # Unproven until keepalive/tool-call success (#62212).
-                        self._session_proven = False
-                        reason = await self._wait_for_lifecycle_event()
-                        if reason == "reconnect":
-                            logger.info(
-                                "MCP server '%s': reconnect requested — "
-                                "tearing down SSE session", self.name,
-                            )
+                        try:
+                            await self._discover_tools()
+                            self._ready.set()
+                            self._ever_connected = True
+                            # Session is live again: clear any breaker state from a
+                            # prior outage so the first call after recovery isn't
+                            # gated on a stale consecutive-failure count (#16788).
+                            _reset_server_error(self.name)
+                            # Unproven until keepalive/tool-call success (#62212).
+                            self._session_proven = False
+                            reason = await self._wait_for_lifecycle_event()
+                            if reason == "reconnect":
+                                logger.info(
+                                    "MCP server '%s': reconnect requested — "
+                                    "tearing down SSE session", self.name,
+                                )
+                        finally:
+                            self._close_rpc_admission()
             except BaseExceptionGroup as _eg:
                 # SSE transport TaskGroup dropped (idle timeout / stream blip):
                 # reconnect immediately instead of backoff/park (#66092).
@@ -3858,21 +3867,24 @@ class MCPServerTask:
                             )
                             # Publish through the admission gate (#48069 residual).
                             self._publish_session(session)
-                            await self._discover_tools()
-                            self._ready.set()
-                            self._ever_connected = True
-                            # Session is live again: clear any breaker state from
-                            # a prior outage so the first call after recovery
-                            # isn't gated on a stale failure count (#16788).
-                            _reset_server_error(self.name)
-                            # Unproven until keepalive/tool-call success (#62212).
-                            self._session_proven = False
-                            reason = await self._wait_for_lifecycle_event()
-                            if reason == "reconnect":
-                                logger.info(
-                                    "MCP server '%s': reconnect requested — "
-                                    "tearing down HTTP session", self.name,
-                                )
+                            try:
+                                await self._discover_tools()
+                                self._ready.set()
+                                self._ever_connected = True
+                                # Session is live again: clear any breaker state from
+                                # a prior outage so the first call after recovery
+                                # isn't gated on a stale failure count (#16788).
+                                _reset_server_error(self.name)
+                                # Unproven until keepalive/tool-call success (#62212).
+                                self._session_proven = False
+                                reason = await self._wait_for_lifecycle_event()
+                                if reason == "reconnect":
+                                    logger.info(
+                                        "MCP server '%s': reconnect requested — "
+                                        "tearing down HTTP session", self.name,
+                                    )
+                            finally:
+                                self._close_rpc_admission()
             except BaseExceptionGroup as _eg:
                 # Streamable-HTTP transport TaskGroup dropped: reconnect
                 # immediately instead of backoff/park (#66092).
@@ -3907,21 +3919,24 @@ class MCPServerTask:
                         )
                         # Publish through the admission gate (#48069 residual).
                         self._publish_session(session)
-                        await self._discover_tools()
-                        self._ready.set()
-                        self._ever_connected = True
-                        # Session is live again: clear any breaker state from a
-                        # prior outage so the first call after recovery isn't
-                        # gated on a stale consecutive-failure count (#16788).
-                        _reset_server_error(self.name)
-                        # Unproven until keepalive/tool-call success (#62212).
-                        self._session_proven = False
-                        reason = await self._wait_for_lifecycle_event()
-                        if reason == "reconnect":
-                            logger.info(
-                                "MCP server '%s': reconnect requested — "
-                                "tearing down legacy HTTP session", self.name,
-                            )
+                        try:
+                            await self._discover_tools()
+                            self._ready.set()
+                            self._ever_connected = True
+                            # Session is live again: clear any breaker state from a
+                            # prior outage so the first call after recovery isn't
+                            # gated on a stale consecutive-failure count (#16788).
+                            _reset_server_error(self.name)
+                            # Unproven until keepalive/tool-call success (#62212).
+                            self._session_proven = False
+                            reason = await self._wait_for_lifecycle_event()
+                            if reason == "reconnect":
+                                logger.info(
+                                    "MCP server '%s': reconnect requested — "
+                                    "tearing down legacy HTTP session", self.name,
+                                )
+                        finally:
+                            self._close_rpc_admission()
             except BaseExceptionGroup as _eg:
                 # Legacy Streamable-HTTP transport TaskGroup dropped: reconnect
                 # immediately instead of backoff/park (#66092).
@@ -4445,6 +4460,7 @@ class MCPServerTask:
                 if self._shutdown_event.is_set():
                     return
             finally:
+                self._close_rpc_admission()
                 self.session = None
                 # Children of this transport are gone (or about to be);
                 # stale PIDs must never fast-fail the NEXT transport's calls.
@@ -4471,6 +4487,8 @@ class MCPServerTask:
 
     async def shutdown(self):
         """Signal the Task to exit and wait for clean resource teardown."""
+        # Stop new work synchronously, before yielding to transport teardown.
+        self._close_rpc_admission()
         self._shutdown_event.set()
         # Defensive: if _wait_for_lifecycle_event is blocking, we need ANY
         # event to unblock it. _shutdown_event alone is sufficient (the
@@ -6508,7 +6526,9 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(
+                server, server_name, "resources/list"
+            ):
                 all_resources = await _paginate_full_list(
                     server.session.list_resources, "resources", server_name
                 )
@@ -6571,7 +6591,9 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(
+                server, server_name, "resources/read"
+            ):
                 result = await server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
@@ -6628,7 +6650,9 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(
+                server, server_name, "prompts/list"
+            ):
                 all_prompts = await _paginate_full_list(
                     server.session.list_prompts, "prompts", server_name
                 )
@@ -6694,7 +6718,9 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(
+                server, server_name, "prompts/get"
+            ):
                 result = await server.session.get_prompt(name, arguments=arguments)
             # GetPromptResult has .messages list
             messages = []
