@@ -647,22 +647,23 @@ describe('typing-aware sessions.changed deferral', () => {
   // re-run the connect-reseed effect and re-subscribe the throttle each
   // render, polluting the counts under observation.
   function renderTypingSync(refreshSessions: () => Promise<void>) {
-    const updateSessionState: Parameters<typeof useBackgroundSync>[0]['updateSessionState'] = vi.fn(
-      (sessionId, updater) => {
-        const current = {} as Parameters<typeof updater>[0]
-
-        return updater(current)
-      }
-    )
-
     const stable = {
       refreshActiveTranscript: async () => undefined,
       refreshCronJobs: vi.fn(),
       refreshCurrentModel: vi.fn(),
       refreshHermesConfig: vi.fn(),
       refreshMessagingSessions: vi.fn(),
-      updateSessionState,
-      requestGateway: vi.fn(async () => ({ sessions: [] })) as never
+      requestGateway: vi.fn(async () => ({ sessions: [] })) as never,
+      // Required by the hook's params. This harness never drives the
+      // transcript path, so the updater just runs against a throwaway state —
+      // but it must live in `stable` like every other prop, since a fresh
+      // identity per render would re-run the connect-reseed effect.
+      updateSessionState: vi.fn(
+        (
+          _sessionId: string,
+          updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+        ) => updater(createClientSessionState(ACTIVE_STORED_ID))
+      )
     }
 
     return renderHook(() => {
