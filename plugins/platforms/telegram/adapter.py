@@ -4345,6 +4345,24 @@ class TelegramAdapter(BasePlatformAdapter):
             filters.TEXT & ~filters.COMMAND,
             self._handle_text_message
         ))
+
+        class _RichMessageInboundFilter(filters.MessageFilter):
+            """Match Bot API 10.x rich_message bodies with no plain text."""
+
+            def filter(self, message):
+                if getattr(message, "text", None) or getattr(message, "caption", None):
+                    return False
+                kw = getattr(message, "api_kwargs", None) or {}
+                return isinstance(kw.get("rich_message"), dict)
+
+        # Bot API 10.x premium/formatted clients deliver long texts as
+        # message.rich_message WITHOUT msg.text, so filters.TEXT never
+        # matches them and they are silently dropped before reaching
+        # _handle_text_message. Route them through the same pipeline.
+        app.add_handler(TelegramMessageHandler(
+            _RichMessageInboundFilter() & ~filters.COMMAND,
+            self._handle_text_message
+        ))
         app.add_handler(TelegramMessageHandler(
             filters.COMMAND,
             self._handle_command
@@ -9658,6 +9676,61 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    @staticmethod
+    def _recover_rich_message_inbound_text(message: "Message") -> Optional[str]:
+        """Render an inbound Bot API 10.x rich_message body to plain text.
+
+        Premium/formatted clients deliver long texts as
+        ``message.rich_message`` with NO ``text`` field; PTB does not model
+        that field but preserves it in ``Message.api_kwargs``. Returns None
+        unless the message carries only a rich_message body.
+        """
+        try:
+            if getattr(message, "text", None) or getattr(message, "caption", None):
+                return None
+            api_kwargs = getattr(message, "api_kwargs", None) or {}
+            rich = api_kwargs.get("rich_message")
+            if not isinstance(rich, dict):
+                return None
+
+            def _render(blocks: Any, depth: int = 0) -> List[str]:
+                lines: List[str] = []
+                if not isinstance(blocks, list):
+                    return lines
+                indent = "  " * max(depth - 1, 0)
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = str(block.get("type", "")).lower()
+                    if btype == "list":
+                        items = block.get("items")
+                        if isinstance(items, list):
+                            for item in items:
+                                if not isinstance(item, dict):
+                                    continue
+                                label = str(item.get("label") or "").strip()
+                                body = _render(item.get("blocks"), depth + 1)
+                                if body:
+                                    child_indent = indent + "  "
+                                    lines.append(f"{indent}{label} {body[0]}".strip())
+                                    lines.extend(
+                                        f"{child_indent}{line}" for line in body[1:]
+                                    )
+                                elif label:
+                                    lines.append(f"{indent}{label}")
+                        continue
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        lines.append(indent + text)
+                    lines.extend(_render(block.get("blocks"), depth + 1))
+                return lines
+
+            rendered = "\n".join(_render(rich.get("blocks"))).strip()
+            return rendered or None
+        except Exception:
+            logger.warning("rich_message inbound recovery failed", exc_info=True)
+            return None
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -9667,7 +9740,25 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
-            return
+            if msg is not None:
+                rich_text = self._recover_rich_message_inbound_text(msg)
+                if rich_text:
+                    try:
+                        # PTB freezes TelegramObject attributes; bypass the
+                        # frozen __setattr__ to attach the rendered body.
+                        object.__setattr__(msg, "text", rich_text)
+                    except Exception:
+                        logger.warning(
+                            "rich_message recovery could not attach text",
+                            exc_info=True,
+                        )
+                        return
+                    logger.info(
+                        "[Telegram] Recovered rich_message inbound text (%d chars)",
+                        len(rich_text),
+                    )
+            if not msg or not msg.text:
+                return
         # Early user-level auth check: reject unauthorized users before any
         # text batching, observe-buffer persistence, event building, or response
         # generation. This prevents removed/blocked users from injecting prompts
