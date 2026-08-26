@@ -298,6 +298,131 @@ def test_review_lane_reservation_across_boards(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_shared_budget_never_exceeded_with_multiple_reviews(kanban_home):
+    """Both lanes draw from ONE shared total (PR #95056 review finding 1).
+
+    The union loop must not track independent per-lane counters: with
+    spawn_budget=2 and multiple spawnable reviews, per-lane accounting
+    admitted 1 ready + 2 reviews = 3 workers. The single-board tick
+    enforces the shared ``spawned`` total in both loops; the union path
+    must enforce the same total across boards.
+    """
+    kb.create_board("work")
+    kb.create_board("revs")
+
+    with kb.connect(board="work") as conn:
+        for title in ("ready-1", "ready-2"):
+            kb.create_task(conn, title=title, assignee="alice")
+    with kb.connect(board="revs") as conn:
+        for title in ("rev-1", "rev-2", "rev-3"):
+            tid = kb.create_task(conn, title=title, assignee="reviewer")
+            _set_status(conn, tid, "review")
+
+    spawns: list = []
+    results = kb.dispatch_once_all_boards(
+        ["work", "revs"],
+        spawn_fn=_fake_spawn_factory(spawns),
+        max_in_progress=2,
+    )
+
+    total = sum(len(res.spawned) for res in results.values())
+    assert total == 2, (
+        f"shared budget breach: spawn_budget=2 admitted {total} workers "
+        f"(spawns={spawns})"
+    )
+    # The reservation still guarantees the review lane its slot.
+    assert len(results["revs"].spawned) >= 1
+    assert len(results["work"].spawned) + len(results["revs"].spawned) == 2
+
+
+def test_transient_maintenance_failure_is_not_quarantined(
+    kanban_home, monkeypatch,
+):
+    """Non-corruption board-local failures must not set corrupt=True
+    (PR #95056 review finding 2).
+
+    A board-local failure raised by one board's maintenance phase — an
+    ordinary ``RuntimeError`` (programming bug / transient infra error)
+    and a non-corrupt SQLite busy/locked ``OperationalError`` — drops
+    that board from the CURRENT union pass only: the healthy sibling
+    still dispatches, the failed board reports corrupt=False, and the
+    watcher (which maps corrupt=True to the durable quarantine registry)
+    has nothing to quarantine. Classified corruption (bad SQLite file)
+    still reports corrupt=True — see
+    test_corrupt_board_still_reported_corrupt below.
+    """
+    kb.create_board("healthy")
+    kb.create_board("flaky")
+
+    real_release = kb.release_stale_claims
+    failures = [
+        RuntimeError("transient maintenance blowup"),
+        sqlite3.OperationalError("database is locked"),
+    ]
+
+    def flaky_release(conn, *args, **kwargs):
+        # Only the flaky board's connection triggers the failure. Boards
+        # live at <root>/kanban/boards/<slug>/kanban.db and sqlite3
+        # connections carry no python-side board attribute, so identify
+        # the board from the connection's database file path —
+        # deterministic regardless of enumeration order.
+        row = conn.execute("PRAGMA database_list").fetchone()
+        db_file = str(row[2]) if row else ""
+        if "flaky" in db_file:
+            raise failures.pop(0)
+        return real_release(conn, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "release_stale_claims", flaky_release)
+
+    for pass_no, boards in enumerate(
+        (["flaky", "healthy"], ["healthy", "flaky"])
+    ):
+        # A fresh ready task per pass: the previous pass's spawn claimed
+        # its task (CAS moves it out of the pool), so re-asserting on a
+        # consumed tid would vacuously fail.
+        with kb.connect(board="healthy") as conn:
+            tid = kb.create_task(
+                conn, title=f"healthy-{pass_no}", assignee="alice",
+            )
+        spawns: list = []
+        results = kb.dispatch_once_all_boards(
+            boards,
+            # LIVE pid: pass 1's spawned task must look like a healthy
+            # running worker to pass 2's crash detector — a dead stub pid
+            # makes detect_crashed_workers requeue it and pollute pass
+            # 2's spawns (the reason _live_pid_spawn_factory exists).
+            spawn_fn=_live_pid_spawn_factory(spawns),
+        )
+
+        # The healthy board dispatched despite its sibling's failure.
+        assert spawns == [("healthy", tid)]
+        # The failed board is NOT marked corrupt — transient, retried
+        # next tick. Both failure classes must stay out of quarantine.
+        assert results["flaky"].corrupt is False
+        assert results["healthy"].corrupt is False
+
+
+def test_corrupt_board_still_reported_corrupt(kanban_home):
+    """Classified corruption keeps its durable semantics: corrupt=True,
+    healthy siblings unaffected (guards against over-correcting the
+    transient-failure fix)."""
+    kb.create_board("good")
+    kb.create_board("bad")
+    kb.kanban_db_path(board="bad").write_text(
+        "this is not sqlite", encoding="utf-8"
+    )
+    with kb.connect(board="good") as conn:
+        tid = kb.create_task(conn, title="healthy", assignee="alice")
+
+    spawns: list = []
+    results = kb.dispatch_once_all_boards(
+        ["bad", "good"],
+        spawn_fn=_fake_spawn_factory(spawns),
+    )
+    assert results["bad"].corrupt is True
+    assert spawns == [("good", tid)]
+
+
 def test_memory_pressure_elevated_spawns_exactly_one_total(
     kanban_home, monkeypatch,
 ):
@@ -416,7 +541,10 @@ def test_repeated_ticks_never_double_spawn(kanban_home):
         spawn_fn=_live_pid_spawn_factory(first_spawns),
         max_in_progress=2,
     )
-    assert sorted(first_spawns) == [("solo", t1), ("solo", t2)]
+    # Sort BOTH sides: tids are random (t_<8hex>), so creation order and
+    # lexicographic order coincide only ~50% of runs — comparing a sorted
+    # actual against an unsorted expected flaked CI (t_6041e228).
+    assert sorted(first_spawns) == sorted([("solo", t1), ("solo", t2)])
     assert len(_spawned_ids(results)) == 2
 
     # Second tick, same boards, no NEW work: zero claims, zero spawns.

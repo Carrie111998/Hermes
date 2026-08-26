@@ -10601,7 +10601,9 @@ def dispatch_once_all_boards(
        (ready lane capped at ``budget - 1`` when spawnable review work
        exists anywhere, review lane drawing on the full budget — the same
        reservation semantics as the single-board tick, now across boards).
-       Every spawnability gate (default-assignee fill, profile existence,
+       BOTH lanes draw from ONE shared total: the review lane's cap is the
+       remaining shared budget, not a second pool — review handoff is not
+       additional capacity (#74431). Every spawnability gate (default-assignee fill, profile existence,
        per-profile cap, respawn guard) and the atomic ``claim_task`` /
        ``claim_review_task`` CAS run UNCHANGED via the shared helpers, so
        caps and crash-safety semantics are byte-for-byte the single-board
@@ -10618,8 +10620,11 @@ def dispatch_once_all_boards(
 
     Corrupt/unreadable board DBs fail soft: the affected board contributes
     no candidates and its result records whatever maintenance completed;
-    healthy boards finish their tick. The gateway watcher maps returned
-    corruption signals onto its quarantine registry.
+    healthy boards finish their tick. Non-corruption failures (transient
+    errors, programming bugs) drop the board for the CURRENT pass only and
+    leave ``corrupt`` unset — only classified corruption enters the
+    corrupt-board quarantine. The gateway watcher maps returned corruption
+    signals onto its quarantine registry.
 
     Returns ``{slug: DispatchResult}`` for watcher telemetry. Tick observer
     hooks fire per board strictly AFTER the lock set is released
@@ -10690,6 +10695,28 @@ def dispatch_once_all_boards(
                         except Exception:
                             pass
 
+                def _drop_board(slug: str) -> None:
+                    """Drop a board from the CURRENT union pass only.
+
+                    For non-corruption failures (transient errors, programming
+                    bugs in a maintenance call, busy/locked SQLite states):
+                    the board contributes no candidates this tick and is
+                    retried naturally on the next tick. It must NOT set
+                    ``DispatchResult.corrupt`` — the watcher maps that flag to
+                    the durable corrupt-board quarantine (fingerprint pause
+                    window), and quarantining on an ordinary exception would
+                    suppress dispatch on a healthy DB until the fingerprint
+                    changes or the timer expires. Mirrors the legacy
+                    single-board tick, where non-corrupt exceptions are
+                    logged and retried, never quarantined.
+                    """
+                    conn = conns.pop(slug, None)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
                 # ---- per-board maintenance (unchanged semantics) ----
                 for slug in list(conns.keys()):
                     conn = conns[slug]
@@ -10722,12 +10749,14 @@ def dispatch_once_all_boards(
                         else:
                             # One board's transient failure must not stall
                             # the others (same fail-open stance as
-                            # count_running_tasks_other_boards).
+                            # count_running_tasks_other_boards). Drop the
+                            # board for THIS pass only — corrupt=False: the
+                            # watcher must not quarantine a healthy DB.
                             _log.exception(
                                 "kanban dispatch: maintenance failed on board %s",
                                 slug,
                             )
-                            _drop_corrupt(slug, exc)
+                            _drop_board(slug)
 
                 # ---- shared budget computed ONCE across the union ----
                 spawn_budget: Optional[int] = None
@@ -10807,7 +10836,7 @@ def dispatch_once_all_boards(
                                     "kanban dispatch: candidate scan failed on board %s",
                                     slug,
                                 )
-                                _drop_corrupt(slug, exc)
+                                _drop_board(slug)
                     pool.sort(key=lambda c: (c[0], c[1], c[2], c[3], c[4]))
 
                 # Review-lane reservation across boards: if ANY board holds
@@ -10868,24 +10897,30 @@ def dispatch_once_all_boards(
                         st.default_assignee_resolved = True
 
                 claimed_from: "dict[str, int]" = {}
-                # Lane budgets are tracked separately (not one shared
-                # counter) so a full ready lane cannot starve the review
-                # lane: the pool is lane-ranked, and once the ready lane
-                # hits its budget the loop must keep scanning for review
-                # candidates — mirroring the single-board tick's two
-                # separate loops.
-                _ready_spawned = 0
-                _review_spawned = 0
+                # ONE shared spawn counter drives both lanes — the same
+                # invariant as the single-board tick, where the ready loop
+                # checks ``st.spawned >= ready_budget`` and the review loop
+                # checks ``st.spawned >= spawn_budget`` against the SAME
+                # total. Tracking per-lane counters instead would let the
+                # review lane admit ``spawn_budget`` reviews ON TOP of the
+                # ready lane's ``ready_budget`` reads (budget 2 → 1 ready +
+                # 2 reviews = 3 workers), breaching max_in_progress /
+                # max_spawn exactly at the admission boundary they exist to
+                # guard. The reservation (ready_budget = spawn_budget - 1)
+                # still guarantees the review lane its slot: once the total
+                # hits spawn_budget the loop breaks, and until then the
+                # ready lane alone cannot consume the reserved slot.
+                _total_spawned = 0
                 for lane_rank, neg_prio, created_at, slug, tid, row in pool:
                     res = results[slug]
                     if slug not in conns:
                         continue  # board died mid-pass (quarantined)
+                    if spawn_budget is not None and _total_spawned >= spawn_budget:
+                        break
                     if lane_rank == 0:
-                        if ready_budget is not None and _ready_spawned >= ready_budget:
+                        if ready_budget is not None and _total_spawned >= ready_budget:
                             continue
                     else:
-                        if spawn_budget is not None and _review_spawned >= spawn_budget:
-                            break
                         if not row["assignee"]:
                             res.skipped_unassigned.append(row["id"])
                             continue
@@ -10909,10 +10944,7 @@ def dispatch_once_all_boards(
                         continue
                     if len(res.spawned) > before:
                         claimed_from[slug] = claimed_from.get(slug, 0) + 1
-                        if lane_rank == 0:
-                            _ready_spawned += 1
-                        else:
-                            _review_spawned += 1
+                        _total_spawned += 1
 
                 # Periodic PASSIVE WAL checkpoints under the lock set,
                 # mirroring dispatch_once's post-tick checkpoint.
