@@ -7701,7 +7701,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     f"**{i + 1}.** {c}" for i, c in enumerate(clean_choices)
                 )
                 embed_suffix = (
-                    "\n\nPick a button below, or click ✏️ Other to type a "
+                    "\n\nPick one below, or click ✏️ Other to type a "
                     "custom answer."
                 )
                 # Reserve the suffix before truncating the options list:
@@ -7740,7 +7740,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # _self_contained_prompt_content() already enforces it.
             if clean_choices:
                 clarify_tail = (
-                    f"\n\n{option_lines_full}\n\nPick a button below, or click "
+                    f"\n\n{option_lines_full}\n\nPick one below, or click "
                     "✏️ Other to type a custom answer."
                 )
             else:

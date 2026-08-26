@@ -398,5 +398,5 @@ class TestClarifyChoicesFullTextMirror:
         # The instruction suffix must still be present and intact even when
         # the option list had to be truncated to make room for it.
         assert option_text.endswith(
-            "Pick a button below, or click ✏️ Other to type a custom answer."
+            "Pick one below, or click ✏️ Other to type a custom answer."
         )
