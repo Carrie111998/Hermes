@@ -258,10 +258,18 @@ describe('fromSkin', () => {
 
   it('overrides branding', async () => {
     const { fromSkin } = await importThemeWithCleanEnv()
-    const { brand } = fromSkin({}, { agent_name: 'TestBot', prompt_symbol: '$' })
+    const { brand } = fromSkin({}, { agent_name: 'TestBot', banner_animation: 'reveal', prompt_symbol: '$' })
 
     expect(brand.name).toBe('TestBot')
+    expect(brand.bannerAnimation).toBe('reveal')
     expect(brand.prompt).toBe('$')
+  })
+
+  it('disables unknown banner animations', async () => {
+    const { fromSkin } = await importThemeWithCleanEnv()
+
+    expect(fromSkin({}, { banner_animation: 'spin' }).brand.bannerAnimation).toBe('none')
+    expect(fromSkin({}, {}).brand.bannerAnimation).toBe('none')
   })
 
   it('normalizes skin prompt symbols to trimmed single-line text', async () => {

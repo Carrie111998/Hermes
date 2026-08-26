@@ -2,7 +2,7 @@ import { Box, Text, useStdout } from '@hermes/ink'
 import { useEffect, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
 
-import { artWidth, caduceus, CADUCEUS_WIDTH, logo, LOGO_WIDTH } from '../banner.js'
+import { artWidth, caduceus, CADUCEUS_WIDTH, logo, LOGO_WIDTH, revealArtLines } from '../banner.js'
 import { mix } from '../lib/color.js'
 import { flat } from '../lib/text.js'
 import type { Theme } from '../theme.js'
@@ -13,6 +13,7 @@ import { ShimmerRows } from './loaders.js'
 import { WidgetGrid } from './widgetGrid.js'
 
 const LOADER_TICK_MS = 120
+const BANNER_REVEAL_TICK_MS = 35
 
 function InlineLoader({ label, t }: { label: string; t: Theme }) {
   const [tick, setTick] = useState(0)
@@ -47,6 +48,36 @@ export function ArtLines({ lines }: { lines: [string, string][] }) {
       ))}
     </Box>
   )
+}
+
+function AnimatedArtLines({ animate, lines }: { animate: boolean; lines: [string, string][] }) {
+  const width = artWidth(lines)
+  const signature = lines.map(([color, text]) => `${color}\u0000${text}`).join('\u0001')
+  const [visibleColumns, setVisibleColumns] = useState(animate ? 0 : width)
+
+  useEffect(() => {
+    setVisibleColumns(animate ? 0 : width)
+
+    if (!animate || width === 0) {
+      return
+    }
+
+    const id = setInterval(() => {
+      setVisibleColumns(current => {
+        if (current >= width) {
+          clearInterval(id)
+
+          return width
+        }
+
+        return current + 1
+      })
+    }, BANNER_REVEAL_TICK_MS)
+
+    return () => clearInterval(id)
+  }, [animate, signature, width])
+
+  return <ArtLines lines={animate ? revealArtLines(lines, visibleColumns) : lines} />
 }
 
 // Responsive Banner: full art → compact rule → text → hidden.
@@ -126,7 +157,10 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
           paddingY={0}
           rowGap={0}
           widgets={[
-            { children: <ArtLines lines={logoLines} />, id: 'banner-art' },
+            {
+              children: <AnimatedArtLines animate={t.brand.bannerAnimation === 'reveal'} lines={logoLines} />,
+              id: 'banner-art'
+            },
             {
               children: (
                 <Text color={t.color.muted} wrap="truncate-end">

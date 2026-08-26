@@ -91,6 +91,52 @@ HERMES_CADUCEUS = """[#CD7F32]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀�
 [#B8860B]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]"""
 
 
+def _reveal_banner_markup(markup: str, visible_columns: int):
+    """Build one fixed-size left-to-right reveal frame from Rich markup."""
+    from rich.text import Text
+
+    lines = Text.from_markup(markup).split("\n", allow_blank=True)
+    width = max((line.cell_len for line in lines), default=0)
+    visible = max(0, min(width, int(visible_columns)))
+    frame = Text()
+
+    for index, line in enumerate(lines):
+        revealed = line[:visible]
+        revealed.append(" " * max(0, width - revealed.cell_len))
+        frame.append_text(revealed)
+        if index + 1 < len(lines):
+            frame.append("\n")
+
+    return frame
+
+
+def _animate_banner_logo(console: "Console", markup: str) -> None:
+    """Reveal a banner once, then leave the complete frame on screen."""
+    from rich.live import Live
+    from rich.text import Text
+
+    lines = Text.from_markup(markup).split("\n", allow_blank=True)
+    width = max((line.cell_len for line in lines), default=0)
+
+    with Live(
+        _reveal_banner_markup(markup, 0),
+        console=console,
+        refresh_per_second=30,
+    ) as live:
+        for visible in range(1, width + 1):
+            live.update(_reveal_banner_markup(markup, visible), refresh=True)
+            time.sleep(0.035)
+
+
+def _print_banner_logo(console: "Console", markup: str, *, animation: str = "none") -> None:
+    """Print a logo statically, or animate it when an interactive skin opts in."""
+    if animation == "reveal" and console.is_terminal:
+        _animate_banner_logo(console, markup)
+        return
+
+    console.print(markup)
+
+
 
 # =========================================================================
 # Skills scanning
@@ -1263,6 +1309,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     term_width = shutil.get_terminal_size().columns
     if term_width >= 95:
         _logo = _bskin.banner_logo if _bskin and hasattr(_bskin, 'banner_logo') and _bskin.banner_logo else HERMES_AGENT_LOGO
-        console.print(_logo)
+        _animation = str((_bskin.branding or {}).get("banner_animation", "none")) if _bskin else "none"
+        _print_banner_logo(console, _logo, animation=_animation.strip().lower())
         console.print()
     console.print(outer_panel)
