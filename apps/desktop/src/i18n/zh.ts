@@ -3351,6 +3351,7 @@ export const zh: Translations = {
       editMessage: '编辑消息',
       expandMessage: '展开消息',
       scrollToBottom: '滚动到底部',
+      jumpToAnswerStart: '跳转到回答开头',
       stop: '停止',
       restorePrevious: '恢复上一个检查点',
       restoreCheckpoint: '恢复检查点',

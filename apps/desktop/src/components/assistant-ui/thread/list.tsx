@@ -22,6 +22,8 @@ import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
 import { cn } from '@/lib/utils'
 import {
+  jumpThreadScroll,
+  onScrollToAnswerStartRequest,
   onScrollToBottomRequest,
   onThreadEditClose,
   onThreadEditOpen,
@@ -122,6 +124,26 @@ export const resolveThreadScrollTarget: GetTargetScrollTop = (targetScrollTop, {
   const remaining = targetScrollTop - currentScrollTop
 
   return remaining >= 0 && remaining <= SCROLL_TARGET_EPSILON_PX ? currentScrollTop : targetScrollTop
+}
+
+interface AnswerStartScrollElement {
+  clientHeight: number
+  scrollHeight: number
+  scrollTop: number
+}
+
+/** Keep the sticky prompt visible and place its paired answer directly below
+ * it. Rects are viewport-relative, so their delta translates directly into a
+ * scrollTop delta; clamp because the first/last turn may sit near an edge. */
+export function resolveAnswerStartScrollTop(
+  scrollElement: AnswerStartScrollElement,
+  promptRect: Pick<DOMRect, 'bottom'>,
+  answerRect: Pick<DOMRect, 'top'>
+): number {
+  const requested = scrollElement.scrollTop + answerRect.top - promptRect.bottom
+  const max = Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight)
+
+  return Math.min(max, Math.max(0, requested))
 }
 
 export function subscribeToThreadForeground(shouldReanchor: () => boolean, onReanchor: () => void): () => void {
@@ -566,6 +588,37 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   // Floating jump button (outside this subtree) → return to the bottom.
   useEffect(() => onScrollToBottomRequest(() => void scrollToBottom()), [scrollToBottom])
+
+  // A prompt's action bubbles to this exact viewport. Release bottom-follow,
+  // resolve the first assistant message inside the same turn, and move only the
+  // owning scroll element — never scrollIntoView(), which can also move hidden
+  // overflow ancestors and corrupt the pane layout.
+  useEffect(() => {
+    const viewport = scrollRef.current
+
+    if (!viewport) {
+      return
+    }
+
+    return onScrollToAnswerStartRequest(viewport, messageId => {
+      const prompt = Array.from(viewport.querySelectorAll<HTMLElement>('[data-slot="aui_user-message-root"]')).find(
+        element => element.dataset.messageId === messageId
+      )
+
+      const turn = prompt?.closest<HTMLElement>('[data-slot="aui_turn-pair"]')
+      const answer = turn?.querySelector<HTMLElement>('[data-slot="aui_assistant-message-root"]')
+
+      if (!prompt || !answer) {
+        return
+      }
+
+      stopScroll()
+      jumpThreadScroll(
+        viewport,
+        resolveAnswerStartScrollTop(viewport, prompt.getBoundingClientRect(), answer.getBoundingClientRect())
+      )
+    })
+  }, [scrollRef, stopScroll])
 
   // Waking from display: hidden (HUD mode hides the main window; OS hide does
   // the same to any window): rAF and ResizeObserver may have been frozen, so
