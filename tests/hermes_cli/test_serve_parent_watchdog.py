@@ -57,3 +57,78 @@ def test_parent_watchdog_preserves_legacy_exact_windows_marker():
         )
         is False
     )
+
+
+def test_parent_watchdog_does_not_kill_a_live_parent_on_macos_timezone_drift():
+    """Regression for issue #95693: `ps -o lstart=` is a timezone/locale-
+    rendered wall-clock string on macOS (the only marker format for
+    platforms without a dedicated linux:/win: branch). The exact
+    evidence from the report -- the SAME process instant rendered
+    under EDT (cached by Electron before a TZ change) vs. CEST (probed
+    by a freshly-spawned backend after) -- must not be treated as proof
+    the parent died; it must degrade to the PID-only check instead."""
+    expected = "ps:Thu Aug 20 22:33:11 2026"  # EDT (UTC-4), Electron's cached marker
+    actual = "ps:Fri Aug 21 04:33:11 2026"  # CEST (UTC+2), same instant, freshly probed
+
+    assert (
+        _is_serve_orphaned(
+            4242,
+            expected,
+            pid_exists=lambda _pid: True,  # parent is genuinely still alive
+            process_start_marker=lambda _pid: actual,
+        )
+        is False
+    )
+
+
+def test_parent_watchdog_still_detects_a_genuinely_dead_parent_despite_ps_marker_mismatch():
+    """The degrade-to-PID-only fallback must still correctly detect a
+    genuinely dead parent -- the fix must not silently disable orphan
+    detection for macOS, only stop treating a TZ-driven marker mismatch
+    as automatic proof of death."""
+    expected = "ps:Thu Aug 20 22:33:11 2026"
+    actual = "ps:Fri Aug 21 04:33:11 2026"
+
+    assert (
+        _is_serve_orphaned(
+            4242,
+            expected,
+            pid_exists=lambda _pid: False,  # parent is genuinely gone
+            process_start_marker=lambda _pid: actual,
+        )
+        is True
+    )
+
+
+def test_parent_watchdog_exact_ps_marker_match_still_short_circuits():
+    """Sanity: an exact ps: marker match (the common, no-TZ-change case)
+    must still resolve to not-orphaned directly, without needing the
+    PID-only fallback at all."""
+    marker = "ps:Thu Aug 20 22:33:11 2026"
+
+    assert (
+        _is_serve_orphaned(
+            4242,
+            marker,
+            pid_exists=lambda _pid: False,  # must be irrelevant -- short-circuits on match
+            process_start_marker=lambda _pid: marker,
+        )
+        is False
+    )
+
+
+def test_parent_watchdog_still_rejects_recycled_pid_via_stable_linux_marker():
+    """Sanity/no-regression: the linux: marker format is a stable,
+    timezone-independent integer (starttime jiffies from /proc stat) --
+    a mismatch there still correctly proves a dead/recycled parent PID
+    and must NOT be softened by this fix, which is scoped specifically
+    to the ps: (macOS) format."""
+    assert (
+        _is_serve_orphaned(
+            4242,
+            "linux:12345",
+            pid_exists=lambda _pid: True,  # even if a PID now exists (reused), still orphaned
+            process_start_marker=lambda _pid: "linux:99999",
+        )
+        is True
+    )
