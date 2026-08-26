@@ -160,11 +160,11 @@ def test_local_ci_runner_executes_only_required_lanes_and_records_exact_head_rec
     assert receipt.identity == identity
     assert [call[0] for call in commands.calls] == [
         ("python3", "scripts/check_ci_governance.py"),
-        ("python3", "scripts/run_hygiene_lane.py"),
         ("python3", "scripts/run_static_lane.py"),
+        ("python3", "scripts/run_hygiene_lane.py"),
         ("python3", "scripts/run_test_lane.py", "--lane", "unit"),
     ]
-    assert commands.calls[2][2]["STATIC_BASE_REF"] == BASE_SHA
+    assert commands.calls[1][2]["STATIC_BASE_REF"] == BASE_SHA
     assert all(len(evidence.stdout_sha256) == 64 for evidence in receipt.commands)
     assert ledger.latest_passing_ci_receipt(
         "acme/widgets",

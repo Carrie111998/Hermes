@@ -315,12 +315,12 @@ class LocalCIRunner:
         started_at = _aware_now(self._now())
         command_specs: list[tuple[tuple[str, ...], Path, dict[str, str]]] = [
             (self._python_argv + ("scripts/check_ci_governance.py",), worktree, {}),
-            (self._python_argv + ("scripts/run_hygiene_lane.py",), worktree, {}),
             (
                 self._python_argv + ("scripts/run_static_lane.py",),
                 worktree,
                 {"STATIC_BASE_REF": identity.base_sha},
             ),
+            (self._python_argv + ("scripts/run_hygiene_lane.py",), worktree, {}),
         ]
         command_specs.extend(
             (
