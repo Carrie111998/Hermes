@@ -13,6 +13,7 @@ import pytest
 from github_pr_feedback.controller import (
     LOCAL_CI_FEEDBACK_ID,
     MAX_ADMISSIONS_PER_SCAN,
+    MAX_PARALLEL_PR_READS,
     GitCommandResult,
     LocalGitRepository,
     PreparedWorktree,
@@ -2416,7 +2417,7 @@ def test_scan_reads_independent_pull_feedback_concurrently(tmp_path: Path) -> No
             f"codex/fix-{number}",
             sha,
         )
-        for number in (17, 18, 19)
+        for number in range(17, 17 + MAX_PARALLEL_PR_READS + 1)
     )
     ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
 
@@ -2432,7 +2433,7 @@ def test_scan_reads_independent_pull_feedback_concurrently(tmp_path: Path) -> No
     assert result.created == 0
     assert result.skipped == {}
     assert result.degraded is False
-    assert github.max_active == 2
+    assert github.max_active == MAX_PARALLEL_PR_READS
     ledger.close()
 
 

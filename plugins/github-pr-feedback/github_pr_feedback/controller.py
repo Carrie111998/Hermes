@@ -20,7 +20,10 @@ from .ledger import ClaimLease, FeedbackLedger, LedgerStateError
 from .policy import FeedbackReceipt, PluginPolicy, PullRequest, RepositoryTarget, RoutingDecision
 
 MAX_ADMISSIONS_PER_SCAN = 128
-MAX_PARALLEL_PR_READS = 2
+# Each PR snapshot already overlaps its three independent GitHub endpoints.
+# Six PR snapshots keeps a 50-PR scan bounded (18 API reads in flight at most)
+# without turning a rate-limited GitHub API into an unbounded fan-out.
+MAX_PARALLEL_PR_READS = 6
 LOCAL_CI_FEEDBACK_ID = "local-ci-audit-v2"
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 DEFAULT_CLAIM_LEASE = timedelta(minutes=5)
