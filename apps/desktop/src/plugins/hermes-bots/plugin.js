@@ -6478,16 +6478,64 @@ function parseGroupChatMentions(text, members) {
   return { everyone, mentioned }
 }
 
-/** Members that should take a turn this round: everyone when no member is
- *  @-mentioned in messages since the last user entry (or @everyone appears),
- *  otherwise only the mentioned members. Recomputed every round so a member
- *  pulled in mid-conversation joins the next round. */
-function resolveGroupResponders(log, members) {
+/** Room default-owner registry. Exact names only — a rename is a new room. */
+const GROUP_ROOM_OWNERS = Object.freeze({
+  'Sherman Personal Office': { owner: 'company-pa', status: 'company-cos' },
+  'Bellyfed Products & Technology': { owner: 'company-cpo', status: 'company-cos' },
+  'Bellyfed Studios & Growth': { owner: 'company-cos', status: 'company-cos' },
+  'Bellyfed Group — Executive Office': { owner: 'company-cos', status: 'company-cos' }
+})
+
+function findGroupMemberByProfile(members, profileName) {
+  const wanted = String(profileName || '').trim().toLowerCase()
+  if (!wanted) return null
+  return members.find(member => String(member.name || '').trim().toLowerCase() === wanted) || null
+}
+
+/** Named role, then company-cos, then the old everyone wake so the room never goes silent. */
+function pickGroupRoomSpeaker(members, groupName, role) {
+  const spec = GROUP_ROOM_OWNERS[groupName]
+  const candidates = []
+  if (spec?.[role]) candidates.push(spec[role])
+  if (!candidates.includes('company-cos')) candidates.push('company-cos')
+  for (const name of candidates) {
+    const member = findGroupMemberByProfile(members, name)
+    if (member) return [member]
+  }
+  return members
+}
+
+/** Status questions go to the status speaker. Planning questions are work. */
+function isGroupStatusIntent(text) {
+  const raw = String(text || '').toLowerCase()
+  if (/\bwhat(?:['’]s|s| is) the plan\b/.test(raw)) return false
+  return (
+    /\bstatus\s*\?/.test(raw) ||
+    /\bwhat(?:['’]s|s| is) the status\b/.test(raw) ||
+    /\bwhat(?:['’]s|s| is) happening\b/.test(raw) ||
+    /\bi(?:['’]?m| am) lost\b/.test(raw) ||
+    /\bwhere did we stop\b/.test(raw) ||
+    /\bwhere are we\b/.test(raw)
+  )
+}
+
+/** Members that should take a turn this round.
+ *  Inspect only messages since the last user line:
+ *  1. @everyone/@all → every member
+ *  2. any other member @mention → those members only
+ *  3. no mention + status intent → status speaker
+ *  4. no mention + anything else → default owner
+ *  Unregistered rooms, or a missing named profile, fall back to company-cos
+ *  then the legacy everyone wake. Recomputed every round so a member pulled
+ *  in mid-conversation joins the next round. */
+function resolveGroupResponders(log, members, groupName) {
   let sinceLastUser = []
+  let lastUserText = ''
 
   for (let i = log.length - 1; i >= 0; i--) {
     if (log[i].from.kind === 'user') {
       sinceLastUser = log.slice(i)
+      lastUserText = log[i].text
       break
     }
   }
@@ -6507,11 +6555,15 @@ function resolveGroupResponders(log, members) {
     }
   }
 
-  if (everyone || mentioned.size === 0) {
+  if (everyone) {
     return members
   }
 
-  return members.filter(member => mentioned.has(groupMemberKey(member)))
+  if (mentioned.size > 0) {
+    return members.filter(member => mentioned.has(groupMemberKey(member)))
+  }
+
+  return pickGroupRoomSpeaker(members, groupName, isGroupStatusIntent(lastUserText) ? 'status' : 'owner')
 }
 
 /** Rotate the roster so a different member leads each round. */
@@ -6612,7 +6664,12 @@ function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLines }) {
     'Rules for this room:',
     '- Reply with ONE conversational message ONLY if you have something new worth adding: build on what was just said, claim or hand off work, answer a question aimed at you, or report a real result. Keep chatter short (1-3 sentences) — but when you are delivering a result, an answer the user asked for, or substantive work, give it at full quality and length; never thin out real content to fit the room.',
     '- If you have nothing new to add, reply with exactly "(pass)". Passing is good — it lets the conversation settle.',
-    '- Mention a teammate as @name to pull them in; mention @user only for a judgment call or a result the user needs. Do not repeat points already made.',
+    '- Mention a teammate as @name to pull them in. Do not repeat points already made.',
+    '- Never ask the user to type start, continue, or tag a Bot already in the room.',
+    '- You are not waiting for the user to tag you.',
+    '- If you are the default owner and this is work: create/resume a Kanban card on the matching board and start. The @mention is optional visibility after the card exists.',
+    '- If you are CoS and this is status: answer from the board with BF-/PO-/ST- IDs; if owned work should be running and is not, dispatch the owner then @mention them.',
+    '- Mention @user only for Auth Handoff, spend, public-send, or explicit yes/no.',
     '- Never reveal content from your private 1:1 chats. Your reply text goes to the room verbatim — no preamble, no meta-commentary.'
   ].join('\n')
 }
@@ -7720,7 +7777,7 @@ async function runGroupChatRounds(group, members, thread) {
       // value shape, since markers are a bare number pre-thread or
       // {before, thread} post-thread.
       const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
-      const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
+      const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members, group), round)
         .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
       let spokeThisRound = 0
 

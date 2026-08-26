@@ -178,6 +178,24 @@ test('mentions: @name-device handle resolves the remote member; same-named agent
   assert.equal(responders[0].remoteSource, true)
 })
 
+test('design A: unmentioned work in Sherman Personal Office does not wake a remote qwen', () => {
+  const ctx = runtime()
+  const { resolveGroupResponders } = ctx.__x
+  const members = [
+    { name: 'company-pa', title: 'Personal Administration' },
+    { name: 'company-cos', title: 'Chief of Staff' },
+    { name: 'qwen', handle: 'qwen-mac-mini', connectionId: 'mac-mini', remoteSource: true }
+  ]
+  const officeResponders = resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: 'file the missing MyCTOS months', at: 1 }],
+    members,
+    'Sherman Personal Office'
+  )
+  assert.equal(officeResponders.map(member => member.name).join(','), 'company-pa')
+  assert.equal(officeResponders.length, 1)
+  assert.equal(officeResponders[0].remoteSource, undefined)
+})
+
 test('room lines and turn prompts badge cross-connection speakers with their device', () => {
   const ctx = runtime()
   const { formatGroupChatLine, buildGroupChatTurnPrompt } = ctx.__x

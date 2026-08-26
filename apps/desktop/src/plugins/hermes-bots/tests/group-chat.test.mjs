@@ -217,6 +217,23 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
 
+const PERSONAL_OFFICE = [
+  { name: 'company-cos', title: 'Chief of Staff' },
+  { name: 'company-pa', title: 'Personal Administration' },
+  { name: 'company-installer', title: 'Installer' },
+  { name: 'qwen', title: 'Qwen' }
+]
+
+const STUDIOS = [
+  { name: 'company-cos', title: 'Chief of Staff' },
+  { name: 'company-social', title: 'Social' },
+  { name: 'company-yuna', title: 'Yuna' }
+]
+
+function responderNames(members) {
+  return members.map(member => member.name).join(',')
+}
+
 function roomLog(gc, group) {
   return (gc.$groupChats.get()[group] || { log: [] }).log
 }
@@ -230,7 +247,7 @@ test('pass detection: (pass), pass, pass., empty are silence; real text is not',
   assert.equal(gc.isGroupPassText('I will pass this to ops'), false)
 })
 
-test('mention routing: only @-mentioned members respond; @everyone or none = all', () => {
+test('mention routing: only @-mentioned members respond; @everyone or none in an unregistered room = all', () => {
   const gc = load(() => '(pass)')
   const log = [{ from: { kind: 'user', name: 'You' }, text: '@builder take this one', at: 1 }]
   const one = gc.resolveGroupResponders(log, MEMBERS)
@@ -251,6 +268,84 @@ test('mention routing: display titles resolve to the member and @user never matc
   const parsed = gc.parseGroupChatMentions('@theops please check, then ping @user', MEMBERS)
   assert.equal(parsed.mentioned.has('ops'), true)
   assert.equal(parsed.mentioned.size, 1)
+})
+
+test('design A: unmentioned status in Sherman Personal Office wakes only company-cos', () => {
+  const gc = load(() => '(pass)')
+  const responders = gc.resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: 'so what is the status', at: 1 }],
+    PERSONAL_OFFICE,
+    'Sherman Personal Office'
+  )
+  assert.equal(responderNames(responders), 'company-cos')
+})
+
+test('design A: unmentioned work in Sherman Personal Office wakes only company-pa', () => {
+  const gc = load(() => '(pass)')
+  const responders = gc.resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: 'file the missing MyCTOS months', at: 1 }],
+    PERSONAL_OFFICE,
+    'Sherman Personal Office'
+  )
+  assert.equal(responderNames(responders), 'company-pa')
+})
+
+test('design A: @personal-administration status? still wakes only PA', () => {
+  const gc = load(() => '(pass)')
+  const responders = gc.resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: '@personal-administration status?', at: 1 }],
+    PERSONAL_OFFICE,
+    'Sherman Personal Office'
+  )
+  assert.equal(responderNames(responders), 'company-pa')
+})
+
+test('design A: @everyone in Sherman Personal Office still wakes all members', () => {
+  const gc = load(() => '(pass)')
+  const responders = gc.resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: '@everyone standup', at: 1 }],
+    PERSONAL_OFFICE,
+    'Sherman Personal Office'
+  )
+  assert.equal(responderNames(responders), 'company-cos,company-pa,company-installer,qwen')
+})
+
+test('design A: unmentioned plan question in Studios & Growth is work for company-cos', () => {
+  const gc = load(() => '(pass)')
+  const responders = gc.resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: "what's the plan for today's sherman x.com", at: 1 }],
+    STUDIOS,
+    'Bellyfed Studios & Growth'
+  )
+  assert.equal(responderNames(responders), 'company-cos')
+})
+
+test('design A: missing owner falls back to company-cos, then everyone', () => {
+  const gc = load(() => '(pass)')
+  const withoutPa = PERSONAL_OFFICE.filter(member => member.name !== 'company-pa')
+  const cosOnly = gc.resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: 'file the missing MyCTOS months', at: 1 }],
+    withoutPa,
+    'Sherman Personal Office'
+  )
+  assert.equal(responderNames(cosOnly), 'company-cos')
+
+  const strangers = [{ name: 'research', title: '' }, { name: 'builder', title: '' }]
+  const everyone = gc.resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: 'file the missing MyCTOS months', at: 1 }],
+    strangers,
+    'Sherman Personal Office'
+  )
+  assert.equal(responderNames(everyone), 'research,builder')
+})
+
+test('design A: runGroupChatRounds only prompts the default owner on unmentioned work', async () => {
+  const gc = load(() => '(pass)')
+  gc.sendToGroupChat('Sherman Personal Office', PERSONAL_OFFICE, 'file the missing MyCTOS months')
+  for (let i = 0; i < 200 && (gc.$groupChats.get()['Sherman Personal Office'] || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal([...new Set(gc.calls.map(call => call.profile))].join(','), 'company-pa')
 })
 
 test('a member @-mentioned by another bot joins the NEXT round', async () => {
@@ -1650,6 +1745,30 @@ test('turn prompt: results are full quality — only chatter is asked to stay sh
   })
   assert.match(prompt, /never thin out real content/i)
   assert.match(prompt, /Keep chatter short/i)
+})
+
+test('turn prompt: default owner cards work; CoS answers status; never ask the user to type start', () => {
+  const gc = load(() => '(pass)')
+  const prompt = gc.buildGroupChatTurnPrompt({
+    groupName: 'Sherman Personal Office',
+    members: [
+      { name: 'company-cos', title: 'Chief of Staff' },
+      { name: 'company-pa', title: 'Personal Administration' }
+    ],
+    viewer: { name: 'company-cos', title: 'Chief of Staff' },
+    deltaLines: ['You (user): resume the parked sitting']
+  })
+
+  assert.match(prompt, /If you have nothing new to add, reply with exactly "\(pass\)"/)
+  assert.match(prompt, /Reply with ONE conversational message ONLY/)
+  assert.match(prompt, /Never ask the user to type start, continue, or tag a Bot already in the room/)
+  assert.match(prompt, /If you are the default owner and this is work: create\/resume a Kanban card on the matching board and start/)
+  assert.match(prompt, /The @mention is optional visibility after the card exists/)
+  assert.match(prompt, /If you are CoS and this is status: answer from the board with BF-\/PO-\/ST- IDs/)
+  assert.match(prompt, /if owned work should be running and is not, dispatch the owner then @mention them/)
+  assert.match(prompt, /Mention @user only for Auth Handoff, spend, public-send, or explicit yes\/no/)
+  assert.doesNotMatch(prompt, /mention @user only for a judgment call or a result the user needs/)
+  assert.doesNotMatch(prompt, /If you are orchestrating, @mention exactly one owner/)
 })
 
 test('threads: room composer mints a new thread; replies land in it', async () => {
