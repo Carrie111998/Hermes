@@ -166,6 +166,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = MAX_TEXT_LENGTH
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    # Empty by default: iMessage threads are personal and most users do not
+    # want a banner on every reply. Opt in via config.yaml `reply_prefix` or
+    # BLUEBUBBLES_REPLY_PREFIX.
+    DEFAULT_REPLY_PREFIX: str = ""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.BLUEBUBBLES)
@@ -193,6 +197,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
         self.require_mention = str(_require_mention).strip().lower() in {"true", "1", "yes", "on"}
+        # Prefix prepended to every outbound bubble so users can tell agent
+        # replies apart in a shared thread. None means "not configured", which
+        # is distinct from "" (explicitly configured to no prefix).
+        _reply_prefix = extra.get("reply_prefix")
+        if _reply_prefix is None:
+            _reply_prefix = os.getenv("BLUEBUBBLES_REPLY_PREFIX")
+        self._reply_prefix: Optional[str] = _reply_prefix
         self._mention_patterns = self._compile_mention_patterns(
             extra["mention_patterns"]
             if "mention_patterns" in extra
@@ -532,6 +543,26 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         chunks = BasePlatformAdapter.truncate_message(content, max_length)
         return [re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks]
 
+    def _effective_reply_prefix(self) -> str:
+        """Prefix prepended to each outbound bubble ("" disables it).
+
+        Mirrors the WhatsApp adapter's contract: ``\\n`` in the configured
+        value is treated as a newline so a multi-line banner can be expressed
+        in a single .env line.
+        """
+        if self._reply_prefix is not None:
+            return self._reply_prefix.replace("\\n", "\n")
+        return self.DEFAULT_REPLY_PREFIX
+
+    def _outgoing_chunk_limit(self) -> int:
+        """Reserve room for the reply prefix so the final message still fits."""
+        prefix_len = len(self._effective_reply_prefix())
+        if prefix_len:
+            prefix_len += 1  # the space joining prefix and body
+        # Keep a floor so a pathologically long prefix cannot drive the limit
+        # to zero and stall chunking.
+        return max(512, self.MAX_MESSAGE_LENGTH - prefix_len)
+
     async def send(
         self,
         chat_id: str,
@@ -542,18 +573,22 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         text = self.format_message(content)
         if not text:
             return SendResult(success=False, error="BlueBubbles send requires text")
+        prefix = self._effective_reply_prefix()
+        chunk_limit = self._outgoing_chunk_limit()
         # Split on paragraph breaks first (double newlines) so each thought
         # becomes its own iMessage bubble, then truncate any that are still
         # too long.
         paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
         chunks: List[str] = []
         for para in (paragraphs or [text]):
-            if len(para) <= self.MAX_MESSAGE_LENGTH:
+            if len(para) <= chunk_limit:
                 chunks.append(para)
             else:
-                chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+                chunks.extend(self.truncate_message(para, max_length=chunk_limit))
         last = SendResult(success=True)
         for chunk in chunks:
+            if prefix:
+                chunk = f"{prefix} {chunk}"
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
                 # If the target looks like an address, try creating a new chat
