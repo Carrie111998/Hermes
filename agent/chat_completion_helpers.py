@@ -3051,8 +3051,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
-            codex_kwargs.pop("tools", None)
+            # Iteration summary is toolless. Passing the live tool list would
+            # set tool_choice=auto; popping only tools then 400s on xAI
+            # ("tool_choice set but no tools"). Build empty and strip both.
+            # Unique-anchor: 1224-late-summary-no-tool-choice
+            codex_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=[])
+            for _toolless_key in ("tools", "tool_choice", "parallel_tool_calls"):
+                codex_kwargs.pop(_toolless_key, None)
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
@@ -3166,8 +3171,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
+                # Unique-anchor: 1224-late-summary-no-tool-choice-retry
+                codex_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=[])
+                for _toolless_key in ("tools", "tool_choice", "parallel_tool_calls"):
+                    codex_kwargs.pop(_toolless_key, None)
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)

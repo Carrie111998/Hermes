@@ -2860,6 +2860,87 @@ class TestHandleMaxIterations:
             for item in input_items
         )
 
+    def test_codex_xai_summary_omits_tool_choice_when_tools_stripped(self, agent):
+        """#1224 seat: xAI 400s 'tool_choice set but no tools' on iteration summary."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4.6"
+        agent.tools = [{
+            "type": "function",
+            "function": {"name": "terminal", "parameters": {"type": "object"}},
+        }]
+        agent._cached_system_prompt = "You are helpful."
+        captured = {}
+
+        def fake_run_codex_stream(kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text="Summary")],
+                    )
+                ],
+            )
+
+        with patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}],
+                60,
+            )
+
+        assert result == "Summary"
+        assert "tools" not in captured
+        assert "tool_choice" not in captured
+        assert "parallel_tool_calls" not in captured
+
+    def test_codex_xai_summary_retry_also_omits_tool_choice(self, agent):
+        """Retry path of Unique-anchor 1224-late-summary-no-tool-choice-retry."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4.6"
+        agent.tools = [{
+            "type": "function",
+            "function": {"name": "terminal", "parameters": {"type": "object"}},
+        }]
+        agent._cached_system_prompt = "You are helpful."
+        captured = []
+
+        def fake_run_codex_stream(kwargs):
+            captured.append(dict(kwargs))
+            text = "" if len(captured) == 1 else "Summary"
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=text)],
+                    )
+                ],
+            )
+
+        with patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}],
+                60,
+            )
+
+        assert result == "Summary"
+        assert len(captured) == 2
+        for kwargs in captured:
+            assert "tools" not in kwargs
+            assert "tool_choice" not in kwargs
+            assert "parallel_tool_calls" not in kwargs
+
     def test_api_sanitizer_matches_responses_call_id_when_id_differs(self, agent):
         messages = [
             {
