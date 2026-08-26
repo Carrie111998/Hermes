@@ -38,8 +38,32 @@ reference.
 from __future__ import annotations
 
 import copy
-import os
 from typing import Any, Callable, Dict, List, Tuple
+
+#: Auto-migration support floor. Configs whose on-disk ``_config_version`` is
+#: below this are NOT auto-migrated any more (policy decision, July 2026):
+#: v12 predates roughly two years of releases, and carrying the sub-v12
+#: migration steps (plus the env bridges they consumed, e.g.
+#: HERMES_TOOL_PROGRESS*) forever is not worth it. Below-floor configs are
+#: left byte-for-byte untouched — the process continues with the config as-is
+#: (defaults deep-merged at read time, matching the non-fatal posture used
+#: for unparseable configs) and a clear message tells the user how to
+#: proceed. The removed steps were the <12 targets: v4 (tool-progress .env →
+#: config.yaml), v5 (timezone seed), v9 (clear ANTHROPIC_TOKEN).
+SUPPORT_FLOOR_VERSION = 12
+
+
+def support_floor_message() -> str:
+    """Human-facing explanation shown when a config is below the floor."""
+    from hermes_constants import display_hermes_home
+
+    return (
+        f"This config predates version {SUPPORT_FLOOR_VERSION} (~2 years old) "
+        "and can no longer be auto-migrated. Back up "
+        f"{display_hermes_home()}/config.yaml and run `hermes setup` to "
+        f"regenerate, or manually set _config_version: {SUPPORT_FLOOR_VERSION} "
+        "after reviewing the changelog."
+    )
 
 
 def _cfg():
@@ -47,73 +71,6 @@ def _cfg():
     from hermes_cli import config
 
     return config
-
-
-def _migrate_to_4(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 3 → 4: migrate tool progress from .env to config.yaml ──
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    get_env_value = _c.get_env_value
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    display = config.get("display", {})
-    if not isinstance(display, dict):
-        display = {}
-    if "tool_progress" not in display:
-        old_enabled = get_env_value("HERMES_TOOL_PROGRESS")
-        old_mode = get_env_value("HERMES_TOOL_PROGRESS_MODE")
-        if old_enabled and old_enabled.lower() in {"false", "0", "no"}:
-            display["tool_progress"] = "off"
-            results["config_added"].append("display.tool_progress=off (from HERMES_TOOL_PROGRESS=false)")
-        elif old_mode and old_mode.lower() in {"new", "all", "verbose"}:
-            display["tool_progress"] = old_mode.lower()
-            results["config_added"].append(f"display.tool_progress={old_mode.lower()} (from HERMES_TOOL_PROGRESS_MODE)")
-        else:
-            display["tool_progress"] = "all"
-            results["config_added"].append("display.tool_progress=all (default)")
-        config["display"] = display
-        _persist_migration(config)
-        if not quiet:
-            print(f"  ✓ Migrated tool progress to config.yaml: {display['tool_progress']}")
-
-
-def _migrate_to_5(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 4 → 5: add timezone field ──
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    if "timezone" not in config:
-        old_tz = os.getenv("HERMES_TIMEZONE", "")
-        if old_tz and old_tz.strip():
-            config["timezone"] = old_tz.strip()
-            results["config_added"].append(f"timezone={old_tz.strip()} (from HERMES_TIMEZONE)")
-        else:
-            config["timezone"] = ""
-            results["config_added"].append("timezone= (empty, uses server-local)")
-        _persist_migration(config)
-        if not quiet:
-            tz_display = config["timezone"] or "(server-local)"
-            print(f"  ✓ Added timezone to config.yaml: {tz_display}")
-
-
-def _migrate_to_9(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 8 → 9: clear ANTHROPIC_TOKEN from .env ──
-    # The new Anthropic auth flow no longer uses this env var.
-    _c = _cfg()
-    get_env_value = _c.get_env_value
-    save_env_value = _c.save_env_value
-
-    try:
-        old_token = get_env_value("ANTHROPIC_TOKEN")
-        if old_token:
-            save_env_value("ANTHROPIC_TOKEN", "")
-            if not quiet:
-                print("  ✓ Cleared ANTHROPIC_TOKEN from .env (no longer used)")
-    except Exception:
-        pass
 
 
 def _migrate_to_12(results: Dict[str, Any], quiet: bool) -> None:
@@ -259,25 +216,6 @@ def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
         _persist_migration(config)
         if not quiet:
             print("  ✓ Migrated legacy stt.model to provider-specific config")
-
-
-def _migrate_to_15(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 14 → 15: add explicit gateway interim-message gate ──
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    display = config.get("display", {})
-    if not isinstance(display, dict):
-        display = {}
-    if "interim_assistant_messages" not in display:
-        display["interim_assistant_messages"] = True
-        config["display"] = display
-        results["config_added"].append("display.interim_assistant_messages=true (default)")
-        _persist_migration(config)
-        if not quiet:
-            print("  ✓ Added display.interim_assistant_messages=true")
 
 
 def _migrate_to_16(results: Dict[str, Any], quiet: bool) -> None:
@@ -687,18 +625,256 @@ def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 33 → 34: one-time personality reset (post-#81946 unification) ──
+    # Personality persistence used to be split per surface: the TUI/desktop
+    # wrote the NAME to display.personality while the CLI/gateway wrote the
+    # rendered TEXT into agent.system_prompt (and their "/personality none"
+    # only blanked the text, leaving the name behind). When #81946 made
+    # display.personality authoritative everywhere, stale names written years
+    # ago resurrected personalities users had already turned off ("kawaii
+    # defaults on after updating"). There is no way to know which of the two
+    # divergent fields reflects the user's intent, so reset the selection to
+    # none once and tell the user how to re-enable it. Two scrubs:
+    #
+    # 1. display.personality → "" (announce the old name).
+    # 2. agent.system_prompt → "" ONLY when it verbatim-equals the rendered
+    #    text of a known personality — that shape was written by the old
+    #    CLI/gateway /personality, never typed by hand. Any other text is a
+    #    user-owned manual prompt and is never touched.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    from hermes_cli.personality import (
+        available_personalities,
+        normalize_personality_name,
+        prompt_text,
+        render_personality_prompt,
+    )
+
+    config = read_raw_config()
+    touched = False
+
+    raw_display = config.get("display")
+    old_name = ""
+    if isinstance(raw_display, dict):
+        old_name = normalize_personality_name(raw_display.get("personality", ""))
+        if old_name:
+            raw_display["personality"] = ""
+            config["display"] = raw_display
+            touched = True
+
+    raw_agent = config.get("agent")
+    scrubbed_text = False
+    if isinstance(raw_agent, dict):
+        manual = prompt_text(raw_agent.get("system_prompt", ""))
+        if manual:
+            rendered = {
+                render_personality_prompt(defn)
+                for defn in available_personalities(config).values()
+            }
+            if manual in rendered:
+                raw_agent["system_prompt"] = ""
+                config["agent"] = raw_agent
+                touched = True
+                scrubbed_text = True
+
+    if touched:
+        _persist_migration(config)
+        results["config_added"].append("display.personality=none (one-time reset)")
+        if not quiet:
+            if old_name:
+                print(
+                    f"  ✓ Personality reset to none (was '{old_name}'). Personality "
+                    "state was previously saved inconsistently across surfaces and "
+                    "could re-enable a personality you had turned off. "
+                    f"Run /personality {old_name} to turn it back on."
+                )
+            if scrubbed_text:
+                print(
+                    "  ✓ Removed personality text from agent.system_prompt (written "
+                    "by an older /personality). That field is now reserved for "
+                    "manual system prompts; personalities live in display.personality."
+                )
+
+
+def _migrate_to_35(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 34 → 35: background process notifications → concise ──
+    # The old default mode 'all' pushed the raw output tail of every finished
+    # background process into the chat ("[Background process proc_x finished
+    # with exit code 0~ Here's the final output: ...]" walls). The new
+    # 'concise' mode renders a one-line status message instead (with a short
+    # output tail on failures) and is the new default. Move users still on
+    # 'all' — the old implicit default, almost never chosen on purpose — to
+    # 'concise'. Explicit non-default choices (result / error / off) are the
+    # user's own and are preserved. Users with the key unset inherit the new
+    # default automatically at read time (no write needed).
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    raw_display = config.get("display")
+    if isinstance(raw_display, dict):
+        raw_val = raw_display.get("background_process_notifications")
+        if isinstance(raw_val, str) and raw_val.strip().lower() == "all":
+            raw_display["background_process_notifications"] = "concise"
+            config["display"] = raw_display
+            _persist_migration(config)
+            results["config_added"].append(
+                "display.background_process_notifications=concise (was: all)"
+            )
+            if not quiet:
+                print(
+                    "  ✓ Background process notifications switched from 'all' to "
+                    "'concise' — completions now show a one-line status message "
+                    "instead of the raw output dump. Set "
+                    "display.background_process_notifications: all to restore "
+                    "the old behavior."
+                )
+
+
+def _migrate_to_36(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 35 → 36: raise the subagent iteration cap default 50 → 250 ──
+    # delegation.max_iterations is the per-subagent tool-call budget. The old
+    # default of 50 truncated substantial delegated work (leaf agents spend
+    # ~15-20 turns on recon before producing output, then ran out mid-task).
+    # The shipped default is now 250. Configs still pinned at exactly the old
+    # default 50 — almost always the inherited default rather than a deliberate
+    # choice — are lifted to 250 so existing installs get the same headroom on
+    # update. Any OTHER explicit value (a deliberate override, high or low) is
+    # the user's own and is preserved; unset inherits 250 at read time.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    raw_deleg = config.get("delegation")
+    if isinstance(raw_deleg, dict) and raw_deleg.get("max_iterations") == 50:
+        raw_deleg["max_iterations"] = 250
+        config["delegation"] = raw_deleg
+        _persist_migration(config)
+        results["config_added"].append("delegation.max_iterations=250 (was: 50)")
+        if not quiet:
+            print(
+                "  ✓ Raised delegation.max_iterations from 50 to 250 — subagents "
+                "now get a larger per-child tool-call budget so delegated work "
+                "finishes instead of truncating. Set delegation.max_iterations "
+                "back to 50 to restore the old cap."
+            )
+
+
+def _migrate_to_37(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 36 → 37: raise the delegation concurrency default 3 → 10 ──
+    # delegation.max_concurrent_children caps how many children run in parallel
+    # per batch (and concurrent background delegation units). The old default of
+    # 3 needlessly serialized independent fan-outs (e.g. reviewing N PRs at
+    # once). The shipped default is now 10, which stays at/below the high-cost
+    # warning threshold. Configs still pinned at exactly the old default 3 —
+    # almost always the inherited default rather than a deliberate choice — are
+    # lifted to 10 so existing installs get the wider fan-out on update. Any
+    # OTHER explicit value (a deliberate override) is preserved; unset inherits
+    # 10 at read time.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    raw_deleg = config.get("delegation")
+    if isinstance(raw_deleg, dict) and raw_deleg.get("max_concurrent_children") == 3:
+        raw_deleg["max_concurrent_children"] = 10
+        config["delegation"] = raw_deleg
+        _persist_migration(config)
+        results["config_added"].append("delegation.max_concurrent_children=10 (was: 3)")
+        if not quiet:
+            print(
+                "  ✓ Raised delegation.max_concurrent_children from 3 to 10 — "
+                "independent delegated children now fan out wider in parallel. "
+                "Each child consumes API tokens independently; set "
+                "delegation.max_concurrent_children back to 3 to restore the old cap."
+            )
+
+
+def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
+    # Version 37 → 38: the bundled observability/nemo_relay plugin was
+    # removed when Relay lifecycle ownership moved into the agent core.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    from hermes_cli.relay_plugin_cutover import legacy_relay_plugin_keys
+
+    config = read_raw_config()
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        return
+    enabled = plugins.get("enabled")
+    removed = legacy_relay_plugin_keys(enabled)
+    if not removed or not isinstance(enabled, list):
+        return
+
+    plugins["enabled"] = [value for value in enabled if value not in removed]
+    config["plugins"] = plugins
+    _persist_migration(config)
+    message = (
+        "Removed legacy Relay plugin from plugins.enabled: "
+        f"{', '.join(removed)}. Configure native Relay plugins with "
+        "HERMES_NEMO_RELAY_PLUGINS_TOML."
+    )
+    results["warnings"].append(message)
+    if not quiet:
+        print(f"  ⚠ {message}")
+
+
+def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 38 → 39: remove the retired `bfl` toolset from saved lists ──
+    # The six bfl_flux3_* core tools shipped for a free FLUX 3 promotional
+    # period that has since ended server-side, leaving every Nous-signed-in
+    # install paying ~2.7K tokens of schema per API call for tools that can
+    # only refuse. They were removed in favor of the standard video_gen
+    # provider surface (`video_generate`, `hermes tools` → Video Generation).
+    # Strip the toolset key wherever the auto-backfill or a picker save wrote
+    # it, so stale config can't resurrect an unknown toolset.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    changed = False
+    for section in ("platform_toolsets", "known_builtin_toolsets"):
+        mapping = config.get(section)
+        if not isinstance(mapping, dict):
+            continue
+        for platform, toolsets in mapping.items():
+            if isinstance(toolsets, list) and "bfl" in toolsets:
+                mapping[platform] = [ts for ts in toolsets if ts != "bfl"]
+                changed = True
+        if changed:
+            config[section] = mapping
+    if changed:
+        _persist_migration(config)
+        results["config_added"].append("removed retired 'bfl' toolset from saved toolset lists")
+        if not quiet:
+            print(
+                "  ✓ Removed the retired BFL FLUX 3 toolset from saved toolset "
+                "lists — video generation now lives under `hermes tools` → "
+                "Video Generation (Nous Subscription or FAL)."
+            )
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
-#: version captured before the ladder started. Order matters: later steps may
 #: observe earlier steps' writes via read_raw_config() (filesystem state).
 MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
-    (4, _migrate_to_4),
-    (5, _migrate_to_5),
-    (9, _migrate_to_9),
+    # v12 is the support floor: configs already AT v12 (or newer) still get
+    # every remaining step below. Only configs BELOW 12 are refused by the
+    # floor gate in run_migrations().
     (12, _migrate_to_12),
     (13, _migrate_to_13),
     (14, _migrate_to_14),
-    (15, _migrate_to_15),
+    # v15 only added a schema default; runtime merging supplies it without a
+    # write. Registering a migration would falsely report or materialise it.
     (16, _migrate_to_16),
     (17, _migrate_to_17),
     (21, _migrate_to_21),
@@ -708,6 +884,12 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (31, _migrate_to_31),
     (32, _migrate_to_32),
     (33, _migrate_to_33),
+    (34, _migrate_to_34),
+    (35, _migrate_to_35),
+    (36, _migrate_to_36),
+    (37, _migrate_to_37),
+    (38, _migrate_to_38),
+    (39, _migrate_to_39),
 )
 
 
