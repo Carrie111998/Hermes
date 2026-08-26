@@ -10,8 +10,10 @@ import { OVERLAY_TOP_CLEARANCE } from './overlay-view'
 
 // The wide rail and the narrow dropdown swap at exactly the width where
 // OverlaySplitLayout drops to a single column, so the rail never stacks.
-const RAIL_HIDDEN = 'max-[47.5rem]:hidden'
-const BAR_HIDDEN = 'hidden max-[47.5rem]:flex'
+// A Fold is physically wide but still touch-first. Let the compact selector
+// take over before the desktop rail can squeeze settings content underneath it.
+const RAIL_HIDDEN = 'max-[64rem]:hidden'
+const BAR_HIDDEN = 'hidden max-[64rem]:flex'
 
 interface OverlaySplitLayoutProps {
   children: ReactNode
@@ -48,7 +50,7 @@ export function OverlaySplitLayout({ children, className }: OverlaySplitLayoutPr
         // Narrow: one column, and pin rows to [nav-bar auto | main 1fr] — without
         // an explicit template the grid's default align-content:stretch splits the
         // height evenly across the two rows, shoving the content to mid-screen.
-        'grid h-full min-h-0 flex-1 grid-cols-[13rem_minmax(0,1fr)] overflow-hidden bg-transparent max-[47.5rem]:grid-cols-1 max-[47.5rem]:grid-rows-[auto_minmax(0,1fr)]',
+        'grid h-full min-h-0 flex-1 grid-cols-[13rem_minmax(0,1fr)] overflow-hidden bg-transparent max-[64rem]:grid-cols-1 max-[64rem]:grid-rows-[auto_minmax(0,1fr)]',
         className
       )}
     >
@@ -90,7 +92,7 @@ export function OverlayMain({ children, className }: OverlayMainProps) {
         // top clearance, the bottom gutter, and the horizontal clamp gutter
         // (inlined from PAGE_INSET_X so only overlay panes tighten, not the
         // shared page gutter). Narrow top drops toward the OverlayNav bar.
-        'mx-auto flex min-h-0 w-full flex-1 flex-col overflow-hidden bg-transparent pb-2 pt-[calc((var(--titlebar-height)/2+1rem)*2/3)] max-[47.5rem]:pt-[calc(0.5rem*2/3)] px-[clamp(0.8333rem,2.6667vw,2.6667rem)]',
+        'mx-auto flex min-h-0 w-full flex-1 flex-col overflow-hidden bg-transparent pb-2 pt-[calc((var(--titlebar-height)/2+1rem)*2/3)] max-[64rem]:pt-[calc(0.5rem*2/3)] px-[clamp(0.8333rem,2.6667vw,2.6667rem)]',
         PAGE_MAX_W,
         className
       )}
@@ -206,6 +208,7 @@ export function OverlayNav({ footer, groups }: { footer?: ReactNode; groups: Ove
           'pointer-events-none relative z-20 h-[calc(var(--titlebar-height)+0.1875rem)] items-center justify-between gap-2 pl-3 pr-12',
           BAR_HIDDEN
         )}
+        data-overlay-compact-nav=""
       >
         <div className="pointer-events-auto min-w-0 [-webkit-app-region:no-drag]">
           <TabDropdown
@@ -231,7 +234,7 @@ export function OverlayNav({ footer, groups }: { footer?: ReactNode; groups: Ove
           />
         </div>
         {footer && (
-          <div className="pointer-events-auto flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
+          <div className="pointer-events-auto flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]" data-overlay-nav-actions="">
             {footer}
           </div>
         )}

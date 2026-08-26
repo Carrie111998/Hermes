@@ -51,6 +51,16 @@ export function normalizeRemoteBaseUrl(rawUrl: string): string {
   return parsed.toString().replace(/\/+$/, '')
 }
 
+export function requireSecureRemoteBaseUrl(rawUrl: string): string {
+  const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+
+  if (new URL(baseUrl).protocol !== 'https:') {
+    throw new Error('Gateway URL must use https://. Configure a TLS-enabled private gateway before connecting Hermes Mobile.')
+  }
+
+  return baseUrl
+}
+
 /** ws(s)://host[/prefix]/api/ws?token=… — legacy/static-token gateways. */
 export function buildGatewayWsUrl(baseUrl: string, token: string): string {
   const parsed = new URL(baseUrl)

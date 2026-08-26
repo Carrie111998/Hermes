@@ -7,6 +7,7 @@ import {
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
   normalizeRemoteBaseUrl,
+  requireSecureRemoteBaseUrl,
   pathWithProfileQuery,
 } from './connection-config'
 
@@ -19,6 +20,16 @@ describe('normalizeRemoteBaseUrl', () => {
   })
   it('rejects an empty URL', () => {
     expect(() => normalizeRemoteBaseUrl('')).toThrow()
+  })
+})
+
+describe('requireSecureRemoteBaseUrl', () => {
+  it('preserves a secure gateway path prefix', () => {
+    expect(requireSecureRemoteBaseUrl('https://argos.tailnet.ts.net/hermes/')).toBe('https://argos.tailnet.ts.net/hermes')
+  })
+
+  it('rejects cleartext gateways for the installed mobile client', () => {
+    expect(() => requireSecureRemoteBaseUrl('http://100.64.0.1:9119')).toThrow(/https/i)
   })
 })
 

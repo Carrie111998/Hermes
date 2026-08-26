@@ -12,9 +12,9 @@ on:
 # build with no error anywhere else. This job is the guard: typecheck + a real
 # Vite build of apps/mobile against the current source on every push/PR.
 #
-# Note: the native Android APK build (capacitor + gradle, compileSdk 36) is not
-# run here yet — it needs the Android SDK/JDK on the runner. Tracked as a
-# follow-up; until then build the APK locally (see apps/mobile/README).
+# Note: this job validates the actual Android compilation path too. A mobile shell
+# that only typechecks/bundles can still fail on manifest, plugin, Java/Kotlin, or
+# Android SDK integration before it ever reaches a phone.
 jobs:
   mobile:
     runs-on: ubuntu-latest
@@ -24,7 +24,20 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
       - run: npm ci
+      - run: npm run --prefix apps/desktop typecheck
       - run: npm run --prefix apps/mobile typecheck
       - run: npm run --prefix apps/mobile test
       - run: npm run --prefix apps/mobile build
+      - run: |
+          set +o pipefail
+          yes | sdkmanager --licenses
+          set -o pipefail
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          cd apps/mobile
+          npx cap sync android --deployment
+          cd android && ./gradlew assembleDebug --no-daemon

@@ -83,7 +83,11 @@ export function Button({
 export function ErrorNote({ children }: { children: ReactNode }) {
   if (!children) return null
   return (
-    <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive-foreground">
+    <div
+      aria-live="assertive"
+      className="rounded-xl border border-destructive/40 bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive-foreground"
+      role="alert"
+    >
       {children}
     </div>
   )

@@ -5,24 +5,20 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "skipLibCheck": true,
-
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "moduleDetection": "force",
     "noEmit": true,
     "jsx": "react-jsx",
-
-    /* strict typecheck; noUnused* left off so the reused desktop source (which
-       we don't modify) doesn't fail our build. */
     "strict": true,
+    "noImplicitAny": false,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true,
-
-    /* `@/*` resolves the desktop renderer source so its components run here
-       unmodified; `@hermes/shared` is the shared gateway client. */
     "paths": {
       "@/*": ["../desktop/src/*"],
       "@hermes/shared": ["../shared/src/index.ts"],
+      "@hermes/shared/*": ["../shared/src/*"],
+      "@hermes/plugin-sdk": ["../desktop/src/sdk/index.ts"],
       "~mobile/*": ["./src/mobile/*"],
       "~bridge/*": ["./src/bridge/*"]
     }

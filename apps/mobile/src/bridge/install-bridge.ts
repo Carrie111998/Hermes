@@ -10,7 +10,7 @@
 
 import { getConnection, getGatewayWsUrl } from './connection'
 import { api } from './http'
-import { notify, onPowerResume, openExternal, writeClipboard } from './native'
+import { notify, onPowerResume, openExternal, requestMicrophoneAccess, writeClipboard } from './native'
 import { makeStubs } from './stubs'
 
 let installed = false
@@ -27,6 +27,7 @@ export function installBridge(): void {
     getGatewayWsUrl,
     // Native integrations.
     notify,
+    requestMicrophoneAccess,
     writeClipboard,
     openExternal,
     onPowerResume,

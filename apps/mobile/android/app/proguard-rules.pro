@@ -18,4 +18,7 @@
 
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Preserve the Capacitor plugin entrypoint and its annotated methods. Capacitor
+# resolves this class by annotation/name at runtime after R8 has run.
+-keep class com.nousresearch.hermesagent.mobile.SecureStorePlugin { *; }
+-keepattributes RuntimeVisibleAnnotations

@@ -34,21 +34,11 @@ const config: CapacitorConfig = {
     },
   },
   server: {
-    // R1 DECISION (highest-risk item): the user's gateway is reached over
-    // cleartext (LAN / Tailscale `http://…:9119`), and the chat WebSocket is
-    // `ws://`. If the WebView's own origin were `https://localhost`, that
-    // `ws://` would be blocked as mixed content. Using the `http` scheme makes
-    // the app origin `http://localhost`, so cleartext `ws://` to the gateway is
-    // allowed. If you later put the gateway behind TLS (`https://`/`wss://`),
-    // flip this back to `https` and drop the cleartext allowance in
-    // android/app/src/main/res/xml/network_security_config.xml.
-    androidScheme: 'http',
-    // Same mixed-content rationale as androidScheme — the chat WebSocket is
-    // `ws://` to a LAN/Tailscale gateway. An https app origin would block it.
-    iosScheme: 'http',
-    // Permit cleartext to the LAN/Tailscale gateway. Scope is narrowed in the
-    // Android network-security config; this is the Capacitor-level enable.
-    cleartext: true,
+    // The installed mobile client connects only to a TLS-enabled private gateway.
+    // This keeps the WebView on https:// and the real-time transport on wss://.
+    androidScheme: 'https',
+    iosScheme: 'https',
+    cleartext: false,
   },
 }
 

@@ -603,6 +603,7 @@ export function ApiKeyForm({
   // Only require a non-empty value — no length/format validation, so a short
   // or unusual key can't block the user from continuing.
   const canSave = value.trim().length >= 1
+  const isMobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
   const optionCopy = t.onboarding.apiKeyOptions[option.id]
   const optionDescription = optionCopy?.description ?? option.description
 
@@ -663,7 +664,7 @@ export function ApiKeyForm({
         </div>
         <Input
           autoComplete="off"
-          autoFocus
+          autoFocus={!isMobileRenderer}
           className="font-mono"
           onChange={e => setValue(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && void submit()}

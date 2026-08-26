@@ -58,6 +58,7 @@ export function TabDropdown({
       <DropdownMenuTrigger asChild>
         <button
           className="flex h-7 cursor-pointer items-center gap-1.5 px-1 text-[length:var(--conversation-caption-font-size)] font-medium text-foreground [-webkit-app-region:no-drag]"
+          data-tab-dropdown-trigger=""
           type="button"
         >
           {active?.icon && <TabDropdownIcon icon={active.icon} indent={active.indent} />}

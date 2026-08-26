@@ -1,19 +1,20 @@
+import { App } from '@capacitor/app'
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 // The REAL desktop app (DesktopController) — its AppShell already collapses to a
 // drawer on narrow viewports, so mounting it on a phone gives the desktop chat
 // experience, responsively. We only gate it behind connect/login.
 import DesktopController from '@/app'
-import { $desktopBoot } from '@/store/boot'
 
-import type { ProbeResult } from '~bridge/auth'
-import { $reauthNonce, loadTarget, setTarget, type GatewayTarget } from '~bridge/state'
+import { verifyTokenGateway, type ProbeResult } from '~bridge/auth'
+import { $reauthNonce, loadTarget, setTarget, setTransientTarget, type GatewayTarget } from '~bridge/state'
 
 import { ConnectScreen } from '~mobile/connect/ConnectScreen'
 import { LoginScreen } from '~mobile/connect/LoginScreen'
 import { TokenScreen } from '~mobile/connect/TokenScreen'
 import { MobileBehaviors } from '~mobile/mobile-behaviors'
+import { mobileBackDestination } from '~mobile/navigation'
 import { initNativeChrome } from '~mobile/native-init'
 
 type View = 'loading' | 'connect' | 'login' | 'token' | 'connected'
@@ -32,6 +33,30 @@ export function MobileRoot() {
       setView(t ? 'connected' : 'connect')
     })()
   }, [])
+
+  // Setup screens precede DesktopController, so they own their Android Back
+  // behavior: login/token returns to gateway selection; selection exits.
+  useEffect(() => {
+    if (view === 'loading' || view === 'connected') return
+
+    let disposed = false
+    let handle: { remove: () => Promise<void> } | undefined
+    void App.addListener('backButton', () => {
+      const destination = mobileBackDestination(view)
+      if (destination) setView(destination)
+      else void App.exitApp()
+    }).then(listener => {
+      if (disposed) {
+        void listener.remove()
+      } else {
+        handle = listener
+      }
+    })
+    return () => {
+      disposed = true
+      void handle?.remove()
+    }
+  }, [view])
 
   // A 401 demanding re-login bounces us back to the right entry form for the
   // gateway's auth mode (token gateways re-collect the token, not a password).
@@ -57,6 +82,16 @@ export function MobileRoot() {
 
   async function commit(t: GatewayTarget) {
     await setTarget(t)
+    setView('connected')
+  }
+
+  async function commitToken(t: GatewayTarget) {
+    await verifyTokenGateway(t.baseUrl, t.token ?? '')
+    await commit(t)
+  }
+
+  function connectWithoutSaving(t: GatewayTarget) {
+    setTransientTarget(t)
     setView('connected')
   }
 
@@ -88,7 +123,10 @@ export function MobileRoot() {
         probe={probe}
         onBack={() => setView('connect')}
         onToken={(token) =>
-          commit({ baseUrl: probe.baseUrl, authMode: 'token', provider: null, token })
+          commitToken({ baseUrl: probe.baseUrl, authMode: 'token', provider: null, token })
+        }
+        onTransientToken={(token) =>
+          connectWithoutSaving({ baseUrl: probe.baseUrl, authMode: 'token', provider: null, token })
         }
       />
     )
@@ -100,52 +138,6 @@ export function MobileRoot() {
     <>
       <DesktopController />
       <MobileBehaviors />
-      <BootAutoRetry />
     </>
-  )
-}
-
-/**
- * Cold-launch connections sometimes time out because the Wi-Fi radio is still
- * waking from power-save (the foreground lock hasn't ramped it yet) — a reload a
- * second later, with the radio warm, connects fine. Rather than greet the user
- * with the failure screen, quietly reload-retry up to twice behind a
- * "Reconnecting…" cover; only after that does the manual BootFailureOverlay take
- * over. The counter lives in sessionStorage so it survives the reload, and is
- * cleared once the gateway connects.
- */
-function BootAutoRetry() {
-  const boot = useStore($desktopBoot)
-  const [retrying, setRetrying] = useState(false)
-  const scheduled = useRef(false)
-
-  useEffect(() => {
-    const KEY = 'hermes-boot-retries'
-    const MAX = 2
-
-    if (boot.running && !boot.error) {
-      window.sessionStorage.removeItem(KEY)
-      return
-    }
-
-    if (boot.error && !boot.running && !scheduled.current) {
-      const tries = Number(window.sessionStorage.getItem(KEY) || '0')
-      if (tries >= MAX) return // give up — let BootFailureOverlay handle it
-      scheduled.current = true
-      window.sessionStorage.setItem(KEY, String(tries + 1))
-      setRetrying(true)
-      const timer = window.setTimeout(() => {
-        void window.hermesDesktop?.resetBootstrap?.()
-        window.location.reload()
-      }, 1100)
-      return () => window.clearTimeout(timer)
-    }
-  }, [boot.running, boot.error])
-
-  if (!retrying) return null
-  return (
-    <div className="fixed inset-0 z-[1500] grid place-items-center bg-(--ui-chat-surface-background) text-sm text-muted-foreground">
-      Reconnecting…
-    </div>
   )
 }
