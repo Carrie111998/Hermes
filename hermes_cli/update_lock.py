@@ -56,6 +56,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -272,6 +273,7 @@ class UpdateLock:
         self.acquired = False
         self.holder: UpdateHolder | None = None
         self.failure_reason: str | None = None
+        self.claim_token: str | None = None
 
     def _fail(self, action: str, exc: BaseException) -> bool:
         self.failure_reason = (
@@ -301,6 +303,7 @@ class UpdateLock:
         self.acquired = False
         self.holder = None
         self.failure_reason = None
+        self.claim_token = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -317,14 +320,22 @@ class UpdateLock:
                 claim = self.path.with_name(
                     f"{self.path.name}.claim-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
                 )
+                claim_token = uuid.uuid4().hex
                 fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as marker:
-                    marker.write(f"{os.getpid()}\n{int(time.time())}\n")
+                    marker.write(f"{os.getpid()}\n{int(time.time())}\n{claim_token}\n")
                 try:
-                    os.link(claim, self.path)
+                    if os.name == "nt":
+                        # Windows rename is non-replacing. Under the named
+                        # mutex this publishes a complete claim atomically and
+                        # also works on filesystems that do not support links.
+                        os.rename(claim, self.path)
+                    else:
+                        os.link(claim, self.path)
                 finally:
                     claim.unlink(missing_ok=True)
                 self.acquired = True
+                self.claim_token = claim_token
                 return True
         except OSError as exc:
             return self._fail("publishing the ownership marker", exc)
@@ -334,18 +345,26 @@ class UpdateLock:
         if not self.acquired:
             return
         self.acquired = False
-        with _ownership_transaction():
-            try:
-                raw = self.path.read_text(encoding="utf-8")
-                owner = int(raw.splitlines()[0].strip())
-            except (OSError, IndexError, ValueError):
-                return
-            if owner != os.getpid():
-                return
-            try:
-                self.path.unlink()
-            except OSError:
-                pass
+        claim_token = self.claim_token
+        self.claim_token = None
+        try:
+            with _ownership_transaction():
+                try:
+                    lines = self.path.read_text(encoding="utf-8").splitlines()
+                    owner = int(lines[0].strip())
+                    on_disk_token = lines[2].strip() if len(lines) > 2 else None
+                except (OSError, IndexError, ValueError):
+                    return
+                if owner != os.getpid() or on_disk_token != claim_token:
+                    return
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
+        except OSError as exc:
+            # Release is best-effort and must never replace the update's real
+            # outcome with a mutex/infrastructure traceback.
+            logger.warning("Could not release update ownership at %s: %s", self.path, exc)
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

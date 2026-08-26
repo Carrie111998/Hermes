@@ -16,6 +16,7 @@ disk.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -60,7 +61,8 @@ def test_acquire_writes_pid_and_start_time(marker):
     lines = marker.read_text(encoding="utf-8").splitlines()
     assert int(lines[0]) == os.getpid(), "the Electron gate probes this pid for liveness"
     assert int(lines[1]) == pytest.approx(time.time(), abs=5)
-    assert len(lines) == 2, "wire format is exactly pid + started_at"
+    assert len(lines) == 3, "wire format is pid + started_at + exact-claim token"
+    assert len(lines[2]) == 32
 
 
 def test_second_acquire_is_refused_while_the_first_is_live(marker):
@@ -126,6 +128,35 @@ def test_release_leaves_a_marker_a_handoff_partner_now_owns(marker):
     lock.release()
 
     assert marker.exists(), "the partner's marker is not ours to remove"
+
+
+def test_release_leaves_a_replacement_claim_with_the_same_pid(marker):
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+
+    marker.write_text(
+        f"{os.getpid()}\n{int(time.time())}\nreplacement-token\n",
+        encoding="utf-8",
+    )
+    lock.release()
+
+    assert marker.exists(), "release must match the exact claim, not only its pid"
+    assert marker.read_text(encoding="utf-8").splitlines()[2] == "replacement-token"
+
+
+def test_release_mutex_failure_never_raises(marker, monkeypatch):
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+
+    @contextlib.contextmanager
+    def broken_transaction():
+        raise OSError("mutex unavailable")
+        yield
+
+    monkeypatch.setattr("hermes_cli.update_lock._ownership_transaction", broken_transaction)
+    lock.release()
+
+    assert marker.exists(), "an unprovable release must leave the claim in place"
 
 
 def test_dead_owner_is_reclaimed_not_honored(marker):

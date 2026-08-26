@@ -70,7 +70,8 @@ try {
 
     # Age only the timestamp while the owner stays alive. Long-running updates
     # must remain exclusive; elapsed time is not permission to steal the lock.
-    "$($first.Id)`n$([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeSeconds())`n" |
+    $firstMarker = @([System.IO.File]::ReadAllLines($marker))
+    "$($first.Id)`n$([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeSeconds())`n$($firstMarker[2])`n" |
         Set-Content -LiteralPath $marker -NoNewline -Encoding ASCII
     $oldLiveCode = Invoke-Probe $oldLiveOut $oldLiveErr
     Assert-True ($oldLiveCode -eq 1) "old-but-live owner was stolen (exit $oldLiveCode)"

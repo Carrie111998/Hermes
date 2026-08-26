@@ -82,6 +82,8 @@ try {
 $TempDir = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $HermesHome = if ($InstallRoot) { Split-Path -Parent $InstallRoot } else { $TempDir }
 $MarkerPath = Join-Path $HermesHome ".hermes-update-in-progress"
+$MarkerMutexName = "Global\HermesUpdateMarkerOwnership"
+$script:MarkerClaimToken = $null
 $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
@@ -522,19 +524,80 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
     } catch {}
 }
 
+function Enter-HandoffOwnership {
+    $transaction = [System.Threading.Mutex]::new($false, $MarkerMutexName)
+    $transactionHeld = $false
+    $claim = $null
+    try {
+        try { $transactionHeld = $transaction.WaitOne() }
+        catch [System.Threading.AbandonedMutexException] { $transactionHeld = $true }
+        if (-not $transactionHeld) { throw "Could not acquire update ownership mutex" }
+
+        if (Test-Path -LiteralPath $MarkerPath) {
+            $lines = @([System.IO.File]::ReadAllLines($MarkerPath))
+            $ownerPid = 0
+            $startedAt = 0L
+            $valid = $lines.Count -ge 2 -and
+                [int]::TryParse($lines[0].Trim(), [ref]$ownerPid) -and
+                [int64]::TryParse($lines[1].Trim(), [ref]$startedAt)
+            $ownerToken = if ($lines.Count -gt 2) { $lines[2].Trim() } else { "" }
+            $alive = $valid -and $ownerPid -gt 0 -and [bool](Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
+            $bridgeToken = "$($env:HERMES_UPDATE_CLAIM_TOKEN)".Trim()
+
+            if ($alive -and $ownerPid -eq $PID -and $ownerToken) {
+                return $ownerToken
+            }
+            if ($alive -and (-not $bridgeToken -or $ownerToken -ne $bridgeToken)) {
+                throw "Another Hermes install or update is already running (PID $ownerPid). Wait for it to finish, then retry."
+            }
+            # A dead/malformed claim, or the exact one-time Desktop bridge
+            # token, may be replaced while the shared transaction is held.
+            Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction Stop
+        }
+
+        $token = "$($env:HERMES_UPDATE_CLAIM_TOKEN)".Trim()
+        if (-not $token) { $token = [Guid]::NewGuid().ToString('N') }
+        $startedAt = 0L
+        $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if (-not [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$startedAt) -or $startedAt -gt $epoch) {
+            $startedAt = $epoch
+        }
+        $claim = "$MarkerPath.claim-$PID-$token"
+        [System.IO.File]::WriteAllText($claim, "$PID`n$startedAt`n$token`n", [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::Move($claim, $MarkerPath)
+        $claim = $null
+        return $token
+    } finally {
+        if ($claim) { Remove-Item -LiteralPath $claim -Force -ErrorAction SilentlyContinue }
+        if ($transactionHeld) { $transaction.ReleaseMutex() }
+        $transaction.Dispose()
+    }
+}
+
 function Remove-MarkerIfOwned {
     if ($NoMarkerCleanup) { return }
+    $transaction = [System.Threading.Mutex]::new($false, $MarkerMutexName)
+    $transactionHeld = $false
     try {
+        try { $transactionHeld = $transaction.WaitOne() }
+        catch [System.Threading.AbandonedMutexException] { $transactionHeld = $true }
+        if (-not $transactionHeld) { return }
         if (Test-Path -LiteralPath $MarkerPath) {
-            $firstLine = (Get-Content -LiteralPath $MarkerPath -TotalCount 1 -ErrorAction SilentlyContinue)
-            if ("$firstLine".Trim() -eq "$PID") {
+            $lines = @([System.IO.File]::ReadAllLines($MarkerPath))
+            $ownerPid = if ($lines.Count -gt 0) { $lines[0].Trim() } else { "" }
+            $ownerToken = if ($lines.Count -gt 2) { $lines[2].Trim() } else { "" }
+            if ($ownerPid -eq "$PID" -and $ownerToken -eq $script:MarkerClaimToken) {
                 Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
                 Write-HandoffLog "removed update marker (owned)"
             } else {
-                Write-HandoffLog "leaving update marker: owned by pid '$firstLine', not us ($PID)"
+                Write-HandoffLog "leaving update marker: exact claim no longer belongs to pid $PID"
             }
         }
     } catch {}
+    finally {
+        if ($transactionHeld) { $transaction.ReleaseMutex() }
+        $transaction.Dispose()
+    }
 }
 
 function Start-DesktopRelaunch {
@@ -1001,18 +1064,13 @@ try {
 
     # -- 0. Claim the update marker with OUR pid ---------------------------
     try {
-        $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $startedAt = 0L
-        $hasStartedAt = [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$startedAt)
-        if (-not $hasStartedAt -or $startedAt -gt $epoch -or ($epoch - $startedAt) -gt 1200) {
-            $startedAt = $epoch
-        }
-        # WriteAllText for byte-exact LF framing: Set-Content emits CRLF and
-        # the marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
-        [System.IO.File]::WriteAllText($MarkerPath, "$PID`n$startedAt`n")
+        $script:MarkerClaimToken = Enter-HandoffOwnership
         Write-HandoffLog "claimed update marker (pid $PID)"
     } catch {
-        Write-HandoffLog "WARNING: could not write update marker: $($_.Exception.Message)"
+        $finalCode = 6
+        $finalMsg = "Update aborted before changing files: could not claim update ownership. $($_.Exception.Message)"
+        Write-HandoffLog $finalMsg
+        exit $finalCode
     }
 
     if ($SelfTestMarker) {

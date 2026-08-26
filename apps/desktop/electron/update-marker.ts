@@ -21,6 +21,7 @@
  */
 
 import fs from 'fs'
+import crypto from 'node:crypto'
 import path from 'path'
 
 export function markerPath(hermesHome) {
@@ -76,7 +77,8 @@ export function readLiveUpdateMarker(
     return null // absent or unreadable => no live update
   }
 
-  const [pidLine, startedLine] = String(raw).split('\n')
+  const [pidLine, startedLine] = raw.split(/\r?\n/)
+  const claimToken = raw.split(/\r?\n/)[2]?.trim() || null
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
@@ -92,7 +94,7 @@ export function readLiveUpdateMarker(
     return null
   }
 
-  return { pid, ageMs }
+  return { pid, ageMs, claimToken }
 }
 
 /**
@@ -124,11 +126,13 @@ export function writeUpdateMarker(
   {
     kill,
     now = Date.now,
-    startedAt
+    startedAt,
+    claimToken
   }: {
     now?: () => number
     kill?: typeof process.kill
     startedAt?: number
+    claimToken?: string
   } = {}
 ) {
   const file = markerPath(hermesHome)
@@ -142,11 +146,26 @@ export function writeUpdateMarker(
         ? Math.floor((nowMs - owner.ageMs) / 1000)
         : Math.floor(nowMs / 1000)
 
+  const token = claimToken || crypto.randomUUID().replaceAll('-', '')
+  const temporary = `${file}.claim-${process.pid}-${token}`
+
   try {
-    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n`, 'utf8')
-  } catch {
-    // Best-effort: if we can't write the marker, proceed anyway. The
-    // updater will write its own when it reaches run_update.
+    fs.writeFileSync(temporary, `${pid}\n${acquiredAt}\n${token}\n`, { encoding: 'utf8', flag: 'wx' })
+    fs.linkSync(temporary, file)
+
+    return { acquired: true, claimToken: token }
+  } catch (error: any) {
+    if (error?.code === 'EEXIST') {
+      return { acquired: false, claimToken: token }
+    }
+
+    throw error
+  } finally {
+    try {
+      fs.unlinkSync(temporary)
+    } catch {
+      // The published hard link owns the inode; temporary cleanup is best-effort.
+    }
   }
 }
 

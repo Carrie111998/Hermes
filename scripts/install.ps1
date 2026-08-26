@@ -433,7 +433,8 @@ function Get-LiveInstallOwner {
         # lock until it exits or releases it; elapsed time must never authorize
         # a second installer to mutate the same checkout and managed venv.
         if ($alive) {
-            return [pscustomobject]@{ Pid = $ownerPid; AgeSeconds = $age }
+            $token = if ($lines.Count -gt 2) { $lines[2].Trim() } else { "" }
+            return [pscustomobject]@{ Pid = $ownerPid; AgeSeconds = $age; ClaimToken = $token }
         }
     } catch {}
 
@@ -481,7 +482,12 @@ function Enter-InstallOwnership {
         $existing = Get-LiveInstallOwner -Path $marker
         if ($existing) {
             if ($existing.Pid -eq $ownerPid) {
-                return [pscustomobject]@{ Path = $marker; OwnerPid = $ownerPid; ReleaseOnExit = $false }
+                return [pscustomobject]@{
+                    Path = $marker
+                    OwnerPid = $ownerPid
+                    ClaimToken = $existing.ClaimToken
+                    ReleaseOnExit = $false
+                }
             }
             $mins = [Math]::Floor($existing.AgeSeconds / 60)
             $secs = $existing.AgeSeconds % 60
@@ -491,7 +497,8 @@ function Enter-InstallOwnership {
 
         try {
             New-Item -ItemType Directory -Path $HermesHome -Force -ErrorAction Stop | Out-Null
-            $claim = "$marker.claim-$PID-$([Guid]::NewGuid().ToString('N'))"
+            $claimToken = [Guid]::NewGuid().ToString('N')
+            $claim = "$marker.claim-$PID-$claimToken"
             $stream = [System.IO.File]::Open(
                 $claim,
                 [System.IO.FileMode]::CreateNew,
@@ -499,7 +506,7 @@ function Enter-InstallOwnership {
                 [System.IO.FileShare]::None
             )
             try {
-                $body = "$ownerPid`n$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())`n"
+                $body = "$ownerPid`n$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())`n$claimToken`n"
                 $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($body)
                 $stream.Write($bytes, 0, $bytes.Length)
                 $stream.Flush()
@@ -516,6 +523,7 @@ function Enter-InstallOwnership {
             return [pscustomobject]@{
                 Path = $marker
                 OwnerPid = $ownerPid
+                ClaimToken = $claimToken
                 ReleaseOnExit = (-not $StageDriven -and $ownerPid -eq $PID)
             }
         } catch [System.IO.IOException] {
@@ -536,7 +544,11 @@ function Exit-InstallOwnership {
         catch [System.Threading.AbandonedMutexException] { $transactionHeld = $true }
         if (-not $transactionHeld) { return }
         $owner = Get-LiveInstallOwner -Path $script:InstallOwnership.Path
-        if ($owner -and $owner.Pid -eq $script:InstallOwnership.OwnerPid) {
+        if (
+            $owner -and
+            $owner.Pid -eq $script:InstallOwnership.OwnerPid -and
+            $owner.ClaimToken -eq $script:InstallOwnership.ClaimToken
+        ) {
             Remove-Item -LiteralPath $script:InstallOwnership.Path -Force -ErrorAction SilentlyContinue
         }
     } catch {}

@@ -115,17 +115,18 @@ test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () =
   assert.ok(fs.existsSync(markerPath(home)), 'marker file should exist after write')
 })
 
-test('writeUpdateMarker preserves a live holder age across pid hand-off', () => {
+test('writeUpdateMarker refuses to replace a live holder during hand-off', () => {
   const home = tmpHome('write-handoff-age')
   const now = 1_000_000_000_000
   const startedAt = Math.floor(now / 1000) - 300
 
   writeMarker(home, 1010, startedAt)
-  writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
+  const result = writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
 
   const [pidLine, startedLine] = fs.readFileSync(markerPath(home), 'utf8').split('\n')
-  assert.equal(Number.parseInt(pidLine, 10), 2020, 'the hand-off records the new owner')
-  assert.equal(Number.parseInt(startedLine, 10), startedAt, 'the holder age must not restart during hand-off')
+  assert.equal(result.acquired, false)
+  assert.equal(Number.parseInt(pidLine, 10), 1010, 'the existing owner must not be replaced')
+  assert.equal(Number.parseInt(startedLine, 10), startedAt, 'the existing claim remains byte-stable')
 })
 
 test('writeUpdateMarker uses the acquisition time passed to a detached script', () => {
@@ -139,10 +140,19 @@ test('writeUpdateMarker uses the acquisition time passed to a detached script', 
   assert.equal(Number.parseInt(startedLine, 10), startedAt)
 })
 
-test('writeUpdateMarker is best-effort (no throw on bad path)', () => {
-  // A non-existent directory should not throw.
+test('writeUpdateMarker fails closed on an unusable marker directory', () => {
   const badHome = path.join(os.tmpdir(), 'hermes-marker-nonexistent-' + Date.now())
-  assert.doesNotThrow(() => writeUpdateMarker(badHome, 4242))
+  assert.throws(() => writeUpdateMarker(badHome, 4242))
+})
+
+test('writeUpdateMarker never replaces an existing claim', () => {
+  const home = tmpHome('write-no-replace')
+  writeMarker(home, 1010, Math.floor(Date.now() / 1000))
+
+  const result = writeUpdateMarker(home, 2020, { claimToken: 'new-token', kill: ALIVE })
+
+  assert.equal(result.acquired, false)
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8').split(/\r?\n/)[0], '1010')
 })
 
 test('writeUpdateMarker + dead pid => self-heals on read', () => {

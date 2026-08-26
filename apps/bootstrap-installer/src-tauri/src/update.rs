@@ -115,9 +115,9 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// keep running while install-mode bootstrap rewrote the tree underneath it.
 pub(crate) struct UpdateMarkerGuard {
     path: PathBuf,
-    /// False when a live foreign updater already owns the marker: we hold no
-    /// claim, so `Drop` must not delete their marker.
-    owned: bool,
+    started_at: u64,
+    claim_token: Option<String>,
+    completed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(windows)]
@@ -162,10 +162,30 @@ impl MarkerTransaction {
     }
 }
 
+#[cfg(windows)]
+fn publish_claim(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { MoveFileW(source.as_ptr(), destination.as_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_claim(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(source, destination)
+}
+
 /// The pid + age of a confirmed-live update holding the marker.
 pub(crate) struct MarkerOwner {
     pub(crate) pid: u32,
     pub(crate) age_secs: u64,
+    started_at: u64,
+    claim_token: Option<String>,
 }
 
 pub(crate) enum MarkerAcquireError {
@@ -224,6 +244,11 @@ fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
     let mut lines = raw.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
     let started_at: u64 = lines.next()?.trim().parse().ok()?;
+    let claim_token = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -232,7 +257,23 @@ fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
     if !pid_is_alive(pid) {
         return None;
     }
-    Some(MarkerOwner { pid, age_secs })
+    Some(MarkerOwner {
+        pid,
+        age_secs,
+        started_at,
+        claim_token,
+    })
+}
+
+fn marker_matches_claim(path: &Path, pid: u32, started_at: u64, claim_token: Option<&str>) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut lines = raw.lines();
+    let parsed_pid = lines.next().and_then(|line| line.trim().parse::<u32>().ok());
+    let parsed_started = lines.next().and_then(|line| line.trim().parse::<u64>().ok());
+    let parsed_token = lines.next().map(str::trim).filter(|value| !value.is_empty());
+    parsed_pid == Some(pid) && parsed_started == Some(started_at) && parsed_token == claim_token
 }
 
 /// True when the on-disk marker names THIS process as its owner.
@@ -275,6 +316,9 @@ fn pid_is_alive(pid: u32) -> bool {
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
+    if pid == 0 {
+        return false;
+    }
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
@@ -292,6 +336,17 @@ fn pid_is_alive(pid: u32) -> bool {
 
 #[cfg(not(windows))]
 fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if let Some(comm_end) = stat.rfind(')') {
+            if stat[comm_end + 1..].split_whitespace().next() == Some("Z") {
+                return false;
+            }
+        }
+    }
     // signal 0 delivers nothing; it only probes existence/permission.
     // ESRCH => dead. EPERM => alive but owned by another user.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -304,9 +359,7 @@ fn pid_is_alive(pid: u32) -> bool {
 impl UpdateMarkerGuard {
     /// Claim the marker, or report the live updater that already owns it.
     pub(crate) fn acquire(path: PathBuf) -> Result<Self, MarkerAcquireError> {
-        Self::acquire_with_link(path, |source, destination| {
-            std::fs::hard_link(source, destination)
-        })
+        Self::acquire_with_link(path, publish_claim)
     }
 
     fn acquire_with_link<F>(path: PathBuf, link: F) -> Result<Self, MarkerAcquireError>
@@ -331,7 +384,12 @@ impl UpdateMarkerGuard {
                     // Repeated acquisition in this process is intentionally
                     // re-entrant because the desktop may have pre-written our pid.
                     // Adopt that claim verbatim so retries cannot reset its age.
-                    return Ok(Self { path, owned: true });
+                    return Ok(Self {
+                        path,
+                        started_at: owner.started_at,
+                        claim_token: owner.claim_token,
+                        completed: std::sync::atomic::AtomicBool::new(false),
+                    });
                 }
                 return Err(MarkerAcquireError::Owned(owner));
             }
@@ -349,6 +407,7 @@ impl UpdateMarkerGuard {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+            let claim_token = uuid::Uuid::new_v4().simple().to_string();
             if let Some(parent) = path.parent() {
                 if let Err(err) = std::fs::create_dir_all(parent) {
                     return Err(MarkerAcquireError::infrastructure(
@@ -375,7 +434,7 @@ impl UpdateMarkerGuard {
             {
                 Ok(mut marker) => {
                     use std::io::Write;
-                    if let Err(err) = write!(marker, "{pid}\n{started_at}\n") {
+                    if let Err(err) = write!(marker, "{pid}\n{started_at}\n{claim_token}\n") {
                         let _ = std::fs::remove_file(&claim);
                         tracing::warn!(?path, %err, "could not write update-in-progress marker");
                         return Err(MarkerAcquireError::infrastructure(
@@ -388,7 +447,14 @@ impl UpdateMarkerGuard {
                     let linked = link(&claim, &path);
                     let _ = std::fs::remove_file(&claim);
                     match linked {
-                        Ok(()) => return Ok(Self { path, owned: true }),
+                        Ok(()) => {
+                            return Ok(Self {
+                                path,
+                                started_at,
+                                claim_token: Some(claim_token),
+                                completed: std::sync::atomic::AtomicBool::new(false),
+                            })
+                        }
                         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                             continue;
                         }
@@ -441,7 +507,8 @@ impl UpdateMarkerGuard {
     /// other updater indefinitely. Idempotent: `Drop` still runs and tolerates
     /// an already-removed marker.
     fn complete(&self) {
-        if !self.owned {
+        use std::sync::atomic::Ordering;
+        if self.completed.load(Ordering::Acquire) {
             return;
         }
         let _transaction = match MarkerTransaction::acquire() {
@@ -451,14 +518,22 @@ impl UpdateMarkerGuard {
                 return;
             }
         };
-        if !marker_owned_by_self(&self.path) {
+        if !marker_matches_claim(
+            &self.path,
+            std::process::id(),
+            self.started_at,
+            self.claim_token.as_deref(),
+        ) {
+            self.completed.store(true, Ordering::Release);
             return;
         }
         if let Err(err) = std::fs::remove_file(&self.path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = ?self.path, %err, "could not remove completed update marker");
+                return;
             }
         }
+        self.completed.store(true, Ordering::Release);
     }
 }
 
@@ -1622,7 +1697,8 @@ mod tests {
                 std::process::id(),
                 "marker records our pid so the desktop can probe liveness"
             );
-            assert_eq!(body.lines().count(), 2, "marker is pid + started_at lines");
+            assert_eq!(body.lines().count(), 3, "marker is pid + started_at + claim token");
+            assert_eq!(body.lines().nth(2).unwrap().len(), 32);
         }
 
         assert!(
@@ -1946,6 +2022,38 @@ mod tests {
         ));
         assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_guard_cannot_delete_same_pid_replacement_claim() {
+        let dir = unique_tmp_dir("marker-replacement");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+
+        let guard = UpdateMarkerGuard::acquire(marker.clone())
+            .unwrap_or_else(|_| panic!("no live owner => acquire must succeed"));
+        let replacement_started = guard.started_at.saturating_add(1);
+        std::fs::write(
+            &marker,
+            format!(
+                "{}\n{replacement_started}\nreplacement-token\n",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+
+        guard.complete();
+        drop(guard);
+        assert!(marker.exists(), "release must match the exact claim token");
+        assert!(std::fs::read_to_string(&marker)
+            .unwrap()
+            .contains("replacement-token"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_zero_is_never_a_live_owner() {
+        assert!(!pid_is_alive(0));
     }
 
     #[test]

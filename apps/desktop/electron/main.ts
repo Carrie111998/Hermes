@@ -3781,6 +3781,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
 
     if (scriptHandoff) {
       const updateStartedAt = Math.floor(Date.now() / 1000)
+      const handoffClaimToken = crypto.randomUUID().replaceAll('-', '')
 
       // A bare detached+hidden powershell spawn silently dies before -File
       // processing (console-subsystem init failure — see
@@ -3806,6 +3807,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
           ...process.env,
           HERMES_HOME,
           HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
+          HERMES_UPDATE_CLAIM_TOKEN: handoffClaimToken,
           PATH: pathWithHermesManagedNode(venvBin)
         },
         detached: true,
@@ -3820,7 +3822,23 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // The `hermes update` child adopts the SCRIPT's claim via
       // update_lock.py's process-ancestry rule; no mtime heuristics needed.
       if (Number.isInteger(child.pid)) {
-        writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
+        const publication = writeUpdateMarker(HERMES_HOME, child.pid, {
+          startedAt: updateStartedAt,
+          claimToken: handoffClaimToken
+        })
+
+        if (!publication.acquired) {
+          const owner = readLiveUpdateMarker(HERMES_HOME)
+
+          if (owner?.claimToken !== handoffClaimToken) {
+            const message = 'Update aborted: another updater claimed Hermes during hand-off. Wait for it to finish, then retry.'
+            rememberLog(`[updates] refusing raced hand-off: ${message}`)
+            emitUpdateProgress({ stage: 'error', message, percent: null })
+            startHermes().catch(() => {})
+
+            return { ok: false, error: 'update-already-running', message }
+          }
+        }
       }
 
       rememberLog(
@@ -3854,7 +3872,20 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // strictly better than never updating again, and the updater still writes
       // its own marker moments later.
       if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
-        writeUpdateMarker(HERMES_HOME, child.pid)
+        const publication = writeUpdateMarker(HERMES_HOME, child.pid)
+
+        if (!publication.acquired) {
+          const owner = readLiveUpdateMarker(HERMES_HOME)
+
+          if (owner?.pid !== child.pid) {
+            const message = 'Update aborted: another updater claimed Hermes during hand-off. Wait for it to finish, then retry.'
+            rememberLog(`[updates] refusing raced staged hand-off: ${message}`)
+            emitUpdateProgress({ stage: 'error', message, percent: null })
+            startHermes().catch(() => {})
+
+            return { ok: false, error: 'update-already-running', message }
+          }
+        }
       } else if (Number.isInteger(child.pid)) {
         rememberLog(
           `[updates] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
