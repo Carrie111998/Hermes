@@ -63,7 +63,7 @@ test('provisionDesktopBrand writes rich Foundrly soul into an isolated home', ()
     assert.equal(result.soulWritten, true)
     const soul = fs.readFileSync(result.soulPath, 'utf8')
     assert.match(soul, /AI co-founder desktop/)
-    assert.match(soul, /foundrly\.intelli-verse-x\.ai/)
+    assert.match(soul, /getfoundrly\.com/)
   } finally {
     fs.rmSync(home, { force: true, recursive: true })
   }
