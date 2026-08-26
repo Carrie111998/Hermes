@@ -1141,6 +1141,23 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Persistent ``done`` flag for rework §1 rule 1 (terminal-state guard).
+    # Mirrors the ``terminal INTEGER NOT NULL DEFAULT 0`` column on the
+    # ``tasks`` table. ``False`` (the default) means "the card has not yet
+    # entered ``done`` via the kernel gate"; ``True`` means "the card is in
+    # a terminal state and any watcher must drop it from its watch set
+    # without re-subscribing". The kernel guard for setting this lives
+    # in ``_set_status_direct`` (kanban t_7ae1b8cd feature A); the schema
+    # + serialization plumbing lands here in t_002084ad.
+    terminal: bool = False
+    # Owner identifier for the running lifecycle (rework §1 rule 3). Set
+    # when ``status`` enters ``running`` by the actor claiming the lifecycle
+    # (today: the dispatcher; after t_7ae1b8cd feature B: the watcher
+    # profile). Cleared on the terminal transition. ``None`` = no current
+    # owner — the task is in a non-running state, or the running claim is
+    # legacy/un-typed (the pre-§1 behavior, preserved for any rows that
+    # existed before this column existed).
+    owner: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1251,16 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            terminal=(
+                bool(row["terminal"])
+                if "terminal" in keys and row["terminal"] is not None
+                else False
+            ),
+            owner=(
+                row["owner"]
+                if "owner" in keys and row["owner"]
+                else None
             ),
         )
 
@@ -1422,7 +1449,27 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Persistent ``done`` flag for rework §1 rule 1 (terminal-state guard).
+    -- Set to 1 by ``_set_status_direct`` when ``status`` enters ``done``
+    -- (and only then — re-opening a done card, which the kernel currently
+    -- permits for parent-reopen cascades, clears it). Read by the watcher
+    -- loop to drop done cards from its watch set without re-subscribing
+    -- (rule 4). Exposed on the ``Task`` dataclass as ``terminal: bool``.
+    -- Existing rows backfill to 0 (= non-terminal), preserving today's
+    -- ``done`` semantics until the kernel gate lands (kanban t_7ae1b8cd
+    -- feature A).
+    terminal             INTEGER NOT NULL DEFAULT 0,
+    -- Owner identifier for the actor that currently holds the lifecycle for
+    -- this card. Set by ``_set_status_direct`` when ``status`` enters
+    -- ``running`` and cleared on the terminal transition. NULL = no current
+    -- owner (the task is in a non-running state, or the running claim is
+    -- legacy/un-typed). The watcher profile (t_7ae1b8cd feature B) writes
+    -- its own profile name here on every ``running`` entry; foreign writes
+    -- are rejected at the kernel guard layer. Existing rows backfill to
+    -- NULL, matching the pre-§1 behavior where ``running`` ownership was
+    -- not persisted.
+    owner                TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2726,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "terminal" not in cols:
+        # Persistent ``done`` flag (rework §1 rule 1, kanban t_002084ad /
+        # t_7ae1b8cd feature A). Defaults to 0 for existing rows: today's
+        # ``done`` cards are NOT yet ``terminal`` because the kernel gate
+        # has not landed. Once the gate ships, a one-shot backfill that
+        # sets ``terminal=1`` for every ``status='done'`` row will be
+        # needed (tracked separately — the migration here only adds the
+        # column so the schema and the ``Task`` dataclass agree).
+        _add_column_if_missing(
+            conn, "tasks", "terminal", "terminal INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "owner" not in cols:
+        # Owner identifier for the ``running`` lifecycle (rework §1 rule 3,
+        # kanban t_7ae1b8cd feature B). NULL for existing rows: no current
+        # owner, which matches the pre-§1 behavior where ``running``
+        # ownership was inferred from ``claim_lock`` only and not persisted
+        # on the task row itself.
+        _add_column_if_missing(conn, "tasks", "owner", "owner TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3183,6 +3250,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    terminal: bool = False,
+    owner: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3200,6 +3269,15 @@ def create_task(
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
     re-queues the task. ``None`` means no cap (default).
+
+    ``terminal`` and ``owner`` are rework §1 fields (kanban t_002084ad /
+    t_7ae1b8cd). They default to ``False`` / ``None`` so existing callers
+    keep their pre-§1 behavior. Most creation paths should NOT pass them
+    — the kernel's status-transition guards (``_set_status_direct``,
+    landing in feature A/B) write them when ``status`` enters ``done``
+    or ``running``. The parameters are accepted here so the round-trip
+    can be exercised end-to-end (see the rework §1 acceptance criteria:
+    "writing a card with the new fields round-trips through storage").
 
     ``skills`` is an optional list of skill names to force-load into
     the worker when dispatched. Stored as JSON; the dispatcher passes
@@ -3497,8 +3575,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        terminal, owner
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3603,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if terminal else 0,
+                        owner,
                     ),
                 )
                 for pid in parents:
