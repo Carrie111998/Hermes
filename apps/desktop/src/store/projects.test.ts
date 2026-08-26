@@ -442,6 +442,7 @@ describe('project connection stamp', () => {
       projects: [{ id: 'p_local', label: 'Local', path: '/local/app', repos: [], sessionCount: 1 }],
       scoped_session_ids: []
     })
+
     activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
     gatewayAtom.set({ connectionState: 'open', request } as never)
 

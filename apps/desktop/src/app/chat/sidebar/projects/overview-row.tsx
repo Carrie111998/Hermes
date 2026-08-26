@@ -1,6 +1,6 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useRef } from 'react'
-import { useStore } from '@nanostores/react'
 
 import { ConnectionOriginTag } from '@/app/chat/connection-origin-tag'
 import { Codicon } from '@/components/ui/codicon'
@@ -96,10 +96,12 @@ export function ProjectOverviewRow({
   const [open, toggleOpen] = useWorkspaceNodeOpen(project.id, false)
   const isActive = project.id === activeProjectId
   const registry = useStore($connectionsRegistry)
+
   const originConnection =
     project.connectionId && project.connectionId !== 'local'
       ? (registry?.connections.find(connection => connection.id === project.connectionId) ?? null)
       : null
+
   const origin = originConnection && originConnection.kind !== 'local' ? originConnection : null
 
   // Prefer the live preview rows handed in by the parent (already overlaid with

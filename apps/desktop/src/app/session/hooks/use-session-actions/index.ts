@@ -60,7 +60,6 @@ import {
   $yoloActive,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
-  setSessionOwnerHint,
   resolveComposerSessionKey,
   sessionPinId,
   setActiveSessionId,
@@ -79,6 +78,7 @@ import {
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
+  setSessionOwnerHint,
   setSessions,
   setSessionStartedAt,
   setTurnStartedAt,
@@ -519,10 +519,12 @@ export function useSessionActions({
 
         if (stored) {
           createdThisRun.add(stored)
+
           if (capturedRoute) {
             setSessionOwnerHint(stored, capturedRoute)
             setSessionOwnerHint(created.session_id, capturedRoute)
           }
+
           // Seed the sidebar preview with the user's first message so the row
           // reads meaningfully while the turn is in flight, instead of flashing
           // "Untitled session" until the turn persists and auto-title runs. The
@@ -618,6 +620,7 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const capturedRoute = options?.route === undefined ? $newChatRoute.get() : options.route
+
         const workspaceScope = options?.workspaceScope ?? {
           workspaceMode: 'sessions' as const,
           ...(capturedRoute ? { ownerRoute: capturedRoute } : {})

@@ -30,8 +30,8 @@ import {
   setMessages,
   touchSessionActivity
 } from '@/store/session'
-import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 import { requestForSessionProfile } from '@/store/session-request-router'
+import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -130,6 +130,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         timeoutMs?: number
       ): Promise<T> => {
         const owner = knownOwnerForSession(sessionKey)
+
         if (owner && typeof owner === 'object' && owner.connectionId.trim()) {
           return requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs)
         }

@@ -321,6 +321,7 @@ describe('startSessionOnSource', () => {
     $connection.set({ connectionId: 'local', mode: 'local' })
     $activeGatewayProfile.set('research')
     $newChatProfile.set(null)
+
     const openDraft = vi.fn(() => {
       // Production startFreshSessionDraft clears the previous draft owner.
       $newChatRoute.set(null)

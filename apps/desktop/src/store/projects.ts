@@ -578,6 +578,7 @@ function applyProjectTreePayload(res: ProjectTreePayload): void {
   const scoped = new Set(res.scoped_session_ids ?? [])
   const stamped = stampChromeProjects(res.projects ?? [])
   const activeId = chromeConnectionId()
+
   // Keep previously-visible foreign nodes until mergeForeign replaces them —
   // wiping here made remote projects flash out on every chrome tree refresh.
   const previousForeign = $projectTree.get().filter(project => {
@@ -636,6 +637,7 @@ async function mergeForeignProjectTrees(generation: number): Promise<void> {
   for (const conn of foreign) {
     try {
       const profile = profileForConnectionId(conn.id)
+
       const res = await requestGatewayForAgent<ProjectTreePayload>(conn.id, profile, 'projects.tree', {
         preview_limit: PROJECT_TREE_PREVIEW_LIMIT,
         profile
@@ -763,6 +765,7 @@ export async function fetchProjectSessions(projectId: string): Promise<SidebarPr
 
     if (isChromeConnection(connectionId)) {
       const context = await activeProjectsContext()
+
       const res = await gatewayRequestOn<{ project: SidebarProjectTree | null }>(
         context.gateway,
         'projects.project_sessions',
@@ -776,6 +779,7 @@ export async function fetchProjectSessions(projectId: string): Promise<SidebarPr
       project = res.project ?? null
     } else {
       const profile = profileForConnectionId(connectionId)
+
       const res = await projectRequest<{ project: SidebarProjectTree | null }>(
         connectionId,
         'projects.project_sessions',
@@ -1141,6 +1145,7 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
 
   const connectionId = (input.connectionId || '').trim() || chromeConnectionId()
   const profile = profileForConnectionId(connectionId)
+
   const createParams = projectParams(
     {
       name: input.name,
@@ -1391,11 +1396,13 @@ export async function deleteProject(id: string): Promise<void> {
 
 export async function setActiveProject(id: null | string): Promise<void> {
   const connectionId = (id ? connectionIdForProjectId(id) : null) || chromeConnectionId()
+
   const res = await projectRequest<{ active_id: null | string }>(
     connectionId,
     'projects.set_active',
     projectParams({ id }, profileForConnectionId(connectionId))
   )
+
   $activeProjectId.set(res.active_id ?? null)
 }
 
