@@ -41,7 +41,6 @@ describe("ChatVoiceControl browser speech input", () => {
 
   afterEach(async () => {
     await act(async () => root.unmount());
-    delete (window as Window & { hermesVoiceBridge?: unknown }).hermesVoiceBridge;
     host.remove();
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -153,24 +152,4 @@ describe("ChatVoiceControl browser speech input", () => {
     expect(host.textContent).toContain("not connected");
   });
 
-  it("uses the optional native bridge and accepts partial and final events", async () => {
-    let listener: ((event: MessageEvent) => void) | undefined;
-    const bridge = {
-      postMessage: vi.fn(),
-      addEventListener: vi.fn((_name: string, cb: (event: MessageEvent) => void) => { listener = cb; }),
-      removeEventListener: vi.fn(),
-    };
-    Object.defineProperty(window, "hermesVoiceBridge", { configurable: true, value: bridge });
-    const { submit, surface } = await render();
-    await act(async () => surface.click());
-    expect(FakeRecognition.instances).toHaveLength(0);
-    expect(bridge.postMessage).toHaveBeenCalledWith(JSON.stringify({ version: 1, command: "start" }));
-    await act(async () => listener?.({ data: JSON.stringify({ version: 1, event: "partial", transcript: "Call" }) } as MessageEvent));
-    await act(async () => listener?.({ data: JSON.stringify({ version: 1, event: "final", transcript: "Call the crew" }) } as MessageEvent));
-    expect(host.textContent).toContain("Call the crew");
-    await act(async () => surface.click());
-    expect(submit).toHaveBeenCalledOnce();
-    expect(submit).toHaveBeenCalledWith("Call the crew");
-    expect(bridge.postMessage).toHaveBeenCalledWith(JSON.stringify({ version: 1, command: "stop" }));
-  });
 });

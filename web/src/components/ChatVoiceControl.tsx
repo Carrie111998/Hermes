@@ -2,11 +2,6 @@ import { Mic, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@nous-research/ui/ui/components/button";
-import {
-  connectNativeVoiceBridge,
-  type NativeVoiceBridgeConnection,
-  type NativeVoiceMessageTarget,
-} from "@/lib/native-voice-bridge";
 
 const RESTART_DELAY_MS = 250;
 const MAX_RESTARTS = 6;
@@ -40,7 +35,6 @@ declare global {
   interface Window {
     SpeechRecognition?: SpeechRecognitionConstructor;
     webkitSpeechRecognition?: SpeechRecognitionConstructor;
-    hermesVoiceBridge?: NativeVoiceMessageTarget;
   }
 }
 
@@ -65,7 +59,6 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
   const restartCountRef = useRef(0);
   const restartTimerRef = useRef<number | null>(null);
   const generationRef = useRef(0);
-  const nativeBridgeRef = useRef<NativeVoiceBridgeConnection | null>(null);
   const finalRef = useRef("");
   const interimRef = useRef("");
 
@@ -164,8 +157,7 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     generationRef.current = generation;
     setError("");
     setState("listening");
-    if (nativeBridgeRef.current) nativeBridgeRef.current.command("start");
-    else startRecognition(generation);
+    startRecognition(generation);
   };
 
   const commit = () => {
@@ -179,7 +171,6 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     clearRestart();
     recognitionRef.current?.abort();
     recognitionRef.current = null;
-    nativeBridgeRef.current?.command("stop");
     submit(transcript);
     updateFinal("");
     updateInterim("");
@@ -193,38 +184,11 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     clearRestart();
     recognitionRef.current?.abort();
     recognitionRef.current = null;
-    nativeBridgeRef.current?.command("cancel");
     updateFinal("");
     updateInterim("");
     setError("");
     setState("idle");
   }, [clearRestart]);
-
-  useEffect(() => {
-    const connection = connectNativeVoiceBridge(window.hermesVoiceBridge, (event) => {
-      if (event.event === "partial") {
-        updateInterim(event.transcript ?? "");
-      } else if (event.event === "final") {
-        updateFinal(event.transcript ?? "");
-        updateInterim("");
-      } else if (event.event === "error") {
-        setError(event.message ?? "Native speech recognition failed.");
-        if (event.fatal) {
-          listeningRef.current = false;
-          setState("error");
-        }
-      } else if (event.event === "listening") {
-        setState("listening");
-      }
-    });
-    nativeBridgeRef.current = connection;
-    connection?.command("check");
-    return () => {
-      connection?.command("cancel");
-      connection?.disconnect();
-      if (nativeBridgeRef.current === connection) nativeBridgeRef.current = null;
-    };
-  }, []);
 
   useEffect(() => cancel, [cancel]);
 
