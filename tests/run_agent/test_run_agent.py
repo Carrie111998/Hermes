@@ -4563,6 +4563,11 @@ class TestRunConversation:
         ``failure_limit`` breaker eventually trips. The legacy
         ``kanban_block`` call was replaced because blocked-outcome runs
         bypass the failure counter.
+
+        As of #95212 the worker records the failure in self-hold mode
+        (``hold_claim=True``): the counter still ticks, but the claim stays
+        held while the process finishes teardown instead of being released
+        from inside a still-running worker.
         """
         self._setup_agent(agent)
         agent.max_iterations = 2
@@ -4610,7 +4615,8 @@ class TestRunConversation:
         # Positional: (conn, task_id, ...)
         assert call.args[1] == "t_test_task_123"
         assert call.kwargs.get("outcome") == "timed_out"
-        assert call.kwargs.get("release_claim") is True
+        assert call.kwargs.get("release_claim") is False
+        assert call.kwargs.get("hold_claim") is True
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 

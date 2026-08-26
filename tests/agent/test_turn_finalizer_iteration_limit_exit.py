@@ -1,5 +1,7 @@
 """Regression tests for iteration-limit exit normalization (#61631)."""
 
+import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -190,7 +192,8 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
             "within the allowed iterations"
         ),
         outcome="timed_out",
-        release_claim=True,
+        release_claim=False,
+        hold_claim=True,
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
@@ -271,7 +274,8 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     args, kwargs = record.call_args
     assert args[1] == "task-456"
     assert kwargs["outcome"] == "timed_out"
-    assert kwargs["release_claim"] is True
+    assert kwargs["release_claim"] is False
+    assert kwargs["hold_claim"] is True
     assert kwargs["end_run"] is True
     assert kwargs["event_payload_extra"]["budget_used"] == 60
     assert kwargs["event_payload_extra"]["budget_max"] == 60
@@ -371,5 +375,61 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     record.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# #95212 regression: the budget-exhaustion fallback runs INSIDE the still-
+# live worker. It must not release the worker's own claim (the old
+# ``release_claim=True`` spawn-failure mode flipped the task back to ready
+# and nulled worker_pid while the process kept running, so the dispatcher
+# spawned a duplicate worker beside it). End-to-end against a real DB.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with an empty kanban DB (mirrors test_kanban_db)."""
+    from hermes_cli import kanban_db as _kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    _kb.init_db()
+    return home
+
+
+def test_budget_exhausted_finalizer_holds_live_workers_claim(kanban_home):
+    """While the worker process is alive, recording its own iteration-budget
+    exhaustion must leave the task running + claimed — NOT re-dispatchable."""
+    from agent.turn_finalizer import _record_kanban_budget_exhausted
+    from hermes_cli import kanban_db as _kb
+
+    with _kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = _kb.create_task(conn, title="budget-race", assignee="a")
+        assert _kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        _kb._set_worker_pid(conn, tid, os.getpid())  # live pid: our process
+
+    # Exactly what finalize_turn does when the iteration budget runs out.
+    _record_kanban_budget_exhausted(tid, 8, 8, logging.getLogger("test"))
+
+    with _kb.connect() as conn:
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, "
+            "consecutive_failures FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "running", (
+            "pre-fix (#95212) this self-released to 'ready' while the "
+            f"worker was still alive; got {row['status']}"
+        )
+        assert row["claim_lock"] == f"{host}:worker"
+        assert row["claim_expires"] is not None
+        assert row["worker_pid"] == os.getpid()
+        # The failure itself is still accounted (#87096 taxonomy).
+        assert row["consecutive_failures"] == 1
+        # The dispatcher cannot spawn a duplicate for a running task.
+        assert _kb.claim_task(conn, tid) is None
 
 

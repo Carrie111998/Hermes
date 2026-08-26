@@ -8849,6 +8849,15 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+def _run_metadata_flag(metadata_json: Optional[str], key: str) -> bool:
+    """True when a JSON-encoded ``task_runs.metadata`` carries truthy ``key``."""
+    try:
+        data = json.loads(metadata_json) if metadata_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(data, dict) and bool(data.get(key))
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -8914,6 +8923,56 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
+
+            # Budget-exhaustion self-hold (#95212): the worker accounted its
+            # own terminal failure and deliberately kept status='running'
+            # with the claim intact while it finished teardown. Its latest
+            # ended run carries the ``claim_hold`` marker. Releasing now is
+            # pure paperwork: restore the source phase WITHOUT re-accounting
+            # the failure (the unified counter already ticked when the
+            # worker held) and WITHOUT classifying the exit as a crash or a
+            # clean-exit protocol violation.
+            held_run = conn.execute(
+                "SELECT id, metadata FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            if held_run is not None and _run_metadata_flag(
+                held_run["metadata"], "claim_hold",
+            ):
+                held_retry_status = _retry_status_for_run(conn, row["id"])
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (held_retry_status, row["id"], pid, row["claim_lock"]),
+                )
+                if cur.rowcount == 1:
+                    _append_event(
+                        conn, row["id"], "budget_hold_reclaimed",
+                        {
+                            "pid": pid,
+                            "claimer": row["claim_lock"],
+                            "retry_status": held_retry_status,
+                            "prior_run_id": int(held_run["id"]),
+                            "prior_outcome": "timed_out",
+                        },
+                        run_id=int(held_run["id"]),
+                    )
+                    exited_hook_payloads.append({
+                        "task_id": row["id"],
+                        "assignee": row["assignee"],
+                        "run_id": int(held_run["id"]),
+                        "worker_pid": pid,
+                        "exit_kind": "budget_hold",
+                        "exit_code": None,
+                        "outcome": "timed_out",
+                        "retry_status": held_retry_status,
+                    })
+                continue
+
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             if kind == "clean_exit":
@@ -9158,6 +9217,7 @@ def _record_task_failure(
     failure_limit: int = None,
     force_trip: bool = False,
     release_claim: bool = False,
+    hold_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
@@ -9185,6 +9245,19 @@ def _record_task_failure(
       counter; if the breaker trips, the task is re-transitioned
       into ``blocked`` and a ``gave_up`` event is emitted.
 
+    * ``hold_claim=True`` — worker self-hold path (#95212). Caller is
+      the live worker itself recording ITS OWN terminal failure
+      (iteration-budget exhaustion). The failure is accounted exactly
+      like every other path (counter tick, run closed with
+      ``outcome``, breaker may trip to ``blocked``), but below
+      threshold the task STAYS ``running`` with its claim intact:
+      releasing your own claim from inside the process that holds it
+      re-advertises the task to the dispatcher while you are still
+      running, which spawns a duplicate worker beside you.
+      ``detect_crashed_workers`` releases the held claim once the pid
+      is actually gone (``budget_hold_reclaimed`` event), without
+      re-counting the failure.
+
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
     context (e.g. pid on crash, elapsed on timeout).
@@ -9206,6 +9279,12 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if release_claim and hold_claim:
+        raise ValueError(
+            "release_claim and hold_claim are mutually exclusive: "
+            "release hands the task back to its source phase now; "
+            "hold keeps it claimed until the worker's pid is gone"
+        )
     blocked = False
     with write_txn(conn):
         row = conn.execute(
@@ -9214,9 +9293,22 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if hold_claim and not conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_runs r "
+            "ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND t.status = 'running' "
+            "  AND r.ended_at IS NULL",
+            (task_id,),
+        ).fetchone():
+            # Self-hold idempotence (#95212): several exit paths can call
+            # this while the worker winds down, and unlike the spawn path
+            # the task STAYS ``running`` after the first call. Only a
+            # caller that still sees an open run accounts the failure;
+            # later callers must not tick ``consecutive_failures`` again.
+            return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
-            if release_claim
+            if (release_claim or hold_claim)
             else ("review" if row["status"] == "review" else "ready")
         )
         failures = int(row["consecutive_failures"]) + 1
@@ -9235,8 +9327,11 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
-            if release_claim:
-                # Spawn path: still running, also clear claim state.
+            if release_claim or hold_claim:
+                # Claimed-task exit (spawn failure, or the worker's own
+                # budget-exhaustion report): flip to blocked and clear the
+                # claim state. Blocked tasks are never dispatched, so
+                # clearing worker_pid here cannot spawn a duplicate.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
@@ -9294,6 +9389,31 @@ def _record_task_failure(
                     "WHERE id = ? AND status = 'running'",
                     (retry_status, failures, error[:500], task_id),
                 )
+            elif hold_claim:
+                # Self-hold (#95212): account the failure but keep the task
+                # running with its claim untouched — the caller IS the live
+                # worker, and clearing its own claim from inside its own
+                # process is what let the dispatcher spawn a duplicate
+                # beside it. Extend the claim window so TTL staleness can't
+                # fire mid-teardown; detect_crashed_workers releases the
+                # claim once the pid is actually gone (without re-counting
+                # this failure — see ``budget_hold_reclaimed``).
+                grace_expires = int(time.time()) + RECLAIM_DEFER_GRACE_SECONDS
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = ?, "
+                    "last_failure_error = ?, claim_expires = ? "
+                    "WHERE id = ? AND status = 'running'",
+                    (failures, error[:500], grace_expires, task_id),
+                )
+                held_run = conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                if held_run is not None and held_run["current_run_id"]:
+                    conn.execute(
+                        "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                        (grace_expires, int(held_run["current_run_id"])),
+                    )
             else:
                 # Timeout/crash path: caller already restored the source phase.
                 conn.execute(
@@ -9302,23 +9422,31 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             if end_run:
-                # Spawn path: close the open run with outcome.
+                # Spawn / self-hold path: close the open run with outcome.
+                run_meta = {
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                event_payload = {
+                    "error": error[:500],
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                if hold_claim:
+                    # Durable marker (#95212): tells detect_crashed_workers
+                    # that this run's failure is already accounted and the
+                    # leftover running claim is paperwork-only — release it
+                    # once the pid is gone, never re-account it.
+                    run_meta["claim_hold"] = True
+                    event_payload["claim_hold"] = True
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    metadata=run_meta,
                 )
                 _append_event(
-                    conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    conn, task_id, outcome, event_payload,
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
