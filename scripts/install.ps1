@@ -387,7 +387,7 @@ $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
 # Dot-source the mirror resolver library. Defines Get-HermesPypiMirror,
 # Get-HermesGithubCloneUrl, Test-HermesMirrorReachable, and
-# Get-HermesMirrorStatus. Resolved URL is a *candidate* — install.ps1 probes
+# Get-HermesMirrorStatus. Resolved URL is a *candidate* -- install.ps1 probes
 # it with Test-HermesMirrorReachable before depending on it, so a wrong
 # resolver choice never produces a confusing 30-second connect timeout.
 #

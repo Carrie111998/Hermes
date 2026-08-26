@@ -43,7 +43,7 @@ def test_repository_stage_relieves_eap_for_ssh_and_https_git_clone() -> None:
     )
     _assert_relaxed_call(
         text,
-        r"git -c windows\.appendAtomically=false clone --depth 1 --branch \$Branch \$RepoUrlHttps \$InstallDir",
+        r"git -c windows\.appendAtomically=false clone --depth 1 --branch \$Branch \$resolvedHttps \$InstallDir",
     )
 
 
