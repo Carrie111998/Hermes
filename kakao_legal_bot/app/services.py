@@ -19,6 +19,7 @@ from .db import Database
 from .iris import IrisClient
 from .lawapi.client import CacheBackend, LawApiClient
 from .llm import LlmClient
+from .rag.multi import MultiRagStore
 from .rag.store import RagStore
 from .sender import Sender
 
@@ -32,7 +33,7 @@ class Services:
     iris: IrisClient
     sender: Sender
     agent: LegalAgent
-    rag: RagStore | None = None
+    rag: RagStore | MultiRagStore | None = None
     law: LawApiClient | None = None
     llm: LlmClient | None = None
     # One semaphore for the whole process: LLM calls are the expensive
@@ -74,7 +75,10 @@ def build_services(settings: Settings | None = None) -> Services:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
     db = Database(settings.db_path)
-    rag = RagStore(settings.data_dir / "rag.sqlite3")
+    # One index per corpus (data/rag/*.sqlite3), with the old single file
+    # picked up as a collection of its own so an upgrade needs no re-index.
+    rag = MultiRagStore.discover(settings.rag_dir, legacy=settings.data_dir / "rag.sqlite3")
+    log.info("rag collections: %s", ", ".join(rag.collections()) or "(none)")
 
     law: LawApiClient | None = None
     if settings.law_api_enabled and (settings.law_oc or settings.data_go_kr_key):

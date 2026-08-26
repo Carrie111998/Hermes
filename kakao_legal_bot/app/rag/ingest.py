@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from ..config import get_settings
+from .multi import MultiRagStore
 from .store import RagStore, chunk_text
 
 TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".text"}
@@ -172,7 +173,13 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     parser = argparse.ArgumentParser(description="법률 자료를 RAG 인덱스에 적재합니다.")
     parser.add_argument("path", nargs="?", default=str(settings.corpus_dir))
-    parser.add_argument("--db", default=str(settings.data_dir / "rag.sqlite3"))
+    parser.add_argument(
+        "--collection",
+        default="",
+        help="자료 구분 (books / commentary / cases / skills …). "
+        "data/rag/<이름>.sqlite3 에 따로 색인합니다. 크면 반드시 나누세요.",
+    )
+    parser.add_argument("--db", default="", help="색인 파일 경로를 직접 지정")
     parser.add_argument("--chunk-size", type=int, default=settings.rag_chunk_chars)
     parser.add_argument("--overlap", type=int, default=settings.rag_chunk_overlap)
     parser.add_argument("--embed", action="store_true", help="OpenAI 임베딩까지 생성")
@@ -180,7 +187,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--search", default="", help="색인 검색 테스트")
     args = parser.parse_args(argv)
 
-    store = RagStore(args.db)
+    if args.stats and not args.db and not args.collection:
+        # No target named — report every collection the server would open.
+        store = MultiRagStore.discover(settings.rag_dir, legacy=settings.data_dir / "rag.sqlite3")
+        print(json.dumps(store.stats_by_collection(), ensure_ascii=False, indent=2))
+        store.close()
+        return 0
+
+    if args.db:
+        db_path = Path(args.db)
+    elif args.collection:
+        db_path = settings.rag_path(args.collection)
+    else:
+        legacy = settings.data_dir / "rag.sqlite3"
+        db_path = legacy if legacy.exists() else settings.rag_path("corpus")
+    store = RagStore(db_path)
+    print(f"색인 파일: {db_path}")
 
     if args.stats:
         print(json.dumps(store.stats(), ensure_ascii=False, indent=2))

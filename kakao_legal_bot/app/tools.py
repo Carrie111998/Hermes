@@ -107,37 +107,58 @@ def build_tools(
 
     # ── local corpus ─────────────────────────────────────────────────────
     if rag is not None:
+        collections = list(rag.collections()) if hasattr(rag, "collections") else []
+
         async def search_local_docs(arguments: dict[str, Any]) -> str:
             query = str(arguments.get("query") or "").strip()
             if not query:
                 return "query 가 비어 있습니다."
             top_k = int(arguments.get("top_k") or rag_top_k)
+            wanted = str(arguments.get("collection") or "").strip()
+            extra = {"collection": wanted} if wanted and collections else {}
             if embed_query is not None:
                 vector = await embed_query(query)
-                hits = await asyncio.to_thread(rag.search_with_embedding, query, vector, top_k)
+                hits = await asyncio.to_thread(
+                    lambda: rag.search_with_embedding(query, vector, top_k, **extra)
+                )
             else:
-                hits = await asyncio.to_thread(rag.search, query, top_k)
+                hits = await asyncio.to_thread(lambda: rag.search(query, top_k, **extra))
             if not hits:
                 return "로컬 자료에서 관련 내용을 찾지 못했습니다."
             blocks = []
             for hit in hits:
                 state.cite(hit.citation)
-                blocks.append(f"■ {hit.citation}\n  {hit.text.strip()}")
+                mark = f"[{hit.collection}] " if hit.collection else ""
+                blocks.append(f"■ {mark}{hit.citation}\n  {hit.text.strip()}")
             return _clip("\n\n".join(blocks))
+
+        properties: dict[str, Any] = {
+            "query": {"type": "string", "description": "검색어. 핵심 법률 키워드 위주로."},
+            "top_k": {"type": "integer", "description": "가져올 문단 수 (기본 6)"},
+        }
+        description = (
+            "사무실 로컬 자료(주석서·법률서적·내부 서면 등)를 검색한다. "
+            "일반적인 법리 설명이나 실무 관행이 필요할 때 가장 먼저 쓴다."
+        )
+        if len(collections) > 1:
+            # Naming a collection turns a fan-out over every index into one
+            # file read. Worth telling the model it can do that.
+            properties["collection"] = {
+                "type": "string",
+                "description": (
+                    "찾을 자료를 좁힌다. 비우면 전부 검색. "
+                    f"있는 자료: {', '.join(collections)}"
+                ),
+            }
+            description += f" 자료 구분: {', '.join(collections)}."
 
         tools.append(
             ToolSpec(
                 name="search_local_docs",
-                description=(
-                    "사무실 로컬 자료(주석서·법률서적·내부 서면 등)를 검색한다. "
-                    "일반적인 법리 설명이나 실무 관행이 필요할 때 가장 먼저 쓴다."
-                ),
+                description=description,
                 input_schema={
                     "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "검색어. 핵심 법률 키워드 위주로."},
-                        "top_k": {"type": "integer", "description": "가져올 문단 수 (기본 6)"},
-                    },
+                    "properties": properties,
                     "required": ["query"],
                 },
                 handler=search_local_docs,

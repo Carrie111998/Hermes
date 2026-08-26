@@ -280,10 +280,17 @@ python kakao_legal_bot/relay/moa_relay.py \
 `.txt .md .docx .pdf .json .jsonl` 를 읽습니다. (PDF는 `pip install pypdf` 필요)
 
 ```bash
-python -m kakao_legal_bot.app.rag.ingest ./corpus
-python -m kakao_legal_bot.app.rag.ingest --search "임대차 보증금 반환"   # 검색 테스트
-python -m kakao_legal_bot.app.rag.ingest --stats
+# 자료별로 나누어 색인합니다 (아래 3-5 참고). 크기가 크면 반드시 나누세요.
+python -m kakao_legal_bot.app.rag.ingest ./corpus/법률서적 --collection books
+python -m kakao_legal_bot.app.rag.ingest ./corpus/주석서   --collection commentary
+python -m kakao_legal_bot.app.rag.ingest ./corpus/판례     --collection cases
+
+python -m kakao_legal_bot.app.rag.ingest --collection books --search "보증금 반환"
+python -m kakao_legal_bot.app.rag.ingest --stats            # 컬렉션별 통계
 ```
+
+`--collection` 을 생략하면 예전처럼 단일 색인 하나에 들어갑니다. 이미 그렇게
+쓰고 계셨다면 그대로 동작하니 다시 색인하실 필요는 없습니다.
 
 조문처럼 구조가 있는 자료는 JSONL이 제일 깔끔합니다:
 
@@ -298,6 +305,62 @@ python -m kakao_legal_bot.app.rag.ingest --stats
 
 임베딩까지 쓰려면 `RAG_EMBEDDINGS=true`, `OPENAI_API_KEY` 를 넣고
 `python -m kakao_legal_bot.app.rag.ingest ./corpus --embed`.
+
+### 3-5. 그래서 데이터베이스는 어디에 두는가
+
+바이그램 색인은 **원본의 약 5.4배**로 불어납니다. 실제 크기로 계산하면:
+
+| 자료 | 원본 | 색인 후 | 파일 |
+|---|---|---|---|
+| 법률서적 | 450MB | ~2.4GB | `data/rag/books.sqlite3` |
+| 주석서 | 820MB | ~4.4GB | `data/rag/commentary.sqlite3` |
+| 판례·법령 | 7.5GB | ~40GB | `data/rag/cases.sqlite3` |
+| 서면 skill | 수백MB | ~1GB | `data/rag/skills.sqlite3` |
+
+**한 파일에 다 넣지 마세요.** 1.27GB 한 덩어리에서 검색이 2,050ms 였는데,
+컬렉션별로 쪼개니 85ms 였습니다. 5초 룰에서 2초는 치명적입니다.
+
+서버는 `data/rag/*.sqlite3` 를 **전부 열어 하나처럼** 다룹니다. 모아가
+자료를 지정하지 않으면 동시에 뒤져 합치고(순위 기반 융합), `collection`
+을 지정하면 그 파일만 읽습니다. 색인 하나가 깨져도 나머지는 그대로 답합니다.
+색인 폴더를 다른 디스크로 옮기시려면 `RAG_DIR` 만 바꾸시면 됩니다.
+
+**놓을 자리는 VPS 디스크 한 곳입니다.** ~50GB는 Railway 볼륨으로는 비싸고
+(GB당 과금), 관리형 DB에 넣을 성질도 아닙니다. NVMe 200GB짜리 VPS 한 대에
+앱과 색인을 같이 두는 것이 가장 싸고 가장 빠릅니다 — 네트워크를 한 번도
+타지 않으니까요.
+
+    /srv/moa/
+      app/            ← 이 저장소
+      corpus/         ← 원본 .md (rsync 로 PC에서 밀어 넣음)
+      data/rag/*.sqlite3   ← 색인. 파생물이므로 백업 대상이 아님
+      data/moa.sqlite3     ← 대화·초안·인테이크. 이것만 매일 백업
+      skills/         ← 서면 skill 깃허브 레포 (git pull)
+
+원본 `.md` 는 **PC(옵시디언)가 정본**이고 VPS는 사본입니다. 고치시면
+`rsync -av ./vault/ vps:/srv/moa/corpus/` 후 색인만 다시 돌리면 됩니다.
+색인 파일은 커밋하지 마세요 — 언제든 다시 만들 수 있습니다.
+
+### 3-6. 서면 skill 깃허브 레포는 두 군데에 둡니다
+
+같은 레포를 **두 곳에 클론해 두고 쓰임을 나눕니다.**
+
+| 어디 | 무엇을 위해 | 어떻게 |
+|---|---|---|
+| VPS `/srv/moa/skills` | 상담 중 모아가 "그 서면은 이런 형식입니다"라고 답할 때 | `git pull` 후 `ingest` 로 `skills.sqlite3` 에 색인 |
+| 변호사님 PC | Codex가 실제로 문서를 쓸 때 원본을 그대로 읽음 | `git pull` 만. 색인 불필요 |
+
+색인은 **찾기 위한 것**이고, Codex에게는 **원문 전체**가 필요합니다.
+Codex는 PC에서 워커로 돌고(`DRAFT_GENERATOR=worker`), 작업 디렉터리에서
+skill 파일을 직접 열어 읽습니다. 그래서 PC 쪽은 색인 없이 `git pull` 이면
+충분하고, 서버 쪽은 검색만 되면 됩니다.
+
+배포할 때 두 줄이면 최신으로 맞춰집니다:
+
+```bash
+cd /srv/moa/skills && git pull
+python -m kakao_legal_bot.app.rag.ingest /srv/moa/skills --collection skills
+```
 
 ---
 

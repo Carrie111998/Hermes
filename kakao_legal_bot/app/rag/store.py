@@ -56,6 +56,8 @@ class Hit:
     source: str
     locator: str
     score: float
+    # Which index this came from. Empty for a single-index deployment.
+    collection: str = ""
 
     @property
     def citation(self) -> str:

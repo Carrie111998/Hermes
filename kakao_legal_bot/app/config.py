@@ -199,6 +199,11 @@ class Settings:
 
     # ── RAG ──────────────────────────────────────────────────────────────
     corpus_dir: Path = field(default_factory=lambda: Path(_env("CORPUS_DIR", "./corpus")))
+    # One SQLite index per corpus lives here. Splitting them is what keeps
+    # search at ~85ms instead of ~2s once the library passes a gigabyte.
+    rag_dir_override: Path | None = field(
+        default_factory=lambda: Path(_env("RAG_DIR")) if _env("RAG_DIR") else None
+    )
     rag_top_k: int = field(default_factory=lambda: _env_int("RAG_TOP_K", 6))
     rag_chunk_chars: int = field(default_factory=lambda: _env_int("RAG_CHUNK_CHARS", 900))
     rag_chunk_overlap: int = field(default_factory=lambda: _env_int("RAG_CHUNK_OVERLAP", 150))
@@ -261,6 +266,15 @@ class Settings:
     @property
     def db_path(self) -> Path:
         return self.data_dir / self.db_filename
+
+    @property
+    def rag_dir(self) -> Path:
+        return self.rag_dir_override or (self.data_dir / "rag")
+
+    def rag_path(self, collection: str) -> Path:
+        """Where one collection's index lives (``books`` → ``data/rag/books.sqlite3``)."""
+        safe = "".join(ch for ch in (collection or "corpus") if ch.isalnum() or ch in "-_") or "corpus"
+        return self.rag_dir / f"{safe}.sqlite3"
 
     @property
     def llm_model(self) -> str:
