@@ -10749,6 +10749,67 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def ensure_assistant_message_content(
+        self,
+        session_id: str,
+        message_row_id: int,
+        content: str,
+    ) -> Optional[str]:
+        """Fill an existing active assistant row without appending a duplicate.
+
+        Finalization may discover the assistant text after an incremental flush
+        already wrote an empty placeholder.  The update is conditional on the
+        row still being empty, so a concurrent finalizer cannot overwrite a
+        completed response.  The returned string is the canonical durable
+        content (whether this call filled the row or another writer won). ``None``
+        means the row is absent or no longer an active assistant row; callers may
+        then use their normal append path.
+        """
+        if (
+            not session_id
+            or not isinstance(message_row_id, int)
+            or isinstance(message_row_id, bool)
+            or not isinstance(content, str)
+            or not content.strip()
+        ):
+            return None
+
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT role, content FROM messages "
+                "WHERE id = ? AND session_id = ? AND active = 1",
+                (message_row_id, session_id),
+            ).fetchone()
+            if row is None or row["role"] != "assistant":
+                return None
+
+            existing = self._decode_content(row["content"])
+            if existing is not None and (
+                not isinstance(existing, str) or existing.strip()
+            ):
+                # Another writer already settled this row. It is durable, so
+                # the caller must not append a second assistant message.
+                if isinstance(existing, str):
+                    return existing
+                try:
+                    return json.dumps(existing, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    return str(existing)
+
+            conn.execute(
+                "UPDATE messages SET content = ? "
+                "WHERE id = ? AND session_id = ? AND role = 'assistant' "
+                "AND active = 1",
+                (stored_content, message_row_id, session_id),
+            )
+            return content
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,

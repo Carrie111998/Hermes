@@ -9,6 +9,7 @@ import {
   chatMessageText,
   collectUnspokenTurnSpeech,
   completeOpenTimelineParts,
+  hasVisibleAssistantText,
   mergeFinalAssistantText,
   preserveLocalAssistantErrors,
   reasoningPart,
@@ -1211,6 +1212,15 @@ describe('mergeFinalAssistantText', () => {
     expect(result.some(p => p.type === 'tool-call')).toBe(true)
   })
 
+  it('keeps streamed parts when the completion has no visible text', () => {
+    const parts: ChatMessagePart[] = [
+      { type: 'text', text: 'the answer already rendered' },
+      toolCallPart('tc-empty-final')
+    ]
+
+    expect(mergeFinalAssistantText(parts, '')).toEqual(parts)
+  })
+
   it('drops reasoning that the final text fully covers (reasoning ⊆ final)', () => {
     const parts = [reasoningPart('Let me check the files.'), { type: 'text' as const, text: 'streamed' }]
 
@@ -1248,13 +1258,32 @@ describe('mergeFinalAssistantText', () => {
     expect(result.filter(p => p.type === 'text')).toHaveLength(1)
   })
 
-  it('handles empty final text', () => {
+  it('preserves streamed text and reasoning when final text is empty', () => {
     const parts = [{ type: 'text' as const, text: 'streamed' }, reasoningPart('some reasoning')]
 
     const result = mergeFinalAssistantText(parts, '')
 
-    expect(result.filter(p => p.type === 'text')).toHaveLength(0)
-    expect(result.filter(p => p.type === 'reasoning')).toHaveLength(1)
+    expect(result).toEqual(parts)
+  })
+
+  it('treats whitespace-only final text as empty', () => {
+    const parts = [{ type: 'text' as const, text: 'streamed' }]
+
+    expect(mergeFinalAssistantText(parts, '   \n')).toEqual(parts)
+  })
+
+  it('only counts visible assistant text for completion recovery', () => {
+    expect(
+      hasVisibleAssistantText([
+        { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'prompt' }] },
+        { id: 'a1', role: 'assistant', parts: [reasoningPart('thinking')] },
+        { id: 'a2', role: 'assistant', hidden: true, parts: [{ type: 'text', text: 'hidden' }] }
+      ])
+    ).toBe(false)
+
+    expect(hasVisibleAssistantText([{ id: 'a3', role: 'assistant', parts: [{ type: 'text', text: 'visible' }] }])).toBe(
+      true
+    )
   })
 })
 
