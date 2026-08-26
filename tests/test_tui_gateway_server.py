@@ -10618,6 +10618,73 @@ def test_commands_catalog_omits_archived_resurrected_skill(tmp_path, monkeypatch
     assert "/lifecycle-x" not in resp["result"]["skills"]
 
 
+def test_commands_catalog_tracks_profile_local_archive_state(tmp_path):
+    """Profile switches must pair lifecycle state with that profile's files."""
+    import agent.skill_commands as sc_mod
+    from agent.skill_commands import get_skill_commands, scan_skill_commands
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import skill_usage
+
+    def write_skill(home: Path, body: str) -> Path:
+        skill_dir = home / "skills" / "shared-lifecycle"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: shared-lifecycle\n"
+            "description: Profile lifecycle test.\n"
+            "---\n\n"
+            f"{body}\n",
+            encoding="utf-8",
+        )
+        return skill_dir
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    skill_a = write_skill(profile_a, "Profile A copy.")
+    skill_b = write_skill(profile_b, "Profile B copy.")
+
+    token_a = set_hermes_home_override(profile_a)
+    try:
+        skill_usage.save_usage(
+            {"shared-lifecycle": {"state": skill_usage.STATE_ARCHIVED}}
+        )
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(profile_b)
+    try:
+        skill_usage.save_usage(
+            {"shared-lifecycle": {"state": skill_usage.STATE_ACTIVE}}
+        )
+        with patch.object(sc_mod, "_skill_commands", {}):
+            fresh = scan_skill_commands()
+            cached = get_skill_commands()
+            resp = server.handle_request(
+                {"id": "1", "method": "commands.catalog", "params": {}}
+            )
+
+            assert fresh["/shared-lifecycle"]["skill_dir"] == str(skill_b)
+            assert cached["/shared-lifecycle"]["skill_dir"] == str(skill_b)
+            assert "/shared-lifecycle" in dict(resp["result"]["pairs"])
+            assert str(skill_a) not in {
+                command["skill_dir"] for command in fresh.values()
+            }
+
+            skill_usage.save_usage(
+                {"shared-lifecycle": {"state": skill_usage.STATE_ARCHIVED}}
+            )
+            assert "/shared-lifecycle" not in get_skill_commands()
+            archived_resp = server.handle_request(
+                {"id": "2", "method": "commands.catalog", "params": {}}
+            )
+            assert "/shared-lifecycle" not in dict(
+                archived_resp["result"]["pairs"]
+            )
+            assert "/shared-lifecycle" not in archived_resp["result"]["skills"]
+    finally:
+        reset_hermes_home_override(token_b)
+
+
 def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
     """Skill entries carry the usage + origin the `/` menu ranks on.
 

@@ -455,7 +455,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     # each naming the same skill as its own incumbent (#74574).
     commands: Dict[str, Dict[str, Any]] = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import _skills_dir, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
             get_external_skills_dirs,
             get_project_skills_dirs,
@@ -465,13 +465,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
+        active_skills_dir = _skills_dir()
 
         # Scan project dirs first (highest precedence), then local, then external.
         # Project dirs iterate through the quarantine chokepoint.
         project_dirs = list(get_project_skills_dirs())
         dirs_to_scan = list(project_dirs)
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
+        if active_skills_dir.exists():
+            dirs_to_scan.append(active_skills_dir)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:
@@ -499,7 +500,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # Archive state belongs to the profile-local copy only.
                     # A same-named project skill has independent precedence and
                     # remains available, matching tools.skills_tool discovery.
-                    if scan_dir == SKILLS_DIR and name in archived:
+                    if scan_dir == active_skills_dir and name in archived:
                         continue
                     # Respect user's disabled skills config
                     if name in disabled:
