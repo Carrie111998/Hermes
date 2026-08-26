@@ -843,11 +843,23 @@
   box-decoration-break: clone;
 }
 
-/* Affordance without chrome: only the ones you can actually activate respond,
-   and they do it with an underline rather than a background. */
-:where(a, button).ref:hover {
+/* Activatable references carry a visible underline AT REST, not only on hover.
+   A reference you can click has to say so before the pointer arrives: hover is
+   not an affordance on a touch screen, it is invisible to anyone scanning the
+   transcript, and it cost a user a delivered file they could see but could not
+   tell was interactive. The rest state is deliberately quiet (a hairline at 45%
+   of the text color) and hover promotes it to the full-strength underline, so
+   the hover response the old rule provided survives. Static `.ref` chips, which
+   are neither `a` nor `button`, stay undecorated. */
+:where(a, button).ref {
   text-decoration: underline;
+  text-decoration-thickness: from-font;
+  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
   text-underline-offset: 0.15em;
+}
+
+:where(a, button).ref:hover {
+  text-decoration-color: currentColor;
 }
 
 /* The leading glyph. Sized in `em` so it tracks the text at any scale, and

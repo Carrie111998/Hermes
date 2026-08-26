@@ -50,6 +50,8 @@ export const en: Translations = {
     revealExplorer: 'Reveal in File Explorer',
     revealFileManager: 'Open Containing Folder',
     revealInSidebar: 'Reveal in filetree',
+    open: 'Open',
+    opening: 'Loading…',
     copyPath: 'Copy Path',
     copyRelativePath: 'Copy Relative Path',
     download: 'Download',

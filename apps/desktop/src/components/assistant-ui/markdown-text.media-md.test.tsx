@@ -39,7 +39,12 @@ describe('markdown documents delivered via MEDIA', () => {
 
     render(<MarkdownTextContent isRunning={false} text={`[archive.zip](${href})`} />)
 
-    expect(await screen.findByText(/archive\.zip/)).toBeTruthy()
-    expect(screen.queryByRole('button')).toBeNull()
+    // The card names the file and, below it, where the file lives — so the
+    // basename legitimately appears twice. Match the name row exactly.
+    expect(await screen.findByText('archive.zip')).toBeTruthy()
+
+    // The fallback is the file card (one Open action), NOT the preview rail's
+    // open/hide toggle — that distinction is what #84951 fixed.
+    expect(screen.queryByRole('button', { name: /preview/i })).toBeNull()
   })
 })

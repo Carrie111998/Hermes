@@ -96,6 +96,8 @@ export interface Translations {
     revealExplorer: string
     revealFileManager: string
     revealInSidebar: string
+    open: string
+    opening: string
     copyPath: string
     copyRelativePath: string
     download: string

@@ -11,6 +11,7 @@ import type { code as streamdownCode } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
+import { MediaFileAttachment } from '@/components/chat/media-file-attachment'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
@@ -226,19 +227,9 @@ function MediaAttachment({ path }: { path: string }) {
   }
 
   return (
-    <span className="wrap-anywhere">
-      <a
-        className="ref wrap-anywhere"
-        href="#"
-        onClick={event => {
-          event.preventDefault()
-          open()
-        }}
-      >
-        {failed ? `Open ${name}` : `Loading ${name}...`}
-      </a>
+    <MediaFileAttachment failed={failed} onOpen={open} path={path}>
       {openFailed && <OpenMediaFailedNote name={name} />}
-    </span>
+    </MediaFileAttachment>
   )
 }
 
