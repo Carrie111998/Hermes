@@ -3206,8 +3206,14 @@ def _completed_oneshot_retention_days() -> float:
     sweep, retaining completed one-shot records indefinitely.
     """
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
+        from hermes_cli.config import load_config_readonly
+        # Read-only view of the already-validated cached config (#95320):
+        # this helper runs once per scheduler tick inside the jobs lock and
+        # only reads two scalar keys. load_config()'s defensive deepcopy of
+        # the entire merged config cost more than the rest of the tick.
+        # Cache invalidation on config change is handled by
+        # _LOAD_CONFIG_CACHE's file-signature check.
+        cfg = load_config_readonly() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         return float(
             cron_cfg.get(
@@ -3351,8 +3357,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             rj["id"] = rj.pop("job_id", None) or uuid.uuid4().hex[:12]
             needs_save = True
 
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
     due = []
+
+    # Normalize malformed records ONCE, in place, on the canonical raw
+    # records (#95320). The tick used to maintain a deep-copied view and a
+    # raw view and run every repair pass over BOTH — doubling validation
+    # work and paying an O(N x fields) deepcopy per tick. Neither is needed:
+    # raw_jobs came fresh out of json.loads() inside load_jobs() above (no
+    # shared references to protect), and repairing the canonical records
+    # first means the derived scheduler view built below inherits every
+    # repair for free.
 
     # Normalize malformed "schedule" records (direct jobs.json edit, old writers,
     # corruption, etc.). "schedule" must be a dict; a null/string/etc. value
@@ -3362,10 +3376,6 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # failure mode of the id-less job bug fixed above). Repair early at the
     # source so the rest of the tick can proceed and persist progress for
     # siblings.
-    for j in jobs:
-        if not isinstance(j.get("schedule"), dict):
-            j["schedule"] = {}
-            needs_save = True
     for rj in raw_jobs:
         if not isinstance(rj.get("schedule"), dict):
             rj["schedule"] = {}
@@ -3378,18 +3388,6 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # fast-forwarded next_run_at (same class of bug as bad "id" or "schedule").
     # Strip the bad value so the existing "no next_run_at" recovery path
     # recomputes a sane value and persists it for this job.
-    for j in jobs:
-        nr = j.get("next_run_at")
-        if nr is not None:
-            if not isinstance(nr, str):
-                j.pop("next_run_at", None)
-                needs_save = True
-            else:
-                try:
-                    datetime.fromisoformat(nr)
-                except Exception:
-                    j.pop("next_run_at", None)
-                    needs_save = True
     for rj in raw_jobs:
         nr = rj.get("next_run_at")
         if nr is not None:
@@ -3404,17 +3402,6 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     needs_save = True
 
     # Same treatment for last_run_at (used as base in recovery / compute_next_run).
-    for j in jobs:
-        lr = j.get("last_run_at")
-        if lr is not None and not isinstance(lr, str):
-            j.pop("last_run_at", None)
-            needs_save = True
-        elif isinstance(lr, str):
-            try:
-                datetime.fromisoformat(lr)
-            except Exception:
-                j.pop("last_run_at", None)
-                needs_save = True
     for rj in raw_jobs:
         lr = rj.get("last_run_at")
         if lr is not None and not isinstance(lr, str):
@@ -3427,6 +3414,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 rj.pop("last_run_at", None)
                 needs_save = True
 
+    # Derived scheduler view: one shallow per-record copy of each normalized
+    # record with skill fields aligned (#95320). The shallow copy keeps
+    # _apply_skill_fields' view-only keys out of save_jobs(); nested values
+    # are shared with the canonical records, which is safe because this scan
+    # only ever assigns whole keys on a view record (never mutates a nested
+    # structure in place) and mirrors every persisted change onto raw_jobs
+    # explicitly before save_jobs() below.
+    jobs = [_apply_skill_fields(rj) for rj in raw_jobs]
+
     # Resolve the one-shot running-claim stale-recovery TTL once per scan
     # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
     _run_claim_ttl = _oneshot_run_claim_ttl_seconds()
@@ -3438,7 +3434,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # window each scan.
     if _sweep_completed_oneshots(raw_jobs, now, removed_ids=intentionally_removed):
         needs_save = True
-        jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]
+        # O(N) survivor filter (#95320): the removed ids are already known —
+        # membership against the surviving id set replaces the old
+        # any()-scan that was quadratic in store size.
+        surviving_ids = {rj.get("id") for rj in raw_jobs}
+        jobs = [j for j in jobs if j.get("id") in surviving_ids]
 
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
@@ -3857,8 +3857,10 @@ _CRON_OUTPUT_DEFAULT_KEEP = 50
 def _cron_output_keep() -> int:
     """Resolve the per-job output-file retention cap from config (``cron.output_retention``)."""
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
+        from hermes_cli.config import load_config_readonly
+        # Read-only cached-config access (#95320) — see
+        # _completed_oneshot_retention_days for why this must not deepcopy.
+        cfg = load_config_readonly() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         return int(cron_cfg.get("output_retention", _CRON_OUTPUT_DEFAULT_KEEP))
     except Exception:
