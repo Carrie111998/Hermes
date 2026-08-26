@@ -1,9 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const { mobileCapabilities } = vi.hoisted(() => ({
+  mobileCapabilities: { requestBackgroundReliability: vi.fn(), requestMedia: vi.fn() },
+}))
+
 vi.mock('@capacitor/app', () => ({ App: { addListener: vi.fn() } }))
 vi.mock('@capacitor/browser', () => ({ Browser: { open: vi.fn() } }))
 vi.mock('@capacitor/clipboard', () => ({ Clipboard: { write: vi.fn() } }))
-vi.mock('@capacitor/core', () => ({ Capacitor: { isNativePlatform: () => true } }))
+vi.mock('@capacitor/core', () => ({
+  Capacitor: { isNativePlatform: () => true },
+  registerPlugin: () => mobileCapabilities,
+}))
 vi.mock('@capacitor/camera', () => ({
   Camera: {
     checkPermissions: vi.fn(),
@@ -29,7 +36,15 @@ import { Browser } from '@capacitor/browser'
 import { Camera, MediaType } from '@capacitor/camera'
 import { LocalNotifications } from '@capacitor/local-notifications'
 import { Network } from '@capacitor/network'
-import { captureCameraPhoto, notify, onPowerResume, openExternal, requestMicrophoneAccess, requestNotificationPermission } from './native'
+import {
+  captureCameraPhoto,
+  notify,
+  onPowerResume,
+  openExternal,
+  requestInitialMobilePermissions,
+  requestMicrophoneAccess,
+  requestNotificationPermission,
+} from './native'
 
 beforeEach(() => {
   vi.mocked(Camera.checkPermissions).mockReset()
@@ -39,6 +54,8 @@ beforeEach(() => {
   vi.mocked(LocalNotifications.createChannel).mockReset()
   vi.mocked(LocalNotifications.requestPermissions).mockReset()
   vi.mocked(LocalNotifications.schedule).mockReset()
+  mobileCapabilities.requestBackgroundReliability.mockReset()
+  mobileCapabilities.requestMedia.mockReset()
   vi.unstubAllGlobals()
 })
 
@@ -106,6 +123,36 @@ describe('requestNotificationPermission', () => {
 
     await expect(requestNotificationPermission()).resolves.toBe(true)
     expect(LocalNotifications.requestPermissions).toHaveBeenCalledOnce()
+  })
+})
+
+describe('requestInitialMobilePermissions', () => {
+  it('requests the user-approved notification, camera/gallery, microphone, and background-reliability capabilities', async () => {
+    vi.mocked(LocalNotifications.checkPermissions).mockResolvedValue({ display: 'prompt' })
+    vi.mocked(LocalNotifications.requestPermissions).mockResolvedValue({ display: 'granted' })
+    vi.mocked(LocalNotifications.createChannel).mockResolvedValue()
+    vi.mocked(Camera.checkPermissions).mockResolvedValue({ camera: 'prompt', photos: 'granted' })
+    vi.mocked(Camera.requestPermissions).mockResolvedValue({ camera: 'granted', photos: 'granted' })
+    mobileCapabilities.requestMedia.mockResolvedValue({ granted: true, supported: true })
+    mobileCapabilities.requestBackgroundReliability.mockResolvedValue({ exempt: false, requested: true, supported: true })
+    const stop = vi.fn()
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop }] })) },
+    })
+
+    await expect(requestInitialMobilePermissions()).resolves.toEqual({
+      backgroundReliabilityRequested: true,
+      camera: true,
+      microphone: true,
+      notifications: true,
+      photos: true,
+    })
+    expect(LocalNotifications.requestPermissions).toHaveBeenCalledOnce()
+    expect(Camera.requestPermissions).toHaveBeenCalledWith({ permissions: ['camera'] })
+    expect(stop).toHaveBeenCalledOnce()
+    expect(mobileCapabilities.requestMedia).toHaveBeenCalledOnce()
+    expect(mobileCapabilities.requestBackgroundReliability).toHaveBeenCalledOnce()
   })
 })
 

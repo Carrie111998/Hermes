@@ -46,13 +46,14 @@ The bridge is deliberately explicit. Desktop-only capabilities must either map t
 
 ## 🤳 Android capability boundaries
 
-Every mobile capability begins with a deliberate user action. Hermes never requests broad storage, contacts, location, SMS, Accessibility, overlay, notification-reader, boot, or exact-alarm access.
+Every mobile capability begins with a deliberate user action or the one-time first successful connection onboarding. Hermes never requests contacts, location, SMS, Accessibility, overlay, notification-reader, boot, or exact-alarm access.
 
-- **Files and images:** Android’s system document/photo chooser grants Hermes access only to the files selected in that interaction. Their bytes are held only for the current app process and are uploaded to the configured remote gateway only when the user sends the composer message.
-- **Camera:** **Capture photo** appears only in the mobile composer. It requests Android camera permission when tapped, does not write the image to the gallery, and keeps the capture as a normal draft attachment until the user sends it.
+- **Files and images:** first successful connection requests the Android visual-media grant for gallery photos and videos. Regular document/photo pickers still use system URI grants; their bytes are held only for the current app process and are uploaded to the configured remote gateway only when the user sends the composer message.
+- **Camera:** first successful connection requests Android camera permission. **Capture photo** still requires a separate composer action, does not write the image to the gallery, and keeps the capture as a normal draft attachment until the user sends it.
 - **Incoming shares:** Android’s Share sheet can open Hermes with text and attachments. Shared text and files are staged in the composer; Hermes does not auto-send shared content to an agent session. Each shared URI is read once through its grant and capped at 25 MiB.
-- **Microphone:** requested only when the user starts voice input; the access probe immediately releases its test track.
+- **Microphone:** requested during first-connection onboarding and used only when the user starts voice input; the access probe immediately releases its test track.
 - **Notifications:** first successful connection asks for Android notification permission; Settings also offers a benign local test. Hermes separates attention-needed, activity, and non-urgent background-update channels. This is local-notification support only—server-to-device push while the app is suspended is not implemented or claimed.
+- **Background reliability:** first successful connection opens Android’s own battery-optimization decision. It can improve resumed network reliability but does not create a hidden agent, make a WebView immortal, or prove closed-app completion notifications.
 
 **Device-proof gate:** these source-level paths are covered by tests and native compilation, but camera, share-sheet, Android permission prompts, notification channels, and gallery behavior remain real-device acceptance items.
 

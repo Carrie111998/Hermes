@@ -7,11 +7,18 @@ import { App } from '@capacitor/app'
 import { Browser } from '@capacitor/browser'
 import { Clipboard } from '@capacitor/clipboard'
 import { Camera } from '@capacitor/camera'
-import { Capacitor } from '@capacitor/core'
+import { Capacitor, registerPlugin } from '@capacitor/core'
 import { LocalNotifications } from '@capacitor/local-notifications'
 import { Network } from '@capacitor/network'
 
 import type { HermesNotification } from '@/global'
+
+interface MobileCapabilitiesPlugin {
+  requestBackgroundReliability(): Promise<{ exempt: boolean; requested: boolean; supported: boolean }>
+  requestMedia(): Promise<{ granted: boolean; supported: boolean }>
+}
+
+const MobileCapabilities = registerPlugin<MobileCapabilitiesPlugin>('MobileCapabilities')
 
 export async function writeClipboard(text: string): Promise<boolean> {
   try {
@@ -56,6 +63,43 @@ export async function captureCameraPhoto(): Promise<Blob | null> {
     return image.size > 0 ? image : null
   } catch {
     return null
+  }
+}
+
+/** Request the explicit camera plus gallery/media grants requested at first connection. */
+export async function requestCameraAndGalleryAccess(): Promise<{ camera: boolean; photos: boolean }> {
+  if (!Capacitor.isNativePlatform()) return { camera: false, photos: false }
+
+  try {
+    const current = await Camera.checkPermissions()
+    const permission = current.camera === 'granted'
+      ? current
+      : await Camera.requestPermissions({ permissions: ['camera'] })
+    const media = await MobileCapabilities.requestMedia()
+
+    return {
+      camera: permission.camera === 'granted',
+      photos: media.granted,
+    }
+  } catch {
+    return { camera: false, photos: false }
+  }
+}
+
+/**
+ * Android has no generic "run in background" permission. This asks the system
+ * for a user-controlled battery-optimization exemption, which can improve a
+ * resumed remote connection but cannot turn the renderer into a hidden agent or
+ * guarantee suspended/terminated app notifications.
+ */
+export async function requestBackgroundReliabilityPermission(): Promise<boolean> {
+  if (!Capacitor.isNativePlatform()) return false
+
+  try {
+    const result = await MobileCapabilities.requestBackgroundReliability()
+    return result.requested || result.exempt
+  } catch {
+    return false
   }
 }
 
@@ -124,6 +168,30 @@ export async function requestNotificationPermission(): Promise<boolean> {
     return true
   } catch {
     return false
+  }
+}
+
+export interface InitialMobilePermissionResult {
+  backgroundReliabilityRequested: boolean
+  camera: boolean
+  microphone: boolean
+  notifications: boolean
+  photos: boolean
+}
+
+/** Issue the user's first-connection capability requests in a deliberate order. */
+export async function requestInitialMobilePermissions(): Promise<InitialMobilePermissionResult> {
+  const notifications = await requestNotificationPermission()
+  const media = await requestCameraAndGalleryAccess()
+  const microphone = await requestMicrophoneAccess()
+  const backgroundReliabilityRequested = await requestBackgroundReliabilityPermission()
+
+  return {
+    backgroundReliabilityRequested,
+    camera: media.camera,
+    microphone,
+    notifications,
+    photos: media.photos,
   }
 }
 
