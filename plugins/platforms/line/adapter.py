@@ -506,77 +506,92 @@ class _LineClient:
     def __init__(self, channel_access_token: str, *, timeout: float = 15.0) -> None:
         self._token = channel_access_token
         self._timeout = timeout
+        self._session = None
         self._headers = {
             "Authorization": f"Bearer {channel_access_token}",
             "Content-Type": "application/json",
         }
 
+    async def _get_session(self):
+        if self._session is None or self._session.closed:
+            import aiohttp
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self._timeout),
+                trust_env=True,
+            )
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
     async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=self._timeout)
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(
-                LINE_REPLY_URL,
-                headers=self._headers,
-                json={"replyToken": reply_token, "messages": messages},
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+        session = await self._get_session()
+        async with session.post(
+            LINE_REPLY_URL,
+            headers=self._headers,
+            json={"replyToken": reply_token, "messages": messages},
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
 
     async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=self._timeout)
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(
-                LINE_PUSH_URL,
-                headers=self._headers,
-                json={"to": chat_id, "messages": messages},
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+        session = await self._get_session()
+        async with session.post(
+            LINE_PUSH_URL,
+            headers=self._headers,
+            json={"to": chat_id, "messages": messages},
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
         if not chat_id or not chat_id.startswith("U"):
             return
-        import aiohttp
         # LINE caps loadingSeconds in 5-step increments, max 60.
         clamped = max(5, min(60, (seconds // 5) * 5 or 5))
         try:
-            timeout = aiohttp.ClientTimeout(total=5.0)
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                await session.post(
-                    LINE_LOADING_URL,
-                    headers=self._headers,
-                    json={"chatId": chat_id, "loadingSeconds": clamped},
-                )
+            session = await self._get_session()
+            async with session.post(
+                LINE_LOADING_URL,
+                headers=self._headers,
+                json={"chatId": chat_id, "loadingSeconds": clamped},
+                timeout=5.0,
+            ):
+                pass
         except Exception as exc:  # best-effort; never raise
             logger.debug("LINE loading indicator failed: %s", exc)
 
     async def fetch_content(self, message_id: str) -> bytes:
         """Download an inbound media message's binary content."""
-        import aiohttp
         url = LINE_CONTENT_URL_FMT.format(message_id=message_id)
-        timeout = aiohttp.ClientTimeout(total=30.0)
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"LINE content {resp.status}")
-                return await resp.read()
+        session = await self._get_session()
+        async with session.get(
+            url,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=30.0,
+        ) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"LINE content {resp.status}")
+            return await resp.read()
 
     async def get_bot_user_id(self) -> Optional[str]:
         """Fetch this channel's own userId so we can filter self-messages."""
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=10.0)
         try:
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                async with session.get(LINE_BOT_INFO_URL, headers=self._headers) as resp:
-                    if resp.status >= 400:
-                        return None
-                    data = await resp.json()
-                    return data.get("userId")
+            session = await self._get_session()
+            async with session.get(
+                LINE_BOT_INFO_URL,
+                headers=self._headers,
+                timeout=10.0,
+            ) as resp:
+                if resp.status >= 400:
+                    return None
+                data = await resp.json()
+                return data.get("userId")
         except Exception:
             return None
 
@@ -908,6 +923,12 @@ class LineAdapter(BasePlatformAdapter):
                 pass
             self._runner = None
         self._app = None
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+            self._client = None
 
         # Cleanup any tracked tempfiles.
         for path in list(self._media_temp_paths):
