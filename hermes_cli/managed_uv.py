@@ -44,6 +44,9 @@ _RUNTIME_DIR_NAME = ".hermes-runtime"
 _VENV_NAME = "venv"
 _ALT_VENV_NAME = ".venv"
 _REPAIR_LOCK_NAME = "runtime-repair.lock"
+# Keep this synchronized with the exclusive upper minor in pyproject.toml;
+# test_fallback_bound_matches_project_python_cap enforces that relationship.
+_MAX_SUPPORTED_MINOR = 14
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -699,12 +702,14 @@ def _install_safe_python_generation(
     # All patches on the current minor line are vulnerable or rejected.
     # Fall forward to the next supported minor (e.g. 3.11 → 3.12) so the
     # user isn't stuck on every `hermes update` with no path to a fixed
-    # runtime (issue #76106).  The requires-python constraint
-    # (>=3.11,<3.14) and the downstream import smoke-test gate
-    # compatibility; we only need to stay inside that window.
+    # runtime (issue #76106). The requires-python constraint
+    # (>=3.11,<3.15) and the downstream import smoke-test gate define
+    # compatibility; only supported minor lines through this bound are tried.
     cur_major, cur_minor = current.python_version[:2]
     fb_tried: set[tuple[int, int, int]] = set(tried_versions)
-    for next_minor in range(cur_minor + 1, 14):  # up to 3.13
+    for next_minor in range(
+        cur_minor + 1, _MAX_SUPPORTED_MINOR + 1
+    ):  # inclusive through _MAX_SUPPORTED_MINOR
         next_request = f"{cur_major}.{next_minor}"
         print(
             f"  → No fixed {cur_major}.{cur_minor} build available; "
