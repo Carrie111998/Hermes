@@ -44,6 +44,12 @@ def test_sibling_container_config_sites_carry_docker_network():
                     f"docker_run_as_host_user but without docker_network "
                     f"(line {node.lineno})"
                 )
+                assert "docker_extra_args" in keys, (
+                    f"{module.__name__} builds a container_config with "
+                    f"docker_run_as_host_user but without docker_extra_args "
+                    f"(line {node.lineno}) — the redteam --network=container:"
+                    f"mullvad-vpn would be dropped, leaking the host IP"
+                )
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
 
 
