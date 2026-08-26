@@ -31,6 +31,39 @@ class RepairScanResult:
     degraded: bool
 
 
+_ACTIVE_BASE_REFRESH_TASK_STATUSES = frozenset({"ready", "running", "review"})
+
+
+def _has_active_base_refresh_binding(
+    ledger: FeedbackLedger,
+    kanban: KanbanClient,
+    *,
+    board: str,
+    receipt: FeedbackReceipt,
+) -> bool:
+    """Return whether a pending exact-head dispatch is actually runnable.
+
+    A completed ledger row records that a card was dispatched, not that its
+    worker is still in flight.  Terminal board states must not reserve the
+    repository-wide refresh slot forever.  Unknown or missing cards likewise
+    provide no positive evidence of active work and therefore fail open only
+    for dispatch concurrency; exact-head identity and repair gates are
+    unchanged.
+    """
+
+    task_status = getattr(kanban, "task_status", None)
+    if not callable(task_status):
+        return False
+    binding = ledger.exact_pending_task_binding(receipt)
+    if binding is None:
+        return False
+    try:
+        status = task_status(board, binding.task_id)
+    except RuntimeError:
+        return False
+    return status in _ACTIVE_BASE_REFRESH_TASK_STATUSES
+
+
 def repair_triggers(
     pull: PullRequestMergeState,
     review: ReviewState,
@@ -176,8 +209,12 @@ class RepairController:
                 if lease is None:
                     if (
                         base_refresh_required
-                        and self._ledger.exact_receipt_status(receipt)
-                        in {"claimed", "completed"}
+                        and _has_active_base_refresh_binding(
+                            self._ledger,
+                            self._kanban,
+                            board=self._policy.board or "",
+                            receipt=receipt,
+                        )
                     ):
                         base_refresh_slots_used += 1
                     skipped["duplicate"] += 1

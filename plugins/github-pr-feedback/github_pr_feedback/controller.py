@@ -195,6 +195,7 @@ def _claim_with_orphan_recovery(
     owner: str,
     claimed_at: datetime,
     stale_before: datetime,
+    exact_dispatch_only: bool = False,
 ):
     """Claim normally, or reclaim an exact dispatch whose card is gone/archived."""
 
@@ -207,7 +208,11 @@ def _claim_with_orphan_recovery(
     if lease is not None:
         return lease
     task_status = getattr(kanban, "task_status", None)
-    bindings = ledger.pending_task_bindings_for_head(receipt)
+    if exact_dispatch_only:
+        binding = ledger.exact_pending_task_binding(receipt)
+        bindings = (binding,) if binding is not None else ()
+    else:
+        bindings = ledger.pending_task_bindings_for_head(receipt)
     if not bindings or not callable(task_status):
         return None
     for binding in bindings:
@@ -217,6 +222,13 @@ def _claim_with_orphan_recovery(
             return None
         if status != "archived":
             return None
+    if exact_dispatch_only:
+        return ledger.reopen_archived_exact_dispatch(
+            receipt,
+            archived=bindings[0],
+            owner=owner,
+            claimed_at=claimed_at,
+        )
     return ledger.replace_archived_dispatches(
         receipt,
         archived=bindings,
@@ -874,11 +886,15 @@ class ScanController:
             head_sha=current.head_sha,
         )
         claimed_at = self._clock()
-        lease = self._ledger.claim(
+        lease = _claim_with_orphan_recovery(
+            self._ledger,
+            self._kanban,
             receipt,
+            board=self._policy.board or "",
             owner=self._claim_owner,
             claimed_at=claimed_at,
             stale_before=claimed_at - self._claim_lease,
+            exact_dispatch_only=True,
         )
         if lease is None:
             return "duplicate"

@@ -10,12 +10,13 @@ from github_pr_feedback.ci_runner import CIAuditIdentity, CIAuditReceipt
 from github_pr_feedback.cli import _run_merge_scan
 from github_pr_feedback.github_client import (
     CheckState,
+    Feedback,
     PullRequestMergeState,
     RepositoryMergePolicy,
     ReviewState,
 )
 from github_pr_feedback.ledger import FeedbackLedger
-from github_pr_feedback.policy import PullRequest, load_policy
+from github_pr_feedback.policy import PullRequest, Reviewer, load_policy
 
 
 BASE_SHA = "b" * 40
@@ -24,8 +25,13 @@ MERGE_SHA = "c" * 40
 
 
 class CanonicalFakeGitHub:
-    def __init__(self, states: list[PullRequestMergeState]) -> None:
+    def __init__(
+        self,
+        states: list[PullRequestMergeState],
+        feedback: tuple[Feedback, ...] = (),
+    ) -> None:
         self.states = states
+        self.feedback = feedback
         self.merge_calls: list[tuple[str, int, str, str]] = []
 
     def list_open_pull_requests(self, repository: str, owner: str) -> tuple[PullRequest, ...]:
@@ -59,8 +65,8 @@ class CanonicalFakeGitHub:
     def get_check_state(self, repository: str, head_sha: str) -> CheckState:
         return CheckState(False, True, 0)
 
-    def list_feedback(self, repository: str, number: int) -> tuple[object, ...]:
-        return ()
+    def list_feedback(self, repository: str, number: int) -> tuple[Feedback, ...]:
+        return self.feedback
 
     def merge_pull_request(
         self, repository: str, number: int, head_sha: str, *, method: str
@@ -111,6 +117,7 @@ def configured_policy(repository: Path, *, report_only: bool = False):
             ],
             "reviewer_logins": ["reviewer"],
             "reviewer_associations": [],
+            "include_self_feedback": True,
             "not_before": "2026-08-24T00:00:00Z",
             "assignee": "repair-agent",
             "board": "repairs",
@@ -201,4 +208,63 @@ def test_end_to_end_report_only_creates_readiness_task_without_a_write(tmp_path:
     assert github.merge_calls == []
     assert len(kanban.tasks) == 1
     assert kanban.tasks[0].evidence["eligible"] is True
+    ledger.close()
+
+
+def test_superseded_owner_ci_status_comment_does_not_block_merge(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    prepare_receipt(repository, ledger)
+    old_head = "e" * 40
+    stale_comment = Feedback(
+        "issue_comment",
+        "5416219124",
+        Reviewer("owner", "OWNER"),
+        (
+            f"Local CI audit completed for exact head `{old_head}` (base `{BASE_SHA}`). "
+            f"Authoritative receipt: `{'f' * 64}`. The failed receipt remains "
+            "merge-blocking; later fail-fast lanes may be absent."
+        ),
+        datetime(2026, 8, 25, 20, 18, tzinfo=UTC),
+        False,
+    )
+    merged = replace(
+        open_state(), state="CLOSED", merged=True, merge_commit_oid=MERGE_SHA
+    )
+    github = CanonicalFakeGitHub(
+        [open_state(), open_state(), merged], feedback=(stale_comment,)
+    )
+
+    payload = _run_merge_scan(
+        configured_policy(repository), ledger, github=github, kanban=RecordingKanban()
+    )
+
+    assert payload["merged"][0]["pr_number"] == 17
+    assert github.merge_calls == [("acme/widgets", 17, HEAD_SHA, "rebase")]
+    ledger.close()
+
+
+def test_current_actionable_review_feedback_remains_merge_blocking(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    prepare_receipt(repository, ledger)
+    actionable = Feedback(
+        "review_comment",
+        "3857347391",
+        Reviewer("reviewer", "MEMBER"),
+        "Align daily windows to the completed market close.",
+        datetime(2026, 8, 25, 20, 59, tzinfo=UTC),
+        False,
+    )
+    github = CanonicalFakeGitHub([open_state()], feedback=(actionable,))
+
+    payload = _run_merge_scan(
+        configured_policy(repository), ledger, github=github, kanban=RecordingKanban()
+    )
+
+    assert payload["merged"] == []
+    assert payload["blocked"] == {"17": ["feedback_unprocessed"]}
+    assert github.merge_calls == []
     ledger.close()

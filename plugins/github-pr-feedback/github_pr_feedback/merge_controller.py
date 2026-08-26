@@ -412,7 +412,11 @@ class CanonicalMergeEvidenceSource:
         )
 
     def _feedback_clear(self, pull: PullRequestMergeState) -> bool:
-        from .controller import _is_non_actionable_review_container, _is_self_resolution_receipt
+        from .controller import (
+            _ci_receipt_feedback_reason,
+            _is_non_actionable_review_container,
+            _is_self_resolution_receipt,
+        )
 
         policy = self._plugin_policy
         target = policy.targets[pull.repository]
@@ -439,6 +443,8 @@ class CanonicalMergeEvidenceSource:
                 feedback.feedback_id,
                 pull.head_sha,
             )
+            if _ci_receipt_feedback_reason(self._ledger, receipt, feedback.body) is not None:
+                continue
             admission = policy.admit(
                 canonical_pull, feedback.reviewer, receipt, is_bot=feedback.is_bot
             )

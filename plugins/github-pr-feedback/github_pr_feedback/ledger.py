@@ -469,6 +469,68 @@ class FeedbackLedger:
             )
         return tuple(bindings)
 
+    def exact_pending_task_binding(
+        self, receipt: FeedbackReceipt
+    ) -> PendingTaskBinding | None:
+        """Return the exact completed dispatch that still awaits a work outcome."""
+
+        row = self._connection.execute(
+            "SELECT task_id FROM feedback_receipts WHERE repository = ? AND pr_number = ? "
+            "AND feedback_kind = ? AND feedback_id = ? AND head_sha = ? "
+            "AND status = 'completed' AND action_status = 'pending'",
+            receipt.key,
+        ).fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0].strip():
+            return None
+        return PendingTaskBinding(receipt, row[0].strip())
+
+    def reopen_archived_exact_dispatch(
+        self,
+        receipt: FeedbackReceipt,
+        *,
+        archived: PendingTaskBinding,
+        owner: str,
+        claimed_at: datetime,
+    ) -> ClaimLease | None:
+        """Atomically reopen one exact dispatch after its Kanban card was archived."""
+
+        owner = owner.strip() if isinstance(owner, str) else ""
+        if not owner or archived.receipt != receipt or not archived.task_id.strip():
+            raise ValueError("claim owner and exact archived binding must be valid")
+        claimed_at = _aware_utc(claimed_at, "claimed_at")
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT task_id, status, action_status, lease_version "
+                "FROM feedback_receipts WHERE repository = ? AND pr_number = ? "
+                "AND feedback_kind = ? AND feedback_id = ? AND head_sha = ?",
+                receipt.key,
+            ).fetchone()
+            if (
+                row is None
+                or row[0] != archived.task_id
+                or row[1] != "completed"
+                or row[2] != "pending"
+            ):
+                return None
+            version = int(row[3] or 0) + 1
+            reopened = self._connection.execute(
+                "UPDATE feedback_receipts SET status = 'claimed', task_id = NULL, "
+                "last_error = NULL, attempts = attempts + 1, claim_owner = ?, claimed_at = ?, "
+                "lease_version = ? WHERE repository = ? AND pr_number = ? AND feedback_kind = ? "
+                "AND feedback_id = ? AND head_sha = ? AND status = 'completed' "
+                "AND action_status = 'pending' AND task_id = ?",
+                (
+                    owner,
+                    claimed_at.isoformat(),
+                    version,
+                    *receipt.key,
+                    archived.task_id,
+                ),
+            )
+            if reopened.rowcount != 1:
+                raise LedgerStateError("exact archived dispatch changed during replacement")
+            return ClaimLease(owner, claimed_at, version)
+
     def replace_archived_dispatches(
         self,
         receipt: FeedbackReceipt,

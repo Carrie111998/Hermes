@@ -758,6 +758,63 @@ def test_only_archived_exact_head_fixer_is_recreated(
 
 
 @pytest.mark.parametrize(
+    ("stored_task_status", "expected_second_result", "expected_task_count"),
+    [("archived", "scheduled", 2), (None, "duplicate", 1)],
+)
+def test_only_archived_exact_head_local_ci_audit_is_recreated(
+    tmp_path: Path,
+    stored_task_status: str | None,
+    expected_second_result: str,
+    expected_task_count: int,
+) -> None:
+    local_path, head_sha = initialized_repository(tmp_path)
+    base_sha = "b" * 40
+    configured = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        local_ci_audit=True,
+    )
+    current = PullRequest(
+        17,
+        "OPEN",
+        "acme/widgets",
+        "acme/widgets",
+        "owner",
+        "codex/fix",
+        head_sha,
+        base_branch="main",
+        base_sha=base_sha,
+    )
+
+    class ArchivedKanban(RecordingKanban):
+        def task_status(self, board: str, task_id: str) -> str | None:
+            assert board == "repairs"
+            assert task_id == "kanban-1"
+            return stored_task_status
+
+    github = FakeGitHub(current, ())
+    github.actions_are_enabled = False
+    kanban = ArchivedKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    controller = ScanController(
+        configured,
+        ledger,
+        github,
+        kanban,
+        RecordingLocalGit(),
+        control_home=tmp_path,
+    )
+
+    assert controller.dispatch_local_ci_after_feedback(current) == "scheduled"
+    assert (
+        controller.dispatch_local_ci_after_feedback(current)
+        == expected_second_result
+    )
+    assert len(kanban.tasks) == expected_task_count
+    ledger.close()
+
+
+@pytest.mark.parametrize(
     "receipt_text",
     (
         "Authoritative receipt: `{receipt_id}`.",

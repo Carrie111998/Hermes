@@ -697,8 +697,20 @@ def _reusable_ci_receipt(
     receipt = reader(identity.repository, identity.pr_number, identity.head_sha)
     if receipt is None:
         return None
-    if not isinstance(receipt, CIAuditReceipt) or receipt.identity != identity:
+    if not isinstance(receipt, CIAuditReceipt):
         raise LedgerStateError("stored CI receipt identity is inconsistent")
+    stored = receipt.identity
+    if (
+        stored.repository != identity.repository
+        or stored.pr_number != identity.pr_number
+        or stored.head_sha != identity.head_sha
+    ):
+        raise LedgerStateError("stored CI receipt identity is inconsistent")
+    if stored.base_sha != identity.base_sha:
+        # A PR can retain its head while the canonical base advances. That
+        # makes the old receipt non-reusable, not corrupt; rerun all
+        # base-relative lanes against the new exact base.
+        return None
     manifest_path = worktree / "tests/manifests/test_lanes.toml"
     if not manifest_path.is_file():
         return None

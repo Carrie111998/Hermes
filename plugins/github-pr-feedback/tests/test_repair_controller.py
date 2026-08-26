@@ -206,6 +206,16 @@ class Kanban:
         return "repair-task"
 
 
+class StatusKanban(Kanban):
+    def __init__(self, statuses: dict[str, str | None]):
+        super().__init__()
+        self.statuses = statuses
+
+    def task_status(self, board: str, task_id: str) -> str | None:
+        assert board == "repairs"
+        return self.statuses.get(task_id)
+
+
 def test_repair_controller_dedupes_exact_head_and_preserves_merge_authority(
     tmp_path: Path,
 ) -> None:
@@ -313,6 +323,87 @@ def test_repair_controller_defaults_to_one_base_refresh_in_flight(
     ledger.close()
 
 
+def test_terminal_refresh_binding_does_not_hold_slot_before_archived_recovery(
+    tmp_path: Path,
+) -> None:
+    configured = policy(tmp_path, merge_maintainer=True)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    terminal = FeedbackReceipt(
+        "acme/widgets", 17, "pr_repair", "repair:base_refresh_required", "7" * 40
+    )
+    archived = FeedbackReceipt(
+        "acme/widgets", 18, "pr_repair", "repair:base_refresh_required", "8" * 40
+    )
+    for receipt, task_id in (
+        (terminal, "triage-refresh-task"),
+        (archived, "archived-refresh-task"),
+    ):
+        lease = ledger.claim(
+            receipt,
+            owner="repair-controller",
+            claimed_at=now,
+            stale_before=now,
+        )
+        assert lease is not None
+        ledger.finalize(receipt, task_id, lease)
+    kanban = StatusKanban(
+        {
+            "triage-refresh-task": "triage",
+            "archived-refresh-task": "archived",
+        }
+    )
+
+    result = RepairController(
+        configured,
+        ledger,
+        ManyBehindBaseGitHub(),
+        kanban,
+        LocalGit(),
+        clock=lambda: now,
+    ).scan()
+
+    assert result.created == 1
+    assert result.skipped == {"duplicate": 1}
+    assert [task.evidence["pr_number"] for task in kanban.tasks] == [18]
+    assert ledger.exact_pending_task_binding(archived) is not None
+    ledger.close()
+
+
+def test_old_head_terminal_binding_does_not_hold_current_refresh_slot(
+    tmp_path: Path,
+) -> None:
+    configured = policy(tmp_path, merge_maintainer=True)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    old_head = FeedbackReceipt(
+        "acme/widgets", 17, "pr_repair", "repair:base_refresh_required", "6" * 40
+    )
+    lease = ledger.claim(
+        old_head,
+        owner="repair-controller",
+        claimed_at=now,
+        stale_before=now,
+    )
+    assert lease is not None
+    ledger.finalize(old_head, "stale-triage-task", lease)
+    kanban = StatusKanban({"stale-triage-task": "triage"})
+
+    result = RepairController(
+        configured,
+        ledger,
+        ManyBehindBaseGitHub(),
+        kanban,
+        LocalGit(),
+        clock=lambda: now,
+    ).scan()
+
+    assert result.created == 1
+    assert result.skipped["base_refresh_serialized"] == 1
+    assert [task.evidence["pr_number"] for task in kanban.tasks] == [17]
+    ledger.close()
+
+
 def test_base_refresh_prefers_clean_pr_before_conflicted_pr(tmp_path: Path) -> None:
     configured = policy(tmp_path, merge_maintainer=True)
     ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
@@ -370,7 +461,7 @@ def test_unrelated_pending_feedback_does_not_consume_the_base_refresh_slot(
     )
     assert lease is not None
     ledger.finalize(unrelated, "feedback-task", lease)
-    kanban = Kanban()
+    kanban = StatusKanban({"feedback-task": "running"})
 
     result = RepairController(
         configured,

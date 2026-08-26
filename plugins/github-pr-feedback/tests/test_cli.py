@@ -1712,6 +1712,37 @@ def test_audit_reuses_exact_head_manifest_receipt_without_rerunning_lane(
     assert _reusable_ci_receipt(Ledger(), identity, worktree) is None
 
 
+def test_audit_reruns_when_canonical_base_advances_with_same_head(
+    tmp_path: Path,
+) -> None:
+    from github_pr_feedback.ci_runner import CIAuditIdentity, CIAuditReceipt
+    from github_pr_feedback.cli import _reusable_ci_receipt
+    from github_pr_feedback.github_client import CheckState
+
+    worktree = tmp_path / "repository"
+    manifest = worktree / "tests/manifests/test_lanes.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("[lane.fast]\nargv = ['pytest']\n", encoding="utf-8")
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    current = CIAuditIdentity("acme/widgets", 17, "c" * 40, "a" * 40)
+    stale = CIAuditReceipt(
+        receipt_id="f" * 64,
+        identity=CIAuditIdentity("acme/widgets", 17, "b" * 40, "a" * 40),
+        manifest_digest=digest,
+        status="passed",
+        started_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 25, 12, 1, tzinfo=UTC),
+        actions_state=CheckState(False, True, 0),
+        commands=(),
+    )
+
+    class Ledger:
+        def latest_ci_receipt_for_head(self, *args):
+            return stale
+
+    assert _reusable_ci_receipt(Ledger(), current, worktree) is None
+
+
 def test_ci_audit_handoff_terminates_only_a_task_scoped_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
