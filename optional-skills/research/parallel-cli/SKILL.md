@@ -2,7 +2,7 @@
 name: parallel-cli
 description: Optional Parallel research, FindAll, enrich, and monitor.
 version: 1.2.0
-author: Hermes Agent
+author: Kshitij (@kshitijk4poor), George Pickett (@grp06), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 prerequisites:
@@ -84,7 +84,7 @@ Hermes deliberately does not forward its own `PARALLEL_API_KEY` into normal `ter
 ## How to Run
 
 1. Run every `parallel-cli` command through `terminal` and inspect the exact leaf command's `--help` before using version-sensitive options.
-2. Treat every user- or API-derived value—including text, URLs, paths, IDs, and JSON—as data, not shell source. Save it with `write_file` to a unique, agent-generated staging path; never paste it into a command, even inside double quotes.
+2. Treat every user- or API-derived value (text, URLs, paths, IDs, and JSON) as data, not shell source. Save it with `write_file` to a unique, agent-generated staging path; never paste it into a command, even inside double quotes.
 3. Prefer stdin or `--input-file`. Otherwise, load staged data into a variable in the same `terminal` call, require a non-empty value, then pass only a quoted expansion. Hermes foreground commands can load multiline text with `objective="$(<"parallel-input-UNIQUE.txt")"`; one-line values and managed-background payloads use `run_id=; IFS= read -r run_id < "parallel-run-id-UNIQUE.txt"; test -n "$run_id" || exit 2`. For a dynamic positional value, put all options first and pass it after the option terminator: `-- "$objective"`. Quote agent-authored file paths too.
 4. Treat Parallel as an external data processor. Do not send credentials, private files, personal records, or sensitive datasets unless the user clearly intends that data to be processed by Parallel.
 5. If the user did not explicitly request Parallel, get approval before the first API call.
@@ -196,7 +196,7 @@ taskgroup_id=; IFS= read -r taskgroup_id < "parallel-taskgroup-id-UNIQUE.txt"; t
 parallel-cli enrich poll --timeout 120 -o "enriched-results-UNIQUE.json" -- "$taskgroup_id"
 ```
 
-Write `taskgroup_id` to its staging file with `write_file`. If waiting while it is still running, use the managed-background rule. In the async form above, `--target` is not written at launch; `enrich poll -o` saves the final results.
+If waiting while it is still running, use the managed-background rule. In the async form above, `--target` is not written at launch; `enrich poll -o` saves the final results. Check the saved row count against the submitted count and report any row errors separately. Polling can exit successfully and save valid JSON even when some rows failed.
 
 Use a prior research `interaction_id` only with `--previous-interaction-id`. Retain a new context ID only when the current command actually returns one.
 
@@ -238,7 +238,7 @@ If waiting while it is still running, use `findall poll` with the managed-backgr
 
 ### 5. Monitor
 
-Create a monitor only after confirming the exact query, frequency, processor, delivery or no-delivery behavior, and that it runs once immediately, then keeps running—and may keep consuming paid usage—at that frequency until canceled:
+Create a monitor only after confirming the exact query, frequency, processor, delivery or no-delivery behavior, and that it runs once immediately, then keeps running at that frequency until canceled, potentially consuming paid usage each time:
 
 ```bash
 query="$(<"parallel-monitor-query-UNIQUE.txt")"
@@ -303,7 +303,7 @@ Before the first chargeable API request, check which credential source will be u
 parallel-cli auth --json
 ```
 
-Use the user's first approved API operation—not a separate chargeable smoke test—as the end-to-end verification.
+Use the user's first approved API operation as the end-to-end verification. Do not launch a separate chargeable smoke test.
 
 - [ ] The credential source and any environment override are understood; only a successful API request validates the key.
 - [ ] The standalone updater is disabled with permission, or the user accepted its mutation and mixed-output behavior.
