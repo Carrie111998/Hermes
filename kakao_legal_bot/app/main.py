@@ -14,6 +14,7 @@ import hmac
 import logging
 import time
 from collections.abc import AsyncIterator
+from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
@@ -231,6 +232,70 @@ async def index() -> PlainTextResponse:
     return PlainTextResponse("moa legal bot is running. POST /iris/webhook")
 
 
+_SYNC_KEY = "law_sync_last_run"
+
+
+async def run_law_sync_if_due(services: Services, *, force: bool = False) -> str:
+    """개정 법령·최근 판례를 확인하고 변호사에게 알린다.
+
+    서버는 **찾아서 알리는 데까지만** 합니다. 글을 고치는 것은 PC의 코덱스
+    몫이에요 — 서버가 자료를 고치기 시작하면 무엇이 근거였는지 알 수 없게
+    되고, 실패했을 때 되돌릴 수도 없습니다.
+    """
+    settings = services.settings
+    if not settings.law_sync_enabled or services.law is None:
+        return ""
+    now = time.time()
+    if not force:
+        last = await asyncio.to_thread(services.db.kv_get, _SYNC_KEY, "0")
+        try:
+            elapsed = now - float(last or 0)
+        except ValueError:
+            elapsed = now
+        if elapsed < max(settings.law_sync_interval_h, 1) * 3600:
+            return ""
+    await asyncio.to_thread(services.db.kv_set, _SYNC_KEY, str(now))
+
+    from .wiki.sync import LawSync, watched_laws
+
+    if services.graph is None:
+        log.info("law sync: 위키 그래프가 없어 지켜볼 법령을 모릅니다")
+        return ""
+    laws = await asyncio.to_thread(watched_laws, services.graph, settings.law_sync_top_laws)
+    if not laws:
+        return ""
+
+    sync = LawSync(services.law, settings.wiki_vault, services.graph)
+    result = await sync.sync_laws(laws)
+    cases = await sync.sync_precedents(
+        laws, since=(date.today() - timedelta(days=settings.law_sync_precedent_days)).isoformat()
+    )
+    result.cases.extend(cases.cases)
+    result.errors.extend(cases.errors)
+    await asyncio.to_thread(sync.write_worklist, result)
+
+    if not result.changed:
+        log.info("law sync: 바뀐 것이 없습니다 (법령 %s건 확인)", len(laws))
+        return ""
+
+    lines = [f"📜 법령·판례 변동 알림 — {result.summary()}"]
+    for update in result.laws[:10]:
+        mark = "신규" if update.is_new else f"{update.previous} → {update.effective_on}"
+        lines.append(f"· {update.law} 개정 ({mark})")
+    for update in result.cases[:10]:
+        lines.append(f"· {update.court} {update.case_no} ({update.decided_on})")
+    if result.affected:
+        lines.append(f"\n개정 이후 확인이 필요한 기존 자료 {len(result.affected)}건:")
+        for item in result.affected[:5]:
+            lines.append(f"  - {item['title']} ({item['statute']})")
+        if len(result.affected) > 5:
+            lines.append(f"  - … 그 밖에 {len(result.affected) - 5}건")
+    lines.append("\nPC에서 코덱스로 정리하시려면: python -m kakao_legal_bot.app.wiki.sync daily")
+    message = "\n".join(lines)
+    await services.sender.notify_lawyer(message)
+    return message
+
+
 async def _janitor(app: FastAPI) -> None:
     """Hourly housekeeping: retention, stuck outbox rows."""
     services: Services = app.state.services
@@ -249,6 +314,7 @@ async def _janitor(app: FastAPI) -> None:
                 log.info(
                     "janitor: purged=%s requeued=%s drafts_requeued=%s", purged, requeued, drafts
                 )
+            await run_law_sync_if_due(services)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

@@ -210,6 +210,15 @@ class Settings:
         default_factory=lambda: Path(_env("WIKI_GRAPH")) if _env("WIKI_GRAPH") else None
     )
     wiki_related_limit: int = field(default_factory=lambda: _env_int("WIKI_RELATED_LIMIT", 6))
+    wiki_vault: Path = field(default_factory=lambda: Path(_env("WIKI_VAULT", "./vault")))
+    # 개정 법령·최근 판례를 주기적으로 확인해 변호사에게 알립니다. 서버는
+    # **찾아서 알리는 데까지만** 하고, 글을 고치는 것은 PC의 코덱스 몫입니다.
+    law_sync_enabled: bool = field(default_factory=lambda: _env_bool("LAW_SYNC_ENABLED", False))
+    law_sync_interval_h: int = field(default_factory=lambda: _env_int("LAW_SYNC_INTERVAL_H", 24))
+    law_sync_top_laws: int = field(default_factory=lambda: _env_int("LAW_SYNC_TOP_LAWS", 30))
+    law_sync_precedent_days: int = field(
+        default_factory=lambda: _env_int("LAW_SYNC_PRECEDENT_DAYS", 7)
+    )
     rag_top_k: int = field(default_factory=lambda: _env_int("RAG_TOP_K", 6))
     rag_chunk_chars: int = field(default_factory=lambda: _env_int("RAG_CHUNK_CHARS", 900))
     rag_chunk_overlap: int = field(default_factory=lambda: _env_int("RAG_CHUNK_OVERLAP", 150))

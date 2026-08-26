@@ -433,6 +433,58 @@ python -m kakao_legal_bot.app.wiki.build lint  --wiki ./vault/wiki --apply
 문장끼리 정말 모순인지는 읽어야 압니다. 그건 규칙으로 판정하는 척하지 않고
 `_lint-worklist.jsonl` 로 넘겨 코덱스가 대조합니다.
 
+### 3-5-2 매일 도는 법령·판례 동기화
+
+낡은 자료를 잡아내려면 **무엇이 최신인지 알아야** 합니다. 그래서 국가법령 API로
+주기적으로 확인합니다.
+
+```
+① 우리 서가가 실제로 다루는 법령의 현행 시행일을 확인
+② 우리가 아는 것보다 새 것이면 본문을 받아 raw/법령/ 에 넣는다
+③ 최근 판례를 받아 raw/판례/ 에 넣는다
+④ 그 조문을 다루던 기존 자료 중 개정보다 먼저 쓰인 것을 목록으로 뽑는다
+⑤ 코덱스가 위키 노트를 쓰고, 낡은 서술을 최신 기준으로 고친다
+```
+
+**④가 핵심입니다.** 새 법령을 받아 놓기만 하면 낡은 설명은 그대로 남습니다.
+"어떤 문서가 이제 틀렸을 수 있는가"까지 짚어 줘야 고쳐집니다.
+
+**지켜볼 법령은 서가가 정합니다.** 손으로 목록을 관리하면 반드시 빠뜨리므로,
+그래프에서 가장 많이 인용된 법령 상위 N개를 자동으로 지켜봅니다.
+
+```bash
+# 변호사님 PC에서 (코덱스가 있는 곳) — 전체 흐름
+python -m kakao_legal_bot.app.wiki.sync daily --vault ./vault
+python -m kakao_legal_bot.app.wiki.build stub --raw ./vault/raw --wiki ./vault/wiki
+#   → 코덱스가 _sync-worklist.jsonl 을 읽고 위키를 쓰고 낡은 서술을 고칩니다
+python -m kakao_legal_bot.app.wiki.build index --wiki ./vault/wiki
+python -m kakao_legal_bot.app.wiki.build lint  --wiki ./vault/wiki --apply
+```
+
+매일 새벽에 돌리시려면 (리눅스 crontab):
+
+```
+0 5 * * * cd /srv/moa && .venv/bin/python -m kakao_legal_bot.app.wiki.sync daily
+```
+
+**서버 쪽은 찾아서 알리는 데까지만 합니다.** `LAW_SYNC_ENABLED=true` 로 두면
+하루 한 번 확인하고, 바뀐 것이 있으면 카톡으로 알립니다 — PC가 꺼져 있어도
+개정 사실은 아시게 됩니다.
+
+```
+📜 법령·판례 변동 알림 — 법령 1건 개정 · 판례 3건 신규 · 영향받는 기존 자료 12건
+· 민법 개정 (2016-02-04 → 2023-06-01)
+· 대법원 2026다12345 (2026-08-01)
+
+개정 이후 확인이 필요한 기존 자료 12건:
+  - 주석민법 임대차 (민법 제618조)
+  …
+```
+
+서버가 **자료를 직접 고치지는 않습니다.** 서버가 글을 고치기 시작하면 무엇이
+근거였는지 알 수 없게 되고, 실패했을 때 되돌릴 수도 없습니다. 고치는 일은
+근거 파일과 이력이 함께 있는 PC의 코덱스 몫입니다.
+
 상담 중에는 `search_related_docs` 도구로 씁니다. `anchor` 에 조문·판례를 넣으면
 그것을 다루는 자료가 **최신 순으로** 나오고, `query` 에 자연어를 넣으면
 FTS5로 찾은 문서를 씨앗 삼아 같은 근거를 공유하는 문서로 넓힙니다. 연혁으로
