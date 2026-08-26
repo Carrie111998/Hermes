@@ -124,7 +124,7 @@ test('regression: keydown shortcut ignores editable targets (composer/inputs)', 
   )
   assert.match(
     pluginSource,
-    /tag === ['\"]INPUT['\"] \|\| tag === ['\"]TEXTAREA['\"]/,
+    /tag === ['"]INPUT['"] || tag === ['"]TEXTAREA['"]/,
     'shortcut must skip INPUT and TEXTAREA targets so typing in the composer or search box is never hijacked'
   )
 })
