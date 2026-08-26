@@ -1783,7 +1783,7 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     # keeps its declared bare slug; ``custom_providers:`` canonicalizes both a
     # bare display name and ``custom:<name>`` to the durable custom slug.
     try:
-        cfg = read_raw_config()
+        cfg = load_config()
     except Exception:
         cfg = {}
     user_providers = cfg.get("providers") if isinstance(cfg, dict) else None
@@ -7144,7 +7144,9 @@ async def get_config(profile: Optional[str] = None):
     # override stays scoped to the worker thread.
     def _run():
         with _profile_scope(profile):
-            return _normalize_config_for_web(read_raw_config())
+            resolved = load_config()
+            raw = read_raw_config()
+            return _normalize_config_for_web(_deep_merge(resolved, raw))
 
     config = await asyncio.to_thread(_run)
     # Strip internal keys that the frontend shouldn't see or send back
@@ -7541,7 +7543,7 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
             }
 
         with _profile_scope(body.profile or profile):
-            cfg = read_raw_config()
+            cfg = load_config()
             if body.presets:
                 raw = {
                     "default_preset": body.default_preset,
