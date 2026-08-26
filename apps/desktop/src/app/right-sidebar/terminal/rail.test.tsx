@@ -1,10 +1,32 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $bindings } from '@/store/keybinds'
 
 import { TerminalRail } from './rail'
 import { $activeTerminalId, $terminals } from './terminals'
+
+class TestResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+beforeAll(() => {
+  vi.stubGlobal('ResizeObserver', TestResizeObserver)
+  Element.prototype.hasPointerCapture ??= () => false
+  Element.prototype.setPointerCapture ??= () => undefined
+  Element.prototype.releasePointerCapture ??= () => undefined
+  HTMLElement.prototype.scrollIntoView ??= () => undefined
+})
+
+function openTabContextMenu(name: string) {
+  const tab = screen.getByRole('tab', { name })
+
+  // Radix ContextMenuTrigger opens on the secondary-button press + contextmenu pair.
+  fireEvent.pointerDown(tab, { button: 2, ctrlKey: false, pointerType: 'mouse' })
+  fireEvent.contextMenu(tab, { button: 2 })
+}
 
 describe('TerminalRail', () => {
   beforeEach(() => {
@@ -45,5 +67,39 @@ describe('TerminalRail', () => {
     fireEvent.click(screen.getByRole('tab', { name: '1. PowerShell' }))
     expect($activeTerminalId.get()).toBe('term-1')
     expect($terminals.get()).toHaveLength(1)
+  })
+
+  it('renames a tab from its context menu, seeding the dialog with the current label', async () => {
+    render(<TerminalRail />)
+
+    openTabContextMenu('1. PowerShell')
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename…' }))
+
+    const dialog = await screen.findByRole('dialog')
+    const input = within(dialog).getByRole<HTMLInputElement>('textbox')
+    expect(input.value).toBe('PowerShell')
+
+    fireEvent.change(input, { target: { value: 'server' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+
+    // The dialog closes and the rail relabels immediately.
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.getByRole('tab', { name: '1. server' })).toBeTruthy()
+    // A custom label pins the tab: the resolved shell name can no longer adopt over it.
+    expect($terminals.get()[0]).toMatchObject({ auto: false, title: 'server' })
+  })
+
+  it('Enter saves the dialog, and an emptied name falls back to the previous label instead of blanking the tab', async () => {
+    render(<TerminalRail />)
+
+    openTabContextMenu('1. PowerShell')
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename…' }))
+
+    const input = await screen.findByRole('textbox')
+    fireEvent.change(input, { target: { value: '' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect($terminals.get()[0]?.title).toBe('PowerShell')
   })
 })
