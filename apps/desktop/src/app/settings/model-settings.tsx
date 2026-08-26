@@ -38,7 +38,7 @@ import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 import { CONTROL_TEXT } from './constants'
 import { getNested, setNested } from './helpers'
 import { ListRow, Pill, SectionHeading } from './primitives'
-import { SearchableSelect } from './searchable-select'
+import { SearchableSelect, type SearchableSelectOption } from './searchable-select'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
 
 // Skeleton mirror of the Model settings DOM so the page keeps its shape while
@@ -121,6 +121,20 @@ const AUX_TASKS: readonly AuxTaskMeta[] = [
 ]
 
 const NO_PROVIDERS: readonly ModelOptionProvider[] = [{ name: '—', slug: '', models: [] }]
+
+/** A provider row as a SearchableSelect option: label by name, findable by
+ *  either name or slug. Built identically at every provider picker here. */
+const providerSelectOption = (provider: ModelOptionProvider): SearchableSelectOption => ({
+  value: provider.slug || 'none',
+  label: provider.name,
+  keywords: [provider.name, provider.slug]
+})
+
+/** A model id as a SearchableSelect option, findable by its alias haystack. */
+const modelSelectOption = (model: string): SearchableSelectOption => ({
+  value: model,
+  keywords: [modelSearchText(model)]
+})
 
 // Radix <Select> renders a blank trigger when `value` matches no <SelectItem>.
 // A custom model (e.g. one added via config that isn't in the provider's
@@ -317,6 +331,18 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   // that would create a recursive MoA tree (the backend rejects it on save).
   // Hide it from the slot selectors so it isn't offered as a dead choice.
   const moaSlotProviderOptions = providerOptions.filter(provider => (provider.slug || '').toLowerCase() !== 'moa')
+
+  // Reference slots and the aggregator build the same list; only the value
+  // kept visible via withActive differs.
+  const moaSlotProviderSelectOptions = (selected: string): SearchableSelectOption[] =>
+    withActive(
+      moaSlotProviderOptions.map(provider => provider.slug || 'none'),
+      selected
+    ).map(slug => {
+      const provider = moaSlotProviderOptions.find(candidate => (candidate.slug || 'none') === slug)
+
+      return { value: slug, label: provider?.name || slug, keywords: [provider?.name || slug, slug] }
+    })
 
   const selectedProviderRow = useMemo(
     () => providers.find(provider => provider.slug === selectedProvider),
@@ -797,11 +823,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             className="min-w-40"
             emptyMessage={m.noResults}
             onChange={setSelectedProvider}
-            options={mainProviderOptions.map(provider => ({
-              value: provider.slug || 'none',
-              label: provider.name,
-              keywords: [provider.name, provider.slug]
-            }))}
+            options={mainProviderOptions.map(providerSelectOption)}
             placeholder={m.searchProvider}
             value={selectedProvider}
           />
@@ -841,10 +863,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                 className="min-w-60"
                 emptyMessage={m.noResults}
                 onChange={setSelectedModel}
-                options={withActive(selectedProviderModels, selectedModel).map(model => ({
-                  value: model,
-                  keywords: [modelSearchText(model)]
-                }))}
+                options={withActive(selectedProviderModels, selectedModel).map(modelSelectOption)}
                 placeholder={m.searchModel}
                 value={selectedModel}
               />
@@ -976,11 +995,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                           className="min-w-32"
                           emptyMessage={m.noResults}
                           onChange={value => setAuxDraft(prev => ({ ...prev, provider: value, model: '' }))}
-                          options={providerOptions.map(provider => ({
-                            value: provider.slug || 'none',
-                            label: provider.name,
-                            keywords: [provider.name, provider.slug]
-                          }))}
+                          options={providerOptions.map(providerSelectOption)}
                           placeholder={m.searchProvider}
                           value={auxDraft.provider}
                         />
@@ -988,10 +1003,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                           className="min-w-48"
                           emptyMessage={m.noResults}
                           onChange={value => setAuxDraft(prev => ({ ...prev, model: value }))}
-                          options={withActive(auxDraftProviderModels, auxDraft.model).map(model => ({
-                            value: model,
-                            keywords: [modelSearchText(model)]
-                          }))}
+                          options={withActive(auxDraftProviderModels, auxDraft.model).map(modelSelectOption)}
                           placeholder={m.searchModel}
                           value={auxDraft.model}
                         />
@@ -1158,18 +1170,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                           )
                         }))
                       }
-                      options={withActive(
-                        moaSlotProviderOptions.map(p => p.slug || 'none'),
-                        slot.provider
-                      ).map(slug => {
-                        const provider = moaSlotProviderOptions.find(p => (p.slug || 'none') === slug)
-
-                        return {
-                          value: slug,
-                          label: provider?.name || slug,
-                          keywords: [provider?.name || slug, slug]
-                        }
-                      })}
+                      options={moaSlotProviderSelectOptions(slot.provider)}
                       placeholder={m.searchProvider}
                       value={slot.provider}
                     />
@@ -1184,10 +1185,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                           )
                         }))
                       }
-                      options={withActive(modelsForProvider(slot.provider), slot.model).map(model => ({
-                        value: model,
-                        keywords: [modelSearchText(model)]
-                      }))}
+                      options={withActive(modelsForProvider(slot.provider), slot.model).map(modelSelectOption)}
                       placeholder={m.searchModel}
                       value={slot.model}
                     />
@@ -1241,18 +1239,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                         aggregator: updateMoaSlot(prev.aggregator, { provider: value })
                       }))
                     }
-                    options={withActive(
-                      moaSlotProviderOptions.map(p => p.slug || 'none'),
-                      currentMoaPreset.aggregator.provider
-                    ).map(slug => {
-                      const provider = moaSlotProviderOptions.find(p => (p.slug || 'none') === slug)
-
-                      return {
-                        value: slug,
-                        label: provider?.name || slug,
-                        keywords: [provider?.name || slug, slug]
-                      }
-                    })}
+                    options={moaSlotProviderSelectOptions(currentMoaPreset.aggregator.provider)}
                     placeholder={m.searchProvider}
                     value={currentMoaPreset.aggregator.provider}
                   />
@@ -1268,10 +1255,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                     options={withActive(
                       modelsForProvider(currentMoaPreset.aggregator.provider),
                       currentMoaPreset.aggregator.model
-                    ).map(model => ({
-                      value: model,
-                      keywords: [modelSearchText(model)]
-                    }))}
+                    ).map(modelSelectOption)}
                     placeholder={m.searchModel}
                     value={currentMoaPreset.aggregator.model}
                   />
