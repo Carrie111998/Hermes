@@ -70,7 +70,7 @@ def test_sessions_export_redact_scrubs_secrets(monkeypatch, tmp_path):
     import hermes_cli.main as main_mod
     import hermes_state
 
-    secret = "sk-proj-Zz12345678901234567890123456789012345678"
+    secret = "sk-" + ("a" * 48)
 
     class FakeDB:
         def resolve_session_id(self, session_id):
