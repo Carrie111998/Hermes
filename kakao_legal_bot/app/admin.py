@@ -111,6 +111,30 @@ async def show_draft(
         raise HTTPException(404, "초안을 찾을 수 없습니다.")
 
     banner = f'<p class="note">{_esc(message)}</p>' if message else ""
+    if draft.awaiting_worker:
+        # Nothing to edit yet — showing an empty textarea here invites the
+        # lawyer to type into a document the worker is about to overwrite.
+        banner += (
+            '<p class="note">PC의 Codex 워커가 이 문서를 작성하고 있습니다. '
+            "작성이 끝나면 이 화면에서 검토·수정하실 수 있습니다."
+            f"{' (PC가 켜져 있는지 확인해 주세요)' if draft.status == 'pending_generation' else ''}"
+            "</p>"
+            f'<p class="meta">작성 지시<br>{_esc(draft.instructions)}</p>'
+        )
+        if draft.last_error:
+            banner += f'<p class="note">직전 오류: {_esc(draft.last_error)}</p>'
+        return HTMLResponse(
+            _PAGE.format(
+                title=f"초안 #{draft.id}",
+                body=(
+                    f'<h1>#{draft.id} {_esc(draft.title)} '
+                    f'<span class="badge">{_esc(draft.status)}</span></h1>'
+                    f'<div class="meta">{_esc(draft.kind)} · 방 {_esc(draft.room_id)}</div>'
+                    f"{banner}"
+                    f'<p><a href="/admin/drafts?token={_esc(token)}">← 목록</a></p>'
+                ),
+            )
+        )
     body = f"""
 <h1>#{draft.id} {_esc(draft.title)} <span class="badge">{_esc(draft.status)}</span></h1>
 <div class="meta">{_esc(draft.kind)} · 방 {_esc(draft.room_id)}</div>

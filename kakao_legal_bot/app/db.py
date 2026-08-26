@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_done"})
 
@@ -26,6 +26,11 @@ ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_
 # deployed bot breaks on its next query.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rooms", "first_alerts_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("drafts", "instructions", "TEXT NOT NULL DEFAULT ''"),
+    ("drafts", "transcript", "TEXT NOT NULL DEFAULT ''"),
+    ("drafts", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("drafts", "last_error", "TEXT NOT NULL DEFAULT ''"),
+    ("drafts", "claimed_at", "REAL"),
 )
 
 _SCHEMA = """
@@ -73,9 +78,18 @@ CREATE TABLE IF NOT EXISTS drafts (
     kind         TEXT NOT NULL DEFAULT 'general',
     title        TEXT NOT NULL DEFAULT '',
     body         TEXT NOT NULL DEFAULT '',
-    status       TEXT NOT NULL DEFAULT 'pending_review',  -- pending_review | approved | sent | rejected
+    -- pending_generation | generating | pending_review | approved | sent
+    -- | rejected | generation_failed
+    status       TEXT NOT NULL DEFAULT 'pending_review',
     lawyer_note  TEXT NOT NULL DEFAULT '',
     client_email TEXT NOT NULL DEFAULT '',
+    -- Everything the Codex worker needs to write the document. Kept on the
+    -- row so a job survives a server restart between request and pickup.
+    instructions TEXT NOT NULL DEFAULT '',
+    transcript   TEXT NOT NULL DEFAULT '',
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT NOT NULL DEFAULT '',
+    claimed_at   REAL,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
     sent_at      REAL
@@ -149,9 +163,14 @@ class Draft:
     created_at: float
     updated_at: float
     sent_at: float | None
+    instructions: str = ""
+    transcript: str = ""
+    attempts: int = 0
+    last_error: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Draft:
+        keys = row.keys()
         return cls(
             id=row["id"],
             consult_id=row["consult_id"],
@@ -165,7 +184,15 @@ class Draft:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             sent_at=row["sent_at"],
+            instructions=row["instructions"] if "instructions" in keys else "",
+            transcript=row["transcript"] if "transcript" in keys else "",
+            attempts=row["attempts"] if "attempts" in keys else 0,
+            last_error=row["last_error"] if "last_error" in keys else "",
         )
+
+    @property
+    def awaiting_worker(self) -> bool:
+        return self.status in {"pending_generation", "generating"}
 
 
 def pseudonymise(value: str, salt: str) -> str:
@@ -371,17 +398,114 @@ class Database:
         body: str,
         consult_id: int | None = None,
         client_email: str = "",
+        status: str = "pending_review",
+        instructions: str = "",
+        transcript: str = "",
     ) -> int:
         now = time.time()
         cur = self._exec(
             """
             INSERT INTO drafts(consult_id, room_id, kind, title, body, client_email,
-                               created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                               status, instructions, transcript, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (consult_id, room_id, kind, title, body, client_email, now, now),
+            (
+                consult_id,
+                room_id,
+                kind,
+                title,
+                body,
+                client_email,
+                status,
+                instructions,
+                transcript,
+                now,
+                now,
+            ),
         )
         return int(cur.lastrowid or 0)
+
+    # ── draft generation queue (Codex worker on the lawyer's PC) ─────────
+    def claim_draft_jobs(self, limit: int = 1) -> list[Draft]:
+        """Hand pending jobs to the worker and mark them in progress.
+
+        Claimed rather than merely listed, so two workers (or a worker that
+        was restarted mid-poll) cannot generate the same document twice.
+        """
+        now = time.time()
+        with self._lock:
+            rows = list(
+                self._conn.execute(
+                    "SELECT * FROM drafts WHERE status = 'pending_generation' "
+                    "ORDER BY id LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            )
+            if rows:
+                ids = [row["id"] for row in rows]
+                placeholders = ",".join("?" * len(ids))
+                self._conn.execute(
+                    f"UPDATE drafts SET status='generating', claimed_at=?, "  # noqa: S608
+                    f"attempts=attempts+1, updated_at=? WHERE id IN ({placeholders})",
+                    (now, now, *ids),
+                )
+                self._conn.commit()
+        return [Draft.from_row(row) for row in rows]
+
+    def complete_draft_generation(self, draft_id: int, body: str, title: str = "") -> bool:
+        """Worker delivered a document — move it into the review queue."""
+        fields: list[Any] = [body]
+        assignments = "body = ?"
+        if title:
+            assignments += ", title = ?"
+            fields.append(title)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE drafts SET {assignments}, status='pending_review', "  # noqa: S608
+                "claimed_at=NULL, last_error='', updated_at=? "
+                "WHERE id = ? AND status IN ('generating', 'pending_generation')",
+                (*fields, time.time(), draft_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def fail_draft_generation(self, draft_id: int, error: str, max_attempts: int = 3) -> str:
+        """Worker could not produce a document.
+
+        Retried until ``max_attempts``, then parked as ``generation_failed``
+        so the lawyer is told rather than the request vanishing.
+        """
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT attempts FROM drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            if row is None:
+                return ""
+            status = "pending_generation" if row["attempts"] < max_attempts else "generation_failed"
+            self._conn.execute(
+                "UPDATE drafts SET status=?, claimed_at=NULL, last_error=?, updated_at=? "
+                "WHERE id = ? AND status IN ('generating', 'pending_generation')",
+                (status, error[:500], now, draft_id),
+            )
+            self._conn.commit()
+            return status
+
+    def requeue_stale_draft_jobs(self, older_than_s: float = 1800.0) -> int:
+        """A worker that died mid-job must not strand the request forever."""
+        cutoff = time.time() - older_than_s
+        cur = self._exec(
+            "UPDATE drafts SET status='pending_generation', claimed_at=NULL, updated_at=? "
+            "WHERE status='generating' AND claimed_at IS NOT NULL AND claimed_at < ?",
+            (time.time(), cutoff),
+        )
+        return cur.rowcount or 0
+
+    def draft_queue_depth(self) -> int:
+        row = self._query_one(
+            "SELECT COUNT(*) AS n FROM drafts WHERE status IN ('pending_generation','generating')"
+        )
+        return int(row["n"]) if row else 0
 
     def get_draft(self, draft_id: int) -> Draft | None:
         row = self._query_one("SELECT * FROM drafts WHERE id = ?", (draft_id,))
@@ -397,7 +521,15 @@ class Database:
         return [Draft.from_row(row) for row in rows]
 
     def update_draft(self, draft_id: int, **fields: Any) -> None:
-        allowed = {"title", "body", "status", "lawyer_note", "client_email", "sent_at"}
+        allowed = {
+            "title",
+            "body",
+            "status",
+            "lawyer_note",
+            "client_email",
+            "sent_at",
+            "instructions",
+        }
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return

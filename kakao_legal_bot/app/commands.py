@@ -99,13 +99,29 @@ async def handle_command(services: Services, event: IrisEvent, decision: Decisio
         return
 
     if command == "draft_list":
-        drafts = await asyncio.to_thread(db.list_drafts, "pending_review", 10)
-        if not drafts:
+        review = await asyncio.to_thread(db.list_drafts, "pending_review", 10)
+        waiting = [
+            draft
+            for status in ("pending_generation", "generating", "generation_failed")
+            for draft in await asyncio.to_thread(db.list_drafts, status, 10)
+        ]
+        if not review and not waiting:
             await reply("검토 대기 중인 초안이 없습니다.")
             return
-        lines = ["[검토 대기 초안]"]
-        for draft in drafts:
-            lines.append(f"#{draft.id} {draft.kind} · {draft.title} → {draft.client_email or '이메일 미등록'}")
+        lines: list[str] = []
+        if review:
+            lines.append("[검토 대기]")
+            for draft in review:
+                lines.append(
+                    f"#{draft.id} {draft.kind} · {draft.title} → {draft.client_email or '이메일 미등록'}"
+                )
+        if waiting:
+            if lines:
+                lines.append("")
+            lines.append("[작성 대기 — PC 워커]")
+            for draft in waiting:
+                mark = "작성 실패" if draft.status == "generation_failed" else "대기 중"
+                lines.append(f"#{draft.id} {draft.kind} · {draft.title} ({mark})")
         if settings.public_base_url:
             lines.append(f"\n검토/수정: {settings.public_base_url}/admin/drafts")
         await reply("\n".join(lines))
@@ -147,12 +163,16 @@ async def handle_command(services: Services, event: IrisEvent, decision: Decisio
         stats = services.rag.stats() if services.rag is not None else {}
         depth = await asyncio.to_thread(db.outbox_depth)
         pending = len(await asyncio.to_thread(db.list_drafts, "pending_review", 50))
+        jobs = await asyncio.to_thread(db.draft_queue_depth)
+        writer = "PC의 Codex 워커" if settings.draft_generator == "worker" else settings.draft_model
         await reply(
             "[모아 상태]\n"
-            f"- 모델: {settings.llm_model} ({settings.llm_provider})\n"
+            f"- 상담 응답: {settings.llm_model} ({settings.llm_provider})\n"
+            f"- 문서 초안: {writer}\n"
             f"- 로컬 자료: 문서 {stats.get('documents', 0)} / 청크 {stats.get('chunks', 0)}\n"
             f"- 법령 API: {'연결됨' if services.law is not None else '미설정'}\n"
             f"- 전송 대기(outbox): {depth}\n"
+            f"- 작성 대기 초안: {jobs}\n"
             f"- 검토 대기 초안: {pending}"
         )
         return

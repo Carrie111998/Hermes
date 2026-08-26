@@ -20,7 +20,7 @@
 
 ---
 
-## 1. 핵심 설계 네 가지
+## 1. 핵심 설계 다섯 가지
 
 ### ① 5초 룰 — 방이 침묵하지 않게
 
@@ -69,7 +69,35 @@ Iris는 내 PC 에뮬레이터에 있고 Railway는 클라우드에 있습니다
 (`LAWYER_FIRST_TURN_ALERTS=false` 로 끌 수 있습니다. 초안·에스컬레이션 알림은
 이 3번과 별개로 필요할 때 나갑니다.)
 
-### ④ 문서는 반드시 변호사를 거쳐서
+### ④ 문서 초안은 변호사님 PC의 Codex가 씁니다 (선택)
+
+상담 답변은 사람이 기다리지만 **문서 초안은 아무도 기다리지 않습니다.**
+어차피 변호사 검토를 거쳐야 나가니까요. 그래서 초안 작성만 떼어
+변호사님 PC로 내려보낼 수 있습니다.
+
+```
+DRAFT_GENERATOR=worker
+DRAFT_WORKER_TOKEN=<긴 랜덤 문자열>
+```
+
+그러면 서버는 초안을 만들지 않고 큐에 쌓고, PC에서 도는 워커가 가져가
+`codex exec` 로 작성해 돌려보냅니다.
+
+```bash
+python kakao_legal_bot/relay/moa_draft_worker.py \
+  --server https://<내서비스> --token "$DRAFT_WORKER_TOKEN"
+```
+
+얻는 것: **Codex의 에이전트 품질**(스스로 법령·판례를 찾고 자기 답을 검증),
+**초안 API 비용 0원**(이미 내고 계신 구독 사용), 그리고 **서버에 만료될
+구독 자격증명을 두지 않음**. PC가 꺼져 있으면 큐에 남아 있다가 켜질 때
+처리됩니다.
+
+`DRAFT_GENERATOR=llm`(기본)이면 지금까지처럼 서버가 API로 작성합니다.
+**상담 응답은 어느 쪽이든 항상 서버의 API 키를 씁니다** — 상담자를 기다리게
+할 수 없기 때문입니다.
+
+### ⑤ 문서는 반드시 변호사를 거쳐서
 
 모델이 쓴 초안은 `pending_review` 상태로 저장되고, 승인 전에는 **코드상 발송이 거부**됩니다
 (`workflows.send_draft`). 변호사는 카톡에서 `/승인 12` / `/발송 12` 로,
@@ -298,7 +326,7 @@ claude mcp add korean-law -- python kakao_legal_bot/mcp_law_server.py
 ## 8. 개발
 
 ```bash
-python -m pytest tests/kakao_legal_bot -q      # 145개
+python -m pytest tests/kakao_legal_bot -q      # 177개
 ```
 
 네트워크는 전부 목입니다. `test_end_to_end.py` 는 LLM 엔드포인트와 Iris만
@@ -315,4 +343,5 @@ python -m pytest tests/kakao_legal_bot -q      # 145개
 | `app/lawapi/` | 법령·판례 API 클라이언트 |
 | `app/workflows.py` · `app/admin.py` | 초안 생성 · 변호사 검토 · 이메일 |
 | `relay/moa_relay.py` | 에뮬레이터 옆에서 도는 아웃박스 릴레이 |
+| `relay/moa_draft_worker.py` | 변호사 PC에서 Codex로 초안을 쓰는 워커 |
 | `mcp_law_server.py` | 법령 검색 MCP 서버 |

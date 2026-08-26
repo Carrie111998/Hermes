@@ -138,6 +138,18 @@ class Settings:
     llm_max_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_TOKENS", 2000))
     llm_temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.2))
     llm_max_tool_rounds: int = field(default_factory=lambda: _env_int("LLM_MAX_TOOL_ROUNDS", 4))
+    # Who writes document drafts:
+    #   "llm"    — this server, via the same API key as the chat replies.
+    #   "worker" — queued for the Codex worker on the lawyer's own PC, which
+    #              uses their ChatGPT subscription. Nobody is waiting on a
+    #              draft, so moving it off the server costs nothing and keeps
+    #              a subscription credential out of the unattended box.
+    draft_generator: str = field(default_factory=lambda: _env("DRAFT_GENERATOR", "llm").lower())
+    draft_worker_token: str = field(default_factory=lambda: _env("DRAFT_WORKER_TOKEN"))
+    draft_job_timeout_s: float = field(
+        default_factory=lambda: _env_float("DRAFT_JOB_TIMEOUT_S", 1800.0)
+    )
+    draft_max_attempts: int = field(default_factory=lambda: _env_int("DRAFT_MAX_ATTEMPTS", 3))
     persona_path: Path = field(
         default_factory=lambda: Path(_env("PERSONA_PATH", "./kakao_legal_bot/persona.md"))
     )
@@ -228,6 +240,8 @@ class Settings:
             missing.append("IRIS_BASE_URL")
         if self.iris_send_mode in {"poll", "hybrid"} and not self.outbox_token:
             missing.append("OUTBOX_TOKEN")
+        if self.draft_generator == "worker" and not self.draft_worker_token:
+            missing.append("DRAFT_WORKER_TOKEN")
         return missing
 
 

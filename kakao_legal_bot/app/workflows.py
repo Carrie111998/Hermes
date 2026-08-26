@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from .docxgen import build_docx, safe_filename
 from .mailer import Attachment, MailError, send_email
@@ -29,14 +30,76 @@ CLIENT_MAIL_TEMPLATE = """{client_greeting}
 """
 
 
+def _transcript(history: list[Any]) -> str:
+    return "\n".join(
+        f"{message.sender or message.role}: {message.text}" for message in history if message.text
+    )
+
+
 async def create_draft(
     services: Services, room_id: str, request: DraftRequest, consult_id: int | None = None
 ) -> int:
-    """Generate a document draft and put it in the lawyer's review queue."""
+    """Queue or generate a document draft, then tell the lawyer about it."""
     db = services.db
-    history = await asyncio.to_thread(
-        db.recent_messages, room_id, services.settings.history_turns
+    settings = services.settings
+    history = await asyncio.to_thread(db.recent_messages, room_id, settings.history_turns)
+
+    email = ""
+    if consult_id is not None:
+        consultation = await asyncio.to_thread(db.get_consultation, consult_id)
+        if consultation is not None:
+            email = str(consultation["client_email"] or "")
+
+    if settings.draft_generator == "worker":
+        return await _queue_for_worker(services, room_id, request, consult_id, email, history)
+    return await _generate_here(services, room_id, request, consult_id, email, history)
+
+
+async def _queue_for_worker(
+    services: Services,
+    room_id: str,
+    request: DraftRequest,
+    consult_id: int | None,
+    email: str,
+    history: list[Any],
+) -> int:
+    """Hand the job to the Codex worker running on the lawyer's own machine.
+
+    The draft is stored with everything the worker needs, so the request
+    survives a server restart and a laptop that is simply switched off.
+    """
+    draft_id = await asyncio.to_thread(
+        services.db.create_draft,
+        room_id,
+        request.kind,
+        request.title,
+        "",
+        consult_id,
+        email,
+        "pending_generation",
+        request.instructions,
+        _transcript(history)[-8000:],
     )
+    depth = await asyncio.to_thread(services.db.draft_queue_depth)
+    await services.sender.notify_lawyer(
+        f"📝 초안 요청 접수 #{draft_id} — {request.kind} · {request.title}\n"
+        f"방: {room_id}\n"
+        f"상담자 이메일: {email or '미등록'}\n"
+        f"---\n{request.instructions[:300]}\n"
+        f"PC의 Codex 워커가 작성합니다. 대기 중 {depth}건.\n"
+        f"(PC가 꺼져 있으면 켜실 때 처리됩니다)"
+    )
+    return draft_id
+
+
+async def _generate_here(
+    services: Services,
+    room_id: str,
+    request: DraftRequest,
+    consult_id: int | None,
+    email: str,
+    history: list[Any],
+) -> int:
     try:
         body = await services.agent.draft_document(
             request.kind, request.title, request.instructions, history
@@ -49,36 +112,39 @@ async def create_draft(
             "변호사님이 직접 작성하셔야 합니다."
         )
 
-    email = ""
-    if consult_id is not None:
-        consultation = await asyncio.to_thread(db.get_consultation, consult_id)
-        if consultation is not None:
-            email = str(consultation["client_email"] or "")
-
     draft_id = await asyncio.to_thread(
-        db.create_draft,
+        services.db.create_draft,
         room_id,
         request.kind,
         request.title,
         body,
         consult_id,
         email,
+        "pending_review",
+        request.instructions,
     )
+    await notify_draft_ready(services, draft_id)
+    return draft_id
 
-    preview = " ".join(body.split())[:300]
+
+async def notify_draft_ready(services: Services, draft_id: int) -> None:
+    """Tell the lawyer a draft is sitting in the review queue."""
+    draft = await asyncio.to_thread(services.db.get_draft, draft_id)
+    if draft is None:
+        return
+    preview = " ".join(draft.body.split())[:300]
     link = (
         f"\n검토/수정: {services.settings.public_base_url}/admin/drafts/{draft_id}"
         if services.settings.public_base_url
         else ""
     )
     await services.sender.notify_lawyer(
-        f"📄 새 초안 #{draft_id} — {request.kind} · {request.title}\n"
-        f"방: {room_id}\n"
-        f"상담자 이메일: {email or '미등록'}\n"
+        f"📄 초안 준비됨 #{draft_id} — {draft.kind} · {draft.title}\n"
+        f"방: {draft.room_id}\n"
+        f"상담자 이메일: {draft.client_email or '미등록'}\n"
         f"---\n{preview}…{link}\n"
         f"승인: /승인 {draft_id}   발송: /발송 {draft_id}"
     )
-    return draft_id
 
 
 async def notify_escalation(

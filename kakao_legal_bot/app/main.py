@@ -24,6 +24,7 @@ from .config import Settings, get_settings
 from .iris import IrisEvent
 from .pipeline import Pipeline
 from .services import Services, build_services
+from .workflows import notify_draft_ready
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +66,8 @@ async def health(request: Request) -> JSONResponse:
             "law_api": services.law is not None,
             "rag": stats,
             "outbox_queued": depth,
+            "draft_generator": settings.draft_generator,
+            "draft_jobs_queued": await asyncio.to_thread(services.db.draft_queue_depth),
             "missing_config": settings.missing_required(),
         }
     )
@@ -137,6 +140,92 @@ async def outbox_ack(request: Request, x_outbox_token: str = Header(default=""))
     return JSONResponse({"ok": True, "acked": len(ids)})
 
 
+def _require_worker_token(services: Services, request: Request, header_value: str) -> None:
+    token = services.settings.draft_worker_token
+    supplied = header_value or request.query_params.get("token", "")
+    if not token or not hmac.compare_digest(supplied, token):
+        raise HTTPException(401, "invalid draft worker token")
+
+
+@router.get("/drafts/queue")
+async def draft_queue(
+    request: Request, x_worker_token: str = Header(default="")
+) -> JSONResponse:
+    """The Codex worker on the lawyer's PC pulls document jobs from here.
+
+    Jobs are *claimed*, not just listed, so a restarted worker cannot write
+    the same document twice.
+    """
+    services: Services = request.app.state.services
+    _require_worker_token(services, request, x_worker_token)
+
+    limit = min(int(request.query_params.get("limit", 1)), 5)
+    jobs = await asyncio.to_thread(services.db.claim_draft_jobs, limit)
+    return JSONResponse(
+        {
+            "jobs": [
+                {
+                    "id": job.id,
+                    "kind": job.kind,
+                    "title": job.title,
+                    "instructions": job.instructions,
+                    "transcript": job.transcript,
+                    "room_id": job.room_id,
+                    "attempts": job.attempts,
+                }
+                for job in jobs
+            ]
+        }
+    )
+
+
+@router.post("/drafts/{draft_id}/result")
+async def draft_result(
+    draft_id: int, request: Request, x_worker_token: str = Header(default="")
+) -> JSONResponse:
+    """The worker delivers a finished document; it enters the review queue."""
+    services: Services = request.app.state.services
+    _require_worker_token(services, request, x_worker_token)
+
+    body = await request.json()
+    text = str(body.get("body") or "").strip()
+    if not text:
+        raise HTTPException(400, "body is empty")
+
+    ok = await asyncio.to_thread(
+        services.db.complete_draft_generation, draft_id, text, str(body.get("title") or "")
+    )
+    if not ok:
+        # Already delivered, or the lawyer edited it in the meantime.
+        return JSONResponse({"ok": False, "reason": "not awaiting generation"}, status_code=409)
+
+    _spawn(notify_draft_ready(services, draft_id))
+    return JSONResponse({"ok": True})
+
+
+@router.post("/drafts/{draft_id}/fail")
+async def draft_failed(
+    draft_id: int, request: Request, x_worker_token: str = Header(default="")
+) -> JSONResponse:
+    """The worker could not produce a document — retry, then tell the lawyer."""
+    services: Services = request.app.state.services
+    _require_worker_token(services, request, x_worker_token)
+
+    body = await request.json()
+    error = str(body.get("error") or "unknown error")
+    status = await asyncio.to_thread(
+        services.db.fail_draft_generation, draft_id, error, services.settings.draft_max_attempts
+    )
+    if status == "generation_failed":
+        _spawn(
+            services.sender.notify_lawyer(
+                f"⚠️ 초안 #{draft_id} 자동 작성에 실패했습니다 — 직접 작성이 필요합니다.\n"
+                f"사유: {error[:300]}"
+            )
+        )
+    return JSONResponse({"ok": True, "status": status})
+
+
 @router.get("/", response_class=PlainTextResponse)
 async def index() -> PlainTextResponse:
     return PlainTextResponse("moa legal bot is running. POST /iris/webhook")
@@ -152,8 +241,14 @@ async def _janitor(app: FastAPI) -> None:
                 services.db.purge_old_messages, services.settings.history_retention_days
             )
             requeued = await asyncio.to_thread(services.db.requeue_stale_outbox, 300.0)
-            if purged or requeued:
-                log.info("janitor: purged=%s requeued=%s", purged, requeued)
+            # A worker that died mid-document must not strand the request.
+            drafts = await asyncio.to_thread(
+                services.db.requeue_stale_draft_jobs, services.settings.draft_job_timeout_s
+            )
+            if purged or requeued or drafts:
+                log.info(
+                    "janitor: purged=%s requeued=%s drafts_requeued=%s", purged, requeued, drafts
+                )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

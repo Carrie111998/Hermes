@@ -174,7 +174,7 @@ async def test_create_draft_queues_it_and_pings_the_lawyer(wiring):
     draft = services.db.get_draft(draft_id)
     assert draft.status == "pending_review"
     assert draft.client_email == "hong@example.com"
-    assert any("새 초안" in note for note in sender.lawyer_notes)
+    assert any("초안 준비됨" in note for note in sender.lawyer_notes)
 
 
 @pytest.mark.asyncio

@@ -401,4 +401,4 @@ async def test_draft_request_creates_a_pending_draft(settings, db):
     assert len(drafts) == 1
     assert drafts[0].kind == "내용증명"
     assert drafts[0].body == "초안 본문"
-    assert any("새 초안" in note for note in sender.lawyer_notes)
+    assert any("초안 준비됨" in note for note in sender.lawyer_notes)
