@@ -2270,6 +2270,89 @@ def _fs_looks_binary(data: bytes) -> bool:
     return suspicious / len(data) > 0.12
 
 
+# ---------------------------------------------------------------------------
+# Spot-editor write sandbox (#95306). POST /api/fs/write-text serves remote
+# dashboard sessions too — the local Electron shell saves through its own
+# hardened IPC — so an authenticated remote session must not be able to
+# overwrite arbitrary files as the gateway user: cron scripts,
+# ~/.hermes/config.yaml, .ssh/authorized_keys and friends are all
+# text-writable RCE primitives. Writes are confined to the workspace roots
+# below and credential/shell-startup targets are denied outright.
+# ---------------------------------------------------------------------------
+
+_FS_WRITE_ROOTS_ENV = "HERMES_DASHBOARD_WRITE_ROOTS"
+
+# Basenames that turn a text write into code execution or credential
+# substitution. Denied even inside an allowed write root (case-insensitive).
+_FS_WRITE_DENIED_BASENAMES = frozenset({
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".zshenv",
+    ".zprofile",
+    ".zshrc",
+    ".profile",
+    "authorized_keys",
+})
+
+# Directory trees whose contents are live keys/credentials. Component match,
+# so they're denied wherever they appear under an allowed write root.
+_FS_WRITE_DENIED_DIR_NAMES = frozenset({
+    ".ssh",
+    ".gnupg",
+})
+
+
+def _fs_write_roots() -> list[Path]:
+    """Writable roots for the spot-editor save endpoint.
+
+    ``HERMES_DASHBOARD_WRITE_ROOTS`` — an ``os.pathsep``-separated list of
+    absolute directories — replaces the default when set; without it the
+    sandbox is the gateway's editor anchor directory (:func:`_fs_default_cwd`),
+    i.e. the tree the remote Files/editor view opens in.
+    """
+    raw = os.environ.get(_FS_WRITE_ROOTS_ENV, "").strip()
+    if raw:
+        roots: list[Path] = []
+        for part in raw.split(os.pathsep):
+            candidate = part.strip()
+            if not candidate:
+                continue
+            try:
+                roots.append(Path(candidate).expanduser().resolve(strict=False))
+            except (OSError, RuntimeError):
+                continue
+        if roots:
+            return roots
+    try:
+        return [Path(_fs_default_cwd()).resolve(strict=False)]
+    except (OSError, RuntimeError):
+        return [Path.cwd().resolve(strict=False)]
+
+
+def _fs_write_guard(target: Path) -> None:
+    """Reject spot-editor writes that escape the sandbox or hit live secrets.
+
+    Two layers, mirroring the guards the other ``/api/fs`` surfaces carry:
+    credential stores are denied outright (same denial surface as
+    ``/api/fs/download`` via :func:`_is_sensitive_path`, plus the write-only
+    shell-startup/key-tree denylists), and the resolved target must sit under
+    one of :func:`_fs_write_roots` — anything else escapes the sandbox.
+    """
+    if (
+        _is_sensitive_path(target)
+        or any(part.lower() in _FS_WRITE_DENIED_DIR_NAMES for part in target.parts)
+        or target.name.lower() in _FS_WRITE_DENIED_BASENAMES
+    ):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    roots = _fs_write_roots()
+    if not any(_path_is_under(root, target) for root in roots):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Path is outside the dashboard write roots (set {_FS_WRITE_ROOTS_ENV} to add more)",
+        )
+
+
 def _fs_regular_file(path: Path) -> tuple[Path, os.stat_result]:
     target = _fs_path(str(path))
     try:
@@ -3036,8 +3119,15 @@ async def fs_write_text(payload: FsWriteText):
     and ``os.replace``-d into place so a crash mid-write can't truncate the
     original. Stale-on-disk detection is the client's job (re-read before save),
     so both transports behave identically.
+
+    Unlike the Electron-local IPC transport, this HTTP mirror also serves
+    remote dashboard sessions (#95306), so writes additionally pass through
+    ``_fs_write_guard``: credential stores and shell-startup/key material are
+    denied outright, and paths outside the write roots (the editor anchor cwd,
+    extended via ``HERMES_DASHBOARD_WRITE_ROOTS``) are rejected.
     """
     target = _fs_path(payload.path)
+    _fs_write_guard(target)
     text = payload.content or ""
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
