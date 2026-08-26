@@ -175,6 +175,7 @@ export function NarrowOverlays() {
           aria-modal="true"
           data-glass-opaque=""
           data-narrow-pane-overlay=""
+          data-narrow-pane-side={sideOf(revealed)}
           onMouseLeave={() => {
             if (!revealRef.current?.pinned) closeReveal()
           }}
