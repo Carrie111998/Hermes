@@ -652,6 +652,17 @@ def test_short_alphabetic_words_are_allowed_in_sanitized_remote_text(tmp_path):
     assert firewall(tmp_path).preflight(request, _route()).allowed
 
 
+def test_json_protocol_acronym_is_not_a_base64_false_positive(tmp_path):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment("Return JSON only.")]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    assert firewall(tmp_path).preflight(request, _route()).allowed
+
+
 def test_scanner_error_fails_closed(monkeypatch, tmp_path):
     def explode(*args, **kwargs):
         raise RuntimeError("scanner unavailable")

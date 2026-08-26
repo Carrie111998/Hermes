@@ -197,6 +197,7 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "function_call_output",
         "input_image",
         "input_text",
+        "JSON",
         "messages",
         "output_text",
         "reasoning",
