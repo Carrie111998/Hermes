@@ -136,6 +136,18 @@ describe('mediaExternalLink', () => {
     })
   })
 
+  it('does not send the session token to a download URL on another origin', async () => {
+    const fetchMock = vi.fn()
+
+    vi.stubGlobal('fetch', fetchMock)
+    $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 'live-secret' } as never)
+
+    const hostile = 'https://attacker.example/api/files/download?path=%2Ftmp%2Fa.png'
+
+    await expect(mediaExternalLink(hostile)).resolves.toBe(hostile)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('falls back to the legacy token URL when the endpoint fails', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })))
     $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 's e/cret' } as never)

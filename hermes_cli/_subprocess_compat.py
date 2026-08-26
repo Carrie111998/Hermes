@@ -47,6 +47,7 @@ __all__ = [
     "bounded_probe_run",
     "noninteractive_git_env",
     "command_needs_shell",
+    "resolve_configured_argv",
     "run_configured_command",
 ]
 
@@ -76,6 +77,24 @@ _SHELL_EXPANSION_CHARS: frozenset[str] = frozenset("$*?[]~`!#")
 # Characters that shlex consumes rather than returns as tokens (multi-line
 # commands, comments) — presence anywhere in the raw string forces the shell.
 _SHELL_RAW_ONLY_CHARS: tuple[str, ...] = ("\n", "\r", "#")
+
+# Commands in the Node ecosystem commonly resolve to Windows batch launchers.
+# Keep this list deliberately narrow: shell builtins such as ``echo`` must not
+# be sent through PATH resolution because they have no executable on disk.
+_NODE_LAUNCHER_NAMES: frozenset[str] = frozenset({
+    "bun",
+    "corepack",
+    "eslint",
+    "node",
+    "npm",
+    "npx",
+    "playwright",
+    "pnpm",
+    "prettier",
+    "tsc",
+    "tsx",
+    "yarn",
+})
 
 
 def command_needs_shell(command: str) -> bool:
@@ -155,7 +174,33 @@ def run_configured_command(command: str, **kwargs) -> "subprocess.CompletedProce
     if not argv:
         # Empty/whitespace-only command: match shell behavior (exit 0, no-op).
         return subprocess.run(command, shell=True, **kwargs)
-    return subprocess.run(argv, **kwargs)
+    return subprocess.run(resolve_configured_argv(argv), **kwargs)
+
+
+def resolve_configured_argv(argv: Sequence[str]) -> list[str]:
+    """Resolve configured Node commands before an argv-based spawn.
+
+    ``split_command_line`` intentionally returns the command as written. On
+    Windows that leaves ``npm``/``npx`` as a bare name even though the actual
+    launcher on PATH is ``npm.cmd``/``npx.cmd``. Resolve those known Node
+    commands through ``shutil.which`` before passing the argv to
+    ``subprocess``. Explicit ``.cmd`` commands are resolved too, so custom
+    batch launchers receive the same treatment.
+
+    Other commands are returned unchanged; in particular, shell builtins are
+    not transformed into impossible filesystem paths. The helper is also
+    used by async subprocess callers so sync and async configured-command
+    execution share the same Windows contract.
+    """
+    if not argv:
+        return []
+
+    executable = str(argv[0])
+    basename = executable.replace(chr(92), "/").rsplit("/", 1)[-1].lower()
+    stem = basename[:-4] if basename.endswith(".cmd") else basename
+    if stem not in _NODE_LAUNCHER_NAMES and not basename.endswith(".cmd"):
+        return list(argv)
+    return resolve_node_command(executable, argv[1:])
 
 
 def split_command_line(line: str) -> list[str]:

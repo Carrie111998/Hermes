@@ -148,8 +148,19 @@ export async function mediaExternalLink(path: string): Promise<string> {
       const url = new URL(path)
       const file = url.searchParams.get('path')
 
-      if (url.pathname.endsWith('/api/files/download') && file) {
-        const signed = await mintSignedLink(url.origin, file)
+      const conn = isRemoteGateway() ? $connection.get() : null
+      const configuredBaseUrl = normalizeGatewayBaseUrl(conn?.baseUrl)
+      const configuredOrigin = configuredBaseUrl ? new URL(configuredBaseUrl).origin : null
+
+      // Never send the live session token to an origin taken from content.
+      // Only legacy download URLs on the active gateway may be re-minted.
+      if (
+        url.pathname.endsWith('/api/files/download') &&
+        file &&
+        configuredBaseUrl &&
+        configuredOrigin === url.origin
+      ) {
+        const signed = await mintSignedLink(file)
 
         if (signed) {
           return signed
@@ -164,8 +175,10 @@ export async function mediaExternalLink(path: string): Promise<string> {
 
   const conn = isRemoteGateway() ? $connection.get() : null
 
-  if (conn?.baseUrl && conn.token) {
-    const signed = await mintSignedLink(conn.baseUrl, filePathFromMediaPath(path))
+  const configuredBaseUrl = normalizeGatewayBaseUrl(conn?.baseUrl)
+
+  if (configuredBaseUrl && conn.token) {
+    const signed = await mintSignedLink(filePathFromMediaPath(path))
 
     if (signed) {
       return signed
@@ -191,8 +204,33 @@ export async function mediaExternalLink(path: string): Promise<string> {
   return mediaExternalUrl(path)
 }
 
-async function mintSignedLink(baseUrl: string, file: string): Promise<string | null> {
-  const conn = $connection.get()
+function normalizeGatewayBaseUrl(baseUrl?: string): string | null {
+  const trimmed = baseUrl?.trim()
+
+  if (!trimmed) {
+    return null
+  }
+
+  try {
+    const url = new URL(trimmed)
+
+    if (!/^https?:$/i.test(url.protocol)) {
+      return null
+    }
+
+    return trimmed.replace(/\/+$/, '')
+  } catch {
+    return null
+  }
+}
+
+async function mintSignedLink(file: string): Promise<string | null> {
+  const conn = isRemoteGateway() ? $connection.get() : null
+  const baseUrl = normalizeGatewayBaseUrl(conn?.baseUrl)
+
+  if (!baseUrl || !conn?.token) {
+    return null
+  }
 
   try {
     const resp = await fetch(`${baseUrl}/api/files/download-link`, {

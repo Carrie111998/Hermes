@@ -18123,6 +18123,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             from tools.environments.local import build_subprocess_env
                             from hermes_cli._subprocess_compat import (
                                 command_needs_shell,
+                                resolve_configured_argv,
                                 split_command_line,
                             )
                             sanitized_env = build_subprocess_env()
@@ -18139,7 +18140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # argv-first hardening: no shell is spawned, so
                                 # metacharacters in arguments stay inert.
                                 proc = await asyncio.create_subprocess_exec(
-                                    *split_command_line(exec_cmd),
+                                    *resolve_configured_argv(split_command_line(exec_cmd)),
                                     stdout=asyncio.subprocess.PIPE,
                                     stderr=asyncio.subprocess.PIPE,
                                     env=sanitized_env,
