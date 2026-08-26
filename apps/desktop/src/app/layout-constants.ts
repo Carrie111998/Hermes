@@ -30,3 +30,16 @@ export const SIDEBAR_COLLAPSE_BREAKPOINT_PX = 1024
 // usable touch layout rather than inheriting a cramped desktop grid.
 export const SIDEBAR_COMPACT_LANDSCAPE_MEDIA_QUERY = '(max-height: 500px) and (orientation: landscape)'
 export const SIDEBAR_COLLAPSE_MEDIA_QUERY = `(max-width: ${SIDEBAR_COLLAPSE_BREAKPOINT_PX}px), ${SIDEBAR_COMPACT_LANDSCAPE_MEDIA_QUERY}`
+
+/** A native mobile shell stays touch-first at every physical width. An unfolded
+ * Fold can exceed the CSS breakpoint while still requiring drawer navigation,
+ * not a persistent desktop rail. */
+export function shouldUseNarrowPaneLayout({
+  mediaQueryMatches,
+  mobileRenderer
+}: {
+  mediaQueryMatches: boolean
+  mobileRenderer: boolean
+}): boolean {
+  return mediaQueryMatches || mobileRenderer
+}

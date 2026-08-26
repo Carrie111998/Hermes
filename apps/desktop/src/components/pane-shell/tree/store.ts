@@ -6,7 +6,7 @@
 
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
-import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
+import { SIDEBAR_COLLAPSE_MEDIA_QUERY, shouldUseNarrowPaneLayout } from '@/app/layout-constants'
 import { setPluginEnabled } from '@/contrib/plugins-store'
 import { registry } from '@/contrib/registry'
 import { translateNow } from '@/i18n'
@@ -1104,9 +1104,17 @@ export function revealTreePane(paneId: string) {
 // test env has no `window`/`matchMedia` — an unguarded call throws at load.
 const narrowQuery = typeof window !== 'undefined' ? window.matchMedia?.(SIDEBAR_COLLAPSE_MEDIA_QUERY) : undefined
 
-export const $narrowViewport = atom(Boolean(narrowQuery?.matches))
+function isMobileRenderer() {
+  return typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
+}
 
-narrowQuery?.addEventListener('change', event => $narrowViewport.set(event.matches))
+export const $narrowViewport = atom(
+  shouldUseNarrowPaneLayout({ mediaQueryMatches: Boolean(narrowQuery?.matches), mobileRenderer: isMobileRenderer() })
+)
+
+narrowQuery?.addEventListener('change', event =>
+  $narrowViewport.set(shouldUseNarrowPaneLayout({ mediaQueryMatches: event.matches, mobileRenderer: isMobileRenderer() }))
+)
 
 /** The titlebar flip toggle (⌘\): mirror the whole layout left↔right. */
 export function mirrorLayoutTree() {
