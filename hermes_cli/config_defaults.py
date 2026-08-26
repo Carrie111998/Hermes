@@ -2047,6 +2047,16 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Background processes started by subagents (task_id "sa-...") route
+        # their notify_on_complete / watch_pattern notifications to the PARENT
+        # conversation (children consume their own waits; anything outliving
+        # the child needs a durable consumer). By default those parent-facing
+        # notifications are SUPPRESSED — the child's consolidated delegation
+        # result is the deliverable, and "npm ci finished" walls mid-chat are
+        # noise. Async-delegation results themselves are NEVER suppressed.
+        # Set to true to restore delivery of child process notifications
+        # (with subagent attribution lines).
+        "surface_child_process_notifications": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -2833,6 +2843,10 @@ DEFAULT_CONFIG = {
             #     model knows which domains are reachable; individual tools
             #     discoverable through tool_search only.
             # "auto"/"on" — activate when at least one deferrable tool exists.
+            #   Today "auto" is an alias of "on"; it stays the default so a
+            #   future budget-gated mode (inline schemas when they fit, defer
+            #   only when they don't) can land on "auto" without changing
+            #   behavior for anyone who pinned "on" or "off" explicitly.
             # "off" — disable entirely. Tools-array assembly is a pass-through.
             "enabled": "auto",
             # Listing budget as a percentage of the active model's context
@@ -2840,10 +2854,11 @@ DEFAULT_CONFIG = {
             # listing_max_tokens). Range 0..100.
             "threshold_pct": 5,
             # When the model calls tool_search without a ``limit`` argument,
-            # how many hits to return. Range 1..max_search_limit.
+            # how many hits to return PER QUERY. Range 1..max_search_limit.
             "search_default_limit": 5,
-            # Hard upper bound the model can request via ``limit``. Range 1..50.
-            "max_search_limit": 20,
+            # Hard upper bound the model can request via ``limit`` (per
+            # query). Range 1..50.
+            "max_search_limit": 25,
             # Skills-style catalog listing embedded in the tool_search bridge
             # description: every deferred tool's name + first sentence of its
             # description (≤60 chars), grouped by MCP server / toolset. Keeps
@@ -3632,6 +3647,12 @@ DEFAULT_CONFIG = {
         # flags when it launches the runtime. See
         # https://cua.ai/docs/reference/cua-driver/permission-modes
         "capability_manifest": "",
+        # macOS only: allow launching an UNSIGNED (ad-hoc / TeamIdentifier
+        # not set) CuaDriver.app for the private-session daemon. The default
+        # (false) fails closed unless the bundle is signed with the official
+        # cua-driver identity (com.trycua.driver / team 4YEC26S9KF). Enable
+        # only when developing the driver locally from source.
+        "allow_unsigned_driver": False,
         # Pre-authorize existing-profile browser attachment in standard mode
         # (cua-driver's trusted-launcher `--grant existing-profile`). When
         # true, the agent can attach to your already-running, signed-in
