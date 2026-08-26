@@ -224,7 +224,15 @@ def _resolve_hermes_bin_for_desktop_entry(
 
     if checkout_root is None:
         checkout_root = _project_root()
-    checkout_root = Path(checkout_root).resolve()
+    # Keep the LEXICAL form: _inside_checkout resolves candidates for its
+    # own comparison anyway, and _wrapper_targets_checkout needs the
+    # lexical root because the installer writes $INSTALL_DIR lexically
+    # into the shim text (symlinked homes would otherwise mismatch).
+    # Production callers pass main.py's realpath'd PROJECT_ROOT; the
+    # module-lexical root derived from __file__ is added alongside so a
+    # symlinked home still matches the shim's lexically-written paths.
+    checkout_root = Path(os.path.abspath(checkout_root))
+    module_lexical_root = _project_root()
     original_argv0 = sys.argv[0]
 
     def _inside_checkout(candidate: str) -> bool:
@@ -233,9 +241,17 @@ def _resolve_hermes_bin_for_desktop_entry(
         except OSError:
             return False
         # The repo `hermes` script and anything else shipped in the tree is
-        # checkout-internal.
-        if path == checkout_root or checkout_root in path.parents:
-            return True
+        # checkout-internal. Compare against BOTH the lexical and resolved
+        # roots (checkout_root is kept lexical; candidates resolve, so a
+        # symlinked home needs the resolved comparison too).
+        resolved_root = None
+        try:
+            resolved_root = checkout_root.resolve()
+        except OSError:
+            pass
+        for root in {checkout_root, resolved_root}:
+            if root is not None and (path == root or root in path.parents):
+                return True
         # The `python -m hermes_cli.main` relaunch context surfaces the
         # invoking interpreter (or a non-executable main.py, which the
         # resolver already skips) as argv[0]; an interpreter is never a
@@ -310,7 +326,9 @@ def _resolve_hermes_bin_for_desktop_entry(
         probe = _known_wrapper_candidates()
         for candidate in probe:
             if candidate.is_file() and os.access(candidate, os.X_OK):
-                if _wrapper_targets_checkout(candidate, checkout_root):
+                if _wrapper_targets_checkout(
+                    candidate, checkout_root
+                ) or _wrapper_targets_checkout(candidate, module_lexical_root):
                     return str(candidate)
         # No durable wrapper for THIS checkout exists anywhere (PATH
         # miss, known locations miss or belong to another install).
@@ -324,6 +342,12 @@ def _resolve_hermes_bin_for_desktop_entry(
 
 def _wrapper_targets_checkout(wrapper: Path, checkout_root: Path) -> bool:
     """Whether a candidate launcher script actually launches THIS checkout.
+
+    Expects the LEXICAL checkout root (the caller keeps it un-resolved):
+    the installer writes ``$INSTALL_DIR`` lexically into the shim, so on a
+    symlinked home the shim text and the resolved root would never match.
+    Both lexical and resolved forms of the root are tried regardless, to
+    tolerate either caller convention.
 
     The installer's shim is a small bash script that execs
     ``<checkout>/venv/bin/python <checkout>/hermes``; a venv console
@@ -346,9 +370,35 @@ def _wrapper_targets_checkout(wrapper: Path, checkout_root: Path) -> bool:
         text = head.decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001 - defensive decode
         return False
-    checkout_str = str(checkout_root)
-    venv_str = str(checkout_root / "venv")
-    return checkout_str in text or venv_str in text
+    # Boundary-aware matching: a bare substring test would also accept
+    # sibling paths that EXTEND this checkout's path (an old install
+    # renamed aside as `<checkout>-old` or `<checkout>.bak`), silently
+    # pointing the entry at that other installation. Require the
+    # reference to end the path (quote, whitespace, or end-of-line
+    # right after the root) or continue INTO it.
+    # Compare both the resolved root and its lexical form: the installer
+    # writes $INSTALL_DIR lexically, so with a symlinked home
+    # (/home/user -> /mnt/disk/home/user) the shim's text carries the
+    # lexical path while checkout_root arrives resolved.
+    roots = {str(checkout_root)}
+    lexical_root = os.path.abspath(str(checkout_root))
+    roots.add(lexical_root)
+    try:
+        resolved_lexical = str(Path(lexical_root).resolve())
+        roots.add(resolved_lexical)
+    except OSError:
+        pass
+    for root in roots:
+        for terminator in ('"', "'", " ", "\n", "\t", "\r", "$", "\x00"):
+            if root + terminator in text:
+                return True
+        if text.rstrip("\r\n").endswith(root):
+            return True
+        # The shim's exec line continues INTO the checkout (…/python
+        # <root>/hermes …): a path-continuation boundary is also a match.
+        if root + "/" in text:
+            return True
+    return False
 
 
 def _known_wrapper_candidates():
@@ -370,8 +420,13 @@ def _known_wrapper_candidates():
 
 
 def _project_root() -> Path:
-    """This file lives at ``<checkout>/hermes_cli/linux_desktop_entry.py``."""
-    return Path(__file__).resolve().parent.parent
+    """This file lives at ``<checkout>/hermes_cli/linux_desktop_entry.py``.
+
+    Lexical (no .resolve()): callers feed this into shim-text matching
+    where the installer's lexically-written $INSTALL_DIR must be able to
+    match; symlinked homes would break a resolved comparison.
+    """
+    return Path(os.path.abspath(__file__)).parent.parent
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
