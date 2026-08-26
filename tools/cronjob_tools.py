@@ -14,8 +14,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from hermes_constants import display_hermes_home
-
 logger = logging.getLogger(__name__)
 
 # Cadence for the heartbeat that keeps the calling agent's inactivity watchdog
@@ -1874,7 +1872,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "script": {
                 "type": "string",
-                "description": f"Optional script run each tick; stdout is injected into the agent's prompt as context (with no_agent=True the script IS the job). Relative paths resolve under {display_hermes_home()}/scripts/; .sh/.bash via bash, else Python. On update, '' clears."
+                "description": "Optional script run each tick; stdout is injected into the agent's prompt as context (with no_agent=True the script IS the job). Relative paths resolve under the active profile's scripts/ directory in the Hermes home; .sh/.bash via bash, else Python. On update, '' clears."
             },
             "monitor": {
                 "type": "string",
