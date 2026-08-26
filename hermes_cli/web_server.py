@@ -3036,8 +3036,19 @@ async def fs_write_text(payload: FsWriteText):
     and ``os.replace``-d into place so a crash mid-write can't truncate the
     original. Stale-on-disk detection is the client's job (re-read before save),
     so both transports behave identically.
+
+    Sensitive targets are refused with the same guard the read surfaces apply
+    (#95306, minimal half): the denylist covers the Hermes credential and
+    config stores (``auth.json``, ``.env*``, ``config.yaml``), and overwriting
+    them through the HTTP spot editor is the config-injection chain — a
+    rewritten ``config.yaml`` registers an attacker-controlled MCP stdio
+    server that executes on next tool resolution. A configurable write-root
+    allowlist is the fuller design and is deliberately left to maintainer
+    discussion; this half only closes the credential-store overwrite.
     """
     target = _fs_path(payload.path)
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     text = payload.content or ""
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
