@@ -486,7 +486,7 @@ class TestPauseResumeJob:
     def test_resume_reenables_job(self, tmp_cron_dir):
         job = create_job(prompt="Resume me", schedule="every 1h")
         pause_job(job["id"], reason="user paused")
-        resumed = resume_job(job["id"])
+        resumed = resume_job(job["id"], caller="test:resume")
         assert resumed is not None
         assert resumed["enabled"] is True
         assert resumed["state"] == "scheduled"
@@ -509,7 +509,7 @@ class TestPauseResumeJob:
         """
         job = create_job(prompt="Resume me", schedule="every 1h")
         pause_job(job["id"], reason="host was CPU-saturated")
-        resumed = resume_job(job["id"])
+        resumed = resume_job(job["id"], caller="test:resume")
 
         assert resumed["paused_reason"] is None
         assert resumed["paused_at"] is None
@@ -543,7 +543,7 @@ class TestPauseResumeJob:
             },
         )
 
-        resumed = resume_job(job["id"])
+        resumed = resume_job(job["id"], caller="test:resume")
 
         assert resumed["enabled"] is True
         assert resumed["state"] == "scheduled"
@@ -579,7 +579,7 @@ class TestPauseResumeJob:
             },
         )
 
-        resumed = resume_job(job["id"])
+        resumed = resume_job(job["id"], caller="test:resume")
 
         assert resumed["paused"] is False
         assert resumed["enabled"] is True
@@ -613,9 +613,9 @@ class TestPauseResumeJob:
             return record["paused"] is (record["state"] == "paused")
 
         assert _coherent(get_job(job["id"]))
-        assert _coherent(resume_job(job["id"]))
+        assert _coherent(resume_job(job["id"], caller="test:resume"))
         assert _coherent(pause_job(job["id"], reason="second pause"))
-        assert _coherent(resume_job(job["id"]))
+        assert _coherent(resume_job(job["id"], caller="test:resume"))
 
     # ---------------------------------------------------------------------
     # The INCOHERENT legacy shape as an INPUT state.
@@ -671,7 +671,7 @@ class TestPauseResumeJob:
         """
         job = self._seed_incoherent_legacy_row("Contained, flag says live")
 
-        resumed = resume_job(job["id"])
+        resumed = resume_job(job["id"], caller="test:resume")
 
         assert resumed["paused"] is False
         assert resumed["enabled"] is True
@@ -726,9 +726,9 @@ class TestPauseResumeJob:
         def _coherent(record):
             return record["paused"] is (record["state"] == "paused")
 
-        assert _coherent(resume_job(job["id"]))
+        assert _coherent(resume_job(job["id"], caller="test:resume"))
         assert _coherent(pause_job(job["id"], reason="re-contained"))
-        assert _coherent(resume_job(job["id"]))
+        assert _coherent(resume_job(job["id"], caller="test:resume"))
         assert _coherent(pause_job(job["id"], reason="re-contained again"))
         assert _coherent(get_job(job["id"]))
 
@@ -757,14 +757,14 @@ class TestPauseResumeJob:
         """Don't grow every record a key it never carried."""
         job = create_job(prompt="Resume me", schedule="every 1h")
         pause_job(job["id"], reason="routine")
-        resumed = resume_job(job["id"])
+        resumed = resume_job(job["id"], caller="test:resume")
         assert "paused" not in resumed
 
     def test_resume_without_a_recorded_pause_writes_no_history(self, tmp_cron_dir):
         """A job disabled directly (no paused_at/reason) has nothing to archive."""
         job = create_job(prompt="Resume me", schedule="every 1h")
         update_job(job["id"], {"enabled": False, "state": "paused"})
-        resumed = resume_job(job["id"])
+        resumed = resume_job(job["id"], caller="test:resume")
         assert "paused_history" not in resumed
 
     def test_paused_history_is_bounded(self, tmp_cron_dir):
@@ -774,7 +774,7 @@ class TestPauseResumeJob:
         job = create_job(prompt="Churn me", schedule="every 1h")
         for i in range(PAUSED_HISTORY_LIMIT + 3):
             pause_job(job["id"], reason=f"cycle {i}")
-            resume_job(job["id"])
+            resume_job(job["id"], caller="test:resume")
 
         history = get_job(job["id"])["paused_history"]
         assert len(history) == PAUSED_HISTORY_LIMIT
@@ -831,7 +831,7 @@ class TestPauseResumeJob:
         }
         save_jobs([job])
         with pytest.raises(ValueError, match="in the past"):
-            resume_job("test-resume-past")
+            resume_job("test-resume-past", caller="test:resume")
 
 
 class TestResolveJobRef:

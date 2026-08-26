@@ -267,8 +267,17 @@ class TestResumeEmits:
         assert bus.query(event_type=EventType.CRON_RESUMED) == []
 
     def test_anonymous_caller_warns(self, store, caplog):
+        """The warn path survives, but only where it is still reachable.
+
+        As of 2026-08-26 an anonymous resume of a pause that carries a
+        ``paused_reason`` is REFUSED outright rather than warned about (see
+        tests/cron/test_resume_barrier.py), so this pause deliberately states
+        no reason. A pause that says nothing has no stated condition to
+        protect, and warning is still the right answer there: attribution is
+        worth having even when nothing is being gated.
+        """
         job = _mk()
-        J.pause_job(job["id"], reason="x", caller="test:pause")
+        J.pause_job(job["id"], caller="test:pause")
         with caplog.at_level("WARNING", logger="cron.jobs"):
             J.resume_job(job["id"])
         assert "resume_job called anonymously" in caplog.text

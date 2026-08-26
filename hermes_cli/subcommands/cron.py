@@ -150,6 +150,45 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
 
+    cron_barrier = cron_subparsers.add_parser(
+        "barrier",
+        help="Show, set, or clear a job's resume authorization barrier",
+    )
+    cron_barrier.add_argument("job_id", help="Job ID or name")
+    cron_barrier_mode = cron_barrier.add_mutually_exclusive_group()
+    cron_barrier_mode.add_argument(
+        "--set",
+        dest="barrier_set",
+        action="store_true",
+        help=(
+            "Attach a barrier. The job then refuses to resume, to be triggered, "
+            "and to be admitted by the scheduler until the barrier is cleared - "
+            "un-pausing it by any route is no longer enough."
+        ),
+    )
+    cron_barrier_mode.add_argument(
+        "--clear",
+        dest="barrier_clear",
+        action="store_true",
+        help="Lift the barrier. Does NOT resume the job; resume it separately.",
+    )
+    cron_barrier.add_argument(
+        "--reason",
+        help=(
+            "Required with --set (the condition that must be met before this "
+            "job may run) and with --clear (the evidence that it now is). Both "
+            "are archived to the job's resume_barrier_history."
+        ),
+    )
+    cron_barrier.add_argument(
+        "--caller",
+        help=(
+            "Who is making this change, e.g. 'diego:gate2-landed'. Required: an "
+            "unattributable barrier lift is the 2026-08-26 bypass this whole "
+            "mechanism exists to prevent."
+        ),
+    )
+
     cron_run = cron_subparsers.add_parser(
         "run", help="Run a job on the next scheduler tick"
     )

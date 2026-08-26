@@ -115,6 +115,48 @@ class EventType(Enum):
     # ⏯️ (play/pause) rather than ▶️, which CRON_STARTED already owns in this
     # same cron_firehose topic — the disjointness standard is per-topic.
     CRON_RESUMED = ("cron_resumed", Priority.LOW, "⏯️")
+    # Added 2026-08-26: the AUTHORIZATION half, distinct from the pause half
+    # above. A resume_barrier is a durable condition on a job ("do not run
+    # until X"); setting or lifting one is not a schedule transition and must
+    # not be recorded as a pause, so it gets its own pair rather than reusing
+    # CRON_PAUSED/CRON_RESUMED.
+    #
+    # These exist because of a measured failure of the pause pair. On
+    # 2026-08-26T05:17:33-35Z the three Gate-2 barrier jobs were resumed by
+    # bin/gate2_resume_barrier_set.py, a sanctioned tool -- which at that
+    # moment omitted its caller= argument (added at 01:27:44 EDT, ~10 min
+    # after). The resulting caller=None on three CRON_RESUMED rows was
+    # indistinguishable on the bus from an unattributed actor, and TWO
+    # sessions independently read it as an unsanctioned bypass and acted on
+    # that reading -- one re-pausing all three jobs, reversing an operator
+    # override. The events were emitted correctly; the ATTRIBUTION was empty,
+    # and an empty attribution is not neutral, it actively misleads.
+    #
+    # Hence: cron.jobs.set_resume_barrier / clear_resume_barrier REFUSE a
+    # blank caller outright rather than warning, so these two can never carry
+    # caller=None the way that CRON_RESUMED trio did.
+    #
+    # Payload (both): job_id, job_name, caller, action, reason, barrier_reason,
+    # barrier_set_at, barrier_set_by. On "barrier_set" ``reason`` IS the new
+    # barrier's condition. On "barrier_cleared" ``reason`` is the
+    # JUSTIFICATION for lifting -- the evidence the condition is now met --
+    # while barrier_* carry the barrier being retired, so the set/clear span
+    # reads from either end without joining to the job record.
+    #
+    # ASYMMETRIC ON PURPOSE, Diego's call 2026-08-26. Setting a barrier ADDS
+    # protection and is routine, so it stays LOW/TRACE with the rest of the
+    # cron lifecycle family. Clearing one REMOVES protection, and that is the
+    # action this whole saga was about being invisible or misattributed -- so
+    # it is promoted to HIGH/WARN and routed to watchdog_alerts, where it
+    # reaches him directly rather than sitting in the firehose.
+    #
+    # The asymmetry is the point: an audit trail nobody reads is only useful
+    # after the fact, and every expensive hour of 2026-08-26 was spent AFTER
+    # the fact. A lift is rare -- a handful ever, each one deliberate -- so
+    # pushing it costs almost no traffic and buys the one notification that
+    # would have collapsed this incident on day one.
+    CRON_BARRIER_SET = ("cron_barrier_set", Priority.LOW, "🛑")
+    CRON_BARRIER_CLEARED = ("cron_barrier_cleared", Priority.HIGH, "🔓")
     CRON_COMPLETED = ("cron_completed", Priority.NORMAL, "✔️")
     CRON_FAILED = ("cron_failed", Priority.HIGH, "💥")
     CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL, "🔥")

@@ -32,6 +32,8 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
+    set_resume_barrier,
+    clear_resume_barrier,
     update_job,
 )
 
@@ -591,6 +593,13 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    if job.get("resume_barrier"):
+        # Surfaced on EVERY read, not just the barrier actions. A fence nobody
+        # can see from `cron list` is a trap: the job reads as a normal paused
+        # (or even scheduled) row right up until it silently refuses to fire.
+        result["resume_barrier"] = job["resume_barrier"]
+    if job.get("resume_barrier_history"):
+        result["resume_barrier_history"] = job["resume_barrier_history"]
     if job.get("paused_history"):
         # Pause reasons survive a resume here (cron.jobs.resume_job), so an
         # auditor can tell a routine pause from one that meant "this is broken".
@@ -887,6 +896,22 @@ def cronjob(
 
         if normalized == "resume":
             updated = resume_job(job_id, caller=caller or "llm:cronjob_tool")
+            _notify_provider_jobs_changed_safe()
+            return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
+
+        if normalized in {"barrier_set", "barrier-set", "set_barrier"}:
+            # An authorization barrier is the durable half of a pause: it names
+            # a condition and survives every un-pause path, so the scheduler
+            # re-checks it at admission. ``caller`` is NOT defaulted here the
+            # way pause/resume default it to "llm:cronjob_tool" - setting or
+            # lifting one is exactly the act that must be attributable to a
+            # specific operator or script, and cron.jobs refuses a blank one.
+            updated = set_resume_barrier(job_id, reason=reason, caller=caller)
+            _notify_provider_jobs_changed_safe()
+            return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
+
+        if normalized in {"barrier_clear", "barrier-clear", "clear_barrier"}:
+            updated = clear_resume_barrier(job_id, reason=reason, caller=caller)
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 

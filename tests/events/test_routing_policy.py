@@ -74,6 +74,16 @@ _VERDICT_EXEMPT = {
     # their seven ACT siblings, and test_no_stale_verdict_exemptions is what
     # forced this list to be updated when they were classified.
     EventType.DEVFLOW_AUTO_MERGED: "governance flag on an ungated merge, not a failure",
+    # Same category (b) shape as DEVFLOW_AUTO_MERGED, and promoted to WARN for
+    # the same reason: a cron resume_barrier being LIFTED removes protection,
+    # so Diego is woken for it (its SET sibling stays TRACE). But the lift
+    # itself is a deliberate, already-completed operator action -- nothing
+    # broke and nothing awaits anyone. FAILED/DEGRADED would paint a correct,
+    # authorized lift red; PENDING would claim someone still has to act. The
+    # governance question the alert exists to raise -- "was this lift
+    # allowed?" -- is not one the event can answer about itself, which is
+    # exactly what UNKNOWN would wrongly imply it had tried to.
+    EventType.CRON_BARRIER_CLEARED: "governance flag on a deliberate barrier lift, not a failure",
 }
 
 # Representative payloads proving the group (a) exemptions really do classify.

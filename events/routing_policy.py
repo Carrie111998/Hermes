@@ -124,6 +124,12 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.CRON_TRIGGERED: _Spec(Attention.TRACE, OPS_TRACE),
     _E.CRON_PAUSED: _Spec(Attention.TRACE, OPS_TRACE),
     _E.CRON_RESUMED: _Spec(Attention.TRACE, OPS_TRACE),
+    # Asymmetric, Diego 2026-08-26 -- see the EventType comment. Arming a
+    # barrier is routine and stays in the firehose; LIFTING one removes
+    # protection and is pushed to alerts, because a barrier lift going
+    # unnoticed is precisely what cost 2026-08-26.
+    _E.CRON_BARRIER_SET: _Spec(Attention.TRACE, OPS_TRACE),
+    _E.CRON_BARRIER_CLEARED: _Spec(Attention.WARN, ALERTS),
     _E.CRON_COMPLETED: _Spec(Attention.TRACE, OPS_TRACE),   # content sniffer may upgrade
     _E.CRON_SKIPPED: _Spec(Attention.TRACE, OPS_TRACE),
     _E.CRON_SKIPPED_DUPLICATE: _Spec(Attention.TRACE, OPS_TRACE),

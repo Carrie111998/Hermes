@@ -469,6 +469,74 @@ def _job_action(
     return 0
 
 
+def cron_barrier(args) -> int:
+    """Show / set / clear a job's resume authorization barrier.
+
+    The operator surface for the fence added 2026-08-26. Without it the only
+    way to set a barrier is an in-process call, which is precisely the shape
+    of access that produced the bypass in the first place - the sanctioned
+    path has to be the convenient one or nobody uses it.
+
+    ``--caller`` is required for both mutating modes and is NOT defaulted to a
+    fixed "hermes_cli:..." string the way pause/resume are. Those record which
+    SURFACE acted, which is enough for a routine pause; a barrier lift needs to
+    record which PERSON or script decided the condition was met, and a constant
+    cannot carry that.
+    """
+    job_id = args.job_id
+    setting = getattr(args, "barrier_set", False)
+    clearing = getattr(args, "barrier_clear", False)
+    reason = _clean_reason(getattr(args, "reason", None))
+    caller = (getattr(args, "caller", None) or "").strip()
+
+    if not setting and not clearing:
+        result = _cron_api(action="list", include_disabled=True)
+        jobs = result.get("jobs") or []
+        match = next(
+            (j for j in jobs if job_id in {j.get("job_id"), j.get("name")}), None
+        )
+        if match is None:
+            print(color(f"No job matching '{job_id}'.", Colors.RED))
+            return 1
+        barrier = match.get("resume_barrier")
+        label = f"{match.get('name')} ({match.get('job_id')})"
+        if not barrier:
+            print(f"{label}: no resume barrier.")
+            return 0
+        print(color(f"{label}: RESUME BARRIER SET", Colors.YELLOW))
+        print(f"  Reason:  {barrier.get('reason')}")
+        print(f"  Set by:  {barrier.get('set_by')}")
+        print(f"  Set at:  {barrier.get('set_at')}")
+        print(color("  This job will not resume, trigger, or be admitted by the", Colors.DIM))
+        print(color("  scheduler until it is cleared.", Colors.DIM))
+        return 0
+
+    if not reason:
+        verb = "set" if setting else "clear"
+        print(color(f"--reason is required to {verb} a barrier.", Colors.RED))
+        return 1
+    if not caller:
+        print(color("--caller is required to set or clear a barrier.", Colors.RED))
+        return 1
+
+    action = "barrier_set" if setting else "barrier_clear"
+    result = _cron_api(action=action, job_id=job_id, reason=reason, caller=caller)
+    if not result.get("success"):
+        print(color(f"Failed: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+    job = result.get("job") or {}
+    label = f"{job.get('name', job_id)} ({job.get('job_id', job_id)})"
+    if setting:
+        print(color(f"Resume barrier SET on {label}", Colors.YELLOW))
+        print(f"  Reason: {reason}")
+        print(color("  It will not run again until the barrier is cleared.", Colors.DIM))
+    else:
+        print(color(f"Resume barrier CLEARED on {label}", Colors.GREEN))
+        print(f"  Justification: {reason}")
+        print(color("  The job is NOT resumed - run 'hermes cron resume' separately.", Colors.DIM))
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -513,6 +581,9 @@ def cron_command(args):
             caller="hermes_cli:cron_resume",
         )
 
+    if subcmd == "barrier":
+        return cron_barrier(args)
+
     if subcmd == "run":
         return _job_action(
             "run",
@@ -526,5 +597,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|barrier|run|remove|status|runs|tick]")
     sys.exit(1)
