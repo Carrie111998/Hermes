@@ -31,6 +31,23 @@ test('room composer is a textarea with Enter=submit, Shift+Enter=newline (#89884
   assert.match(component, /insert\(options\[active\]\.handle\)/)
 })
 
+test('room composer grows with long prompts while preserving a bounded transcript', () => {
+  const start = source.indexOf('function GroupMentionInput')
+  const nextFn = source.indexOf('\nfunction ', start + 1)
+  const component = source.slice(start, nextFn)
+
+  // Start as one row, then let Chromium size the textarea from its content.
+  // A viewport-relative cap keeps the transcript usable; content beyond it
+  // scrolls inside the textarea rather than taking over the whole room.
+  const composerClass = /className: cn\(\s*'([^']*)',\s*inputProps\.className\s*\)/.exec(component)?.[1]
+
+  assert.ok(composerClass, 'composer class contract is present')
+  assert.match(component, /rows: 1/)
+  assert.match(composerClass, /field-sizing-content/)
+  assert.match(composerClass, /max-h-\[min\(50vh,24rem\)\]/)
+  assert.match(composerClass, /overflow-y-auto/)
+})
+
 test('room composer swallows IME composition Enters before submit/mention (#93528)', () => {
   // macOS Chinese IME: Enter that confirms a candidate word fires a keydown
   // the composer mistook for a send — the message went out mid-composition.
