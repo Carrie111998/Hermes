@@ -20,6 +20,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 
 import { CDP, SELECTORS, discoverTarget } from '../scripts/perf/lib/cdp.mjs'
+import os from 'node:os'
+import path from 'node:path'
 import { actTools, handleAct } from './tools/act.mjs'
 import { flowTools, handleFlow } from './tools/flows.mjs'
 
@@ -44,6 +46,44 @@ const CFG = {
 
 let cdp = null // lazily connected CDP instance
 const consoleRing = [] // renderer console capture (bounded)
+
+// The HERMES_HOME the operator declares this desktop instance is running
+// against. Mutating tools refuse to run unless this is set AND differs from
+// the operator's real default home — see assertSandboxed(). This is the rail
+// that prevents a debug MCP run from reading/writing the operator's real API
+// keys and chat history (the 2026-08-26 incident: a manual electron launch
+// with only HERMES_DESKTOP_USER_DATA_DIR set silently used ~/.hermes).
+const EXPECTED_HOME = process.env.DESKTOP_DEBUG_MCP_EXPECTED_HOME || ''
+const DEFAULT_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes')
+
+/**
+ * Fail-closed safety rail for mutating tools.
+ *
+ * A debug MCP run must target an isolated sandbox (its own HERMES_HOME), never
+ * the operator's real data. We cannot reliably read the target's HERMES_HOME
+ * from the renderer (it is not exposed), so we require the operator to DECLARE
+ * it: set DESKTOP_DEBUG_MCP_EXPECTED_HOME to the sandbox path when launching
+ * the server. If unset, or if it equals the default home, mutating tools are
+ * refused with a clear instruction.
+ */
+function assertSandboxed() {
+  if (!EXPECTED_HOME) {
+    throw new Error(
+      'REFUSED: DESKTOP_DEBUG_MCP_EXPECTED_HOME is not set. The debug MCP ' +
+        'server will not mutate a desktop instance unless you declare which ' +
+        'isolated HERMES_HOME it is running against. Launch with ' +
+        'DESKTOP_DEBUG_MCP_EXPECTED_HOME=/tmp/your-sandbox-home and ensure the ' +
+        'desktop instance was started with the same HERMES_HOME. Never point ' +
+        'this at your real ~/.hermes.'
+    )
+  }
+  if (EXPECTED_HOME === DEFAULT_HOME) {
+    throw new Error(
+      `REFUSED: declared HERMES_HOME (${EXPECTED_HOME}) is the default home. ` +
+        'The debug MCP server must target an isolated sandbox, not your real data.'
+    )
+  }
+}
 
 async function connect() {
   if (cdp) return cdp
@@ -272,14 +312,18 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           ]
         }
       }
-      out = await handleAct(name, a, toolCtx)
+      const live = await connect()
+      assertSandboxed()
+      out = await handleAct(name, a, { ...toolCtx, cdp: live })
     } else if (flowTools.some(t => t.name === name)) {
       if (!CFG.allowAct) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: 'flows mutate the UI — disabled without DESKTOP_DEBUG_MCP_ALLOW_ACT=1' }) }]
         }
       }
-      out = await handleFlow(name, a, toolCtx)
+      const live = await connect()
+      assertSandboxed()
+      out = await handleFlow(name, a, { ...toolCtx, cdp: live })
     } else {
       throw new Error(`unknown tool: ${name}`)
     }

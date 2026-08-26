@@ -75,3 +75,46 @@ HERMES_DESKTOP_CDP_PORT=9333 \
 - Mutating tools are opt-in via env; flows refuse to run without it.
 - One shared connection; friendly errors instead of raw discovery dumps.
 - Real input events only — no synthetic `dispatchEvent` shortcuts.
+- **Isolation guard (fail-closed).** Mutating tools refuse to run unless you
+  declare the target's `HERMES_HOME` via `DESKTOP_DEBUG_MCP_EXPECTED_HOME`, AND
+  it differs from your real default home. If the env var is unset, or equals
+  `~/.hermes`, every mutating call returns `REFUSED`. This prevents a debug run
+  from reading/writing your real API keys and chat history — the exact failure
+  mode of the 2026-08-26 incident where a manual `electron .` launch (with only
+  `HERMES_DESKTOP_USER_DATA_DIR` set) silently used `~/.hermes` as `HERMES_HOME`.
+
+## Launching an isolated probe instance (REQUIRED before any act/flow)
+
+Never point a debug instance at your real `~/.hermes`. Always give it its own
+home with a mock provider config, and tell the server that home:
+
+```bash
+# 1. isolated home + mock config
+mkdir -p /tmp/hermes-debug-home
+cat > /tmp/hermes-debug-home/config.yaml <<'YAML'
+model: { default: mock-model, provider: mock }
+providers:
+  mock: { api: http://127.0.0.1:53999/v1, name: Mock, api_mode: chat_completions,
+          key_env: MOCK_API_KEY, models: { mock-model: {} }, context_length: 4096 }
+YAML
+echo "MOCK_API_KEY=debug" > /tmp/hermes-debug-home/.env
+# 2. start vite + electron against that home, with CDP
+cd apps/desktop
+( npm run dev:renderer & )
+HERMES_HOME=/tmp/hermes-debug-home \
+HERMES_DESKTOP_PYTHON=<path-to-venv>/bin/python \
+HERMES_DESKTOP_CDP_PORT=9333 \
+HERMES_DESKTOP_DEV_SERVER=http://127.0.0.1:5174 \
+HERMES_DESKTOP_USER_DATA_DIR=/tmp/cdp-probe-userdata \
+HERMES_DESKTOP_IGNORE_EXISTING=1 \
+  npx electron . --user-data-dir=/tmp/cdp-probe-userdata
+# 3. start the server DECLARING the same home
+DESKTOP_DEBUG_MCP_ALLOW_ACT=1 \
+DESKTOP_DEBUG_MCP_EXPECTED_HOME=/tmp/hermes-debug-home \
+DESKTOP_DEBUG_MCP_PORT=9333 \
+  node mcp/server.mjs
+```
+
+If you skip step 3's `DESKTOP_DEBUG_MCP_EXPECTED_HOME`, all mutating tools
+return `REFUSED`. If you skip step 1's isolated `HERMES_HOME`, the instance
+falls back to `~/.hermes` and the guard blocks it anyway.
