@@ -51,6 +51,22 @@ export const PREVIEW_READ_MAX_CHARS = 24_000
 
 const readers = new Map<string, PageReader>()
 
+/** True when at least one preview tab has a registered live page reader
+ *  AND that tab is still open in `$previewTabs` (guards against stale
+ *  registrations outliving their tab). Used by the desktop bridge to
+ *  allow preview actions from non-active sessions (#95459). */
+export function hasLivePreviewReaders(): boolean {
+  const openIds = new Set($previewTabs.get().map(t => t.id))
+
+  for (const tabId of readers.keys()) {
+    if (openIds.has(tabId)) {
+      return true
+    }
+  }
+
+  return false
+}
+
 /** Register a live preview's page reader; returns an idempotent unregister. */
 export function registerPreviewPageReader(tabId: string, reader: PageReader): () => void {
   readers.set(tabId, reader)
@@ -75,10 +91,18 @@ function windowText(
   return { ...base, end: to, start: from, text: text.slice(from, to), total_chars: total }
 }
 
-/** Read the ACTIVE preview tab. Null only when no tab is open at all. */
+/** Read the ACTIVE preview tab. Null when no tab is open or the global
+ *  active-tab ID doesn't match any open tab.
+ *
+ *  The `?? tabs[0]` fallback is deliberately absent: when the global
+ *  active-tab ID is stale (pointing at a closed tab, or desynced across
+ *  multiple preview zones — #89272), falling through to `tabs[0]` reads
+ *  an arbitrary surface the user is NOT looking at. Returning null is
+ *  honest — the agent retries or asks the user instead of narrating the
+ *  wrong preview. */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
-  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get()) ?? tabs[0]
+  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get())
 
   if (!tab) {
     return null
