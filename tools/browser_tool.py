@@ -1025,8 +1025,8 @@ def _is_local_backend() -> bool:
 _auto_local_for_private_urls_resolved = False
 _cached_auto_local_for_private_urls: bool = True
 
-_use_real_profile_resolved = False
-_cached_use_real_profile: bool = False
+# browser.use_real_profile itself is read per call (consent switch, see
+# _use_real_profile); only the derived launch flags are cached:
 # (args, error) from _resolve_real_profile_launch_args, or None when unresolved.
 _real_profile_args_cache: Optional[tuple] = None
 
@@ -1435,25 +1435,28 @@ def _auto_local_for_private_urls() -> bool:
 def _use_real_profile() -> bool:
     """Return whether the user consented to real-profile local browsing.
 
-    Reads ``browser.use_real_profile`` (default False) once and caches it. When
-    True, local Chromium launches point agent-browser at the user's REAL
+    Reads ``browser.use_real_profile`` (default False) on every call. This is
+    a consent switch, so it is deliberately not cached for the process:
+    turning it off has to revoke immediately (the desktop save path writes
+    config.yaml and does not restart the backend), and the profile
+    multiplexer scopes config per turn through a ContextVar, so a cached
+    value would hand one profile's consent to another. Callers that need the
+    derived launch flags to stay identical across commands cache those
+    instead (see _real_profile_launch_args).
+
+    When True, local Chromium launches point agent-browser at the user's REAL
     default-browser profile, and the browser tools' ``local_browser`` argument
     is honored.
     """
-    global _use_real_profile_resolved, _cached_use_real_profile
-    if _use_real_profile_resolved:
-        return _cached_use_real_profile
-
-    _use_real_profile_resolved = True
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict) and "use_real_profile" in browser_cfg:
-            _cached_use_real_profile = bool(browser_cfg.get("use_real_profile"))
+        if isinstance(browser_cfg, dict):
+            return is_truthy_value(browser_cfg.get("use_real_profile"), default=False)
     except Exception as e:
         logger.debug("Could not read use_real_profile from config: %s", e)
-    return _cached_use_real_profile
+    return False
 
 
 def _real_profile_launch_args() -> tuple:
@@ -1643,10 +1646,14 @@ def _navigation_session_key(task_id: str, url: str, local_browser: bool = False)
     continues to serve public URLs.
 
     ``local_browser=True`` (the model-facing arg) forces the ``::local`` sidecar
-    regardless of the URL — but ONLY when the user consented to real-profile
+    for the backend choice — but ONLY when the user consented to real-profile
     browsing (``browser.use_real_profile``). Without consent the flag is ignored
     (the caller surfaces a note); it never silently routes to the real profile.
-    A CDP override or Camofox mode still owns the session and is not overridden.
+    It does not override the private-URL policy: a private URL is still routed
+    exactly as ``browser.auto_local_for_private_urls`` says. Without a cloud
+    provider the bare session is already local (and already carries the real
+    profile when consented), so the flag adds nothing there. A CDP override or
+    Camofox mode still owns the session and is not overridden.
     """
     if task_id is None:
         task_id = "default"
@@ -1654,10 +1661,18 @@ def _navigation_session_key(task_id: str, url: str, local_browser: bool = False)
         return task_id
     if _is_camofox_mode():
         return task_id
-    if local_browser and _use_real_profile():
-        return f"{task_id}{_LOCAL_SUFFIX}"
     if _get_cloud_provider() is None:
+        # Already local. A second ``::local`` session for the same task would
+        # contend with the bare one for the same user-data-dir.
         return task_id
+    if local_browser and _use_real_profile():
+        # Every private-URL gate in browser_navigate keys off the sidecar
+        # key, so honouring the flag for a private URL while the user opted
+        # out of auto-local routing would turn a model-supplied argument
+        # into a LAN policy override.
+        if _url_is_private(url) and not _auto_local_for_private_urls():
+            return task_id
+        return f"{task_id}{_LOCAL_SUFFIX}"
     if not _auto_local_for_private_urls():
         return task_id
     if not _url_is_private(url):

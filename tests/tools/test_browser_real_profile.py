@@ -41,6 +41,35 @@ class TestRealProfileResolvers:
             assert bc.detect_default_chromium("Linux") is None
 
 
+class TestUseRealProfileConsent:
+    """The consent flag is re-read per call: revocation must not wait for a
+    process restart, and multiplexed profiles must not inherit each other's
+    consent through a module-level cache."""
+
+    def test_toggle_off_revokes_without_restart(self):
+        import tools.browser_tool as bt
+        reads = [
+            {"browser": {"use_real_profile": True}},
+            {"browser": {"use_real_profile": False}},
+        ]
+        with patch("hermes_cli.config.read_raw_config", side_effect=reads):
+            assert bt._use_real_profile() is True
+            assert bt._use_real_profile() is False
+
+    def test_string_false_is_off(self):
+        import tools.browser_tool as bt
+        with patch("hermes_cli.config.read_raw_config",
+                   return_value={"browser": {"use_real_profile": "false"}}):
+            assert bt._use_real_profile() is False
+
+    def test_missing_key_and_unreadable_config_are_off(self):
+        import tools.browser_tool as bt
+        with patch("hermes_cli.config.read_raw_config", return_value={"browser": {}}):
+            assert bt._use_real_profile() is False
+        with patch("hermes_cli.config.read_raw_config", side_effect=OSError("boom")):
+            assert bt._use_real_profile() is False
+
+
 class TestRealProfileLaunchArgs:
     def _reset(self):
         import tools.browser_tool as bt
@@ -330,8 +359,49 @@ class TestLocalBrowserRouting:
         self._reset()
         with patch.object(bt, "_get_cdp_override_raw", return_value=""), \
              patch.object(bt, "_is_camofox_mode", return_value=False), \
+             patch.object(bt, "_get_cloud_provider", return_value=Mock()), \
+             patch.object(bt, "_url_is_private", return_value=False), \
              patch.object(bt, "_use_real_profile", return_value=True):
             key = bt._navigation_session_key("t1", "https://example.com", local_browser=True)
+        assert key == "t1::local"
+
+    def test_local_browser_without_cloud_provider_keeps_bare_session(self):
+        """Pure local backend: the bare session already is the (real-profile)
+        local Chromium; a second ``::local`` session would fight it for the
+        same user-data-dir."""
+        import tools.browser_tool as bt
+        self._reset()
+        with patch.object(bt, "_get_cdp_override_raw", return_value=""), \
+             patch.object(bt, "_is_camofox_mode", return_value=False), \
+             patch.object(bt, "_get_cloud_provider", return_value=None), \
+             patch.object(bt, "_use_real_profile", return_value=True):
+            key = bt._navigation_session_key("t1", "https://example.com", local_browser=True)
+        assert key == "t1"
+
+    def test_local_browser_respects_private_url_opt_out(self):
+        """auto_local_for_private_urls: false is the user's LAN routing
+        decision; a model-supplied flag must not override it."""
+        import tools.browser_tool as bt
+        self._reset()
+        with patch.object(bt, "_get_cdp_override_raw", return_value=""), \
+             patch.object(bt, "_is_camofox_mode", return_value=False), \
+             patch.object(bt, "_get_cloud_provider", return_value=Mock()), \
+             patch.object(bt, "_url_is_private", return_value=True), \
+             patch.object(bt, "_auto_local_for_private_urls", return_value=False), \
+             patch.object(bt, "_use_real_profile", return_value=True):
+            key = bt._navigation_session_key("t1", "http://192.168.1.1/admin", local_browser=True)
+        assert key == "t1"
+
+    def test_local_browser_private_url_follows_auto_local_when_allowed(self):
+        import tools.browser_tool as bt
+        self._reset()
+        with patch.object(bt, "_get_cdp_override_raw", return_value=""), \
+             patch.object(bt, "_is_camofox_mode", return_value=False), \
+             patch.object(bt, "_get_cloud_provider", return_value=Mock()), \
+             patch.object(bt, "_url_is_private", return_value=True), \
+             patch.object(bt, "_auto_local_for_private_urls", return_value=True), \
+             patch.object(bt, "_use_real_profile", return_value=True):
+            key = bt._navigation_session_key("t1", "http://192.168.1.1/admin", local_browser=True)
         assert key == "t1::local"
 
     def test_local_browser_ignored_without_consent(self):
