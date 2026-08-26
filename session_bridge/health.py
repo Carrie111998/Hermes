@@ -154,6 +154,15 @@ for _code in CLAUDE_VISIBILITY_FATAL_CODES:
     _FAILURE_REGISTRY[("claude_visibility", _code)] = (
         "queue", "visibility_terminal_failure", "terminal"
     )
+# An unregistered reason collapses to "unregistered_failure_code", which is
+# strictly MORE opaque than the "invalid_status" these codes replace -- so
+# naming the condition without registering it here would make the surface worse.
+_FAILURE_REGISTRY[("claude_visibility", "reconciliation_repair_active")] = (
+    "queue", "visibility_repair_authority_held", "terminal"
+)
+_FAILURE_REGISTRY[("claude_visibility", "reconciliation_repair_abandoned")] = (
+    "queue", "visibility_repair_authority_abandoned", "terminal"
+)
 
 
 def _mapping(value: object) -> dict[str, Any]:

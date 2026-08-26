@@ -39,6 +39,7 @@ from .claude_visibility import (
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
+    CLAUDE_VISIBILITY_STATUS_FATAL_CODES,
 )
 from .codex_adapter import SidebarVerificationError
 from .config import BridgeConfig
@@ -358,7 +359,7 @@ def _claude_visibility_enqueue_gates(
             continue
         fatal_item = cast(Mapping[object, object], item)
         code = fatal_item.get("code")
-        if code in ("unknown_job_state", "unknown_error_code"):
+        if code in CLAUDE_VISIBILITY_STATUS_FATAL_CODES:
             fatal.add(str(code))
         else:
             fatal.add("invalid_visibility_status")

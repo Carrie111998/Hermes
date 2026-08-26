@@ -8978,3 +8978,145 @@ def test_claude_visibility_preflight_gate_codes_stay_out_of_public_output(
     }
     assert "not_logged_in" not in captured
     assert code not in captured
+
+
+def test_cli_names_an_abandoned_repair_lease_instead_of_invalid_status() -> None:
+    """The CLI must not flatten the store's specific classification.
+
+    'invalid_status' tells an operator the evidence is malformed.  Here the
+    evidence is perfectly well formed and says exactly what is wrong, so the
+    generic reason actively misdirects.
+    """
+
+    from session_bridge.cli import _claude_visibility_fatal_reasons
+
+    raw = {
+        "retry_codes": {},
+        "failed_codes": {},
+        "fatal": [
+            {
+                "code": "reconciliation_repair_abandoned",
+                "state": "claude_leased",
+                "error_code": "bridge_conflict",
+                "count": 1,
+            }
+        ],
+        "lineage": {
+            "unlinked_visible": 0,
+            "repairable": 0,
+            "blocked": 0,
+            "blocker_codes": {},
+        },
+    }
+
+    assert _claude_visibility_fatal_reasons(raw) == [
+        "reconciliation_repair_abandoned"
+    ]
+
+
+def _repair_status_backend(monkeypatch, repair_rows):
+    from session_bridge.cli import ProductionBackend
+
+    class ReadOnlyStore:
+        def claude_visibility_status(self, now: float) -> dict[str, object]:
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 1,
+                    "claude_retry": 0,
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "usage": {
+                    "local_day": "2026-08-26",
+                    "attempts": 1,
+                    "reserved_cost_usd": "0.02",
+                },
+                "fatal": [
+                    {
+                        "code": "reconciliation_repair_abandoned",
+                        "state": "claude_leased",
+                        "error_code": "bridge_conflict",
+                        "count": 1,
+                    }
+                ],
+                "repair_required": repair_rows,
+            }
+
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+    return backend
+
+
+def test_status_hands_the_operator_the_exact_repair_command(monkeypatch) -> None:
+    """Nothing frees an abandoned repair lease, so status must say how.
+
+    The guarded API is the only route, and it is deliberately operator-only --
+    which is worth nothing if the operator has to reconstruct the invocation.
+    """
+
+    backend = _repair_status_backend(
+        monkeypatch,
+        [
+            {
+                "job_id": "job-7",
+                "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+                "error_code": "bridge_conflict",
+            }
+        ],
+    )
+
+    result = backend.claude_visibility_status()
+
+    assert result["degraded_reasons"] == ["reconciliation_repair_abandoned"]
+    assert result["repair_required"] == [
+        {
+            "job_id": "job-7",
+            "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+            "error_code": "bridge_conflict",
+            "command": (
+                "hermes-session-bridge claude-visibility-repair-failed "
+                "--job-id job-7 "
+                "--reserved-claude-uuid d8ae024c-1111-2222-3333-444455556666 "
+                "--error-code bridge_conflict "
+                "--apply --confirm-exact-terminal-repair"
+            ),
+        }
+    ]
+
+
+def test_status_withholds_a_command_it_cannot_build_safely(monkeypatch) -> None:
+    """A pastable command line is assembled from stored identifiers.
+
+    If one does not look like an identifier the row is still reported, but with
+    no command -- handing an operator a line to paste is a promise about it.
+    """
+
+    backend = _repair_status_backend(
+        monkeypatch,
+        [
+            {
+                "job_id": "job-7 --apply; rm -rf /",
+                "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+                "error_code": "bridge_conflict",
+            }
+        ],
+    )
+
+    result = backend.claude_visibility_status()
+
+    assert result["repair_required"] == [
+        {
+            "job_id": "job-7 --apply; rm -rf /",
+            "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+            "error_code": "bridge_conflict",
+            "command": None,
+        }
+    ]

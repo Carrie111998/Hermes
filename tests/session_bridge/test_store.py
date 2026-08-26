@@ -13901,9 +13901,18 @@ def test_expired_terminal_repair_lease_is_reclaimed_only_by_exact_repair_api(
     ]
 
 
-def test_terminal_repair_lease_keeps_bridge_conflict_as_fatal_status(
+def test_terminal_repair_lease_projects_as_fatal_status(
     db: SessionDB,
 ) -> None:
+    """A held repair lease is fatal status, distinguishable from a dead one.
+
+    Renamed from ..._keeps_bridge_conflict_as_fatal_status.  The guarantee it
+    was added for in 6e0feeb75a is unchanged and still asserted below -- the row
+    stays fenced out of ordinary counts and reports as fatal.  Only the fatal
+    GROUP LABEL moved, so that an abandoned repair lease can be told apart from
+    a live one; no reader consumed the old label, all three flattened it.
+    """
+
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity("terminal-status")
     _enqueue_claude_visibility_job(store, candidate, identity)
@@ -13928,12 +13937,13 @@ def test_terminal_repair_lease_keeps_bridge_conflict_as_fatal_status(
     assert status["failed_codes"] == {}
     assert status["fatal"] == [
         {
-            "code": "bridge_conflict",
+            "code": "reconciliation_repair_active",
             "state": "claude_leased",
             "error_code": "bridge_conflict",
             "count": 1,
         }
     ]
+    assert status["repair_required"] == []
 
 
 def test_terminal_repair_lease_cannot_record_exact_absence(
@@ -15552,3 +15562,81 @@ def test_rebuild_preserves_a_keyless_row_with_no_keyed_twin(db):
     assert "unique keyless row with no twin" in contents
     assert "ingested again" in contents
     assert "ingested" not in contents
+
+
+def _abandoned_repair_lease(db, clock):
+    """Drive a job into the abandoned exact-terminal repair shape."""
+
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("repair-abandoned")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "exact transcript conflict",
+    )
+    store.claim_failed_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+        expected_reserved_claude_uuid=identity.claude_uuid,
+        expected_error_code="bridge_conflict",
+    )
+    return store, identity
+
+
+def test_abandoned_repair_lease_is_named_not_flattened(db: SessionDB) -> None:
+    """An expired repair lease must report itself, not hide behind a generic code.
+
+    The lease is taken at t=100 for 60s, so at t=5000 it is long dead.  Nothing
+    frees it automatically by design, so the only way an operator learns of it is
+    this projection.
+    """
+
+    clock = [100.0]
+    store, identity = _abandoned_repair_lease(db, clock)
+
+    clock[0] = 5000.0
+    status = store.claude_visibility_status(5000.0)
+
+    assert status["fatal"] == [
+        {
+            "code": "reconciliation_repair_abandoned",
+            "state": "claude_leased",
+            "error_code": "bridge_conflict",
+            "count": 1,
+        }
+    ]
+    assert status["repair_required"] == [
+        {
+            "job_id": identity.job_id,
+            "reserved_claude_uuid": identity.claude_uuid,
+            "error_code": "bridge_conflict",
+        }
+    ]
+
+
+def test_live_repair_lease_is_not_reported_as_abandoned(db: SessionDB) -> None:
+    """A repair still inside its lease is ordinary work, not an operator ticket.
+
+    Reporting a healthy in-flight repair with the same code as a dead one is what
+    trains an operator to ignore the signal.
+    """
+
+    clock = [100.0]
+    store, _identity = _abandoned_repair_lease(db, clock)
+
+    clock[0] = 130.0
+    status = store.claude_visibility_status(130.0)
+
+    assert status["fatal"] == [
+        {
+            "code": "reconciliation_repair_active",
+            "state": "claude_leased",
+            "error_code": "bridge_conflict",
+            "count": 1,
+        }
+    ]
+    assert status["repair_required"] == []

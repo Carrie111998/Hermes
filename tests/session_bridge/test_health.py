@@ -1189,3 +1189,42 @@ def test_hostile_dynamic_mapping_is_not_iterated() -> None:
     assert work["state"] == "unknown"
     assert work["code"] == "invalid_failure_evidence"
     assert "private_code" not in json.dumps(evidence)
+
+
+def test_repair_lease_codes_are_registered_failures() -> None:
+    """An unregistered reason degrades to 'unregistered_failure_code'.
+
+    That is strictly more opaque than what it replaces, so naming the condition
+    without registering it here would make the surface worse, not better.
+    """
+
+    from session_bridge.health import _classify_registered_codes
+
+    assert _classify_registered_codes(
+        ["reconciliation_repair_abandoned"], capability="claude_visibility"
+    ) == ("error", "reconciliation_repair_abandoned")
+    assert _classify_registered_codes(
+        ["reconciliation_repair_active"], capability="claude_visibility"
+    ) == ("error", "reconciliation_repair_active")
+
+
+def test_every_status_fatal_code_is_registered_for_health() -> None:
+    """The drift that caused this defect, pinned.
+
+    Readers now derive the known-code set from one constant, but health keeps its
+    own registry. A code added to the constant and missed here would degrade to
+    'unregistered_failure_code' -- opaque in a new way rather than the old one.
+    """
+
+    from session_bridge.claude_visibility_codes import (
+        CLAUDE_VISIBILITY_STATUS_FATAL_CODES,
+    )
+    from session_bridge.health import _FAILURE_REGISTRY
+
+    unregistered = sorted(
+        code
+        for code in CLAUDE_VISIBILITY_STATUS_FATAL_CODES
+        if ("claude_visibility", code) not in _FAILURE_REGISTRY
+    )
+
+    assert unregistered == []
