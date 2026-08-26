@@ -50,6 +50,7 @@ from .claude_visibility import (
     ClaudeVisibilityCandidate,
     build_claude_visibility_candidate,
     derive_claude_visibility_identity,
+    normalized_claude_visibility_repair_rows,
 )
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
@@ -4789,65 +4790,15 @@ def _claude_characterization_auth_recovery_allowed(
     )
 
 
-_REPAIR_IDENTIFIER = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
-
-
-def _claude_visibility_repair_command(
-    job_id: object, reserved_claude_uuid: object, error_code: object
-) -> str | None:
-    """Render the one supported escape hatch as a pastable line, or nothing.
-
-    An abandoned repair lease is excluded from every automatic reclaim path on
-    purpose, so this operator invocation IS the recovery path -- which is worth
-    nothing if the operator has to reconstruct it from the source. The line is
-    assembled from stored identifiers, so anything that is not plainly an
-    identifier yields no command at all rather than a line that could read as
-    one thing and mean another.
-    """
-
-    if error_code != "bridge_conflict":
-        return None
-    if not isinstance(job_id, str) or not _REPAIR_IDENTIFIER.match(job_id):
-        return None
-    if not isinstance(
-        reserved_claude_uuid, str
-    ) or not _REPAIR_IDENTIFIER.match(reserved_claude_uuid):
-        return None
-    return (
-        "hermes-session-bridge claude-visibility-repair-failed "
-        f"--job-id {job_id} "
-        f"--reserved-claude-uuid {reserved_claude_uuid} "
-        f"--error-code {error_code} "
-        "--apply --confirm-exact-terminal-repair"
-    )
-
-
 def _claude_visibility_repair_required(
     raw: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     """Name every job whose repair authority is dead and awaiting an operator."""
 
-    rows = raw.get("repair_required", [])
-    if not isinstance(rows, list):
-        return []
-    required: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        job_id = row.get("job_id")
-        reserved = row.get("reserved_claude_uuid")
-        error_code = row.get("error_code")
-        required.append(
-            {
-                "job_id": job_id,
-                "reserved_claude_uuid": reserved,
-                "error_code": error_code,
-                "command": _claude_visibility_repair_command(
-                    job_id, reserved, error_code
-                ),
-            }
-        )
-    return required
+    shaped, _malformed = normalized_claude_visibility_repair_rows(
+        raw.get("repair_required", [])
+    )
+    return shaped
 
 
 def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:

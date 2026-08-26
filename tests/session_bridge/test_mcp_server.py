@@ -3809,3 +3809,165 @@ def test_mcp_status_names_an_abandoned_repair_lease() -> None:
     payload = _claude_visibility_status_payload(raw, config)
 
     assert payload["degraded_reasons"] == ["reconciliation_repair_abandoned"]
+
+
+def _repair_raw(repair_rows):
+    return {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 1,
+            "claude_retry": 0,
+            "claude_visible": 0,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "usage": {
+            "local_day": "2026-08-26",
+            "attempts": 1,
+            "reserved_cost_usd": "0.02",
+        },
+        "fatal": [
+            {
+                "code": "reconciliation_repair_abandoned",
+                "state": "claude_leased",
+                "error_code": "bridge_conflict",
+                "count": 1,
+            }
+        ],
+        "repair_required": repair_rows,
+    }
+
+
+def _repair_config():
+    return ClaudeVisibilityConfig(
+        enabled=True,
+        continuous=True,
+        daily_registration_limit=25,
+        reserved_cost_per_attempt_usd="0.02",
+        emergency_daily_cost_usd="0.50",
+    )
+
+
+def test_mcp_status_names_the_stuck_job_and_its_repair_command() -> None:
+    """An agent polling MCP must learn WHICH job, not just what is wrong.
+
+    Nothing frees an abandoned repair lease automatically, so the status surface
+    is the whole discovery path.  Reporting only the reason forces a shell-out to
+    the CLI to answer the very next question.
+    """
+
+    payload = _claude_visibility_status_payload(
+        _repair_raw(
+            [
+                {
+                    "job_id": "job-7",
+                    "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+                    "error_code": "bridge_conflict",
+                }
+            ]
+        ),
+        _repair_config(),
+    )
+
+    assert payload["degraded_reasons"] == ["reconciliation_repair_abandoned"]
+    assert payload["repair_required"] == [
+        {
+            "job_id": "job-7",
+            "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+            "error_code": "bridge_conflict",
+            "command": (
+                "hermes-session-bridge claude-visibility-repair-failed "
+                "--job-id job-7 "
+                "--reserved-claude-uuid d8ae024c-1111-2222-3333-444455556666 "
+                "--error-code bridge_conflict "
+                "--apply --confirm-exact-terminal-repair"
+            ),
+        }
+    ]
+
+
+def test_mcp_status_degrades_on_a_malformed_repair_row() -> None:
+    """This payload is a fixed public contract; malformed evidence degrades."""
+
+    payload = _claude_visibility_status_payload(
+        _repair_raw([{"job_id": "job-7"}]), _repair_config()
+    )
+
+    assert "invalid_status" in payload["degraded_reasons"]
+    assert payload["repair_required"] == []
+
+
+def test_mcp_status_omits_a_command_it_cannot_build_safely() -> None:
+    """Same withholding rule as the CLI: a pastable line is a promise."""
+
+    payload = _claude_visibility_status_payload(
+        _repair_raw(
+            [
+                {
+                    "job_id": "job-7 --apply; rm -rf /",
+                    "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+                    "error_code": "bridge_conflict",
+                }
+            ]
+        ),
+        _repair_config(),
+    )
+
+    assert payload["repair_required"][0]["command"] is None
+
+
+def test_both_surfaces_render_one_identical_repair_command() -> None:
+    """The CLI and MCP must not each grow their own copy of this line.
+
+    Three readers independently re-deriving one rule is the defect this whole
+    change exists to remove; a second command renderer would reintroduce it.
+    """
+
+    from session_bridge.cli import _claude_visibility_repair_required
+
+    rows = [
+        {
+            "job_id": "job-7",
+            "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+            "error_code": "bridge_conflict",
+        }
+    ]
+
+    cli_rows = _claude_visibility_repair_required({"repair_required": rows})
+    mcp_rows = _claude_visibility_status_payload(
+        _repair_raw(rows), _repair_config()
+    )["repair_required"]
+
+    assert cli_rows == mcp_rows
+
+
+def test_no_command_is_offered_for_a_code_the_repair_cli_refuses() -> None:
+    """The repair verb declares choices=("bridge_conflict",).
+
+    Rendering any other code produces a line argparse rejects outright -- a
+    pastable command that cannot run is worse than none, so the row is still
+    reported but carries no command.  Found by an arming mutant that survived.
+    """
+
+    payload = _claude_visibility_status_payload(
+        _repair_raw(
+            [
+                {
+                    "job_id": "job-7",
+                    "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+                    "error_code": "duplicate_uuid",
+                }
+            ]
+        ),
+        _repair_config(),
+    )
+
+    assert payload["repair_required"] == [
+        {
+            "job_id": "job-7",
+            "reserved_claude_uuid": "d8ae024c-1111-2222-3333-444455556666",
+            "error_code": "duplicate_uuid",
+            "command": None,
+        }
+    ]
