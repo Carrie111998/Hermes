@@ -222,6 +222,19 @@ class TestProfileScopedMcp:
 
 
 class TestProfileScopedModel:
+    def test_main_assignment_requires_provider(self, client, isolated_profiles):
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "model": "test/model-1",
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "provider and model required for main"
+
     def test_model_set_main_scoped(self, client, isolated_profiles):
         resp = client.post(
             "/api/model/set",
@@ -348,6 +361,152 @@ class TestProfileScopedModel:
         assert confirmation.status_code == 200
         assert confirmation.json()["confirm_required"] is True
         assert "cron_model_impact" not in confirmation.json()
+
+    def test_auxiliary_reset_rejects_reasoning_effort(self, client, isolated_profiles):
+        before = _cfg(isolated_profiles["worker_beta"])
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "__reset__",
+                "reasoning_effort": "high",
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "reasoning_effort cannot be combined with task=__reset__"
+        )
+        assert _cfg(isolated_profiles["worker_beta"]) == before
+
+    def test_auxiliary_reasoning_update_preserves_provider_and_model(
+        self, client, isolated_profiles
+    ):
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.web_server import _profile_scope
+
+        with _profile_scope("worker_beta"):
+            cfg = load_config()
+            cfg["auxiliary"]["vision"].update(
+                {"provider": "openrouter", "model": "old/model", "reasoning_effort": "low"}
+            )
+            save_config(cfg)
+
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "vision",
+                "reasoning_effort": "high",
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 200
+        vision = _cfg(isolated_profiles["worker_beta"])["auxiliary"]["vision"]
+        assert vision["provider"] == "openrouter"
+        assert vision["model"] == "old/model"
+        assert vision["reasoning_effort"] == "high"
+
+        current = client.get("/api/model/auxiliary", params={"profile": "worker_beta"})
+        assert current.status_code == 200
+        vision_payload = next(item for item in current.json()["tasks"] if item["task"] == "vision")
+        assert vision_payload["reasoning_effort"] == "high"
+
+    def test_auxiliary_reasoning_none_is_an_explicit_override(
+        self, client, isolated_profiles
+    ):
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.web_server import _profile_scope
+
+        with _profile_scope("worker_beta"):
+            cfg = load_config()
+            cfg["auxiliary"]["vision"].update(
+                {"provider": "openrouter", "model": "old/model", "reasoning_effort": "high"}
+            )
+            save_config(cfg)
+
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "vision",
+                "reasoning_effort": "none",
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 200
+        vision = _cfg(isolated_profiles["worker_beta"])["auxiliary"]["vision"]
+        assert vision["provider"] == "openrouter"
+        assert vision["model"] == "old/model"
+        assert vision["reasoning_effort"] == "none"
+
+    def test_auxiliary_reasoning_null_removes_only_task_override(
+        self, client, isolated_profiles
+    ):
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.web_server import _profile_scope
+
+        with _profile_scope("worker_beta"):
+            cfg = load_config()
+            cfg["auxiliary"]["vision"].update(
+                {
+                    "provider": "openrouter",
+                    "model": "old/model",
+                    "base_url": "https://example.test/v1",
+                    "reasoning_effort": "high",
+                }
+            )
+            save_config(cfg)
+
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "vision",
+                "reasoning_effort": None,
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 200
+        vision = _cfg(isolated_profiles["worker_beta"])["auxiliary"]["vision"]
+        assert vision["provider"] == "openrouter"
+        assert vision["model"] == "old/model"
+        assert vision["base_url"] == "https://example.test/v1"
+        assert "reasoning_effort" not in vision
+
+    def test_auxiliary_model_assignment_without_reasoning_preserves_override(
+        self, client, isolated_profiles
+    ):
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.web_server import _profile_scope
+
+        with _profile_scope("worker_beta"):
+            cfg = load_config()
+            cfg["auxiliary"]["vision"].update(
+                {"provider": "openrouter", "model": "old/model", "reasoning_effort": "high"}
+            )
+            save_config(cfg)
+
+        response = client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "vision",
+                "provider": "nous",
+                "model": "new/model",
+                "profile": "worker_beta",
+            },
+        )
+
+        assert response.status_code == 200
+        vision = _cfg(isolated_profiles["worker_beta"])["auxiliary"]["vision"]
+        assert vision["provider"] == "nous"
+        assert vision["model"] == "new/model"
+        assert vision["reasoning_effort"] == "high"
 
 
 
