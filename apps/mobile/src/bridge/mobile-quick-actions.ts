@@ -1,6 +1,6 @@
 import { registerPlugin } from '@capacitor/core'
 
-export type MobileQuickAction = 'newTask'
+export type MobileQuickAction = 'newTask' | 'wakeToggle'
 
 interface MobileQuickActionPlugin {
   addListener(eventName: 'quickAction', listener: (event: { action?: MobileQuickAction }) => void): Promise<{ remove: () => Promise<void> }>
@@ -10,7 +10,7 @@ interface MobileQuickActionPlugin {
 const MobileQuickAction = registerPlugin<MobileQuickActionPlugin>('MobileQuickAction')
 
 function parse(value: { action?: MobileQuickAction }): MobileQuickAction | null {
-  return value.action === 'newTask' ? value.action : null
+  return value.action === 'newTask' || value.action === 'wakeToggle' ? value.action : null
 }
 
 /** Consume a user-tapped widget/notification action exactly once. */

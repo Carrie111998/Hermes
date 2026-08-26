@@ -31,12 +31,22 @@ public class MobileQuickActionPlugin extends Plugin {
     }
 
     private void capture(Intent intent) {
-        if (intent == null || !HermesWidgetProvider.ACTION_NEW_TASK.equals(intent.getAction())) {
+        if (intent == null) {
+            return;
+        }
+
+        String action = intent.getAction();
+        String bridgeAction;
+        if (HermesWidgetProvider.ACTION_NEW_TASK.equals(action)) {
+            bridgeAction = "newTask";
+        } else if (HermesWidgetProvider.ACTION_WAKE_TOGGLE.equals(action)) {
+            bridgeAction = "wakeToggle";
+        } else {
             return;
         }
 
         JSObject result = new JSObject();
-        result.put("action", "newTask");
+        result.put("action", bridgeAction);
         pending = result;
         notifyListeners("quickAction", result, true);
     }
