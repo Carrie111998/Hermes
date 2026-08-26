@@ -894,8 +894,17 @@ class MattermostAdapter(BasePlatformAdapter):
                 f"@{self._bot_username}",
                 f"@{self._bot_user_id}",
             ]
+            # Use word-boundary checks so @hermes-bot does NOT match inside
+            # @hermes-bot2 or hermes-bot-helper.  Mattermost usernames are
+            # alphanumeric plus dashes/underscores/dots; a boundary is any
+            # character that is NOT one of those.
             has_mention = any(
-                pattern.lower() in message_text.lower()
+                re.search(
+                    re.escape(pattern) + r"(?!\w)",
+                    message_text,
+                    flags=re.IGNORECASE,
+                )
+                is not None
                 for pattern in mention_patterns
             )
 
@@ -910,7 +919,10 @@ class MattermostAdapter(BasePlatformAdapter):
             if has_mention:
                 for pattern in mention_patterns:
                     message_text = re.sub(
-                        re.escape(pattern), "", message_text, flags=re.IGNORECASE
+                        re.escape(pattern) + r"(?!\w)",
+                        "",
+                        message_text,
+                        flags=re.IGNORECASE,
                     ).strip()
 
         # Resolve sender info.
