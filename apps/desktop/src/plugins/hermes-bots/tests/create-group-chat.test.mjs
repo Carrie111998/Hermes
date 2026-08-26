@@ -58,5 +58,14 @@ test('source contract: creation negotiates continuity without exposing routing j
 
 test('source contract: an admitted autonomous room must roll back before any Desktop fallback', () => {
   assert.match(pluginSource, /cancel_id: `rollback-\$\{roomId\}`/)
+  assert.match(pluginSource, /'groups\.peer\.revoke'/)
+  assert.match(
+    pluginSource,
+    /try \{[\s\S]*?'groups\.peer\.invite'[\s\S]*?'groups\.create'[\s\S]*?'groups\.peer\.register'[\s\S]*?catch \(error\)/
+  )
+  assert.match(
+    pluginSource,
+    /setCreateError\(error instanceof Error \? error\.message/
+  )
   assert.doesNotMatch(pluginSource, /Room created\. Keep Desktop open until its gateways are ready\./)
 })

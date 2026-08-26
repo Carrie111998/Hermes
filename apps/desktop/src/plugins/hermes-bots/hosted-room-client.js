@@ -24,7 +24,7 @@ export const HOSTED_ROOM_CLIENT_LIMITATIONS = Object.freeze({
 const ATTACHMENT_FIELDS = new Set(['kind', 'name', 'size', 'mime', 'refs'])
 const ATTACHMENT_KINDS = new Set(['image', 'pdf', 'file'])
 const ATTACHMENT_PAYLOAD_ALIASES = new Set(['attachment', 'attachment_manifest', 'files', 'images'])
-const COMMAND_KINDS = new Set(['create', 'send', 'stop', 'disband'])
+const COMMAND_KINDS = new Set(['send', 'stop'])
 const DISALLOWED_STAGED_REF_SCHEMES = new Set(['blob', 'data', 'file', 'http', 'https', 'path'])
 const FORBIDDEN_TRANSPORT_FIELD_TOKENS = new Set(['base64', 'byte', 'bytes', 'data', 'path', 'paths'])
 const MEMBER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
@@ -74,6 +74,13 @@ function positiveInteger(value, fallback = null) {
   const number = Number(value)
 
   return Number.isSafeInteger(number) && number > 0 ? number : fallback
+}
+
+function timestampMilliseconds(value) {
+  const number = Number(value)
+
+  if (!Number.isFinite(number) || number <= 0) return 0
+  return number < 1_000_000_000_000 ? number * 1000 : number
 }
 
 function errorCode(error) {
@@ -523,7 +530,7 @@ function messageFromEvent(roomEvent) {
     },
     text: typeof payload.text === 'string' ? payload.text : '',
     thread: text(payload.thread_id) || text(payload.thread) || 'legacy',
-    at: roomEvent.createdAt,
+    at: timestampMilliseconds(roomEvent.createdAt),
     ...(attachments.length ? { attachments } : {})
   }
 }
@@ -535,7 +542,7 @@ function activityFromEvent(roomEvent) {
     kind: roomEvent.kind,
     member: memberLabel(roomEvent),
     reasonCode: text(roomEvent.payload?.reason_code),
-    at: roomEvent.createdAt
+    at: timestampMilliseconds(roomEvent.createdAt)
   }
 }
 
@@ -1093,7 +1100,7 @@ function updateCommand(state, commandId, mutate) {
   return { ...state, commands }
 }
 
-/** Pure state transitions for persisted create/send/stop/disband commands. */
+/** Pure state transitions for persisted send/stop commands. */
 export function reduceHostedRoomOutbox(state, action) {
   const current = state && Array.isArray(state.commands) ? state : createHostedRoomOutbox()
 
@@ -1112,6 +1119,9 @@ export function reduceHostedRoomOutbox(state, action) {
         throw new TypeError(`commandId ${command.commandId} is already bound to different content`)
       }
       return current
+    }
+    if (current.commands.length >= MAX_OUTBOX_COMMANDS) {
+      throw new TypeError('too many room actions are waiting for their gateway')
     }
 
     return { ...current, commands: [...current.commands, command] }

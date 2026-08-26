@@ -567,12 +567,14 @@ let groupChatSyncDisposed = false
 
 const HOSTED_ROOM_OUTBOX_KEY = 'hosted-room-outbox-v1'
 const HOSTED_ROOM_SYNC_INTERVAL_MS = 5000
+const HOSTED_ROOM_UNSUPPORTED_REPROBE_MS = 30000
 const $hostedRoomCapabilities = atom({})
 const $hostedRoomOutbox = atom({ version: 1, commands: [] })
 let hostedRoomSyncTimer = null
 let hostedRoomSyncRunning = false
 let hostedRoomSyncDisposed = false
 const hostedAuthorityRoutes = new Map()
+const hostedCapabilityRetryAt = new Map()
 
 /** Conservative byte count for the gateway's ensure_ascii JSON encoding.
  *  Python also inserts separator spaces, so reserve one extra byte per JS
@@ -815,6 +817,10 @@ function groupChatSyncSequence(entry) {
   return Number.isSafeInteger(seq) && seq > 0 ? seq : null
 }
 
+function groupChatSyncEventId(entry) {
+  return String(entry?.id || entry?.eventId || '')
+}
+
 /** Hosted gateway logs carry a monotonic per-room sequence. Prefer it when
  *  both entries have one; legacy/local entries keep their existing time/key
  *  order until migration assigns them a sequence. */
@@ -842,7 +848,7 @@ function mergeGroupChatSyncEntries(...logs) {
   const bySeq = new Map()
 
   const remember = (entry, index) => {
-    const id = entry?.id ? String(entry.id) : ''
+    const id = groupChatSyncEventId(entry)
     const seq = groupChatSyncSequence(entry)
 
     if (id) {
@@ -855,7 +861,7 @@ function mergeGroupChatSyncEntries(...logs) {
   }
 
   for (const entry of logs.flat()) {
-    const id = entry?.id ? String(entry.id) : ''
+    const id = groupChatSyncEventId(entry)
     const seq = groupChatSyncSequence(entry)
     let index = id ? byId.get(id) : undefined
 
@@ -1526,7 +1532,10 @@ async function requestHostedConnection(route, method, params = {}) {
   if (!route?.connectionId || typeof host.requestProfile !== 'function') {
     throw new Error('Hermes gateway is unavailable')
   }
-  return host.requestProfile(route, method, params)
+  return withHostedRoomProbeTimeout(
+    host.requestProfile(route, method, params),
+    8000
+  )
 }
 
 async function withHostedRoomProbeTimeout(task, timeoutMs = 3000) {
@@ -1544,17 +1553,50 @@ async function withHostedRoomProbeTimeout(task, timeoutMs = 3000) {
   }
 }
 
-function hostedMemberDescriptors(room, connectionId, connectionLabel) {
-  return (Array.isArray(room?.members) ? room.members : []).map(member => ({
-    name: String(member?.profile || member?.member_id || 'default'),
-    handle: String(member?.handle || member?.profile || 'hermes'),
-    title: String(member?.display_name || ''),
-    connectionId,
-    connectionLabel,
-    remoteSource: true,
-    sourceScoped: true,
-    targetProfile: String(member?.profile || 'default')
-  }))
+function hostedMemberDescriptors(room, connectionId, connectionLabel, sources = []) {
+  const byInstall = new Map(
+    (Array.isArray(sources) ? sources : [])
+      .filter(source => source?.installId)
+      .map(source => [String(source.installId), source])
+  )
+  return (Array.isArray(room?.members) ? room.members : []).map(member => {
+    const target = member?.target
+    const peer = target?.kind === 'peer'
+    const owner = peer ? byInstall.get(String(target.installation_id || '')) : null
+    const targetConnectionId = peer ? String(owner?.connectionId || '') : connectionId
+    const targetConnectionLabel = peer
+      ? String(owner?.label || owner?.connectionLabel || 'Unavailable gateway')
+      : connectionLabel
+    return {
+      memberId: String(member?.member_id || ''),
+      name: String(target?.profile || member?.profile || member?.member_id || 'default'),
+      handle: String(member?.handle || member?.profile || 'hermes'),
+      title: String(member?.display_name || ''),
+      connectionId: targetConnectionId,
+      connectionLabel: targetConnectionLabel,
+      remoteSource: true,
+      sourceScoped: Boolean(targetConnectionId),
+      sourceMissing: peer && !targetConnectionId,
+      sourceReachable: Boolean(targetConnectionId),
+      targetProfile: String(target?.profile || member?.profile || 'default')
+    }
+  })
+}
+
+function markHostedConnectionUnavailable(connectionId, { unsupported = false } = {}) {
+  for (const [name, room] of Object.entries($groupChats.get())) {
+    if (String(room?.hostedConnectionId || '') !== connectionId) continue
+    updateGroupChat(name, current => ({
+      ...current,
+      hostedStatus: {
+        state: unsupported ? 'unsupported' : 'offline',
+        label: unsupported ? 'Gateway update needed' : 'Gateway unavailable'
+      },
+      continuityIssue: unsupported
+        ? 'Update this gateway to continue background room work.'
+        : 'Reconnect this gateway to see new room activity.'
+    }), { sync: false })
+  }
 }
 
 async function refreshHostedRooms() {
@@ -1572,11 +1614,17 @@ async function refreshHostedRooms() {
     const capabilities = { ...$hostedRoomCapabilities.get() }
 
     for (const route of routes) {
+      if (hostedRoomSyncDisposed) return
       const connectionId = String(route.connectionId)
       let capability
 
+      if (Date.now() < Number(hostedCapabilityRetryAt.get(connectionId) || 0)) {
+        continue
+      }
+
       try {
         const result = await requestHostedConnection(route, 'groups.capabilities', {})
+        if (hostedRoomSyncDisposed) return
         capability = client.classifyHostedRoomCapability(result, { connectionId })
       } catch (error) {
         capability = client.classifyHostedRoomCapability({ ok: false, error }, { connectionId })
@@ -1588,16 +1636,33 @@ async function refreshHostedRooms() {
         capability.persistentProcess !== true ||
         !capability.authorityId
       ) {
+        if (capability.kind === 'unsupported') {
+          hostedCapabilityRetryAt.set(
+            connectionId,
+            Date.now() + HOSTED_ROOM_UNSUPPORTED_REPROBE_MS
+          )
+        }
+        markHostedConnectionUnavailable(connectionId, {
+          unsupported: capability.kind === 'unsupported'
+        })
         continue
       }
+      hostedCapabilityRetryAt.delete(connectionId)
 
       hostedAuthorityRoutes.set(capability.authorityId, route)
       let listed
       try {
         listed = await requestHostedConnection(route, 'groups.list', {})
       } catch {
+        markHostedConnectionUnavailable(connectionId)
         continue
       }
+      if (hostedRoomSyncDisposed) return
+      const listedRoomIds = new Set(
+        (Array.isArray(listed?.rooms) ? listed.rooms : [])
+          .map(room => String(room?.room_id || ''))
+          .filter(Boolean)
+      )
 
       for (const listedRoom of Array.isArray(listed?.rooms) ? listed.rooms : []) {
         const roomId = String(listedRoom?.room_id || '')
@@ -1608,14 +1673,28 @@ async function refreshHostedRooms() {
         try {
           serverState = await requestHostedConnection(route, 'groups.state', { room_id: roomId })
         } catch {
+          markHostedConnectionUnavailable(connectionId)
           continue
         }
+        if (hostedRoomSyncDisposed) return
         const roomState = serverState?.room || listedRoom
         const existingEntry = Object.entries($groupChats.get()).find(
           ([, room]) => String(room?.roomId || '') === roomId
         )
-        const existingName = existingEntry?.[0] || roomName
-        const existing = existingEntry?.[1] || {}
+        let existingName = existingEntry?.[0] || roomName
+        let existing = existingEntry?.[1] || {}
+        if (existingEntry && existingName !== roomName) {
+          const renamed = await renameGroupChat(
+            existingName,
+            roomName,
+            Array.isArray(existing.members) ? existing.members : [],
+            { hostedAlreadyRenamed: true }
+          )
+          if (renamed) {
+            existingName = renamed
+            existing = $groupChats.get()[renamed] || existing
+          }
+        }
         const replay = await client.replayHostedRoomPages({
           state: client.createHostedRoomReplayState({
             roomId,
@@ -1634,9 +1713,12 @@ async function refreshHostedRooms() {
               limit
             })
         })
+        if (hostedRoomSyncDisposed) return
         const source = sources.get(connectionId)
         const label = source?.label || source?.connectionLabel || connectionId
         const replayState = replay.state
+        const driverStatus = serverState?.driver_status || {}
+        const driverCounts = driverStatus?.counts || {}
         const distributed = Array.isArray(roomState.members) && roomState.members.some(
           member => member?.target?.kind === 'peer'
         )
@@ -1647,20 +1729,56 @@ async function refreshHostedRooms() {
           return {
             ...authoritative,
             roomId,
-            members: hostedMemberDescriptors(roomState, connectionId, label),
-            log: mergeGroupChatSyncEntries(room.log || [], replayState.messages || []),
+            members: hostedMemberDescriptors(
+              roomState,
+              connectionId,
+              label,
+              [...sources.values()]
+            ),
+            log: mergeGroupChatSyncEntries(room.log || [], replayState.messages || []).map(
+              entry => (groupChatSyncSequence(entry) !== null ? { ...entry, pending: false } : entry)
+            ),
             hostedConnectionId: connectionId,
             hostedSeq: replayState.cursor,
             continuityMode: distributed ? 'distributed' : 'gateway',
             continuityIssue: null,
-            hostedStatus: client.deriveFriendlyHostedRoomStatus(replayState),
-            running: replayState.lastStatusEvent?.kind === 'turn.started'
+            hostedStatus: driverCounts.stopping
+              ? { state: 'stopping', label: 'Stopping…' }
+              : driverStatus.blocked
+                ? { state: 'blocked', label: 'Needs attention' }
+                : driverStatus.working
+                  ? { state: 'working', label: 'Working' }
+                  : (() => {
+                      const friendly = client.deriveFriendlyHostedRoomStatus(replayState)
+                      return { state: friendly.kind, label: friendly.text }
+                    })(),
+            hostedPendingActions: Array.isArray(driverStatus.pending_actions)
+              ? driverStatus.pending_actions
+              : [],
+            running: Boolean(driverStatus.working)
           }
         }, { sync: false })
       }
+      for (const [name, room] of Object.entries($groupChats.get())) {
+        if (
+          hostedRoomSyncDisposed ||
+          String(room?.hostedConnectionId || '') !== connectionId ||
+          !room?.roomId ||
+          listedRoomIds.has(String(room.roomId))
+        ) {
+          continue
+        }
+        await disbandGroupChat(
+          name,
+          Array.isArray(room.members) ? room.members : [],
+          { hostedAlreadyDisbanded: true }
+        )
+      }
     }
 
-    $hostedRoomCapabilities.set(capabilities)
+    if (!hostedRoomSyncDisposed) {
+      $hostedRoomCapabilities.set(capabilities)
+    }
   } finally {
     hostedRoomSyncRunning = false
   }
@@ -1672,8 +1790,33 @@ function scheduleHostedRoomSync(delay = HOSTED_ROOM_SYNC_INTERVAL_MS) {
   hostedRoomSyncTimer = window.setTimeout(async () => {
     hostedRoomSyncTimer = null
     await refreshHostedRooms().catch(() => undefined)
+    await dispatchHostedRoomOutbox().catch(() => undefined)
     scheduleHostedRoomSync()
   }, delay)
+  // Node-based plugin harnesses expose Timeout.unref(); the browser returns
+  // a numeric id. Avoid keeping CI/hot-reload processes alive after every
+  // test has finished without changing renderer scheduling.
+  hostedRoomSyncTimer?.unref?.()
+}
+
+async function startHostedRoomSync(storage) {
+  hostedRoomSyncDisposed = false
+  const client = await import('./hosted-room-client.js')
+  let persisted = null
+
+  try {
+    persisted = await storage?.get?.(HOSTED_ROOM_OUTBOX_KEY)
+  } catch {
+    /* an empty outbox is the safe fallback */
+  }
+  try {
+    $hostedRoomOutbox.set(client.createHostedRoomOutbox(persisted))
+  } catch {
+    $hostedRoomOutbox.set(client.createHostedRoomOutbox())
+  }
+  await refreshHostedRooms().catch(() => undefined)
+  await dispatchHostedRoomOutbox().catch(() => undefined)
+  scheduleHostedRoomSync()
 }
 
 function stopHostedRoomSync() {
@@ -1682,6 +1825,8 @@ function stopHostedRoomSync() {
     window.clearTimeout(hostedRoomSyncTimer)
   }
   hostedRoomSyncTimer = null
+  hostedCapabilityRetryAt.clear()
+  hostedAuthorityRoutes.clear()
 }
 
 async function hostedRouteForRoom(room) {
@@ -1694,14 +1839,19 @@ async function hostedRouteForRoom(room) {
 }
 
 async function persistHostedRoomOutbox() {
-  try {
-    await pluginCtx?.storage?.set?.(HOSTED_ROOM_OUTBOX_KEY, $hostedRoomOutbox.get())
-  } catch {
-    /* a later mutation retries persistence */
+  if (typeof pluginCtx?.storage?.set !== 'function') {
+    throw new Error('Room work cannot be queued safely because Desktop storage is unavailable.')
   }
+  await pluginCtx.storage.set(HOSTED_ROOM_OUTBOX_KEY, $hostedRoomOutbox.get())
 }
 
 let hostedOutboxDispatching = false
+
+function transitionHostedRoomOutbox(client, action) {
+  const next = client.reduceHostedRoomOutbox($hostedRoomOutbox.get(), action)
+  $hostedRoomOutbox.set(next)
+  return next
+}
 
 async function dispatchHostedRoomOutbox() {
   if (hostedOutboxDispatching || hostedRoomSyncDisposed) return
@@ -1709,42 +1859,71 @@ async function dispatchHostedRoomOutbox() {
 
   try {
     const client = await import('./hosted-room-client.js')
-    let state = $hostedRoomOutbox.get()
+    const pending = $hostedRoomOutbox.get().commands.filter(
+      entry => entry.status === 'pending'
+    )
 
-    for (const command of state.commands.filter(entry => entry.status === 'pending')) {
+    for (const command of pending) {
       const routes = await hostedDefaultRoutes()
       const route = routes.find(candidate => String(candidate?.connectionId || '') === command.connectionId)
 
       if (!route) continue
-      state = client.reduceHostedRoomOutbox(state, { type: 'dispatch', commandId: command.commandId })
-      $hostedRoomOutbox.set(state)
+      transitionHostedRoomOutbox(client, {
+        type: 'dispatch',
+        commandId: command.commandId
+      })
       await persistHostedRoomOutbox()
 
-      const method = {
-        create: 'groups.create',
-        send: 'groups.send',
-        stop: 'groups.stop',
-        disband: 'groups.disband'
-      }[command.kind]
+      const method = { send: 'groups.send', stop: 'groups.stop' }[command.kind]
       const params =
         command.kind === 'send'
           ? { room_id: command.roomId, event_id: command.commandId, payload: command.payload }
-          : command.kind === 'stop'
-            ? { room_id: command.roomId, cancel_id: command.commandId }
-            : command.kind === 'disband'
-              ? { room_id: command.roomId, cancel_id: command.commandId }
-              : command.payload
+          : { room_id: command.roomId, cancel_id: command.commandId }
 
       try {
         await requestHostedConnection(route, method, params)
-        state = client.reduceHostedRoomOutbox(state, { type: 'acknowledge', commandId: command.commandId })
-        $hostedRoomOutbox.set(state)
+        transitionHostedRoomOutbox(client, {
+          type: 'acknowledge',
+          commandId: command.commandId
+        })
         await persistHostedRoomOutbox()
         scheduleHostedRoomSync(0)
-      } catch {
-        state = client.reduceHostedRoomOutbox(state, { type: 'transient-failure', commandId: command.commandId })
-        $hostedRoomOutbox.set(state)
+      } catch (error) {
+        const code = Number(error?.code ?? error?.error?.code)
+        const message = String(error?.message || error?.error?.message || '')
+        const terminal =
+          code === -32601 ||
+          (Number.isFinite(code) && code >= 4000 && code < 5000) ||
+          /invalid.room.grant|authorization|method not found|unsupported/i.test(message)
+        transitionHostedRoomOutbox(client, {
+          type: terminal ? 'terminal-failure' : 'transient-failure',
+          commandId: command.commandId,
+          failureCode: terminal ? String(code || 'command-rejected') : null
+        })
         await persistHostedRoomOutbox()
+        if (terminal) {
+          const roomEntry = Object.entries($groupChats.get()).find(
+            ([, room]) => String(room?.roomId || '') === command.roomId
+          )
+          if (roomEntry) {
+            updateGroupChat(roomEntry[0], room => ({
+              ...room,
+              running: false,
+              hostedStatus: { state: 'failed', label: 'Needs attention' },
+              continuityIssue: 'The gateway rejected this action. Review the room setup and try again.',
+              log: (room.log || []).map(entry =>
+                groupChatSyncEventId(entry) === command.commandId
+                  ? { ...entry, pending: false, failed: true }
+                  : entry
+              )
+            }), { sync: false })
+          }
+          transitionHostedRoomOutbox(client, {
+            type: 'acknowledge',
+            commandId: command.commandId
+          })
+          await persistHostedRoomOutbox()
+        }
       }
     }
   } finally {
@@ -1754,89 +1933,98 @@ async function dispatchHostedRoomOutbox() {
 
 async function enqueueHostedRoomCommand(command) {
   const client = await import('./hosted-room-client.js')
-  const next = client.reduceHostedRoomOutbox($hostedRoomOutbox.get(), {
+  transitionHostedRoomOutbox(client, {
     type: 'enqueue',
     command
   })
-  $hostedRoomOutbox.set(next)
   await persistHostedRoomOutbox()
   await dispatchHostedRoomOutbox()
+  return !$hostedRoomOutbox.get().commands.some(
+    entry => entry.commandId === command.commandId
+  )
 }
 
-function hostedAttachmentRef(eventId, index, memberId) {
-  const seed = `${eventId}-${index}-${memberId}`.replace(/[^A-Za-z0-9._:-]/g, '-').slice(0, 220)
-  return `staged:${seed || `attachment-${index}`}`
-}
-
-function attachmentMime(attachment) {
-  if (attachment?.mime) return String(attachment.mime)
-  const match = /^data:([^;,]+)/i.exec(String(attachment?.data || ''))
-  return match?.[1] || (attachment?.kind === 'pdf' ? 'application/pdf' : attachment?.kind === 'image' ? 'image/png' : 'application/octet-stream')
-}
-
-async function stageHostedAttachments(group, members, eventId, attachments) {
-  const picked = (Array.isArray(attachments) ? attachments : []).slice(0, 8)
-  if (!picked.length) return []
-  const manifests = picked.map(attachment => ({
-    kind: attachment.kind,
-    name: attachment.name || 'attachment',
-    size: Math.max(0, Number(attachment.size || 0)),
-    mime: attachmentMime(attachment),
-    refs: {}
-  }))
-
-  for (const member of members) {
-    const { runtime } = await ensureGroupChatSession(group, member)
-    if (!runtime) throw new Error(`${displayName(member, botRosterMeta(member, $botMeta.get()))} is unavailable.`)
-    const memberId = member.name === 'default' ? 'default' : member.name
-
-    for (let index = 0; index < picked.length; index++) {
-      const attachment = picked[index]
-      if (attachment.kind === 'pdf') {
-        await requestForBot(member, 'pdf.attach', {
-          session_id: runtime,
-          content_base64: attachment.data,
-          filename: attachment.name || 'attachment.pdf'
-        })
-      } else if (attachment.kind === 'file') {
-        await requestForBot(member, 'file.attach', {
-          session_id: runtime,
-          data_url: attachment.data,
-          name: attachment.name || 'attachment'
-        })
-      } else {
-        await requestForBot(member, 'image.attach_bytes', {
-          session_id: runtime,
-          content_base64: attachment.data,
-          filename: attachment.name || 'attachment.png'
-        })
-      }
-      manifests[index].refs[memberId] = hostedAttachmentRef(eventId, index, memberId)
-    }
-  }
-
-  return manifests
-}
-
-async function sendHostedGroupChat(group, members, sent, thread, attachments) {
+async function sendHostedGroupChat(group, sent, thread) {
   const room = $groupChats.get()[group]
-  const route = await hostedRouteForRoom(room)
-  if (!route) {
+  const connectionId = String(room?.hostedConnectionId || '')
+  if (!connectionId) {
     throw new Error('This group is offline. Try again when its gateway reconnects.')
   }
-  const manifests = await stageHostedAttachments(group, members, sent.id, attachments)
   await enqueueHostedRoomCommand({
     commandId: sent.id,
     kind: 'send',
     roomId: room.roomId,
     authorityId: groupChatHostedGateway(room),
-    connectionId: String(route.connectionId),
+    connectionId,
     payload: {
       text: sent.text || '',
-      thread_id: thread,
-      ...(manifests.length ? { attachments: manifests } : {})
+      thread_id: thread
     }
   })
+}
+
+async function stopHostedGroupChat(group) {
+  const room = $groupChats.get()[group]
+  const connectionId = String(room?.hostedConnectionId || '')
+  if (!connectionId || !room?.roomId) {
+    throw new Error('This group is offline. Try again when its gateway reconnects.')
+  }
+  const commandId = `stop-${groupChatEntryId()}`
+  updateGroupChat(group, current => ({
+    ...current,
+    hostedStatus: { state: 'stopping', label: 'Stopping…' },
+    running: true
+  }), { sync: false })
+  const acknowledged = await enqueueHostedRoomCommand({
+    commandId,
+    kind: 'stop',
+    roomId: room.roomId,
+    authorityId: groupChatHostedGateway(room),
+    connectionId,
+    payload: {}
+  })
+  if (!acknowledged) {
+    throw new Error('Stop is pending until the gateway reconnects.')
+  }
+  scheduleHostedRoomSync(0)
+}
+
+async function retryHostedGroupChat(group, taskId) {
+  const room = $groupChats.get()[group]
+  const route = await hostedRouteForRoom(room)
+  if (!route || !room?.roomId || !taskId) {
+    throw new Error('This group is offline. Try again when its gateway reconnects.')
+  }
+  await requestHostedConnection(route, 'groups.retry', {
+    room_id: room.roomId,
+    task_id: taskId
+  })
+  scheduleHostedRoomSync(0)
+}
+
+async function approveHostedGroupChat(group, action, choice) {
+  const room = $groupChats.get()[group]
+  const route = await hostedRouteForRoom(room)
+  if (!route || !room?.roomId) {
+    throw new Error('This group is offline. Try again when its gateway reconnects.')
+  }
+  await requestHostedConnection(route, 'groups.approve', {
+    room_id: room.roomId,
+    member_id: action.member_id,
+    task_id: action.task_id,
+    execution_generation: action.execution_generation,
+    choice
+  })
+  updateGroupChat(group, current => ({
+    ...current,
+    hostedPendingActions: (current.hostedPendingActions || []).filter(candidate =>
+      candidate?.kind !== 'approval' ||
+      candidate?.member_id !== action.member_id ||
+      candidate?.task_id !== action.task_id ||
+      Number(candidate?.execution_generation || 0) !== Number(action.execution_generation || 0)
+    )
+  }), { sync: false })
+  scheduleHostedRoomSync(0)
 }
 
 async function groupChatRemoteSnapshot(job) {
@@ -7676,12 +7864,26 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
  *  room log from the atom + plugin storage, and close the room view if it's
  *  open. Other group memberships and the members' per-group gateway sessions
  *  ("Group: <roomId>", or legacy "Group: <name>") are intentionally KEPT. */
-async function disbandGroupChat(group, members) {
+async function disbandGroupChat(
+  group,
+  members,
+  { hostedAlreadyDisbanded = false } = {}
+) {
   // Invalidate any in-flight round-robin FIRST: bump the epoch so a running
   // drive bails at its next member boundary instead of appending to a room
   // the user just discarded.
   const all = { ...$groupChats.get() }
   const prior = all[group] || {}
+  if (groupChatHostedGateway(prior) && !hostedAlreadyDisbanded) {
+    const route = await hostedRouteForRoom(prior)
+    if (!route || !prior.roomId) {
+      throw new Error('This group is offline. Reconnect its gateway before deleting it.')
+    }
+    await requestHostedConnection(route, 'groups.disband', {
+      room_id: prior.roomId,
+      cancel_id: `disband-${groupChatEntryId()}`
+    })
+  }
   const metaBefore = $botMeta.get()
   const cleanup = groupDisbandMetadataPlan(group, members, prior, $lastRoster.get(), metaBefore)
   let metadataPersistence = Promise.resolve()
@@ -7792,7 +7994,12 @@ function setGroupChatImage(group, image) {
  *  rename, so even a member whose sid is later lost falls back to the same
  *  "Group: <roomId>" title lookup instead of a fresh "Group: <new name>".
  *  Returns the new name, or null when the target name is taken. */
-async function renameGroupChat(oldName, newName, members) {
+async function renameGroupChat(
+  oldName,
+  newName,
+  members,
+  { hostedAlreadyRenamed = false } = {}
+) {
   const next = String(newName || '').trim().slice(0, 64)
 
   if (!next || next === oldName) {
@@ -7815,6 +8022,19 @@ async function renameGroupChat(oldName, newName, members) {
   if (taken.has(next)) {
     host.notify({ kind: 'error', message: `A group named “${next}” already exists.` })
     return null
+  }
+
+  const currentRoom = $groupChats.get()[oldName]
+  if (groupChatHostedGateway(currentRoom) && !hostedAlreadyRenamed) {
+    const route = await hostedRouteForRoom(currentRoom)
+    if (!route || !currentRoom?.roomId) {
+      throw new Error('This group is offline. Reconnect its gateway before renaming it.')
+    }
+    await requestHostedConnection(route, 'groups.rename', {
+      room_id: currentRoom.roomId,
+      event_id: `rename-${groupChatEntryId()}`,
+      name: next
+    })
   }
 
   // Move the room record wholesale — log, watermarks, sessions, members,
@@ -7908,11 +8128,18 @@ function normalizeGroupChatText(text) {
   return trimmed === GROUP_EMPTY_SENTINEL ? GROUP_EMPTY_FRIENDLY : trimmed
 }
 
-function appendGroupChatEntry(group, from, text, thread, images) {
+function appendGroupChatEntry(
+  group,
+  from,
+  text,
+  thread,
+  images,
+  { hostedMirror = false, pending = false, sync = true } = {}
+) {
   // Once a gateway owns the room, its monotonic log is authoritative. Late
   // renderer harvest/clarify callbacks from the pre-hosted epoch must not
   // mutate the read mirror after ownership moves.
-  if (groupChatHostedGateway($groupChats.get()[group])) {
+  if (groupChatHostedGateway($groupChats.get()[group]) && !hostedMirror) {
     return null
   }
 
@@ -7923,6 +8150,7 @@ function appendGroupChatEntry(group, from, text, thread, images) {
     text: normalizeGroupChatText(text),
     thread: thread || 'legacy'
   }
+  if (pending) entry.pending = true
 
   if (Array.isArray(images) && images.length) {
     // [{ name, data }] — data URLs. Persisted with the room log so reloads
@@ -7944,7 +8172,7 @@ function appendGroupChatEntry(group, from, text, thread, images) {
   updateGroupChat(group, room => {
     room.log.push(entry)
     return room
-  })
+  }, { sync })
 
   // Needs-you: a member addressing @user badges the group header.
   if (from.kind === 'member' && /@user\b/i.test(entry.text)) {
@@ -9205,11 +9433,41 @@ function sendToGroupChat(group, members, text, thread, images) {
   }
 
   if (hosted) {
-    host.notify?.({
-      kind: 'info',
-      message: `“${group}” runs on ${hosted}. Sending to hosted rooms isn't available in this build yet.`
+    if (attached.length) {
+      host.notify?.({
+        kind: 'info',
+        message: 'Files are not available in background rooms yet. The draft was kept.'
+      })
+      return null
+    }
+    const target = thread || mintGroupThreadId()
+    const sent = appendGroupChatEntry(
+      group,
+      { kind: 'user', name: 'You' },
+      trimmed,
+      target,
+      [],
+      { hostedMirror: true, pending: true, sync: false }
+    )
+    if (!sent) return null
+    updateGroupChat(group, room => {
+      room.running = true
+      room.hostedStatus = { state: 'working', label: 'Working' }
+      return room
     })
-    return null
+    recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
+    void sendHostedGroupChat(group, sent, target).catch(() => {
+      updateGroupChat(group, room => {
+        room.running = false
+        room.hostedStatus = { state: 'failed', label: 'Needs attention' }
+        room.continuityIssue = 'Message not sent. Retry when the gateway reconnects.'
+        room.log = room.log.map(entry =>
+          entry.id === sent.id ? { ...entry, pending: false, failed: true } : entry
+        )
+        return room
+      }, { sync: false })
+    })
+    return target
   }
 
   const target = thread || mintGroupThreadId()
@@ -13237,6 +13495,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const [hostPlanCopy, setHostPlanCopy] = useState(null)
   const [hostProbePending, setHostProbePending] = useState(false)
   const [createPending, setCreatePending] = useState(false)
+  const createGuard = useRef(false)
   const [createError, setCreateError] = useState('')
 
   // Reset per open so a cancelled draft doesn't leak into the next one.
@@ -13254,6 +13513,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       setHostPlanCopy(null)
       setHostProbePending(false)
       setCreatePending(false)
+      createGuard.current = false
       setCreateError('')
     }
   }, [open])
@@ -13361,6 +13621,9 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const hostedEligible = hostPlan?.kind === 'single-gateway' || hostPlan?.kind === 'multi-gateway'
 
   const create = async () => {
+    if (createGuard.current || createPending || hostProbePending) {
+      return
+    }
     const base = (name.trim() || placeholder).slice(0, 64)
 
     if (selected.length < 2 || !base) {
@@ -13391,6 +13654,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
     // gateway's name-keyed bot metadata to remain seated in this room.
     const roomMembers = durableGroupChatMembers(selected)
 
+    createGuard.current = true
     setCreatePending(true)
     setCreateError('')
     let hostedRoom = null
@@ -13409,80 +13673,97 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
 
         const hostedMembers = []
         const peerRegistrations = []
-
-        for (const [index, bot] of selected.entries()) {
-          const route = botConnectionRoute(bot)
-          const connectionId = String(route?.connectionId || '')
-          const profile = backendTargetProfile(route, bot.name)
-          const memberId = `member-${index + 1}-${String(profile || 'default')}`
-            .replace(/[^A-Za-z0-9._:-]/g, '-')
-            .slice(0, 128)
-          const descriptor = {
-            member_id: memberId,
-            profile,
-            handle: botMentionTag(bot),
-            ...(displayName(bot, botRosterMeta(bot, allMeta))
-              ? { display_name: displayName(bot, botRosterMeta(bot, allMeta)) }
-              : {})
-          }
-
-          if (connectionId === hostPlan.homeConnectionId) {
-            hostedMembers.push(descriptor)
-            continue
-          }
-
-          const invitation = await requestForBot(bot, 'groups.peer.invite', {
-            room_id: roomId,
-            home_install_id: homeCapability.authorityId
-          })
-          const targetCapability = hostCapabilities[connectionId]
-          const targetUrl = targetCapability?.roomLink?.endpoint
-
-          if (!targetUrl || !invitation?.grant || !invitation?.catalog || !invitation?.target_profile) {
-            throw new Error('A gateway could not prepare this room.')
-          }
-
-          hostedMembers.push({
-            ...descriptor,
-            profile: invitation.target_profile,
-            target: {
-              kind: 'peer',
-              peer_id: invitation.catalog.installation_id,
-              installation_id: invitation.catalog.installation_id,
-              profile: invitation.target_profile,
-              capability_digest: invitation.catalog.catalog_digest
-            }
-          })
-          peerRegistrations.push({
-            room_id: roomId,
-            member_id: memberId,
-            target_url: targetUrl,
-            target_profile: invitation.target_profile,
-            grant: invitation.grant,
-            catalog: invitation.catalog
-          })
-        }
-
-        const created = await requestHostedConnection(homeRoute, 'groups.create', {
-          room_id: roomId,
-          name: groupName,
-          members: hostedMembers
-        })
-        hostedRoom = created?.room
-        if (!hostedRoom?.authority_gateway_id) {
-          throw new Error('The gateway did not create the group.')
-        }
-
         try {
-          for (const registration of peerRegistrations) {
+          for (const [index, bot] of selected.entries()) {
+            const route = botConnectionRoute(bot)
+            const connectionId = String(route?.connectionId || '')
+            const profile = backendTargetProfile(route, bot.name)
+            const memberId = `member-${index + 1}-${String(profile || 'default')}`
+              .replace(/[^A-Za-z0-9._:-]/g, '-')
+              .slice(0, 128)
+            const descriptor = {
+              member_id: memberId,
+              profile,
+              handle: botMentionTag(bot),
+              ...(displayName(bot, botRosterMeta(bot, allMeta))
+                ? { display_name: displayName(bot, botRosterMeta(bot, allMeta)) }
+                : {})
+            }
+
+            if (connectionId === hostPlan.homeConnectionId) {
+              hostedMembers.push(descriptor)
+              continue
+            }
+
+            const invitation = await requestForBot(bot, 'groups.peer.invite', {
+              room_id: roomId,
+              home_install_id: homeCapability.authorityId,
+              authority_gateway_id: homeCapability.authorityId,
+              authority_epoch: 1,
+              member_id: memberId,
+              profile
+            })
+            const targetCapability = hostCapabilities[connectionId]
+            const targetUrl = targetCapability?.roomLink?.endpoint
+
+            if (!targetUrl || !invitation?.grant || !invitation?.catalog || !invitation?.target_profile) {
+              throw new Error('A gateway could not prepare this room.')
+            }
+
+            hostedMembers.push({
+              ...descriptor,
+              profile: invitation.target_profile,
+              target: {
+                kind: 'peer',
+                peer_id: invitation.catalog.installation_id,
+                installation_id: invitation.catalog.installation_id,
+                profile: invitation.target_profile,
+                capability_digest: invitation.catalog.catalog_digest
+              }
+            })
+            peerRegistrations.push({
+              bot,
+              room_id: roomId,
+              member_id: memberId,
+              target_url: targetUrl,
+              target_profile: invitation.target_profile,
+              grant: invitation.grant,
+              catalog: invitation.catalog
+            })
+          }
+
+          const created = await requestHostedConnection(homeRoute, 'groups.create', {
+            room_id: roomId,
+            name: groupName,
+            members: hostedMembers
+          })
+          hostedRoom = created?.room
+          if (!hostedRoom?.authority_gateway_id) {
+            throw new Error('The gateway did not create the group.')
+          }
+
+          for (const { bot: _bot, ...registration } of peerRegistrations) {
             await requestHostedConnection(homeRoute, 'groups.peer.register', registration)
           }
         } catch (error) {
-          await requestHostedConnection(homeRoute, 'groups.disband', {
-            room_id: roomId,
-            cancel_id: `rollback-${roomId}`
-          }).catch(() => undefined)
+          const cleanup = await Promise.allSettled([
+            ...(hostedRoom
+              ? [requestHostedConnection(homeRoute, 'groups.disband', {
+                  room_id: roomId,
+                  cancel_id: `rollback-${roomId}`
+                })]
+              : []),
+            ...peerRegistrations.map(registration =>
+              requestForBot(registration.bot, 'groups.peer.revoke', {
+                grant: registration.grant,
+                profile: registration.target_profile
+              })
+            )
+          ])
           hostedRoom = null
+          if (cleanup.some(result => result.status === 'rejected')) {
+            throw new Error('Some gateways could not finish cleanup. Check gateway connections before trying again.')
+          }
           throw error
         }
       }
@@ -13517,22 +13798,17 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       onClose()
       onCreated?.(groupName)
     } catch (error) {
-      setCreateError(
-        keepRunning
-          ? 'The gateways could not finish setting up this room. Nothing was started. Try again, or turn off background work.'
-          : error instanceof Error
-            ? error.message
-            : 'Could not create the group.'
-      )
+      setCreateError(error instanceof Error ? error.message : 'Could not create the group.')
     } finally {
       setCreatePending(false)
+      createGuard.current = false
     }
   }
 
   return jsx(Dialog, {
     open,
     onOpenChange: value => {
-      if (!value) {
+      if (!value && !createPending) {
         onClose()
       }
     },
@@ -13543,7 +13819,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
           children: [
             jsx(DialogTitle, { children: 'New Group Chat' }),
             jsx(DialogDescription, {
-              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Hermes handles their gateways for you.`
+              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots to start a shared conversation.`
             })
           ]
         }),
@@ -13651,7 +13927,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
         }),
         selected.length >= 2
           ? jsxs('details', {
-              className: 'group rounded-md border border-(--ui-stroke-secondary) px-2.5 py-2',
+              className: 'group py-1',
               children: [
                 jsxs('summary', {
                   className:
@@ -13702,10 +13978,9 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
           : null,
         jsxs(DialogFooter, {
           children: [
-            jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
+            jsx(Button, { variant: 'secondary', disabled: createPending, onClick: onClose, children: 'Cancel' }),
             jsx(Button, {
               disabled: !canCreate || createPending || hostProbePending,
-              title: selected.length < 2 ? 'Pick at least 2 bots' : undefined,
               onClick: () => void create(),
               children: createPending
                 ? 'Creating…'
@@ -13960,7 +14235,7 @@ function GroupMentionInput({ members, onChange, onSubmitDraft, value, ...inputPr
  *  - approval: the command in a code row plus the server's choice set
  *    (once/session/always/deny) as buttons — no free text; approvals are a
  *    closed choice. Answer sends via the member's own source. */
-function GroupClarifyCard({ entry, members }) {
+function GroupClarifyCard({ entry, members, onAnswer = null }) {
   const { group } = entry
   const isApproval = entry.kind === 'approval'
   const member = members.find(m => groupMemberKey(m) === entry.memberKey) || members.find(m => m.name === entry.member)
@@ -13997,7 +14272,11 @@ function GroupClarifyCard({ entry, members }) {
 
     try {
       if (isApproval || !(entry.questions && entry.questions.length)) {
-        await answerGroupClarify(entry, member, answerFor(questions[0]))
+        if (onAnswer) {
+          await onAnswer(entry, answerFor(questions[0]))
+        } else {
+          await answerGroupClarify(entry, member, answerFor(questions[0]))
+        }
       } else {
         const answers = {}
 
@@ -14208,6 +14487,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
+  const hosted = Boolean(groupChatHostedGateway(room))
+  const retryAction = Array.isArray(room.hostedPendingActions)
+    ? room.hostedPendingActions.find(action => action?.kind === 'retry')
+    : null
   const composerKey = groupComposerDraftKey(group, room)
   const composerKeyRef = useRef(composerKey)
   const [composerDraft, setComposerDraft] = useState(() => groupComposerDraftSnapshot(composerKey))
@@ -14251,6 +14534,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         typeof value === 'function' ? value(current.pendingAttachments || {}) : value
     }))
   const [confirmDisband, setConfirmDisband] = useState(false)
+  const [confirmRetry, setConfirmRetry] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
@@ -14340,6 +14624,13 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     }
 
     event.preventDefault()
+    if (hosted) {
+      host.notify({
+        kind: 'info',
+        message: 'Files are not available in background rooms yet.'
+      })
+      return
+    }
     void filesToGroupAttachments(files).then(picked => addImages(thread, picked))
   }
 
@@ -14358,6 +14649,13 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     }
 
     event.preventDefault()
+    if (hosted) {
+      host.notify({
+        kind: 'info',
+        message: 'Files are not available in background rooms yet.'
+      })
+      return
+    }
     void filesToGroupAttachments(files).then(picked => addImages(replyThread, picked))
   }
 
@@ -14371,6 +14669,32 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const roomClarifies = Object.values(clarifyAll || {})
     .filter(entry => entry?.group === group)
     .sort((a, b) => (a.at || 0) - (b.at || 0))
+  const hostedApprovals = (Array.isArray(room.hostedPendingActions) ? room.hostedPendingActions : [])
+    .filter(action => action?.kind === 'approval')
+    .map(action => {
+      const member = members.find(
+        candidate =>
+          candidate.memberId === action.member_id ||
+          groupMemberKey(candidate) === action.member_id
+      )
+      const approval = action.approval && typeof action.approval === 'object' ? action.approval : {}
+
+      return {
+        group,
+        kind: 'approval',
+        memberKey: action.member_id,
+        member: member?.name || action.member_id,
+        requestId: `${action.task_id || 'task'}:${Number(action.execution_generation || 0)}`,
+        question: typeof approval.description === 'string' ? approval.description : '',
+        command: typeof approval.command === 'string' ? approval.command : '',
+        choices: Array.isArray(approval.choices) && approval.choices.length
+          ? approval.choices.filter(choice => typeof choice === 'string' && choice)
+          : ['once', 'deny'],
+        multiSelect: false,
+        hostedAction: action
+      }
+    })
+  const pendingPrompts = [...roomClarifies, ...hostedApprovals]
   const availableMembers = members.filter(member => botSourceStatus(member).available).length
   const availabilityLabel = `${availableMembers} of ${members.length} available`
   const memberNames = members.map(b => displayName(b, botRosterMeta(b, allMeta))).join(', ') || 'No bots in this group chat'
@@ -14411,6 +14735,41 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           children: members.length > 0 && availableMembers < members.length ? availabilityLabel : `${members.length} bots`
         })
       }),
+      hosted && room.hostedStatus?.label
+        ? jsx('span', {
+            className: 'shrink-0 text-[0.65rem] text-(--ui-text-tertiary)',
+            role: 'status',
+            children: room.hostedStatus.label
+          })
+        : null,
+      hosted && room.running
+        ? jsx(Tip, {
+            label: 'Stop room work',
+            children: jsx(Button, {
+              variant: 'ghost',
+              size: 'sm',
+              className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
+              'aria-label': `Stop work in ${group}`,
+              onClick: () => void stopHostedGroupChat(group).catch(error =>
+                host.notify({ kind: 'error', message: error?.message || 'Could not stop room work.' })
+              ),
+              children: jsx(Codicon, { name: 'debug-stop' })
+            })
+        })
+        : null,
+      hosted && retryAction
+        ? jsx(Tip, {
+            label: 'Retry uncertain work',
+            children: jsx(Button, {
+              variant: 'ghost',
+              size: 'sm',
+              className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
+              'aria-label': `Retry uncertain work in ${group}`,
+              onClick: () => setConfirmRetry(true),
+              children: jsx(Codicon, { name: 'refresh' })
+            })
+          })
+        : null,
       jsx(Tip, {
         label: `Group settings — rename ${group} or set a room picture`,
         children: jsx(Button, {
@@ -14647,14 +15006,20 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   }
 
   const attachButton = thread =>
-    jsx(Button, {
-      type: 'button',
-      variant: 'ghost',
-      size: 'sm',
-      className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
-      title: 'Attach files — every responding bot sees them',
-      onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
-      children: jsx(Codicon, { name: 'attach' })
+    jsx(Tip, {
+      label: hosted
+        ? 'Files are not available in background rooms yet'
+        : 'Attach files — every responding bot sees them',
+      children: jsx(Button, {
+        type: 'button',
+        variant: 'ghost',
+        size: 'sm',
+        disabled: hosted,
+        className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
+        'aria-label': hosted ? 'File sharing unavailable in this room' : 'Attach files',
+        onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
+        children: jsx(Codicon, { name: 'attach' })
+      })
     })
 
   // One log entry, rendered exactly as before conversation folding existed.
@@ -14730,8 +15095,11 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                                     children: label
                                   }),
                               jsx('span', {
-                                className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-                                children: relativeTime(entry.at)
+                                className: cn(
+                                  'text-[0.625rem] text-(--ui-text-quaternary)',
+                                  entry.failed && 'text-destructive'
+                                ),
+                                children: entry.failed ? 'Not sent' : entry.pending ? 'Sending…' : relativeTime(entry.at)
                               }),
                               entry.text.trim()
                                 ? jsx('div', {
@@ -14959,13 +15327,19 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                     children: 'Say something — every bot in this group hears the room.'
                   }, 'empty')
                 ]),
-            ...roomClarifies.map(entry =>
-              jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
+            ...pendingPrompts.map(entry =>
+              jsx(GroupClarifyCard, {
+                entry,
+                members,
+                onAnswer: entry.hostedAction
+                  ? (_pending, choice) => approveHostedGroupChat(group, entry.hostedAction, choice)
+                  : null
+              }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: roomClarifies.length
+                  children: pendingPrompts.length
                     ? 'Waiting for your answer…'
                     : room.turn
                       ? `${groupSpeakerLabel(room.turn)} is thinking…`
@@ -15018,6 +15392,19 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         members,
         open: settingsOpen,
         onClose: () => setSettingsOpen(false)
+      }),
+      jsx(ConfirmDialog, {
+        open: confirmRetry,
+        title: 'Retry uncertain work?',
+        description:
+          'The earlier attempt may already have finished. Retrying can repeat side effects.',
+        confirmLabel: 'Retry',
+        busyLabel: 'Retrying…',
+        doneLabel: 'Retried',
+        onClose: () => setConfirmRetry(false),
+        onConfirm: async () => {
+          await retryHostedGroupChat(group, retryAction?.task_id)
+        }
       }),
       jsx(ConfirmDialog, {
         open: confirmDisband,
@@ -16583,15 +16970,18 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
+    hostedRoomSyncDisposed = false
     startFaceClock()
     // The cross-connection relay rides every gateway socket this Desktop
     // holds: roster sync + envelope drain/deliver/reply loops.
     startBotRelay()
+    void startHostedRoomSync(ctx.storage).catch(() => scheduleHostedRoomSync())
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(stopFaceClock)
       ctx.onDispose(stopBotRelay)
+      ctx.onDispose(stopHostedRoomSync)
     }
 
     // @-mention autocomplete: typing "@rese…" in ANY composer offers the

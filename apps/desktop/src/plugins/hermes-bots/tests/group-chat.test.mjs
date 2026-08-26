@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
+import { createHostedRoomOutbox, reduceHostedRoomOutbox } from '../hosted-room-client.js'
+
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
@@ -205,7 +207,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, hostedMemberDescriptors, transitionHostedRoomOutbox, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $hostedRoomOutbox, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -683,7 +685,7 @@ test('hosted-room marker survives projection, cold hydrate, and plugin persisten
   assert.equal(reloaded.Hosted.running, false)
 })
 
-test('persisted hosted fence blocks the local driver after relaunch', () => {
+test('persisted hosted fence routes the message without starting a local driver', () => {
   const gc = load(() => 'must not run')
   const reloaded = gc.hydratePersistedGroupChatRooms({
     Hosted: {
@@ -698,9 +700,9 @@ test('persisted hosted fence blocks the local driver after relaunch', () => {
   gc.$groupChats.set(reloaded)
   const thread = gc.sendToGroupChat('Hosted', [{ name: 'research' }], 'after restart')
 
-  assert.equal(thread, null)
+  assert.ok(thread)
   assert.equal(gc.calls.length, 0)
-  assert.match(gc.notifications.at(-1).message, /gateway-a/)
+  assert.equal(gc.$groupChats.get().Hosted.log.at(-1).text, 'after restart')
 })
 
 test('remote-merge persistence preserves session ownership and sticky holds', () => {
@@ -966,7 +968,7 @@ test('a receipted legacy adoption converges on the install authority once', () =
   assert.deepEqual(repeated, adopted)
 })
 
-test('a hosted-room marker prevents a second local round driver', () => {
+test('a hosted-room marker sends through the hosted outbox, never the local driver', () => {
   const gc = load(() => 'must not run')
   gc.$groupChats.set({
     Hosted: {
@@ -981,13 +983,10 @@ test('a hosted-room marker prevents a second local round driver', () => {
 
   const sent = gc.sendToGroupChat('Hosted', [{ name: 'research', title: '' }], 'do the work')
 
-  assert.equal(sent, null)
+  assert.ok(sent)
   assert.equal(gc.calls.length, 0, 'no member turn starts locally')
-  assert.equal(gc.$groupChats.get().Hosted.log.length, 0, 'the local mirror stays read-only')
-  assert.equal(gc.notifications.length, 1)
-  assert.equal(gc.notifications[0].kind, 'info')
-  assert.match(gc.notifications[0].message, /gateway-a/)
-  assert.match(gc.notifications[0].message, /isn't available in this build yet/)
+  assert.equal(gc.$groupChats.get().Hosted.log.length, 1, 'the optimistic entry stays local until replay')
+  assert.equal(gc.$groupChats.get().Hosted.log[0].pending, true)
 })
 
 test('late renderer callbacks cannot mutate a hosted room mirror', () => {
@@ -1102,6 +1101,36 @@ test('hosted replay adds sequence to a same-id legacy entry without duplicating 
   assert.equal(merged.rooms['id:room-1'].log.length, 1)
   assert.equal(merged.rooms['id:room-1'].log[0].id, 'stable-id')
   assert.equal(merged.rooms['id:room-1'].log[0].seq, 4)
+})
+
+test('hosted replay acknowledges the optimistic event id without duplicating it', () => {
+  const gc = load(() => '(pass)')
+  const merged = gc.mergeGroupChatSyncEntries(
+    [
+      {
+        id: 'desktop-event-1',
+        pending: true,
+        from: { kind: 'user', name: 'You' },
+        text: 'hello',
+        at: 1000
+      }
+    ],
+    [
+      {
+        eventId: 'desktop-event-1',
+        seq: 1,
+        pending: false,
+        from: { kind: 'user', name: 'You' },
+        text: 'hello',
+        at: 1000
+      }
+    ]
+  )
+
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0].id, 'desktop-event-1')
+  assert.equal(merged[0].seq, 1)
+  assert.equal(merged[0].pending, false)
 })
 
 test('empty runtime rooms are omitted from the gateway mirror', () => {
@@ -2386,7 +2415,7 @@ test('source contract: room renders clarify cards and the poll gates on them', (
   assert.match(pluginSource, /syncGroupClarify\(group, member, state\)/)
   assert.match(pluginSource, /const done = !busy && !awaitingUser/)
   assert.match(pluginSource, /busy \|\| awaitingUser/)
-  assert.match(pluginSource, /roomClarifies\.map\(entry =>/)
+  assert.match(pluginSource, /pendingPrompts\.map\(entry =>/)
   assert.match(pluginSource, /'clarify\.respond'/)
 })
 
@@ -2481,6 +2510,80 @@ test('source contract: approval card renders the command and routes approval.res
   assert.match(pluginSource, /'approval\.respond'/)
   assert.match(pluginSource, /kind: 'approval'/)
   assert.match(pluginSource, /wants to run a command/)
+})
+
+test('hosted room controls await exact stop and approval acknowledgements', () => {
+  assert.match(
+    pluginSource,
+    /async function stopHostedGroupChat[\s\S]*?const acknowledged = await enqueueHostedRoomCommand\([\s\S]*?kind: 'stop'[\s\S]*?if \(!acknowledged\)/
+  )
+  assert.match(
+    pluginSource,
+    /async function approveHostedGroupChat[\s\S]*?'groups\.approve'[\s\S]*?hostedPendingActions/
+  )
+  assert.match(pluginSource, /onAnswer: entry\.hostedAction/)
+})
+
+test('outbox acknowledgement cannot overwrite a command enqueued in flight', () => {
+  const gc = load(() => '(pass)')
+  const client = { reduceHostedRoomOutbox }
+  const command = id => ({
+    commandId: id,
+    kind: 'send',
+    roomId: 'room-1',
+    authorityId: 'install:home',
+    connectionId: 'connection-home',
+    payload: { text: id }
+  })
+  gc.$hostedRoomOutbox.set(
+    reduceHostedRoomOutbox(createHostedRoomOutbox(), {
+      type: 'enqueue',
+      command: command('send-1')
+    })
+  )
+  gc.transitionHostedRoomOutbox(client, {
+    type: 'dispatch',
+    commandId: 'send-1'
+  })
+  gc.transitionHostedRoomOutbox(client, {
+    type: 'enqueue',
+    command: command('send-2')
+  })
+  gc.transitionHostedRoomOutbox(client, {
+    type: 'acknowledge',
+    commandId: 'send-1'
+  })
+
+  assert.deepEqual(
+    gc.$hostedRoomOutbox.get().commands.map(entry => entry.commandId),
+    ['send-2']
+  )
+})
+
+test('hosted member descriptors preserve the authority member id for approvals', () => {
+  const gc = load(() => '(pass)')
+  const [member] = gc.hostedMemberDescriptors(
+    {
+      members: [
+        {
+          member_id: 'member-2-reviewer',
+          profile: 'reviewer',
+          handle: 'reviewer',
+          target: {
+            kind: 'peer',
+            installation_id: 'install-peer',
+            profile: 'reviewer'
+          }
+        }
+      ]
+    },
+    'home-connection',
+    'Home',
+    [{ installId: 'install-peer', connectionId: 'peer-connection', label: 'Peer' }]
+  )
+
+  assert.equal(member.memberId, 'member-2-reviewer')
+  assert.equal(member.connectionId, 'peer-connection')
 })
 
 test('durableGroupChatRooms excludes tombstoned rooms — the remote-merge persist path\'s own durable-map builder, independent of updateGroupChat\'s inline one', () => {

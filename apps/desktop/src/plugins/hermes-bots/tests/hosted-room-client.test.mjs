@@ -332,6 +332,22 @@ test('autonomous room planning chooses a persistent home and verified remote cat
   })
   assert.equal(incompatible.reason, 'remote-needs-setup')
 
+  const unpublishedV1 = resolveAutonomousRoomPlan(members, {
+    activeConnectionId: 'home',
+    capabilities: {
+      home,
+      peer: {
+        ...peer,
+        roomLink: {
+          ...peer.roomLink,
+          catalog: { ...peer.roomLink.catalog, protocolVersions: [1] }
+        }
+      }
+    }
+  })
+  assert.equal(unpublishedV1.kind, 'unsupported')
+  assert.equal(unpublishedV1.reason, 'remote-needs-setup')
+
   assert.deepEqual(describeAutonomousRoomPlan(plan, { homeLabel: 'Home lab' }), {
     defaultEnabled: true,
     level: 'distributed',
@@ -381,6 +397,7 @@ test('authoritative replay orders and deduplicates by sequence and event id whil
       [3, 'event-member-1', 'Review complete']
     ]
   )
+  assert.equal(replayed.messages[0].at, 1000)
   assert.deepEqual(replayed.pendingEvents, [])
 
   const repeated = reduceHostedRoomEvents(replayed, [member, unknown, user])
@@ -561,7 +578,7 @@ test('paged replay refuses a gateway response larger than the requested bound', 
 test('persisted command outbox accepts each supported command and enqueue is idempotent', () => {
   let outbox = createHostedRoomOutbox()
 
-  for (const kind of ['create', 'send', 'stop', 'disband']) {
+  for (const kind of ['send', 'stop']) {
     outbox = reduceHostedRoomOutbox(outbox, {
       type: 'enqueue',
       command: {
@@ -579,11 +596,11 @@ test('persisted command outbox accepts each supported command and enqueue is ide
   assert.equal(unchanged, outbox)
   assert.deepEqual(
     outbox.commands.map(command => command.kind),
-    ['create', 'send', 'stop', 'disband']
+    ['send', 'stop']
   )
   assert.equal(outbox.commands[0].authorityId, 'install:stable-home')
   assert.equal(outbox.commands[0].connectionId, 'machine-local-7')
-  assert.deepEqual(outbox.commands[1].payload.attachments, attachmentManifest())
+  assert.deepEqual(outbox.commands[0].payload.attachments, attachmentManifest())
 })
 
 test('send attachment manifests reject raw transport data, local paths, malformed refs, and oversized metadata', () => {
@@ -684,4 +701,39 @@ test('response-lost commands retry with the same idempotency key after persisted
 
   const acknowledged = reduceHostedRoomOutbox(retried, { type: 'acknowledge', commandId: command.commandId })
   assert.deepEqual(acknowledged.commands, [])
+})
+
+test('outbox refuses unbounded offline growth without dropping queued actions', () => {
+  let outbox = createHostedRoomOutbox()
+
+  for (let index = 0; index < 256; index += 1) {
+    outbox = reduceHostedRoomOutbox(outbox, {
+      type: 'enqueue',
+      command: {
+        commandId: `send-${index}`,
+        kind: 'send',
+        roomId: 'room-1',
+        authorityId: 'install:home',
+        connectionId: 'connection-home',
+        payload: { text: `message ${index}` }
+      }
+    })
+  }
+
+  assert.throws(
+    () =>
+      reduceHostedRoomOutbox(outbox, {
+        type: 'enqueue',
+        command: {
+          commandId: 'send-overflow',
+          kind: 'send',
+          roomId: 'room-1',
+          authorityId: 'install:home',
+          connectionId: 'connection-home',
+          payload: { text: 'overflow' }
+        }
+      }),
+    /too many room actions/i
+  )
+  assert.equal(outbox.commands.length, 256)
 })
