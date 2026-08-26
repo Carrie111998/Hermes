@@ -521,6 +521,9 @@ def _room_grant_scope_key(claims: Mapping[str, Any]) -> str:
         for key in (
             "room_id",
             "home_install_id",
+            "authority_gateway_id",
+            "authority_epoch",
+            "member_id",
             "target_install_id",
             "target_profile",
         )
@@ -919,6 +922,88 @@ def list_rooms(
             (int(include_disbanded),),
         ).fetchall()
     return [_room_from_row(row) for row in rows]
+
+
+def rename_room(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    event_id: Any,
+    name: Any,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Rename a live room and append its replay event atomically."""
+    room_id = _validate_identifier(
+        room_id, label="room_id", max_chars=MAX_ROOM_ID_CHARS
+    )
+    event_id = _validate_identifier(
+        event_id, label="event_id", max_chars=MAX_EVENT_ID_CHARS
+    )
+    name = _validate_room_name(name)
+    now = time.time() if now is None else float(now)
+    actor_json = _canonical_json(
+        {"kind": "system", "id": "room-control"},
+        label="actor",
+        max_bytes=4 * 1024,
+    )
+    payload_json = _canonical_json(
+        {"name": name}, label="payload", max_bytes=MAX_EVENT_JSON_BYTES
+    )
+    with _transaction(db_path, immediate=True) as conn:
+        room = conn.execute(
+            """SELECT room_id, name, members_json, authority_gateway_id,
+                      authority_epoch, next_seq, revision, created_at,
+                      updated_at, disbanded_at
+                 FROM hosted_rooms WHERE room_id=?""",
+            (room_id,),
+        ).fetchone()
+        if room is None or room["disbanded_at"] is not None:
+            raise RoomNotFoundError("hosted room not found")
+        existing = conn.execute(
+            """SELECT room_id, seq, event_id, kind, actor_json,
+                      authority_epoch, payload_json, created_at
+                 FROM hosted_room_events WHERE room_id=? AND event_id=?""",
+            (room_id, event_id),
+        ).fetchone()
+        if existing is not None:
+            if existing["kind"] != "room.renamed" or existing["payload_json"] != payload_json:
+                raise EventConflictError(
+                    "event_id already exists with different immutable content"
+                )
+            result = _room_from_row(room, idempotent=True)
+            result["event"] = _event_from_row(existing, idempotent=True)
+            return result
+        seq = int(room["next_seq"])
+        epoch = int(room["authority_epoch"])
+        conn.execute(
+            """UPDATE hosted_rooms
+               SET name=?, next_seq=?, revision=revision+1, updated_at=?
+               WHERE room_id=?""",
+            (name, seq + 1, now, room_id),
+        )
+        conn.execute(
+            """INSERT INTO hosted_room_events(
+                   room_id, seq, event_id, kind, actor_json,
+                   authority_epoch, payload_json, created_at
+               ) VALUES (?, ?, ?, 'room.renamed', ?, ?, ?, ?)""",
+            (room_id, seq, event_id, actor_json, epoch, payload_json, now),
+        )
+        updated = conn.execute(
+            """SELECT room_id, name, members_json, authority_gateway_id,
+                      authority_epoch, next_seq, revision, created_at,
+                      updated_at, disbanded_at
+                 FROM hosted_rooms WHERE room_id=?""",
+            (room_id,),
+        ).fetchone()
+        event = conn.execute(
+            """SELECT room_id, seq, event_id, kind, actor_json,
+                      authority_epoch, payload_json, created_at
+                 FROM hosted_room_events WHERE room_id=? AND event_id=?""",
+            (room_id, event_id),
+        ).fetchone()
+    result = _room_from_row(updated)
+    result["event"] = _event_from_row(event)
+    return result
 
 
 def append_event(

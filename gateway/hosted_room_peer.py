@@ -18,10 +18,14 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Iterable, Literal, Mapping
 
 
-PROTOCOL_VERSION = 1
+# Version 2 adds authority/member lineage to scoped grants. It is intentionally
+# not wire-compatible with the unpublished v1 draft; mixed gateways must fall
+# back to Desktop-driven rooms instead of accepting a weaker token shape.
+PROTOCOL_VERSION = 2
 MAX_TOKEN_BYTES = 16 * 1024
 MAX_PROMPT_BYTES = 256 * 1024
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
@@ -313,7 +317,7 @@ def local_catalog_mapping(
 
 def local_room_link_endpoint(value: Any | None = None) -> dict[str, Any]:
     """Return the validated endpoint this gateway explicitly advertises."""
-    configured = os.getenv("HERMES_ROOM_LINK_URL") if value is None else value
+    configured = _configured_room_link_url() if value is None else value
     if not str(configured or "").strip():
         return {"available": False, "reason": "not_configured"}
     try:
@@ -325,6 +329,25 @@ def local_room_link_endpoint(value: Any | None = None) -> dict[str, Any]:
         "url": url,
         "transport_security": transport_security,
     }
+
+
+@lru_cache(maxsize=16)
+def _room_link_url_from_config(home: str) -> str | None:
+    """Read the restart-scoped user setting without polling config on probes."""
+    from gateway.config import load_gateway_config
+
+    value = load_gateway_config().room_link_url
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _configured_room_link_url() -> str | None:
+    """Resolve the explicit endpoint with environment override precedence."""
+    override = os.getenv("HERMES_ROOM_LINK_URL")
+    if override is not None:
+        return override
+    from hermes_constants import get_hermes_home
+
+    return _room_link_url_from_config(str(get_hermes_home()))
 
 
 def validate_room_link_url(value: Any) -> tuple[str, TransportSecurity]:
@@ -517,6 +540,9 @@ _GRANT_FIELDS = {
     "grant_id",
     "room_id",
     "home_install_id",
+    "authority_gateway_id",
+    "authority_epoch",
+    "member_id",
     "target_install_id",
     "target_profile",
     "permissions",
@@ -534,9 +560,12 @@ def issue_room_grant(
     grant_id: str,
     room_id: str,
     home_install_id: str,
+    authority_gateway_id: str,
+    authority_epoch: int,
+    member_id: str,
     target_install_id: str,
     target_profile: str,
-    permissions: Iterable[str] = ("dispatch", "status", "stop"),
+    permissions: Iterable[str] = ("approve", "dispatch", "status", "stop"),
     issued_at: float | None = None,
     ttl_seconds: float = 3600,
     status_ttl_seconds: float = MAX_STATUS_GRANT_TTL_SECONDS,
@@ -561,13 +590,25 @@ def issue_room_grant(
     ):
         raise HostedRoomGrantError("room grant lifetime is invalid")
     allowed = tuple(sorted(set(permissions)))
-    if not allowed or not set(allowed) <= {"dispatch", "status", "stop"}:
+    if not allowed or not set(allowed) <= {
+        "approve",
+        "dispatch",
+        "status",
+        "stop",
+    }:
         raise HostedRoomGrantError("room grant permissions are invalid")
     payload = {
         "version": PROTOCOL_VERSION,
         "grant_id": _identifier(grant_id, field="grant_id"),
         "room_id": _identifier(room_id, field="room_id"),
         "home_install_id": _identifier(home_install_id, field="home_install_id"),
+        "authority_gateway_id": _identifier(
+            authority_gateway_id, field="authority_gateway_id"
+        ),
+        "authority_epoch": _positive_int(
+            authority_epoch, field="authority_epoch"
+        ),
+        "member_id": _identifier(member_id, field="member_id"),
         "target_install_id": _identifier(target_install_id, field="target_install_id"),
         "target_profile": _identifier(target_profile, field="target_profile"),
         "permissions": list(allowed),
@@ -603,6 +644,9 @@ def verify_room_grant(
     expected = {
         "room_id": dispatch.room_id,
         "home_install_id": dispatch.home_install_id,
+        "authority_gateway_id": dispatch.authority_gateway_id,
+        "authority_epoch": dispatch.authority_epoch,
+        "member_id": dispatch.member_id,
         "target_install_id": dispatch.target_install_id,
         "target_profile": dispatch.target_profile,
     }
@@ -655,7 +699,9 @@ def decode_room_grant(
     ):
         raise HostedRoomGrantError("room grant lifetime is invalid")
     operation_expires_at = (
-        status_expires_at if permission in {"status", "stop"} else expires_at
+        status_expires_at
+        if permission in {"approve", "status", "stop"}
+        else expires_at
     )
     if checked_now < issued_at - 30 or checked_now >= operation_expires_at:
         raise HostedRoomGrantError("room grant is expired or not active")
@@ -676,8 +722,6 @@ def room_grant_needs_dispatch_refresh(
     This deliberately does not establish trust; the target validates the
     signature and immutable scope before issuing a replacement.
     """
-    if token in {"compat", "compatibility-only"}:
-        return False
     try:
         encoded_token, separator, _signature = token.partition(".")
         if not separator:

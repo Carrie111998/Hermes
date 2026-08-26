@@ -159,6 +159,25 @@ def load_room_links(db_path: Path | str) -> tuple[StoredRoomLink, ...]:
     return tuple(StoredRoomLink.from_record(row) for row in rows)
 
 
+def load_room_links_tolerant(
+    db_path: Path | str,
+) -> tuple[tuple[StoredRoomLink, ...], tuple[str, ...]]:
+    """Load healthy routes while quarantining malformed rows by identity."""
+    rows = hosted_rooms.list_room_link_records(db_path)
+    if len(rows) > MAX_LINKS:
+        raise HostedRoomPeerError("stored room link list is invalid")
+    links = []
+    errors = []
+    for row in rows:
+        try:
+            links.append(StoredRoomLink.from_record(row))
+        except Exception:
+            room = str(row.get("room_id") or "unknown")
+            member = str(row.get("member_id") or "unknown")
+            errors.append(f"{room}:{member}:invalid")
+    return tuple(links), tuple(errors)
+
+
 def save_room_link(db_path: Path | str, link: StoredRoomLink) -> None:
     hosted_rooms.upsert_room_link_record(
         db_path, record=link.as_record(), max_links=MAX_LINKS

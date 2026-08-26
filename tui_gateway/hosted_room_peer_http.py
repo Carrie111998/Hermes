@@ -1,9 +1,4 @@
-"""Trusted-fleet HTTP client for peer hosted-room member turns.
-
-This compatibility adapter proves the Desktop-independent data path against
-the existing API server. It requires an explicitly trusted peer API key and is
-not the final room-scoped grant boundary; callers must opt in deliberately.
-"""
+"""Scoped HTTP client for peer hosted-room member turns."""
 
 from __future__ import annotations
 
@@ -62,14 +57,13 @@ class PeerRunsHTTPError(RuntimeError):
 
 
 class PeerRunsHTTPClient:
-    """Drive a trusted peer's dedicated group session via async Runs API."""
+    """Drive a peer's dedicated group session via scoped async Runs APIs."""
 
     def __init__(
         self,
         *,
         base_url: str,
         api_key: str,
-        trusted_fleet_compatibility: bool = False,
         timeout_seconds: float = 30,
         receipt_db_path: Path | str | None = None,
     ) -> None:
@@ -78,7 +72,6 @@ class PeerRunsHTTPClient:
             raise ValueError("peer API key is missing or too short")
         self.base_url = base_url
         self.api_key = api_key
-        self.trusted_fleet_compatibility = bool(trusted_fleet_compatibility)
         self.timeout_seconds = float(timeout_seconds)
         self.receipt_db_path = Path(receipt_db_path) if receipt_db_path else None
         self._runs: dict[tuple[str, int], dict[str, Any]] = {}
@@ -169,52 +162,20 @@ class PeerRunsHTTPClient:
     ) -> Mapping[str, Any] | None:
         if source != "bot_room":
             raise PeerRunsHTTPError("peer room source must be bot_room")
-        if grant not in {"compat", "compatibility-only"}:
-            logical_session = (
-                "roomlink_"
-                + hashlib.sha256(f"{room_id}\0{profile}".encode("utf-8")).hexdigest()[
-                    :32
-                ]
-            )
-            if expected_session_id and expected_session_id != logical_session:
-                raise PeerRunsHTTPError("peer room session identity changed")
-            return {
-                "session_id": logical_session,
-                "title": f"Group: {room_id}",
-                "source": source,
-            }
-        if not self.trusted_fleet_compatibility:
-            raise PeerRunsHTTPError("broad peer compatibility requires explicit opt-in")
-        title = f"Group: {room_id}"
-        query = urllib.parse.urlencode({
-            "limit": 200,
-            "title": title,
-            "include_hidden": 1,
-        })
-        listing = self._request(f"/api/sessions?{query}")
-        for row in listing.get("data") or []:
-            if not isinstance(row, dict) or str(row.get("title") or "") != title:
-                continue
-            session_id = str(row.get("id") or row.get("session_id") or "")
-            if expected_session_id and session_id != expected_session_id:
-                raise PeerRunsHTTPError("peer room session identity changed")
-            return row
-        if not create:
-            return None
-        created = self._request(
-            "/api/sessions",
-            method="POST",
-            body={"title": title, "source": source},
+        self._require_room_grant(grant)
+        logical_session = (
+            "roomlink_"
+            + hashlib.sha256(f"{room_id}\0{profile}".encode("utf-8")).hexdigest()[
+                :32
+            ]
         )
-        session = (
-            created.get("session")
-            if isinstance(created.get("session"), dict)
-            else created
-        )
-        session_id = str(session.get("id") or session.get("session_id") or "")
-        if not session_id:
-            raise PeerRunsHTTPError("peer did not return a room session id")
-        return {**session, "session_id": session_id, "profile": profile}
+        if expected_session_id and expected_session_id != logical_session:
+            raise PeerRunsHTTPError("peer room session identity changed")
+        return {
+            "session_id": logical_session,
+            "title": f"Group: {room_id}",
+            "source": source,
+        }
 
     def dispatch(
         self,
@@ -223,21 +184,18 @@ class PeerRunsHTTPClient:
         grant: str,
     ) -> Mapping[str, Any]:
         checked = HostedMemberDispatch.from_mapping(dispatch)
+        self._require_room_grant(grant)
         session_id = self._session_id(checked, grant=grant)
         idempotency_key = f"room:{checked.task_id}:{checked.execution_generation}"
         result = self._request(
             "/v1/runs",
             method="POST",
-            body=(
-                {"input": checked.prompt, "session_id": session_id}
-                if grant in {"compat", "compatibility-only"}
-                else {
-                    "input": checked.prompt,
-                    "hosted_room_dispatch": checked.as_mapping(),
-                }
-            ),
+            body={
+                "input": checked.prompt,
+                "hosted_room_dispatch": checked.as_mapping(),
+            },
             headers={"Idempotency-Key": idempotency_key},
-            room_grant=(None if grant in {"compat", "compatibility-only"} else grant),
+            room_grant=grant,
         )
         run_id = str(result.get("run_id") or "")
         if not run_id:
@@ -296,7 +254,7 @@ class PeerRunsHTTPClient:
             (
                 self._request(
                     f"/v1/runs/{record['run_id']}",
-                    room_grant=(None if grant in {"compat", "compatibility-only"} else grant),
+                    room_grant=self._require_room_grant(grant),
                 ),
                 record,
             )
@@ -356,7 +314,7 @@ class PeerRunsHTTPClient:
         messages = []
         for status, receipt in found:
             state = str(status.get("status") or "")
-            if state not in {"completed", "failed", "interrupted"}:
+            if state not in {"completed", "failed", "interrupted", "cancelled"}:
                 continue
             messages.append(
                 {
@@ -365,7 +323,9 @@ class PeerRunsHTTPClient:
                     "execution_generation": receipt["execution_generation"],
                     "status": "settled" if state == "completed" else "failed",
                     "message_id": f"peer-run:{status.get('run_id')}",
-                    "content": status.get("output") or status.get("error") or "",
+                    "content": status.get("output")
+                    or status.get("error")
+                    or ("Remote run was cancelled." if state == "cancelled" else ""),
                 }
             )
         return messages
@@ -398,9 +358,39 @@ class PeerRunsHTTPClient:
         return {
             "active": status.get("status") in active_states,
             "task_id": receipt["task_id"],
+            "execution_generation": receipt["execution_generation"],
             "status": status.get("status"),
             "run_id": status.get("run_id"),
+            "approval": status.get("approval"),
         }
+
+    def approve_receipt(
+        self,
+        *,
+        task_id: str,
+        execution_generation: int,
+        choice: str,
+        grant: str,
+    ) -> Mapping[str, Any] | None:
+        """Resolve approval for the exact durable remote run."""
+        record = self._runs.get((task_id, execution_generation))
+        if record is None and self.receipt_db_path is not None:
+            from gateway import hosted_rooms
+
+            record = hosted_rooms.remote_run_receipt(
+                self.receipt_db_path,
+                task_id=task_id,
+                execution_generation=execution_generation,
+            )
+        if record is None:
+            return None
+        self._require_room_grant(grant)
+        return self._request(
+            f"/v1/runs/{urllib.parse.quote(str(record['run_id']), safe='')}/approval",
+            method="POST",
+            body={"choice": choice},
+            room_grant=grant,
+        )
 
     def stop(
         self,
@@ -438,7 +428,7 @@ class PeerRunsHTTPClient:
             f"/v1/runs/{urllib.parse.quote(str(record['run_id']), safe='')}/stop",
             method="POST",
             body={},
-            room_grant=(None if grant in {"compat", "compatibility-only"} else grant),
+            room_grant=self._require_room_grant(grant),
         )
 
     def issue_invitation(
@@ -446,6 +436,9 @@ class PeerRunsHTTPClient:
         *,
         room_id: str,
         home_install_id: str,
+        authority_gateway_id: str,
+        authority_epoch: int,
+        member_id: str,
         grant_id: str,
         ttl_seconds: float = 3600,
     ) -> Mapping[str, Any]:
@@ -460,6 +453,9 @@ class PeerRunsHTTPClient:
             body={
                 "room_id": room_id,
                 "home_install_id": home_install_id,
+                "authority_gateway_id": authority_gateway_id,
+                "authority_epoch": authority_epoch,
+                "member_id": member_id,
                 "grant_id": grant_id,
                 "ttl_seconds": ttl_seconds,
             },
@@ -472,8 +468,7 @@ class PeerRunsHTTPClient:
         ttl_seconds: float = 24 * 60 * 60,
     ) -> Mapping[str, Any]:
         """Renew dispatch access using only the still-valid scoped grant."""
-        if grant in {"compat", "compatibility-only"}:
-            return {"grant": grant}
+        self._require_room_grant(grant)
         refreshed = self._request(
             "/v1/room-members/grants/refresh",
             method="POST",
@@ -490,8 +485,7 @@ class PeerRunsHTTPClient:
 
     def revoke_grant(self, *, grant: str) -> Mapping[str, Any]:
         """Revoke this grant's exact room/home/target/profile scope."""
-        if grant in {"compat", "compatibility-only"}:
-            return {"revoked": False, "compatibility": True}
+        self._require_room_grant(grant)
         return self._request(
             "/v1/room-members/grants/revoke",
             method="POST",
@@ -501,7 +495,16 @@ class PeerRunsHTTPClient:
 
     def probe(self, *, grant: str) -> Mapping[str, Any]:
         """Verify gateway reachability and the live scoped capability catalog."""
+        self._require_room_grant(grant)
         return self._request(
             "/v1/room-members/capabilities",
             room_grant=grant,
         )
+
+    @staticmethod
+    def _require_room_grant(grant: str) -> str:
+        """Prevent scoped operations from falling back to broad Bearer auth."""
+        value = str(grant or "")
+        if not value or value in {"compat", "compatibility-only"}:
+            raise PeerRunsHTTPError("a scoped room grant is required")
+        return value

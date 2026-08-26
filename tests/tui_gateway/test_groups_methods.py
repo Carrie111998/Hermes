@@ -70,6 +70,9 @@ def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch
             {
                 "room_id": "room-1",
                 "home_install_id": "install-home",
+                "authority_gateway_id": "install-home",
+                "authority_epoch": 1,
+                "member_id": "member-peer",
                 "grant_id": "grant-room-1",
             },
         )
@@ -92,6 +95,9 @@ def test_app_managed_catalog_and_self_advertised_endpoint_are_consistent(
             {
                 "room_id": "room-1",
                 "home_install_id": "install-home",
+                "authority_gateway_id": "install-home",
+                "authority_epoch": 1,
+                "member_id": "member-peer",
             },
         )
     )
@@ -115,6 +121,48 @@ def test_roomlink_endpoint_absence_has_machine_reason(home, monkeypatch):
     }
 
 
+def test_multiplexed_invitation_uses_exact_profile_secret(home, monkeypatch):
+    from gateway.hosted_room_peer import (
+        HostedRoomGrantError,
+        decode_room_grant,
+        derive_room_grant_secret,
+    )
+
+    reviewer_home = home / "profiles" / "reviewer"
+    reviewer_home.mkdir(parents=True)
+    reviewer_key = "reviewer-api-key-1234567890"
+    default_key = "default-api-key-1234567890"
+    (reviewer_home / ".env").write_text(
+        f"API_SERVER_KEY={reviewer_key}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("API_SERVER_KEY", default_key)
+    invitation = _result(
+        srv._methods["groups.peer.invite"](
+            3,
+            {
+                "room_id": "room-1",
+                "home_install_id": "install-home",
+                "authority_gateway_id": "gateway-home",
+                "authority_epoch": 1,
+                "member_id": "member-reviewer",
+                "profile": "reviewer",
+            },
+        )
+    )
+    claims = decode_room_grant(
+        derive_room_grant_secret(reviewer_key),
+        invitation["grant"],
+        permission="status",
+    )
+    assert claims["target_profile"] == "reviewer"
+    with pytest.raises(HostedRoomGrantError, match="signature"):
+        decode_room_grant(
+            derive_room_grant_secret(default_key),
+            invitation["grant"],
+            permission="status",
+        )
+
+
 def test_register_peer_route_probes_scope_and_persists_via_service(home, monkeypatch):
     from gateway.hosted_room_peer import catalog_mapping
     from gateway.hosted_rooms import local_authority_gateway_id
@@ -124,6 +172,7 @@ def test_register_peer_route_probes_scope_and_persists_via_service(home, monkeyp
         persistent_process=True,
     )
     captured = {}
+    room = _create_room()
 
     class FakeClient:
         def __init__(self, *, base_url, api_key, **kwargs):
@@ -135,6 +184,9 @@ def test_register_peer_route_probes_scope_and_persists_via_service(home, monkeyp
             return {
                 "room_id": "room-1",
                 "home_install_id": local_authority_gateway_id(),
+                "authority_gateway_id": room["authority_gateway_id"],
+                "authority_epoch": room["authority_epoch"],
+                "member_id": "member-peer",
                 "target_profile": "reviewer",
                 "catalog": catalog,
             }
@@ -188,7 +240,7 @@ def test_register_rejects_plaintext_non_loopback(home, monkeypatch):
     assert "https outside" in response["error"]["message"]
 
 
-def test_register_requires_roomlink_protocol_v1(home, monkeypatch):
+def test_register_requires_roomlink_protocol_v2(home, monkeypatch):
     from gateway.hosted_room_peer import catalog_mapping
 
     class FakeService:
@@ -205,13 +257,13 @@ def test_register_requires_roomlink_protocol_v1(home, monkeypatch):
             "grant": "signed.room.grant",
             "catalog": catalog_mapping(
                 installation_id="install-peer",
-                protocol_versions=(2,),
+                protocol_versions=(1,),
                 persistent_process=True,
             ),
         },
     )
     assert response["error"]["code"] == 5120
-    assert "protocol v1" in response["error"]["message"]
+    assert "protocol v2" in response["error"]["message"]
 
 
 def test_create_list_send_and_log_roundtrip(home):
@@ -395,3 +447,99 @@ def test_disband_tombstones_room(home):
         )
     )
     assert [event["kind"] for event in replay["events"]] == ["room.disbanded"]
+
+
+def test_disband_stops_and_revokes_before_tombstoning(home, monkeypatch):
+    _create_room()
+    calls = []
+
+    class FakeService:
+        def stop_room(self, room_id, **_kwargs):
+            calls.append(("stop", room_id))
+
+        def revoke_room_routes(self, room_id):
+            calls.append(("revoke", room_id))
+
+    monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
+    _result(srv._methods["groups.disband"](9, {"room_id": "room-1"}))
+
+    assert calls == [("stop", "room-1"), ("revoke", "room-1")]
+    assert _result(srv._methods["groups.list"](10, {}))["rooms"] == []
+
+
+def test_failed_remote_revocation_keeps_room_recoverable(home, monkeypatch):
+    _create_room()
+
+    class FakeService:
+        def stop_room(self, _room_id, **_kwargs):
+            return 1
+
+        def revoke_room_routes(self, _room_id):
+            raise RuntimeError("peer is offline")
+
+    monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
+    result = srv._methods["groups.disband"](11, {"room_id": "room-1"})
+
+    assert result["error"]["code"] == 5114
+    assert [
+        room["room_id"]
+        for room in _result(srv._methods["groups.list"](12, {}))["rooms"]
+    ] == ["room-1"]
+
+
+def test_disband_does_not_revoke_routes_while_stop_is_unacknowledged(
+    home, monkeypatch
+):
+    _create_room()
+    calls = []
+
+    class FakeService:
+        def stop_room(self, _room_id, **kwargs):
+            calls.append(("stop", kwargs["require_acknowledged"]))
+            raise RuntimeError("room work is still stopping")
+
+        def revoke_room_routes(self, _room_id):
+            calls.append(("revoke", True))
+
+    monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
+    result = srv._methods["groups.disband"](13, {"room_id": "room-1"})
+
+    assert result["error"]["code"] == 5114
+    assert calls == [("stop", True)]
+    assert [
+        room["room_id"]
+        for room in _result(srv._methods["groups.list"](14, {}))["rooms"]
+    ] == ["room-1"]
+
+
+def test_approve_routes_one_exact_peer_action(home, monkeypatch):
+    captured = {}
+
+    class FakeService:
+        def approve_room_task(self, room_id, **kwargs):
+            captured["room_id"] = room_id
+            captured.update(kwargs)
+            return {"resolved": 1}
+
+    monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
+    result = _result(
+        srv._methods["groups.approve"](
+            8,
+            {
+                "room_id": "room-1",
+                "member_id": "member-peer",
+                "task_id": "task-1",
+                "execution_generation": 2,
+                "choice": "once",
+            },
+        )
+    )
+
+    assert result == {"approved": True, "result": {"resolved": 1}}
+    assert captured == {
+        "room_id": "room-1",
+        "member_id": "member-peer",
+        "task_id": "task-1",
+        "execution_generation": 2,
+        "choice": "once",
+    }

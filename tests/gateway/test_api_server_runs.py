@@ -1029,6 +1029,45 @@ class TestRunIdempotency:
         )
         store.close()
 
+    def test_retention_never_releases_an_active_idempotency_reservation(
+        self, tmp_path
+    ):
+        from gateway.platforms.api_server import RunIdempotencyStore
+
+        store = RunIdempotencyStore(str(tmp_path / "idem.db"))
+        with patch("gateway.platforms.api_server.time.time", return_value=100):
+            assert store.reserve(
+                "tenant",
+                "active-key",
+                "active-fingerprint",
+                "run-active",
+                {"status": "running"},
+            )[0] == "created"
+            assert store.reserve(
+                "tenant",
+                "done-key",
+                "done-fingerprint",
+                "run-done",
+                {"status": "completed"},
+            )[0] == "created"
+
+        after_retention = 100 + RunIdempotencyStore.RETENTION_SECONDS + 1
+        with patch(
+            "gateway.platforms.api_server.time.time", return_value=after_retention
+        ):
+            active, active_record = store.lookup(
+                "tenant", "active-key", "active-fingerprint"
+            )
+            done, done_record = store.lookup(
+                "tenant", "done-key", "done-fingerprint"
+            )
+
+        assert active == "reused"
+        assert active_record["run_id"] == "run-active"
+        assert done == "missing"
+        assert done_record is None
+        store.close()
+
     @pytest.mark.asyncio
     async def test_missing_key_preserves_legacy_new_run_behavior(
         self, adapter, tmp_path
@@ -1249,6 +1288,40 @@ class TestRunIdempotency:
 
 class TestHostedRoomRuns:
     @pytest.mark.asyncio
+    async def test_room_grant_cannot_create_session_or_permanent_approval_policy(
+        self, auth_adapter
+    ):
+        app = _create_runs_app(auth_adapter)
+        with (
+            patch.object(auth_adapter, "_check_run_auth", return_value=None),
+            patch.object(auth_adapter, "_request_owns_run", return_value=True),
+            patch.object(
+                auth_adapter,
+                "_durable_run_status",
+                return_value={"status": "waiting_for_approval"},
+            ),
+            patch.object(
+                auth_adapter, "_room_grant_token", return_value="scoped-grant"
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                permanent = await cli.post(
+                    "/v1/runs/run-room/approval",
+                    json={"choice": "always"},
+                )
+                resolve_all = await cli.post(
+                    "/v1/runs/run-room/approval",
+                    json={"choice": "once", "resolve_all": True},
+                )
+                permanent_body = await permanent.json()
+                resolve_all_body = await resolve_all.json()
+
+        assert permanent.status == 400
+        assert permanent_body["error"]["code"] == "invalid_approval_choice"
+        assert resolve_all.status == 400
+        assert resolve_all_body["error"]["code"] == "invalid_approval_scope"
+
+    @pytest.mark.asyncio
     async def test_invitation_uses_validated_app_managed_local_catalog(
         self, auth_adapter, monkeypatch
     ):
@@ -1263,6 +1336,9 @@ class TestHostedRoomRuns:
                 json={
                     "room_id": "room-1",
                     "home_install_id": "install-home",
+                    "authority_gateway_id": "gateway-home",
+                    "authority_epoch": 1,
+                    "member_id": "member-reviewer",
                 },
                 headers={"Authorization": "Bearer sk-secret"},
             )
@@ -1288,6 +1364,9 @@ class TestHostedRoomRuns:
             grant_id="grant-old",
             room_id="room-1",
             home_install_id="install-home",
+            authority_gateway_id="install-home",
+            authority_epoch=1,
+            member_id="member-peer",
             target_install_id=local_authority_gateway_id(),
             target_profile="default",
             issued_at=100,
@@ -1320,6 +1399,9 @@ class TestHostedRoomRuns:
             grant_id="grant-expired",
             room_id="room-1",
             home_install_id="install-home",
+            authority_gateway_id="install-home",
+            authority_epoch=1,
+            member_id="member-peer",
             target_install_id=local_authority_gateway_id(),
             target_profile="default",
             issued_at=100,
@@ -1350,6 +1432,9 @@ class TestHostedRoomRuns:
             grant_id="grant-revoked",
             room_id="room-1",
             home_install_id="install-home",
+            authority_gateway_id="install-home",
+            authority_epoch=1,
+            member_id="member-peer",
             target_install_id=local_authority_gateway_id(),
             target_profile="default",
             issued_at=100,
@@ -1367,6 +1452,50 @@ class TestHostedRoomRuns:
         assert denied.status == 401
         assert denied_body["error"]["code"] == "invalid_room_grant"
 
+    def test_grant_refresh_keeps_idempotency_scope_but_member_change_does_not(
+        self, auth_adapter
+    ):
+        from types import SimpleNamespace
+
+        from gateway.hosted_room_peer import issue_room_grant
+        from gateway.hosted_rooms import local_authority_gateway_id
+
+        common = {
+            "room_id": "room-1",
+            "home_install_id": "install-home",
+            "authority_gateway_id": "gateway-home",
+            "authority_epoch": 1,
+            "member_id": "member-reviewer",
+            "target_install_id": local_authority_gateway_id(),
+            "target_profile": "default",
+        }
+        first = issue_room_grant(
+            auth_adapter._room_grant_secret(),
+            grant_id="grant-first",
+            **common,
+        )
+        refreshed = issue_room_grant(
+            auth_adapter._room_grant_secret(),
+            grant_id="grant-refreshed",
+            **common,
+        )
+        other_member = issue_room_grant(
+            auth_adapter._room_grant_secret(),
+            grant_id="grant-other-member",
+            **{**common, "member_id": "member-other"},
+        )
+
+        def request(token):
+            return SimpleNamespace(
+                headers={"Authorization": f"HermesRoom {token}"},
+                method="POST",
+                path="/v1/runs",
+            )
+
+        first_scope = auth_adapter._run_idempotency_scope(request(first))
+        assert auth_adapter._run_idempotency_scope(request(refreshed)) == first_scope
+        assert auth_adapter._run_idempotency_scope(request(other_member)) != first_scope
+
     @pytest.mark.asyncio
     async def test_scoped_grant_revoke_is_idempotent_and_fences_prior_lineage(
         self, auth_adapter, monkeypatch
@@ -1383,6 +1512,9 @@ class TestHostedRoomRuns:
         claims = {
             "room_id": "room-1",
             "home_install_id": "install-home",
+            "authority_gateway_id": "install-home",
+            "authority_epoch": 1,
+            "member_id": "member-peer",
             "target_install_id": local_authority_gateway_id(),
             "target_profile": "default",
         }
@@ -1443,6 +1575,9 @@ class TestHostedRoomRuns:
                 json={
                     "room_id": "room-1",
                     "home_install_id": "install-home",
+                    "authority_gateway_id": "gateway-home",
+                    "authority_epoch": 1,
+                    "member_id": "member-reviewer",
                 },
                 headers={"Authorization": "Bearer sk-secret"},
             )
@@ -1475,6 +1610,9 @@ class TestHostedRoomRuns:
                     "grant_id": "grant-room-1",
                     "room_id": "room-1",
                     "home_install_id": "install-home",
+                    "authority_gateway_id": "gateway-home",
+                    "authority_epoch": 1,
+                    "member_id": "member-reviewer",
                     "ttl_seconds": 3600,
                 },
                 headers={"Authorization": "Bearer sk-secret"},
@@ -1492,7 +1630,7 @@ class TestHostedRoomRuns:
             assert probe_body["catalog"] == catalog
             prompt = "Review this room message."
             dispatch = {
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "room_id": "room-1",
                 "home_install_id": "install-home",
                 "authority_gateway_id": "gateway-home",
@@ -1562,13 +1700,16 @@ class TestHostedRoomRuns:
                 json={
                     "room_id": "room-1",
                     "home_install_id": "install-home",
+                    "authority_gateway_id": "gateway-home",
+                    "authority_epoch": 1,
+                    "member_id": "member-reviewer",
                 },
                 headers={"Authorization": "Bearer sk-secret"},
             )
             invitation_body = await invitation.json()
             prompt = "Review."
             dispatch = {
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "room_id": "room-1",
                 "home_install_id": "install-home",
                 "authority_gateway_id": "gateway-home",

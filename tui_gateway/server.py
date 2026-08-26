@@ -316,9 +316,15 @@ _LONG_HANDLERS = frozenset(
         "groups.create",
         "groups.state",
         "groups.send",
+        "groups.rename",
         "groups.log",
         "groups.disband",
         "groups.stop",
+        "groups.retry",
+        "groups.approve",
+        "groups.peer.invite",
+        "groups.peer.revoke",
+        "groups.peer.register",
         # image.generate is a multi-second remote API round-trip.
         "image.generate",
         "projects.discover_repos",
@@ -17098,6 +17104,7 @@ from . import (  # noqa: E402
 # singleton rather than starting one from an RPC call.
 get_hosted_room_service = _methods_groups.get_hosted_room_service
 _profile_name = _methods_groups._profile_name
+_requested_profile = _methods_groups._requested_profile
 _api_server_key = _methods_groups._api_server_key
 
 for _m in (

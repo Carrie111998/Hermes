@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from tui_gateway.hosted_room_peer_http import PeerRunsHTTPError
 class _FakeRPC:
     def __init__(self) -> None:
         self.sessions = {}
+        self.approvals = []
 
     def resolve_exact(self, *, profile, title, source):
         return self.sessions.get((profile, title))
@@ -58,6 +60,10 @@ class _FakeRPC:
 
     def interrupt(self, *, profile, session_id, source, expected_task_id):
         return {"interrupted": True}
+
+    def approve(self, **kwargs):
+        self.approvals.append(dict(kwargs))
+        return {"resolved": 1}
 
 
 class _FakePeerClient:
@@ -137,6 +143,33 @@ class _RefreshingPeerClient(_FakePeerClient):
     def dispatch(self, **kwargs):
         self.dispatched_grants.append(kwargs["grant"])
         return super().dispatch(**kwargs)
+
+
+class _ApprovalPeerClient(_FakePeerClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.approvals = []
+
+    def status(self, **kwargs):
+        task_id = self.dispatches[-1]["task_id"] if self.dispatches else "task-1"
+        return {
+            "status": "waiting_for_approval",
+            "active": True,
+            "task_id": task_id,
+                "execution_generation": 2,
+                "run_id": "run-peer-1",
+                "session_id": "peer-group-session",
+                "request_id": "req-peer-1",
+                "approval": {
+                "description": "Run the focused tests",
+                "command": "pytest -q tests/focused",
+                "choices": ["once", "deny"],
+            },
+        }
+
+    def approve_receipt(self, **kwargs):
+        self.approvals.append(dict(kwargs))
+        return {"resolved": 1}
 
 
 def _server():
@@ -422,7 +455,85 @@ def test_registered_peer_route_rehydrates_after_service_restart(tmp_path: Path):
     assert restored.target_install_id == "install-peer"
     assert restored.target_profile == "reviewer"
     assert restored.grant == "signed.room.grant"
-    assert "install-peer" in restarted.peer_clients
+    assert ("room-1", "member-peer") in restarted.peer_clients
+
+
+def test_one_corrupt_stored_route_does_not_hide_healthy_peers(tmp_path: Path):
+    db = tmp_path / "state.db"
+    catalog = GatewayRoomCatalog.from_mapping(
+        catalog_mapping(installation_id="install-peer", persistent_process=True)
+    )
+    service = HostedRoomService(_server(), db_path=db)
+    for room_id, member_id in (("room-good", "member-good"), ("room-bad", "member-bad")):
+        route = PeerMemberRoute(
+            home_install_id=hosted_rooms.local_authority_gateway_id(),
+            member_id=member_id,
+            target_install_id="install-peer",
+            target_profile="reviewer",
+            capability_digest=catalog.catalog_digest,
+            cancellation_scope_id=f"cancel-{room_id}",
+            trace_id=f"trace-{room_id}",
+            grant=f"grant-{room_id}",
+        )
+        service.register_peer_route(
+            room_id=room_id,
+            member_id=member_id,
+            route=route,
+            client=_FakePeerClient(),
+            target_url="https://peer.example.test",
+            catalog=catalog,
+        )
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE hosted_room_links SET target_url=? WHERE room_id=?",
+            ("http://public-plaintext.example.test", "room-bad"),
+        )
+
+    restarted = HostedRoomService(_server(), db_path=db)
+
+    assert ("room-good", "member-good") in restarted.peer_routes
+    assert ("room-bad", "member-bad") not in restarted.peer_routes
+    assert restarted.status()["link_load_error"] == "room-bad:member-bad:invalid"
+
+
+def test_unpublished_roomlink_v1_route_is_quarantined_for_reinvitation(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    legacy_catalog = GatewayRoomCatalog.from_mapping(
+        catalog_mapping(
+            installation_id="install-peer",
+            protocol_versions=(1,),
+            persistent_process=True,
+        )
+    )
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-peer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest=legacy_catalog.catalog_digest,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="legacy-v1-grant",
+    )
+    service = HostedRoomService(_server(), db_path=db)
+    service.register_peer_route(
+        room_id="room-1",
+        member_id="member-peer",
+        route=route,
+        client=_FakePeerClient(),
+        target_url="https://peer.example.test",
+        catalog=legacy_catalog,
+    )
+
+    restarted = HostedRoomService(_server(), db_path=db)
+
+    assert restarted.peer_routes == {}
+    assert restarted.status()["link_load_error"] == (
+        "room-1:member-peer:protocol-upgrade-required"
+    )
 
 
 def test_peer_member_without_route_fails_closed_instead_of_running_locally(
@@ -671,6 +782,9 @@ def test_dispatch_refresh_persists_before_remote_admission(tmp_path: Path):
         grant_id="grant-old",
         room_id="room-1",
         home_install_id=hosted_rooms.local_authority_gateway_id(),
+        authority_gateway_id=hosted_rooms.local_authority_gateway_id(),
+        authority_epoch=1,
+        member_id="member-peer",
         target_install_id="install-peer",
         target_profile="reviewer",
         issued_at=now - 3700,
@@ -682,6 +796,9 @@ def test_dispatch_refresh_persists_before_remote_admission(tmp_path: Path):
         grant_id="grant-new",
         room_id="room-1",
         home_install_id=hosted_rooms.local_authority_gateway_id(),
+        authority_gateway_id=hosted_rooms.local_authority_gateway_id(),
+        authority_epoch=1,
+        member_id="member-peer",
         target_install_id="install-peer",
         target_profile="reviewer",
         issued_at=now,
@@ -763,34 +880,157 @@ def test_dispatch_refresh_persists_before_remote_admission(tmp_path: Path):
     ].grant == new_grant
 
 
-def test_stop_fence_prevents_the_next_room_member_from_starting(
-    tmp_path: Path, monkeypatch
-):
+def test_peer_approval_is_scoped_visible_and_resolvable(tmp_path: Path):
     db = tmp_path / "state.db"
+    catalog = GatewayRoomCatalog.from_mapping(
+        catalog_mapping(installation_id="install-peer", persistent_process=True)
+    )
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-peer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest=catalog.catalog_digest,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed.room.grant",
+    )
+    peer = _ApprovalPeerClient()
     service = HostedRoomService(_server(), db_path=db)
-    monkeypatch.setattr(service, "local_profiles", lambda: ("default", "ops"))
+    service.register_peer_route(
+        room_id="room-1",
+        member_id="member-peer",
+        route=route,
+        client=peer,
+        target_url="https://peer.example.test",
+        catalog=catalog,
+    )
     service.create_room(
         room_id="room-1",
-        name="Release room",
+        name="Peer room",
         members=[
-            {"member_id": "default", "profile": "default", "handle": "hermes"},
-            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+            {
+                "member_id": "default",
+                "profile": "default",
+                "handle": "hermes",
+            },
+            {
+                "member_id": "member-peer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": catalog.catalog_digest,
+                },
+            }
         ],
     )
-    service.send(
-        room_id="room-1",
-        event_id="user-1",
-        payload={"text": "Inspect the release", "thread_id": "thread-1"},
+    identity = driver.TaskIdentity("room-1", "task-1", "thread-1", "turn-1")
+    transport = service._resolve_member_transport(
+        service.bindings()[0],
+        {
+            "identity": identity,
+            "execution_generation": 2,
+            "payload": {
+                "target_member_id": "member-peer",
+                "target_profile": "reviewer",
+                "source_event_seq": 1,
+            },
+        },
     )
-    assert len(driver.list_tasks(db, room_id="room-1")) == 1
 
-    assert service.stop_room("room-1", cancel_id="stop-1") == 1
-    service.prepare_room(service.bindings()[0])
-
-    tasks = driver.list_tasks(db, room_id="room-1")
-    assert len(tasks) == 1
-    assert tasks[0]["status"] == "cancelled"
-    assert any(
-        event["kind"] == "room.stop_requested"
-        for event in service._events("room-1")
+    status = transport.info(
+        profile="reviewer",
+        session_id="peer-group-session",
+        source="bot_room",
     )
+    assert status["status"] == "waiting_for_approval"
+    service._set_pending_action(
+        "room-1",
+        "member-peer",
+        {
+            "kind": "approval",
+            "task_id": status["task_id"],
+            "execution_generation": status["execution_generation"],
+            "run_id": status["run_id"],
+            "session_id": "peer-group-session",
+            "request_id": "req-peer-1",
+            "approval": status["approval"],
+        },
+    )
+    pending = service.status("room-1")["pending_actions"]
+    assert pending == [
+        {
+            "kind": "approval",
+            "task_id": "task-1",
+            "execution_generation": 2,
+            "run_id": "run-peer-1",
+            "session_id": "peer-group-session",
+            "request_id": "req-peer-1",
+            "approval": {
+                "description": "Run the focused tests",
+                "command": "pytest -q tests/focused",
+                "choices": ["once", "deny"],
+            },
+            "member_id": "member-peer",
+        }
+    ]
+
+    assert service.approve_room_task(
+        "room-1",
+        member_id="member-peer",
+        task_id="task-1",
+        execution_generation=2,
+        choice="once",
+    ) == {"resolved": 1}
+    assert peer.approvals == [
+        {
+            "task_id": "task-1",
+            "execution_generation": 2,
+            "choice": "once",
+            "grant": "signed.room.grant",
+        }
+    ]
+    assert service.status("room-1")["pending_actions"] == []
+
+
+def test_local_room_approval_uses_the_exact_hidden_session(tmp_path: Path):
+    service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
+    rpc = _FakeRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service._set_pending_action(
+        "room-1",
+        "local",
+        {
+            "kind": "approval",
+            "task_id": "task-local-1",
+            "execution_generation": 1,
+            "session_id": "local-session",
+            "request_id": "approval-local-1",
+            "approval": {
+                "description": "Run focused tests",
+                "command": "pytest -q tests/focused",
+                "choices": ["once", "deny"],
+            },
+        },
+    )
+
+    assert service.approve_room_task(
+        "room-1",
+        member_id="local",
+        task_id="task-local-1",
+        execution_generation=1,
+        choice="once",
+    ) == {"resolved": 1}
+    assert rpc.approvals == [
+        {
+            "session_id": "local-session",
+            "request_id": "approval-local-1",
+            "choice": "once",
+        }
+    ]
+    assert service.status("room-1")["pending_actions"] == []

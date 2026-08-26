@@ -13,6 +13,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from gateway.config import PlatformConfig
+from gateway.hosted_rooms import local_authority_gateway_id
 from gateway.platforms.api_server import APIServerAdapter
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient
 from tui_gateway.hosted_room_peer_transport import PeerMemberRoute
@@ -82,10 +83,14 @@ async def test_in_process_scoped_transport_contract_finishes_headlessly(
         base_url=str(server.make_url("")).rstrip("/"),
         api_key="target-peer-key-1234567890",
     )
+    home_install_id = local_authority_gateway_id()
     invitation = await asyncio.to_thread(
         client.issue_invitation,
         room_id="room-1",
-        home_install_id="install-home",
+        home_install_id=home_install_id,
+        authority_gateway_id=home_install_id,
+        authority_epoch=1,
+        member_id="member-peer",
         grant_id="grant-room-1",
     )
     catalog = invitation["catalog"]
@@ -95,7 +100,7 @@ async def test_in_process_scoped_transport_contract_finishes_headlessly(
     )
     assert probe["catalog"] == catalog
     route = PeerMemberRoute(
-        home_install_id="install-home",
+        home_install_id=home_install_id,
         member_id="member-peer",
         target_install_id=catalog["installation_id"],
         target_profile="default",

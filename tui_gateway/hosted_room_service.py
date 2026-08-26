@@ -16,7 +16,7 @@ from gateway import hosted_room_discussion as discussion
 from gateway import hosted_room_driver as driver
 from gateway import hosted_room_links
 from gateway import hosted_rooms
-from gateway.hosted_room_peer import GatewayRoomCatalog
+from gateway.hosted_room_peer import GatewayRoomCatalog, PROTOCOL_VERSION
 from tui_gateway.hosted_room_driver import HostedRoomBinding, HostedRoomRuntime
 from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient
@@ -36,7 +36,7 @@ class HostedRoomService:
         *,
         db_path: Path | str | None = None,
         peer_routes: Mapping[tuple[str, str], PeerMemberRoute] | None = None,
-        peer_clients: Mapping[str, HostedRoomPeerClient] | None = None,
+        peer_clients: Mapping[Any, HostedRoomPeerClient] | None = None,
     ) -> None:
         self.server = server
         self.db_path = Path(db_path or hosted_rooms.default_db_path())
@@ -44,10 +44,20 @@ class HostedRoomService:
         self.rpc = HostedRoomServerRPC(server)
         self._link_load_error = None
         self._peer_route_status: dict[tuple[str, str], str] = {}
+        self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
         self.peer_routes = {}
         self.peer_clients = {}
         try:
-            for stored in hosted_room_links.load_room_links(self.db_path):
+            stored_links, load_errors = hosted_room_links.load_room_links_tolerant(
+                self.db_path
+            )
+            errors = list(load_errors)
+            for stored in stored_links:
+                if PROTOCOL_VERSION not in stored.catalog.protocol_versions:
+                    errors.append(
+                        f"{stored.room_id}:{stored.member_id}:protocol-upgrade-required"
+                    )
+                    continue
                 client = PeerRunsHTTPClient(
                     base_url=stored.target_url,
                     api_key="",
@@ -64,14 +74,23 @@ class HostedRoomService:
                     grant=stored.grant,
                 )
                 self.peer_routes[(stored.room_id, stored.member_id)] = route
-                self.peer_clients[stored.catalog.installation_id] = client
+                self.peer_clients[(stored.room_id, stored.member_id)] = client
                 self._peer_route_status[(stored.room_id, stored.member_id)] = (
                     stored.status
                 )
+            if errors:
+                self._link_load_error = ",".join(errors)
         except Exception as exc:
             self._link_load_error = str(exc)
-        self.peer_routes.update(peer_routes or {})
-        self.peer_clients.update(peer_clients or {})
+        supplied_routes = dict(peer_routes or {})
+        supplied_clients = dict(peer_clients or {})
+        self.peer_routes.update(supplied_routes)
+        for key, route in supplied_routes.items():
+            client = supplied_clients.get(key)
+            if client is None:
+                client = supplied_clients.get(route.target_install_id)
+            if client is not None:
+                self.peer_clients[key] = client
         self.runtime = HostedRoomRuntime(
             db_path=self.db_path,
             rooms=self.bindings,
@@ -80,6 +99,7 @@ class HostedRoomService:
             turn_lock=self._turn_lock,
             prepare_room=self.prepare_room,
             publish_terminal=self.publish_terminal,
+            pending_action=self._set_pending_action,
         )
 
     @property
@@ -153,7 +173,7 @@ class HostedRoomService:
         # never leave a process-local route that disappears after restart.
         with self._policy_lock:
             self.peer_routes[(room_id, member_id)] = route
-            self.peer_clients[route.target_install_id] = client
+            self.peer_clients[(room_id, member_id)] = client
             self._peer_route_status[(room_id, member_id)] = "ready"
         self.runtime.wakeup()
 
@@ -170,8 +190,8 @@ class HostedRoomService:
                 for key, route in self.peer_routes.items()
                 if key[0] == room_id
             ]
-        for _key, route in routes:
-            client = self.peer_clients.get(route.target_install_id)
+        for key, route in routes:
+            client = self.peer_clients.get(key)
             revoke = getattr(client, "revoke_grant", None)
             if not callable(revoke):
                 raise RuntimeError("peer room grant cannot be revoked safely")
@@ -182,11 +202,7 @@ class HostedRoomService:
             for key, route in routes:
                 self.peer_routes.pop(key, None)
                 self._peer_route_status.pop(key, None)
-                if not any(
-                    candidate.target_install_id == route.target_install_id
-                    for candidate in self.peer_routes.values()
-                ):
-                    self.peer_clients.pop(route.target_install_id, None)
+                self.peer_clients.pop(key, None)
         return len(routes)
 
     def _resolve_member_transport(
@@ -203,7 +219,7 @@ class HostedRoomService:
             if self._member_is_peer(binding.room_id, member_id):
                 raise RuntimeError("peer room route is unavailable")
             return self.rpc
-        client = self.peer_clients.get(route.target_install_id)
+        client = self.peer_clients.get((binding.room_id, member_id))
         if client is None:
             raise RuntimeError("peer room client is unavailable")
         return PeerHostedRoomTransport(
@@ -249,6 +265,16 @@ class HostedRoomService:
             member_id=member_id,
             status=status,
         )
+
+    def _set_pending_action(
+        self, room_id: str, member_id: str, action: Mapping[str, Any] | None
+    ) -> None:
+        key = (room_id, member_id)
+        with self._policy_lock:
+            if action is None:
+                self._pending_actions.pop(key, None)
+            else:
+                self._pending_actions[key] = {**action, "member_id": member_id}
 
     def _rotate_route_grant(
         self, room_id: str, member_id: str, grant: str
@@ -489,24 +515,105 @@ class HostedRoomService:
         self.runtime.wakeup()
         return event
 
-    def stop_room(self, room_id: str, *, cancel_id: str) -> int:
+    def stop_room(
+        self,
+        room_id: str,
+        *,
+        cancel_id: str,
+        require_acknowledged: bool = False,
+    ) -> int:
         hosted_rooms.request_room_stop(
             self.db_path,
             room_id=room_id,
             cancel_id=cancel_id,
         )
         cancelled = 0
+        pending = 0
         with self._policy_lock:
-            for status in ("queued", "running", "indeterminate"):
+            for status in ("queued", "running", "indeterminate", "stopping"):
                 for task in driver.list_tasks(
                     self.db_path,
                     room_id=room_id,
                     status=status,
                 ):
-                    self.runtime.cancel(task["identity"], cancel_id=cancel_id)
+                    result = self.runtime.cancel(
+                        task["identity"], cancel_id=cancel_id
+                    )
                     cancelled += 1
+                    if result["status"] == "stopping":
+                        pending += 1
+        if require_acknowledged and pending:
+            raise RuntimeError(
+                "room work is still stopping; retry deletion after Stop completes"
+            )
         self.runtime.wakeup()
         return cancelled
+
+    def retry_room_task(self, room_id: str, *, task_id: str) -> dict[str, Any]:
+        """Retry one indeterminate task only after explicit user action."""
+        task = next(
+            (
+                candidate
+                for candidate in driver.list_tasks(
+                    self.db_path, room_id=room_id, status="indeterminate"
+                )
+                if candidate["identity"].task_id == task_id
+            ),
+            None,
+        )
+        if task is None:
+            raise driver.InvalidTaskTransitionError(
+                "no indeterminate room task matches task_id"
+            )
+        return self.runtime.retry_indeterminate(task["identity"])
+
+    def approve_room_task(
+        self,
+        room_id: str,
+        *,
+        member_id: str,
+        task_id: str,
+        execution_generation: int,
+        choice: str,
+    ) -> Mapping[str, Any]:
+        """Resolve one exact local or peer approval and wake room observation."""
+        key = (room_id, member_id)
+        route = self.peer_routes.get(key)
+        client = self.peer_clients.get(key)
+        with self._policy_lock:
+            action = self._pending_actions.get(key)
+        if (
+            action is None
+            or action.get("task_id") != task_id
+            or int(action.get("execution_generation") or 0)
+            != execution_generation
+        ):
+            raise RuntimeError("room approval is no longer pending")
+        if choice not in {"once", "deny"}:
+            raise RuntimeError("room approval choice must be once or deny")
+        approve = getattr(client, "approve_receipt", None)
+        if route is not None and callable(approve):
+            result = approve(
+                task_id=task_id,
+                execution_generation=execution_generation,
+                choice=choice,
+                grant=route.grant,
+            )
+        else:
+            session_id = str(action.get("session_id") or "")
+            request_id = str(action.get("request_id") or "")
+            if not session_id or not request_id:
+                raise RuntimeError("local room approval identity is unavailable")
+            result = self.rpc.approve(
+                session_id=session_id,
+                request_id=request_id,
+                choice=choice,
+            )
+        if result is None:
+            raise RuntimeError("room approval target is unavailable")
+        self._set_pending_action(room_id, member_id, None)
+        self.runtime.wakeup()
+        return result
 
     def status(self, room_id: str | None = None) -> dict[str, Any]:
         runtime = self.runtime.status()
@@ -517,6 +624,20 @@ class HostedRoomService:
             return runtime
         tasks = driver.list_tasks(self.db_path, room_id=room_id)
         counts = Counter(str(task["status"]) for task in tasks)
+        pending_actions = [
+            {
+                "kind": "retry",
+                "task_id": task["identity"].task_id,
+            }
+            for task in tasks
+            if task["status"] == "indeterminate"
+        ]
+        with self._policy_lock:
+            pending_actions.extend(
+                dict(action)
+                for (action_room_id, _member_id), action in self._pending_actions.items()
+                if action_room_id == room_id
+            )
         return {
             "running": runtime["running"],
             "working": bool(
@@ -525,8 +646,9 @@ class HostedRoomService:
                 or counts.get("stopping")
             ),
             "blocked": room_id in runtime["blocked_rooms"]
-            or bool(counts.get("indeterminate")),
+            or bool(counts.get("indeterminate") or counts.get("stopping")),
             "counts": dict(counts),
+            "pending_actions": pending_actions,
             "peer_routes": self._route_statuses(room_id),
         }
 
@@ -535,7 +657,12 @@ class _RouteStatusPeerClient:
     """Classify scoped-auth failures without exposing route credentials."""
 
     def __init__(
-        self, client, *, on_ready, on_reauthorization, on_refreshed
+        self,
+        client,
+        *,
+        on_ready,
+        on_reauthorization,
+        on_refreshed,
     ) -> None:
         self._client = client
         self._on_ready = on_ready

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from gateway.hosted_room_driver import TaskIdentity
-from gateway.hosted_room_peer import HostedMemberDispatch
+from gateway.hosted_room_peer import HostedMemberDispatch, PROTOCOL_VERSION
 from tui_gateway.hosted_room_driver import (
     ROOM_SESSION_SOURCE,
     HostedRoomBinding,
@@ -268,7 +268,7 @@ class PeerHostedRoomTransport(InternalSessionRPC):
         if self._session_id not in {None, session_id}:
             raise ValueError("peer room session changed during admission")
         dispatch = HostedMemberDispatch.from_mapping({
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "room_id": task.room_id,
             "home_install_id": self.route.home_install_id,
             "authority_gateway_id": self.binding.gateway_id,

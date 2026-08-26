@@ -1,4 +1,4 @@
-"""Trusted-fleet peer Runs adapter tests."""
+"""Scoped peer Runs adapter tests."""
 
 from __future__ import annotations
 
@@ -27,8 +27,6 @@ class FakePeer(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.startswith("/api/sessions"):
-            return self._json({"data": list(type(self).sessions)})
         if self.path.startswith("/v1/runs/"):
             run_id = self.path.rsplit("/", 1)[-1]
             return self._json(type(self).runs[run_id])
@@ -37,21 +35,19 @@ class FakePeer(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
-        if self.path == "/api/sessions":
-            row = {
-                "id": "group-session",
-                "title": body["title"],
-                "source": body["source"],
-                "hidden": True,
-            }
-            type(self).sessions.append(row)
-            return self._json({"session": row}, 201)
         if self.path == "/v1/runs":
+            dispatch = body["hosted_room_dispatch"]
+            logical_session = (
+                "roomlink_"
+                + __import__("hashlib").sha256(
+                    f"{dispatch['room_id']}\0{dispatch['target_profile']}".encode()
+                ).hexdigest()[:32]
+            )
             type(self).idempotency.append(self.headers.get("Idempotency-Key"))
             run_id = "run-1"
             type(self).runs[run_id] = {
                 "run_id": run_id,
-                "session_id": body["session_id"],
+                "session_id": logical_session,
                 "status": "running",
             }
             return self._json(
@@ -87,7 +83,7 @@ def _dispatch(**overrides):
 
     prompt = "Review this room message."
     return {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "room_id": "room-1",
         "home_install_id": "install-home",
         "authority_gateway_id": "gateway-home",
@@ -107,9 +103,9 @@ def _dispatch(**overrides):
     }
 
 
-def test_trusted_peer_runs_client_requires_explicit_compatibility(peer_server):
+def test_peer_runs_client_rejects_broad_compatibility_grants(peer_server):
     client = PeerRunsHTTPClient(base_url=peer_server, api_key="k" * 32)
-    with pytest.raises(PeerRunsHTTPError, match="explicit opt-in"):
+    with pytest.raises(PeerRunsHTTPError, match="scoped room grant"):
         client.prepare(
             room_id="room-1",
             profile="default",
@@ -117,6 +113,9 @@ def test_trusted_peer_runs_client_requires_explicit_compatibility(peer_server):
             grant="compatibility-only",
             create=True,
         )
+    with pytest.raises(PeerRunsHTTPError, match="scoped room grant"):
+        client.dispatch(dispatch=_dispatch(), grant="")
+    assert FakePeer.runs == {}
 
 
 def test_peer_client_rejects_plaintext_non_loopback():
@@ -127,24 +126,19 @@ def test_peer_client_rejects_plaintext_non_loopback():
         )
 
 
-def test_trusted_peer_runs_client_uses_group_session_and_durable_run(peer_server):
-    client = PeerRunsHTTPClient(
-        base_url=peer_server,
-        api_key="k" * 32,
-        trusted_fleet_compatibility=True,
-    )
-    accepted = client.dispatch(dispatch=_dispatch(), grant="compat")
+def test_scoped_peer_runs_client_uses_logical_session_and_durable_run(peer_server):
+    client = PeerRunsHTTPClient(base_url=peer_server, api_key="")
+    accepted = client.dispatch(dispatch=_dispatch(), grant="signed.room.grant")
     assert accepted["status"] == "accepted"
-    assert FakePeer.sessions[0]["title"] == "Group: room-1"
-    assert FakePeer.sessions[0]["source"] == "bot_room"
+    assert accepted["session_id"].startswith("roomlink_")
     assert FakePeer.idempotency == ["room:task-1:1"]
 
     assert (
         client.status(
             room_id="room-1",
             profile="reviewer",
-            session_id="group-session",
-            grant="compat",
+            session_id=accepted["session_id"],
+            grant="signed.room.grant",
         )["active"]
         is True
     )
@@ -156,8 +150,8 @@ def test_trusted_peer_runs_client_uses_group_session_and_durable_run(peer_server
     history = client.history(
         room_id="room-1",
         profile="reviewer",
-        session_id="group-session",
-        grant="compat",
+        session_id=accepted["session_id"],
+        grant="signed.room.grant",
     )
     assert history == [
         {
@@ -171,15 +165,11 @@ def test_trusted_peer_runs_client_uses_group_session_and_durable_run(peer_server
     ]
 
 
-def test_trusted_peer_runs_client_stops_exact_run(peer_server):
-    client = PeerRunsHTTPClient(
-        base_url=peer_server,
-        api_key="k" * 32,
-        trusted_fleet_compatibility=True,
-    )
+def test_scoped_peer_runs_client_stops_exact_run(peer_server):
+    client = PeerRunsHTTPClient(base_url=peer_server, api_key="")
     dispatch = _dispatch()
-    client.dispatch(dispatch=dispatch, grant="compat")
-    stopped = client.stop(dispatch=dispatch, grant="compat")
+    client.dispatch(dispatch=dispatch, grant="signed.room.grant")
+    stopped = client.stop(dispatch=dispatch, grant="signed.room.grant")
     assert stopped["status"] == "stopping"
     assert FakePeer.runs["run-1"]["status"] == "cancelled"
 
@@ -188,27 +178,25 @@ def test_remote_run_receipt_survives_home_restart(peer_server, tmp_path):
     db = tmp_path / "state.db"
     first = PeerRunsHTTPClient(
         base_url=peer_server,
-        api_key="k" * 32,
-        trusted_fleet_compatibility=True,
+        api_key="",
         receipt_db_path=db,
     )
     dispatch = _dispatch(source_event_seq=17)
-    accepted = first.dispatch(dispatch=dispatch, grant="compat")
+    accepted = first.dispatch(dispatch=dispatch, grant="signed.room.grant")
 
     restarted = PeerRunsHTTPClient(
         base_url=peer_server,
-        api_key="k" * 32,
-        trusted_fleet_compatibility=True,
+        api_key="",
         receipt_db_path=db,
     )
     status = restarted.status(
         room_id="room-1",
         profile="reviewer",
         session_id=accepted["session_id"],
-        grant="compat",
+        grant="signed.room.grant",
     )
     assert status["run_id"] == accepted["run_id"]
-    stopped = restarted.stop(dispatch=dispatch, grant="compat")
+    stopped = restarted.stop(dispatch=dispatch, grant="signed.room.grant")
     assert stopped["status"] == "stopping"
 
 

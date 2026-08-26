@@ -7660,14 +7660,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 permission=(
                     "stop"
                     if request.path.endswith("/stop")
+                    else "approve"
+                    if request.path.endswith("/approval")
                     else "status"
                     if request.method == "GET"
                     else "dispatch"
                 ),
             )
             identity = (
-                f"{claims['grant_id']}\0{claims['room_id']}\0"
-                f"{claims['target_install_id']}\0{claims['target_profile']}"
+                f"{claims['room_id']}\0{claims['home_install_id']}\0"
+                f"{claims['authority_gateway_id']}\0{claims['authority_epoch']}\0"
+                f"{claims['member_id']}\0{claims['target_install_id']}\0"
+                f"{claims['target_profile']}"
             )
             return hashlib.sha256(identity.encode()).hexdigest()
         profile = _api_request_profile.get() or "default"
@@ -7794,21 +7798,29 @@ class APIServerAdapter(BasePlatformAdapter):
         body, error = await self._read_json_body(request)
         if error:
             return error
-        allowed = {"grant_id", "room_id", "home_install_id", "ttl_seconds"}
-        if set(body) - allowed or not {
+        required = {
             "room_id",
             "home_install_id",
-        } <= set(body):
+            "authority_gateway_id",
+            "authority_epoch",
+            "member_id",
+        }
+        allowed = required | {"grant_id", "ttl_seconds"}
+        if set(body) - allowed or not required <= set(body):
             return web.json_response(
                 _openai_error(
-                    "Invitation requires room_id and home_install_id only.",
+                    "Invitation is missing required room authority fields.",
                     code="invalid_room_invitation",
                 ),
                 status=400,
             )
         try:
             from gateway import hosted_rooms
-            from gateway.hosted_room_peer import catalog_mapping, issue_room_grant
+            from gateway.hosted_room_peer import (
+                PROTOCOL_VERSION as ROOM_LINK_PROTOCOL_VERSION,
+                catalog_mapping,
+                issue_room_grant,
+            )
 
             profile = _api_request_profile.get() or "default"
             target_install_id = hosted_rooms.local_authority_gateway_id()
@@ -7817,7 +7829,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise ValueError("ttl_seconds must be between 60 and 86400")
             catalog = catalog_mapping(
                 installation_id=target_install_id,
-                protocol_versions=(1,),
+                protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
                 link_modes=("direct",),
                 persistent_process=True,
                 text=True,
@@ -7828,6 +7840,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 grant_id=str(body.get("grant_id") or f"grant-{uuid.uuid4().hex}"),
                 room_id=str(body["room_id"]),
                 home_install_id=str(body["home_install_id"]),
+                authority_gateway_id=str(body["authority_gateway_id"]),
+                authority_epoch=int(body["authority_epoch"]),
+                member_id=str(body["member_id"]),
                 target_install_id=target_install_id,
                 target_profile=profile,
                 issued_at=time.time(),
@@ -7842,6 +7857,7 @@ class APIServerAdapter(BasePlatformAdapter):
             {
                 "object": "hermes.room_member.invitation",
                 "grant": token,
+                "target_profile": profile,
                 "catalog": catalog,
             },
             status=201,
@@ -7853,7 +7869,10 @@ class APIServerAdapter(BasePlatformAdapter):
         """Verify a scoped grant and return this target's live room catalog."""
         try:
             from gateway import hosted_rooms
-            from gateway.hosted_room_peer import catalog_mapping
+            from gateway.hosted_room_peer import (
+                PROTOCOL_VERSION as ROOM_LINK_PROTOCOL_VERSION,
+                catalog_mapping,
+            )
 
             claims = self._room_grant_claims(request, permission="status")
             profile = _api_request_profile.get() or "default"
@@ -7865,7 +7884,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise ValueError("room grant target does not match this profile")
             catalog = catalog_mapping(
                 installation_id=installation_id,
-                protocol_versions=(1,),
+                protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
                 link_modes=("direct",),
                 persistent_process=True,
                 text=True,
@@ -7885,6 +7904,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "object": "hermes.room_member.capabilities",
                 "room_id": claims["room_id"],
                 "home_install_id": claims["home_install_id"],
+                "authority_gateway_id": claims["authority_gateway_id"],
+                "authority_epoch": claims["authority_epoch"],
+                "member_id": claims["member_id"],
                 "target_profile": profile,
                 "catalog": catalog,
             }
@@ -7940,6 +7962,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 grant_id=f"grant-refresh-{uuid.uuid4().hex}",
                 room_id=claims["room_id"],
                 home_install_id=claims["home_install_id"],
+                authority_gateway_id=claims["authority_gateway_id"],
+                authority_epoch=int(claims["authority_epoch"]),
+                member_id=claims["member_id"],
                 target_install_id=installation_id,
                 target_profile=profile,
                 permissions=claims["permissions"],
@@ -8105,6 +8130,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 from gateway.hosted_room_peer import (
                     GatewayRoomCatalog,
                     HostedMemberDispatch,
+                    PROTOCOL_VERSION as ROOM_LINK_PROTOCOL_VERSION,
                     catalog_mapping,
                     verify_room_grant,
                 )
@@ -8128,7 +8154,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 catalog = GatewayRoomCatalog.from_mapping(
                     catalog_mapping(
                         installation_id=local_install,
-                        protocol_versions=(1,),
+                        protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
                         link_modes=("direct",),
                         persistent_process=True,
                         text=True,
@@ -8461,6 +8487,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        approval=event,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -8798,7 +8825,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
-        auth_err = self._check_auth(request)
+        auth_err = self._check_run_auth(request, permission="approve")
         if auth_err:
             return auth_err
 
@@ -8823,12 +8850,32 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_choice = str(body.get("choice", "")).strip().lower()
         aliases = {"approve": "once", "approved": "once", "allow": "once"}
         choice = aliases.get(raw_choice, raw_choice)
-        allowed = {"once", "session", "always", "deny"}
+        room_scoped = bool(self._room_grant_token(request))
+        allowed = {"once", "deny"} if room_scoped else {
+            "once",
+            "session",
+            "always",
+            "deny",
+        }
         if choice not in allowed:
             return web.json_response(
                 _openai_error(
-                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    "Invalid approval choice; expected one of: "
+                    + ", ".join(sorted(allowed)),
                     code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        if room_scoped and resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "Room approvals can resolve only one exact request",
+                    code="invalid_approval_scope",
                 ),
                 status=400,
             )
@@ -8842,11 +8889,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=409,
             )
-
-        resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
-            or _coerce_request_bool(body.get("resolve_all"), default=False)
-        )
         try:
             from tools.approval import resolve_gateway_approval
 
