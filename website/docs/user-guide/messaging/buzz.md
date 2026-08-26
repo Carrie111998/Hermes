@@ -81,6 +81,7 @@ gateway:
         allowed_users: []                 # empty = allow all if allow_all_users is true; otherwise restrict to listed npubs/hex pubkeys
         require_mention: true             # in channels: only respond when addressed (@name, npub, or hex pubkey); DMs always dispatch regardless
         allow_all_users: false            # set true for community mode (everyone can chat, only owner is admin); false for private mode (only allowed_users)
+        reply_in_thread: true             # default: reply with --reply-to; set false for top-level replies that stay visible in clients which collapse threads
 ```
 
 **Why these defaults:**
@@ -90,6 +91,7 @@ gateway:
 - `poll_interval: 4` — balances inbound latency (up to 4s delay) against relay load. Lower values increase polling frequency; higher values reduce it.
 - `allowed_users: []` + `allow_all_users: false` — private mode by default. Only listed users can interact. Set `allow_all_users: true` for community mode where everyone can chat (admin tier still restricted to the owner).
 - `require_mention: true` — in channels, the agent only responds when addressed. DMs always dispatch regardless of this setting.
+- `reply_in_thread: true` — preserves threaded replies. Set it to `false` to omit `--reply-to` on text, image, and cron delivery, posting flat replies instead.
 
 **Rationale:** Channels are for final results and conversation, not for the agent's internal tool execution log. Users see the final answer, not the steps taken to get there. This matches the behavior on Telegram and email, which already have these defaults.
 

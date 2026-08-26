@@ -27,10 +27,10 @@ Configuration in config.yaml::
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
             reply_in_thread: true      # reply with --reply-to (default); false = post flat
 
-Or via environment variables (overrides config.yaml):
+Or via environment variables:
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS, BUZZ_REPLY_IN_THREAD
+    BUZZ_ALLOW_ALL_USERS
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -354,14 +354,8 @@ class BuzzAdapter(BasePlatformAdapter):
 
         # Whether outbound replies should chain into the triggering message's
         # thread (Buzz ``--reply-to``). Default True preserves historical
-        # behaviour; set False to post flat (top-level) replies instead.
-        # Env (BUZZ_REPLY_IN_THREAD) overrides config.yaml.
-        _rit_raw = os.getenv("BUZZ_REPLY_IN_THREAD")
-        if _rit_raw is None:
-            _rit_cfg = extra.get("reply_in_thread", True)
-        else:
-            _rit_cfg = _rit_raw
-        self.reply_in_thread = str(_rit_cfg).strip().lower() not in ("false", "0", "no", "off")
+        # behaviour; set False in config.yaml to post flat (top-level) replies.
+        self.reply_in_thread = str(extra.get("reply_in_thread", True)).strip().lower() not in ("false", "0", "no", "off")
 
         try:
             interval = float(os.getenv("BUZZ_POLL_INTERVAL") or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL))
@@ -1374,14 +1368,8 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    # Honour reply_in_thread the same way the adapter does: default True,
-    # but allow standalone cron delivery to post flat when configured.
-    _rit_raw = os.getenv("BUZZ_REPLY_IN_THREAD")
-    if _rit_raw is None:
-        _rit_cfg = extra.get("reply_in_thread", True)
-    else:
-        _rit_cfg = _rit_raw
-    _reply_in_thread = str(_rit_cfg).strip().lower() not in ("false", "0", "no", "off")
+    # Honour config.yaml's reply_in_thread setting for cron delivery too.
+    _reply_in_thread = str(extra.get("reply_in_thread", True)).strip().lower() not in ("false", "0", "no", "off")
     if thread_id and _reply_in_thread:
         args += ["--reply-to", str(thread_id)]
     for path in media_files or []:

@@ -45,7 +45,6 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
-    "BUZZ_REPLY_IN_THREAD",
 )
 
 
@@ -142,6 +141,10 @@ class TestBuzzAdapterInit:
         from gateway.config import PlatformConfig
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
+
+    def test_reply_in_thread_is_config_only_with_true_default(self):
+        assert _make_adapter().reply_in_thread is True
+        assert _make_adapter(extra={"reply_in_thread": False}).reply_in_thread is False
 
 
 # ── CLI error contract ────────────────────────────────────────────────────
@@ -423,6 +426,18 @@ class TestBuzzAdapterSend:
         assert args[args.index("--file") + 1] == str(img)
 
     @pytest.mark.asyncio
+    async def test_send_image_includes_reply_to_by_default(self, tmp_path):
+        img = tmp_path / "threaded.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
+        adapter._run_cli = cli
+        await adapter.send_image(CHANNEL, str(img), reply_to="trigger-evt")
+        args, _ = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "trigger-evt"
+
+    @pytest.mark.asyncio
     async def test_send_includes_reply_to_by_default(self):
         """Default behaviour: reply chains into the triggering message."""
         adapter = _make_adapter()
@@ -448,15 +463,15 @@ class TestBuzzAdapterSend:
         assert "--reply-to" not in args
 
     @pytest.mark.asyncio
-    async def test_send_flat_when_reply_in_thread_false_env_override(self):
-        """BUZZ_REPLY_IN_THREAD=false env var also suppresses --reply-to."""
-        adapter = _make_adapter()
-        adapter.reply_in_thread = False  # simulate env override
-        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+    async def test_send_image_flat_when_reply_in_thread_false(self, tmp_path):
+        """reply_in_thread=False also keeps image replies top-level."""
+        img = tmp_path / "flat.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter(extra={"reply_in_thread": False})
         cli = _ScriptedCli()
         cli.script("messages", "send", {"accepted": True, "event_id": "evt202", "message": ""})
         adapter._run_cli = cli
-        await adapter.send(CHANNEL, "flat", reply_to="trigger-evt", metadata={"thread_id": "t1"})
+        await adapter.send_image(CHANNEL, str(img), caption="flat", reply_to="trigger-evt")
         args, _ = cli.calls[0]
         assert "--reply-to" not in args
 
@@ -575,5 +590,49 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_includes_reply_to_by_default(self, monkeypatch, tmp_path):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-threaded", "message": ""}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        await _standalone_send(PlatformConfig(enabled=True, extra={}), CHANNEL, "cron says hi", thread_id="trigger-evt")
+        assert captured["args"][captured["args"].index("--reply-to") + 1] == "trigger-evt"
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_flat_when_reply_in_thread_false(self, monkeypatch, tmp_path):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-flat", "message": ""}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={"reply_in_thread": False}),
+            CHANNEL,
+            "cron says hi",
+            thread_id="trigger-evt",
+        )
+        assert result == {"success": True, "message_id": "evt-flat"}
+        assert "--reply-to" not in captured["args"]
 
 
