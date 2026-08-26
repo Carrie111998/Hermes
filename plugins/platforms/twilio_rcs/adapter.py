@@ -16,9 +16,21 @@ SMS platform and the optional telephony skill):
 There is no inbound channel, so ``connect()``/``disconnect()`` are no-ops.
 Delivery always goes through ``send()`` (live gateway) or
 ``_standalone_send()`` (out-of-process ``hermes send`` / cron delivery).
+
+Rich content (RCS cards, quick-reply chips) is sent by referencing a
+pre-created Twilio Content API template through a ``CONTENT:`` directive
+in the message text, mirroring the existing ``MEDIA:<path>`` convention
+used elsewhere in Hermes cross-platform messaging:
+
+    hermes send --to twilio_rcs:+15551234567 "CONTENT:HXxxxxxxxxxxxx"
+    hermes send --to twilio_rcs:+15551234567 'CONTENT:HXxxxxxxxxxxxx:{"1":"Alice"}'
+
+Create templates with ``scripts/manage_content.py`` (create-card /
+create-quick-reply), which prints the resulting Content SID.
 """
 
 import base64
+import json
 import logging
 import os
 import re
@@ -54,6 +66,36 @@ def parse_target_ref(target_ref: str):
 
 def validate_target_ref(chat_id: str):
     return True if _E164_TARGET_RE.fullmatch(chat_id) else "not a valid E.164 phone number"
+
+
+# 'CONTENT:<ContentSid>' or 'CONTENT:<ContentSid>:<json ContentVariables>' —
+# references a Content API template created via scripts/manage_content.py.
+_CONTENT_DIRECTIVE_RE = re.compile(r"^CONTENT:(?P<sid>HX[0-9a-fA-F]{32})(?::(?P<vars>.+))?$", re.DOTALL)
+
+
+def _parse_content_directive(message: str):
+    """Return (content_sid, content_variables_json_or_None), or None if `message`
+    isn't a CONTENT: directive. Raises ValueError if the variables aren't valid JSON."""
+    match = _CONTENT_DIRECTIVE_RE.match(message.strip())
+    if not match:
+        return None
+    raw_vars = match.group("vars")
+    if raw_vars is not None:
+        try:
+            json.loads(raw_vars)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid ContentVariables JSON in CONTENT: directive: {e}")
+    return match.group("sid"), raw_vars
+
+
+def _build_content_form(aiohttp_module, messaging_service_sid: str, chat_id: str, content_sid: str, content_variables: Optional[str]):
+    form_data = aiohttp_module.FormData()
+    form_data.add_field("MessagingServiceSid", messaging_service_sid)
+    form_data.add_field("To", chat_id)
+    form_data.add_field("ContentSid", content_sid)
+    if content_variables:
+        form_data.add_field("ContentVariables", content_variables)
+    return form_data
 
 
 def _get_scoped_secret(name, default=None):
@@ -132,23 +174,33 @@ class TwilioRcsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         import aiohttp
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted)
-        last_result = SendResult(success=True)
+        try:
+            directive = _parse_content_directive(content)
+        except ValueError as e:
+            return SendResult(success=False, error=str(e))
 
         url = f"{TWILIO_API_BASE}/{self._account_sid}/Messages.json"
         headers = {"Authorization": _basic_auth_header(self._account_sid, self._auth_token)}
 
-        session = self._http_session or aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30), trust_env=True,
-        )
-        try:
+        if directive:
+            form_data_list = [_build_content_form(aiohttp, self._messaging_service_sid, chat_id, *directive)]
+        else:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted)
+            form_data_list = []
             for chunk in chunks:
                 form_data = aiohttp.FormData()
                 form_data.add_field("MessagingServiceSid", self._messaging_service_sid)
                 form_data.add_field("To", chat_id)
                 form_data.add_field("Body", chunk)
+                form_data_list.append(form_data)
 
+        last_result = SendResult(success=True)
+        session = self._http_session or aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30), trust_env=True,
+        )
+        try:
+            for form_data in form_data_list:
                 try:
                     async with session.post(url, data=form_data, headers=headers) as resp:
                         body = await resp.json()
@@ -205,7 +257,10 @@ async def _standalone_send(
             )
         }
 
-    body = strip_markdown(message)
+    try:
+        directive = _parse_content_directive(message)
+    except ValueError as e:
+        return {"error": str(e)}
 
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
@@ -215,10 +270,13 @@ async def _standalone_send(
         url = f"{TWILIO_API_BASE}/{account_sid}/Messages.json"
         headers = {"Authorization": _basic_auth_header(account_sid, auth_token)}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **sess_kw) as session:
-            form_data = aiohttp.FormData()
-            form_data.add_field("MessagingServiceSid", messaging_service_sid)
-            form_data.add_field("To", chat_id)
-            form_data.add_field("Body", body)
+            if directive:
+                form_data = _build_content_form(aiohttp, messaging_service_sid, chat_id, *directive)
+            else:
+                form_data = aiohttp.FormData()
+                form_data.add_field("MessagingServiceSid", messaging_service_sid)
+                form_data.add_field("To", chat_id)
+                form_data.add_field("Body", strip_markdown(message))
             async with session.post(url, data=form_data, headers=headers, **req_kw) as resp:
                 payload = await resp.json()
                 if resp.status >= 400:
