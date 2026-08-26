@@ -1,0 +1,235 @@
+name: Reconcile PR 93042 fleet convergence
+
+on:
+  push:
+    branches:
+      - phase4-desktop-fleet
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr-93042-fleet-convergence
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.repository == 'andrexibiza/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: phase4-desktop-fleet
+          fetch-depth: 0
+
+      - name: Apply exact merged fleet convergence semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          from pathlib import Path
+
+          def git_blob_sha(data: bytes) -> str:
+              header = f"blob {len(data)}\0".encode()
+              return hashlib.sha1(header + data).hexdigest()
+
+          source_path = Path("hermes_cli/update_cmd.py")
+          source_bytes = source_path.read_bytes()
+          source_sha = git_blob_sha(source_bytes)
+          if source_sha != "b84d552ab4ab4db63d649578cac892aa07f0ad24":
+              raise SystemExit(
+                  "refusing to patch unexpected update_cmd.py blob: "
+                  f"{source_sha}"
+              )
+          source = source_bytes.decode("utf-8")
+
+          old_source = "\n".join(
+              [
+                  "            # A brief settle window: freshly restarted/resumed gateways need",
+                  "            # a moment to rewrite gateway_state.json with their new identity.",
+                  "            # Skipped when the restart phase touched nothing (no gateways",
+                  "            # were running) — nothing to settle.",
+                  "            if _fleet_rows_expected:",
+                  "                _time.sleep(2.0)",
+                  "            # Pass the pre-restart PID snapshot so a gateway the restart",
+                  "            # phase stopped WITHOUT a verified replacement shows as a DOWN",
+                  "            # row (exit 1) instead of silently producing no row at all.",
+                  "            _fleet_snapshot = collect_fleet_versions(",
+                  "                pre_restart_pids=_pre_restart_gateway_pids",
+                  "            )",
+              ]
+          ) + "\n"
+
+          new_source = "\n".join(
+              [
+                  "            # A brief settle window: freshly restarted/resumed gateways need",
+                  "            # a moment to rewrite gateway_state.json with their new identity.",
+                  "            # Skipped when the restart phase touched nothing (no gateways",
+                  "            # were running) — nothing to settle.",
+                  "            #",
+                  "            # On Windows the resume path relaunches the gateway DETACHED, and",
+                  "            # that process must boot before it stamps gateway_state.json or",
+                  "            # answers the control socket (a Telegram gateway reconnects its",
+                  "            # polling loop — ~10s).  A single 2s sleep therefore races the",
+                  "            # gateway's own startup and reports \"no rows\" (exit 1) for a",
+                  "            # healthy resume, which then triggers a full retry that re-kills",
+                  "            # the gateway the first attempt just started.  Poll a bounded",
+                  "            # window for the resumed gateway to publish its identity instead.",
+                  "            _fleet_snapshot = []",
+                  "            if _fleet_rows_expected:",
+                  "                _fleet_deadline = _time.monotonic() + 30.0",
+                  "                while True:",
+                  "                    _time.sleep(2.0)",
+                  "                    # Pass the pre-restart PID snapshot so a gateway the",
+                  "                    # restart phase stopped WITHOUT a verified replacement",
+                  "                    # shows as a DOWN row (exit 1) instead of silently",
+                  "                    # producing no row at all.",
+                  "                    _fleet_snapshot = collect_fleet_versions(",
+                  "                        pre_restart_pids=_pre_restart_gateway_pids",
+                  "                    )",
+                  "                    # A \"down\" row here is the stale pre-restart record of a",
+                  "                    # gateway whose detached replacement is still booting —",
+                  "                    # not a confirmed failure.  Keep polling until every",
+                  "                    # resumed gateway has published (no \"down\" rows remain)",
+                  "                    # or the deadline passes, so a slow second gateway can't",
+                  "                    # be misread as down and re-trigger the retry loop.",
+                  "                    if _fleet_snapshot and not any(",
+                  "                        row.get(\"state\") == \"down\" for row in _fleet_snapshot",
+                  "                    ):",
+                  "                        break",
+                  "                    if _time.monotonic() >= _fleet_deadline:",
+                  "                        break",
+                  "            else:",
+                  "                _fleet_snapshot = collect_fleet_versions(",
+                  "                    pre_restart_pids=_pre_restart_gateway_pids",
+                  "                )",
+              ]
+          ) + "\n"
+
+          if source.count(old_source) != 1:
+              raise SystemExit(
+                  "expected exactly one legacy fleet settle block; "
+                  f"found {source.count(old_source)}"
+              )
+          source = source.replace(old_source, new_source, 1)
+          source_path.write_text(source, encoding="utf-8")
+
+          test_path = Path("tests/hermes_cli/test_update_fleet_check_fail_closed.py")
+          test_bytes = test_path.read_bytes()
+          test_sha = git_blob_sha(test_bytes)
+          if test_sha != "8ec1781d6e8ce4458205e3dfa5e4bb93c97b59ea":
+              raise SystemExit(
+                  "refusing to patch unexpected focused regression blob: "
+                  f"{test_sha}"
+              )
+          tests = test_bytes.decode("utf-8")
+
+          old_doc = "condition gates the 2.0s settle sleep."
+          new_doc = (
+              "condition gates the bounded detached-gateway convergence poll."
+          )
+          if tests.count(old_doc) != 1:
+              raise SystemExit(
+                  "expected exactly one legacy test description; "
+                  f"found {tests.count(old_doc)}"
+              )
+          tests = tests.replace(old_doc, new_doc, 1)
+
+          old_test = "\n".join(
+              [
+                  "    def test_settle_sleep_gated_on_expected_runtimes(self):",
+                  "        src = self._impl_source()",
+                  "        assert \"_fleet_rows_expected = _m()._fleet_probe_expected_runtimes(\" in src",
+                  "        # The 2.0s settle window must key on the cross-platform signal, so a",
+                  "        # resumed Windows gateway gets its settle window too (#93406).",
+                  "        assert \"if _fleet_rows_expected:\\n\" in src",
+                  "        assert \"if restarted_services or killed_pids:\\n                _time.sleep\" not in src",
+              ]
+          )
+
+          new_test = "\n".join(
+              [
+                  "    def test_convergence_poll_gated_on_expected_runtimes(self):",
+                  "        src = self._impl_source()",
+                  "        assert \"_fleet_rows_expected = _m()._fleet_probe_expected_runtimes(\" in src",
+                  "        # Detached Windows gateways can take materially longer than two",
+                  "        # seconds to publish their replacement identity. The bounded poll",
+                  "        # must key on the cross-platform liveness signal and stop only once",
+                  "        # every expected row has converged away from the stale DOWN state.",
+                  "        assert \"_fleet_deadline = _time.monotonic() + 30.0\" in src",
+                  "        assert 'row.get(\"state\") == \"down\"' in src",
+                  "        assert \"if _fleet_snapshot and not any(\" in src",
+                  "        assert \"else:\\n                _fleet_snapshot = collect_fleet_versions(\" in src",
+                  "        assert \"if restarted_services or killed_pids:\\n                _time.sleep\" not in src",
+              ]
+          )
+
+          if tests.count(old_test) != 1:
+              raise SystemExit(
+                  "expected exactly one legacy settle regression; "
+                  f"found {tests.count(old_test)}"
+              )
+          test_path.write_text(
+              tests.replace(old_test, new_test, 1),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Verify and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m py_compile \
+            hermes_cli/update_cmd.py \
+            tests/hermes_cli/test_update_fleet_check_fail_closed.py
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path("hermes_cli/update_cmd.py").read_text(encoding="utf-8")
+          tests = Path(
+              "tests/hermes_cli/test_update_fleet_check_fail_closed.py"
+          ).read_text(encoding="utf-8")
+
+          required = (
+              "_fleet_deadline = _time.monotonic() + 30.0",
+              'row.get("state") == "down"',
+              "if _fleet_snapshot and not any(",
+              "elif not _fleet_snapshot and _fleet_rows_expected:",
+          )
+          missing = [needle for needle in required if needle not in source]
+          if missing:
+              raise SystemExit(f"missing reconciled semantics: {missing}")
+          if source.count("_fleet_deadline = _time.monotonic() + 30.0") != 1:
+              raise SystemExit("fleet convergence deadline is not unique")
+          if "def test_convergence_poll_gated_on_expected_runtimes" not in tests:
+              raise SystemExit("focused convergence regression is absent")
+          PY
+
+          git diff --check
+
+          rm .github/workflows/pr-93042-reconcile.yml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            hermes_cli/update_cmd.py \
+            tests/hermes_cli/test_update_fleet_check_fail_closed.py \
+            .github/workflows/pr-93042-reconcile.yml
+
+          git diff --cached --check
+          git diff --cached --name-only | sort > /tmp/actual-paths
+          printf '%s\n' \
+            .github/workflows/pr-93042-reconcile.yml \
+            hermes_cli/update_cmd.py \
+            tests/hermes_cli/test_update_fleet_check_fail_closed.py \
+            | sort > /tmp/expected-paths
+          diff -u /tmp/expected-paths /tmp/actual-paths
+
+          git commit -m "fix(update): reconcile detached fleet convergence"
+          git push origin HEAD:phase4-desktop-fleet
