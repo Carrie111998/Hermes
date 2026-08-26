@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -919,5 +921,27 @@ def test_multiplex_recovery_does_not_recreate_home_deleted_after_snapshot(tmp_pa
     assert not thread.is_alive()
     assert not deleted_home.exists()
     assert not (deleted_home / "cron" / "executions.db").exists()
+
+
+def test_real_tick_does_not_recreate_missing_guarded_profile(tmp_path):
+    """The tick lock must honor the multiplex profile-home boundary."""
+    import shutil
+
+    from cron.jobs import use_cron_store
+    from cron.scheduler import tick
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_home = tmp_path / "profiles" / "deleted"
+    profile_home.mkdir(parents=True)
+    home_token = set_hermes_home_override(str(profile_home))
+    try:
+        with use_cron_store(profile_home, require_existing_home=True):
+            shutil.rmtree(profile_home)
+            with pytest.raises(FileNotFoundError):
+                tick(verbose=False)
+    finally:
+        reset_hermes_home_override(home_token)
+
+    assert not profile_home.exists()
 
 

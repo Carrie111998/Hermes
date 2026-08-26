@@ -45,19 +45,20 @@ vi.mock('@/store/gateway', () => ({
   retireLocalProfileGateways: vi.fn()
 }))
 
-vi.mock('@/store/connections', () => ({
-  $activeConnectionId: { get: () => 'local' },
-  forgetLastProfileForConnection: vi.fn()
-}))
-
-const { $activeGatewayProfile: activeGateway, $profileColors } = vi.hoisted(() => {
+const { $activeConnectionId: activeConnectionId, $activeGatewayProfile: activeGateway, $profileColors } = vi.hoisted(() => {
   const { atom } = require('nanostores') as typeof Nanostores
 
   return {
+    $activeConnectionId: { get: vi.fn(() => 'local') },
     $activeGatewayProfile: atom<string>('default'),
     $profileColors: atom<Record<string, string>>({})
   }
 })
+
+vi.mock('@/store/connections', () => ({
+  $activeConnectionId: activeConnectionId,
+  forgetLastProfileForConnection: vi.fn()
+}))
 
 vi.mock('@/store/profile', () => ({
   $activeGatewayProfile: activeGateway,
@@ -160,6 +161,9 @@ describe('ProfilesView', () => {
   })
 
   it('leaves the active profile alone when a different profile is deleted', async () => {
+    activeConnectionId.get.mockClear()
+    activeConnectionId.get.mockReturnValue('local')
+    vi.mocked(deleteProfile).mockClear()
     vi.mocked(forgetLastProfileForConnection).mockClear()
     vi.mocked(selectProfile).mockClear()
     vi.mocked(setActiveProfile).mockClear()
@@ -171,9 +175,25 @@ describe('ProfilesView', () => {
 
     await waitFor(() => expect(deleteProfile).toHaveBeenCalledWith(NAMED_PROFILE))
     expect(forgetLastProfileForConnection).toHaveBeenCalledWith('local', NAMED_PROFILE)
+    expect(activeConnectionId.get.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(deleteProfile).mock.invocationCallOrder[0]
+    )
     // The dialog closes once the delete settles; a non-active delete must not re-home.
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull())
     expect(selectProfile).not.toHaveBeenCalled()
     expect(setActiveProfile).not.toHaveBeenCalled()
+  })
+
+  it('keeps the boot target when profile deletion fails', async () => {
+    vi.mocked(forgetLastProfileForConnection).mockClear()
+    vi.mocked(deleteProfile).mockRejectedValueOnce(new Error('delete failed'))
+    vi.mocked(refreshProfiles).mockResolvedValue([makeProfile('default', true), makeProfile(NAMED_PROFILE)])
+    activeGateway.set('default')
+
+    await renderProfilesView()
+    await deleteTheNamedProfile()
+
+    await waitFor(() => expect(deleteProfile).toHaveBeenCalledWith(NAMED_PROFILE))
+    expect(forgetLastProfileForConnection).not.toHaveBeenCalled()
   })
 })

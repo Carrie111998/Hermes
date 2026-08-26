@@ -542,6 +542,7 @@ from cron.jobs import (
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
+    ensure_cron_dir,
     mark_job_run,
     save_job_output,
     use_cron_store,
@@ -7285,7 +7286,7 @@ def tick(
         Number of jobs executed (0 if another tick is already running)
     """
     lock_dir, lock_file = _get_lock_paths()
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    ensure_cron_dir(lock_dir)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows.
     # Only genuine lock contention (another ticker holds the lock) skips the
