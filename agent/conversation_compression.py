@@ -3831,32 +3831,115 @@ def compress_context(
                     # covers inserted/merged; compress_context is intentionally
                     # NOT self-contained for already_present — a future direct
                     # caller of compress_context must go through that wrapper.
-                    current_idx = getattr(agent, "_persist_user_message_idx", None)
-                    if (
-                        compressed_user_turn_outcome in {"inserted", "merged"}
-                        and isinstance(current_idx, int)
-                        and 0 <= current_idx < len(messages)
-                    ):
-                        _live_user_message = messages[current_idx]
-                        if (
-                            isinstance(_live_user_message, dict)
-                            and _live_user_message.get("role") == "user"
-                        ):
-                            _live_user_message[_DB_PERSISTED_MARKER] = True
-                            _session_messages = getattr(agent, "_session_messages", None)
+                    if compressed_user_turn_outcome in {"inserted", "merged"}:
+                        # The published child represents exactly one live row:
+                        # the anchor source _ensure_compressed_has_user_turn
+                        # inserted (verbatim) or merged (as the leading
+                        # content) into the handoff. Stamp THAT row, not an
+                        # index that may have drifted (adoption rebind at
+                        # :3028/:3045 rebinds _persist_user_message_idx to
+                        # len(messages) — deliberately OUT OF RANGE — or
+                        # reanchor_current_turn_user_idx falling back to a
+                        # user-role neighbor). The persist index is
+                        # deliberately NOT read here: trusting it is the
+                        # drift vector. _messages_match_scoped_identity is
+                        # intentionally NOT used against the HANDOFF row: for
+                        # `merged` the handoff is a superset (anchor +
+                        # scaffolding), so a verbatim match would break the
+                        # legitimate merged stamp. Live views are compared
+                        # against the ANCHOR SOURCE only.
+                        _compressed_anchor_source = None
+                        for _reversed_message in reversed(messages):
+                            if _is_real_user_message(_reversed_message):
+                                _compressed_anchor_source = _reversed_message
+                                break
+                        if isinstance(_compressed_anchor_source, dict):
+                            _compressed_anchor_source[_DB_PERSISTED_MARKER] = True
+                            _session_messages = getattr(
+                                agent, "_session_messages", None
+                            )
                             if (
                                 isinstance(_session_messages, list)
                                 and _session_messages is not messages
-                                and 0 <= current_idx < len(_session_messages)
                             ):
-                                _session_live_user_message = _session_messages[current_idx]
-                                if (
-                                    _is_real_user_message(_session_live_user_message)
-                                    and _messages_match_scoped_identity(
-                                        _session_live_user_message, _live_user_message
-                                    )
-                                ):
-                                    _session_live_user_message[_DB_PERSISTED_MARKER] = True
+                                # Adoption divergence: `messages` now points
+                                # at the adopted durable snapshot while
+                                # agent._session_messages may still point at
+                                # the pre-adoption live list (comment
+                                # :3040-3044), and the persist index is OUT
+                                # OF RANGE for the twin by design. The
+                                # post-publish _sync_persisted_markers cannot
+                                # mirror a MERGED handoff either (anchor +
+                                # scaffolding superset has no scoped match
+                                # with the standalone live row). Locate the
+                                # twin's corresponding live row(s) by scoped
+                                # identity AGAINST THE ANCHOR SOURCE and
+                                # stamp them — mirroring the wrapper's "stamp
+                                # every scoped match" pattern for
+                                # timestamp-less ambiguity
+                                # (run_agent.py:8237-8281).
+                                _anchor_timestamp = _compressed_anchor_source.get(
+                                    "timestamp"
+                                )
+                                _found_exact_timestamp_candidate = False
+                                if _anchor_timestamp is not None:
+                                    for _twin_message in _session_messages:
+                                        if (
+                                            isinstance(_twin_message, dict)
+                                            and _twin_message.get("timestamp")
+                                            == _anchor_timestamp
+                                            and _messages_match_scoped_identity(
+                                                _twin_message,
+                                                _compressed_anchor_source,
+                                            )
+                                        ):
+                                            # An exact scoped twin EXISTS —
+                                            # count the hit REGARDLESS of the
+                                            # marker. An already-stamped exact
+                                            # twin (stamped by a prior
+                                            # flush/rotation) must still
+                                            # suppress the broad fallback:
+                                            # otherwise a timestamp-less
+                                            # historical duplicate with the
+                                            # same content would be stamped as
+                                            # a "twin" of the anchor — the
+                                            # exact wrong-row path the
+                                            # reviewer flagged. The stamp
+                                            # itself stays idempotent (skip
+                                            # rows already carrying the
+                                            # marker); only the HIT is
+                                            # marker-independent.
+                                            _found_exact_timestamp_candidate = True
+                                            if not _twin_message.get(
+                                                _DB_PERSISTED_MARKER
+                                            ):
+                                                _twin_message[
+                                                    _DB_PERSISTED_MARKER
+                                                ] = True
+                                if not _found_exact_timestamp_candidate:
+                                    # No exact scoped twin exists anywhere (or
+                                    # the anchor itself is timestamp-less):
+                                    # stamp every scoped match — the wrapper's
+                                    # documented ambiguity policy for
+                                    # timestamp-less anchors. This branch is
+                                    # reached ONLY when an exact hit is
+                                    # provably absent; an exact hit that is
+                                    # already stamped does NOT open this
+                                    # branch.
+                                    for _twin_message in _session_messages:
+                                        if (
+                                            isinstance(_twin_message, dict)
+                                            and not _twin_message.get(
+                                                _DB_PERSISTED_MARKER
+                                            )
+                                            and _messages_match_scoped_identity(
+                                                _twin_message,
+                                                _compressed_anchor_source,
+                                            )
+                                        ):
+                                            _twin_message[
+                                                _DB_PERSISTED_MARKER
+                                            ] = True
                     for _handoff_message in compressed:
                         if isinstance(_handoff_message, dict):
                             _handoff_message[_DB_PERSISTED_MARKER] = True

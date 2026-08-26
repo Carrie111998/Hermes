@@ -8211,28 +8211,23 @@ class AIAgent:
                     fence=active_fence,
                     telemetry_agent=self,
                 )
-            try:
-                # _DB_PERSISTED_MARKER lives at module level in
-                # agent.context_compressor; conversation_compression only
-                # imports it locally (cannot be imported from there).
-                from agent.context_compressor import _DB_PERSISTED_MARKER
-                from agent.conversation_compression import (
-                    _messages_match_scoped_identity,
-                )
-            except Exception:
-                _DB_PERSISTED_MARKER = "_db_persisted"
-                def _messages_match_scoped_identity(left, right):
-                    if not isinstance(left, dict) or not isinstance(right, dict):
-                        return False
-                    if left.get("role") != right.get("role"):
-                        return False
-                    if left.get("content") != right.get("content"):
-                        return False
-                    left_timestamp = left.get("timestamp")
-                    right_timestamp = right.get("timestamp")
-                    if left_timestamp is not None and right_timestamp is not None:
-                        return left_timestamp == right_timestamp
-                    return True
+            # _DB_PERSISTED_MARKER lives at module level in
+            # agent.context_compressor; conversation_compression only
+            # imports it locally (cannot be imported from there). Imported
+            # UNCONDITIONALLY (no fallback): both modules are already
+            # hard dependencies at this point — agent.context_compressor is
+            # imported at the top of this module (line ~162), and
+            # agent.conversation_compression is imported at the top of this
+            # very method and its compress_context is invoked below. The
+            # only way these imports can fail while the wrapper is
+            # functional is a renamed/removed symbol, and that must fail
+            # LOUDLY: a silent fallback literal ("_db_persisted") would
+            # split the stamping key from the flush's and quietly resurrect
+            # the duplicate-row bug this fix removed.
+            from agent.context_compressor import _DB_PERSISTED_MARKER
+            from agent.conversation_compression import (
+                _messages_match_scoped_identity,
+            )
 
             def _sync_persisted_markers(target_messages, source_messages):
                 if not isinstance(target_messages, list) or not isinstance(
