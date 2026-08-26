@@ -19,7 +19,7 @@ import pytest
 from agent.prompt_builder import hud_surface_note
 from tui_gateway import server
 
-FULL_KIT = {"read_window_below", "computer_use", "browser_navigate", "annotate_screen"}
+FULL_KIT = {"read_window_below", "computer_use", "browser_navigate", "annotate_screen", "subtitle_overlay"}
 
 
 def _tool_def(name: str) -> dict:
@@ -57,6 +57,7 @@ class TestNoteContents:
         assert "computer_use" in note
         assert "browser_navigate" in note
         assert "annotate_screen" in note
+        assert "subtitle_overlay" in note
 
     def test_no_note_at_all_without_the_tool_it_rests_on(self):
         assert hud_surface_note({"computer_use", "browser_navigate"}) == ""
@@ -84,6 +85,18 @@ class TestNoteContents:
         note = hud_surface_note({"read_window_below", "annotate_screen"})
 
         assert "annotate_screen" in note
+        assert "computer_use" not in note
+
+    def test_subtitle_offer_needs_the_subtitle_tool(self):
+        note = hud_surface_note({"read_window_below", "annotate_screen"})
+
+        assert "subtitle_overlay" not in note
+
+    def test_offers_subtitles_independently_of_the_other_affordances(self):
+        note = hud_surface_note({"read_window_below", "subtitle_overlay"})
+
+        assert "subtitle_overlay" in note
+        assert "annotate_screen" not in note
         assert "computer_use" not in note
 
     def test_no_tools_at_all(self):

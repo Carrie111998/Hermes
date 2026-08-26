@@ -34,6 +34,14 @@ BRIDGES = [
         "screen.annotate.request",
         id="annotate",
     ),
+    pytest.param(
+        server._subtitles_control_request,
+        "subtitles_bridge",
+        server._SUBTITLES_CONTROL_PROBE_TIMEOUT_S,
+        server._SUBTITLES_CONTROL_TIMEOUT_S,
+        "subtitles.control.request",
+        id="subtitles",
+    ),
 ]
 
 
