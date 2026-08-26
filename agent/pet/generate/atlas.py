@@ -23,7 +23,6 @@ from OpenAI's ``hatch-pet`` skill (openai/skills, Apache-2.0).
 
 from __future__ import annotations
 
-import io
 import logging
 import math
 from pathlib import Path
@@ -1066,13 +1065,6 @@ def compose_atlas(frames_by_state: dict[str, list]):
                 cell = _fit_to_cell(cell)
             atlas.alpha_composite(cell, (col * CELL_WIDTH, row * CELL_HEIGHT))
     return _clear_transparent_rgb(atlas)
-
-
-def atlas_to_webp_bytes(atlas) -> bytes:
-    """Encode an atlas image to lossless WebP bytes (the on-disk pet format)."""
-    buf = io.BytesIO()
-    atlas.save(buf, format="WEBP", lossless=True, quality=100, method=6, exact=True)
-    return buf.getvalue()
 
 
 def validate_atlas(atlas) -> dict:
