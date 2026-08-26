@@ -1,5 +1,8 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { leaveGatewaySettingsForReconnect } from './gateway-settings'
 
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
@@ -27,13 +30,28 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  window.history.replaceState(window.history.state, '', '#/')
 })
 
 describe('GatewaySettings', () => {
+  it('leaves the gateway Settings hash before applying a reconnect', () => {
+    const navigate = vi.fn()
+    window.history.replaceState(window.history.state, '', '#/settings?tab=gateway')
+
+    leaveGatewaySettingsForReconnect(navigate)
+
+    expect(window.location.hash).toBe('#/')
+    expect(navigate).toHaveBeenCalledWith('/', { replace: true })
+  })
+
   it('loads the machine-level connection config (no profile scoping)', async () => {
     const { GatewaySettings } = await import('./gateway-settings')
 
-    render(<GatewaySettings />)
+    render(
+      <MemoryRouter>
+        <GatewaySettings />
+      </MemoryRouter>
+    )
     expect(await screen.findByText('Local gateway')).toBeTruthy()
     expect(
       screen.getByText('Start a private Hermes backend on localhost. This is the default and works offline.')

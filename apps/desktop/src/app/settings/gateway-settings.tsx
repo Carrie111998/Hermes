@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router'
 
+import { NEW_CHAT_ROUTE } from '@/app/routes'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
@@ -97,6 +99,14 @@ export function savedCloudConnectionUrl(config: Pick<GatewaySettingsState, 'mode
   return config.mode === 'cloud' ? config.remoteUrl.trim().replace(/\/+$/, '').toLowerCase() : ''
 }
 
+export function leaveGatewaySettingsForReconnect(navigate: (to: string, options: { replace: boolean }) => void) {
+  // applyConnectionConfig re-homes the backend and reloads the Electron window.
+  // HashRouter state must leave Settings synchronously or that reload restores
+  // `#/settings?tab=gateway` and makes a successful reconnect look like a no-op.
+  window.history.replaceState(window.history.state, '', '#/')
+  navigate(NEW_CHAT_ROUTE, { replace: true })
+}
+
 function ModeCard({
   active,
   description,
@@ -152,6 +162,7 @@ function ModeCard({
 // reconnect action), so only the connection controls render.
 export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {}) {
   const { t } = useI18n()
+  const navigate = useNavigate()
   const g = t.settings.gateway
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -502,6 +513,12 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     setSaving(true)
 
     try {
+      // The main process reloads immediately after a successful apply. Change
+      // the hash first so the fresh renderer cannot reopen this Settings tab.
+      if (apply) {
+        leaveGatewaySettingsForReconnect(navigate)
+      }
+
       const next = apply
         ? await window.hermesDesktop.applyConnectionConfig(payload(allowPlainTextToken))
         : await window.hermesDesktop.saveConnectionConfig(payload(allowPlainTextToken))
