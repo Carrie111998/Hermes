@@ -1497,7 +1497,7 @@ class TestPythonLockfileTracking:
             )
         return wheel
 
-    def test_no_cache_reconciles_real_venv_without_pruning_unlocked_package(
+    def test_no_cache_reconciles_real_transitive_without_pruning_unlocked_package(
         self, tmp_path, monkeypatch
     ):
         import json
@@ -1522,11 +1522,10 @@ class TestPythonLockfileTracking:
         self._write_wheel(wheelhouse, "locked-demo", "1.0.0")
         self._write_wheel(
             wheelhouse,
-            "locked-demo",
-            "2.0.0",
-            requires_dist="transitive-demo==1.0.0",
+            "app-demo",
+            "1.0.0",
+            requires_dist="locked-demo>=1,<3",
         )
-        self._write_wheel(wheelhouse, "transitive-demo", "1.0.0")
         self._write_wheel(wheelhouse, "unrelated-demo", "1.0.0")
 
         (project / "pyproject.toml").write_text(
@@ -1559,12 +1558,43 @@ class TestPythonLockfileTracking:
                 "install",
                 "--python",
                 str(python_exe),
-                "locked-demo==1.0.0",
+                "app-demo==1.0.0",
                 "unrelated-demo==1.0.0",
             ],
             env=install_env,
             check=True,
         )
+
+        def probe_environment():
+            result = subprocess.run(
+                [
+                    str(python_exe),
+                    "-c",
+                    "import importlib.metadata as m, json; "
+                    "print(json.dumps({'versions': {n: m.version(n) for n in "
+                    "('app-demo', 'locked-demo', 'unrelated-demo')}, "
+                    "'app_requires': m.requires('app-demo')}))",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(result.stdout)
+
+        # The stale lock-managed distribution is present only because the
+        # installed application depends on it, matching the real report.
+        assert probe_environment() == {
+            "versions": {
+                "app-demo": "1.0.0",
+                "locked-demo": "1.0.0",
+                "unrelated-demo": "1.0.0",
+            },
+            "app_requires": ["locked-demo>=1,<3"],
+        }
+
+        # Make the reviewed lock target available only after seeding the stale
+        # environment, so app-demo genuinely installed locked-demo transitively.
+        self._write_wheel(wheelhouse, "locked-demo", "2.0.0")
 
         # Existing installs start with no digest cache; this must drive the
         # same non-pruning reconciliation used by hermes update.
@@ -1573,32 +1603,14 @@ class TestPythonLockfileTracking:
             [uv, "pip"], env=install_env, hermes_root=hermes_root
         )
 
-        probe = subprocess.run(
-            [
-                str(python_exe),
-                "-c",
-                "import importlib.metadata as m, json; "
-                "print(json.dumps({n: m.version(n) for n in "
-                "('locked-demo', 'unrelated-demo')}))",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert json.loads(probe.stdout) == {
-            "locked-demo": "2.0.0",
-            "unrelated-demo": "1.0.0",
+        assert probe_environment() == {
+            "versions": {
+                "app-demo": "1.0.0",
+                "locked-demo": "2.0.0",
+                "unrelated-demo": "1.0.0",
+            },
+            "app_requires": ["locked-demo>=1,<3"],
         }
-        missing_transitive = subprocess.run(
-            [
-                str(python_exe),
-                "-c",
-                "import importlib.metadata as m; m.version('transitive-demo')",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert missing_transitive.returncode != 0
         assert uc._python_lockfile_changed(hermes_root) is False
 
     def test_failed_reconciliation_does_not_record_hash(
