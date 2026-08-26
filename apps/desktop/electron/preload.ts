@@ -40,6 +40,22 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       return () => ipcRenderer.removeListener('hermes:wake-indicator:state', listener)
     }
   },
+  subtitleCapture: {
+    // Chat renderer → main: start/stop/status of the live-subtitle session
+    // (subtitle_overlay tool). Resolves with the outcome JSON.
+    control: payload => ipcRenderer.invoke('hermes:subtitles:control', payload),
+    // Hidden capture window (?win=subcap) pulls its band config on mount —
+    // its chunk is lazy, so main's did-finish-load push can predate it.
+    getConfig: () => ipcRenderer.invoke('hermes:subtitle-capture:get'),
+    onConfig: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:subtitle-capture:config', listener)
+
+      return () => ipcRenderer.removeListener('hermes:subtitle-capture:config', listener)
+    },
+    // Capture window → main: one changed subtitle-band crop.
+    sendFrame: payload => ipcRenderer.send('hermes:subtitle-capture:frame', payload)
+  },
   screenAnnotations: {
     // Chat renderer → main: draw/clear the agent's marks on the transparent
     // screen overlay (annotate_screen tool). Resolves with the outcome JSON.

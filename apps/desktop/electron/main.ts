@@ -283,6 +283,7 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import { createScreenAnnotationsController, registerScreenAnnotationsIpc } from './screen-annotations-window'
+import { createSubtitleCaptureController, registerSubtitleCaptureIpc } from './subtitle-capture-session'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -11482,6 +11483,29 @@ const screenAnnotationsController = createScreenAnnotationsController({
 
 registerScreenAnnotationsIpc(screenAnnotationsController)
 
+// Live subtitles (subtitle_overlay tool): a hidden worker window samples the
+// subtitle band of the window behind Hermes, the backend OCRs + translates
+// changed frames, and the translation is painted through the annotation
+// overlay's `subtitles` channel. The agent only starts/stops the session; the
+// per-line loop never touches a model conversation.
+const subtitleCaptureController = createSubtitleCaptureController({
+  annotations: screenAnnotationsController,
+  devServer: DEV_SERVER,
+  loadWindowUrl,
+  log: rememberLog,
+  postToBackend: async (path, body) => {
+    const connection = await ensureBackend(undefined)
+
+    return postJsonForBackend(connection, path, body)
+  },
+  preloadPath: PRELOAD_PATH,
+  rendererIndex: resolveRendererIndex,
+  titlesAvailable: () => (IS_MAC ? systemPreferences.getMediaAccessStatus?.('screen') === 'granted' : true),
+  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('petOverlay'))
+})
+
+registerSubtitleCaptureIpc(subtitleCaptureController)
+
 // The pet overlay: a single transparent, frameless, always-on-top window that
 // hosts ONLY the floating mascot. Shift-clicking the in-window pet "pops it out"
 // here so it can leave the app's bounds and stay visible while Hermes is
@@ -15667,6 +15691,10 @@ app.on('before-quit', event => {
   // Same for the agent's screen-annotation overlay — marks floating over a
   // quit app would be pure ghost UI.
   screenAnnotationsController.close()
+
+  // And the live-subtitle session: the hidden capture worker and its screen
+  // stream must not outlive the app.
+  subtitleCaptureController.close()
 
   // Same for the HUD — an always-on-top panel outliving the app would leave a
   // floating composer with nothing behind it. Close it directly rather than via

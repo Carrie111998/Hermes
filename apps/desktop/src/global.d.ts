@@ -218,6 +218,17 @@ declare global {
         /** Overlay renderer: subscribe to shape pushes (draws, clears, TTL expiry). */
         onState: (callback: (payload: { shapes: ScreenAnnotationShape[] }) => void) => () => void
       }
+      /** subtitle_overlay tool: the live-subtitle capture session. Absent on older shells. */
+      subtitleCapture?: {
+        /** Chat renderer → main: start/stop/status; resolves with the outcome JSON the tool reports back. */
+        control: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>
+        /** Hidden capture window: pull the band config on mount. */
+        getConfig: () => Promise<Record<string, unknown> | null>
+        /** Hidden capture window: subscribe to band config pushes (moves, resizes). */
+        onConfig: (callback: (payload: Record<string, unknown> | null) => void) => () => void
+        /** Hidden capture window → main: one changed subtitle-band crop. */
+        sendFrame: (payload: { data_url: string; epoch: number; height: number; width: number }) => void
+      }
       readFileDataUrl: (filePath: string) => Promise<string>
       /** Remote non-image attach: higher dedicated cap than preview/Settings default. */
       readFileDataUrlForAttach?: (filePath: string) => Promise<string>
