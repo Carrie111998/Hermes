@@ -44,8 +44,7 @@ def _build_compression_agent(
     if install_mock_compressor:
         compressor = MagicMock()
         compressor.compress.return_value = [
-            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
-            {"role": "user", "content": "tail"},
+            {"role": "user", "content": "x"},
         ]
         compressor.compression_count = 1
         compressor.protect_first_n = 3
@@ -370,7 +369,7 @@ def test_projection_length_mismatch_with_equal_revision_still_compresses(
     )
 
     assert compressed is not projection
-    assert compressed[0]["content"] == "[CONTEXT COMPACTION] summary"
+    assert compressed[0]["content"] == "x"
     agent.context_compressor.compress.assert_called_once()
 
 
@@ -445,7 +444,7 @@ def test_rotation_commit_fence_rejects_mutation_after_precheck(
     assert db.get_compression_lock_holder(session_id) is None
 
 
-def test_in_place_commit_fence_rejects_mutation_after_precheck(
+def test_in_place_commit_preserves_mutation_after_precheck(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -470,22 +469,17 @@ def test_in_place_commit_fence_rejects_mutation_after_precheck(
 
     monkeypatch.setattr(db, "archive_and_compact", _archive_after_late_write)
 
-    with pytest.raises(CompressionSnapshotStaleError) as caught:
-        agent._compress_context(
-            [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
-            "sys",
-            approx_tokens=120_000,
-        )
+    compressed, _ = agent._compress_context(
+        [{"role": "user", "content": "snapshot row", "_db_persisted": True}],
+        "sys",
+        approx_tokens=120_000,
+    )
 
-    assert caught.value.expected_revision == expected_revision
-    assert caught.value.observed_revision == db.get_active_message_revision(session_id)
     getattr(agent, "context_compressor").compress.assert_called_once()
-    all_rows = db.get_messages(session_id, include_inactive=True)
-    assert [row["content"] for row in all_rows] == [
-        "snapshot row",
-        "late durable row",
-    ]
-    assert all(row["active"] == 1 and row["compacted"] == 0 for row in all_rows)
+    assert compressed[0]["content"] == "x"
+    assert [
+        row["content"] for row in db.get_messages_as_conversation(session_id)
+    ] == ["x", "late durable row"]
     assert db.get_compression_lock_holder(session_id) is None
 
 
@@ -901,7 +895,7 @@ def test_in_place_commit_failure_restores_mutated_messages_and_stops(
 
     def _mutating_compress(live_messages, **_kwargs):
         live_messages[:] = [{"role": "user", "content": "mutated summary"}]
-        return [{"role": "user", "content": "compressed summary"}]
+        return [{"role": "user", "content": "x"}]
 
     agent.context_compressor.compress.side_effect = _mutating_compress
     monkeypatch.setattr(

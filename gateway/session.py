@@ -4180,6 +4180,51 @@ class SessionStore:
         with self._get_transcript_drain_lock():
             if n < 1:
                 n = 1
+            if not all(
+                hasattr(self._db, name)
+                for name in (
+                    "get_active_message_ids",
+                    "get_messages_as_conversation",
+                )
+            ):
+                # Compatibility path for pre-composite SessionDB adapters.
+                try:
+                    try:
+                        recents, revision = self._db.list_recent_user_messages(
+                            session_id,
+                            limit=max(n, 10),
+                            with_revision=True,
+                        )
+                    except TypeError:
+                        recents = self._db.list_recent_user_messages(
+                            session_id, limit=max(n, 10)
+                        )
+                        revision = None
+                    if not recents:
+                        return None
+                    target_idx = min(n - 1, len(recents) - 1)
+                    target_id = recents[target_idx]["id"]
+                    if revision is None:
+                        result = self._db.rewind_to_message(session_id, target_id)
+                    else:
+                        result = self._db.rewind_to_message(
+                            session_id,
+                            target_id,
+                            expected_revision=revision,
+                        )
+                except Exception as e:
+                    logger.debug("rewind_session: legacy adapter failed: %s", e)
+                    return None
+                self._clear_dirty_transcript(session_id)
+                target_msg = result.get("target_message") or {}
+                target_text = target_msg.get("content") or ""
+                return {
+                    "rewound_count": result.get("rewound_count", 0),
+                    "turns_undone": target_idx + 1,
+                    "target_text": target_text
+                    if isinstance(target_text, str)
+                    else "",
+                }
             from agent.context_compressor import (
                 retryable_user_text,
                 split_user_originated_turn,

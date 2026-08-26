@@ -7372,7 +7372,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 observed_revision = _active_message_revision_in_transaction(
                     conn,
                     parent_session_id,
-                    max_message_id=watermark,
                 )
                 if observed_revision != expected_parent_revision:
                     raise CompressionTranscriptRevisionError(
@@ -12152,6 +12151,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and lock_holder != compression_lock_holder
             ):
                 raise ValueError("conflicting compression lock holders")
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                effective_lock_holder,
+                reject_active_compression_lock=True,
+            )
             if effective_lock_holder is not None or require_compression_lease:
                 lock_row = conn.execute(
                     "SELECT holder, expires_at FROM compression_locks "

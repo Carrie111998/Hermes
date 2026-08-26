@@ -4319,6 +4319,14 @@ def compress_context(
                             agent._session_db,
                             agent.session_id,
                         )
+                        # Fence the exact parent state after our own audit flush.
+                        # The publisher compares this full revision inside the
+                        # closure/child transaction, while watermark_ceiling
+                        # still excludes those already-summarized flush rows
+                        # from the concurrent-tail clone.
+                        _expected_parent_revision = getattr(
+                            agent, "_durable_transcript_revision", None
+                        )
                     except Exception:
                         pass  # best-effort — don't block compression on a flush error
                     # Publish parent closure + child row + compacted handoff in
