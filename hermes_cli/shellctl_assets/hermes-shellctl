@@ -16,7 +16,14 @@ TUI + dashboard) reaches back through a reverse SSH forward
 Design: stdlib only, no sudo, no ControlMaster dependency,
 localhost-bound + token-gated.
 
-Run:  hermes-shellctl daemon --port 8765 --token <tok>
+Run:  hermes-shellctl daemon --port 8765 --token-file <path>
+
+The token is a bearer credential for every endpoint. A caller with the token
+and listener access can pull any file readable by this process unless
+``--allowed-root`` is set, read clipboard content, and push files into the
+download directory. The SSH reverse forward intentionally gives the remote
+Hermes host listener access, so a compromised host is inside this trust
+boundary.
 """
 from __future__ import annotations
 
@@ -38,7 +45,16 @@ _IS_MAC = platform.system() == "Darwin"
 
 _TOKEN = ""
 _DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
+_ALLOWED_ROOT = ""
 _MAX_BYTES = 64 * 1024 * 1024  # 64 MB cap per transfer
+
+
+class _BodyTooLarge(ValueError):
+    pass
+
+
+class _MalformedBody(ValueError):
+    pass
 
 
 def _which(*cands: str):
@@ -313,13 +329,37 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_body(self):
-        n = int(self.headers.get("Content-Length", 0) or 0)
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise _MalformedBody("missing Content-Length")
+        try:
+            n = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise _MalformedBody("invalid Content-Length") from exc
+        if n < 0:
+            raise _MalformedBody("negative Content-Length")
         if n > _MAX_BYTES:
-            return b""
-        return self.rfile.read(n) if n else b""
+            raise _BodyTooLarge("request body too large")
+        data = self.rfile.read(n) if n else b""
+        if len(data) != n:
+            raise _MalformedBody("incomplete request body")
+        return data
+
+    @staticmethod
+    def _pull_path_allowed(path):
+        if not _ALLOWED_ROOT:
+            return True
+        try:
+            return os.path.commonpath(
+                (os.path.realpath(path), _ALLOWED_ROOT)
+            ) == _ALLOWED_ROOT
+        except (OSError, ValueError):
+            return False
 
     def do_GET(self):
         u = urlparse(self.path)
+        if not self._auth_ok():
+            return self._send(401, {"error": "unauthorized"})
         if u.path == "/ping":
             return self._send(200, {
                 "ok": True,
@@ -327,11 +367,11 @@ class _Handler(BaseHTTPRequestHandler):
                 "os": platform.system(),
                 "caps": _capabilities(),
             })
-        if not self._auth_ok():
-            return self._send(401, {"error": "unauthorized"})
         q = parse_qs(u.query)
         if u.path == "/pull":
             path = os.path.expanduser((q.get("path") or [""])[0])
+            if path and not self._pull_path_allowed(path):
+                return self._send(403, {"error": "path outside allowed root"})
             if not path or not os.path.isfile(path):
                 return self._send(
                     404, {"error": "file not found: " + path}
@@ -384,15 +424,19 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 or "hermes-file"
             )
-            data = self._read_body()
+            try:
+                data = self._read_body()
+            except _BodyTooLarge:
+                return self._send(413, {"error": "request body too large"})
+            except _MalformedBody as exc:
+                return self._send(400, {"error": str(exc)})
             if not data:
-                return self._send(
-                    400, {"error": "empty body or too large"}
-                )
+                return self._send(400, {"error": "empty body"})
             os.makedirs(_DOWNLOAD_DIR, exist_ok=True)
-            dest = os.path.join(_DOWNLOAD_DIR, name)
-            with open(dest, "wb") as f:
-                f.write(data)
+            try:
+                dest = _write_deduplicated(_DOWNLOAD_DIR, name, data)
+            except OSError as exc:
+                return self._send(500, {"error": str(exc)})
             opened = (q.get("open") or ["1"])[0] not in (
                 "0", "false", "no"
             )
@@ -407,9 +451,35 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "no such endpoint"})
 
 
+def _write_deduplicated(directory, name, data):
+    """Write data without replacing an existing destination."""
+    stem, ext = os.path.splitext(name)
+    for suffix in range(10000):
+        candidate = name if suffix == 0 else "%s-%d%s" % (stem, suffix, ext)
+        dest = os.path.join(directory, candidate)
+        try:
+            with open(dest, "xb") as f:
+                f.write(data)
+            return dest
+        except FileExistsError:
+            continue
+    raise OSError("could not allocate a unique destination filename")
+
+
+def _read_token_file(path):
+    if not path:
+        return ""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError as exc:
+        print("FATAL: cannot read token file: %s" % exc, file=sys.stderr)
+        return ""
+
+
 def cmd_daemon(args):
-    global _TOKEN, _DOWNLOAD_DIR
-    _TOKEN = args.token or os.environ.get(
+    global _TOKEN, _DOWNLOAD_DIR, _ALLOWED_ROOT
+    _TOKEN = args.token or _read_token_file(args.token_file) or os.environ.get(
         "HERMES_SHELLCTL_TOKEN", ""
     )
     if not _TOKEN:
@@ -421,6 +491,15 @@ def cmd_daemon(args):
         return 2
     if args.download_dir:
         _DOWNLOAD_DIR = os.path.expanduser(args.download_dir)
+    if args.allowed_root:
+        root = os.path.realpath(os.path.expanduser(args.allowed_root))
+        if not os.path.isdir(root):
+            print(
+                "FATAL: allowed root is not a directory: %s" % root,
+                file=sys.stderr,
+            )
+            return 2
+        _ALLOWED_ROOT = root
     srv = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(
         "hermes-shellctl %s listening on %s:%d (%s, caps=%s)" % (
@@ -448,7 +527,13 @@ def main(argv=None):
     d.add_argument("--host", default="127.0.0.1")
     d.add_argument("--port", type=int, default=8765)
     d.add_argument("--token", default="")
+    d.add_argument("--token-file", default="")
     d.add_argument("--download-dir", default="")
+    d.add_argument(
+        "--allowed-root",
+        default="",
+        help="optionally restrict /pull to this directory tree",
+    )
     d.set_defaults(func=cmd_daemon)
     v = sub.add_parser("version", help="print version")
     v.set_defaults(func=lambda a: (print(SHELLCTL_VERSION), 0)[1])
