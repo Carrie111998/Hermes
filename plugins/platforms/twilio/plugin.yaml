@@ -1,0 +1,33 @@
+name: twilio-platform
+label: Twilio
+kind: platform
+version: 1.0.0
+description: >
+  Outbound-only Twilio adapter for Hermes Agent. Sends messages through
+  a Twilio Messaging Service with an RCS Sender attached — Twilio
+  automatically selects RCS for capable recipients and falls back to
+  SMS/MMS otherwise. No inbound channel; use `hermes send` or cron
+  `deliver=twilio` to send. Built to host more channels (SMS, MMS,
+  WhatsApp, Voice, Email) over time.
+
+  Shares TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN with the built-in SMS
+  platform and the optional telephony skill.
+author: Hermes user
+requires_env:
+  - name: TWILIO_ACCOUNT_SID
+    description: "Twilio Account SID (starts with AC) — shared with the SMS platform"
+    prompt: "Twilio Account SID"
+    password: false
+  - name: TWILIO_AUTH_TOKEN
+    description: "Twilio Auth Token — shared with the SMS platform"
+    prompt: "Twilio Auth Token"
+    password: true
+  - name: TWILIO_MESSAGING_SERVICE_SID
+    description: "Messaging Service SID (starts with MG) with an approved RCS Sender attached"
+    prompt: "Twilio Messaging Service SID"
+    password: false
+optional_env:
+  - name: TWILIO_RCS_HOME_CHANNEL
+    description: "Default destination phone number (E.164) for cron / notification delivery"
+    prompt: "Home channel phone number (or empty)"
+    password: false
