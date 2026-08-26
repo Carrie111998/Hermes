@@ -199,13 +199,32 @@ def check_frontier_downgrade(
 
     # Also log it: on the cron path there is no human reading the result dict,
     # and the session log is the transcript.
-    logger.warning(
-        "Frontier guarantee not held: requested %r (%s) but %r (%s) served this turn",
-        warning.get("requested_model"),
-        warning.get("requested_class") or "unknown",
-        warning.get("served_model"),
-        warning.get("served_class") or "unknown",
-    )
+    #
+    # The two warning types are distinct findings and must not share a message.
+    # "Guarantee not held" is a claim that a frontier request was demonstrably
+    # served by a non-frontier model. On the frontier_check_unavailable path we
+    # know nothing of the kind — the check never ran, so the guarantee is
+    # *unverified*, not violated. Logging the stronger sentence for the weaker
+    # finding would send anyone reading the transcript hunting a downgrade that
+    # may not have happened, and it hides the thing that actually needs fixing:
+    # the check itself is broken.
+    if warning.get("type") == "frontier_downgrade":
+        logger.warning(
+            "Frontier guarantee not held: requested %r (%s) but %r (%s) served this turn",
+            warning.get("requested_model"),
+            warning.get("requested_class") or "unknown",
+            warning.get("served_model"),
+            warning.get("served_class") or "unknown",
+        )
+    else:
+        logger.warning(
+            "Frontier guarantee unverified for this turn (%s): requested %r, "
+            "served %r — the downgrade check could not run, so this is neither "
+            "a pass nor a detected downgrade",
+            warning.get("detail") or warning.get("type"),
+            warning.get("requested_model"),
+            warning.get("served_model"),
+        )
     return warning
 
 
