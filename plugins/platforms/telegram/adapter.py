@@ -7774,6 +7774,7 @@ class TelegramAdapter(BasePlatformAdapter):
         original = (event.text or "").strip()
         if skill and not event.is_command():
             target = event.metadata["telegram_media_recovery"]
+            event.metadata["preserve_command_args"] = True
             event.auto_skill = skill
             event.text = (
                 f"/{skill} Recover the exact oversized Telegram {label} through the "
