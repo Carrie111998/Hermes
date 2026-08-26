@@ -88,18 +88,11 @@ def build_services(settings: Settings | None = None) -> Services:
     elif settings.law_api_enabled:
         log.warning("LAW_OC/DATA_GO_KR_KEY unset — 법령·판례 검색 도구 없이 동작합니다")
 
+    api_key, base_url = settings.llm_credentials
     llm = LlmClient(
         provider=settings.llm_provider,
-        api_key=(
-            settings.anthropic_api_key
-            if settings.llm_provider == "anthropic"
-            else settings.openai_api_key
-        ),
-        base_url=(
-            settings.anthropic_base_url
-            if settings.llm_provider == "anthropic"
-            else settings.openai_base_url
-        ),
+        api_key=api_key,
+        base_url=base_url,
         model=settings.llm_model,
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,

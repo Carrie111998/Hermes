@@ -49,6 +49,21 @@ def _env_list(name: str, default: str = "") -> list[str]:
     return [part.strip() for part in raw.replace("\n", ",").split(",") if part.strip()]
 
 
+# Sensible model per provider so `LLM_PROVIDER=gemini` alone does the right
+# thing — forgetting LLM_MODEL should not send a Claude id to Google.
+DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-5",
+    "gemini": "gemini-3.7-flash",
+}
+
+# Where each provider's credentials and endpoint live.
+PROVIDER_CREDENTIALS = {
+    "anthropic": ("anthropic_api_key", "anthropic_base_url", "ANTHROPIC_API_KEY"),
+    "openai": ("openai_api_key", "openai_base_url", "OPENAI_API_KEY"),
+    "gemini": ("gemini_api_key", "gemini_base_url", "GEMINI_API_KEY"),
+}
+
+
 @dataclass(frozen=True)
 class Settings:
     """Resolved configuration. Immutable — build a new one to change it."""
@@ -133,7 +148,15 @@ class Settings:
     openai_base_url: str = field(
         default_factory=lambda: _env("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     )
-    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "claude-sonnet-5"))
+    gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY"))
+    gemini_base_url: str = field(
+        default_factory=lambda: _env(
+            "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
+        ).rstrip("/")
+    )
+    # Empty means "use the provider's default" — see `llm_model` below. Set
+    # LLM_MODEL to pin an exact id.
+    llm_model_override: str = field(default_factory=lambda: _env("LLM_MODEL"))
     llm_draft_model: str = field(default_factory=lambda: _env("LLM_DRAFT_MODEL", ""))
     llm_max_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_TOKENS", 2000))
     llm_temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.2))
@@ -211,8 +234,20 @@ class Settings:
         return self.data_dir / self.db_filename
 
     @property
+    def llm_model(self) -> str:
+        return self.llm_model_override or DEFAULT_MODELS.get(self.llm_provider, "")
+
+    @property
     def draft_model(self) -> str:
         return self.llm_draft_model or self.llm_model
+
+    @property
+    def llm_credentials(self) -> tuple[str, str]:
+        """``(api_key, base_url)`` for the configured provider."""
+        key_field, url_field, _ = PROVIDER_CREDENTIALS.get(
+            self.llm_provider, PROVIDER_CREDENTIALS["anthropic"]
+        )
+        return getattr(self, key_field), getattr(self, url_field)
 
     @property
     def total_answer_budget_s(self) -> float:
@@ -232,10 +267,14 @@ class Settings:
     def missing_required(self) -> list[str]:
         """Config that must be present for the bot to do anything useful."""
         missing: list[str] = []
-        if self.llm_provider == "anthropic" and not self.anthropic_api_key:
-            missing.append("ANTHROPIC_API_KEY")
-        if self.llm_provider == "openai" and not self.openai_api_key:
-            missing.append("OPENAI_API_KEY")
+        if self.llm_provider not in PROVIDER_CREDENTIALS:
+            missing.append(f"LLM_PROVIDER (알 수 없는 값: {self.llm_provider})")
+        else:
+            key, _url = self.llm_credentials
+            if not key:
+                missing.append(PROVIDER_CREDENTIALS[self.llm_provider][2])
+            if not self.llm_model:
+                missing.append("LLM_MODEL")
         if self.iris_send_mode in {"direct", "hybrid"} and not self.iris_base_url:
             missing.append("IRIS_BASE_URL")
         if self.iris_send_mode in {"poll", "hybrid"} and not self.outbox_token:
