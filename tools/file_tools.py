@@ -1650,15 +1650,6 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
-def _strip_read_file_gutter(content: str, start_line: int) -> str:
-    """Remove the display-only ``LINE|`` prefix added by ``read_file``."""
-    raw_lines = []
-    for line_number, line in enumerate(content.split("\n"), start=start_line):
-        prefix = f"{line_number}|"
-        raw_lines.append(line[len(prefix):] if line.startswith(prefix) else line)
-    return "\n".join(raw_lines)
-
-
 def read_file_tool(
     path: str,
     offset: int = 1,
@@ -1899,9 +1890,7 @@ def read_file_tool(
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
-        if result.content and not line_numbers:
-            result.content = _strip_read_file_gutter(result.content, offset)
+        result = file_ops.read_file(path, offset, limit, line_numbers=line_numbers)
         result_dict = result.to_dict()
 
         # ── Populate negative-result cache on not-found ───────────────
@@ -1980,6 +1969,13 @@ def read_file_tool(
         # Programmatic sandbox reads are ordinary function calls: repeated
         # calls must return the same data and must not consume or seed the
         # chat-facing dedup/loop budget.
+        #
+        # With deduplicate=False (the read_file_programmatic_tool path)
+        # nothing is recorded in read_history/consecutive, so this loop
+        # breaker does NOT apply to sandbox RPC callers. That is safe by
+        # contract: the RPC layer bounds runaway scripts via its own call
+        # limit and per-script timeout — the consecutive-loop guard here
+        # only protects the chat-facing model loop.
         count = 0
         if deduplicate:
             read_key = ("read", path, offset, limit)
