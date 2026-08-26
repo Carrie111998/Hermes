@@ -5819,6 +5819,34 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+def _sync_agent_fallback_chain_with_config(sid: str, session: dict) -> None:
+    """Adopt a config.yaml fallback-chain change into the live agent.
+
+    Desktop/TUI chats cache their agent across turns and used to freeze the
+    fallback chain at agent-create time (#95066): a chat opened before
+    ``hermes fallback add`` kept an empty in-memory chain forever, so a
+    provider-quota 429 ended in a provider error even though a healthy
+    fallback was configured. The messaging gateway already re-applies its
+    cached agents' chain per message; this is the same contract at turn
+    start. Fail-open — a failed read keeps the current chain and never
+    blocks the turn.
+    """
+    agent = session.get("agent")
+    if agent is None:
+        return
+    try:
+        from hermes_cli.fallback_config import (
+            apply_fallback_chain_to_agent,
+            get_fallback_chain,
+        )
+
+        apply_fallback_chain_to_agent(agent, get_fallback_chain(_load_cfg()))
+    except Exception as e:
+        logger.warning(
+            "fallback chain sync failed for %s: %s", sid, e, exc_info=True
+        )
+
+
 def _apply_pending_model_switch(sid: str, session: dict) -> None:
     """Apply a model switch queued while a turn was running.
 
@@ -11493,6 +11521,11 @@ def _run_prompt_submit(
                 # config sync so an explicit pick wins over a config.yaml change.
                 _apply_pending_model_switch(sid, session)
                 _sync_agent_model_with_config(sid, session)
+                # Adopt fallback_providers edits into the cached agent too —
+                # a chain added after the chat opened must reach the next
+                # turn (#95066), same per-message contract the messaging
+                # gateway applies to its cached agents.
+                _sync_agent_fallback_chain_with_config(sid, session)
             # Bot Chat capability sync — adopt Settings→Capabilities edits
             # (skills/toolsets/MCP/SOUL) into the eternal bot session before
             # the turn runs. No-op for every other session shape.

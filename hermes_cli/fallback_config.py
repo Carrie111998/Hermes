@@ -99,3 +99,73 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+def apply_fallback_chain_to_agent(
+    agent: Any, chain: list[dict[str, Any]] | None
+) -> None:
+    """Keep a live agent's fallback chain aligned with current config.
+
+    Shared by the messaging gateway (per message) and the Desktop/TUI server
+    (per turn) so a chain configured *after* a chat was opened still reaches
+    that chat's next turn without recreating it (#95066).
+
+    Skips the rewrite while a rate-limit cooldown is holding the agent on an
+    already-activated fallback provider — ``restore_primary_runtime`` owns
+    that turn-scoped lifecycle. When the primary is active (or the cooldown
+    expired), replace the chain so mid-session ``fallback_providers`` edits
+    take effect.
+    """
+    import time
+
+    if agent is None:
+        return
+    new_chain = list(chain or [])
+    rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
+    if (
+        getattr(agent, "_fallback_activated", False)
+        and rate_limited_until > time.monotonic()
+    ):
+        return
+    old_chain = list(getattr(agent, "_fallback_chain", []) or [])
+    agent._fallback_chain = new_chain
+    agent._fallback_model = new_chain[0] if new_chain else None
+    if not getattr(agent, "_fallback_activated", False):
+        agent._fallback_index = 0
+    # A config edit signals the user changed something — drop the session-
+    # scoped unavailability memo so re-configured entries (e.g. credentials
+    # added mid-session for a previously-failing provider) get retried
+    # instead of staying suppressed for the cached agent's lifetime. Only on
+    # actual content change, so repeated no-op refreshes keep the memo's
+    # rate-limiting benefit (#60955).
+    if new_chain != old_chain:
+        unavailable = getattr(agent, "_unavailable_fallback_keys", None)
+        if unavailable:
+            unavailable.clear()
+
+
+def codex_pool_account_ids(entries: Any) -> set[str]:
+    """Distinct ChatGPT account ids backing a credential-pool snapshot.
+
+    Codex OAuth access tokens are JWTs whose ``chatgpt_account_id`` claim
+    scopes usage quota: two stored rows that re-authenticate the same
+    ChatGPT account share one quota wall, so rotating between them can
+    never clear an account-quota 429. Entries whose token cannot be decoded
+    contribute nothing — callers treat a missing id as "cannot prove these
+    rows share an account".
+    """
+    from hermes_cli.auth import _decode_jwt_claims
+
+    accounts: set[str] = set()
+    for entry in entries or []:
+        token = getattr(entry, "access_token", None)
+        claims = _decode_jwt_claims(token) if isinstance(token, str) else {}
+        auth_claims = claims.get("https://api.openai.com/auth")
+        account_id = (
+            auth_claims.get("chatgpt_account_id")
+            if isinstance(auth_claims, dict)
+            else None
+        )
+        if isinstance(account_id, str) and account_id.strip():
+            accounts.add(account_id.strip())
+    return accounts
