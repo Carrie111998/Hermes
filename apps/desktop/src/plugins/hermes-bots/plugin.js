@@ -599,6 +599,69 @@ function groupChatRoomKey(name, room) {
     : `name:${String(name)}`
 }
 
+/** Gateway id/label for a backend-hosted room. The field is additive in the
+ *  v3 projection; older clients ignore it, while hosted-aware clients must
+ *  never start a second local round driver for the same room. */
+function groupChatHostedGateway(room) {
+  return typeof room?.hosted === 'string' ? room.hosted.trim().slice(0, 128) : ''
+}
+
+/** Monotonic fencing epoch for the hosted room authority. Draft rooms that
+ *  predate the field are epoch 1; local rooms have no hosted epoch. */
+function groupChatHostedEpoch(room) {
+  const epoch = Number(room?.hostedEpoch || 0)
+  if (Number.isSafeInteger(epoch) && epoch >= 1) {
+    return epoch
+  }
+  return groupChatHostedGateway(room) ? 1 : 0
+}
+
+/** Apply an authority coordinate read directly from ``groups.state``.
+ *  Display projections are client-writable caches and must never call this
+ *  helper. Only a higher server-issued epoch may replace an existing owner. */
+function applyHostedRoomAuthority(room, serverRoom) {
+  const authorityGateway = groupChatHostedGateway({ hosted: serverRoom?.authority_gateway_id })
+  const authorityEpoch = Number(serverRoom?.authority_epoch || 0)
+  const roomId = typeof room?.roomId === 'string' ? room.roomId : ''
+  const serverRoomId = typeof serverRoom?.room_id === 'string' ? serverRoom.room_id : ''
+
+  if (
+    !authorityGateway ||
+    !Number.isSafeInteger(authorityEpoch) ||
+    authorityEpoch < 1 ||
+    (roomId && serverRoomId && roomId !== serverRoomId)
+  ) {
+    return room
+  }
+
+  const currentGateway = groupChatHostedGateway(room)
+  const currentEpoch = groupChatHostedEpoch(room)
+  const claim = serverRoom?.authority_claim
+  const claimPayload = claim?.payload
+  const transferProven = Boolean(
+    claim?.kind === 'authority.claimed' &&
+      claim?.actor?.kind === 'system' &&
+      claim?.actor?.id === 'authority-control' &&
+      Number(claim?.authority_epoch || 0) === authorityEpoch &&
+      claimPayload?.previous_gateway_id === currentGateway &&
+      claimPayload?.authority_gateway_id === authorityGateway &&
+      Number(claimPayload?.authority_epoch || 0) === authorityEpoch
+  )
+  if (
+    currentEpoch > authorityEpoch ||
+    (currentGateway && currentGateway !== authorityGateway && !transferProven) ||
+    (currentEpoch === authorityEpoch && currentGateway && currentGateway !== authorityGateway)
+  ) {
+    return room
+  }
+
+  return {
+    ...room,
+    hosted: authorityGateway,
+    hostedEpoch: authorityEpoch
+  }
+}
+
 /** Lift any historical projection shape (v1 wall-clock, v2 name-keyed) to
  *  the v3 room-key shape so one merge path serves mixed-version fleets. */
 function normalizeGroupChatSyncSnapshot(snapshot) {
@@ -660,6 +723,7 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
   for (const [name, room] of ranked) {
     const log = room.log.slice(-GROUP_CHAT_SYNC_MESSAGES).map(entry => ({
       ...(entry?.id ? { id: String(entry.id).slice(0, 160) } : {}),
+      ...(groupChatSyncSequence(entry) !== null ? { seq: groupChatSyncSequence(entry) } : {}),
       from: {
         kind: entry?.from?.kind === 'member' ? 'member' : 'user',
         name: String(entry?.from?.name || (entry?.from?.kind === 'member' ? 'Bot' : 'You')).slice(0, 128),
@@ -672,6 +736,11 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
     const compact = {
       name: String(name).slice(0, 64),
       ...(typeof room?.roomId === 'string' && room.roomId ? { roomId: String(room.roomId).slice(0, 128) } : {}),
+      // Presence is the compatibility contract: current clients always emit
+      // a value or null. Older clients omit the unknown field, which must not
+      // be interpreted as moving a hosted room back to local execution.
+      hosted: groupChatHostedGateway(room) || null,
+      hostedEpoch: groupChatHostedEpoch(room) || null,
       log,
       revision: Math.max(0, Number(room?.syncRevision ?? room?.revision ?? 0)),
       members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS).map(member => ({
@@ -704,6 +773,12 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
 }
 
 function groupChatSyncEntryKey(entry) {
+  const seq = groupChatSyncSequence(entry)
+
+  if (seq !== null) {
+    return `seq:${seq}`
+  }
+
   if (entry?.id) {
     return `id:${String(entry.id)}`
   }
@@ -722,6 +797,85 @@ function groupChatSyncEntryKey(entry) {
     String(entry?.thread || 'legacy').replace(/^legacy-\d+$/, 'legacy'),
     String(entry?.text || '')
   ])
+}
+
+function groupChatSyncSequence(entry) {
+  const seq = Number(entry?.seq)
+
+  return Number.isSafeInteger(seq) && seq > 0 ? seq : null
+}
+
+/** Hosted gateway logs carry a monotonic per-room sequence. Prefer it when
+ *  both entries have one; legacy/local entries keep their existing time/key
+ *  order until migration assigns them a sequence. */
+function compareGroupChatSyncEntries(left, right) {
+  const leftSeq = groupChatSyncSequence(left)
+  const rightSeq = groupChatSyncSequence(right)
+
+  if (leftSeq !== null && rightSeq !== null) {
+    return leftSeq - rightSeq || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
+  }
+
+  const byTime = Number(left?.at || 0) - Number(right?.at || 0)
+
+  return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
+}
+
+/** Union gateway replay with a legacy/local mirror without duplicating the
+ *  same event across its two identities. A hosted replay may add ``seq`` to
+ *  an entry the local room already knows by ``id``; repeated replay may also
+ *  carry different transport ids for the same authoritative sequence. Keep
+ *  both indexes while preferring the gateway sequence for ordering. */
+function mergeGroupChatSyncEntries(...logs) {
+  const entries = []
+  const byId = new Map()
+  const bySeq = new Map()
+
+  const remember = (entry, index) => {
+    const id = entry?.id ? String(entry.id) : ''
+    const seq = groupChatSyncSequence(entry)
+
+    if (id) {
+      byId.set(id, index)
+    }
+
+    if (seq !== null) {
+      bySeq.set(seq, index)
+    }
+  }
+
+  for (const entry of logs.flat()) {
+    const id = entry?.id ? String(entry.id) : ''
+    const seq = groupChatSyncSequence(entry)
+    let index = id ? byId.get(id) : undefined
+
+    if (index === undefined && seq !== null) {
+      index = bySeq.get(seq)
+    }
+
+    if (index === undefined) {
+      index = entries.length
+      entries.push(entry)
+      remember(entry, index)
+      continue
+    }
+
+    const prior = entries[index]
+    const authoritativeSeq = groupChatSyncSequence(prior) ?? seq
+    const merged = {
+      ...prior,
+      ...entry,
+      ...(prior?.images && !entry?.images ? { images: prior.images } : {}),
+      ...(prior?.id && !entry?.id ? { id: prior.id } : {}),
+      ...(authoritativeSeq !== null ? { seq: authoritativeSeq } : {})
+    }
+    entries[index] = merged
+    remember(prior, index)
+    remember(entry, index)
+    remember(merged, index)
+  }
+
+  return entries.sort(compareGroupChatSyncEntries)
 }
 
 function groupChatSyncMemberKey(member) {
@@ -804,24 +958,48 @@ function mergeGroupChatSyncSnapshots(
     const localRevision = changed.has(key)
       ? Math.max(0, Number(writeRevision || 0))
       : Math.max(0, Number(localRoom?.revision || 0))
-    const entries = new Map()
-    for (const entry of [...(remoteRoom?.log || []), ...(localRoom?.log || [])]) {
-      entries.set(groupChatSyncEntryKey(entry), entry)
-    }
+    const entries = mergeGroupChatSyncEntries(remoteRoom?.log || [], localRoom?.log || [])
 
     // Identity fields (display name, membership, picture) follow the higher
     // revision; a tie unions members and prefers the local writer's fields.
     let identity
     let members
     let image
+    let hosted
+    let hostedEpoch = 0
+    let hostedPresent = false
+    const remoteHostedPresent = Object.prototype.hasOwnProperty.call(remoteRoom || {}, 'hosted')
+    const localHostedPresent = Object.prototype.hasOwnProperty.call(localRoom || {}, 'hosted')
+    const remoteHostedEpoch = groupChatHostedEpoch(remoteRoom)
+    const localHostedEpoch = groupChatHostedEpoch(localRoom)
     if (localRevision > remoteRevision) {
       identity = localRoom
       members = [...(localRoom?.members || [])]
       image = localRoom?.image
+      if (localHostedPresent) {
+        hostedPresent = true
+        hosted = groupChatHostedGateway(localRoom)
+        hostedEpoch = groupChatHostedEpoch(localRoom)
+      } else if (remoteHostedPresent) {
+        // A newer legacy writer omitted a field it cannot understand. Keep
+        // the last explicit hosted/local statement from the other side.
+        hostedPresent = true
+        hosted = groupChatHostedGateway(remoteRoom)
+        hostedEpoch = groupChatHostedEpoch(remoteRoom)
+      }
     } else if (remoteRevision > localRevision) {
       identity = remoteRoom
       members = [...(remoteRoom?.members || [])]
       image = remoteRoom?.image
+      if (remoteHostedPresent) {
+        hostedPresent = true
+        hosted = groupChatHostedGateway(remoteRoom)
+        hostedEpoch = groupChatHostedEpoch(remoteRoom)
+      } else if (localHostedPresent) {
+        hostedPresent = true
+        hosted = groupChatHostedGateway(localRoom)
+        hostedEpoch = groupChatHostedEpoch(localRoom)
+      }
     } else {
       identity = localRoom || remoteRoom
       const byId = new Map()
@@ -830,18 +1008,34 @@ function mergeGroupChatSyncSnapshots(
       }
       members = [...byId.values()]
       image = Object.prototype.hasOwnProperty.call(localRoom || {}, 'image') ? localRoom.image : remoteRoom?.image
+      hostedPresent = localHostedPresent || remoteHostedPresent
+      hosted = localHostedPresent ? groupChatHostedGateway(localRoom) : groupChatHostedGateway(remoteRoom)
+      hostedEpoch = localHostedPresent ? groupChatHostedEpoch(localRoom) : groupChatHostedEpoch(remoteRoom)
+    }
+    // Both snapshots are client-writable display projections, not authority
+    // receipts. Keep an existing non-empty owner as a conservative execution
+    // fence; a larger client-authored epoch cannot replace or clear it.
+    const remoteHosted = groupChatHostedGateway(remoteRoom)
+    const localHosted = groupChatHostedGateway(localRoom)
+    if (remoteHosted) {
+      hostedPresent = true
+      hosted = remoteHosted
+      hostedEpoch = remoteHostedEpoch
+    } else if (localHosted) {
+      hostedPresent = true
+      hosted = localHosted
+      hostedEpoch = localHostedEpoch
     }
     rooms[key] = {
       ...(identity?.name ? { name: identity.name } : {}),
       ...(identity?.roomId || (key.startsWith('id:') ? key.slice(3) : '')
         ? { roomId: identity?.roomId || key.slice(3) }
         : {}),
-      log: [...entries.values()].sort((left, right) => {
-        const byTime = Number(left?.at || 0) - Number(right?.at || 0)
-        return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
-      }),
+      log: entries,
       members,
       revision: Math.max(remoteRevision, localRevision),
+      ...(hostedPresent ? { hosted: hosted || null } : {}),
+      ...(hostedPresent ? { hostedEpoch: hostedEpoch || null } : {}),
       ...(typeof image === 'string' && image ? { image } : {})
     }
   }
@@ -963,6 +1157,14 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
       }
     }
     const isPreserved = preserved.has(displayName) || (localName && preserved.has(localName))
+    const projectedAuthorityEpoch = groupChatHostedEpoch(projected)
+    const existingAuthorityEpoch = groupChatHostedEpoch(existing)
+    const projectedHosted = groupChatHostedGateway(projected)
+    const existingHosted = groupChatHostedGateway(existing)
+    // ``ui_meta`` is only a cache. It may initialize a fail-safe hosted fence,
+    // but it cannot replace or clear one already held by this runtime.
+    const cachedHosted = existingHosted || projectedHosted
+    const cachedHostedEpoch = existingHosted ? existingAuthorityEpoch : projectedAuthorityEpoch
     if (!isPreserved) {
       if (remoteRevision > localRevision) {
         members.clear()
@@ -972,12 +1174,7 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
       }
     }
 
-    const log = assignLegacyThreads(
-      [...entries.values()].sort((left, right) => {
-        const byTime = Number(left?.at || 0) - Number(right?.at || 0)
-        return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
-      })
-    )
+    const log = assignLegacyThreads([...entries.values()].sort(compareGroupChatSyncEntries))
     const bounded = trimGroupChatLog(log, existing.watermarks || {})
 
     // A remote rename with a higher revision moves the local record to the
@@ -1001,6 +1198,8 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
         : remoteRevision >= localRevision && Object.prototype.hasOwnProperty.call(projected, 'image')
           ? projected.image || null
           : existing.image || null,
+      hosted: cachedHosted || null,
+      hostedEpoch: cachedHostedEpoch || null,
       syncRevision: isPreserved ? localRevision : Math.max(remoteRevision, localRevision),
       epoch: Number(existing.epoch || 0),
       running: Boolean(existing.running)
@@ -1051,7 +1250,9 @@ function durableGroupChatRooms(all = $groupChats.get()) {
       log: room.log,
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
+      sessionOwners: room.sessionOwners || {},
       stranded: room.stranded || {},
+      holds: room.holds || {},
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
       // remote-sync path (the only caller of this function) loses its
@@ -1059,12 +1260,51 @@ function durableGroupChatRooms(all = $groupChats.get()) {
       // name-keyed identity — same field updateGroupChat's inline map
       // already carries.
       roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+      hosted: groupChatHostedGateway(room) || null,
+      hostedEpoch: groupChatHostedEpoch(room) || null,
       image: room.image || null,
       syncRevision: Math.max(0, Number(room.syncRevision || 0))
     }
   }
 
   return durable
+}
+
+/** Rehydrate the durable room cache without weakening execution authority.
+ *  Runtime-only loop state always resets, but a hosted marker is a safety
+ *  fence: dropping it while its gateway is offline would let the renderer
+ *  start the legacy local driver after a relaunch. */
+function hydratePersistedGroupChatRooms(value) {
+  const rooms = {}
+
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return rooms
+  }
+
+  for (const [name, room] of Object.entries(value)) {
+    if (!room || !Array.isArray(room.log)) {
+      continue
+    }
+
+    rooms[name] = {
+      log: assignLegacyThreads(room.log),
+      watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
+      sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
+      sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
+      stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
+      holds: room.holds && typeof room.holds === 'object' ? room.holds : {},
+      members: Array.isArray(room.members) ? room.members : [],
+      roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+      hosted: groupChatHostedGateway(room) || null,
+      hostedEpoch: groupChatHostedEpoch(room) || null,
+      image: typeof room.image === 'string' && room.image ? room.image : null,
+      syncRevision: Math.max(0, Number(room.syncRevision || 0)),
+      epoch: 0,
+      running: false
+    }
+  }
+
+  return rooms
 }
 
 function persistGroupChatRooms(all = $groupChats.get()) {
@@ -7018,6 +7258,8 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
         members: Array.isArray(room.members) ? room.members : [],
         // Immutable room identity: the member-session title for new rooms.
         roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+        hosted: groupChatHostedGateway(room) || null,
+        hostedEpoch: groupChatHostedEpoch(room) || null,
         // Room picture (small data URL, same normalization as bot avatars).
         image: room.image || null,
         syncRevision: Math.max(0, Number(room.syncRevision || 0))
@@ -7106,6 +7348,8 @@ async function disbandGroupChat(group, members) {
           sessionOwners: room.sessionOwners || {},
           members: Array.isArray(room.members) ? room.members : [],
           roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+          hosted: groupChatHostedGateway(room) || null,
+          hostedEpoch: groupChatHostedEpoch(room) || null,
           image: room.image || null,
           syncRevision: Math.max(0, Number(room.syncRevision || 0))
         }
@@ -7271,6 +7515,13 @@ function normalizeGroupChatText(text) {
 }
 
 function appendGroupChatEntry(group, from, text, thread, images) {
+  // Once a gateway owns the room, its monotonic log is authoritative. Late
+  // renderer harvest/clarify callbacks from the pre-hosted epoch must not
+  // mutate the read mirror after ownership moves.
+  if (groupChatHostedGateway($groupChats.get()[group])) {
+    return null
+  }
+
   const entry = {
     id: groupChatEntryId(),
     at: Date.now(),
@@ -8553,8 +8804,17 @@ async function harvestStrandedUntilSettled(group, members, thread) {
 function sendToGroupChat(group, members, text, thread, images) {
   const trimmed = String(text || '').trim()
   const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
+  const hosted = groupChatHostedGateway($groupChats.get()[group])
 
   if ((!trimmed && !attached.length) || !members.length) {
+    return null
+  }
+
+  if (hosted) {
+    host.notify?.({
+      kind: 'info',
+      message: `“${group}” runs on ${hosted}. Sending to hosted rooms isn't available in this build yet.`
+    })
     return null
   }
 
@@ -15735,31 +15995,7 @@ export default {
       Promise.resolve(ctx.storage?.get?.('group-chats'))
         .then(async value => {
           if (value && typeof value === 'object' && !Array.isArray(value)) {
-            const rooms = {}
-
-            for (const [name, room] of Object.entries(value)) {
-              if (room && Array.isArray(room.log)) {
-                rooms[name] = {
-                  // Pre-thread entries get synthetic thread ids on hydrate so
-                  // every UI/engine path can assume entry.thread exists.
-                  log: assignLegacyThreads(room.log),
-                  watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
-                  sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
-                  sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
-                  stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
-                  // #93129: rehydrate sticky stop holds with the same shape
-                  // guard as the other maps — a held bot stays held across
-                  // window restarts until explicitly released.
-                  holds: room.holds && typeof room.holds === 'object' ? room.holds : {},
-                  members: Array.isArray(room.members) ? room.members : [],
-                  roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
-                  image: typeof room.image === 'string' && room.image ? room.image : null,
-                  syncRevision: Math.max(0, Number(room.syncRevision || 0)),
-                  epoch: 0,
-                  running: false
-                }
-              }
-            }
+            const rooms = hydratePersistedGroupChatRooms(value)
 
             $groupChats.set({ ...rooms, ...$groupChats.get() })
 

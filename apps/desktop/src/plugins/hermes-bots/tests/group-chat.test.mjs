@@ -22,6 +22,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
   }
   const calls = []
   const clarifyResponds = []
+  const notifications = []
   const approvalResponds = []
   const requests = []
   const sessions = new Map()
@@ -192,7 +193,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
         return {}
       },
       state: { profile: { get: () => 'default', listen: () => undefined }, gateway: { listen: () => undefined } },
-      notify: () => undefined,
+      notify: notification => notifications.push(notification),
       notifyError: () => undefined
     }
   }
@@ -204,7 +205,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -212,7 +213,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
     register: () => undefined
   })
-  return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, requests, sessions, storageWrites, sharedUiMeta, uiMetaRevisions }
+  return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, notifications, requests, sessions, storageWrites, sharedUiMeta, uiMetaRevisions }
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
@@ -319,6 +320,7 @@ test('failed member turn is a pass, not a room error', async () => {
 
   const log = roomLog(gc, 'Flaky')
   assert.equal(log.length, 1) // just the user message; no error entries
+  assert.equal(gc.calls.length, MEMBERS.length, 'remaining members still receive their turns')
 })
 
 test('delta injection: a second user send only feeds members the NEW messages', async () => {
@@ -648,6 +650,458 @@ test('group gateway mirror preserves threads and budgets escaped Unicode', () =>
 
   assert.ok(gc.groupChatGatewayJsonSize(snapshot) <= 48000)
   assert.equal(snapshot.rooms['name:Unicode'].log.at(-1).thread, 'thread-15')
+  assert.equal(snapshot.rooms['name:Unicode'].hosted, null, 'current clients state local execution explicitly')
+})
+
+test('hosted-room marker survives projection, cold hydrate, and plugin persistence', () => {
+  const gc = load(() => '(pass)')
+  const snapshot = gc.groupChatSyncSnapshot({
+    Hosted: {
+      roomId: 'room-hosted',
+      hosted: '  gateway-a  ',
+      syncRevision: 4,
+      log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }],
+      members: [{ name: 'research' }]
+    }
+  })
+
+  assert.equal(snapshot.rooms['id:room-hosted'].hosted, 'gateway-a')
+  assert.equal(snapshot.rooms['id:room-hosted'].hostedEpoch, 1)
+
+  const hydrated = gc.mergeRemoteGroupChatSnapshotIntoRooms(snapshot, {})
+  assert.equal(hydrated.Hosted.hosted, 'gateway-a')
+  assert.equal(hydrated.Hosted.hostedEpoch, 1)
+
+  const durable = gc.durableGroupChatRooms(hydrated)
+  assert.equal(durable.Hosted.hosted, 'gateway-a')
+  assert.equal(durable.Hosted.hostedEpoch, 1)
+
+  const reloaded = gc.hydratePersistedGroupChatRooms(durable)
+  assert.equal(reloaded.Hosted.hosted, 'gateway-a')
+  assert.equal(reloaded.Hosted.hostedEpoch, 1)
+  assert.equal(reloaded.Hosted.epoch, 0)
+  assert.equal(reloaded.Hosted.running, false)
+})
+
+test('persisted hosted fence blocks the local driver after relaunch', () => {
+  const gc = load(() => 'must not run')
+  const reloaded = gc.hydratePersistedGroupChatRooms({
+    Hosted: {
+      roomId: 'room-hosted',
+      hosted: 'gateway-a',
+      hostedEpoch: 3,
+      log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'before restart', at: 1 }],
+      members: [{ name: 'research' }]
+    }
+  })
+
+  gc.$groupChats.set(reloaded)
+  const thread = gc.sendToGroupChat('Hosted', [{ name: 'research' }], 'after restart')
+
+  assert.equal(thread, null)
+  assert.equal(gc.calls.length, 0)
+  assert.match(gc.notifications.at(-1).message, /gateway-a/)
+})
+
+test('remote-merge persistence preserves session ownership and sticky holds', () => {
+  const gc = load(() => '(pass)')
+  const durable = gc.durableGroupChatRooms({
+    Team: {
+      log: [{ id: 'm1', from: { kind: 'user', name: 'You' }, text: 'pause', at: 1 }],
+      watermarks: {},
+      sessions: { research: 'session-1' },
+      sessionOwners: { research: 'gateway-a' },
+      holds: { research: { at: 1, byMessageId: 'm1' } },
+      members: [{ name: 'research' }]
+    }
+  })
+  const reloaded = gc.hydratePersistedGroupChatRooms(durable)
+
+  assert.equal(reloaded.Team.sessionOwners.research, 'gateway-a')
+  assert.equal(reloaded.Team.holds.research.byMessageId, 'm1')
+})
+
+test('a newer legacy revision cannot clear a hosted-room marker by omission', () => {
+  const gc = load(() => '(pass)')
+  const merged = gc.mergeGroupChatSyncSnapshots(
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          hosted: 'gateway-a',
+          hostedEpoch: 1,
+          revision: 3,
+          log: [{ id: 'old', from: { kind: 'user', name: 'You' }, text: 'old', at: 1 }]
+        }
+      }
+    },
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          revision: 4,
+          log: [{ id: 'new', from: { kind: 'user', name: 'You' }, text: 'new', at: 2 }]
+        }
+      }
+    }
+  )
+
+  assert.equal(merged.rooms['id:room-1'].hosted, 'gateway-a')
+  assert.equal(merged.rooms['id:room-1'].hostedEpoch, 1)
+})
+
+test('a fabricated higher client epoch cannot move a hosted room back to local', () => {
+  const gc = load(() => '(pass)')
+  const merged = gc.mergeGroupChatSyncSnapshots(
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          hosted: 'gateway-a',
+          revision: 3,
+          log: [{ id: 'old', from: { kind: 'user', name: 'You' }, text: 'old', at: 1 }]
+        }
+      }
+    },
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          hosted: null,
+          hostedEpoch: 2,
+          revision: 4,
+          log: [{ id: 'new', from: { kind: 'user', name: 'You' }, text: 'new', at: 2 }]
+        }
+      }
+    }
+  )
+
+  assert.equal(merged.rooms['id:room-1'].hosted, 'gateway-a')
+  assert.equal(merged.rooms['id:room-1'].hostedEpoch, 1)
+})
+
+test('a fabricated higher client epoch cannot replace a cached hosted owner', () => {
+  const gc = load(() => '(pass)')
+  const merged = gc.mergeGroupChatSyncSnapshots(
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          hosted: 'gateway-a',
+          hostedEpoch: 1,
+          revision: 4,
+          log: [{ id: 'new-owner', from: { kind: 'user', name: 'You' }, text: 'new', at: 2 }]
+        }
+      }
+    },
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          hosted: 'gateway-b',
+          hostedEpoch: 99,
+          revision: 99,
+          log: [{ id: 'stale-owner', from: { kind: 'user', name: 'You' }, text: 'stale', at: 3 }]
+        }
+      }
+    }
+  )
+
+  assert.equal(merged.rooms['id:room-1'].hosted, 'gateway-a')
+  assert.equal(merged.rooms['id:room-1'].hostedEpoch, 1)
+})
+
+test('a client-authored local projection cannot clear a cached hosted owner', () => {
+  const gc = load(() => '(pass)')
+  const hydrated = gc.mergeRemoteGroupChatSnapshotIntoRooms(
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          hosted: 'gateway-b',
+          hostedEpoch: 2,
+          revision: 4,
+          log: [{ id: 'stale', from: { kind: 'user', name: 'You' }, text: 'stale', at: 1 }]
+        }
+      }
+    },
+    {
+      Team: {
+        roomId: 'room-1',
+        hosted: null,
+        hostedEpoch: 3,
+        syncRevision: 5,
+        log: [{ id: 'local', from: { kind: 'user', name: 'You' }, text: 'local', at: 2 }]
+      }
+    },
+    { preserveRooms: ['Team'] }
+  )
+
+  assert.equal(hydrated.Team.hosted, 'gateway-b')
+  assert.equal(hydrated.Team.hostedEpoch, 2)
+})
+
+test('ordinary hydration cannot replace an existing owner from client projection', () => {
+  const gc = load(() => '(pass)')
+  const hydrated = gc.mergeRemoteGroupChatSnapshotIntoRooms(
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Team',
+          roomId: 'room-1',
+          hosted: 'gateway-b',
+          hostedEpoch: 2,
+          revision: 4,
+          log: [{ id: 'new-owner', from: { kind: 'user', name: 'You' }, text: 'new', at: 1 }]
+        }
+      }
+    },
+    {
+      Team: {
+        roomId: 'room-1',
+        hosted: 'gateway-a',
+        hostedEpoch: 1,
+        syncRevision: 99,
+        log: [{ id: 'stale-owner', from: { kind: 'user', name: 'You' }, text: 'stale', at: 2 }]
+      }
+    }
+  )
+
+  assert.equal(hydrated.Team.hosted, 'gateway-a')
+  assert.equal(hydrated.Team.hostedEpoch, 1)
+})
+
+test('a higher server epoch without transfer lineage cannot replace the cached owner', () => {
+  const gc = load(() => '(pass)')
+  const room = {
+    roomId: 'room-1',
+    hosted: 'gateway-a',
+    hostedEpoch: 1,
+    log: []
+  }
+
+  const updated = gc.applyHostedRoomAuthority(room, {
+    room_id: 'room-1',
+    authority_gateway_id: 'gateway-b',
+    authority_epoch: 2
+  })
+
+  assert.equal(updated.hosted, 'gateway-a')
+  assert.equal(updated.hostedEpoch, 1)
+})
+
+test('a server-issued transfer receipt replaces the cached owner', () => {
+  const gc = load(() => '(pass)')
+  const room = {
+    roomId: 'room-1',
+    hosted: 'gateway-a',
+    hostedEpoch: 1,
+    log: []
+  }
+
+  const updated = gc.applyHostedRoomAuthority(room, {
+    room_id: 'room-1',
+    authority_gateway_id: 'gateway-b',
+    authority_epoch: 2,
+    authority_claim: {
+      kind: 'authority.claimed',
+      actor: { kind: 'system', id: 'authority-control' },
+      authority_epoch: 2,
+      payload: {
+        previous_gateway_id: 'gateway-a',
+        authority_gateway_id: 'gateway-b',
+        authority_epoch: 2
+      }
+    }
+  })
+
+  assert.equal(updated.hosted, 'gateway-b')
+  assert.equal(updated.hostedEpoch, 2)
+})
+
+test('a receipted legacy adoption converges on the install authority once', () => {
+  const gc = load(() => '(pass)')
+  const room = {
+    roomId: 'room-1',
+    hosted: 'legacy',
+    hostedEpoch: 1,
+    log: []
+  }
+  const serverRoom = {
+    room_id: 'room-1',
+    authority_gateway_id: 'install:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    authority_epoch: 2,
+    authority_claim: {
+      kind: 'authority.claimed',
+      actor: { kind: 'system', id: 'authority-control' },
+      authority_epoch: 2,
+      payload: {
+        previous_gateway_id: 'legacy',
+        authority_gateway_id: 'install:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        authority_epoch: 2
+      }
+    }
+  }
+
+  const adopted = gc.applyHostedRoomAuthority(room, serverRoom)
+  const repeated = gc.applyHostedRoomAuthority(adopted, serverRoom)
+
+  assert.equal(adopted.hosted, 'install:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+  assert.equal(adopted.hostedEpoch, 2)
+  assert.deepEqual(repeated, adopted)
+})
+
+test('a hosted-room marker prevents a second local round driver', () => {
+  const gc = load(() => 'must not run')
+  gc.$groupChats.set({
+    Hosted: {
+      roomId: 'room-hosted',
+      hosted: 'gateway-a',
+      log: [],
+      watermarks: {},
+      sessions: {},
+      members: [{ name: 'research' }]
+    }
+  })
+
+  const sent = gc.sendToGroupChat('Hosted', [{ name: 'research', title: '' }], 'do the work')
+
+  assert.equal(sent, null)
+  assert.equal(gc.calls.length, 0, 'no member turn starts locally')
+  assert.equal(gc.$groupChats.get().Hosted.log.length, 0, 'the local mirror stays read-only')
+  assert.equal(gc.notifications.length, 1)
+  assert.equal(gc.notifications[0].kind, 'info')
+  assert.match(gc.notifications[0].message, /gateway-a/)
+  assert.match(gc.notifications[0].message, /isn't available in this build yet/)
+})
+
+test('late renderer callbacks cannot mutate a hosted room mirror', () => {
+  const gc = load(() => '(pass)')
+  gc.$groupChats.set({
+    Hosted: {
+      hosted: 'gateway-a',
+      log: [{ id: 'm1', seq: 1, from: { kind: 'user', name: 'You' }, text: 'hello', at: 1 }]
+    }
+  })
+
+  const appended = gc.appendGroupChatEntry(
+    'Hosted',
+    { kind: 'member', name: 'research' },
+    'late reply',
+    'legacy'
+  )
+
+  assert.equal(appended, null)
+  assert.equal(gc.$groupChats.get().Hosted.log.length, 1)
+})
+
+test('hosted projection preserves only valid monotonic sequence ids', () => {
+  const gc = load(() => '(pass)')
+  const snapshot = gc.groupChatSyncSnapshot({
+    Hosted: {
+      hosted: 'gateway-a',
+      log: [
+        { seq: 1, from: { kind: 'user', name: 'You' }, text: 'one', at: 30 },
+        { seq: '2', from: { kind: 'member', name: 'research' }, text: 'two', at: 20 },
+        { seq: 0, from: { kind: 'member', name: 'research' }, text: 'legacy', at: 10 }
+      ]
+    }
+  })
+
+  assert.equal(snapshot.rooms['name:Hosted'].log[0].seq, 1)
+  assert.equal(snapshot.rooms['name:Hosted'].log[1].seq, 2)
+  assert.equal(Object.prototype.hasOwnProperty.call(snapshot.rooms['name:Hosted'].log[2], 'seq'), false)
+})
+
+test('since-seq replay deduplicates repeated events and orders clock-skewed deltas by sequence', () => {
+  const gc = load(() => '(pass)')
+  const merged = gc.mergeGroupChatSyncSnapshots(
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Hosted',
+          roomId: 'room-1',
+          hosted: 'gateway-a',
+          revision: 5,
+          log: [
+            { seq: 2, id: 'remote-2', from: { kind: 'member', name: 'research' }, text: 'two', at: 1 }
+          ]
+        }
+      }
+    },
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Hosted',
+          roomId: 'room-1',
+          hosted: 'gateway-a',
+          revision: 5,
+          log: [
+            { seq: 1, id: 'local-1', from: { kind: 'user', name: 'You' }, text: 'one', at: 999 },
+            { seq: 2, id: 'local-copy-2', from: { kind: 'member', name: 'research' }, text: 'two', at: 998 }
+          ]
+        }
+      }
+    }
+  )
+
+  assert.equal(merged.rooms['id:room-1'].log.length, 2)
+  assert.equal(JSON.stringify(merged.rooms['id:room-1'].log.map(entry => entry.seq)), JSON.stringify([1, 2]))
+})
+
+test('hosted replay adds sequence to a same-id legacy entry without duplicating it', () => {
+  const gc = load(() => '(pass)')
+  const merged = gc.mergeGroupChatSyncSnapshots(
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Hosted',
+          roomId: 'room-1',
+          hosted: 'gateway-a',
+          revision: 5,
+          log: [
+            { seq: 4, id: 'stable-id', from: { kind: 'user', name: 'You' }, text: 'hello', at: 20 }
+          ]
+        }
+      }
+    },
+    {
+      version: 3,
+      rooms: {
+        'id:room-1': {
+          name: 'Hosted',
+          roomId: 'room-1',
+          hosted: 'gateway-a',
+          revision: 5,
+          log: [
+            { id: 'stable-id', from: { kind: 'user', name: 'You' }, text: 'hello', at: 10 }
+          ]
+        }
+      }
+    }
+  )
+
+  assert.equal(merged.rooms['id:room-1'].log.length, 1)
+  assert.equal(merged.rooms['id:room-1'].log[0].id, 'stable-id')
+  assert.equal(merged.rooms['id:room-1'].log[0].seq, 4)
 })
 
 test('empty runtime rooms are omitted from the gateway mirror', () => {
