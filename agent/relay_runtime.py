@@ -307,6 +307,16 @@ class RelayRuntime:
                 self._subagent_parent_handles.pop(session_id, None)
             return
         failures: list[str] = []
+        # Drain any turn still open on this session before popping the
+        # session scope itself -- the native Relay stack only pops in LIFO
+        # order, and a turn interrupted by shutdown never reaches its
+        # normal end_turn() call. Must run before session.closing is set
+        # below: end_turn()'s scope.pop does not pass allow_closing=True.
+        failures.extend(
+            SESSION_COORDINATOR.close_active_turns_for_session(
+                profile_key=self.profile_key, session_id=session_id
+            )
+        )
         with session.lock:
             if session.closing:
                 return
@@ -504,7 +514,7 @@ class RelaySessionCoordinator:
             Callable[[RelayRuntime, dict[str, Any]], None],
         ] = {}
         self._active_turns_lock = threading.RLock()
-        self._active_turns: dict[tuple[str, str], set[int]] = {}
+        self._active_turns: dict[tuple[str, str], dict[int, RelayTurnContext]] = {}
 
     def register_session_initializer(
         self,
@@ -613,7 +623,7 @@ class RelaySessionCoordinator:
                     lease.session_id,
                 )
             else:
-                self._active_turns[key] = {id(turn)}
+                self._active_turns[key] = {id(turn): turn}
                 turn._active_registered = True
         if (
             turn.relay_enabled
@@ -698,6 +708,29 @@ class RelaySessionCoordinator:
         with self._active_turns_lock:
             return bool(self._active_turns.get(key))
 
+    def close_active_turns_for_session(
+        self, *, profile_key: str, session_id: str
+    ) -> list[str]:
+        """End any turn still open on one session before its scope stack closes.
+
+        A session's Relay scope stack only pops in LIFO order. If shutdown
+        interrupts a turn mid-flight, RelayRuntime.close_session's attempt to
+        pop the session scope fails with "scope handle is not at the top of
+        the stack" because the turn scope above it was never popped. Draining
+        open turns here -- reusing the same best-effort, idempotent end_turn()
+        path a normal turn completion takes -- keeps that pop in order.
+        """
+        key = (profile_key, session_id)
+        with self._active_turns_lock:
+            turns = list(self._active_turns.get(key, {}).values())
+        failures: list[str] = []
+        for turn in turns:
+            try:
+                self.end_turn(turn, outcome="interrupted_shutdown")
+            except Exception as exc:
+                failures.append(f"turn {turn.turn_id} close failed: {exc}")
+        return failures
+
     def _unregister_active_turn(self, turn: RelayTurnContext) -> None:
         if not turn._active_registered:
             return
@@ -705,7 +738,7 @@ class RelaySessionCoordinator:
         with self._active_turns_lock:
             active = self._active_turns.get(key)
             if active is not None:
-                active.discard(id(turn))
+                active.pop(id(turn), None)
                 if not active:
                     self._active_turns.pop(key, None)
             turn._active_registered = False
