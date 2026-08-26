@@ -4203,6 +4203,36 @@ This compaction should PRIORITISE preserving all information related to the focu
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
+
+            # ── Bound the fallback summarizer's output to remaining context ──
+            # The main path intentionally sends NO max_tokens (see the "NO
+            # max_tokens" comment above): a hard adapter cap truncated thinking
+            # models mid-reasoning and caused compaction loops.  But when the
+            # summarizer FALLS BACK to the main model (no dedicated aux
+            # provider, or provider==custom), an unset cap lets it request the
+            # model's full native output ceiling (~65K) even when the context
+            # is already near-full, which can overrun the window mid-summary.
+            # Reconcile both: derive a ceiling from REMAINING context above a
+            # sane floor, so we never truncate a reasonable summary (the floor
+            # guarantees a usable budget) yet never request more output than the
+            # context can physically hold.  This is prompt-level / request-level
+            # bounding, distinct from the adapter-cap truncation the comment
+            # above warns against (a fixed default forwarded by the wire).
+            _fallback_to_main = not self.summary_model or getattr(
+                self, "provider", ""
+            ) == "custom"
+            if _fallback_to_main and self.max_tokens is not None:
+                try:
+                    _input_tokens = call_kwargs.get("messages", [{}])
+                    _in_est = sum(
+                        len(str(m.get("content", ""))) // 4 for m in _input_tokens
+                    )
+                    _remaining = max(0, (self.context_length or 0) - _in_est)
+                except Exception:
+                    _remaining = 0
+                _FLOOR = 2048  # never truncate below this many output tokens
+                _ceiling = max(_FLOOR, min(self.max_tokens, _remaining))
+                call_kwargs["max_tokens"] = _ceiling
             _aux_provider = ""
             _aux_model = self.summary_model or ""
             _aux_context = None
@@ -4245,10 +4275,51 @@ This compaction should PRIORITISE preserving all information related to the focu
             # OpenAI-compatible proxies / local backends return a dict- or
             # str-shaped message; coerce defensively instead of crashing.
             message = response.choices[0].message
-            if isinstance(message, dict):
-                content = message.get("content")
-            else:
-                content = getattr(message, "content", message)
+            # Normalize through one helper so dict- and object-shaped messages
+            # behave identically: both skip empty/whitespace content and, when
+            # the primary ``content`` is unusable, fall back to
+            # ``reasoning_content`` (Qwen thinking models / DeepSeek R1 return
+            # their output there) rather than hitting the empty-content
+            # RuntimeError and setting a compression-failure cooldown (#15892).
+            def _extract_content(msg) -> str:
+                if isinstance(msg, dict):
+                    content = msg.get("content")
+                    rc = msg.get("reasoning_content")
+                else:
+                    content = getattr(msg, "content", msg)
+                    rc = getattr(msg, "reasoning_content", None)
+                if (
+                    not content
+                    or not isinstance(content, str)
+                    or not content.strip()
+                ):
+                    # Primary content unusable — fall back to the reasoning
+                    # trace if it is real text, but BOUND it: a raw
+                    # chain-of-thought can be far longer and unbounded than the
+                    # intended final answer, so an un-capped fallback could
+                    # balloon the compressed prefix (defeating compression) and
+                    # inject raw reasoning traces into the structured handoff.
+                    # Truncate the trace and log a warning so a verbose thinking
+                    # backend can't silently blow up the buffer (#95231 review).
+                    if rc and isinstance(rc, str) and rc.strip():
+                        _REASONING_CAP_CHARS = 8000  # ~2K tokens of trace max
+                        _FALLBACK_LEN = len(rc)
+                        if _FALLBACK_LEN > _REASONING_CAP_CHARS:
+                            logger.warning(
+                                "summarizer fell back to reasoning_content (%d "
+                                "chars); truncating to %d for the compaction "
+                                "summary",
+                                _FALLBACK_LEN,
+                                _REASONING_CAP_CHARS,
+                            )
+                            content = rc[:_REASONING_CAP_CHARS]
+                        else:
+                            content = rc
+                    else:
+                        content = ""
+                return content
+
+            content = _extract_content(message)
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""
