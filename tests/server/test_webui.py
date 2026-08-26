@@ -22,6 +22,20 @@ from server.db import json_dump, new_id, now
 # See tests/server/test_api_mvp.py: outbound email requires a signed opt-out link.
 TEST_CREDENTIAL_KEY = "KJ9KmdJiLL6itiwlEGTvGQ4ptS4dnd1ZZPyRPTwmjs4="
 
+# One real field per onboarding step, for tests that exercise step *mechanics*
+# and do not care about the content. Sections reject fields they do not define
+# (schemas.SECTION_FIELDS), so there is no generic filler key.
+STEP_MINIMAL_PATCH = {
+    "company-identity": {"company_name": "Setup Boundary Co"},
+    "positioning": {"what_company_sells": "Kitchen appliances"},
+    "products": {"catalog_confirmed": True},
+    "internal-sales-data": {"sources_reviewed": True},
+    "current-contacts": {"contact_list_added": True},
+    "target-markets": {"target_markets": ["DE"]},
+    "integrations": {"connected": True},
+    "brain-review": {"reviewed": True},
+}
+
 
 def make_client(chat_agent_factory=None, **overrides):
     root = Path(tempfile.mkdtemp(prefix="interfaze-webui-test-"))
@@ -420,7 +434,7 @@ def test_phase4_onboarding_completion_uses_only_the_five_required_steps():
         response = client.patch(
             f"/api/v1/onboarding/{step}",
             headers=headers,
-            json={"data": {"confirmed": True}},
+            json={"data": STEP_MINIMAL_PATCH[step]},
         )
         assert response.status_code == 200, response.text
 
@@ -815,7 +829,7 @@ def test_phase4_promoted_routes_and_exports_are_tenant_safe():
     for step in ("current-contacts", "integrations", "brain-review"):
         response = client.patch(
             f"/api/v1/onboarding/{step}", headers=headers,
-            json={"data": {"confirmed": True}},
+            json={"data": STEP_MINIMAL_PATCH[step]},
         )
         assert response.status_code == 200, response.text
         assert step in response.json()["completed_steps"]

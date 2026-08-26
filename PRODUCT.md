@@ -222,6 +222,37 @@ User marks status in interfaze-agent
 
 The onboarding must define the company deeply, not just collect basic profile info.
 
+**Where these fields land, and what enforces them.** Onboarding writes company
+sections through one function, `_put_section` in `server/routes/company.py`, and
+`schemas.SECTION_FIELDS` decides which keys each section accepts. A field this
+document names but the section does not define is a 422 with the offending key
+named — not a silent write. That matters more here than it looks: every section
+is handed to the model wholesale by `AgentRunService.company_context`, so an
+unvalidated typo does not disappear, it becomes context.
+
+The four subsections below are not all the same kind of thing:
+
+```text
+6.1 Company identity   -> section 'profile'      keys, validated
+6.2 Company positioning-> section 'positioning'  keys, validated
+6.3 Product data       -> products.data          per-product, open by design
+6.4 Internal sales data-> uploaded documents     DOCUMENT_TYPES in knowledge.py
+6.5 Current contact data-> uploaded documents    DOCUMENT_TYPES in knowledge.py
+```
+
+§6.1 and §6.2 are field lists, and `tests/server/test_onboarding_contract.py`
+asserts that every name printed below is accepted by its section — edit one side
+and the other fails. §6.3 stays open because a product catalog carries columns
+nobody enumerated in advance (`product_import._parse_row` keeps them as
+`extra`), and rejecting them would reject valid imports. §6.4 and §6.5 are
+upload categories rather than fields: the customer supplies them as documents,
+and `DOCUMENT_TYPES` is the list that actually gates them. It does not yet cover
+every category named here — `active_deals`, `previous_outreach`,
+`country_revenue_breakdown`, `customer_segments`, `average_order_value`,
+`sales_cycle_length`, `repeat_customers`, `customer_objections`,
+`support_questions`, `email_examples`, and the four `*_contact_list` variants
+land under `other` until each earns its own processing behaviour.
+
 ## 6.1 Company identity
 
 ```text

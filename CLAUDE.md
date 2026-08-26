@@ -84,6 +84,7 @@ the point, so fix both rather than editing the assertion.
 |---|---|---|
 | `PRODUCT.md` §7 (API routes) | the live OpenAPI schema | `tests/server/test_api_mvp.py` |
 | `PRODUCT.md` §8.2 (frontend routes) | `server/webui/js/main.js` | `tests/server/test_webui.py` |
+| `PRODUCT.md` §6.1–6.2 (onboarding fields) | `schemas.SECTION_FIELDS` | `tests/server/test_onboarding_contract.py` |
 | `skills/sales/*/SKILL.md` | the run contract in `server/run_types.py` and `OUTPUT_KEYS` | `tests/server/`, `tests/sales_skills/` |
 
 `skills/sales/*/SKILL.md` is behaviour, not documentation. Changing what a run

@@ -9,7 +9,7 @@ from ..db import Database, json_dump, json_load, now
 from ..lead_research.models import CompanyResearchProfile
 from ..lead_research.profiles import ProfileRepository
 from ..quality import validate_outreach_text
-from ..schemas import DataPatch
+from ..schemas import DataPatch, unknown_section_fields
 
 
 router = APIRouter(prefix="/company", tags=["company"])
@@ -28,6 +28,14 @@ def _get_section(db: Database, company_id: str, section: str) -> dict:
 
 
 def _put_section(db: Database, company_id: str, section: str, patch: dict) -> dict:
+    # The single gate on the §6 contract: every onboarding step and every
+    # company section writes through here. See schemas.SECTION_FIELDS.
+    unknown = unknown_section_fields(section, patch)
+    if unknown:
+        raise HTTPException(422, {
+            "code": "unknown_section_fields", "section": section, "fields": unknown,
+            "message": f"{section} does not define these fields: {', '.join(unknown)}",
+        })
     current = _get_section(db, company_id, section)["data"]
     merged = {**current, **patch}
     db.execute(

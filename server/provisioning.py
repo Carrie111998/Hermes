@@ -6,6 +6,7 @@ from typing import Any
 from .auth import hash_password
 from .db import json_dump, new_id, now
 from .routes.onboarding import REQUIRED_STEPS
+from .schemas import unknown_section_fields
 
 
 OPERATIONAL_TABLES = (
@@ -42,6 +43,11 @@ def provision_demo_account(
         raise ValueError("email is required")
     if not isinstance(company_profile, dict) or not company_profile.get("name"):
         raise ValueError("company_profile must include a name")
+    # Same §6.1 contract the API enforces. An operator hands this in as a JSON
+    # file, where a misspelled field would otherwise be written and ignored.
+    unknown = unknown_section_fields("profile", company_profile)
+    if unknown:
+        raise ValueError(f"company_profile has unknown fields: {', '.join(unknown)}")
     if not isinstance(onboarding_sources, list):
         raise ValueError("onboarding_sources must be a list")
 
