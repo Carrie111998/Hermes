@@ -20,8 +20,9 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
 import { copyFilePath, revealFile } from '@/store/file-actions'
-import { revealFileInTree } from '@/store/layout'
+import { $rightRailActiveTabId, revealFileInTree } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $previewTabs, openBrowserTab } from '@/store/preview'
 import { $projectTree, projectNameForCwd } from '@/store/projects'
 import {
   $activeSessionId,
@@ -96,6 +97,9 @@ export function useStatusbarItems({
   const terminalShowing = useStore($paneVisible('terminal'))
   const sessionsShowing = useStore($paneVisible('sessions'))
   const botsShowing = useStore($paneVisible('hermes-bots:pane'))
+  const previewTabs = useStore($previewTabs)
+  const rightRailActiveTabId = useStore($rightRailActiveTabId)
+  const browserShowing = previewTabs.some(tab => tab.id === rightRailActiveTabId && tab.target.kind === 'url')
   const primaryBusy = useStore($busy)
   // Draft / primary composer atom — used only while the focused surface is the
   // primary (or a draft with no runtime slice yet). A focused TILE keeps its
@@ -571,6 +575,17 @@ export function useStatusbarItems({
         toggleLabel: copy.toggleApprovalMode
       },
       {
+        actionId: 'view.showBrowser',
+        className: `w-7 justify-center px-0${browserShowing ? ' bg-accent/55 text-foreground' : ''}`,
+        hidden: !chatOpen,
+        icon: <Globe className="size-3.5" />,
+        id: 'browser',
+        onSelect: () => openBrowserTab(),
+        title: browserShowing ? copy.hideBrowser : copy.showBrowser,
+        toggleLabel: copy.toggleBrowser,
+        variant: 'action'
+      },
+      {
         actionId: 'view.showTerminal',
         className: `w-7 justify-center px-0${terminalShowing ? ' bg-accent/55 text-foreground' : ''}`,
         hidden: !chatOpen,
@@ -598,6 +613,7 @@ export function useStatusbarItems({
       gaugeUsage,
       sessionStartedAt,
       gatewayState,
+      browserShowing,
       terminalShowing,
       turnStartedAt
     ]

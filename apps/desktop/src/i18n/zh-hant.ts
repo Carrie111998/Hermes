@@ -2438,6 +2438,8 @@ export const zhHant = defineLocale({
       openCommandCenter: '開啟命令中心',
       showTerminal: '顯示終端機',
       hideTerminal: '隱藏終端機',
+      showBrowser: '開啟瀏覽器',
+      hideBrowser: '開啟瀏覽器',
       gateway: '閘道',
       gatewayReady: '就緒',
       gatewayNeedsSetup: '需要設定',

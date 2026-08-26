@@ -64,6 +64,14 @@ describe('statusbar item visibility', () => {
     expect(screen.getByText('Gateway')).toBeTruthy()
   })
 
+  it('shows the browser chip by default while the terminal stays hidden', () => {
+    bar([item('browser', 'Browser'), item('terminal', 'Terminal'), item('gateway-health', 'Gateway')])
+
+    expect(screen.getByText('Browser')).toBeTruthy()
+    expect(screen.queryByText('Terminal')).toBeNull()
+    expect(STATUSBAR_HIDDEN_BY_DEFAULT).not.toContain('browser')
+  })
+
   it('shows an item once the user enables it from the bar context menu', async () => {
     const statusbar = bar([item('cron', 'Cron'), item('gateway-health', 'Gateway')])
 
