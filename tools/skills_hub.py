@@ -679,6 +679,19 @@ class GitHubSource(SkillSource):
                 if item is None:
                     logger.warning("Referenced skill support file is missing: %s", item_path)
                     return None
+                if item.get("type") == "tree":
+                    # A directory-shaped Markdown link (``[recipes](refs/)``)
+                    # is an index pointer, not a "bundle this exact path"
+                    # instruction — its contents are bundled only when linked
+                    # individually. Skipping must not abort the whole fetch
+                    # (#95637), where one such link made every install of the
+                    # skill die with the generic "Could not fetch from any
+                    # source".
+                    logger.debug(
+                        "Skipping directory-shaped reference in skill bundle: %s",
+                        item_path,
+                    )
+                    continue
                 if item.get("type") != "blob" or item.get("mode") == "120000":
                     logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
                     return None

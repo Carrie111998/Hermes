@@ -1804,3 +1804,51 @@ class TestLoadHermesIndex:
 
         data = hub._load_hermes_index()
         assert data == {"skills": [{"name": "stale"}]}
+
+
+class TestFetchDirectoryShapedReferences:
+    """A directory-shaped Markdown link must not abort the whole install (#95637)."""
+
+    @staticmethod
+    def _make_source(tree_entries, contents):
+        src = GitHubSource(GitHubAuth())
+        src._get_repo_tree = lambda repo: ("main", tree_entries)
+        src._fetch_file_bytes = lambda repo, path: contents.get(path)
+        return src
+
+    @classmethod
+    def _skill_md(cls, body="See [recipes](references/recipes.md) and [index](references/style-recipes/)."):
+        return f"---\nname: demo\ndescription: demo skill\n---\n\n{body}\n"
+
+    def test_directory_reference_is_skipped_not_fatal(self):
+        skill_path = "skills/demo/SKILL.md"
+        src = self._make_source(
+            [
+                {"type": "blob", "path": "skills/demo/references/recipes.md", "mode": "100644"},
+                {"type": "tree", "path": "skills/demo/references/style-recipes", "mode": "040000"},
+            ],
+            {
+                skill_path: self._skill_md(),
+                "skills/demo/references/recipes.md": b"recipe content",
+            },
+        )
+        src._fetch_file_content = lambda repo, path: self._skill_md() if path == skill_path else None
+
+        bundle = src.fetch("owner/repo/skills/demo")
+
+        assert bundle is not None
+        assert bundle.files["references/recipes.md"] == b"recipe content"
+        # The directory pointer itself contributes no bundled entry.
+        assert "references/style-recipes" not in bundle.files
+
+    def test_symlink_reference_still_rejected(self):
+        skill_path = "skills/demo/SKILL.md"
+        src = self._make_source(
+            [
+                {"type": "blob", "path": "skills/demo/references/recipes.md", "mode": "120000"},
+            ],
+            {skill_path: self._skill_md()},
+        )
+        src._fetch_file_content = lambda repo, path: self._skill_md() if path == skill_path else None
+
+        assert src.fetch("owner/repo/skills/demo") is None
