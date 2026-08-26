@@ -3400,6 +3400,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "subtitle_overlay":
+        def _execute(next_args: dict) -> Any:
+            from tools.subtitle_overlay_tool import subtitle_overlay_tool as _subtitle_overlay_tool
+            return _finish_agent_tool(
+                _subtitle_overlay_tool(
+                    action=next_args.get("action", "status"),
+                    language=next_args.get("language"),
+                    target=next_args.get("target"),
+                    band_fraction=next_args.get("band_fraction"),
+                    callback=getattr(agent, "subtitle_overlay_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "tour":
         def _execute(next_args: dict) -> Any:
             from tools.tour_tool import tour_tool as _tour_tool

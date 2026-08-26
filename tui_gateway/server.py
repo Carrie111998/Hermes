@@ -4102,6 +4102,7 @@ def _block(
         "mcp.setup.request",
         "tour.request",
         "screen.annotate.request",
+        "subtitles.control.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -4344,6 +4345,52 @@ def _annotate_screen_request(sid: str, payload: dict) -> str:
         probe_timeout=_ANNOTATE_SCREEN_PROBE_TIMEOUT_S,
         retry_error=_ANNOTATE_SCREEN_BRIDGE_SLOW,
         dead_error=_ANNOTATE_SCREEN_BRIDGE_UNAVAILABLE,
+    )
+
+
+# A subtitle control action is one native round-trip: resolve the target
+# window and spawn/stop the hidden capture worker. The capture loop itself
+# never crosses this bridge — only start/stop/status do.
+_SUBTITLES_CONTROL_TIMEOUT_S = 20
+_SUBTITLES_CONTROL_PROBE_TIMEOUT_S = 10
+
+_SUBTITLES_BRIDGE_SLOW = json.dumps(
+    {
+        "success": False,
+        "error": (
+            f"No Hermes Desktop window answered the subtitle request within "
+            f"{_SUBTITLES_CONTROL_PROBE_TIMEOUT_S}s, which can happen on a "
+            "busy machine. If the desktop app is running, try this call once "
+            "more."
+        ),
+    }
+)
+
+_SUBTITLES_BRIDGE_UNAVAILABLE = json.dumps(
+    {
+        "success": False,
+        "error": (
+            "No Hermes Desktop window answered the subtitle request, twice. "
+            "Live subtitles are run by the desktop app, which updates "
+            "separately from this backend, so an app build older than the "
+            "subtitle_overlay tool has nothing listening. Update the Hermes "
+            "Desktop app and start a new session. Do not retry "
+            "subtitle_overlay in this session."
+        ),
+    }
+)
+
+
+def _subtitles_control_request(sid: str, payload: dict) -> str:
+    return _probed_bridge_request(
+        sid,
+        payload,
+        method="subtitles.control.request",
+        state_key="subtitles_bridge",
+        timeout=_SUBTITLES_CONTROL_TIMEOUT_S,
+        probe_timeout=_SUBTITLES_CONTROL_PROBE_TIMEOUT_S,
+        retry_error=_SUBTITLES_BRIDGE_SLOW,
+        dead_error=_SUBTITLES_BRIDGE_UNAVAILABLE,
     )
 
 
@@ -7114,6 +7161,14 @@ def _agent_cbs(sid: str) -> dict:
         # transparent click-through overlay, then answers
         # screen.annotate.respond with the outcome.
         "annotate_screen_callback": lambda payload: _annotate_screen_request(
+            sid, payload
+        ),
+        # subtitle_overlay tool (desktop GUI): start/stop/status of the live
+        # subtitle session. The renderer forwards to its main process, which
+        # owns the capture worker and the overlay, and answers
+        # subtitles.control.respond with the outcome. Only control crosses
+        # this bridge — the per-line capture loop never touches the agent.
+        "subtitle_overlay_callback": lambda payload: _subtitles_control_request(
             sid, payload
         ),
     }
