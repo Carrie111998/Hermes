@@ -72,6 +72,86 @@ def fake_tool(monkeypatch):
 
 
 
+def test_feishu_card_file_is_passed_as_structured_card(fake_tool, tmp_path):
+    card_file = tmp_path / "card.json"
+    card = {"schema": "2.0", "body": {"elements": []}}
+    card_file.write_text(json.dumps(card), encoding="utf-8")
+
+    args = _parse(["--to", "feishu:oc_chat", "--card-file", str(card_file)])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{"action": "send", "target": "feishu:oc_chat", "card": card}]
+
+
+def test_feishu_card_patch_requires_no_text_fallback(fake_tool, tmp_path):
+    card_file = tmp_path / "card.json"
+    card = {"schema": "2.0", "body": {"elements": []}}
+    card_file.write_text(json.dumps(card), encoding="utf-8")
+
+    args = _parse([
+        "--to", "feishu", "--card-file", str(card_file),
+        "--patch-message-id", "om_existing",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "send",
+        "target": "feishu",
+        "card": card,
+        "patch_message_id": "om_existing",
+    }]
+
+
+def test_invalid_feishu_card_file_is_usage_error(fake_tool, capsys, tmp_path):
+    card_file = tmp_path / "bad.json"
+    card_file.write_text("{broken", encoding="utf-8")
+
+    args = _parse(["--to", "feishu", "--card-file", str(card_file)])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "raw_card, expected_error",
+    [
+        ("[]", "must be a JSON object"),
+        ('{"schema":"1.0"}', "must declare schema='2.0'"),
+    ],
+)
+def test_invalid_card_shape_is_usage_error_before_tool(fake_tool, capsys, tmp_path, raw_card, expected_error):
+    card_file = tmp_path / "bad-card.json"
+    card_file.write_text(raw_card, encoding="utf-8")
+
+    args = _parse(["--to", "feishu", "--card-file", str(card_file)])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+    assert expected_error in capsys.readouterr().err
+
+
+def test_card_file_is_mutually_exclusive_with_text(fake_tool, capsys, tmp_path):
+    card_file = tmp_path / "card.json"
+    card_file.write_text('{"schema":"2.0"}', encoding="utf-8")
+
+    args = _parse(["--to", "feishu", "--card-file", str(card_file), "text"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Error paths
 # ---------------------------------------------------------------------------
@@ -174,6 +254,19 @@ def test_list_json_includes_configured_platform(monkeypatch, capsys):
     assert payload["platforms"]["simplex"] == []
     assert "local" not in payload["platforms"]  # infra pseudo-platform skipped
     assert payload["platforms"]["telegram"]  # discovered entries preserved
+
+
+def test_card_capabilities_is_offline_json(capsys):
+    args = _parse(["--card-capabilities", "--json"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["platform"] == "feishu"
+    assert payload["contract"] == "mvp1"
+    assert set(payload["capabilities"]) >= {
+        "send_card", "patch_card", "card_action_envelope"
+    }
 
 
 # ---------------------------------------------------------------------------

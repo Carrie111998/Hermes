@@ -52,6 +52,7 @@ import collections
 import concurrent.futures
 import hashlib
 import hmac
+import inspect
 import itertools
 import json
 import logging
@@ -61,6 +62,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -95,6 +97,8 @@ CreateImageRequest = None  # type: ignore[assignment]
 CreateImageRequestBody = None  # type: ignore[assignment]
 CreateMessageRequest = None  # type: ignore[assignment]
 CreateMessageRequestBody = None  # type: ignore[assignment]
+PatchMessageRequest = None  # type: ignore[assignment]
+PatchMessageRequestBody = None  # type: ignore[assignment]
 GetChatRequest = None  # type: ignore[assignment]
 GetMessageRequest = None  # type: ignore[assignment]
 GetMessageResourceRequest = None  # type: ignore[assignment]
@@ -109,6 +113,7 @@ FEISHU_DOMAIN = None  # type: ignore[assignment]
 LARK_DOMAIN = None  # type: ignore[assignment]
 BaseRequest = None  # type: ignore[assignment]
 CallBackCard = None  # type: ignore[assignment]
+CallBackToast = None  # type: ignore[assignment]
 P2CardActionTriggerResponse = None  # type: ignore[assignment]
 EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
@@ -242,6 +247,28 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+_FEISHU_CARD_MAX_CALLBACK_VALUE_BYTES = 64 * 1024
+_FEISHU_CARD_MAX_CALLBACK_TEXT_LENGTH = 4096
+_FEISHU_CARD_ACTION_DEDUP_CACHE_SIZE = 2048
+_FEISHU_CARD_HANDLER_MAX_WORKERS = 4
+_FEISHU_CARD_HANDLER_TIMEOUT_SECONDS = 2.5
+_FEISHU_CARD_NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*$")
+
+FEISHU_CARD_CONTRACT_VERSION = "mvp1"
+FEISHU_CARD_CAPABILITIES = frozenset({
+    "send_card",
+    "patch_card",
+    "card_action_envelope",
+})
+
+# Card handlers are plugin code. Keep both execution threads and in-flight
+# submissions bounded; timed-out running handlers retain their permit until
+# they actually return.
+_FEISHU_CARD_HANDLER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_FEISHU_CARD_HANDLER_MAX_WORKERS,
+    thread_name_prefix="hermes-feishu-card",
+)
+_FEISHU_CARD_HANDLER_IN_FLIGHT = threading.BoundedSemaphore(_FEISHU_CARD_HANDLER_MAX_WORKERS)
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -399,6 +426,115 @@ class FeishuNormalizedMessage:
     mentions: List[FeishuMentionRef] = field(default_factory=list)
     relation_kind: str = "plain"
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class FeishuCardValidationError(ValueError):
+    """Raised when a raw Feishu JSON 2.0 card violates the contract."""
+
+
+def validate_feishu_card(card: Any) -> Dict[str, Any]:
+    """Validate and return a raw JSON 2.0 card without changing its shape."""
+    if not isinstance(card, dict):
+        raise FeishuCardValidationError("Feishu card must be a JSON object")
+    if card.get("schema") != "2.0":
+        raise FeishuCardValidationError("Feishu card must declare schema='2.0'")
+    try:
+        json.dumps(card, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise FeishuCardValidationError("Feishu card must contain JSON values") from exc
+    return card
+
+
+def parse_feishu_card_json(raw: str) -> Dict[str, Any]:
+    """Parse and strictly validate a JSON 2.0 card from text."""
+    try:
+        card = json.loads(raw)
+    except (TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise FeishuCardValidationError("Feishu card file is not valid JSON") from exc
+    return validate_feishu_card(card)
+
+
+@dataclass(frozen=True)
+class FeishuCardHandlerResult:
+    """Immediate card-handler result with optional card and background work.
+
+    ``card`` is a complete JSON 2.0 card.  When present, the callback
+    response replaces the original interactive card in place; it is never a
+    partial patch or a text fallback.
+    """
+
+    status: str
+    message: str
+    background: Any = None
+    card: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class FeishuCardActionEnvelope:
+    """Bounded, LLM-free contract passed to a registered card handler."""
+
+    event_id: str
+    event_token: str
+    operator: Dict[str, str]
+    context: Dict[str, str]
+    action_tag: str
+    action_name: str
+    action_value: Dict[str, Any]
+    form_value: Dict[str, Any]
+    input_value: Optional[str]
+
+    @property
+    def token(self) -> str:
+        return self.event_token
+
+    @property
+    def chat_id(self) -> str:
+        return self.context.get("open_chat_id", "")
+
+    @property
+    def message_id(self) -> str:
+        return self.context.get("open_message_id", "")
+
+    @property
+    def namespace(self) -> str:
+        return str(self.action_value.get("namespace", "") or "")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "event_token": self.event_token,
+            "operator": dict(self.operator),
+            "context": dict(self.context),
+            "action_tag": self.action_tag,
+            "action_name": self.action_name,
+            "action_value": dict(self.action_value),
+            "form_value": dict(self.form_value),
+            "input_value": self.input_value,
+        }
+
+
+@dataclass(frozen=True)
+class _FeishuCardActionDispatch:
+    envelope: FeishuCardActionEnvelope
+    callback: Any
+    plugin_name: str
+    dedup_key: str
+    dedup_reservation: object
+
+
+class _FeishuCardHandlerPermit:
+    """One idempotent permit for a submitted card handler future."""
+
+    def __init__(self) -> None:
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self, _future: Any = None) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        _FEISHU_CARD_HANDLER_IN_FLIGHT.release()
 
 
 @dataclass(frozen=True)
@@ -1401,6 +1537,7 @@ def _load_lark_oapi() -> bool:
                 CreateImageRequest, CreateImageRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+                PatchMessageRequest, PatchMessageRequestBody,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
                 UpdateMessageRequest, UpdateMessageRequestBody,
@@ -1409,7 +1546,7 @@ def _load_lark_oapi() -> bool:
             from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
             from lark_oapi.core.model import BaseRequest
             from lark_oapi.event.callback.model.p2_card_action_trigger import (
-                CallBackCard, P2CardActionTriggerResponse,
+                CallBackCard, CallBackToast, P2CardActionTriggerResponse,
             )
             from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
             from lark_oapi.ws import Client as FeishuWSClient
@@ -1425,6 +1562,8 @@ def _load_lark_oapi() -> bool:
             "CreateImageRequestBody": CreateImageRequestBody,
             "CreateMessageRequest": CreateMessageRequest,
             "CreateMessageRequestBody": CreateMessageRequestBody,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
@@ -1439,6 +1578,7 @@ def _load_lark_oapi() -> bool:
             "LARK_DOMAIN": LARK_DOMAIN,
             "BaseRequest": BaseRequest,
             "CallBackCard": CallBackCard,
+            "CallBackToast": CallBackToast,
             "P2CardActionTriggerResponse": P2CardActionTriggerResponse,
             "EventDispatcherHandler": EventDispatcherHandler,
             "FeishuWSClient": FeishuWSClient,
@@ -1529,7 +1669,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
-        self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+        self._card_action_tokens: Dict[str, tuple[float, object]] = {}  # token → (first_seen_time, reservation)
+        self._card_action_tokens_lock = threading.Lock()
         # Inbound events that arrived before the adapter loop was ready
         # (e.g. during startup/restart or network-flap reconnect). A single
         # drainer thread replays them as soon as the loop becomes available.
@@ -2010,6 +2151,79 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_card(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send one raw Feishu JSON 2.0 interactive card without text fallback."""
+        try:
+            validate_feishu_card(card)
+            payload = json.dumps(card, ensure_ascii=False, allow_nan=False)
+        except FeishuCardValidationError as exc:
+            return SendResult(success=False, error=str(exc))
+        except (TypeError, ValueError):
+            return SendResult(success=False, error="Feishu card must contain JSON values")
+
+        if not str(chat_id or "").strip():
+            return SendResult(success=False, error="Feishu card send requires chat_id")
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "card send failed")
+        except Exception as exc:
+            logger.error("[Feishu] Card send failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def patch_card(self, message_id: str, card: Dict[str, Any]) -> SendResult:
+        """Replace an existing message's raw JSON 2.0 content via PATCH only."""
+        try:
+            validate_feishu_card(card)
+            payload = json.dumps(card, ensure_ascii=False, allow_nan=False)
+        except FeishuCardValidationError as exc:
+            return SendResult(success=False, error=str(exc))
+        except (TypeError, ValueError):
+            return SendResult(success=False, error="Feishu card must contain JSON values")
+
+        normalized_message_id = str(message_id or "").strip()
+        if not normalized_message_id:
+            return SendResult(success=False, error="Feishu card patch requires message_id")
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            request_body = self._build_patch_message_body(content=payload)
+            request = self._build_patch_message_request(
+                message_id=normalized_message_id,
+                request_body=request_body,
+            )
+            response = await self._feishu_patch_with_retry(
+                message_id=normalized_message_id,
+                request=request,
+            )
+            result = self._finalize_send_result(response, "card patch failed")
+            if result.success:
+                result.message_id = normalized_message_id
+            return result
+        except Exception as exc:
+            logger.error(
+                "[Feishu] Card patch failed for message %s: %s",
+                normalized_message_id,
+                exc,
+                exc_info=True,
+            )
             return SendResult(success=False, error=str(exc))
 
     async def edit_message(
@@ -2719,7 +2933,8 @@ class FeishuAdapter(BasePlatformAdapter):
         inline (the only reliable way to sync all clients), and schedules a
         lightweight async method to actually unblock the agent.
 
-        For other card actions: delegates to ``_handle_card_action_event``.
+        For other card actions: invokes the bounded synchronous handler
+        contract and returns its real status/message as a Toast.
         """
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
@@ -2728,8 +2943,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
-        action_value = getattr(action, "value", {}) or {}
-        hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+        try:
+            action_value = self._bounded_callback_mapping(
+                getattr(action, "value", {}) or {},
+                field_name="action.value",
+            )
+        except ValueError:
+            action_value = {}
+        hermes_action = action_value.get("hermes_action")
         update_prompt_action = (
             action_value.get("hermes_update_prompt_action")
             if isinstance(action_value, dict) else None
@@ -2744,18 +2965,39 @@ class FeishuAdapter(BasePlatformAdapter):
                 loop=loop,
             )
 
-        self._submit_on_loop(loop, self._handle_card_action_event(data))
-        if P2CardActionTriggerResponse is None:
-            return None
-        return P2CardActionTriggerResponse()
+        dispatch, reason = self._prepare_card_action_dispatch(data)
+        if dispatch is None:
+            result = self._card_action_result_for_reason(reason)
+        else:
+            # The immediate handler call is deliberately synchronous: Feishu
+            # needs the real status/message in this callback response. Slow
+            # work must be returned separately through
+            # ``FeishuCardHandlerResult.background``.
+            result = self._invoke_feishu_card_handler_sync(dispatch, loop=loop)
+        toast_type = {
+            "accepted": "success",
+            "ignored": "info",
+            "error": "error",
+        }.get(result["status"], "error")
+        return self._new_card_callback_response(
+            toast_type=toast_type,
+            toast_content=result["message"],
+            card=result.get("card"),
+        )
 
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:
         """Return True when the adapter loop can accept thread-safe submissions."""
         return loop is not None and not bool(getattr(loop, "is_closed", lambda: False)())
 
-    def _submit_on_loop(self, loop: Any, coro: Any) -> bool:
-        """Schedule background work on the adapter loop with shared failure logging."""
+    def _submit_on_loop(
+        self,
+        loop: Any,
+        coro: Any,
+        *,
+        redact_failure: bool = False,
+    ) -> bool:
+        """Schedule background work on the adapter loop with bounded logging."""
         from agent.async_utils import safe_schedule_threadsafe
         future = safe_schedule_threadsafe(
             coro, loop,
@@ -2765,7 +3007,8 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         if future is None:
             return False
-        future.add_done_callback(self._log_background_failure)
+        callback = self._log_card_background_failure if redact_failure else self._log_background_failure
+        future.add_done_callback(callback)
         return True
 
     def _is_interactive_operator_authorized(self, open_id: str) -> bool:
@@ -2777,6 +3020,382 @@ class FeishuAdapter(BasePlatformAdapter):
         if not allowed_ids:
             return True
         return "*" in allowed_ids or normalized in allowed_ids
+
+    @staticmethod
+    def _callback_field(value: Any, name: str, default: Any = "") -> Any:
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    @staticmethod
+    def _bounded_callback_text(value: Any, *, field_name: str) -> str:
+        text = str(value or "")
+        if len(text) > _FEISHU_CARD_MAX_CALLBACK_TEXT_LENGTH:
+            raise ValueError(f"card callback {field_name} is too large")
+        return text
+
+    @classmethod
+    def _bounded_callback_mapping(cls, value: Any, *, field_name: str) -> Dict[str, Any]:
+        if value is None:
+            return {}
+
+        def to_plain(item: Any) -> Any:
+            if isinstance(item, dict):
+                return {str(key): to_plain(child) for key, child in item.items()}
+            if isinstance(item, list):
+                return [to_plain(child) for child in item]
+            if hasattr(item, "__dict__"):
+                return {
+                    str(key): to_plain(child)
+                    for key, child in vars(item).items()
+                    if not str(key).startswith("_")
+                }
+            return item
+
+        plain = to_plain(value)
+        if not isinstance(plain, dict):
+            raise ValueError(f"card callback {field_name} must be an object")
+        try:
+            encoded = json.dumps(plain, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"card callback {field_name} is not JSON") from exc
+        if len(encoded.encode("utf-8")) > _FEISHU_CARD_MAX_CALLBACK_VALUE_BYTES:
+            raise ValueError(f"card callback {field_name} is too large")
+        return plain
+
+    def _build_card_action_envelope(
+        self,
+        data: Any,
+    ) -> tuple[Optional[FeishuCardActionEnvelope], str]:
+        event = self._callback_field(data, "event", None)
+        if event is None:
+            return None, "invalid"
+        header = self._callback_field(data, "header", None)
+        operator_obj = self._callback_field(event, "operator", None)
+        context_obj = self._callback_field(event, "context", None)
+        action_obj = self._callback_field(event, "action", None)
+        try:
+            operator = {
+                key: self._bounded_callback_text(
+                    self._callback_field(operator_obj, key, ""),
+                    field_name=f"operator.{key}",
+                )
+                for key in ("tenant_key", "user_id", "open_id", "union_id")
+            }
+            context = {
+                key: self._bounded_callback_text(
+                    self._callback_field(context_obj, key, ""),
+                    field_name=f"context.{key}",
+                )
+                for key in ("url", "preview_token", "open_message_id", "open_chat_id")
+            }
+            action_value = self._bounded_callback_mapping(
+                self._callback_field(action_obj, "value", {}),
+                field_name="action.value",
+            )
+            form_value = self._bounded_callback_mapping(
+                self._callback_field(action_obj, "form_value", {}),
+                field_name="form_value",
+            )
+            raw_input_value = self._callback_field(action_obj, "input_value", None)
+            input_value = (
+                None
+                if raw_input_value is None
+                else self._bounded_callback_text(raw_input_value, field_name="input_value")
+            )
+            envelope = FeishuCardActionEnvelope(
+                event_id=self._bounded_callback_text(
+                    self._callback_field(header, "event_id", ""), field_name="event_id"
+                ),
+                event_token=self._bounded_callback_text(
+                    self._callback_field(event, "token", ""), field_name="event_token"
+                ),
+                operator=operator,
+                context=context,
+                action_tag=self._bounded_callback_text(
+                    self._callback_field(action_obj, "tag", "") or "button",
+                    field_name="action.tag",
+                ),
+                action_name=self._bounded_callback_text(
+                    self._callback_field(action_obj, "name", ""), field_name="action.name"
+                ),
+                action_value=action_value,
+                form_value=form_value,
+                input_value=input_value,
+            )
+        except ValueError:
+            return None, "invalid"
+
+        if not envelope.chat_id or not any(
+            envelope.operator.get(key) for key in ("open_id", "user_id", "union_id")
+        ):
+            return None, "missing_context"
+        if not _FEISHU_CARD_NAMESPACE_RE.fullmatch(envelope.namespace):
+            return None, "unknown_namespace"
+
+        sender_id = SimpleNamespace(
+            open_id=envelope.operator.get("open_id", ""),
+            user_id=envelope.operator.get("user_id", ""),
+            union_id=envelope.operator.get("union_id", ""),
+        )
+        if not self._allow_group_message(sender_id, envelope.chat_id, is_bot=False):
+            return None, "unauthorized"
+        return envelope, ""
+
+    @staticmethod
+    def _card_action_dedup_key(envelope: FeishuCardActionEnvelope) -> str:
+        if envelope.event_token:
+            return f"token:{envelope.event_token}"
+        if envelope.event_id:
+            return f"event:{envelope.event_id}"
+        return hashlib.sha256(
+            json.dumps(envelope.as_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _find_feishu_card_handler(
+        self,
+        namespace: str,
+    ) -> Optional[tuple[Any, str]]:
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            handlers = get_plugin_manager().get_feishu_card_action_handlers()
+        except Exception:
+            logger.warning("[Feishu] Failed to load card action handlers")
+            return None
+        for registered_namespace, callback, plugin_name in handlers:
+            if registered_namespace == namespace:
+                return callback, plugin_name
+        return None
+
+    def _prepare_card_action_dispatch(
+        self,
+        data: Any,
+    ) -> tuple[Optional[_FeishuCardActionDispatch], str]:
+        envelope, reason = self._build_card_action_envelope(data)
+        if envelope is None:
+            return None, reason
+        handler = self._find_feishu_card_handler(envelope.namespace)
+        if handler is None:
+            return None, "unknown_namespace"
+        dedup_key = self._card_action_dedup_key(envelope)
+        reservation = self._reserve_card_action_token(dedup_key)
+        if reservation is None:
+            return None, "duplicate"
+        callback, plugin_name = handler
+        return _FeishuCardActionDispatch(
+            envelope, callback, plugin_name, dedup_key, reservation
+        ), ""
+
+    @staticmethod
+    def _new_card_callback_response(
+        *,
+        toast_type: Optional[str] = None,
+        toast_content: Optional[str] = None,
+        card: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if toast_type and toast_content:
+            toast = CallBackToast() if CallBackToast is not None else SimpleNamespace()
+            toast.type = toast_type
+            toast.content = toast_content
+            response.toast = toast
+        if card is not None:
+            callback_card = CallBackCard() if CallBackCard is not None else SimpleNamespace()
+            callback_card.type = "raw"
+            callback_card.data = card
+            response.card = callback_card
+        return response
+
+    @staticmethod
+    def _serialize_card_callback_response(response: Any) -> Dict[str, Any]:
+        if response is None:
+            return {}
+        payload: Dict[str, Any] = {}
+        toast = getattr(response, "toast", None)
+        if toast is not None:
+            payload["toast"] = {
+                "type": getattr(toast, "type", None),
+                "content": getattr(toast, "content", None),
+            }
+        card = getattr(response, "card", None)
+        if card is not None:
+            payload["card"] = {
+                "type": getattr(card, "type", None),
+                "data": getattr(card, "data", None),
+            }
+        return {key: value for key, value in payload.items() if value is not None}
+
+    @staticmethod
+    def _invalid_card_handler_result() -> Dict[str, str]:
+        return {"status": "error", "message": "Card action handler returned an invalid result."}
+
+    @staticmethod
+    def _close_card_handler_background(background: Any) -> None:
+        if inspect.iscoroutine(background):
+            background.close()
+
+    @classmethod
+    def _discard_late_card_handler_result(cls, future: Any) -> None:
+        """Consume a timed-out result without scheduling or exposing its data."""
+        if future.cancelled():
+            return
+        try:
+            result = future.result()
+        except Exception:
+            logger.error("[Feishu] Timed-out card action handler failed")
+            return
+        if inspect.iscoroutine(result):
+            cls._close_card_handler_background(result)
+        elif isinstance(result, FeishuCardHandlerResult):
+            cls._close_card_handler_background(result.background)
+        elif isinstance(result, dict):
+            cls._close_card_handler_background(result.get("background"))
+
+    @classmethod
+    def _validate_card_handler_result(
+        cls,
+        result: Any,
+    ) -> tuple[Optional[Dict[str, Any]], Any]:
+        if isinstance(result, FeishuCardHandlerResult):
+            status = result.status
+            message = result.message
+            background = result.background
+            card = result.card
+            if background is not None and not (
+                callable(background) or inspect.isawaitable(background)
+            ):
+                return None, None
+        elif isinstance(result, dict):
+            if set(result) - {"status", "message", "background", "card"}:
+                return None, None
+            status = result.get("status")
+            message = result.get("message")
+            background = result.get("background")
+            card = result.get("card")
+            if background is not None and not (
+                callable(background) or inspect.isawaitable(background)
+            ):
+                return None, None
+        else:
+            return None, None
+        if status not in {"accepted", "ignored", "error"}:
+            return None, None
+        if (
+            not isinstance(message, str)
+            or not message.strip()
+            or len(message) > _FEISHU_CARD_MAX_CALLBACK_TEXT_LENGTH
+        ):
+            return None, None
+        if card is not None:
+            try:
+                validate_feishu_card(card)
+            except FeishuCardValidationError:
+                return None, None
+        normalized: Dict[str, Any] = {"status": status, "message": message}
+        if card is not None:
+            normalized["card"] = card
+        return normalized, background
+
+    async def _run_card_handler_background(self, background: Any) -> None:
+        work = background() if callable(background) else background
+        if not inspect.isawaitable(work):
+            raise TypeError("card handler background must be awaitable")
+        await work
+
+    def _schedule_card_handler_background(self, background: Any, loop: Any) -> bool:
+        coroutine = self._run_card_handler_background(background)
+        scheduled = self._submit_on_loop(loop, coroutine, redact_failure=True)
+        if not scheduled and inspect.iscoroutine(background):
+            background.close()
+        return scheduled
+
+    def _invoke_feishu_card_handler_sync(
+        self,
+        dispatch: _FeishuCardActionDispatch,
+        *,
+        loop: Any,
+    ) -> Dict[str, Any]:
+        if not _FEISHU_CARD_HANDLER_IN_FLIGHT.acquire(blocking=False):
+            self._rollback_card_action_token(dispatch.dedup_key, dispatch.dedup_reservation)
+            return {"status": "error", "message": "Card action handler is busy; please retry."}
+
+        permit = _FeishuCardHandlerPermit()
+        future = None
+        try:
+            try:
+                future = _FEISHU_CARD_HANDLER_EXECUTOR.submit(
+                    dispatch.callback, dispatch.envelope
+                )
+                future.add_done_callback(permit.release)
+            except Exception:
+                if future is not None:
+                    future.cancel()
+                permit.release()
+                self._rollback_card_action_token(dispatch.dedup_key, dispatch.dedup_reservation)
+                return {
+                    "status": "error",
+                    "message": "Card action handler could not be scheduled.",
+                }
+
+            try:
+                raw_result = future.result(timeout=_FEISHU_CARD_HANDLER_TIMEOUT_SECONDS)
+            except FutureTimeoutError:
+                future.add_done_callback(self._discard_late_card_handler_result)
+                future.cancel()
+                return {
+                    "status": "error",
+                    "message": "Card action handler timed out before the 3-second response deadline.",
+                }
+            except Exception:
+                logger.error(
+                    "[Feishu] Card action handler failed (namespace=%s, plugin=%s)",
+                    dispatch.envelope.namespace,
+                    dispatch.plugin_name,
+                )
+                return {"status": "error", "message": "Card action handler failed."}
+
+            if inspect.isawaitable(raw_result):
+                if inspect.iscoroutine(raw_result):
+                    self._close_card_handler_background(raw_result)
+                return {
+                    "status": "error",
+                    "message": "Card action handler must return an immediate result.",
+                }
+            result, background = self._validate_card_handler_result(raw_result)
+            if result is None:
+                if isinstance(raw_result, FeishuCardHandlerResult):
+                    self._close_card_handler_background(raw_result.background)
+                elif isinstance(raw_result, dict):
+                    self._close_card_handler_background(raw_result.get("background"))
+                return self._invalid_card_handler_result()
+            if background is not None and not self._schedule_card_handler_background(background, loop):
+                return {"status": "error", "message": "Card action background work could not be scheduled."}
+            return result
+        except Exception:
+            logger.error(
+                "[Feishu] Card action handler failed (namespace=%s, plugin=%s)",
+                dispatch.envelope.namespace,
+                dispatch.plugin_name,
+            )
+            return {"status": "error", "message": "Card action handler failed."}
+
+    async def _invoke_feishu_card_handler(
+        self,
+        dispatch: _FeishuCardActionDispatch,
+    ) -> Dict[str, Any]:
+        return self._invoke_feishu_card_handler_sync(dispatch, loop=self._loop)
+
+    @staticmethod
+    def _card_action_result_for_reason(reason: str) -> Dict[str, Any]:
+        if reason == "duplicate":
+            return {"status": "ignored", "message": "Card action was already received."}
+        if reason == "unauthorized":
+            return {"status": "error", "message": "Card action is not authorized."}
+        if reason == "unknown_namespace":
+            return {"status": "error", "message": "Unknown card action namespace."}
+        return {"status": "error", "message": "Card action was rejected."}
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
@@ -3047,68 +3666,45 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
         await self._handle_message_with_guards(synthetic_event)
 
-    def _is_card_action_duplicate(self, token: str) -> bool:
-        """Return True if this card action token was already processed within the dedup window."""
+    def _reserve_card_action_token(self, token: str) -> Optional[object]:
+        """Atomically reserve a card action token, or return None if duplicated."""
         now = time.time()
-        # Prune expired tokens lazily each call.
-        expired = [t for t, ts in self._card_action_tokens.items() if now - ts > _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS]
-        for t in expired:
-            del self._card_action_tokens[t]
-        if token in self._card_action_tokens:
-            return True
-        self._card_action_tokens[token] = now
-        return False
+        with self._card_action_tokens_lock:
+            expired = [
+                key
+                for key, (seen_at, _reservation) in self._card_action_tokens.items()
+                if now - seen_at > _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS
+            ]
+            for key in expired:
+                del self._card_action_tokens[key]
+            if token in self._card_action_tokens:
+                return None
+            if len(self._card_action_tokens) >= _FEISHU_CARD_ACTION_DEDUP_CACHE_SIZE:
+                self._card_action_tokens.pop(next(iter(self._card_action_tokens)), None)
+            reservation = object()
+            self._card_action_tokens[token] = (now, reservation)
+            return reservation
 
-    async def _handle_card_action_event(self, data: Any) -> None:
-        """Route Feishu interactive card button clicks as synthetic COMMAND events."""
-        event = getattr(data, "event", None)
-        token = str(getattr(event, "token", "") or "")
-        if token and self._is_card_action_duplicate(token):
-            logger.debug("[Feishu] Dropping duplicate card action token: %s", token)
-            return
+    def _is_card_action_duplicate(self, token: str) -> bool:
+        """Compatibility helper that performs an atomic token reservation."""
+        return self._reserve_card_action_token(token) is None
 
-        context = getattr(event, "context", None)
-        chat_id = str(getattr(context, "open_chat_id", "") or "")
-        operator = getattr(event, "operator", None)
-        open_id = str(getattr(operator, "open_id", "") or "")
-        if not chat_id or not open_id:
-            logger.debug("[Feishu] Card action missing chat_id or operator open_id, dropping")
-            return
+    def _rollback_card_action_token(self, token: str, reservation: object) -> None:
+        """Remove only this dispatch's token reservation after no execution."""
+        with self._card_action_tokens_lock:
+            current = self._card_action_tokens.get(token)
+            if current is not None and current[1] is reservation:
+                del self._card_action_tokens[token]
 
-        action = getattr(event, "action", None)
-        action_tag = str(getattr(action, "tag", "") or "button")
-        action_value = getattr(action, "value", {}) or {}
-
-        synthetic_text = f"/card {action_tag}"
-        if action_value:
-            try:
-                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
-            except Exception:
-                pass
-
-        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-        sender_profile = await self._resolve_sender_profile(sender_id)
-        chat_info = await self.get_chat_info(chat_id)
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
-            user_id=sender_profile["user_id"],
-            user_name=sender_profile["user_name"],
-            thread_id=None,
-            user_id_alt=sender_profile["user_id_alt"],
-        )
-        synthetic_event = MessageEvent(
-            text=synthetic_text,
-            message_type=MessageType.COMMAND,
-            source=source,
-            raw_message=data,
-            message_id=token or str(uuid.uuid4()),
-            channel_prompt=self._resolve_channel_prompt(chat_id),
-            timestamp=datetime.now(),
-        )
-        logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
-        await self._handle_message_with_guards(synthetic_event)
+    async def _handle_card_action_event(self, data: Any) -> Dict[str, Any]:
+        """Dispatch a namespaced card action without entering the Agent/LLM path."""
+        dispatch, reason = self._prepare_card_action_dispatch(data)
+        if dispatch is None:
+            result = self._card_action_result_for_reason(reason)
+            if reason not in {"duplicate", "unknown_namespace"}:
+                logger.warning("[Feishu] Card action rejected before handler dispatch: %s", reason)
+            return result
+        return await self._invoke_feishu_card_handler(dispatch)
 
     # =========================================================================
     # Per-chat serialization and typing indicator
@@ -3641,6 +4237,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         event_type = str((payload.get("header") or {}).get("event_type") or "")
         data = self._namespace_from_mapping(payload)
+        callback_response = None
         if event_type == "im.message.receive_v1":
             self._on_message_event(data)
         elif event_type == "im.message.message_read_v1":
@@ -3652,13 +4249,17 @@ class FeishuAdapter(BasePlatformAdapter):
         elif event_type in {"im.message.reaction.created_v1", "im.message.reaction.deleted_v1"}:
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
-            self._on_card_action_trigger(data)
+            callback_response = self._on_card_action_trigger(data)
         elif event_type == "drive.notice.comment_add_v1":
             self._on_drive_comment_event(data)
         elif event_type == "vc.bot.meeting_invited_v1":
             self._on_meeting_invited_event(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
+        if callback_response is not None:
+            serialized = self._serialize_card_callback_response(callback_response)
+            if serialized:
+                return web.json_response(serialized)
         return web.json_response({"code": 0, "msg": "ok"})
 
     def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes) -> bool:
@@ -4341,6 +4942,15 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("[Feishu] Background inbound processing failed")
 
+    @staticmethod
+    def _log_card_background_failure(future: Any) -> None:
+        try:
+            future.result()
+        except Exception:
+            # Do not include exception text: controlled card background work
+            # may contain user-provided form/input values.
+            logger.error("[Feishu] Card action background work failed")
+
     # =========================================================================
     # Inbound admission
     # =========================================================================
@@ -4988,6 +5598,28 @@ class FeishuAdapter(BasePlatformAdapter):
             .build()
         )
 
+    async def _feishu_patch_with_retry(self, *, message_id: str, request: Any) -> Any:
+        """PATCH a message with the same bounded retry policy as sends."""
+        last_error: Optional[Exception] = None
+        for attempt in range(_FEISHU_SEND_ATTEMPTS):
+            try:
+                response = await self._run_blocking(self._client.im.v1.message.patch, request)
+                if self._response_succeeded(response) or attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                    return response
+            except Exception as exc:
+                last_error = exc
+                if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                    raise
+                logger.warning(
+                    "[Feishu] Card patch attempt %d/%d failed for message %s; retrying in %ds",
+                    attempt + 1,
+                    _FEISHU_SEND_ATTEMPTS,
+                    message_id,
+                    2 ** attempt,
+                )
+            await asyncio.sleep(2 ** attempt)
+        raise last_error or RuntimeError("Feishu card patch failed")
+
     async def _feishu_send_with_retry(
         self,
         *,
@@ -5128,6 +5760,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if ReplyMessageRequest is not None:
             return (
                 ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if PatchMessageRequestBody is not None:
+            return PatchMessageRequestBody.builder().content(content).build()
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if PatchMessageRequest is not None:
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()
@@ -5670,6 +6319,67 @@ async def _standalone_send(
         }
     except Exception as e:
         return {"error": f"Feishu send failed: {e}"}
+
+
+async def standalone_send_card(
+    pconfig: Any,
+    chat_id: str,
+    card: Dict[str, Any],
+    *,
+    reply_to: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Send a card from a process without a live gateway adapter."""
+    if not FEISHU_AVAILABLE and not await asyncio.to_thread(_load_lark_oapi):
+        return {"error": "Feishu dependencies not installed"}
+    try:
+        adapter = FeishuAdapter(pconfig)
+        domain_name = getattr(adapter, "_domain_name", "feishu")
+        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+        adapter._client = adapter._build_lark_client(domain)
+        result = await adapter.send_card(
+            chat_id,
+            card,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if not result.success:
+            return {"error": f"Feishu card send failed: {result.error}"}
+        return {
+            "success": True,
+            "platform": "feishu",
+            "chat_id": chat_id,
+            "message_id": result.message_id,
+        }
+    except Exception:
+        logger.error("[Feishu] Standalone card send failed", exc_info=True)
+        return {"error": "Feishu card send failed"}
+
+
+async def standalone_patch_card(
+    pconfig: Any,
+    message_id: str,
+    card: Dict[str, Any],
+) -> Dict[str, Any]:
+    """PATCH a card from a process without a live gateway adapter."""
+    if not FEISHU_AVAILABLE and not await asyncio.to_thread(_load_lark_oapi):
+        return {"error": "Feishu dependencies not installed"}
+    try:
+        adapter = FeishuAdapter(pconfig)
+        domain_name = getattr(adapter, "_domain_name", "feishu")
+        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+        adapter._client = adapter._build_lark_client(domain)
+        result = await adapter.patch_card(message_id, card)
+        if not result.success:
+            return {"error": f"Feishu card patch failed: {result.error}"}
+        return {
+            "success": True,
+            "platform": "feishu",
+            "message_id": message_id,
+        }
+    except Exception:
+        logger.error("[Feishu] Standalone card patch failed", exc_info=True)
+        return {"error": "Feishu card patch failed"}
 
 
 def interactive_setup() -> None:

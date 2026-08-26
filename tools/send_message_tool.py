@@ -258,6 +258,9 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
+    if "card" in args or args.get("patch_message_id"):
+        return _handle_card_send(args)
+
     return _handle_send(args)
 
 
@@ -358,6 +361,86 @@ def _handle_react(args, remove=False):
     if isinstance(result, dict):
         return json.dumps(result)
     return json.dumps({"success": bool(result)})
+
+
+def _handle_card_send(args):
+    """Send or PATCH a Feishu JSON 2.0 card without a text fallback."""
+    target = str(args.get("target", "") or "").strip()
+    if not target:
+        return tool_error("'target' is required for Feishu card transport")
+
+    parts = target.split(":", 1)
+    platform_name = parts[0].strip().lower()
+    target_ref = parts[1].strip() if len(parts) > 1 else None
+    if platform_name != "feishu":
+        return tool_error("Feishu card transport only supports target platform 'feishu'")
+
+    card = args.get("card")
+    if not isinstance(card, dict):
+        return tool_error("'card' must be a JSON object")
+    try:
+        from plugins.platforms.feishu.adapter import validate_feishu_card
+        validate_feishu_card(card)
+    except Exception as exc:
+        return json.dumps(_error(str(exc)))
+
+    patch_message_id = str(args.get("patch_message_id") or "").strip() or None
+    if target_ref:
+        chat_id, thread_id, is_explicit = _parse_target_ref("feishu", target_ref)
+        if not is_explicit:
+            if patch_message_id:
+                return json.dumps(_error("PATCH target must be feishu or an explicit Feishu chat ID"))
+            try:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name("feishu", target_ref)
+            except Exception:
+                resolved = None
+            if not resolved:
+                return json.dumps(_error(f"Could not resolve '{target_ref}' on feishu"))
+            chat_id, thread_id, _ = _parse_target_ref("feishu", resolved)
+    else:
+        chat_id = None
+        thread_id = None
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+        config = load_gateway_config()
+        platform = Platform.FEISHU
+    except Exception as exc:
+        return json.dumps(_error(f"Failed to load gateway config: {exc}"))
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(
+            "Platform 'feishu' is not configured. Set up credentials in "
+            "~/.hermes/config.yaml or environment variables."
+        )
+
+    if not patch_message_id and not chat_id:
+        home = config.get_home_channel(platform)
+        if home:
+            chat_id = home.chat_id
+        else:
+            return json.dumps(_error(
+                "No home channel set for feishu. Specify 'feishu:CHAT_ID' when sending a card."
+            ))
+
+    try:
+        from model_tools import _run_async
+        result = _run_async(
+            _send_feishu_card_via_adapter(
+                pconfig,
+                chat_id=chat_id,
+                card=card,
+                patch_message_id=patch_message_id,
+                thread_id=thread_id,
+            )
+        )
+    except Exception as exc:
+        return json.dumps(_error(f"Feishu card transport failed: {exc}"))
+    if isinstance(result, dict) and result.get("error"):
+        result["error"] = _sanitize_error_text(result["error"])
+    return json.dumps(result)
 
 
 def _handle_send(args):
@@ -825,6 +908,77 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
             "your final response instead, or use a different target if you want an additional message."
         ),
     }
+
+
+async def _send_feishu_card_via_adapter(
+    pconfig,
+    *,
+    chat_id,
+    card,
+    patch_message_id=None,
+    thread_id=None,
+):
+    """Use the live Feishu adapter or its explicit standalone card API."""
+    from gateway.config import Platform
+
+    runner = None
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+
+    if runner is not None:
+        try:
+            adapter = runner.adapters.get(Platform.FEISHU)
+        except Exception:
+            adapter = None
+        if adapter is not None:
+            try:
+                if patch_message_id:
+                    fn = getattr(adapter, "patch_card", None)
+                    if not callable(fn):
+                        return {"error": "Feishu adapter does not support card PATCH"}
+                    result = await fn(patch_message_id, card)
+                else:
+                    fn = getattr(adapter, "send_card", None)
+                    if not callable(fn):
+                        return {"error": "Feishu adapter does not support card sending"}
+                    metadata = {"thread_id": thread_id} if thread_id else None
+                    result = await fn(chat_id, card, metadata=metadata)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("Feishu live card transport failed", exc_info=True)
+                return {"error": "Feishu live card transport failed"}
+            if result.success:
+                return {
+                    "success": True,
+                    "platform": "feishu",
+                    "chat_id": chat_id,
+                    "message_id": result.message_id or patch_message_id,
+                }
+            return {"error": f"Feishu card transport failed: {result.error}"}
+
+    try:
+        from plugins.platforms.feishu.adapter import (
+            standalone_patch_card,
+            standalone_send_card,
+        )
+        if patch_message_id:
+            return await standalone_patch_card(pconfig, patch_message_id, card)
+        metadata = {"thread_id": thread_id} if thread_id else None
+        return await standalone_send_card(
+            pconfig,
+            chat_id,
+            card,
+            metadata=metadata,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("Feishu standalone card transport failed", exc_info=True)
+        return {"error": "Feishu standalone card transport failed"}
 
 
 async def _send_via_adapter(

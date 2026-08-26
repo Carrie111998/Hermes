@@ -242,30 +242,24 @@ class TestResolveApproval:
 # ===========================================================================
 
 class TestNonApprovalCardAction:
-    """Non-approval card actions should still route as synthetic commands."""
+    """Unnamespaced card actions have no gateway or LLM side effect."""
 
     @pytest.mark.asyncio
-    async def test_routes_as_synthetic_command(self):
+    async def test_does_not_route_as_synthetic_command(self):
         adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_user1"}
 
         data = _make_card_action_data(
             action_value={"custom_action": "something_else"},
             token="tok_normal",
         )
 
-        with (
-            patch.object(
-                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
-                return_value={"user_id": "ou_u", "user_name": "Dave", "user_id_alt": None},
-            ),
-            patch.object(adapter, "get_chat_info", new_callable=AsyncMock, return_value={"name": "Test Chat"}),
-            patch.object(adapter, "_handle_message_with_guards", new_callable=AsyncMock) as mock_handle,
-        ):
-            await adapter._handle_card_action_event(data)
+        with patch.object(adapter, "_handle_message_with_guards", new_callable=AsyncMock) as mock_handle:
+            result = await adapter._handle_card_action_event(data)
 
-        mock_handle.assert_called_once()
-        event = mock_handle.call_args[0][0]
-        assert "/card button" in event.text
+        assert result["status"] == "error"
+        assert "namespace" in result["message"]
+        mock_handle.assert_not_called()
 
 
 # ===========================================================================

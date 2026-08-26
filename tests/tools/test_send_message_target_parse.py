@@ -17,6 +17,89 @@ def _run_async_immediately(coro):
     return asyncio.run(coro)
 
 
+def test_send_message_routes_feishu_card_without_text_fallback() -> None:
+    feishu_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+    config = SimpleNamespace(
+        platforms={Platform.FEISHU: feishu_cfg},
+        get_home_channel=lambda _platform: SimpleNamespace(chat_id="oc_home"),
+    )
+    card = {"schema": "2.0", "body": {"elements": []}}
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("model_tools._run_async", side_effect=_run_async_immediately), \
+         patch(
+             "tools.send_message_tool._send_feishu_card_via_adapter",
+             new=AsyncMock(return_value={"success": True, "message_id": "om_card"}),
+         ) as card_send, \
+         patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as text_send:
+        result = json.loads(send_message_tool({
+            "action": "send",
+            "target": "feishu",
+            "card": card,
+        }))
+
+    assert result["success"] is True
+    card_send.assert_awaited_once_with(
+        feishu_cfg,
+        chat_id="oc_home",
+        card=card,
+        patch_message_id=None,
+        thread_id=None,
+    )
+    text_send.assert_not_awaited()
+
+
+def test_send_message_rejects_invalid_feishu_card_before_transport() -> None:
+    feishu_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+    config = SimpleNamespace(
+        platforms={Platform.FEISHU: feishu_cfg},
+        get_home_channel=lambda _platform: SimpleNamespace(chat_id="oc_home"),
+    )
+
+    with patch("gateway.config.load_gateway_config", return_value=config), patch(
+        "tools.send_message_tool._send_feishu_card_via_adapter", new=AsyncMock()
+    ) as card_send:
+        result = json.loads(send_message_tool({
+            "action": "send",
+            "target": "feishu",
+            "card": {"schema": "1.0"},
+        }))
+
+    assert "error" in result
+    card_send.assert_not_awaited()
+
+
+def test_send_message_routes_feishu_card_patch_by_message_id() -> None:
+    feishu_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+    config = SimpleNamespace(
+        platforms={Platform.FEISHU: feishu_cfg},
+        get_home_channel=lambda _platform: None,
+    )
+    card = {"schema": "2.0", "body": {"elements": []}}
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("model_tools._run_async", side_effect=_run_async_immediately), \
+         patch(
+             "tools.send_message_tool._send_feishu_card_via_adapter",
+             new=AsyncMock(return_value={"success": True, "message_id": "om_existing"}),
+         ) as card_send:
+        result = json.loads(send_message_tool({
+            "action": "send",
+            "target": "feishu",
+            "card": card,
+            "patch_message_id": "om_existing",
+        }))
+
+    assert result["success"] is True
+    card_send.assert_awaited_once_with(
+        feishu_cfg,
+        chat_id=None,
+        card=card,
+        patch_message_id="om_existing",
+        thread_id=None,
+    )
+
+
 def test_photon_e164_target_is_explicit() -> None:
     chat_id, thread_id, is_explicit = _parse_target_ref("photon", "+15551234567")
 

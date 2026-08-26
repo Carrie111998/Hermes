@@ -87,6 +87,27 @@ def _read_message_body(
     return None
 
 
+def _read_card_file(file_path: str) -> dict:
+    """Read and strictly validate a JSON 2.0 card without exposing contents."""
+    try:
+        raw = sys.stdin.read() if file_path == "-" else Path(file_path).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        print(f"hermes send: card file is not UTF-8: {file_path}", file=sys.stderr)
+        raise SystemExit(_USAGE_EXIT) from exc
+    except OSError as exc:
+        print(f"hermes send: cannot read card file {file_path}: {exc}", file=sys.stderr)
+        raise SystemExit(_USAGE_EXIT) from exc
+    try:
+        from plugins.platforms.feishu.adapter import (
+            FeishuCardValidationError,
+            parse_feishu_card_json,
+        )
+        return parse_feishu_card_json(raw)
+    except FeishuCardValidationError as exc:
+        print(f"hermes send: {exc}", file=sys.stderr)
+        raise SystemExit(_USAGE_EXIT) from exc
+
+
 def _resolve_target(arg_to: Optional[str]) -> Optional[str]:
     """Return a cleaned ``--to`` value, or ``None`` when nothing is set."""
     if arg_to and arg_to.strip():
@@ -328,13 +349,49 @@ def _load_hermes_env() -> None:
 def cmd_send(args: argparse.Namespace) -> None:
     """Entry point wired into the top-level argparse dispatcher."""
 
+    if getattr(args, "card_capabilities", False):
+        if any(
+            getattr(args, name, None)
+            for name in (
+                "to", "message", "file", "subject", "card_file",
+                "patch_message_id", "list_targets",
+            )
+        ):
+            print(
+                "hermes send: --card-capabilities cannot be combined with send arguments",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        from plugins.platforms.feishu.adapter import (
+            FEISHU_CARD_CAPABILITIES,
+            FEISHU_CARD_CONTRACT_VERSION,
+        )
+        payload = {
+            "success": True,
+            "platform": "feishu",
+            "contract": FEISHU_CARD_CONTRACT_VERSION,
+            "capabilities": sorted(FEISHU_CARD_CAPABILITIES),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(
+                f"feishu card contract {payload['contract']}: "
+                f"{', '.join(payload['capabilities'])}"
+            )
+        sys.exit(_SUCCESS_EXIT)
+
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
     # gateway config loader (invoked downstream by send_message_tool and by
     # the channel directory) can see platform credentials and home channels.
     _load_hermes_env()
 
-    # --list short-circuits everything else.
+    # --list short-circuits everything else, but never silently ignores card
+    # transport arguments.
     if getattr(args, "list_targets", False):
+        if getattr(args, "card_file", None) or getattr(args, "patch_message_id", None):
+            print("hermes send: --list is mutually exclusive with card transport", file=sys.stderr)
+            sys.exit(_USAGE_EXIT)
         # When `--list telegram` is used, argparse stores "telegram" in the
         # `message` positional (since list_targets takes no argument).
         platform_filter = getattr(args, "message", None)
@@ -352,6 +409,31 @@ def cmd_send(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(_USAGE_EXIT)
+
+    card_file = getattr(args, "card_file", None)
+    patch_message_id = getattr(args, "patch_message_id", None)
+    if patch_message_id and not card_file:
+        print("hermes send: --patch-message-id requires --card-file", file=sys.stderr)
+        sys.exit(_USAGE_EXIT)
+    if card_file:
+        if any(getattr(args, name, None) for name in ("message", "file", "subject")):
+            print(
+                "hermes send: --card-file is mutually exclusive with text, --file, and --subject",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        card = _read_card_file(card_file)
+        tool_args = {"action": "send", "target": target, "card": card}
+        if patch_message_id:
+            tool_args["patch_message_id"] = patch_message_id
+        from tools.send_message_tool import send_message_tool
+        result = send_message_tool(tool_args)
+        exit_code = _emit_result(
+            result,
+            json_mode=getattr(args, "json", False),
+            quiet=getattr(args, "quiet", False),
+        )
+        sys.exit(exit_code)
 
     message = _read_message_body(
         getattr(args, "message", None),
@@ -419,6 +501,9 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "  hermes send --to discord:#ops --file /tmp/report.md\n"
             "  hermes send --to slack:#eng --subject \"[CI]\" --file build.log\n"
             "  hermes send --to telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
+            "  hermes send --to feishu --card-file card.json       # send JSON 2.0 card\n"
+            "  hermes send --to feishu --card-file card.json --patch-message-id om_xxx\n"
+            "  hermes send --card-capabilities --json               # offline contract check\n"
             "  hermes send --list                  # all platforms\n"
             "  hermes send --list telegram         # filter by platform\n"
             "\n"
@@ -458,8 +543,35 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         help=(
             "Read message body from PATH (text only). Use '-' to force stdin. "
             "To send an image/document as an attachment, use MEDIA:<path> in "
-            "the message text instead."
+            "the message text instead. Mutually exclusive with --card-file."
         ),
+    )
+
+    parser.add_argument(
+        "--card-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Send a Feishu JSON 2.0 card from PATH (use '-' for stdin). "
+            "Requires --to feishu[:CHAT_ID] and is mutually exclusive with text."
+        ),
+    )
+
+    parser.add_argument(
+        "--patch-message-id",
+        metavar="MESSAGE_ID",
+        default=None,
+        help=(
+            "PATCH the card from --card-file into this existing Feishu message ID; "
+            "requires --card-file and never falls back to text."
+        ),
+    )
+
+    parser.add_argument(
+        "--card-capabilities",
+        action="store_true",
+        default=False,
+        help="Print the installed Feishu card contract/capabilities without sending or loading credentials.",
     )
 
     parser.add_argument(

@@ -2948,6 +2948,55 @@ class PluginContext:
             name, current, replacement, scope=scope
         )
 
+    # -- Feishu card action handler registration ----------------------------
+
+    def register_feishu_card_action_handler(
+        self,
+        namespace: str,
+        callback: Callable,
+    ) -> PluginRegistration:
+        """Register a namespaced Feishu JSON 2.0 card handler.
+
+        The namespace is an exact bounded identifier selected by the plugin;
+        payload data is never interpreted as an import path, command, or tool.
+        The callback must return a validated immediate result. It may include
+        a complete JSON 2.0 ``card`` field to replace the original card in
+        place. Slow work is carried only in an explicit ``background`` result
+        field.
+        """
+        import re
+
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Feishu "
+                "card handler with a non-callable callback."
+            )
+        if (
+            not isinstance(namespace, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*", namespace)
+        ):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register an invalid "
+                f"Feishu card namespace: {namespace!r}."
+            )
+        if any(item[0] == namespace for item in self._manager._feishu_card_action_handlers):
+            raise ValueError(f"Feishu card namespace already registered: {namespace}")
+        entry = (namespace, callback, self.manifest.name)
+        self._manager._feishu_card_action_handlers.append(entry)
+        handle = self._track(
+            "feishu_card_action_handler",
+            namespace,
+            lambda: self._manager._remove_identity(
+                self._manager._feishu_card_action_handlers, entry
+            ),
+        )
+        logger.debug(
+            "Plugin %s registered Feishu card action handler: %s",
+            self.manifest.name,
+            namespace,
+        )
+        return handle
+
     # -- slack action handler registration ----------------------------------
 
     def register_slack_action_handler(
@@ -3523,6 +3572,10 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Feishu JSON 2.0 card handlers. Each entry is
+        # (fixed_namespace, callback, plugin_name); payload-derived dispatch is
+        # forbidden and callbacks return an immediate status mapping.
+        self._feishu_card_action_handlers: List[tuple] = []
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3899,6 +3952,7 @@ class PluginManager:
             self._system_prompt_sections.clear()
             self._approval_transports.clear()
             self._slack_action_handlers.clear()
+            self._feishu_card_action_handlers.clear()
             self._predeclared_modules.clear()
             self._predeclared_tools.clear()
             self._context_engine = None
@@ -5659,6 +5713,14 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    # -----------------------------------------------------------------------
+    # Feishu card action handler accessor
+    # -----------------------------------------------------------------------
+
+    def get_feishu_card_action_handlers(self) -> List[tuple]:
+        """Return a copy of plugin-registered Feishu card handlers."""
+        return list(self._feishu_card_action_handlers)
 
     # -----------------------------------------------------------------------
     # Introspection
