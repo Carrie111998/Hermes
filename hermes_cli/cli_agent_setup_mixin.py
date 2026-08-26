@@ -14,6 +14,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from rich.markup import escape as _escape
@@ -47,6 +48,18 @@ def _single_query_clarify_callback(question: str, choices=None, multi_select=Fal
         f"[single-query mode: no user available to answer {question!r}. Make "
         f"the most reasonable assumption you can and continue.]"
     )
+
+
+
+
+def _remote_kanban_private_work(provider: str | None) -> bool:
+    """Return whether this CLI is a protected-remote Kanban worker."""
+
+    if not str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    from agent.llm_egress_runtime import provider_uses_egress_firewall
+
+    return provider_uses_egress_firewall(provider)
 
 
 class CLIAgentSetupMixin:
@@ -522,6 +535,9 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            remote_kanban_private_work = _remote_kanban_private_work(
+                runtime.get("provider")
+            )
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -573,8 +589,9 @@ class CLIAgentSetupMixin:
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
-                skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
+                skip_context_files=self.ignore_rules or remote_kanban_private_work,
+                skip_memory=self.ignore_rules or remote_kanban_private_work,
+                skip_background_review=remote_kanban_private_work,
                 tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
@@ -584,6 +601,13 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            if remote_kanban_private_work:
+                # Large generated prompt fields are split into independently
+                # scanned 32 KiB segments. The aggregate allowance is bounded
+                # below the fixed request cap; secrets, encoded payloads, and
+                # private paths remain denied at the final provider boundary.
+                self.agent._llm_egress_max_sanitized_bytes = 196_608
+                self.agent._llm_egress_max_sanitized_segment_bytes = 32_768
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

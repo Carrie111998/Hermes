@@ -174,6 +174,8 @@ _LOCAL_PROCESS_MODES = frozenset({"local_process", "in_process"})
 _BASE64_CANDIDATE = re.compile(
     r"(?<![A-Za-z0-9_+/\-])([A-Za-z0-9_+/\-]{4,}={0,2})(?![A-Za-z0-9_+/=\-])"
 )
+_HERMES_TASK_ID = re.compile(r"^t_[0-9a-f]{8}$")
+_PROMPT_CACHE_KEY = re.compile(r"^pck_[0-9a-f]{24}$")
 _MAX_BASE64_CANDIDATE_CHARS = 262_144
 _PRIVATE_ABSOLUTE_PATH = re.compile(
     r"(?:^|[\s\"'`(])(?:"
@@ -189,19 +191,68 @@ _PRIVATE_ABSOLUTE_PATH = re.compile(
 # scan; this set only resolves the mathematical ambiguity in Base64 detection.
 _PROTOCOL_GRAMMAR_ATOMS = frozenset(
     {
+        "--result",
+        "-removed",
+        "100K",
+        "2000",
+        "2026",
+        "4dae",
+        "600s",
+        "BOTH",
+        "COVERAGE",
+        "EPUB",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BRANCH",
+        "HERMES_KANBAN_WORKSPACE",
+        "LAST",
+        "MIME",
+        "MODE",
+        "MUTUALLY",
+        "MUST",
+        "NOTE",
+        "ONLY",
+        "REPL",
+        "REPLACE",
+        "REQUIRED",
+        "SILENTLY",
         "assistant",
+        "assignee/profile",
         "computer_call_output",
+        "com/docs",
         "content",
         "developer",
+        "doc/",
+        "echo/cat",
+        "echo/heredoc",
+        "environment-variable",
+        "find-and-replace",
         "function_call",
         "function_call_output",
+        "github-code-review",
+        "grep/rg/find/ls",
+        "include_archived",
         "input_image",
         "input_text",
         "JSON",
+        "kanban_heartbeat",
+        "machine-readable",
+        "max_runtime_seconds",
         "messages",
+        "notification/15s",
+        "optional-profile",
         "output_text",
+        "parent/child",
+        "parents=",
+        "parallel_tool_calls",
+        "path/to/file",
+        "ppt/",
+        "prompt_cache_key",
         "reasoning",
         "role",
+        "sed/awk",
+        "servers/daemons",
+        "servers/watchers/daemons",
+        "skills/plugins/cron/memories",
         "system",
         "tool",
         "user",
@@ -366,6 +417,15 @@ def _contains_canonical_base64(value: Any, *, seen: set[int] | None = None) -> b
             prefix = value[max(0, match.start() - 16) : match.start()].lower()
             if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate.lower()):
                 continue
+            # The fixed Kanban task-id grammar carries only a 32-bit hex
+            # database key. It is application protocol metadata, not an
+            # encoded source payload.
+            if _HERMES_TASK_ID.fullmatch(candidate):
+                continue
+            # Content-addressed cache routing is a fixed application protocol
+            # value: the literal ``pck_`` prefix plus exactly 96 bits of hex.
+            if _PROMPT_CACHE_KEY.fullmatch(candidate):
+                continue
             if _canonical_base64_candidate(candidate):
                 return True
         # Providers and source-control tools sometimes wrap an otherwise
@@ -459,6 +519,45 @@ def _contains_private_absolute_path(value: Any, *, seen: set[int] | None = None)
         seen.add(identity)
         return any(_contains_private_absolute_path(item, seen=seen) for item in value)
     return False
+
+
+def content_free_violation_locations(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return structural indexes and reasons without returning request text."""
+
+    locations: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[int] = set()
+
+    def visit(item: Any, path: str) -> None:
+        if isinstance(item, str):
+            reasons: list[str] = []
+            if _contains_canonical_base64(item):
+                reasons.append("base64_payload")
+            if _contains_private_absolute_path(item):
+                reasons.append("private_absolute_path")
+            if reasons:
+                locations.append((path, tuple(reasons)))
+            return
+        if isinstance(item, Mapping):
+            identity = id(item)
+            if identity in seen:
+                locations.append((path, ("cyclic_container",)))
+                return
+            seen.add(identity)
+            for index, (key, child) in enumerate(item.items()):
+                visit(key, f"{path}.map[{index}].key")
+                visit(child, f"{path}.map[{index}].value")
+            return
+        if isinstance(item, (list, tuple, set, frozenset)):
+            identity = id(item)
+            if identity in seen:
+                locations.append((path, ("cyclic_container",)))
+                return
+            seen.add(identity)
+            for index, child in enumerate(item):
+                visit(child, f"{path}.sequence[{index}]")
+
+    visit(value, "$")
+    return tuple(locations)
 
 
 def _contains_grant_substring(grant_content: bytes, candidate: bytes) -> bool:
