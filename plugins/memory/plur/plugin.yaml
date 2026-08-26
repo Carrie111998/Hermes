@@ -1,0 +1,9 @@
+name: plur
+version: 0.18.1
+description: "PLUR — local-first persistent memory with engrams, BM25+embedding retrieval, and cross-device git sync."
+pip_dependencies:
+  - plur-hermes>=0.18.1
+external_dependencies:
+  - name: plur CLI
+    install: "npm install -g @plur-ai/cli"
+    check: "plur --version"
