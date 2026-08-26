@@ -110,7 +110,8 @@ hermes config set terminal.backend acmebox
   never shadow in-tree backends.
 - **`create_environment` must accept `**kwargs`** and ignore unknown keys —
   the forward-compat contract that lets the factory signature evolve without
-  breaking older plugins.
+  breaking older plugins. An empty `image` string means no image is
+  configured — treat `""` as unset and use your backend's own default.
 - **`is_available()` / `probe()` must be cheap.** No network calls — they run
   during requirement checks and UI paints.
 - **Fail-soft everywhere.** A provider attribute that raises is treated as
@@ -146,7 +147,8 @@ default cwd instead of failing the environment start.
 - Declare `guest_home_root` when the guest home lives under a host-looking
   prefix (e.g. `/home/agent`). Its subtree is then accepted as a valid
   in-sandbox cwd — including the agent's recorded `cd` state between
-  commands — instead of being discarded as a host path.
+  commands — instead of being discarded as a host path. The root must be an
+  absolute path other than `/`; empty, relative, and `/` roots are ignored.
 - Set `probe_at_prompt_build = False` when creating an environment is
   expensive or billable: the system-prompt builder then skips the live
   OS/$HOME/cwd probe and describes the backend with your `env_description`.

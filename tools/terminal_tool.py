@@ -1691,6 +1691,27 @@ def _get_plugin_env_provider(env_type: str):
         return None
 
 
+def _resolve_task_image(env_type: str, overrides: Dict[str, Any], config: Dict[str, Any]) -> str:
+    """Resolve the container image for an environment about to be created.
+
+    The single owner of the backend→image ladder — shared by
+    ``terminal_tool()``, :func:`ensure_task_env`, execute_code's
+    ``_get_or_create_env``, and the file tools' ``_get_file_ops`` so the
+    four creation paths can't drift. Built-in container backends resolve
+    their per-task override then the configured image; plugin-registered
+    backends resolve their ``f"{env_type}_image"`` override so RL/benchmark
+    per-task images reach ``provider.create_environment``; everything else
+    resolves to ``""`` (no image configured — the backend's own default
+    applies).
+    """
+    if env_type in ("docker", "singularity", "modal", "daytona"):
+        key = f"{env_type}_image"
+        return overrides.get(key) or config[key]
+    if _get_plugin_env_provider(env_type) is not None:
+        return overrides.get(f"{env_type}_image") or ""
+    return ""
+
+
 def _is_backend_guest_subpath(env_type: str, cwd: str) -> bool:
     """True when *cwd* is the backend's guest-home root or a path beneath it.
 
@@ -1698,11 +1719,18 @@ def _is_backend_guest_subpath(env_type: str, cwd: str) -> bool:
     declares it via the provider's ``guest_home_root`` attribute (e.g.
     ``/home/agent``); its subtree is a legitimate in-sandbox cwd that the
     host-path sanitizers must not discard.
+
+    The root must be an absolute path other than ``/`` — a bare ``/`` would
+    exempt every absolute path from the host-path guard, and an empty or
+    relative root is meaningless; all such roots yield False.
     """
     root = _plugin_env_flag(env_type, "guest_home_root", None)
-    if not isinstance(root, str) or not root or not cwd:
+    if not isinstance(root, str) or not cwd:
         return False
-    return cwd == root or cwd.startswith(root.rstrip("/") + "/")
+    root = root.rstrip("/")
+    if not root or not root.startswith("/"):
+        return False
+    return cwd == root or cwd.startswith(root + "/")
 
 
 def _is_unusable_container_cwd(cwd: str) -> bool:
@@ -2331,18 +2359,7 @@ def ensure_task_env(task_id: Optional[str] = None):
         return existing
 
     overrides = resolve_task_overrides(task_id)
-    if env_type == "docker":
-        image = overrides.get("docker_image") or config["docker_image"]
-    elif env_type == "singularity":
-        image = overrides.get("singularity_image") or config["singularity_image"]
-    elif env_type == "modal":
-        image = overrides.get("modal_image") or config["modal_image"]
-    elif env_type == "daytona":
-        image = overrides.get("daytona_image") or config["daytona_image"]
-    elif _get_plugin_env_provider(env_type) is not None:
-        image = overrides.get(f"{env_type}_image") or ""
-    else:
-        image = ""
+    image = _resolve_task_image(env_type, overrides, config)
 
     _start_cleanup_thread()
 
@@ -2928,21 +2945,9 @@ def terminal_tool(
         # isolation-keyed RL/benchmark overrides keep resolving as before.
         overrides = resolve_task_overrides(task_id)
         
-        # Select image based on env type, with per-task override support.
-        # Plugin backends resolve their override under f"{backend}_image" so
-        # RL/benchmark per-task images reach provider.create_environment too.
-        if env_type == "docker":
-            image = overrides.get("docker_image") or config["docker_image"]
-        elif env_type == "singularity":
-            image = overrides.get("singularity_image") or config["singularity_image"]
-        elif env_type == "modal":
-            image = overrides.get("modal_image") or config["modal_image"]
-        elif env_type == "daytona":
-            image = overrides.get("daytona_image") or config["daytona_image"]
-        elif _get_plugin_env_provider(env_type) is not None:
-            image = overrides.get(f"{env_type}_image") or ""
-        else:
-            image = ""
+        # Select image based on env type, with per-task override support
+        # (single owner: _resolve_task_image).
+        image = _resolve_task_image(env_type, overrides, config)
 
         cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
         # Session-scoped mount resolution (single owner: _resolve_task_host_cwd).

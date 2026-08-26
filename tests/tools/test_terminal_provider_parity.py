@@ -149,6 +149,35 @@ class TestBackendGuestSubpath:
         reg.register_provider(RaiseBox())
         assert tt._is_backend_guest_subpath("raisebox", "/home/guest") is False
 
+    def test_root_slash_never_exempts(self):
+        # A bare "/" root would exempt EVERY absolute path from the
+        # host-path guard — reject it instead of honoring it.
+        class SlashBox(_GuestHomeProvider):
+            name = "slashbox"
+            guest_home_root = "/"
+
+        reg.register_provider(SlashBox())
+        assert tt._is_backend_guest_subpath("slashbox", "/Users/me/secrets") is False
+        assert tt._is_backend_guest_subpath("slashbox", "/home/guest") is False
+        assert tt._is_backend_guest_subpath("slashbox", "/") is False
+
+    def test_empty_root_never_exempts(self):
+        class EmptyBox(_GuestHomeProvider):
+            name = "emptybox"
+            guest_home_root = ""
+
+        reg.register_provider(EmptyBox())
+        assert tt._is_backend_guest_subpath("emptybox", "/home/guest") is False
+
+    def test_relative_root_never_exempts(self):
+        class RelBox(_GuestHomeProvider):
+            name = "relbox"
+            guest_home_root = "home/guest"
+
+        reg.register_provider(RelBox())
+        assert tt._is_backend_guest_subpath("relbox", "home/guest/project") is False
+        assert tt._is_backend_guest_subpath("relbox", "/home/guest") is False
+
     def test_terminal_cwd_in_guest_home_survives_sanitize(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "guestbox")
         monkeypatch.setenv("TERMINAL_CWD", "/home/guest/project")
@@ -186,6 +215,35 @@ class TestBackendGuestSubpath:
         finally:
             tt.clear_session_cwd("sess-guest-cd")
         assert resolved == "/home/guest"
+
+
+class TestResolveTaskImage:
+    """_resolve_task_image is the single owner of the backend→image ladder
+    (terminal_tool, ensure_task_env, execute_code, file tools); pin the
+    helper itself so the ladder can't drift at any call site."""
+
+    def test_builtin_override_wins(self):
+        image = tt._resolve_task_image(
+            "docker", {"docker_image": "task:img"}, {"docker_image": "cfg:img"})
+        assert image == "task:img"
+
+    def test_builtin_falls_back_to_config(self):
+        image = tt._resolve_task_image("docker", {}, {"docker_image": "cfg:img"})
+        assert image == "cfg:img"
+
+    def test_plugin_override_resolved_when_registered(self):
+        reg.register_provider(_GuestHomeProvider())
+        image = tt._resolve_task_image("guestbox", {"guestbox_image": "guest:img"}, {})
+        assert image == "guest:img"
+
+    def test_plugin_without_override_is_empty(self):
+        reg.register_provider(_GuestHomeProvider())
+        assert tt._resolve_task_image("guestbox", {}, {}) == ""
+
+    def test_unknown_backend_is_empty(self):
+        # Not registered: an arbitrary *_image override key resolves nothing.
+        image = tt._resolve_task_image("nosuchbox", {"nosuchbox_image": "x:img"}, {})
+        assert image == ""
 
 
 def _plugin_backend_config(config_cwd="/home/guest"):
