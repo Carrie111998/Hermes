@@ -465,6 +465,10 @@ async def _lifespan(app: "FastAPI"):
     # sweeping stale sessions on schedule, independent of list requests.
     auto_archive_task = asyncio.create_task(_auto_archive_ticker_loop())
 
+    # Live curator timer — a Desktop/serve backend that stays up for days still
+    # gets weekly skill maintenance (mirrors the gateway housekeeping loop).
+    curator_task = asyncio.create_task(_curator_ticker_loop())
+
     try:
         yield
     finally:
@@ -473,6 +477,7 @@ async def _lifespan(app: "FastAPI"):
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
+        curator_task.cancel()
         await PTY_REGISTRY.close_all()
         if os.getenv("HERMES_DESKTOP") == "1":
             _terminate_desktop_managed_gateway()
@@ -12566,6 +12571,44 @@ async def _auto_archive_ticker_loop(
             _log.debug("auto-archive tick skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
+
+async def _curator_ticker_loop(
+    interval_s: float = 3600.0, initial_delay_s: float = 90.0
+) -> None:
+    """Live timer for weekly curator skill maintenance on a Desktop/serve backend.
+
+    A long-running Desktop backend (no CLI chat session, no ``hermes gateway
+    run``) previously never auto-ran the curator — the only production call
+    sites were the CLI session startup and the gateway housekeeping loop. This
+    loop is the Desktop sibling: it polls ``maybe_run_curator`` on a fixed
+    cadence so a backend that stays up for days still gets weekly skill
+    maintenance. ``maybe_run_curator`` is internally gated by
+    ``curator.interval_hours`` (7 days by default), so this is only the poll
+    rate; ``maybe_pull_skills`` is inert unless the access gate is open and a
+    sync base URL is configured. Both are best-effort and never raise.
+    """
+
+    def _tick() -> None:
+        try:
+            from agent.curator import maybe_run_curator
+
+            maybe_run_curator(
+                idle_for_seconds=float("inf"),
+                on_summary=lambda msg: _log.info("curator: %s", msg),
+            )
+        except Exception as exc:
+            _log.debug("Curator tick error: %s", exc)
+        try:
+            from tools.skills_sync_client import maybe_pull_skills
+
+            maybe_pull_skills()
+        except Exception as exc:
+            _log.debug("Sync pull tick error: %s", exc)
+
+    await asyncio.sleep(initial_delay_s)
+    while True:
+        await asyncio.to_thread(_tick)
+        await asyncio.sleep(interval_s)
 
 
 
