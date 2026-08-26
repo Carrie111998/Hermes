@@ -12330,6 +12330,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_paste_command()
         elif canonical == "image":
             self._handle_image_command(cmd_original)
+        elif canonical == "senv":
+            from hermes_cli.senv import run_senv
+
+            _senv_args = cmd_original.split(None, 1)
+            _senv_rest = _senv_args[1] if len(_senv_args) > 1 else ""
+            _senv_result = run_senv(_senv_rest, messenger=False)
+            print(f"  {_senv_result.text}")
         elif canonical == "reload":
             from hermes_cli.config import reload_env
             count = reload_env()

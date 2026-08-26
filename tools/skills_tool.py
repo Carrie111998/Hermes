@@ -545,7 +545,11 @@ def _gateway_setup_hint() -> str:
 
         return GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
     except Exception:
-        return f"Secure secret entry is not available. Load this skill in the local CLI to be prompted, or add the key to {display_hermes_home()}/.env manually."
+        return (
+            "Secure secret entry is not available over this surface. "
+            f"Use /senv KEY=VALUE to store the key in {display_hermes_home()}/.env "
+            "without sending it to the model, or load this skill in the local CLI."
+        )
 
 
 def _build_setup_note(

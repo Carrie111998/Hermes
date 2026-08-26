@@ -6137,6 +6137,9 @@ def fire_pre_command_hook(
     middleware variant ships against the #64231 command-event taxonomy.
     """
     try:
+        from hermes_cli.senv import redact_senv_hook_args
+
+        args_raw = redact_senv_hook_args(command, args_raw)
         manager = get_plugin_manager()
         if not manager.has_hook("pre_command"):
             return
