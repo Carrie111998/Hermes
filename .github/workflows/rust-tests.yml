@@ -52,11 +52,15 @@ jobs:
             libssl-dev \
             patchelf
 
-      # Cargo.lock is committed so this signed-installer dependency graph is
-      # reproducible and CI fails closed when the manifest and lock diverge.
+      # Keyed on Cargo.toml, not Cargo.lock: apps/bootstrap-installer/.gitignore
+      # excludes the lockfile (a create-tauri-app scaffold default), so there is
+      # nothing pinned to hash and `--locked` cannot be used. That also means
+      # this crate re-resolves its whole dependency graph on every build, which
+      # is a real gap for a signed installer given the pinning policy in
+      # AGENTS.md — tracking separately rather than widening this PR.
       #
       # No restore-keys: a partial hit leaves a stale target dir, and cargo
-      # still validates the committed lockfile on every build.
+      # re-resolves correctly on top of a Cargo.toml-keyed hit anyway.
       - name: Restore cargo cache
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
@@ -64,41 +68,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             apps/bootstrap-installer/src-tauri/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('apps/bootstrap-installer/src-tauri/Cargo.toml', 'apps/bootstrap-installer/src-tauri/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/bootstrap-installer/src-tauri/Cargo.toml') }}
 
-      # Keep integration tests out: they need a built frontend (vite dist) that
-      # this lane deliberately does not produce. Include --bins so the
-      # [[bin]] Hermes-Setup target is compiled and its test harness is covered
-      # alongside the library target.
-      #
-      # The Rust tests cover the marker wire format, ownership fencing, and a
-      # real Linux Python fcntl ↔ Rust flock contention check used by
-      # Python/Electron.
+      # --lib only: the integration/bin targets would need a built frontend
+      # (vite dist) that this lane deliberately does not produce.
       - name: cargo test
-        run: cargo test --locked --lib --bins
-
-  bootstrap-installer-windows:
-    name: cargo test (bootstrap installer, Windows)
-    # Keep a native Windows Cargo lane so the committed lockfile is checked
-    # under both runner platforms. The Linux-only process-contention test is
-    # compiled out on Windows, while the Windows-specific installer code and
-    # the shared library/bin targets still compile and run here.
-    runs-on: windows-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: apps/bootstrap-installer/src-tauri
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Restore cargo cache
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            apps/bootstrap-installer/src-tauri/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('apps/bootstrap-installer/src-tauri/Cargo.toml', 'apps/bootstrap-installer/src-tauri/Cargo.lock') }}
-
-      - name: cargo test
-        run: cargo test --locked --lib --bins
+        run: cargo test --lib

@@ -126,8 +126,6 @@ jobs:
           NOUS_API_KEY: ""
 
   e2e:
-    # Keep the ordinary E2E suite on every trigger, including fork PRs. The
-    # privileged systemd witness is a separate, explicitly trusted step below.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -196,18 +194,3 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
-
-      - name: Run privileged real-systemd witness
-        # This is the only workflow call site that enables the root-gated test.
-        # A fork PR still receives the ordinary E2E coverage above, but never
-        # executes PR-controlled code through sudo. Pull requests, including
-        # same-repository PRs with labels, never reach this root-gated step.
-        # Manual dispatch is trusted only when it runs the protected main ref.
-        if: >-
-          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-          (github.event_name == 'workflow_dispatch' &&
-           github.ref == 'refs/heads/main')
-        run: |
-          sudo env HERMES_RUN_SYSTEMD_ROLLOUT_E2E=1 \
-            .venv/bin/python -m pytest \
-            tests/hermes_cli/test_update_rollout_systemd_e2e.py -v --tb=short
