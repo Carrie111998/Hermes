@@ -11,8 +11,10 @@ import { test } from 'vitest'
 import { profileSshOverride } from './connection-config'
 import {
   buildSpawnCommand,
+  classifySshReuseProof,
   cleanupStale,
   connect,
+  disconnect,
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,

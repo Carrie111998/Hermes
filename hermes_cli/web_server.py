@@ -38,6 +38,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -543,6 +544,8 @@ def _resolve_session_token() -> str:
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
+_SSH_RUNTIME_PURELIB: Optional[Tuple[str, int, int]] = None
+_SSH_RUNTIME_MARKER: Optional[str] = None
 
 
 def _apply_ssh_session_token(token: str) -> None:
@@ -552,8 +555,44 @@ def _apply_ssh_session_token(token: str) -> None:
 
 
 def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
-    global _SSH_OWNER_NONCE
+    global _SSH_OWNER_NONCE, _SSH_RUNTIME_PURELIB, _SSH_RUNTIME_MARKER
     _SSH_OWNER_NONCE = nonce
+    _SSH_RUNTIME_PURELIB = None
+    _SSH_RUNTIME_MARKER = None
+    if nonce:
+        try:
+            purelib = sysconfig.get_paths()["purelib"]
+        except (KeyError, OSError):
+            return
+        # Primary identity: a marker FILE written into site-packages now.
+        # A replaced venv loses the marker deterministically, while installs
+        # into the live venv leave it untouched. A bare inode snapshot is not
+        # sufficient because ext4 can immediately reuse directory inodes.
+        try:
+            marker = os.path.join(purelib, f".hermes-ssh-runtime-{nonce}")
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(f"pid={os.getpid()}\n")
+            _SSH_RUNTIME_MARKER = marker
+        except OSError:
+            pass  # read-only site-packages — fall back to the stat snapshot
+        try:
+            st = os.stat(purelib)
+            _SSH_RUNTIME_PURELIB = (purelib, st.st_dev, st.st_ino)
+        except OSError:
+            pass
+
+
+def _ssh_runtime_intact() -> bool:
+    if _SSH_RUNTIME_MARKER is not None:
+        return os.path.isfile(_SSH_RUNTIME_MARKER)
+    if _SSH_RUNTIME_PURELIB is None:
+        return True
+    purelib, device, inode = _SSH_RUNTIME_PURELIB
+    try:
+        st = os.stat(purelib)
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (device, inode)
 
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the

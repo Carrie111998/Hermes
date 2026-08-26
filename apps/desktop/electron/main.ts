@@ -84,7 +84,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { applyConnectionChange } from './connection-apply'
+import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,

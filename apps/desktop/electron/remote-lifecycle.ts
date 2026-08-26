@@ -1157,9 +1157,11 @@ async function connect(deps) {
 export {
   adoptOwnedServedToken,
   buildSpawnCommand,
+  classifySshReuseProof,
   cleanupStale,
   connect,
   DEFAULT_READY_TIMEOUT_MS,
+  disconnect,
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,
