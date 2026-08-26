@@ -61,6 +61,48 @@ class TestCodexBuildKwargs:
 
 
 
+    def test_no_tools_strips_tool_overrides_after_request_overrides(self, transport):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.6",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            request_overrides={
+                "tools": [],
+                "tool_choice": "required",
+                "parallel_tool_calls": True,
+            },
+        )
+
+        assert "tools" not in kwargs
+        assert "tool_choice" not in kwargs
+        assert "parallel_tool_calls" not in kwargs
+
+    def test_tools_keep_default_tool_control_fields(self, transport):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "description": "Run a command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            },
+        ]
+
+        kwargs = transport.build_kwargs(
+            model="gpt-5.6",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=tools,
+        )
+
+        assert kwargs["tools"]
+        assert kwargs["tool_choice"] == "auto"
+        assert kwargs["parallel_tool_calls"] is True
+
     def test_cache_key_is_content_addressed_not_session_id(self, transport):
         """prompt_cache_key is content-addressed from the static prefix
         (instructions + tools), not the session_id. This keeps recurring cron

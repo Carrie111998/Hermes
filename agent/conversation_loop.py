@@ -37,6 +37,10 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.request_context_budget import (
+    build_request_context_budget,
+    select_request_context_window,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
@@ -1683,6 +1687,70 @@ def _redecorate_prompt_cache_for_provider(
     return messages, prepared, planned_tools
 
 
+def _apply_request_context_budget_window(
+    agent: Any,
+    api_messages: List[Dict[str, Any]],
+    *,
+    fixed_prefix_count: int,
+) -> List[Dict[str, Any]]:
+    """Apply the built-in request-only sliding window without touching history.
+
+    Fixed prompt messages (the active system prompt and ephemeral prefills) are
+    charged before history.  This closes the mid-turn undercount where dynamic
+    system prompt bytes were absent from the pressure calculation.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    context_length = getattr(compressor, "context_length", 0)
+    if isinstance(context_length, bool) or not isinstance(context_length, int) or context_length <= 0:
+        return api_messages
+
+    reserved_output = getattr(agent, "max_tokens", None)
+    if not isinstance(reserved_output, int) or isinstance(reserved_output, bool) or reserved_output < 0:
+        reserved_output = getattr(compressor, "max_tokens", 0)
+    if not isinstance(reserved_output, int) or isinstance(reserved_output, bool) or reserved_output < 0:
+        reserved_output = 0
+
+    fixed_prefix_count = max(0, min(int(fixed_prefix_count), len(api_messages)))
+    fixed_prompt_tokens = estimate_messages_tokens_rough(api_messages[:fixed_prefix_count])
+    tools = getattr(agent, "tools", None) or []
+    tool_schema_tokens = _estimate_tools_tokens_rough(tools) if tools else 0
+    budget = build_request_context_budget(
+        context_window_tokens=context_length,
+        reserved_output_tokens=reserved_output,
+        system_prompt_tokens=fixed_prompt_tokens,
+        tool_schema_tokens=tool_schema_tokens,
+        confidence="rough",
+    )
+    # Request-local observability only; this is never persisted as transcript
+    # state and is intentionally best effort for lightweight test doubles.
+    try:
+        agent._last_request_context_budget = budget
+    except Exception:
+        pass
+
+    history = api_messages[fixed_prefix_count:]
+    history_tokens = estimate_messages_tokens_rough(history)
+    if history_tokens <= budget.history_budget_tokens:
+        return api_messages
+
+    selection = select_request_context_window(
+        api_messages,
+        fixed_prefix_count=fixed_prefix_count,
+        budget=budget,
+    )
+    if selection.omitted_message_count:
+        logger.info(
+            "Request sliding window selected %s history messages (~%s tokens; "
+            "budget=%s, pinned=%s) and omitted %s older messages",
+            len(selection.messages) - fixed_prefix_count,
+            selection.selected_tokens,
+            budget.history_budget_tokens,
+            selection.pinned_tokens,
+            selection.omitted_message_count,
+        )
+    return selection.messages
+
+
 def _apply_context_engine_selection(
     agent: Any,
     api_messages: List[Dict[str, Any]],
@@ -2453,6 +2521,12 @@ def run_conversation(
                 # containers (same aliasing class as the history build).
                 api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
 
+        # System prompt and ephemeral prefill are fixed request components, not
+        # durable transcript history. Charge them before any request-only tail
+        # selection so their dynamic bytes cannot be hidden from the budget.
+        _request_fixed_prefix_count = len(api_messages) - len(messages)
+        _request_fixed_prefix_count = max(0, _request_fixed_prefix_count)
+
         # Per-turn context selection hook (additive, no-op by default).
         # Lets a context engine select/replace which context enters the
         # prompt for THIS call only — retrieval, topic routing, role/branch
@@ -2471,6 +2545,16 @@ def run_conversation(
             messages,
             _sel_incoming,
             logger=request_logger,
+        )
+
+        # Built-in Dynamic Sliding Window. This runs after an optional plugin
+        # selection so every provider request has a final request-local cap.
+        # The durable SessionDB transcript and ContextCompressor lifecycle are
+        # deliberately untouched.
+        api_messages = _apply_request_context_budget_window(
+            agent,
+            api_messages,
+            fixed_prefix_count=_request_fixed_prefix_count,
         )
 
         # Safety net: strip orphaned tool results / add stubs for missing

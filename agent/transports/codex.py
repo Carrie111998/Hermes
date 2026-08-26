@@ -660,8 +660,16 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["include"] = []
 
         request_overrides = params.get("request_overrides")
-        if request_overrides:
+        if isinstance(request_overrides, dict):
             kwargs.update(request_overrides)
+
+        # The OpenAI Responses SDK eagerly iterates ``tools``. A request with
+        # no exposed functions must omit every tool-related field, including
+        # values reintroduced by request_overrides.
+        if not response_tools:
+            kwargs.pop("tools", None)
+            kwargs.pop("tool_choice", None)
+            kwargs.pop("parallel_tool_calls", None)
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
