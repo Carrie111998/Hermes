@@ -5298,8 +5298,8 @@ def _for_each_systemd_gateway_unit(
     process_unit,
     on_unit_timeout,
 ) -> None:
-    """Process each ``hermes-gateway*.service``/``hermes-serve*.service`` unit
-    from ``systemctl list-units``.
+    """Process each ``hermes-gateway*.service``/``hermes-serve*.service``/
+    ``hermes-webui*.service`` unit from ``systemctl list-units``.
 
     ``subprocess.TimeoutExpired`` raised by ``process_unit`` is isolated to
     that unit via ``on_unit_timeout`` so one wedged systemctl call cannot
@@ -5313,15 +5313,18 @@ def _for_each_systemd_gateway_unit(
         if not unit.endswith(".service"):
             continue
         # list-units is already pattern-filtered, but keep the name gate so a
-        # stray non-gateway/serve line cannot enter the restart path.
+        # stray non-gateway/serve/webui line cannot enter the restart path.
         # ``unit.startswith("hermes-serve")`` alone would also accept the
         # unrelated ``hermes-server.service`` — require the exact base unit
-        # or the hyphenated profile family instead (review on #83595).
+        # or the hyphenated profile family instead (review on #83595). The
+        # same strict shape guards hermes-webui against ``hermes-webuid``.
         if not (
             unit == "hermes-gateway.service"
             or unit.startswith("hermes-gateway-")
             or unit == "hermes-serve.service"
             or unit.startswith("hermes-serve-")
+            or unit == "hermes-webui.service"
+            or unit.startswith("hermes-webui-")
         ):
             continue
         svc_name = unit.removesuffix(".service")
@@ -8024,7 +8027,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             # --- Systemd services (Linux) ---
             # Discover all hermes-gateway* units (default + profiles) plus
-            # hermes-serve* units (the Desktop app's backend, #83438).
+            # hermes-serve* units (the Desktop app's backend, #83438) and
+            # hermes-webui* units (the WebUI/Hermex backend).
             if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
@@ -8042,6 +8046,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 "list-units",
                                 "hermes-gateway*",
                                 "hermes-serve*",
+                                "hermes-webui*",
                                 "--plain",
                                 "--no-legend",
                                 "--no-pager",

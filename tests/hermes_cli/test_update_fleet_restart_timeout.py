@@ -140,6 +140,41 @@ class TestFleetRestartTimeoutIsolation:
 
         assert seen == ["hermes-gateway-coder"]
 
+    def test_hermes_webui_units_are_included(self):
+        # hermes update restarted hermes-gateway*/hermes-serve* but left
+        # hermes-webui* (the WebUI/Hermex backend) on stale pre-update code.
+        seen: list[str] = []
+
+        _for_each_systemd_gateway_unit(
+            "\n".join(
+                [
+                    "ssh.service loaded active running",
+                    "hermes-webui.service loaded active running",
+                    "hermes-webui-work.service loaded active running",
+                    "hermes-gateway.service loaded active running",
+                    "",
+                ]
+            ),
+            process_unit=seen.append,
+            on_unit_timeout=lambda *_: pytest.fail("unexpected timeout"),
+        )
+
+        assert seen == ["hermes-webui", "hermes-webui-work", "hermes-gateway"]
+
+    def test_hermes_webui_near_prefix_is_rejected(self):
+        # Same strict shape: a bare ``startswith("hermes-webui")`` gate would
+        # also accept ``hermes-webuid.service``. Only the exact base unit or
+        # the hyphenated profile family should pass.
+        seen: list[str] = []
+
+        _for_each_systemd_gateway_unit(
+            _list_units_stdout(["hermes-webuid"]),
+            process_unit=seen.append,
+            on_unit_timeout=lambda *_: pytest.fail("unexpected timeout"),
+        )
+
+        assert seen == []
+
 
 class TestGracefulSigusr1Eligibility:
     def test_gateway_units_are_eligible(self):
