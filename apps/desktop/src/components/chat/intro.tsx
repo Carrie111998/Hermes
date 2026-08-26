@@ -17,6 +17,7 @@ type IntroCopyRecord = IntroCopy & {
 export type IntroProps = {
   personality?: string
   seed?: number
+  spectator?: boolean
 }
 
 const NEUTRAL_PERSONALITIES = new Set(['', 'default', 'none', 'neutral'])
@@ -157,9 +158,11 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
   return pickCopy(copies, seed)
 }
 
-export function Intro({ personality, seed }: IntroProps) {
+export function Intro({ personality, seed, spectator = false }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
-  const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+  const copy = spectator
+    ? { headline: 'Hermes spectator', body: 'Select a session to view it. This iPad app is read-only.' }
+    : resolveCopy(personality, mountSeed + (seed ?? 0))
 
   return (
     <div

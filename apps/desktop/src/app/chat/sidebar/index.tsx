@@ -30,6 +30,7 @@ import { resolveProfileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronJobs } from '@/store/cron'
 import { $bindings } from '@/store/keybinds'
@@ -322,6 +323,7 @@ export function ChatSidebar({
   onTriggerCronJob
 }: ChatSidebarProps) {
   const { t } = useI18n()
+  const spectator = isBrowserSpectator()
   const s = t.sidebar
   const { pathname } = useLocation()
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
@@ -1472,7 +1474,9 @@ export function ChatSidebar({
         <SidebarGroup className="shrink-0 p-0 pb-2 pt-[calc(var(--titlebar-height)+0.375rem)]">
           <SidebarGroupContent>
             <SidebarMenu className="gap-px">
-              {[...SIDEBAR_NAV, ...contributedNav].map(item => {
+              {[...SIDEBAR_NAV, ...contributedNav]
+                .filter(item => !spectator || item.id !== 'new-session')
+                .map(item => {
                 const isInteractive = Boolean(item.action) || Boolean(item.route)
 
                 const active =
