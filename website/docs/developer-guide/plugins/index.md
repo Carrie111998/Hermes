@@ -508,6 +508,8 @@ def register(ctx):
 **What `register()` does:**
 - Called exactly once at startup
 - `ctx.register_tool()` puts your tool in the registry — the model sees it immediately
+- `ctx.replace_toolset_snapshot()` atomically refreshes a dynamic, profile-scoped
+  toolset without exposing registry internals
 - `ctx.register_hook()` subscribes to lifecycle events
 - `ctx.register_cli_command()` registers a CLI subcommand (e.g. `hermes my-plugin <subcommand>`)
 - `ctx.register_command()` registers an in-session slash command (e.g. `/myplugin <args>` inside CLI / gateway chat) — see [Register slash commands](#register-slash-commands) below
@@ -533,6 +535,80 @@ def register(ctx):
 ```
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
+
+### Refresh a dynamic toolset atomically
+
+Use `ctx.replace_toolset_snapshot()` when a real external source can add,
+change, or remove a complete set of tools while Hermes is running. Static
+plugin tools should keep using `ctx.register_tool()` during `register(ctx)`.
+
+```python
+def publish_catalog(ctx, catalog):
+    result = ctx.replace_toolset_snapshot(
+        "plugin_remote_catalog",
+        source_revision=catalog.revision,
+        entries=[
+            {
+                "name": item.registration_name,
+                "schema": item.schema,
+                "handler": item.handler,
+                "check_fn": item.check_fn,
+                "requires_env": item.requires_env,
+                "is_async": item.is_async,
+                "description": item.description,
+                "emoji": item.emoji,
+            }
+            for item in catalog.tools
+        ],
+    )
+    return result.generation
+```
+
+The public contract is:
+
+- `toolset` and `source_revision` are non-empty strings. Each entry requires
+  `name`, `schema`, and a callable `handler`; the other fields shown above are
+  optional. `requires_env` must be a list of strings, `is_async` a boolean,
+  and `description` and `emoji` strings. Unknown or mistyped fields are
+  rejected so misspelled policy or schema fields cannot be silently ignored.
+- Hermes validates the complete candidate first, then replaces the old
+  context-owned snapshot under one registry lock. Readers observe the old or
+  new complete snapshot, never a partially removed or partially added set.
+  Published schemas are detached JSON values, so later mutation of the
+  producer's nested dictionaries cannot change live definitions.
+- Names cannot collide with built-in tools, ordinary plugin registrations, or
+  another context's snapshot. This surface intentionally has no `override`
+  option; use the separately gated `ctx.register_tool(..., override=True)`
+  path for an operator-authorized static override. Hermes also reserves its
+  synthesized `tool_search`, `tool_describe`, and `tool_call` names.
+- Reusing a `source_revision` with different entries is rejected. Repeating an
+  equivalent revision and snapshot is a no-op, as is advancing the revision
+  while the entries and callback identities remain equivalent. Empty
+  snapshots still retain their revision identity even though they do not bump
+  the registry generation when no tools were present.
+- Passing `entries=[]` atomically removes every tool in this context's prior
+  snapshot. Plugin unload performs the same owned cleanup and permanently
+  revokes that context's snapshot token. Publication is bound to the host's
+  context-lifecycle generation, so an in-flight or re-entrant unload cannot
+  leave zombie tools.
+- The result is an immutable `SnapshotReplacement` with `changed`,
+  `generation`, `source_revision`, `added`, and `removed` fields.
+  `ctx.registry_generation` exposes the current generation without requiring
+  access to `registry._generation`, `_tools`, or `_lock`.
+- Ownership and profile scope come from the host-created `PluginContext`; an
+  entry cannot claim either value. Handlers still execute through normal tool
+  dispatch, hooks, approval, and result normalization.
+- A snapshot `check_fn` participates in the normal Hermes availability cache,
+  is re-evaluated while definitions are assembled, and is checked again before
+  dispatch. An unavailable projected tool is therefore neither advertised nor
+  executed. Use the existing `no_cache_check_fn` marker only for cheap local
+  state whose availability must be reflected on every lookup.
+
+Keep handler and availability callback objects stable when republishing an
+equivalent snapshot. A new callback identity is executable behavior and
+therefore requires a new publication. If schemas are versioned, include that
+version in the registration name so a name described against an old schema no
+longer resolves after refresh.
 
 ### Store settings and runtime state
 

@@ -3,6 +3,7 @@
 import logging
 import json
 import sys
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1376,6 +1377,902 @@ class TestThreadToolWhitelist:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
+    def test_replace_toolset_snapshot_publishes_one_generation(self, tmp_path):
+        """A complete plugin snapshot is published through one public mutation."""
+        from tools.registry import registry
+
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"),
+            manager,
+        )
+        generation_before = context.registry_generation
+
+        result = context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_alpha_v1",
+                    "schema": {
+                        "name": "snapshot_alpha_v1",
+                        "description": "Alpha v1",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"version": 1}',
+                },
+                {
+                    "name": "snapshot_beta_v1",
+                    "schema": {
+                        "name": "snapshot_beta_v1",
+                        "description": "Beta v1",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"version": 1}',
+                },
+            ],
+        )
+
+        assert result.changed is True
+        assert result.generation == generation_before + 1
+        assert context.registry_generation == result.generation
+        assert result.added == ("snapshot_alpha_v1", "snapshot_beta_v1")
+        assert result.removed == ()
+        assert registry.get_entry("snapshot_alpha_v1", scope=scope) is not None
+        assert registry.get_entry("snapshot_beta_v1", scope=scope) is not None
+
+        manager.unload()
+
+    def test_replace_toolset_snapshot_same_revision_is_idempotent(self, tmp_path):
+        """Re-publishing an equivalent source revision does not churn caches."""
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"),
+            manager,
+        )
+        handler = lambda args, **kwargs: '{"ok": true}'
+        entries = [
+            {
+                "name": "snapshot_stable_v1",
+                "schema": {
+                    "name": "snapshot_stable_v1",
+                    "description": "Stable schema",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                "handler": handler,
+            }
+        ]
+
+        first = context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-1", entries
+        )
+        second = context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-1", entries
+        )
+
+        assert first.changed is True
+        assert second.changed is False
+        assert second.generation == first.generation
+        assert context.registry_generation == first.generation
+
+        manager.unload()
+
+    def test_snapshot_name_cannot_be_reclaimed_by_another_plugin(self, tmp_path):
+        """A later per-tool registration cannot overwrite snapshot ownership."""
+        from tools.registry import registry
+
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        owner = PluginContext(
+            PluginManifest(name="snapshot-owner", source="user"), manager
+        )
+        contender = PluginContext(
+            PluginManifest(name="snapshot-contender", source="user"), manager
+        )
+        owner.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_owned_tool",
+                    "schema": {
+                        "name": "snapshot_owned_tool",
+                        "description": "Owned",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"owner": "snapshot"}',
+                }
+            ],
+        )
+
+        handle = contender.register_tool(
+            name="snapshot_owned_tool",
+            toolset="plugin_snapshot",
+            schema={
+                "name": "snapshot_owned_tool",
+                "description": "Contender",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: '{"owner": "contender"}',
+        )
+
+        assert handle is None
+        assert registry.dispatch("snapshot_owned_tool", {}, scope=scope) == (
+            '{"owner": "snapshot"}'
+        )
+
+        manager.unload()
+
+    def test_initial_empty_snapshot_is_a_noop(self, tmp_path):
+        """Publishing absence over absence does not advance registry state."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        generation_before = context.registry_generation
+
+        result = context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-empty", []
+        )
+
+        assert result.changed is False
+        assert result.generation == generation_before
+        assert context.registry_generation == generation_before
+        assert manager._registration_order == []
+
+        manager.unload()
+
+    def test_equivalent_snapshot_with_new_revision_does_not_churn(self, tmp_path):
+        """A producer revision may advance without republishing equal entries."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        handler = lambda args, **kwargs: '{"ok": true}'
+        entries = [
+            {
+                "name": "snapshot_equal_tool",
+                "schema": {
+                    "name": "snapshot_equal_tool",
+                    "description": "Equal",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                "handler": handler,
+            }
+        ]
+        first = context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-1", entries
+        )
+
+        second = context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-2", entries
+        )
+
+        assert second.changed is False
+        assert second.generation == first.generation
+        assert context.registry_generation == first.generation
+
+        manager.unload()
+
+    def test_snapshot_schema_is_detached_from_caller_mutation(self, tmp_path):
+        """Published nested schema state cannot change outside a publication."""
+        import copy
+
+        from hermes_cli.plugins import _plugin_home_scope
+        from model_tools import get_tool_definitions
+        from tools.registry import registry
+
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        schema = {
+            "name": "snapshot_detached_schema",
+            "description": "Detached",
+            "parameters": {
+                "type": "object",
+                "properties": {"before": {"type": "string"}},
+            },
+        }
+        result = context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_detached_schema",
+                    "schema": schema,
+                    "handler": lambda args, **kwargs: '{"ok": true}',
+                }
+            ],
+        )
+
+        schema["parameters"]["properties"]["after"] = {"type": "integer"}
+
+        entry = registry.get_entry("snapshot_detached_schema", scope=scope)
+        assert entry is not None
+        assert set(entry.schema["parameters"]["properties"]) == {"before"}
+        with pytest.raises(TypeError, match="schemas are immutable"):
+            entry.schema["parameters"]["properties"]["after"] = {
+                "type": "integer"
+            }
+        copied_schema = copy.deepcopy(entry.schema)
+        copied_schema["parameters"]["properties"]["after"] = {"type": "integer"}
+        with _plugin_home_scope(Path(scope)):
+            [definition] = get_tool_definitions(
+                enabled_toolsets=["plugin_snapshot"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        definition["function"]["parameters"]["properties"]["after"] = {
+            "type": "integer"
+        }
+        assert set(entry.schema["parameters"]["properties"]) == {"before"}
+        assert context.registry_generation == result.generation
+
+        manager.unload()
+
+    def test_empty_snapshot_revision_cannot_be_reused_for_different_content(
+        self, tmp_path
+    ):
+        """An empty revision remains an identity-bearing source checkpoint."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-empty", []
+        )
+
+        with pytest.raises(ValueError, match="already identifies a different"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot",
+                "revision-empty",
+                [
+                    {
+                        "name": "snapshot_resurrected_tool",
+                        "schema": {
+                            "name": "snapshot_resurrected_tool",
+                            "description": "Resurrected",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        "handler": lambda args, **kwargs: '{"ok": true}',
+                    }
+                ],
+            )
+
+        manager.unload()
+
+    def test_snapshot_uses_context_bound_registry(self, tmp_path):
+        """A loader can bind publication to an isolated transaction view."""
+        from tools.registry import ToolRegistry, registry
+
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        isolated = ToolRegistry()
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"),
+            manager,
+            registration_registry=isolated,
+        )
+        context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_isolated_tool",
+                    "schema": {
+                        "name": "snapshot_isolated_tool",
+                        "description": "Isolated",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"ok": true}',
+                }
+            ],
+        )
+
+        assert isolated.get_entry(
+            "snapshot_isolated_tool", scope=manager.scope_key
+        ) is not None
+        assert registry.get_entry(
+            "snapshot_isolated_tool", scope=manager.scope_key
+        ) is None
+
+        manager.unload()
+
+    def test_snapshot_refresh_removes_stale_name_and_empty_removes_all(self, tmp_path):
+        """Versioned names fail closed after refresh and disappear on empty."""
+        from tools.registry import registry
+
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        first = context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_schema_v1",
+                    "schema": {
+                        "name": "snapshot_schema_v1",
+                        "description": "Schema v1",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"version": 1}',
+                }
+            ],
+        )
+
+        second = context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-2",
+            [
+                {
+                    "name": "snapshot_schema_v2",
+                    "schema": {
+                        "name": "snapshot_schema_v2",
+                        "description": "Schema v2",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"version": 2}',
+                }
+            ],
+        )
+
+        assert second.generation == first.generation + 1
+        assert second.added == ("snapshot_schema_v2",)
+        assert second.removed == ("snapshot_schema_v1",)
+        stale_result = registry.dispatch("snapshot_schema_v1", {}, scope=scope)
+        assert isinstance(stale_result, str)
+        assert json.loads(stale_result)["error"] == "Unknown tool: snapshot_schema_v1"
+        assert registry.dispatch("snapshot_schema_v2", {}, scope=scope) == (
+            '{"version": 2}'
+        )
+
+        empty = context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-empty", []
+        )
+        assert empty.generation == second.generation + 1
+        assert empty.removed == ("snapshot_schema_v2",)
+        assert registry.get_entry("snapshot_schema_v2", scope=scope) is None
+
+        manager.unload()
+
+    def test_invalid_candidate_leaves_prior_snapshot_unchanged(self, tmp_path):
+        """The complete candidate is validated before any live mutation."""
+        from tools.registry import registry
+
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_survivor",
+                    "schema": {
+                        "name": "snapshot_survivor",
+                        "description": "Survivor",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"ok": true}',
+                }
+            ],
+        )
+        generation_before = context.registry_generation
+        duplicate = {
+            "name": "snapshot_duplicate",
+            "schema": {
+                "name": "snapshot_duplicate",
+                "description": "Duplicate",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            "handler": lambda args, **kwargs: '{"ok": true}',
+        }
+
+        with pytest.raises(ValueError, match="duplicate snapshot tool name"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot", "revision-invalid", [duplicate, duplicate]
+            )
+
+        assert context.registry_generation == generation_before
+        assert registry.dispatch("snapshot_survivor", {}, scope=scope) == (
+            '{"ok": true}'
+        )
+        assert registry.get_entry("snapshot_duplicate", scope=scope) is None
+
+        manager.unload()
+
+    def test_snapshot_entries_cannot_request_override(self, tmp_path):
+        """The snapshot surface has no path around ordinary collision policy."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        generation_before = context.registry_generation
+
+        with pytest.raises(ValueError, match="unsupported snapshot entry fields"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot",
+                "revision-1",
+                [
+                    {
+                        "name": "snapshot_override_attempt",
+                        "schema": {
+                            "name": "snapshot_override_attempt",
+                            "description": "Override attempt",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        "handler": lambda args, **kwargs: '{"ok": true}',
+                        "override": True,
+                    }
+                ],
+            )
+
+        assert context.registry_generation == generation_before
+
+    @pytest.mark.parametrize("name", ["tool_search", "tool_describe", "tool_call"])
+    def test_snapshot_rejects_progressive_disclosure_bridge_names(
+        self, tmp_path, name
+    ):
+        """Dynamic snapshots cannot shadow Hermes's synthesized bridge tools."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        generation_before = context.registry_generation
+
+        with pytest.raises(ValueError, match="reserved by Hermes"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot",
+                "revision-1",
+                [
+                    {
+                        "name": name,
+                        "schema": {
+                            "name": name,
+                            "description": "Reserved",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        "handler": lambda args, **kwargs: '{"ok": true}',
+                    }
+                ],
+            )
+
+        assert context.registry_generation == generation_before
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("requires_env", "TOKEN", "must be a list of strings"),
+            ("requires_env", ["TOKEN", 1], "must be a list of strings"),
+            ("is_async", "false", "must be a boolean"),
+            ("description", 1, "must be a string"),
+            ("emoji", 1, "must be a string"),
+        ],
+    )
+    def test_snapshot_rejects_mistyped_optional_fields(
+        self, tmp_path, field, value, message
+    ):
+        """Optional metadata is strict so malformed policy is not coerced."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        entry = {
+            "name": "snapshot_strict_tool",
+            "schema": {
+                "name": "snapshot_strict_tool",
+                "description": "Strict",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            "handler": lambda args, **kwargs: '{"ok": true}',
+            field: value,
+        }
+
+        with pytest.raises(TypeError, match=message):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot", "revision-invalid", [entry]
+            )
+
+    def test_snapshot_availability_is_rechecked_for_definitions_and_dispatch(
+        self, tmp_path
+    ):
+        """A live snapshot check cannot leave a callable stale tool behind."""
+        from hermes_cli.plugins import _plugin_home_scope
+        from model_tools import get_tool_definitions
+        from tools.registry import no_cache_check_fn, registry
+
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        available = True
+
+        @no_cache_check_fn
+        def is_available():
+            return available
+
+        context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_available_tool",
+                    "schema": {
+                        "name": "snapshot_available_tool",
+                        "description": "Availability",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"executed": true}',
+                    "check_fn": is_available,
+                }
+            ],
+        )
+
+        with _plugin_home_scope(Path(manager.scope_key)):
+            first = get_tool_definitions(
+                enabled_toolsets=["plugin_snapshot"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        assert [item["function"]["name"] for item in first] == [
+            "snapshot_available_tool"
+        ]
+        available = False
+
+        with _plugin_home_scope(Path(manager.scope_key)):
+            second = get_tool_definitions(
+                enabled_toolsets=["plugin_snapshot"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        assert second == []
+        unavailable_result = registry.dispatch(
+            "snapshot_available_tool", {}, scope=manager.scope_key
+        )
+        assert isinstance(unavailable_result, str)
+        unavailable = json.loads(unavailable_result)
+        assert unavailable["error"] == "Tool unavailable: snapshot_available_tool"
+
+        manager.unload()
+
+    def test_snapshot_names_are_isolated_by_profile_scope(self, tmp_path):
+        """Two profiles may publish the same name without sharing handlers."""
+        from tools.registry import registry
+
+        first_scope = str(tmp_path / "first")
+        second_scope = str(tmp_path / "second")
+        first_manager = PluginManager(scope_key=first_scope)
+        second_manager = PluginManager(scope_key=second_scope)
+        first = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), first_manager
+        )
+        second = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), second_manager
+        )
+        schema = {
+            "name": "snapshot_scoped_tool",
+            "description": "Scoped",
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+        first.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "first-revision",
+            [{"name": "snapshot_scoped_tool", "schema": schema,
+              "handler": lambda args, **kwargs: '"first"'}],
+        )
+        second.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "second-revision",
+            [{"name": "snapshot_scoped_tool", "schema": schema,
+              "handler": lambda args, **kwargs: '"second"'}],
+        )
+
+        assert registry.dispatch(
+            "snapshot_scoped_tool", {}, scope=first_scope
+        ) == '"first"'
+        assert registry.dispatch(
+            "snapshot_scoped_tool", {}, scope=second_scope
+        ) == '"second"'
+
+        first_manager.unload()
+        assert registry.get_entry("snapshot_scoped_tool", scope=first_scope) is None
+        assert registry.dispatch(
+            "snapshot_scoped_tool", {}, scope=second_scope
+        ) == '"second"'
+        second_manager.unload()
+
+    def test_concurrent_readers_see_old_or_new_complete_snapshot(self):
+        """Readers never observe a partially replaced projected toolset."""
+        from tools.registry import registry
+
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+
+        def entry(name):
+            return {
+                "name": name,
+                "schema": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                "handler": lambda args, **kwargs: '{"ok": true}',
+            }
+
+        old_names = frozenset({"snapshot_old_a", "snapshot_old_b"})
+        new_names = frozenset({"snapshot_new_a", "snapshot_new_b"})
+        all_names = set(old_names | new_names)
+        context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-old", [entry(name) for name in old_names]
+        )
+        start = threading.Barrier(2)
+        observed = set()
+        old_seen = threading.Event()
+        new_seen = threading.Event()
+
+        def read_snapshots():
+            start.wait(timeout=5)
+            for _ in range(10_000):
+                definitions = registry.get_definitions(all_names, quiet=True)
+                names = frozenset(
+                    item["function"]["name"] for item in definitions
+                )
+                observed.add(names)
+                if names == old_names:
+                    old_seen.set()
+                elif names == new_names:
+                    new_seen.set()
+                    return
+
+        reader = threading.Thread(target=read_snapshots)
+        reader.start()
+        start.wait(timeout=5)
+        assert old_seen.wait(timeout=5)
+        context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-new", [entry(name) for name in new_names]
+        )
+        assert new_seen.wait(timeout=5)
+        reader.join(timeout=10)
+
+        assert not reader.is_alive()
+        assert old_names in observed
+        assert new_names in observed
+        assert observed <= {old_names, new_names}
+
+        manager.unload()
+
+    def test_toolset_introspection_waits_for_complete_attribution_refresh(
+        self, monkeypatch
+    ):
+        """Registry and manager attribution are coherent to runtime readers."""
+        from hermes_cli import plugins as plugins_mod
+        from tools.registry import registry
+
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+
+        def entry(name):
+            return {
+                "name": name,
+                "schema": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                "handler": lambda args, **kwargs: '{"ok": true}',
+            }
+
+        context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-old",
+            [entry("snapshot_introspection_old")],
+        )
+        committed = threading.Event()
+        release = threading.Event()
+        original_replace = registry._replace_plugin_toolset_snapshot
+
+        def blocking_replace(**kwargs):
+            result = original_replace(**kwargs)
+            committed.set()
+            assert release.wait(timeout=5)
+            return result
+
+        monkeypatch.setattr(
+            registry, "_replace_plugin_toolset_snapshot", blocking_replace
+        )
+        monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: manager)
+        publisher = threading.Thread(
+            target=lambda: context.replace_toolset_snapshot(
+                "plugin_snapshot",
+                "revision-new",
+                [
+                    entry("snapshot_introspection_new_a"),
+                    entry("snapshot_introspection_new_b"),
+                ],
+            )
+        )
+        publisher.start()
+        assert committed.wait(timeout=5)
+        observed = []
+        reader = threading.Thread(
+            target=lambda: observed.extend(plugins_mod.get_plugin_toolsets())
+        )
+        reader.start()
+        release.set()
+        publisher.join(timeout=5)
+        reader.join(timeout=5)
+
+        assert not publisher.is_alive()
+        assert not reader.is_alive()
+        assert observed == [
+            (
+                "plugin_snapshot",
+                "🔌 Plugin Snapshot",
+                "snapshot_introspection_new_a, snapshot_introspection_new_b",
+            )
+        ]
+
+        manager.unload()
+
+    def test_unloaded_context_cannot_republish_snapshot(self, tmp_path):
+        """An ownership token is permanently revoked when its plugin unloads."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        context.replace_toolset_snapshot(
+            "plugin_snapshot",
+            "revision-1",
+            [
+                {
+                    "name": "snapshot_lifecycle_tool",
+                    "schema": {
+                        "name": "snapshot_lifecycle_tool",
+                        "description": "Lifecycle",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"ok": true}',
+                }
+            ],
+        )
+        manager.unload()
+
+        with pytest.raises(RuntimeError, match="context has been unloaded"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot", "revision-2", []
+            )
+
+    def test_unloaded_context_cannot_publish_after_initial_empty_snapshot(
+        self, tmp_path
+    ):
+        """An empty first publication still binds revocation to unload."""
+        manager = PluginManager(scope_key=str(tmp_path / "profile"))
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        context.replace_toolset_snapshot(
+            "plugin_snapshot", "revision-empty", []
+        )
+        manager.unload()
+
+        with pytest.raises(RuntimeError, match="context has been unloaded"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot",
+                "revision-1",
+                [
+                    {
+                        "name": "snapshot_late_tool",
+                        "schema": {
+                            "name": "snapshot_late_tool",
+                            "description": "Late",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        "handler": lambda args, **kwargs: '{"ok": true}',
+                    }
+                ],
+            )
+
+    def test_unload_serializes_with_inflight_snapshot_materialization(
+        self, tmp_path
+    ):
+        """Unload during materialization revokes publication before commit."""
+        from tools.registry import registry
+
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        publisher_errors = []
+
+        class BlockingEntries:
+            def __iter__(self):
+                entered.set()
+                assert release.wait(timeout=5)
+                yield {
+                    "name": "snapshot_inflight_tool",
+                    "schema": {
+                        "name": "snapshot_inflight_tool",
+                        "description": "Inflight",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"ok": true}',
+                }
+
+        def publish():
+            try:
+                context.replace_toolset_snapshot(
+                    "plugin_snapshot", "revision-1", BlockingEntries()
+                )
+            except Exception as exc:
+                publisher_errors.append(exc)
+
+        publisher = threading.Thread(target=publish)
+        publisher.start()
+        assert entered.wait(timeout=5)
+        unloader = threading.Thread(target=manager.unload)
+        unloader.start()
+        release.set()
+        publisher.join(timeout=5)
+        unloader.join(timeout=5)
+
+        assert not publisher.is_alive()
+        assert not unloader.is_alive()
+        assert len(publisher_errors) == 1
+        assert isinstance(publisher_errors[0], RuntimeError)
+        assert "context has been unloaded" in str(publisher_errors[0])
+        assert registry.get_entry("snapshot_inflight_tool", scope=scope) is None
+        with pytest.raises(RuntimeError, match="context has been unloaded"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot", "revision-late", []
+            )
+
+    def test_reentrant_unload_during_materialization_cannot_publish(self, tmp_path):
+        """A plugin-controlled iterator cannot unload and then create zombies."""
+        from tools.registry import registry
+
+        scope = str(tmp_path / "profile")
+        manager = PluginManager(scope_key=scope)
+        context = PluginContext(
+            PluginManifest(name="snapshot-plugin", source="user"), manager
+        )
+
+        class UnloadingEntries:
+            def __iter__(self):
+                assert manager.unload() is True
+                yield {
+                    "name": "snapshot_reentrant_zombie",
+                    "schema": {
+                        "name": "snapshot_reentrant_zombie",
+                        "description": "Zombie",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    "handler": lambda args, **kwargs: '{"ok": true}',
+                }
+
+        with pytest.raises(RuntimeError, match="context has been unloaded"):
+            context.replace_toolset_snapshot(
+                "plugin_snapshot", "revision-1", UnloadingEntries()
+            )
+
+        assert registry.get_entry("snapshot_reentrant_zombie", scope=scope) is None
+        assert manager.unload() is False
+
 
 
 
@@ -1603,6 +2500,79 @@ class TestPluginManagerList:
         # not by display name, so that category plugins group together.
         keys = [p["key"] for p in listing]
         assert keys == sorted(keys)
+
+    def test_discovered_plugin_reports_snapshot_tools(self, tmp_path, monkeypatch):
+        """Real discovery attributes atomically published tools to the plugin."""
+        from tools.registry import registry
+
+        home = tmp_path / "hermes_test"
+        plugins_dir = home / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "snapshot_catalog",
+            register_body=(
+                "ctx.replace_toolset_snapshot("
+                "'snapshot_catalog_tools', 'revision-1', [{"
+                "'name': 'snapshot_discovered_tool', "
+                "'schema': {'name': 'snapshot_discovered_tool', "
+                "'description': 'Discovered', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "'handler': lambda args, **kwargs: '{\"ok\": true}'"
+                "}])"
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        loaded = manager._plugins["snapshot_catalog"]
+        listing = {item["name"]: item for item in manager.list_plugins()}
+        assert loaded.tools_registered == ["snapshot_discovered_tool"]
+        assert listing["snapshot_catalog"]["tools"] == 1
+        assert registry.dispatch(
+            "snapshot_discovered_tool", {}, scope=manager.scope_key
+        ) == '{"ok": true}'
+
+        manager.unload()
+
+    def test_failed_plugin_registration_revokes_published_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """A register() exception cannot leave snapshot tools callable."""
+        from tools.registry import registry
+
+        home = tmp_path / "hermes_test"
+        plugins_dir = home / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "failing_snapshot_catalog",
+            register_body=(
+                "ctx.replace_toolset_snapshot("
+                "'failing_snapshot_tools', 'revision-1', [{"
+                "'name': 'snapshot_failed_registration_tool', "
+                "'schema': {'name': 'snapshot_failed_registration_tool', "
+                "'description': 'Must be revoked', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "'handler': lambda args, **kwargs: '{\"ok\": true}'"
+                "}]); raise RuntimeError('register failed')"
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        loaded = manager._plugins["failing_snapshot_catalog"]
+        assert loaded.enabled is False
+        assert loaded.error == "register failed"
+        assert registry.get_entry(
+            "snapshot_failed_registration_tool", scope=manager.scope_key
+        ) is None
+        assert "snapshot_failed_registration_tool" not in manager._plugin_tool_names
+        assert "failing_snapshot_catalog" not in manager._plugin_snapshot_tool_names
+
+        manager.unload()
 
 
     def test_shared_hook_name_credited_to_every_plugin(self, tmp_path, monkeypatch):
