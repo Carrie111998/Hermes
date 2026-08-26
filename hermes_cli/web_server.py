@@ -2110,20 +2110,40 @@ _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
     "bws_cache.enc.json",
     # git's credential-store helper cache (agent.file_safety blocks this too).
     ".git-credentials",
+    # Standard single-file credential stores outside HERMES_HOME (#95311):
+    # curl/wget/FTP/SMTP machine credentials ('_netrc' is the spelling curl
+    # falls back to on Windows) and npm registry auth tokens (_authToken),
+    # present at both user (~) and project level.
+    ".netrc",
+    "_netrc",
+    ".npmrc",
 })
 
-# Directory names whose entire subtree is credential material. Both canonical
-# guards deny these as directory trees, not basenames:
+# Directory names whose entire subtree is credential material. The first two
+# mirror the canonical Hermes guards as directory trees:
 #   * gateway.platforms.base._ROOT_CREDENTIAL_DIRS = {"pairing", "mcp-tokens"}
 #   * agent.file_safety.get_read_block_error (mcp-tokens/ prefix match)
-# The managed-files API lets the browser descend into subdirs, so a
-# basename-only guard would still expose e.g. ``mcp-tokens/<server>.json``
-# (live MCP OAuth tokens) and ``pairing/<x>``. We match on ANY path component
-# so these trees are blocked wherever they appear under the browsable root,
-# without needing to resolve them relative to HERMES_HOME.
+# The rest (#95311) are the standard OS/tool credential homes, where every
+# file is secret material: SSH private keys (any name — ``id_ed25519``,
+# custom), the whole AWS/GnuPG/kube/docker/azure state trees, and the XDG
+# stores gcloud/gh/tailscale. They are matched on ANY path component like
+# mcp-tokens/pairing, so these trees are blocked wherever they appear under
+# the browsable root without needing to resolve them relative to HERMES_HOME
+# or HOME. Exact-component match keeps shared parents browsable: the guard
+# fires on the ``gcloud``/``gh``/``tailscale`` component inside ``~/.config``
+# while the rest of ``.config`` stays listable.
 _SENSITIVE_MANAGED_DIR_NAMES = frozenset({
     "mcp-tokens",
     "pairing",
+    ".ssh",       # private keys, agent sockets, known_hosts
+    ".aws",       # credentials, config, SSO/token cache
+    ".gnupg",     # keyrings, private-keys-v1.d, trustdb
+    ".kube",      # cluster admin credentials (config, cache tokens)
+    ".docker",    # registry auth (config.json auths section)
+    ".azure",     # MSAL token cache, service-principal creds
+    "gcloud",     # ~/.config/gcloud — SA keys, credentials.db
+    "gh",         # ~/.config/gh — hosts.yml OAuth tokens
+    "tailscale",  # ~/.config/tailscale — tailcaled.state node keys
 })
 
 
@@ -2139,8 +2159,9 @@ def _is_sensitive_filename(name: str) -> bool:
     the guard.
 
     Basename-only: for the directory-tree credential stores
-    (``mcp-tokens/``, ``pairing/``) that the canonical guards also deny,
-    use :func:`_is_sensitive_path`, which the API call sites route through.
+    (``mcp-tokens/``, ``pairing/`` and the standard OS/tool credential homes
+    in ``_SENSITIVE_MANAGED_DIR_NAMES``) use :func:`_is_sensitive_path`,
+    which the API call sites route through.
     """
     lowered = name.lower()
     if lowered == ".env" or lowered.startswith(".env.") or lowered == ".envrc":
@@ -2154,11 +2175,13 @@ def _is_sensitive_path(path: Path) -> bool:
     Combines the basename denylist (:func:`_is_sensitive_filename`) with a
     credential-directory-tree check: a path is sensitive if its own basename
     is sensitive OR any of its path components is a credential directory
-    (``mcp-tokens`` / ``pairing``). The component match is case-insensitive
-    and needs no HERMES_HOME resolution, so it blocks these trees wherever
-    they sit under the operator-configured managed root — closing the gap
-    the canonical guards cover as directory trees but a basename-only check
-    would miss.
+    (the Hermes-internal trees plus the standard OS/tool credential homes —
+    see ``_SENSITIVE_MANAGED_DIR_NAMES``). The component match is
+    case-insensitive and needs no HERMES_HOME resolution, so it blocks these
+    trees wherever they sit under the operator-configured managed root —
+    closing the gap the canonical guards cover as directory trees but a
+    basename-only check would miss (e.g. ``~/.ssh/id_ed25519`` or
+    ``~/.kube/config``, whose basenames are innocuous).
 
     Read-side only: this guards list/read/download (the #57505 exfil surface).
     The write endpoints (upload/mkdir/delete) are a separate threat class
