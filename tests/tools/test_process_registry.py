@@ -916,7 +916,7 @@ class TestSpawnRewriteCompoundBackground:
         assert "sleep 5 &" in shell_cmd
 
     def test_pty_path_uses_rewritten_command(self, registry):
-        """PTY spawn path must also use the rewritten command (issue #68915)."""
+        """An ineligible approval bridge must preserve the PTY rewrite."""
         mock_pty_proc = MagicMock()
         mock_pty_proc.pid = 5555
 
@@ -925,6 +925,9 @@ class TestSpawnRewriteCompoundBackground:
 
         fake_thread = MagicMock()
         fake_thread.daemon = False
+        # Exercise the bridge-selection path with a live gateway sink. This
+        # non-Codex command must be returned unchanged *after* safe rewriting.
+        registry.on_approval = MagicMock()
 
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch.dict("sys.modules", {"ptyprocess": mock_pty_module}), \
