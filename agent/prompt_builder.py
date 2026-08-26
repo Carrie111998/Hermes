@@ -2167,17 +2167,18 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}")
 
         result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
+            "## Skills\n"
+            "Before replying, scan the skill index below and load selectively. Load one "
+            "primary skill with skill_view(name) when the task is complex or ambiguous, or "
+            "when a matching skill likely encodes non-obvious pitfalls, a specialized "
+            "workflow, or the user's quality standards (e.g. code review, planning, testing) — "
+            "there the skill defines how the work should be done here. Load additional skills "
+            "only when carrying out the task materially depends on them. Skip loading for "
+            "straightforward one-line commands, status checks, or single tool calls you can "
+            "already handle directly.\n"
+            "Do not reload a skill you already loaded earlier in this session while its "
+            "content is unchanged. Reload it only when it was pruned, its content changed, or "
+            "the Skill Safety Rule above requires re-checking it with skill_view(name).\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
@@ -2192,7 +2193,7 @@ def _build_skills_system_prompt_inner(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "When no skill meets the bar above, proceed without loading one."
             + hidden_note
         )
 

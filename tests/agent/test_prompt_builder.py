@@ -365,6 +365,66 @@ class TestBuildSkillsSystemPrompt:
         assert "cached-skill" not in second
 
 
+    def _skills_policy_text(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "policy-probe"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: policy-probe\ndescription: Probe policy wording\n---\n"
+        )
+        return build_skills_system_prompt()
+
+    def test_selective_loading_policy_wording(self, monkeypatch, tmp_path):
+        """The policy describes selective loading, not blanket loading."""
+        result = self._skills_policy_text(monkeypatch, tmp_path)
+        lowered = result.lower()
+        # Load selectively, keyed to task complexity/ambiguity.
+        assert "load selectively" in lowered
+        assert "one primary skill" in lowered
+        assert "complex" in lowered and "ambiguous" in lowered
+        # Non-obvious pitfalls / specialized workflow / quality standards trigger.
+        assert "non-obvious pitfalls" in lowered
+        assert "specialized workflow" in lowered
+        assert "quality standards" in lowered
+        # Additional skills only when execution materially depends.
+        assert "additional skills only when" in lowered
+        assert "materially depends" in lowered
+        # Skip straightforward one-liners / status / single tool calls.
+        assert "straightforward one-line commands" in lowered
+        assert "status checks" in lowered
+        assert "single tool call" in lowered
+
+    def test_no_blanket_loading_phrases(self, monkeypatch, tmp_path):
+        """Old blanket-loading phrases must be gone (any apostrophe variant)."""
+        result = self._skills_policy_text(monkeypatch, tmp_path)
+        assert "even partially relevant" not in result
+        # Cover both straight and curly apostrophes in the source phrasing.
+        assert "always better to have context you don't need" not in result
+        assert "always better to have context you don’t need" not in result
+
+    def test_no_reload_of_unchanged_skill_policy(self, monkeypatch, tmp_path):
+        """Do not reload an unchanged skill unless pruned/changed/required."""
+        result = self._skills_policy_text(monkeypatch, tmp_path)
+        lowered = result.lower()
+        assert "do not reload" in lowered
+        # Unchanged-skill no-reload must be explicit.
+        assert "unchanged" in lowered
+        assert "pruned" in lowered
+        assert "changed" in lowered
+        assert "skill safety rule" in lowered
+
+    def test_preserves_hermes_agent_first_requirement(self, monkeypatch, tmp_path):
+        """Hermes setup/config/troubleshooting still loads hermes-agent first."""
+        result = self._skills_policy_text(monkeypatch, tmp_path)
+        assert "`hermes-agent` skill" in result
+        assert "troubleshoot Hermes Agent" in result
+        assert "first" in result.lower()
+
+    def test_preserves_skill_maintenance_guidance(self, monkeypatch, tmp_path):
+        """Skill repair and post-difficult-task maintenance guidance survives."""
+        result = self._skills_policy_text(monkeypatch, tmp_path)
+        assert "skill_manage(action='patch')" in result
+        assert "offer to save as a skill" in result
 
 
 
