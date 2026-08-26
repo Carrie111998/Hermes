@@ -121,3 +121,17 @@ def test_desktop_relaunch_waits_for_an_in_place_rebuild() -> None:
     assert "if ((Get-Date) -ge $relaunchDeadline)" in body
     assert "Start-Sleep -Milliseconds 500" in body
     assert "[System.Windows.Forms.Application]::DoEvents()" in body
+
+
+def test_successful_update_repairs_both_desktop_shortcuts() -> None:
+    source = _read()
+
+    assert "function Repair-DesktopShortcuts {" in source
+    assert (
+        'Join-Path $InstallRoot "apps\\desktop\\release\\win-unpacked\\Hermes.exe"'
+        in source
+    )
+    assert "GetFolderPath('Programs')" in source
+    assert "GetFolderPath('Desktop')" in source
+    assert "$shortcutRepairOk = Repair-DesktopShortcuts" in source
+    assert "if (-not $shortcutRepairOk)" in source

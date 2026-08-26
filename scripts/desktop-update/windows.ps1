@@ -841,6 +841,61 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     return @{ Code = $proc.ExitCode; Output = $all }
 }
 
+function Repair-DesktopShortcuts {
+    # The in-app updater rebuilds the packed Desktop app in-place under
+    # apps\desktop\release. Keep the user-facing links aligned with that
+    # location after every successful update; otherwise they can retain a
+    # deleted date-stamped release path from the previous build.
+    $desktopExe = Join-Path $InstallRoot "apps\desktop\release\win-unpacked\Hermes.exe"
+    if (-not (Test-Path -LiteralPath $desktopExe)) {
+        Write-HandoffLog "WARNING: cannot repair Hermes shortcuts; packed executable is missing: $desktopExe"
+        return $false
+    }
+
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $workDir = Split-Path -Parent $desktopExe
+        $iconIco = Join-Path $workDir "resources\icon.ico"
+        $iconLocation = if (Test-Path -LiteralPath $iconIco) {
+            "$iconIco,0"
+        } else {
+            "$desktopExe,0"
+        }
+        $targets = @(
+            (Join-Path ([Environment]::GetFolderPath('Programs')) 'Hermes.lnk'),
+            (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Hermes.lnk')
+        )
+        $allOk = $true
+
+        foreach ($lnkPath in $targets) {
+            try {
+                $parent = Split-Path -Parent $lnkPath
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+                }
+                $sc = $shell.CreateShortcut($lnkPath)
+                $sc.TargetPath = $desktopExe
+                $sc.WorkingDirectory = $workDir
+                $sc.IconLocation = $iconLocation
+                $sc.Description = 'Hermes Agent'
+                $sc.Save()
+                Write-HandoffLog "shortcut repaired: $lnkPath -> $desktopExe"
+            } catch {
+                $allOk = $false
+                Write-HandoffLog "WARNING: could not repair shortcut $lnkPath : $($_.Exception.Message)"
+            }
+        }
+
+        # Best-effort icon-cache refresh; never turn a successful update into a
+        # failed one over a cosmetic shell refresh.
+        try { & ie4uinit.exe -show 2>$null } catch {}
+        return $allOk
+    } catch {
+        Write-HandoffLog "WARNING: skipping shortcut repair: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 $finalCode = 1
 $finalMsg = "update did not complete"
 
@@ -1171,6 +1226,12 @@ try {
     #   3. only then the terminal UI state — done means "Hermes is back",
     #      manual means "it is not, reopen it", error is error (and still
     #      tries to bring the app back after showing itself).
+    if ($finalCode -eq 0) {
+        $shortcutRepairOk = Repair-DesktopShortcuts
+        if (-not $shortcutRepairOk) {
+            $finalMsg = "Update complete. Hermes shortcuts could not be repaired; reopen Hermes manually."
+        }
+    }
     Write-Result ($finalCode -eq 0) $finalCode $finalMsg
     Remove-MarkerIfOwned
     if ($finalCode -ne 0) {
