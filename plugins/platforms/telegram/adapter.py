@@ -4333,6 +4333,14 @@ class TelegramAdapter(BasePlatformAdapter):
             },
         }
 
+    @staticmethod
+    def _is_rich_message_inbound(message: Any) -> bool:
+        """Return whether a Message carries a rich-only inbound body."""
+        if getattr(message, "text", None) or getattr(message, "caption", None):
+            return False
+        api_kwargs = getattr(message, "api_kwargs", None) or {}
+        return isinstance(api_kwargs.get("rich_message"), dict)
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app``.
 
@@ -4350,10 +4358,7 @@ class TelegramAdapter(BasePlatformAdapter):
             """Match Bot API 10.x rich_message bodies with no plain text."""
 
             def filter(self, message):
-                if getattr(message, "text", None) or getattr(message, "caption", None):
-                    return False
-                kw = getattr(message, "api_kwargs", None) or {}
-                return isinstance(kw.get("rich_message"), dict)
+                return TelegramAdapter._is_rich_message_inbound(message)
 
         # Bot API 10.x premium/formatted clients deliver long texts as
         # message.rich_message WITHOUT msg.text, so filters.TEXT never
@@ -8980,7 +8985,13 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
 
     @classmethod
-    def _extract_bot_mention_usernames(cls, message: Message, self_username: str = "") -> set[str]:
+    def _extract_bot_mention_usernames(
+        cls,
+        message: Message,
+        self_username: str = "",
+        *,
+        text_override: Optional[str] = None,
+    ) -> set[str]:
         """Extract explicit Telegram bot usernames mentioned in text/captions.
 
         Foreign handles are only treated as bot mentions when they look
@@ -9005,7 +9016,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(cls._FOREIGN_BOT_HANDLE_RE.fullmatch(handle))
 
         def _iter_sources():
-            yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
+            message_text = getattr(message, "text", None) or ""
+            if text_override is not None:
+                # rich_message is rendered locally, so Telegram's entity offsets
+                # cannot be trusted against the normalized replacement text.
+                text_entities = (
+                    (getattr(message, "entities", None) or [])
+                    if text_override == message_text
+                    else []
+                )
+                yield text_override, text_entities
+            else:
+                yield message_text, getattr(message, "entities", None) or []
             yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
 
         for source_text, entities in _iter_sources():
@@ -9062,7 +9084,7 @@ class TelegramAdapter(BasePlatformAdapter):
         except UnicodeDecodeError:
             return ""
 
-    def _message_mentions_bot(self, message: Message) -> bool:
+    def _message_mentions_bot(self, message: Message, *, text_override: Optional[str] = None) -> bool:
         if not self._bot:
             return False
 
@@ -9071,7 +9093,18 @@ class TelegramAdapter(BasePlatformAdapter):
         expected = f"@{bot_username}" if bot_username else None
 
         def _iter_sources():
-            yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
+            message_text = getattr(message, "text", None) or ""
+            if text_override is not None:
+                # See _extract_bot_mention_usernames: rendered rich_message text
+                # has no reliable one-to-one mapping to Telegram entity offsets.
+                text_entities = (
+                    (getattr(message, "entities", None) or [])
+                    if text_override == message_text
+                    else []
+                )
+                yield text_override, text_entities
+            else:
+                yield message_text, getattr(message, "entities", None) or []
             yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
 
         # Telegram parses mentions server-side and emits MessageEntity objects
@@ -9115,7 +9148,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     if command_text[at_index:].strip().lower() == expected:
                         return True
         if bot_username:
-            return bot_username in self._extract_bot_mention_usernames(message, bot_username)
+            return bot_username in self._extract_bot_mention_usernames(
+                message,
+                bot_username,
+                text_override=text_override,
+            )
         return False
 
     def _schedule_bot_identity_recheck(self) -> None:
@@ -9145,7 +9182,12 @@ class TelegramAdapter(BasePlatformAdapter):
             tracked.add(task)
             task.add_done_callback(tracked.discard)
 
-    def _explicit_bot_mentions_exclude_self(self, message: Message) -> bool:
+    def _explicit_bot_mentions_exclude_self(
+        self,
+        message: Message,
+        *,
+        text_override: Optional[str] = None,
+    ) -> bool:
         """Return True when explicit bot handles target other bots, not this one.
 
         Telegram groups can contain several Hermes bot profiles. A message like
@@ -9167,7 +9209,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not bot_username:
             return False
 
-        mentioned_bot_usernames = self._extract_bot_mention_usernames(message, bot_username)
+        mentioned_bot_usernames = self._extract_bot_mention_usernames(
+            message,
+            bot_username,
+            text_override=text_override,
+        )
         excludes_self = bool(mentioned_bot_usernames) and bot_username not in mentioned_bot_usernames
         if excludes_self:
             # Either the message really is for another bot, or our cached
@@ -9177,10 +9223,16 @@ class TelegramAdapter(BasePlatformAdapter):
             self._schedule_bot_identity_recheck()
         return excludes_self
 
-    def _message_matches_mention_patterns(self, message: Message) -> bool:
+    def _message_matches_mention_patterns(
+        self,
+        message: Message,
+        *,
+        text_override: Optional[str] = None,
+    ) -> bool:
         if not self._mention_patterns:
             return False
-        for candidate in (getattr(message, "text", None), getattr(message, "caption", None)):
+        text = text_override if text_override is not None else getattr(message, "text", None)
+        for candidate in (text, getattr(message, "caption", None)):
             if not candidate:
                 continue
             for pattern in self._mention_patterns:
@@ -9188,13 +9240,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     return True
         return False
 
-    def _is_guest_mention(self, message: Message) -> bool:
+    def _is_guest_mention(self, message: Message, *, text_override: Optional[str] = None) -> bool:
         """Return True for the narrow guest-mode bypass: explicit bot mention.
 
         The caller (:meth:`_should_process_message`) has already verified
         the message is a group chat, so that check is not repeated here.
         """
-        return self._telegram_guest_mode() and self._message_mentions_bot(message)
+        return self._telegram_guest_mode() and self._message_mentions_bot(
+            message,
+            text_override=text_override,
+        )
 
     def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
         bot_username = self._current_bot_username()
@@ -9204,7 +9259,12 @@ class TelegramAdapter(BasePlatformAdapter):
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
-    def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
+    def _should_observe_unmentioned_group_message(
+        self,
+        message: Message,
+        *,
+        text_override: Optional[str] = None,
+    ) -> bool:
         """Return True when a group message should be stored but not dispatched."""
         if self._is_own_message(message):
             return False
@@ -9228,7 +9288,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
-        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(
+            message,
+            text_override=text_override,
+        ):
             return False
 
         allowed = self._telegram_observe_allowed_chats()
@@ -9251,9 +9314,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._is_reply_to_bot(message):
             return False
-        if self._message_mentions_bot(message):
+        if self._message_mentions_bot(message, text_override=text_override):
             return False
-        if self._message_matches_mention_patterns(message):
+        if self._message_matches_mention_patterns(message, text_override=text_override):
             return False
         return True
 
@@ -9547,7 +9610,13 @@ class TelegramAdapter(BasePlatformAdapter):
         user_id = getattr(from_user, "id", None)
         return bot_id is not None and user_id is not None and bot_id == user_id
 
-    def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
+    def _should_process_message(
+        self,
+        message: Message,
+        *,
+        is_command: bool = False,
+        text_override: Optional[str] = None,
+    ) -> bool:
         """Apply Telegram group trigger rules.
 
         DMs remain unrestricted. Group/supergroup messages are accepted when:
@@ -9611,12 +9680,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
-        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(
+            message,
+            text_override=text_override,
+        ):
             return False
 
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
-        guest_mention = self._is_guest_mention(message)
+        guest_mention = self._is_guest_mention(message, text_override=text_override)
 
         # allowed_chats check (whitelist). When set, group messages from chats
         # outside the whitelist are ignored unless guest_mode permits this
@@ -9637,9 +9709,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         # When guest_mode is True, _is_guest_mention already called
         # _message_mentions_bot above — skip the redundant second call.
-        if not self._telegram_guest_mode() and self._message_mentions_bot(message):
+        if not self._telegram_guest_mode() and self._message_mentions_bot(
+            message,
+            text_override=text_override,
+        ):
             return True
-        return self._message_matches_mention_patterns(message)
+        return self._message_matches_mention_patterns(message, text_override=text_override)
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
@@ -9718,7 +9793,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                     )
                                 elif label:
                                     lines.append(f"{indent}{label}")
-                        continue
+                        # Fall through so a future list block carrying its own
+                        # text or sibling blocks does not silently lose content.
                     text = block.get("text")
                     if isinstance(text, str) and text.strip():
                         lines.append(indent + text)
@@ -9739,30 +9815,10 @@ class TelegramAdapter(BasePlatformAdapter):
         them into a single MessageEvent before dispatching.
         """
         msg = self._effective_update_message(update)
-        if not msg or not msg.text:
-            if msg is not None:
-                rich_text = self._recover_rich_message_inbound_text(msg)
-                if rich_text:
-                    try:
-                        # PTB freezes TelegramObject attributes; bypass the
-                        # frozen __setattr__ to attach the rendered body.
-                        object.__setattr__(msg, "text", rich_text)
-                    except Exception:
-                        logger.warning(
-                            "rich_message recovery could not attach text",
-                            exc_info=True,
-                        )
-                        return
-                    logger.info(
-                        "[Telegram] Recovered rich_message inbound text (%d chars)",
-                        len(rich_text),
-                    )
-            if not msg or not msg.text:
-                return
-        # Early user-level auth check: reject unauthorized users before any
-        # text batching, observe-buffer persistence, event building, or response
-        # generation. This prevents removed/blocked users from injecting prompts
-        # into the agent path or the observed transcript context (#40863).
+        if not msg:
+            return
+        # Reject unauthorized users before rich_message recovery, batching,
+        # observed-context persistence, event building, or response generation.
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
@@ -9770,13 +9826,41 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(msg):
-            if self._should_observe_unmentioned_group_message(msg):
-                self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
-            return
-        await self._ensure_forum_commands(update.message)
 
-        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        # Keep the raw PTB Message truthful: rich_message has no msg.text.
+        # The recovered body belongs in Hermes' normalized MessageEvent instead.
+        effective_text = msg.text or self._recover_rich_message_inbound_text(msg)
+        if not effective_text:
+            return
+        if not msg.text:
+            logger.info(
+                "[Telegram] Recovered rich_message inbound text (%d chars)",
+                len(effective_text),
+            )
+
+        if not self._should_process_message(msg, text_override=effective_text):
+            if self._should_observe_unmentioned_group_message(msg, text_override=effective_text):
+                observed_event = self._build_message_event(
+                    msg,
+                    MessageType.TEXT,
+                    update_id=update.update_id,
+                    text_override=effective_text,
+                )
+                self._observe_unmentioned_group_message(
+                    msg,
+                    MessageType.TEXT,
+                    update_id=update.update_id,
+                    event=observed_event,
+                )
+            return
+        await self._ensure_forum_commands(msg)
+
+        event = self._build_message_event(
+            msg,
+            MessageType.TEXT,
+            update_id=update.update_id,
+            text_override=effective_text,
+        )
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -10627,6 +10711,8 @@ class TelegramAdapter(BasePlatformAdapter):
         message: Message,
         msg_type: MessageType,
         update_id: Optional[int] = None,
+        *,
+        text_override: Optional[str] = None,
     ) -> MessageEvent:
         """Build a MessageEvent from a Telegram message.
 
@@ -10777,7 +10863,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         return MessageEvent(
-            text=message.text or "",
+            text=text_override if text_override is not None else (message.text or ""),
             message_type=msg_type,
             source=source,
             raw_message=message,

@@ -9,7 +9,9 @@ dropped. These tests lock in both halves of the fix:
 2. ``_RichMessageInboundFilter`` matches only rich_message-only updates.
 """
 
+import asyncio
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,9 +43,7 @@ def _load_real_ptb():
             pytest.skip("real python-telegram-bot unavailable")
         # Keep the real package alive under a private name and restore whatever
         # the conftest had installed so other suites are unaffected.
-        ext = importlib.import_module("telegram.ext")
         sys.modules["_real_telegram_for_rich_tests"] = mod
-        sys.modules["_real_telegram_for_rich_tests_ext"] = ext
         return mod
     finally:
         for k, v in saved.items():
@@ -51,9 +51,9 @@ def _load_real_ptb():
 
 
 _real_telegram = _load_real_ptb()
-_real_telegram_ext = sys.modules["_real_telegram_for_rich_tests_ext"]
 Message = _real_telegram.Message  # noqa: E402
 Update = _real_telegram.Update  # noqa: E402
+Chat = _real_telegram.Chat  # noqa: E402
 
 
 RICH_BLOCKS = {
@@ -94,6 +94,15 @@ def _rich_message(**kwargs):
         chat={"id": 12345, "type": "private"},
         api_kwargs={"rich_message": RICH_BLOCKS},
     )
+
+
+def _event_adapter():
+    """Build the narrow adapter fixture needed by _build_message_event."""
+    adapter = _make_adapter()
+    adapter.config = SimpleNamespace(extra={})
+    adapter.build_source = lambda **_kwargs: SimpleNamespace()
+    adapter._effective_message_thread_id = lambda _message: None
+    return adapter
 
 
 class TestRecoverRichMessageInboundText:
@@ -153,53 +162,107 @@ class TestRecoverRichMessageInboundText:
         assert "- first line" in out
         assert "\n  second line" in out
 
-
-class TestAttachRecoveredText:
-    def test_object_setattr_attaches_to_frozen_message(self):
-        # PTB freezes Message attributes; the handler must bypass via
-        # object.__setattr__ so downstream code can read msg.text.
-        msg = _rich_message()
+    def test_list_keeps_own_text_and_sibling_blocks(self):
         adapter = _make_adapter()
-        text = adapter._recover_rich_message_inbound_text(msg)
-        object.__setattr__(msg, "text", text)
-        assert msg.text == text
+        msg = Message(message_id=1, date=0, chat={"id": 1, "type": "private"},
+                      api_kwargs={"rich_message": {"blocks": [
+                          {"type": "list", "text": "list title", "blocks": [
+                              {"type": "paragraph", "text": "sibling block"}],
+                           "items": [{"label": "-", "blocks": [
+                               {"type": "paragraph", "text": "list item"}]}]},
+                      ]}})
+        out = adapter._recover_rich_message_inbound_text(msg)
+        assert out == "- list item\nlist title\nsibling block"
+
+
+class TestRecoveredTextNormalisation:
+    def test_build_event_uses_override_and_preserves_raw_message(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = _event_adapter()
+        msg = Message(
+            message_id=1,
+            date=0,
+            chat=Chat(id=12345, type="private"),
+            api_kwargs={"rich_message": RICH_BLOCKS},
+        )
+        recovered = adapter._recover_rich_message_inbound_text(msg)
+        event = adapter._build_message_event(msg, MessageType.TEXT, text_override=recovered)
+
+        assert recovered is not None
+        assert msg.text is None
+        assert event.raw_message is msg
+        assert event.text == recovered
+
+    def test_handler_enqueues_recovered_text_without_mutating_raw_message(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = _event_adapter()
+        msg = Message(
+            message_id=1,
+            date=0,
+            chat=Chat(id=12345, type="private"),
+            api_kwargs={"rich_message": RICH_BLOCKS},
+        )
+        update = Update(update_id=1, message=msg)
+        queued = []
+        seen = {}
+
+        adapter._is_user_authorized_from_message = lambda _message: True
+        adapter._should_process_message = lambda _message, **kwargs: seen.update(kwargs) or True
+        adapter._clean_bot_trigger_text = lambda text: text
+        adapter._apply_telegram_group_observe_attribution = lambda event: event
+        adapter._enqueue_text_event = queued.append
+
+        async def _noop(*_args, **_kwargs):
+            return None
+
+        adapter._ensure_forum_commands = _noop
+        adapter._cache_replied_media = _noop
+
+        asyncio.run(adapter._handle_text_message(update, None))
+
+        assert seen["text_override"] == adapter._recover_rich_message_inbound_text(msg)
+        assert len(queued) == 1
+        assert queued[0].message_type == MessageType.TEXT
+        assert queued[0].text == seen["text_override"]
+        assert queued[0].raw_message is msg
+        assert msg.text is None
+
+    def test_recovered_text_participates_in_bot_mention_detection(self):
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(id=7)
+        adapter._current_bot_username = lambda: "hermesbot"
+        msg = _rich_message()
+
+        assert adapter._message_mentions_bot(msg, text_override="@hermesbot hello")
 
 
 class TestRichMessageInboundFilter:
     def _filter(self):
-        # Re-create the filter class exactly as registered, using the REAL
-        # PTB filters module (sys.modules["telegram"] may be a conftest mock).
-        filters = _real_telegram_ext.filters
+        # The nested registration filter delegates to this production predicate;
+        # testing it directly prevents a copied test-only implementation drifting.
+        from plugins.platforms.telegram.adapter import TelegramAdapter
 
-        class _RichMessageInboundFilter(filters.MessageFilter):
-            def filter(self, message):
-                if getattr(message, "text", None) or getattr(message, "caption", None):
-                    return False
-                kw = getattr(message, "api_kwargs", None) or {}
-                return isinstance(kw.get("rich_message"), dict)
-
-        return _RichMessageInboundFilter()
-
-    def _update(self, msg):
-        return Update(update_id=1, message=msg)
+        return TelegramAdapter._is_rich_message_inbound
 
     def test_matches_rich_only_update(self):
         f = self._filter()
-        assert f.check_update(self._update(_rich_message())) == 1
+        assert f(_rich_message()) is True
 
     def test_ignores_plain_text_update(self):
         f = self._filter()
         msg = Message(message_id=1, date=0, chat={"id": 1, "type": "private"})
         object.__setattr__(msg, "text", "hello")
-        assert not f.check_update(self._update(msg))
+        assert f(msg) is False
 
     def test_ignores_caption_update(self):
         f = self._filter()
         msg = Message(message_id=1, date=0, chat={"id": 1, "type": "private"})
         object.__setattr__(msg, "caption", "cap")
-        assert not f.check_update(self._update(msg))
+        assert f(msg) is False
 
     def test_ignores_message_without_anything(self):
         f = self._filter()
         msg = Message(message_id=1, date=0, chat={"id": 1, "type": "private"})
-        assert not f.check_update(self._update(msg))
+        assert f(msg) is False
