@@ -2098,6 +2098,71 @@ class TestWebServerEndpoints:
         contents = [m["content"] for m in resp.json()["messages"]]
         assert contents == ["old q", "old a", "summary", "live q", "live a"]
 
+    def test_get_session_messages_projects_and_dedupes_composite_carrier(self):
+        from agent.context_compressor import (
+            HISTORICAL_TASK_HEADING,
+            SUMMARY_PREFIX,
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+            _SUMMARY_END_MARKER,
+        )
+        from hermes_state import SessionDB
+
+        handoff = (
+            f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n"
+            f"{_SUMMARY_END_MARKER}"
+        )
+        carrier = f"{handoff}\n\nREAL ASK"
+        assistant_carrier = (
+            f"{_MERGED_PRIOR_CONTEXT_HEADER}\n"
+            "real completed answer\n\n"
+            f"{_MERGED_SUMMARY_DELIMITER}\n\n{handoff}"
+        )
+        db = SessionDB()
+        try:
+            db.create_session(session_id="compacted-carrier-display", source="desktop")
+            db.append_message(
+                "compacted-carrier-display",
+                "user",
+                "REAL ASK",
+                timestamp=123.0,
+            )
+            db.archive_and_compact(
+                "compacted-carrier-display",
+                [{"role": "user", "content": carrier, "timestamp": 123.0}],
+            )
+            db.append_message(
+                "compacted-carrier-display",
+                "user",
+                handoff,
+                timestamp=124.0,
+            )
+            db.append_message(
+                "compacted-carrier-display",
+                "assistant",
+                assistant_carrier,
+                timestamp=125.0,
+            )
+            active_id = db.get_messages("compacted-carrier-display")[0]["id"]
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions/compacted-carrier-display/messages"
+            "?include_compacted=true"
+        )
+        assert resp.status_code == 200
+        messages = resp.json()["messages"]
+        assert len(messages) == 3
+        assert messages[0]["id"] == active_id
+        assert messages[0]["content"] == carrier
+        assert messages[0]["display_content"] == "REAL ASK"
+        assert not messages[0].get("display_kind")
+        assert messages[1]["content"] == handoff
+        assert messages[1]["display_kind"] == "hidden"
+        assert messages[2]["content"] == assistant_carrier
+        assert messages[2]["display_content"] == "real completed answer"
+
     def test_get_session_messages_latest_page_with_compacted_rows(self):
         """The desktop's real read path (getLatestSessionMessages: limit +
         order=latest + include_compacted=true) pages back from the newest
@@ -5005,3 +5070,47 @@ class TestSessionPatchUnread:
         # a string outside the accepted set to prove validation rejects it.
         resp = self.auth_client.patch("/api/sessions/s1", json={"unread": "maybe"})
         assert resp.status_code == 422  # pydantic validation
+
+    def test_patch_hidden_updates_persisted_session_without_live_runtime(self):
+        resp = self.auth_client.patch("/api/sessions/s1", json={"hidden": True})
+        assert resp.status_code == 200
+        assert resp.json()["hidden"] is True
+
+        rows = self.auth_client.get("/api/sessions?limit=100").json()["sessions"]
+        assert all(s["id"] != "s1" for s in rows)
+
+        restored = self.auth_client.patch(
+            "/api/sessions/s1", json={"hidden": False}
+        )
+        assert restored.status_code == 200
+        rows = self.auth_client.get("/api/sessions?limit=100").json()["sessions"]
+        assert bool(next(s for s in rows if s["id"] == "s1")["hidden"]) is False
+
+    def test_patch_hidden_alone_is_accepted(self):
+        resp = self.auth_client.patch("/api/sessions/s1", json={"hidden": True})
+        assert resp.status_code == 200
+
+
+def test_mount_spa_dynamic_web_dist_recheck(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from hermes_cli import web_server
+
+    app = FastAPI()
+    dist = tmp_path / "web_dist"
+    monkeypatch.setattr(web_server, "WEB_DIST", dist)
+
+    web_server.mount_spa(app)
+    client = TestClient(app)
+
+    # 1. missing build -> 404
+    res1 = client.get("/")
+    assert res1.status_code == 404
+    assert res1.json()["error"] == "Frontend not built. Run: cd web && npm run build"
+
+    # 2. build created dynamically -> 200
+    dist.mkdir(parents=True, exist_ok=True)
+    (dist / "index.html").write_text("<html><body>Test</body></html>")
+    res2 = client.get("/")
+    assert res2.status_code == 200
+    assert "Test" in res2.text

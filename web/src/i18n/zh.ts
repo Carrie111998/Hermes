@@ -169,6 +169,7 @@ export const zh: TranslationOverlay = {
     websocketUnavailableReason: '对话 WebSocket 不可用：{reason}。',
     localClientRefused: '请求被拒绝：服务器仅允许本机客户端访问。',
     localClientRefusedReason: '请求被拒绝：{reason}。',
+    panel: '面板',
     showSidePanelTitle: '显示侧栏（模型和会话）',
     showSidePanelAria: '显示对话侧栏',
     collapseSidePanelTitle: '折叠侧栏',
@@ -445,12 +446,12 @@ export const zh: TranslationOverlay = {
     useAs: '用途',
     auxTasks: {
       vision: { label: '视觉', hint: '图像分析' },
-      web_extract: { label: '网页提取', hint: '页面摘要' },
       compression: { label: '上下文压缩', hint: '压缩会话上下文' },
       skills_hub: { label: '技能中心', hint: '搜索技能' },
       approval: { label: '审批', hint: '智能自动审批' },
       mcp: { label: 'MCP', hint: 'MCP 工具路由' },
       title_generation: { label: '标题生成', hint: '生成会话标题' },
+      review: { label: '审查', hint: '/review 子代理' },
       triage_specifier: { label: '分流规范制定者', hint: '完善看板任务规范' },
       kanban_decomposer: { label: '看板任务拆解器', hint: '分解任务' },
       profile_describer: {

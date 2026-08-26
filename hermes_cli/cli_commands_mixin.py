@@ -165,6 +165,11 @@ class CLICommandsMixin:
                 more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
                 print(f"  ↷ Kept your hand-edits: {shown}{more}")
                 print("  Use /rollback <N> --all to restore those too.")
+            oversize = result.get("skipped_oversize") or []
+            if oversize:
+                shown = ", ".join(oversize[:5])
+                more = f" (+{len(oversize) - 5} more)" if len(oversize) > 5 else ""
+                print(f"  ↷ Kept (too large for checkpoints, no stored copy to revert to): {shown}{more}")
             print("  A pre-rollback snapshot was saved automatically.")
 
             # Also undo the last conversation turn so the agent's context
@@ -2777,6 +2782,38 @@ class CLICommandsMixin:
             f"  ⚗ Reviewing this conversation in the background{tail} — "
             f"any memory/skill updates will be reported when done."
         )
+
+    def _handle_review_command(self, cmd: str) -> None:
+        """Dispatch /review — spawn an independent reviewer subagent.
+
+        Snapshots the last N chat messages, wraps them (plus any argument
+        text as extra instructions) in a reviewer briefing, and dispatches a
+        full-privilege background subagent via the async delegation rail.
+        The review re-enters this session as a normal async-delegation
+        completion, addressed to the primary agent.
+        """
+        from cli import _DIM, _RST, _cprint
+
+        parts = (cmd or "").strip().split(None, 1)
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            _cprint(f"  {_DIM}Nothing to review yet — send a message first.{_RST}")
+            return
+
+        snapshot = list(getattr(self, "conversation_history", None) or [])
+        try:
+            from agent.review_engine import format_dispatch_note, start_review
+
+            result = start_review(agent, snapshot, prompt)
+        except ValueError as exc:
+            _cprint(f"  {_DIM}{exc}{_RST}")
+            return
+        except Exception as exc:
+            _cprint(f"  /review failed to start: {exc}")
+            return
+        _cprint(f"  {format_dispatch_note(result, prompt)}")
 
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""

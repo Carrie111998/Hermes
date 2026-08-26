@@ -126,10 +126,8 @@ export const en: Translations = {
     memoryCriticalBanner:
       'Your agent is almost out of memory and may restart. Consider closing idle sessions or upgrading its memory.',
     memoryElevatedBanner: 'Your agent is running low on memory.',
-    diskCriticalBanner:
-      "Your agent's disk is almost full. New messages, memories, and settings may fail to save.",
-    diskElevatedBanner:
-      "Your agent's disk is filling up. Consider clearing old sessions or expanding its storage.",
+    diskCriticalBanner: "Your agent's disk is almost full. New messages, memories, and settings may fail to save.",
+    diskElevatedBanner: "Your agent's disk is filling up. Consider clearing old sessions or expanding its storage.",
     dismiss: 'Dismiss'
   },
 
@@ -175,6 +173,7 @@ export const en: Translations = {
     websocketUnavailableReason: 'Chat websocket unavailable: {reason}.',
     localClientRefused: "Refused: your client isn't permitted (server bound to localhost only).",
     localClientRefusedReason: 'Refused: {reason}.',
+    panel: 'panel',
     showSidePanelTitle: 'Show side panel (model + sessions)',
     showSidePanelAria: 'Show chat side panel',
     collapseSidePanelTitle: 'Collapse side panel',
@@ -457,12 +456,12 @@ export const en: Translations = {
     useAs: 'Use as',
     auxTasks: {
       vision: { label: 'Vision', hint: 'Image analysis' },
-      web_extract: { label: 'Web Extract', hint: 'Page summarization' },
       compression: { label: 'Compression', hint: 'Context compaction' },
       skills_hub: { label: 'Skills Hub', hint: 'Skill search' },
       approval: { label: 'Approval', hint: 'Smart auto-approve' },
       mcp: { label: 'MCP', hint: 'MCP tool routing' },
       title_generation: { label: 'Title Gen', hint: 'Session titles' },
+      review: { label: 'Review', hint: '/review subagent' },
       triage_specifier: {
         label: 'Triage Specifier',
         hint: 'Kanban spec fleshing'
@@ -701,8 +700,7 @@ export const en: Translations = {
     repeatForever: 'forever',
     repeatTimes: '{count} times',
     fallbackJobTitle: 'Cron job',
-    continuityDescription:
-      "continuity: each run sees the previous run's output (dedupe, pick up where it left off)",
+    continuityDescription: "continuity: each run sees the previous run's output (dedupe, pick up where it left off)",
     missedScheduledFire: 'missed scheduled fire ({time}):',
     views: {
       jobs: 'Jobs',
@@ -2257,8 +2255,7 @@ export const en: Translations = {
     confirmArchive: 'Archive this task? It disappears from the default board view.',
     confirmBlocked: "Mark this task as blocked? The worker's claim is released.",
     confirmScheduled: 'Move this task to Scheduled? Use this for known time delays rather than human blockers.',
-    confirmDoneMany:
-      "Mark {n} tasks as done? The workers' claims are released and dependent children become ready.",
+    confirmDoneMany: "Mark {n} tasks as done? The workers' claims are released and dependent children become ready.",
     confirmArchiveMany: 'Archive {n} tasks? They disappear from the default board view.',
     confirmBlockedMany: "Mark {n} tasks as blocked? The workers' claims are released.",
     completionSummary: 'Completion summary for {label}. This is stored as the task result.',

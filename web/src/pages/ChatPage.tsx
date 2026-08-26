@@ -30,16 +30,16 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from 'react-dom'
 import { useSearchParams } from 'react-router'
 
-import { ChatSidebar } from "@/components/ChatSidebar";
-import { ChatSessionList } from "@/components/ChatSessionList";
-import { usePageHeader } from "@/contexts/usePageHeader";
-import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
-import { latchChatActivation } from "@/lib/chat-activation";
-import { copyTextToClipboard } from "@/lib/clipboard";
-import { normalizeSessionTitle } from "@/lib/chat-title";
-import { createPtyCompositionForwarder } from "@/lib/pty-composition";
-import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
+import { ChatSidebar } from '@/components/ChatSidebar'
+import { ChatSessionList } from '@/components/ChatSessionList'
+import { usePageHeader } from '@/contexts/usePageHeader'
+import { useI18n } from '@/i18n'
+import { api } from '@/lib/api'
+import { latchChatActivation } from '@/lib/chat-activation'
+import { copyTextToClipboard } from '@/lib/clipboard'
+import { normalizeSessionTitle } from '@/lib/chat-title'
+import { createPtyCompositionForwarder } from '@/lib/pty-composition'
+import { PtyResumeSanitizer } from '@/lib/pty-resume-sanitizer'
 import {
   PTY_CONNECTING_TIMEOUT_MS,
   PTY_RESUME_RECONNECT_THROTTLE_MS,
@@ -57,26 +57,16 @@ import {
 import {
   MOBILE_REPLACEMENT_WINDOW_MS,
   normalizePtyMobileInput,
-  shouldTreatInputAsMobileReplacement,
-} from "@/lib/pty-mobile-input";
-import { computeKeyboardInset, shouldPinScroll } from "@/lib/keyboard-inset";
-import {
-  resolvePtyKeyboardShortcut,
-  sendPtyShortcutSequence,
-} from "@/lib/pty-keyboard-shortcuts";
-import {
-  isViewportPinnedToBottom,
-  shouldFollowPtyOutput,
-} from "@/lib/pty-scroll";
-import {
-  imageFilesFromTransfer,
-  transferMayContainImage,
-  uploadChatImage,
-} from "@/lib/chatImagePaste";
-import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
-import { PluginSlot } from "@/plugins";
-import { useTheme } from "@/themes";
-import { useProfileScope } from "@/contexts/useProfileScope";
+  shouldTreatInputAsMobileReplacement
+} from '@/lib/pty-mobile-input'
+import { computeKeyboardInset, shouldPinScroll } from '@/lib/keyboard-inset'
+import { resolvePtyKeyboardShortcut, sendPtyShortcutSequence } from '@/lib/pty-keyboard-shortcuts'
+import { isViewportPinnedToBottom, parseResumeControlMessage, shouldFollowPtyOutput } from '@/lib/pty-scroll'
+import { imageFilesFromTransfer, transferMayContainImage, uploadChatImage } from '@/lib/chatImagePaste'
+import { maybeReloadForLoopbackWsAuthFailure } from '@/lib/dashboard-auth-reload'
+import { PluginSlot } from '@/plugins'
+import { useTheme } from '@/themes'
+import { useProfileScope } from '@/contexts/useProfileScope'
 
 // Stable per-browser token identifying THIS chat tab's keep-alive PTY session.
 // Sent as ?attach=; lets a refresh/disconnect reattach to the same live process
@@ -178,24 +168,24 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
 }
 
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const termWrapRef = useRef<HTMLDivElement | null>(null);
-  const termRef = useRef<Terminal | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const stickToBottomRef = useRef(true);
+  const hostRef = useRef<HTMLDivElement | null>(null)
+  const termWrapRef = useRef<HTMLDivElement | null>(null)
+  const termRef = useRef<Terminal | null>(null)
+  const fitRef = useRef<FitAddon | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const stickToBottomRef = useRef(true)
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
-  const syncMetricsRef = useRef<(() => void) | null>(null);
+  const syncMetricsRef = useRef<(() => void) | null>(null)
   // NS-434 follow-up: the keyboard-inset sync + reset closures from the main
   // PTY effect, exposed to the visibility-gated listener effect below.
   // ChatPage stays mounted (hidden) on every dashboard route, so the
   // visualViewport listeners must only be attached while /chat is the active
   // tab — otherwise the scroll pin fires when a soft keyboard opens on
   // Settings etc. and fights iOS's own focus-scroll behavior there.
-  const keyboardInsetSyncRef = useRef<(() => void) | null>(null);
-  const keyboardInsetResetRef = useRef<(() => void) | null>(null);
+  const keyboardInsetSyncRef = useRef<(() => void) | null>(null)
+  const keyboardInsetResetRef = useRef<(() => void) | null>(null)
   // Sticky activation latch: the PTY-connect effect below must not open
   // `/api/pty` until the chat tab has actually been active at least once.
   // The dashboard mounts ChatPage persistently (hidden) on every route, so
@@ -304,29 +294,31 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // /chat re-runs the effect (derived flips back to true) and re-locks.
   // Keying on the raw state would leak the body.overflow="hidden" across
   // tabs because the dep wouldn't change on tab switch.
-  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
-  const mobilePanelOpen = isActive && mobilePanelOpenRaw;
+  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false)
+  const mobilePanelOpen = isActive && mobilePanelOpenRaw
 
   // Collapse toggle for the desktop chat side panel (model + sessions),
   // persisted in localStorage so the choice survives reloads.
   const [chatPanelCollapsed, setChatPanelCollapsed] = useState(
-    () => localStorage.getItem("hermes-chat-panel-collapsed") === "1",
-  );
+    () => localStorage.getItem('hermes-chat-panel-collapsed') === '1'
+  )
   const toggleChatPanel = useCallback(() => {
-    setChatPanelCollapsed((prev) => {
-      const next = !prev;
-      localStorage.setItem("hermes-chat-panel-collapsed", next ? "1" : "0");
-      return next;
-    });
-  }, []);
-  const { setEnd, setTitle } = usePageHeader();
+    setChatPanelCollapsed(prev => {
+      const next = !prev
+      localStorage.setItem('hermes-chat-panel-collapsed', next ? '1' : '0')
+      return next
+    })
+  }, [])
+  const { setEnd, setTitle } = usePageHeader()
   const [sessionTitleState, setSessionTitleState] = useState<{
     scope: string
     title: string | null
   }>({ scope: '', title: null })
   const { format, t } = useI18n()
   const chatCopyRef = useRef(t.chatSidebar)
-  chatCopyRef.current = t.chatSidebar
+  useEffect(() => {
+    chatCopyRef.current = t.chatSidebar
+  }, [t.chatSidebar])
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), [])
   const modelToolsLabel = useMemo(
     () => `${t.app.modelToolsSheetTitle} ${t.app.modelToolsSheetSubtitle}`,
@@ -507,11 +499,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // page. Sticky, so switching away from /chat keeps the PTY alive.
     if (!hasActivated) return
 
-    const host = hostRef.current;
-    if (!host) return;
+    const host = hostRef.current
+    if (!host) return
     // Captured once so the effect cleanup doesn't re-read the ref (which
     // may point elsewhere by then — react-hooks/exhaustive-deps).
-    const termWrap = termWrapRef.current;
+    const termWrap = termWrapRef.current
 
     const token = window.__HERMES_SESSION_TOKEN__
     const gated = !!window.__HERMES_AUTH_REQUIRED__
@@ -588,18 +580,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       const payload = data.slice(semi + 1)
       if (payload === '?' || payload === '') return false // read/clear — ignore
       try {
-        const binary = atob(payload);
-        const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-        const text = new TextDecoder("utf-8").decode(bytes);
+        const binary = atob(payload)
+        const bytes = Uint8Array.from(binary, c => c.charCodeAt(0))
+        const text = new TextDecoder('utf-8').decode(bytes)
         // copyTextToClipboard falls back to a selection-based copy when the
         // Clipboard API is unavailable (plain-HTTP deployments) or when the
         // write is rejected — e.g. the OSC 52 response arriving outside the
         // original keydown event's activation ("user gesture" requirement).
-        void copyTextToClipboard(text).then((copied) => {
+        void copyTextToClipboard(text).then(copied => {
           if (!copied) {
-            console.warn("[dashboard clipboard] OSC 52 write failed");
+            console.warn('[dashboard clipboard] OSC 52 write failed')
           }
-        });
+        })
       } catch {
         console.warn('[dashboard clipboard] malformed OSC 52 payload')
       }
@@ -679,41 +671,33 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // when xterm has a selection; without one Ctrl+C still reaches the TUI
       // as SIGINT.
       // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
-      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey;
+      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey
       // Paste on BARE Ctrl+V too (not only Ctrl+Shift+V). Bare Ctrl+V otherwise
       // falls through to the TUI, whose server-side clipboard read can't see the
       // browser/OS clipboard → "No image found in clipboard". Routing Ctrl+V
       // through the same navigator.clipboard path below makes it paste
       // image-or-text correctly, like Ctrl+Shift+V.
-      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey;
+      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey
 
-      const terminalSelection = term.getSelection();
-      const shortcut = resolvePtyKeyboardShortcut(
-        ev,
-        isMac,
-        Boolean(terminalSelection),
-      );
+      const terminalSelection = term.getSelection()
+      const shortcut = resolvePtyKeyboardShortcut(ev, isMac, Boolean(terminalSelection))
 
-      if (
-        (shortcut === "copy" ||
-          (copyModifier && ev.shiftKey && ev.key.toLowerCase() === "c")) &&
-        terminalSelection
-      ) {
+      if ((shortcut === 'copy' || (copyModifier && ev.shiftKey && ev.key.toLowerCase() === 'c')) && terminalSelection) {
         // Direct copy inside the keydown handler preserves the user
         // gesture — async round-trips through OSC 52 can lose activation
         // and fail with "Document is not focused". copyTextToClipboard
         // additionally covers insecure (plain-HTTP) contexts where the
         // Clipboard API is unavailable.
-        void copyTextToClipboard(terminalSelection).then((copied) => {
+        void copyTextToClipboard(terminalSelection).then(copied => {
           if (!copied) {
-            console.warn("[dashboard clipboard] direct copy failed");
+            console.warn('[dashboard clipboard] direct copy failed')
           }
-        });
-          // Clear xterm.js's highlight after copy (matches gnome-terminal).
-          term.clearSelection()
-          ev.preventDefault()
-          return false
-        }
+        })
+        // Clear xterm.js's highlight after copy (matches gnome-terminal).
+        term.clearSelection()
+        ev.preventDefault()
+        return false
+      }
 
       // Ctrl+Backspace → delete previous word. xterm.js sends bare DEL
       // regardless of modifier, so word-delete never reaches the TUI on its
@@ -721,18 +705,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // delete-word-backward. (Ctrl+W can't be used in a browser tab — it's a
       // reserved shortcut that closes the tab and preventDefault has no effect;
       // for Ctrl+W muscle memory use the Electron desktop app.)
-      if (shortcut === "delete-word-backward") {
-        ev.preventDefault();
-        sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, "\x17");
-        return false;
+      if (shortcut === 'delete-word-backward') {
+        ev.preventDefault()
+        sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, '\x17')
+        return false
       }
 
       // Ctrl+Delete → delete next word. Mirror of Ctrl+Backspace; sends Alt+d
       // (ESC d), the readline / prompt_toolkit kill-word-forward binding.
-      if (shortcut === "delete-word-forward") {
-        ev.preventDefault();
-        sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, "\x1bd");
-        return false;
+      if (shortcut === 'delete-word-forward') {
+        ev.preventDefault()
+        sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, '\x1bd')
+        return false
       }
 
       if (pasteModifier && ev.key.toLowerCase() === 'v') {
@@ -801,14 +785,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     term.loadAddon(new WebLinksAddon())
 
-    let mobileInputCleanup: (() => void) | null = null;
+    let mobileInputCleanup: (() => void) | null = null
     // xterm occasionally drops committed dead-key/IME text instead of emitting
     // onData. The compositionend event supplies the authoritative text.
-    let sendComposedText: (data: string) => void = () => undefined;
-    const compositionForwarder = createPtyCompositionForwarder((data) => {
-      sendComposedText(data);
-    });
-    term.open(host);
+    let sendComposedText: (data: string) => void = () => undefined
+    const compositionForwarder = createPtyCompositionForwarder(data => {
+      sendComposedText(data)
+    })
+    term.open(host)
 
     // IME composition guard (fixes #52111).
     //
@@ -828,13 +812,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // sits in the *capture* phase on the terminal host so it fires before
     // the event bubbles up to the React root.
     const _imeCompositionGuard = (e: KeyboardEvent) => {
-      if (e.keyCode === 229 || e.key === "Process") {
-        e.stopPropagation();
+      if (e.keyCode === 229 || e.key === 'Process') {
+        e.stopPropagation()
       }
-    };
-    host.addEventListener("keydown", _imeCompositionGuard, true);
+    }
+    host.addEventListener('keydown', _imeCompositionGuard, true)
 
-    const textarea = term.textarea;
+    const textarea = term.textarea
     if (textarea) {
       textarea.setAttribute('autocomplete', 'off')
       textarea.setAttribute('autocorrect', 'off')
@@ -848,11 +832,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         if (shouldTreatInputAsMobileReplacement(input.inputType, input.data, isMobileLike)) {
           mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS
         }
-      };
+      }
       const markCompositionEnd = (ev: CompositionEvent) => {
-        mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
-        compositionForwarder.onCompositionEnd(ev.data);
-      };
+        mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS
+        compositionForwarder.onCompositionEnd(ev.data)
+      }
 
       textarea.addEventListener('beforeinput', markReplacementInput, true)
       textarea.addEventListener('compositionend', markCompositionEnd, true)
@@ -959,59 +943,56 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // apply it as bottom padding on the terminal wrapper — that *does*
     // shrink the host, so the ResizeObserver refit path kicks in and the
     // PTY re-lays-out above the keyboard.
-    let appliedKeyboardInset = 0;
+    let appliedKeyboardInset = 0
     const syncKeyboardInset = () => {
-      const wrap = termWrap;
-      if (!wrap) return;
-      const vv = window.visualViewport;
-      const inset = computeKeyboardInset(
-        vv ? { height: vv.height, offsetTop: vv.offsetTop } : null,
-        window.innerHeight,
-      );
+      const wrap = termWrap
+      if (!wrap) return
+      const vv = window.visualViewport
+      const inset = computeKeyboardInset(vv ? { height: vv.height, offsetTop: vv.offsetTop } : null, window.innerHeight)
       if (shouldPinScroll(inset)) {
         // iOS auto-scrolls the page to reveal xterm's hidden textarea when
         // the keyboard opens. The shell is a fixed h-dvh column that must
         // never scroll — pin it back so the terminal chrome stays put.
-        window.scrollTo(0, 0);
-        const scroller = document.scrollingElement;
-        if (scroller && scroller.scrollTop !== 0) scroller.scrollTop = 0;
+        window.scrollTo(0, 0)
+        const scroller = document.scrollingElement
+        if (scroller && scroller.scrollTop !== 0) scroller.scrollTop = 0
       }
-      if (inset === appliedKeyboardInset) return;
-      appliedKeyboardInset = inset;
+      if (inset === appliedKeyboardInset) return
+      appliedKeyboardInset = inset
       if (inset > 0) {
-        wrap.style.paddingBottom = `${inset}px`;
+        wrap.style.paddingBottom = `${inset}px`
         // Keep the freshly-resized input line in view.
         try {
-          term.scrollToBottom();
+          term.scrollToBottom()
         } catch {
           /* ignore */
         }
       } else {
-        wrap.style.paddingBottom = "";
+        wrap.style.paddingBottom = ''
       }
       // The wrapper padding change resizes the host; the ResizeObserver
       // will refit, but schedule one explicitly in case the observer
       // coalesces with an in-flight frame.
-      scheduleHostSync();
-    };
+      scheduleHostSync()
+    }
     const onViewportChange = () => {
-      syncKeyboardInset();
-      scheduleSyncTerminalMetrics();
-    };
+      syncKeyboardInset()
+      scheduleSyncTerminalMetrics()
+    }
 
-    window.addEventListener("resize", scheduleSyncTerminalMetrics);
+    window.addEventListener('resize', scheduleSyncTerminalMetrics)
     // The visualViewport listeners that drive `onViewportChange` are NOT
     // attached here: ChatPage is persistently mounted (hidden) on every
     // dashboard route, so they are attached/detached by the isActive-gated
     // effect below via these refs. Attaching them unconditionally made the
     // scroll pin fire when a soft keyboard opened on any page.
-    keyboardInsetSyncRef.current = onViewportChange;
+    keyboardInsetSyncRef.current = onViewportChange
     keyboardInsetResetRef.current = () => {
-      appliedKeyboardInset = 0;
-      if (termWrap) termWrap.style.paddingBottom = "";
-    };
-    scheduleHostSync();
-    requestAnimationFrame(() => scheduleHostSync());
+      appliedKeyboardInset = 0
+      if (termWrap) termWrap.style.paddingBottom = ''
+    }
+    scheduleHostSync()
+    requestAnimationFrame(() => scheduleHostSync())
 
     // Double-rAF authoritative fit.  On the second frame the layout has
     // committed at least once since mount; fit.fit() then reads the
@@ -1035,12 +1016,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // session token. The IIFE keeps the outer effect synchronous so its
     // ``return cleanup`` stays at the top level; handlers + disposables
     // are hoisted to ``let`` bindings the cleanup closes over.
-    let unmounting = false;
-    let onDataDisposable: { dispose(): void } | null = null;
-    let onResizeDisposable: { dispose(): void } | null = null;
-    let onScrollDisposable: { dispose(): void } | null = null;
-    let eraseSuppressionTimer: ReturnType<typeof setTimeout> | null = null;
-    let resumeMaxTimer: ReturnType<typeof setTimeout> | null = null;
+    let unmounting = false
+    // The implicit active-session fallback (no `?resume=` on the URL) only
+    // becomes known once the server's control frame arrives (see
+    // `ws.onmessage` below) — everything gated on "is this a resume replay"
+    // reads this instead of `resumeParam` directly (#93518).
+    let effectiveResume = resumeParam
+    let onDataDisposable: { dispose(): void } | null = null
+    let onResizeDisposable: { dispose(): void } | null = null
+    let onScrollDisposable: { dispose(): void } | null = null
+    let eraseSuppressionTimer: ReturnType<typeof setTimeout> | null = null
+    let resumeMaxTimer: ReturnType<typeof setTimeout> | null = null
     const clearEraseSuppressionTimer = () => {
       if (eraseSuppressionTimer) {
         clearTimeout(eraseSuppressionTimer)
@@ -1060,7 +1046,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     }
     const noteResumePtyChunk = (chunkText: string) => {
-      if (!resumeParam || unmounting) {
+      if (!effectiveResume || unmounting) {
         return
       }
       if (shouldFinishResumeHydrationOnChunk(chunkText)) {
@@ -1193,11 +1179,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // out against on its first paint.  The double-rAF block above will
         // follow up with the authoritative measurement — at worst Ink
         // reflows once after the PTY boots, which is imperceptible.
-        ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+        ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`)
         // Resumed sessions replay scrollback over the socket. Start pinned to
         // the bottom so the latest output is in view; released once the user
         // scrolls up (#59591).
-        if (resumeParam) stickToBottomRef.current = true;
+        if (resumeParam) stickToBottomRef.current = true
         // One-shot: a ?learn=<text> param (set by the Skills page "Learn a
         // skill" panel) is typed into the composer as a /learn command once the
         // PTY is up. /learn resolves via command.dispatch → a normal agent turn,
@@ -1225,36 +1211,66 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // in-place redraws through untouched. See pty-resume-sanitizer.ts.
       const decoder = new TextDecoder()
       const sanitizer = new PtyResumeSanitizer()
+      const beginResumeReplay = () => {
+        stickToBottomRef.current = true
+        if (!eraseSuppressionTimer) {
+          eraseSuppressionTimer = setTimeout(() => {
+            eraseSuppressionTimer = null
+            sanitizer.endEraseSuppression()
+          }, PTY_RESUME_SANITIZE_WINDOW_MS)
+        }
+        if (!resumeMaxTimer) {
+          setResumeHydrating(true)
+          resumeMaxTimer = setTimeout(finishResumeHydration, PTY_RESUME_LOADING_MAX_MS)
+        }
+      }
       if (resumeParam) {
-        eraseSuppressionTimer = setTimeout(() => {
-          eraseSuppressionTimer = null
-          sanitizer.endEraseSuppression()
-        }, PTY_RESUME_SANITIZE_WINDOW_MS)
+        beginResumeReplay()
       }
 
       ws.onmessage = ev => {
+        if (typeof ev.data === 'string') {
+          // The active-session fallback (no `?resume=` on the URL) tells us
+          // via a one-off JSON control frame that a replay is starting (#93518,
+          // see `pty_ws` in web_server.py). Real PTY output always arrives as
+          // binary frames, so any text frame is a candidate; anything that
+          // isn't this control shape (e.g. the ANSI "Chat unavailable" banners
+          // pty_ws sends as text on failure) falls through to the write path
+          // below unchanged.
+          const resumeId = parseResumeControlMessage(ev.data)
+          if (resumeId) {
+            effectiveResume = resumeId
+            beginResumeReplay()
+            return
+          }
+        }
         const text =
           typeof ev.data === 'string'
             ? ev.data
             : decoder.decode(new Uint8Array(ev.data as ArrayBuffer), {
-              stream: true,
-            });
+                stream: true
+              })
         // Gate hydration on the payload actually written to xterm. The
         // sanitizer can turn a nonempty erase-only / all-newline / partial-CSI
         // resume frame into "" (pty-resume-sanitizer.ts); keying off raw `text`
         // would hide the wait notice while the terminal is still blank.
-        const rendered = resumeParam ? sanitizer.next(text) : text;
+        const rendered = effectiveResume ? sanitizer.next(text) : text
         // Resume replay lands over many write chunks; pin the viewport to the
-        // bottom as each chunk commits, and release the pin when the user scrolls up.
-        const followScroll = shouldFollowPtyOutput(resumeParam, stickToBottomRef.current)
+        // bottom as each chunk COMMITS (xterm write callback) instead of
+        // guessing with a fixed delay, and release the pin the moment the user
+        // scrolls up to read the backlog (#59591).
+        const followScroll = shouldFollowPtyOutput(effectiveResume, stickToBottomRef.current)
           ? () => termRef.current?.scrollToBottom()
-          : undefined;
-        term.write(rendered, followScroll);
-        noteResumePtyChunk(rendered);
-      };
+          : undefined
+        term.write(rendered, followScroll)
+        noteResumePtyChunk(rendered)
+      }
 
       ws.onclose = ev => {
-        if (resumeParam) {
+        // Drain buffered sanitizer state. A buffered partial escape is dropped
+        // (writing an unterminated CSI would wedge xterm's parser); a buffered
+        // newline run is emitted collapsed.
+        if (effectiveResume) {
           clearEraseSuppressionTimer()
           try {
             term.write(sanitizer.flush())
@@ -1338,7 +1354,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // forwarding them into Hermes. Keyboard input, paste, and resize still
       // behave normally.
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
-      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
+      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/
       const forwardPtyData = (data: string, useMobileReplacement = true) => {
         // Mouse reports (scroll wheel etc.) are not typed input — swallow
         // them before the blocked-input check so scrolling a disconnected
@@ -1358,82 +1374,82 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         const normalized = normalizePtyMobileInput(
           data,
           ptyInputLineRef.current,
-          useMobileReplacement && Date.now() <= mobileReplacementInputUntilRef.current,
-        );
-        ptyInputLineRef.current = normalized.nextLine;
+          useMobileReplacement && Date.now() <= mobileReplacementInputUntilRef.current
+        )
+        ptyInputLineRef.current = normalized.nextLine
         if (normalized.normalized) {
           mobileReplacementInputUntilRef.current = 0
         }
-        ws.send(normalized.data);
-      };
+        ws.send(normalized.data)
+      }
       // The deferred composition fallback is already committed text, so it
       // must not consume the mobile replacement window intended for xterm's
       // normal onData path.
-      sendComposedText = (data) => forwardPtyData(data, false);
-      onDataDisposable = term.onData((data) => {
+      sendComposedText = data => forwardPtyData(data, false)
+      onDataDisposable = term.onData(data => {
         if (!SGR_MOUSE_RE.test(data)) {
-          compositionForwarder.noteTerminalData(data);
+          compositionForwarder.noteTerminalData(data)
         }
-        forwardPtyData(data);
-      });
+        forwardPtyData(data)
+      })
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(`\x1b[RESIZE:${cols};${rows}]`)
         }
-      });
+      })
 
       // Release the stick-to-bottom pin the moment the user scrolls up, so
       // we only auto-follow during the resume replay — not their manual
       // review of the backlog (#59591).
       onScrollDisposable = term.onScroll(() => {
-        stickToBottomRef.current = isViewportPinnedToBottom(term.buffer.active);
-      });
-    })();
+        stickToBottomRef.current = isViewportPinnedToBottom(term.buffer.active)
+      })
+    })()
 
     term.focus()
 
     return () => {
-      unmounting = true;
-      imageUploadDisposed = true;
-      syncMetricsRef.current = null;
-      clearEraseSuppressionTimer();
-      clearResumeLoadingTimers();
-      setResumeHydrating(false);
-      onDataDisposable?.dispose();
-      onResizeDisposable?.dispose();
-      onScrollDisposable?.dispose();
-      mobileInputCleanup?.();
-      compositionForwarder.dispose();
-      host.removeEventListener("paste", handleBrowserPaste, true);
-      host.removeEventListener("dragover", handleBrowserDragOver, true);
-      host.removeEventListener("drop", handleBrowserDrop, true);
-      if (metricsDebounce) clearTimeout(metricsDebounce);
-      window.removeEventListener("resize", scheduleSyncTerminalMetrics);
-      keyboardInsetSyncRef.current = null;
-      keyboardInsetResetRef.current = null;
-      const wrap = termWrap;
-      if (wrap) wrap.style.paddingBottom = "";
-      ro.disconnect();
-      if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
-      if (settleRaf1) cancelAnimationFrame(settleRaf1);
-      if (settleRaf2) cancelAnimationFrame(settleRaf2);
-      clearReconnectTimer();
-      clearConnectingTimer();
-      clearTicketTimer();
-      ticketSuperseded = true;
-      connectInFlightRef.current = false;
+      unmounting = true
+      imageUploadDisposed = true
+      syncMetricsRef.current = null
+      clearEraseSuppressionTimer()
+      clearResumeLoadingTimers()
+      setResumeHydrating(false)
+      onDataDisposable?.dispose()
+      onResizeDisposable?.dispose()
+      onScrollDisposable?.dispose()
+      mobileInputCleanup?.()
+      compositionForwarder.dispose()
+      host.removeEventListener('paste', handleBrowserPaste, true)
+      host.removeEventListener('dragover', handleBrowserDragOver, true)
+      host.removeEventListener('drop', handleBrowserDrop, true)
+      if (metricsDebounce) clearTimeout(metricsDebounce)
+      window.removeEventListener('resize', scheduleSyncTerminalMetrics)
+      keyboardInsetSyncRef.current = null
+      keyboardInsetResetRef.current = null
+      const wrap = termWrap
+      if (wrap) wrap.style.paddingBottom = ''
+      ro.disconnect()
+      if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf)
+      if (settleRaf1) cancelAnimationFrame(settleRaf1)
+      if (settleRaf2) cancelAnimationFrame(settleRaf2)
+      clearReconnectTimer()
+      clearConnectingTimer()
+      clearTicketTimer()
+      ticketSuperseded = true
+      connectInFlightRef.current = false
       // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
       // ticket fetch makes the open async). The cleanup runs at the outer
       // effect's top level so it can't reach into that scope — close via
       // the ref instead. ``?.`` covers the race where unmount fires before
       // the ticket fetch resolves and ``wsRef.current`` was never assigned.
-      wsRef.current?.close();
-      wsRef.current = null;
-      host.removeEventListener("keydown", _imeCompositionGuard, true);
-      term.dispose();
-      termRef.current = null;
-      fitRef.current = null;
+      wsRef.current?.close()
+      wsRef.current = null
+      host.removeEventListener('keydown', _imeCompositionGuard, true)
+      term.dispose()
+      termRef.current = null
+      fitRef.current = null
       if (copyResetRef.current) {
         clearTimeout(copyResetRef.current)
         copyResetRef.current = null
@@ -1457,22 +1473,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // keyboard left open during navigation can't leave the hidden terminal
   // wrapper padded with a stale value.
   useEffect(() => {
-    if (!isActive || typeof window === "undefined") return;
-    const vv = window.visualViewport;
-    if (!vv) return;
-    const onViewportChange = () => keyboardInsetSyncRef.current?.();
-    vv.addEventListener("resize", onViewportChange);
+    if (!isActive || typeof window === 'undefined') return
+    const vv = window.visualViewport
+    if (!vv) return
+    const onViewportChange = () => keyboardInsetSyncRef.current?.()
+    vv.addEventListener('resize', onViewportChange)
     // offsetTop changes (keyboard-driven visual scroll on iOS) arrive as
     // vv `scroll` events, not `resize`.
-    vv.addEventListener("scroll", onViewportChange);
+    vv.addEventListener('scroll', onViewportChange)
     // Catch up on any geometry change that happened while hidden.
-    onViewportChange();
+    onViewportChange()
     return () => {
-      vv.removeEventListener("resize", onViewportChange);
-      vv.removeEventListener("scroll", onViewportChange);
-      keyboardInsetResetRef.current?.();
-    };
-  }, [isActive]);
+      vv.removeEventListener('resize', onViewportChange)
+      vv.removeEventListener('scroll', onViewportChange)
+      keyboardInsetResetRef.current?.()
+    }
+  }, [isActive])
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
@@ -1709,10 +1725,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
         <div
           ref={termWrapRef}
-          className={cn(
-            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
-            "p-2 sm:p-3",
-          )}
+          className={cn('relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg', 'p-2 sm:p-3')}
           style={{
             backgroundColor: terminalBg,
             boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4)'
@@ -1800,21 +1813,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               title={t.chatSidebar.showSidePanelTitle}
               aria-label={t.chatSidebar.showSidePanelAria}
               className={cn(
-                "absolute z-10",
-                "normal-case tracking-normal font-normal",
-                "rounded border border-current/30",
-                "bg-black/20",
-                "opacity-70 hover:opacity-100 hover:border-current/60",
-                "transition-opacity duration-150",
-                "top-2 right-2 px-2 py-1 text-xs sm:top-3 sm:right-3",
+                'absolute z-10',
+                'normal-case tracking-normal font-normal',
+                'rounded border border-current/30',
+                'bg-black/20',
+                'opacity-70 hover:opacity-100 hover:border-current/60',
+                'transition-opacity duration-150',
+                'top-2 right-2 px-2 py-1 text-xs sm:top-3 sm:right-3'
               )}
               style={{ color: terminalFg }}
             >
               <span className="inline-flex items-center gap-1">
                 <PanelRight className="h-3 w-3 shrink-0" />
-                <span className="hidden min-[400px]:inline tracking-wide">
-                  panel
-                </span>
+                <span className="hidden min-[400px]:inline tracking-wide">{t.chatSidebar.panel}</span>
               </span>
             </Button>
           )}

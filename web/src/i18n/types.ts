@@ -180,6 +180,7 @@ export interface Translations {
     websocketUnavailableReason: string
     localClientRefused: string
     localClientRefusedReason: string
+    panel: string
     showSidePanelTitle: string
     showSidePanelAria: string
     collapseSidePanelTitle: string
