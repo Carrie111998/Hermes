@@ -568,6 +568,30 @@ def _refuse_checkpoint_required_on_plugin_context_engine(
     )
 
 
+def checkpoint_required_from_config() -> bool:
+    """Report whether ``compression.checkpoint_required`` is armed in config.
+
+    For call sites that decide before an agent exists (the fork sites);
+    callers holding a live agent read ``agent.compression_checkpoint_required``.
+    Reads ``load_config_readonly()`` — the same call ``init_agent`` uses to arm
+    the gate on the child. An unreadable config reads as "not armed", matching
+    ``init_agent``.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _cfg = load_config_readonly() or {}
+        _compression = _cfg.get("compression") or {}
+    except Exception:
+        return False
+    if not isinstance(_compression, dict):
+        return False
+    return (
+        is_truthy_value(_compression.get("checkpoint_required"), default=False)
+        is True
+    )
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -635,6 +659,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    memory_agent_context: str = "primary",
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -1957,7 +1982,14 @@ def init_agent(
                         "session_id": agent.session_id,
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
+                        # Providers scope writes by this label; empty or
+                        # non-str falls back to the historical "primary".
+                        "agent_context": (
+                            memory_agent_context
+                            if isinstance(memory_agent_context, str)
+                            and memory_agent_context.strip()
+                            else "primary"
+                        ),
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning

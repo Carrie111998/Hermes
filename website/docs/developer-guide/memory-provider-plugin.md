@@ -184,6 +184,21 @@ compressor stays the only lossy authority on every path the host can intercept
 or prove safe by hook inference; an engine with its own scheduler and a false
 declaration remain trust boundaries.
 
+### Forks under an armed gate
+
+Hermes forks a second agent in five places (delegated subagents, the
+background memory/skill review, the curator pass, the batch runner, the
+Feishu comment responder). With the gate off they run provider-less, as
+before. With `checkpoint_required` armed a fork arms the same gate and would
+fail its first compaction with `BLOCKED_MISSING_PREREQUISITE`, so it loads the
+configured provider, initialized with `agent_context="subagent"` (plus
+`platform` and `parent_session_id` to tell the shapes apart). Two consequences:
+
+- **One `initialize()` per fork** — a round trip per spawn for a
+  network-backed store.
+- **Fork transcripts reach the archive.** Providers that should not keep them
+  drop them on `agent_context`.
+
 What your provider receives depends on its declared API version. Version 1
 providers (the implicit default — every pre-existing provider) keep the
 historical contract: the raw message list, exactly as before. Version 2

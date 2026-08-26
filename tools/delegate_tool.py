@@ -1960,6 +1960,16 @@ def _build_child_agent(
 
     from agent.delegation_context import delegated_child_context
 
+    # Forks run provider-less by default. Under compression.checkpoint_required
+    # the child arms the same gate and would raise CompressionCheckpointUnavailable
+    # at its first compaction, so it inherits the provider (see
+    # checkpoint_required_from_config). Cost: one provider initialize() per
+    # spawn and child transcripts reaching the archive, both visible to the
+    # provider via agent_context="subagent".
+    from agent.agent_init import checkpoint_required_from_config
+
+    _checkpoint_required = checkpoint_required_from_config()
+
     with delegated_child_context():
         try:
             child = AIAgent(
@@ -1982,7 +1992,8 @@ def _build_child_agent(
                 log_prefix=f"[subagent-{task_index}]",
                 platform="subagent",
                 skip_context_files=True,
-                skip_memory=True,
+                skip_memory=not _checkpoint_required,
+                memory_agent_context="subagent",
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,

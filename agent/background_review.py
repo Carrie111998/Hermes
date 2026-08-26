@@ -1250,6 +1250,12 @@ def _run_review_in_thread(
                     _pref_val = getattr(agent, _pref_attr, None)
                     if _pref_val:
                         _fork_kwargs[_pref_attr] = _pref_val
+            # Under compression.checkpoint_required the fork inherits the
+            # provider it must checkpoint with (see checkpoint_required_from_config
+            # in agent/agent_init.py). Gate off: skip_memory=True as before.
+            from agent.agent_init import checkpoint_required_from_config
+
+            _checkpoint_required = checkpoint_required_from_config()
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
                 max_iterations=_REVIEW_MAX_ITERATIONS,
@@ -1264,7 +1270,8 @@ def _run_review_in_thread(
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                skip_memory=True,
+                skip_memory=not _checkpoint_required,
+                memory_agent_context="subagent",
                 **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"

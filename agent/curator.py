@@ -1936,6 +1936,12 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         if isinstance(_acp_command, str) and _acp_command:
             _agent_kwargs["acp_command"] = _acp_command
             _agent_kwargs["acp_args"] = _acp_args or []
+        # Under compression.checkpoint_required the fork inherits the provider
+        # it must checkpoint with (see checkpoint_required_from_config in
+        # agent/agent_init.py). Gate off: skip_memory=True as before.
+        from agent.agent_init import checkpoint_required_from_config
+
+        _checkpoint_required = checkpoint_required_from_config()
         review_agent = AIAgent(
             model=_model_name,
             provider=_resolved_provider,
@@ -1955,7 +1961,8 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             quiet_mode=True,
             platform="curator",
             skip_context_files=True,
-            skip_memory=True,
+            skip_memory=not _checkpoint_required,
+            memory_agent_context="subagent",
         )
         # Disable recursive nudges — the curator must never spawn its own review.
         review_agent._memory_nudge_interval = 0

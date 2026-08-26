@@ -1101,3 +1101,259 @@ def test_turn_gate_fails_closed_when_the_resolver_cannot_be_imported():
 
     assert calls == []
     assert agent._checkpoint_gate_suppression_count == 1
+
+
+# --- Fork sites inherit the memory provider under an armed gate ------------
+
+
+def _fork_config(checkpoint_required):
+    """Minimal on-disk config shape the five spawn sites read through."""
+    return {
+        "compression": {"checkpoint_required": checkpoint_required},
+        "agent": {},
+        "memory": {},
+        "delegation": {},
+    }
+
+
+class _ConstructorStop(BaseException):
+    """Abort at the child constructor. BaseException, because four of the
+    five sites catch ``except Exception``."""
+
+
+def _fork_site(site):
+    """Resolve one fork site lazily: ``(module holding the AIAgent binding,
+    spawn thunk, extra patches)``. batch_runner binds AIAgent at import, so
+    its patch lands on its own global; the others resolve it via run_agent."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    if site == "delegate":
+        import run_agent
+        import tools.delegate_tool as delegate_tool
+
+        parent = SimpleNamespace(
+            model="m", provider="openrouter", api_key="k",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions", session_id="parent",
+            enabled_toolsets=None, disabled_toolsets=None,
+            request_overrides={}, prefill_messages=None, _delegate_depth=0,
+        )
+        return run_agent, (lambda: delegate_tool._build_child_agent(
+            task_index=0, goal="g", context=None, toolsets=None,
+            model=None, max_iterations=3, task_count=1,
+            parent_agent=parent,
+        )), ()
+
+    if site == "background_review":
+        import run_agent
+        import agent.background_review as background_review
+
+        parent = SimpleNamespace(
+            model="m", provider="openrouter", api_key="k",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions", session_id="parent",
+            enabled_toolsets=None, disabled_toolsets=None,
+            request_overrides={}, prefill_messages=None, platform="cli",
+            quiet_mode=True, _memory_store=None, _memory_enabled=False,
+            _user_profile_enabled=False, _skip_mcp_refresh=False,
+            _memory_nudge_interval=0, _skill_nudge_interval=0,
+            _safe_print=lambda *a, **k: None,
+            background_review_callback=None,
+            _current_main_runtime=lambda: {},
+            _emit_auxiliary_failure=lambda *a, **k: None,
+        )
+        return run_agent, (lambda: background_review._run_review_in_thread(
+            parent, [{"role": "user", "content": "x"}], "prompt"
+        )), ()
+
+    if site == "curator":
+        import run_agent
+        import agent.curator as curator
+
+        return run_agent, (lambda: curator._run_llm_review("prompt")), ()
+
+    if site == "batch_runner":
+        import batch_runner
+
+        return batch_runner, (lambda: batch_runner._process_single_prompt(
+            0, {"prompt": "p"}, 0,
+            {"model": "m", "max_iterations": 3, "distribution": {}},
+        )), (
+            patch.object(
+                batch_runner, "sample_toolsets_from_distribution",
+                return_value=["terminal"],
+            ),
+        )
+
+    if site == "feishu_comment":
+        import run_agent
+        import plugins.platforms.feishu.feishu_comment as feishu_comment
+
+        return run_agent, (lambda: feishu_comment._run_comment_agent(
+            "p", client=object(), session_key=""
+        )), (
+            patch.object(
+                feishu_comment, "_resolve_model_and_runtime",
+                return_value=("m", {}),
+            ),
+            patch.object(feishu_comment, "_load_session_history", return_value=[]),
+        )
+
+    raise AssertionError(f"unknown fork site: {site}")  # pragma: no cover
+
+
+def _capture_fork_kwargs(site, *, checkpoint_required):
+    """Drive one real fork site and return the kwargs it passed to AIAgent."""
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    binding, spawn, extra_patches = _fork_site(site)
+    captured = {}
+
+    def _recorder(**kwargs):
+        captured.update(kwargs)
+        raise _ConstructorStop()
+
+    cfg = _fork_config(checkpoint_required)
+    with ExitStack() as stack:
+        stack.enter_context(patch("hermes_cli.config.load_config", return_value=cfg))
+        stack.enter_context(
+            patch("hermes_cli.config.load_config_readonly", return_value=cfg)
+        )
+        stack.enter_context(patch.object(binding, "AIAgent", _recorder))
+        for extra in extra_patches:
+            stack.enter_context(extra)
+        with pytest.raises(_ConstructorStop):
+            spawn()
+
+    assert captured, f"{site} never reached the child constructor"
+    return captured
+
+
+_FORK_SITES = (
+    "delegate",
+    "background_review",
+    "curator",
+    "batch_runner",
+    "feishu_comment",
+)
+
+
+@pytest.mark.parametrize("site", _FORK_SITES)
+def test_fork_inherits_memory_provider_when_checkpoint_required(site):
+    """An armed gate hands every fork the provider it must checkpoint with;
+    a provider-less fork would raise ``CompressionCheckpointUnavailable`` at
+    its first compaction."""
+    captured = _capture_fork_kwargs(site, checkpoint_required=True)
+
+    assert captured["skip_memory"] is False
+    # The value agent/memory_provider.py already names; a fresh string would
+    # fall out of providers' non-primary write gates.
+    assert captured["memory_agent_context"] == "subagent"
+
+
+@pytest.mark.parametrize("site", _FORK_SITES)
+def test_fork_stays_provider_less_when_gate_is_off(site):
+    """Gate off (the default) stays provider-less: the control against
+    "always inherit"."""
+    captured = _capture_fork_kwargs(site, checkpoint_required=False)
+
+    assert captured["skip_memory"] is True
+
+
+def test_checkpoint_required_from_config_reads_the_armed_key():
+    """The shared resolver the five sites call before an agent exists;
+    ``is True`` rather than truthiness, like the gate's other read sites."""
+    from unittest.mock import patch
+
+    from agent.agent_init import checkpoint_required_from_config
+
+    def _with(cfg):
+        with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            return checkpoint_required_from_config()
+
+    assert _with({"compression": {"checkpoint_required": True}}) is True
+    assert _with({"compression": {"checkpoint_required": "yes"}}) is True
+    assert _with({"compression": {"checkpoint_required": False}}) is False
+    assert _with({"compression": {}}) is False
+    assert _with({}) is False
+    # A config section of the wrong shape must not raise out of a spawn path.
+    assert _with({"compression": "nonsense"}) is False
+    assert _with(None) is False
+
+    # An unreadable config reads as "not armed", matching init_agent.
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        side_effect=RuntimeError("config unreadable"),
+    ):
+        assert checkpoint_required_from_config() is False
+
+
+def test_memory_agent_context_reaches_the_provider_initialize():
+    """The label survives the whole constructor path to the provider's
+    ``initialize()``; driven through a real ``init_agent()``."""
+    from unittest.mock import patch
+
+    seen = {}
+
+    class _RecordingProvider(MemoryProvider):
+        pre_compress_checkpoint_api_version = PRE_COMPRESS_CHECKPOINT_API_VERSION
+
+        @property
+        def name(self):
+            return "recording"
+
+        def is_available(self):
+            return True
+
+        def initialize(self, session_id, **kwargs):
+            seen.clear()
+            seen.update(kwargs)
+
+        def get_tool_schemas(self):
+            return []
+
+    cfg = {
+        "compression": {},
+        "agent": {},
+        "memory": {
+            "provider": "recording",
+            "memory_enabled": False,
+            "user_profile_enabled": False,
+        },
+    }
+
+    def _build(**extra):
+        with (
+            patch("hermes_cli.config.load_config", return_value=cfg),
+            patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+            patch(
+                "plugins.memory.load_memory_provider",
+                return_value=_RecordingProvider(),
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=204_800,
+            ),
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            from run_agent import AIAgent
+
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                **extra,
+            )
+        return seen.get("agent_context")
+
+    assert _build(memory_agent_context="subagent") == "subagent"
+    # Unset, blank or non-str falls back to the historical "primary".
+    assert _build() == "primary"
+    assert _build(memory_agent_context="   ") == "primary"
+    assert _build(memory_agent_context=None) == "primary"
