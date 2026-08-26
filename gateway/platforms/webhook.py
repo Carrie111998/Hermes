@@ -191,7 +191,18 @@ def _hmac_str_equal(provided: str, expected: str) -> bool:
     Comparing as UTF-8 bytes keeps the constant-time guarantee while making a
     hostile header fail closed with a clean rejection.
     """
-    return hmac.compare_digest(provided.encode(), expected.encode())
+    # aiohttp decodes header bytes that are NOT valid UTF-8 using
+    # ``surrogateescape``, so ``provided`` can hold lone surrogates (e.g.
+    # ``\udce9`` from a latin-1 byte). A strict ``.encode()`` refuses those
+    # with ``UnicodeEncodeError``, which escapes the request handler as a 500
+    # — the exact failure this helper exists to prevent, just one codec
+    # further out than the original non-ASCII fix reached. Re-encoding with
+    # the same error handler round-trips them back to the original wire
+    # bytes, so a hostile header is compared as bytes and fails closed with a
+    # clean rejection instead of a 500.
+    return hmac.compare_digest(
+        provided.encode("utf-8", "surrogateescape"), expected.encode()
+    )
 
 
 # Headers that mean "somebody relayed this request for the real client".
