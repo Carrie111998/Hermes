@@ -189,6 +189,19 @@ if TELEGRAM_AVAILABLE and getattr(filters, "MessageFilter", None) is not None:
         def filter(self, message: Any) -> bool:
             if getattr(message, "text", None):
                 return False
+            # Attachment-bearing messages (photo/document/... often carry a rich
+            # caption) must fall through to the media handler so the attachment is
+            # not consumed by the rich text path (#94899). Cheap attribute checks
+            # also keep the to_dict() serialization off the dispatch hot path.
+            # NOTE: generic `caption` is intentionally NOT checked — every supported
+            # media type with a caption also carries its truthy media attr, and an
+            # unsupported caption-bearing type (e.g. animation) must NOT be excluded
+            # here or it would match no handler at all.
+            if any(
+                getattr(message, attr, None)
+                for attr in ("photo", "document", "video", "audio", "voice", "sticker")
+            ):
+                return False
             rp = getattr(message, "rich_message", None)
             if rp is not None:
                 return True
@@ -4363,10 +4376,15 @@ class TelegramAdapter(BasePlatformAdapter):
         the ``gateway_platform_event`` observer (group 99) in lockstep with the
         core handlers.
         """
-        app.add_handler(TelegramMessageHandler(
-            _RichMessageFilter(),
-            self._handle_rich_message
-        ))
+        # Kill-switch: when rich inbound handling is disabled, do NOT register
+        # the rich filter at all — otherwise it would claim the update and the
+        # message would vanish with no fallback and no log (#94899). The flag is
+        # set once in __init__ before every _register_handlers call site.
+        if self._rich_inbound_handling:
+            app.add_handler(TelegramMessageHandler(
+                _RichMessageFilter(),
+                self._handle_rich_message
+            ))
         app.add_handler(TelegramMessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._handle_text_message

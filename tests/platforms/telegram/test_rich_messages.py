@@ -5,8 +5,13 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
-from plugins.platforms.telegram.adapter import TelegramAdapter, _RichMessageFilter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    TelegramMessageHandler,
+    _RichMessageFilter,
+)
 from plugins.platforms.telegram.rich_messages import (
+    _render_list,
     rich_message_to_markdown,
     rich_message_to_plaintext,
 )
@@ -34,7 +39,18 @@ def _adapter():
     return adapter
 
 
-def _message(*, text=None, rich_message=None):
+def _message(
+    *,
+    text=None,
+    rich_message=None,
+    caption=None,
+    photo=None,
+    document=None,
+    video=None,
+    audio=None,
+    voice=None,
+    sticker=None,
+):
     payload = {"rich_message": rich_message} if rich_message is not None else {}
 
     class Msg(SimpleNamespace):
@@ -44,7 +60,13 @@ def _message(*, text=None, rich_message=None):
     return Msg(
         message_id=7,
         text=text,
-        caption=None,
+        caption=caption,
+        photo=photo,
+        document=document,
+        video=video,
+        audio=audio,
+        voice=voice,
+        sticker=sticker,
         entities=[],
         caption_entities=[],
         message_thread_id=None,
@@ -255,3 +277,172 @@ def test_rich_message_filter_returns_false_when_to_dict_raises():
             raise RuntimeError("boom")
 
     assert not filt.filter(BrokenMessage())
+
+
+def test_rich_message_filter_falls_through_for_photo_with_rich_caption():
+    filt = _RichMessageFilter()
+    msg = _message(
+        caption="rich caption",
+        photo=[SimpleNamespace(file_id="p1")],
+        rich_message={"blocks": [{"type": "paragraph", "text": "x"}]},
+    )
+    assert filt.filter(msg) is False
+
+
+def test_rich_message_filter_falls_through_for_document_with_rich_caption():
+    filt = _RichMessageFilter()
+    msg = _message(
+        caption="rich caption",
+        document=[SimpleNamespace(file_id="d1")],
+        rich_message={"blocks": [{"type": "paragraph", "text": "x"}]},
+    )
+    assert filt.filter(msg) is False
+
+
+@pytest.mark.parametrize("attr", ["video", "audio", "voice", "sticker"])
+def test_rich_message_filter_excludes_attachment_bearing_messages(attr):
+    filt = _RichMessageFilter()
+    msg = _message(
+        caption="rich caption",
+        rich_message={"blocks": [{"type": "paragraph", "text": "x"}]},
+        **{attr: [SimpleNamespace(file_id="x")]},
+    )
+    assert filt.filter(msg) is False
+
+
+@pytest.mark.parametrize("attr", ["photo", "document", "video", "audio", "voice", "sticker"])
+def test_rich_message_filter_short_circuits_before_to_dict_for_media(attr):
+    filt = _RichMessageFilter()
+    msg = _message(**{attr: [SimpleNamespace(file_id="x")]})
+    calls = []
+
+    def recording_to_dict():
+        calls.append(1)
+        raise AssertionError("to_dict must not be called for media messages")
+
+    msg.to_dict = recording_to_dict
+    assert filt.filter(msg) is False
+    assert calls == []
+
+
+class _MediaAttrFilter:
+    """Truthy-media-attr stub mirroring the adapter's media-handler filter."""
+
+    def filter(self, message):
+        return any(
+            getattr(message, attr, None)
+            for attr in ("photo", "document", "video", "audio", "voice", "sticker")
+        )
+
+
+class _DispatchApp:
+    """Minimal PTB-like app: handlers claim updates in registration order."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def add_handler(self, handler, group=None):
+        self.handlers.append((handler, group))
+
+    async def dispatch(self, update):
+        for handler, group in self.handlers:
+            if group is not None:
+                continue
+            if handler.filters.filter(update.effective_message):
+                await handler.callback(update, SimpleNamespace())
+                return handler
+        return None
+
+
+@pytest.mark.asyncio
+async def test_photo_with_rich_caption_reaches_media_path_not_rich_handler():
+    rich_cb = AsyncMock()
+    media_cb = AsyncMock()
+    app = _DispatchApp()
+    app.add_handler(TelegramMessageHandler(_RichMessageFilter(), rich_cb))
+    app.add_handler(TelegramMessageHandler(_MediaAttrFilter(), media_cb))
+
+    msg = _message(
+        caption="rich caption",
+        photo=[SimpleNamespace(file_id="p1")],
+        rich_message={"blocks": [{"type": "paragraph", "text": "x"}]},
+    )
+    matched = await app.dispatch(_update(msg))
+
+    assert matched is not None
+    media_cb.assert_awaited_once()
+    rich_cb.assert_not_awaited()
+
+
+class _RecordingApp:
+    def __init__(self):
+        self.handlers = []
+
+    def add_handler(self, handler, group=None):
+        self.handlers.append((handler, group))
+
+
+def _rich_handlers(app):
+    return [
+        handler
+        for handler, _group in app.handlers
+        if isinstance(getattr(handler, "filters", None), _RichMessageFilter)
+    ]
+
+
+def test_rich_handler_not_registered_when_inbound_disabled():
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="fake-token", extra={"rich_inbound_handling": False})
+    )
+    app = _RecordingApp()
+    adapter._register_handlers(app)
+    assert _rich_handlers(app) == []
+
+
+def test_rich_handler_registered_when_inbound_enabled():
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token", extra={}))
+    app = _RecordingApp()
+    adapter._register_handlers(app)
+    assert len(_rich_handlers(app)) == 1
+
+
+def test_table_cell_escapes_pipes():
+    rich = {
+        "blocks": [
+            {
+                "type": "table",
+                "cells": [
+                    [{"text": "Name", "is_header": True}, {"text": "Value", "is_header": True}],
+                    [{"text": "A|B"}, {"text": "ok"}],
+                ],
+            }
+        ]
+    }
+    md = rich_message_to_markdown(rich)
+    assert "| A\\|B | ok |" in md
+    assert "A|B |" not in md
+
+
+def test_list_prefixes_ordered_and_unordered():
+    rich = {
+        "blocks": [
+            {
+                "type": "list",
+                "items": [
+                    {"value": 2, "blocks": [{"type": "paragraph", "text": "x"}]},
+                    {"blocks": [{"type": "paragraph", "text": "y"}]},
+                ],
+            }
+        ]
+    }
+    md = rich_message_to_markdown(rich)
+    assert "2. x" in md
+    assert "- y" in md
+
+
+def test_render_list_has_no_dead_ordered_branch():
+    import inspect
+
+    src = inspect.getsource(_render_list)
+    assert "ordered = value is not None" not in src
+    assert '"1. " if ordered' not in src

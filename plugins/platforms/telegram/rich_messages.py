@@ -171,8 +171,7 @@ def _render_list(block: dict) -> List[str]:
         if item.get("has_checkbox"):
             checkbox = "[x] " if item.get("is_checked") else "[ ] "
         value = item.get("value")
-        ordered = value is not None
-        prefix = f"{value}. " if value is not None else ("1. " if ordered else "- ")
+        prefix = f"{value}. " if value is not None else "- "
         first_line = content.splitlines()[0]
         if label:
             first_line = f"{label} {first_line}".strip()
@@ -208,7 +207,7 @@ def _render_table(block: dict) -> List[str]:
     for row in rows:
         if not isinstance(row, list):
             row = []
-        rendered_rows.append([cell_text(cell).replace("\n", " ").strip() for cell in row])
+        rendered_rows.append([cell_text(cell).replace("\n", " ").replace("|", "\\|").strip() for cell in row])
 
     header = rendered_rows[header_row_idx] if header_row_idx < len(rendered_rows) else []
     header = header + [""] * (max_cols - len(header))
