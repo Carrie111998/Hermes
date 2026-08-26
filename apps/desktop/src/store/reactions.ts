@@ -75,7 +75,7 @@ export async function toggleMessageReaction(
   try {
     const result = await requestForOwnedSession<MessageReactResponse>(
       sessionId,
-      gateway.request.bind(gateway) as typeof gateway.request,
+      gateway.request.bind(gateway),
       'message.react',
       {
         session_id: sessionId,
