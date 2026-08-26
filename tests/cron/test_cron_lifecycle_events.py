@@ -739,3 +739,296 @@ class TestSchemaAndRouting:
         icons = [et.icon for et in same_topic]
         assert len(icons) == len(set(icons))
         assert EventType.CRON_PAUSED.icon != EventType.CRON_RESUMED.icon
+
+
+# ---------------------------------------------------------------------------
+# CALLER ATTRIBUTION — the emitted event must never carry a null caller
+# ---------------------------------------------------------------------------
+#
+# The delivery half of this feature shipped 2026-08-25 and was verified live on
+# 2026-08-26. The ATTRIBUTION half had a hole. ``pause_job``/``resume_job``/
+# ``trigger_job`` take ``caller: Optional[str] = None`` and, when it is None,
+# only log a warning — they do not refuse. So anything importing ``cron.jobs``
+# and calling ``resume_job(job_id)`` bare produced a perfectly well-formed,
+# audit-logged event whose ``caller`` was null, which is the single field the
+# whole feature exists to provide.
+#
+# Observed live, not hypothetical: at 2026-08-26 01:17:33-35 EDT a bare
+# ``J.resume_job(jid)`` in ``~/.hermes/bin/gate2_resume_barrier_set.py``
+# released three Gate-2 containment-hold jobs. All three landed on the bus
+# (rowid 636947/636948/636949) with ``caller=None``, side by side with sanctioned
+# resumes stamped ``hermes_cli:cron_resume``. Note the event's ``source`` field
+# carries the JOB NAME, not the actor, so it cannot substitute.
+#
+# The fix is deliberately NOT a required keyword argument. That design was
+# tried on 2026-08-25 for ``pause_jobs_cas``/``restore_jobs_cas`` on the premise
+# that they had "no landed consumer yet" — and the premise was false: the
+# tracked ``profiles/tracker/workspace/quarantine_scheduler_adapter.py`` calls
+# both without a caller and has raised TypeError ever since, unnoticed for a
+# day. Breaking a signature breaks the out-of-repo scripts that ARE the hole,
+# at runtime, mid-operation.
+#
+# Instead the emitter resolves a non-null value and says which kind it is:
+#   threaded  — a call site passed an explicit caller. Strong evidence.
+#   derived   — nobody passed one; the value comes from $HERMES_CALLER, else
+#               ``script:<basename(sys.argv[0])>``. Weaker evidence, and
+#               ``caller_source`` is what stops a reader mistaking it for the
+#               strong kind.
+# A derived value is strictly better than null: for the incident above it would
+# have read ``script:gate2_resume_barrier_set.py``, which names the actor.
+#
+# The anonymous-call WARNING is deliberately kept (see the two
+# ``test_anonymous_caller_warns`` tests above). Deriving a value makes the
+# record usable; it does not make threading a caller optional in new code.
+
+
+class TestResolveCaller:
+    """The pure helper, tested directly so the policy is pinned in one place."""
+
+    def test_an_explicit_caller_passes_through_and_is_marked_threaded(self):
+        from events.producers.cron_lifecycle_emitter import resolve_caller
+
+        assert resolve_caller("hermes_cli:cron_resume") == (
+            "hermes_cli:cron_resume", "threaded",
+        )
+
+    def test_none_derives_from_argv0_basename(self, monkeypatch):
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.delenv("HERMES_CALLER", raising=False)
+        monkeypatch.setattr(
+            E.sys, "argv", [r"C:\Users\diego\.hermes\bin\gate2_resume_barrier_set.py"]
+        )
+
+        assert E.resolve_caller(None) == (
+            "script:gate2_resume_barrier_set.py", "derived",
+        )
+
+    def test_a_blank_caller_counts_as_absent(self, monkeypatch):
+        """``caller=""`` and ``caller="   "`` are the same mistake as None.
+
+        Without this a call site that threads an empty config value would sail
+        past the check and write a falsy caller that reads as attributed.
+        """
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.delenv("HERMES_CALLER", raising=False)
+        monkeypatch.setattr(E.sys, "argv", ["/usr/bin/hermes"])
+
+        for blank in ("", "   ", "\t\n"):
+            assert E.resolve_caller(blank) == ("script:hermes", "derived")
+
+    def test_hermes_caller_env_beats_argv(self, monkeypatch):
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.setenv("HERMES_CALLER", "claude-code/vigilant-hawking:barrier-lift")
+        monkeypatch.setattr(E.sys, "argv", ["/usr/bin/hermes"])
+
+        assert E.resolve_caller(None) == (
+            "claude-code/vigilant-hawking:barrier-lift", "derived",
+        )
+
+    def test_hermes_caller_env_is_stripped_and_a_blank_one_is_ignored(self, monkeypatch):
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.setattr(E.sys, "argv", ["/usr/bin/hermes"])
+
+        monkeypatch.setenv("HERMES_CALLER", "  spaced:actor  ")
+        assert E.resolve_caller(None) == ("spaced:actor", "derived")
+
+        monkeypatch.setenv("HERMES_CALLER", "   ")
+        assert E.resolve_caller(None) == ("script:hermes", "derived")
+
+    def test_env_never_overrides_a_threaded_caller(self, monkeypatch):
+        """$HERMES_CALLER is a fallback, not an override.
+
+        An env var that could rewrite a threaded caller would let ambient
+        process state forge attribution on a call site that did the right
+        thing — strictly worse than the null it replaces.
+        """
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.setenv("HERMES_CALLER", "impostor")
+        assert E.resolve_caller("hermes_cli:cron_pause") == (
+            "hermes_cli:cron_pause", "threaded",
+        )
+
+    def test_an_unusable_argv_falls_back_to_a_named_unknown(self, monkeypatch):
+        """Never null, even with no env and no argv — embedded interpreters and
+        some service hosts leave ``sys.argv`` empty or blank."""
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.delenv("HERMES_CALLER", raising=False)
+
+        for argv in ([], [""], ["   "], ["/"], ["\\"]):
+            monkeypatch.setattr(E.sys, "argv", argv)
+            assert E.resolve_caller(None) == ("script:unknown", "derived")
+
+    def test_a_trailing_separator_still_yields_the_name(self, monkeypatch):
+        """A path handed in with a trailing separator is usable, not unknown:
+        bare ``os.path.basename`` returns "" for it, which would have silently
+        demoted a perfectly identifiable script to :data:`UNKNOWN_SCRIPT`."""
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.delenv("HERMES_CALLER", raising=False)
+
+        for argv0 in ("/opt/hermes/bin/runner.py/", r"C:\hermes\bin\runner.py" + "\\"):
+            monkeypatch.setattr(E.sys, "argv", [argv0])
+            assert E.resolve_caller(None) == ("script:runner.py", "derived")
+
+
+class TestEmittedCallerIsNeverNull:
+    """End-to-end through the real functions and the real bus."""
+
+    @pytest.fixture(autouse=True)
+    def _anonymous_environment(self, monkeypatch):
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.delenv("HERMES_CALLER", raising=False)
+        monkeypatch.setattr(E.sys, "argv", ["/somewhere/bare_script.py"])
+
+    def test_an_anonymous_resume_is_attributed_not_null(self, store, bus):
+        """A bare ``resume_job(jid)``, the 2026-08-26 01:17 shape.
+
+        Deliberately paused with NO reason. A sibling session is landing a
+        refusal on ``resume_job`` for jobs that carry a ``paused_reason`` —
+        which is the authorization half, and complementary to this. Its own
+        comment says "anonymous is tolerated only for a pause that says
+        nothing", so a reasonless pause is exactly the case that refusal leaves
+        open and this derivation closes. Pinning the reasonless shape here
+        keeps the two changes composable instead of racing.
+        """
+        job = _mk()
+        J.pause_job(job["id"], caller="test:pause")
+
+        J.resume_job(job["id"])  # no caller — the defect
+
+        payload = _payloads(bus, EventType.CRON_RESUMED)[-1]
+        assert payload["caller"] == "script:bare_script.py"
+        assert payload["caller_source"] == "derived"
+
+    def test_an_anonymous_pause_is_attributed_not_null(self, store, bus):
+        job = _mk()
+
+        J.pause_job(job["id"], reason="containment")  # no caller
+
+        payload = _payloads(bus, EventType.CRON_PAUSED)[-1]
+        assert payload["caller"] == "script:bare_script.py"
+        assert payload["caller_source"] == "derived"
+
+    def test_an_anonymous_trigger_attributes_its_implicit_unpause(self, store, bus):
+        """``trigger_job`` on a paused job implicitly ends the pause, and that
+        CRON_RESUMED needs a caller as much as the explicit one does.
+
+        Written to survive the sibling change that removes the path entirely.
+        ``a8a37895ae`` (branch ``claude/cron-run-unpause-20260826``, unmerged at
+        the time of writing) makes ``trigger_job`` raise ``JobPaused`` rather
+        than revive a contained job. Both outcomes are correct here and the
+        assertion is the same invariant either way: a paused job is never left
+        un-paused by an unattributed actor. What must NOT happen is the third
+        outcome — the un-pause going through with a null caller.
+        """
+        job = _mk()
+        J.pause_job(job["id"], reason="contained", caller="test:pause")
+
+        try:
+            J.trigger_job(job["id"])  # no caller
+        except Exception as exc:  # JobPaused, once that lands
+            assert "paus" in type(exc).__name__.lower() or "paus" in str(exc).lower(), (
+                f"unexpected failure from trigger_job: {exc!r}"
+            )
+            assert _payloads(bus, EventType.CRON_RESUMED) == [], (
+                "a refused trigger must not emit a resume at all"
+            )
+            return
+
+        payload = _payloads(bus, EventType.CRON_RESUMED)[-1]
+        assert payload["caller"] == "script:bare_script.py"
+        assert payload["caller_source"] == "derived"
+
+    def test_a_threaded_caller_is_preserved_and_marked_threaded(self, store, bus):
+        job = _mk()
+        J.pause_job(job["id"], reason="jaum backlog", caller="hermes_cli:cron_pause")
+        J.resume_job(job["id"], caller="hermes_cli:cron_resume")
+
+        paused = _payloads(bus, EventType.CRON_PAUSED)[-1]
+        resumed = _payloads(bus, EventType.CRON_RESUMED)[-1]
+
+        assert (paused["caller"], paused["caller_source"]) == (
+            "hermes_cli:cron_pause", "threaded",
+        )
+        assert (resumed["caller"], resumed["caller_source"]) == (
+            "hermes_cli:cron_resume", "threaded",
+        )
+
+    def test_env_attributes_a_bare_script_that_exports_it(self, store, bus, monkeypatch):
+        """The migration path for an out-of-repo script that cannot be edited:
+        export HERMES_CALLER and its resumes stop reading as anonymous."""
+        monkeypatch.setenv("HERMES_CALLER", "cron:82bcbc0edbf1")
+        job = _mk()
+        J.pause_job(job["id"], caller="test:pause")  # reasonless: see above
+
+        J.resume_job(job["id"])
+
+        payload = _payloads(bus, EventType.CRON_RESUMED)[-1]
+        assert payload["caller"] == "cron:82bcbc0edbf1"
+        assert payload["caller_source"] == "derived"
+
+    def test_no_lifecycle_path_can_emit_a_null_caller(self, store, bus):
+        """The population check: drive every one of the five paths anonymously
+        where the signature allows it, and assert the invariant holds across
+        the whole emitted set rather than per-test.
+
+        ``pause_jobs_cas``/``restore_jobs_cas`` cannot be driven anonymously —
+        ``caller`` is a required keyword there — so they contribute threaded
+        rows and are covered by TestBulkContainment above.
+
+        Pauses are reasonless so the sequence stays legal under the sibling
+        ``resume_job`` refusal described in
+        ``test_an_anonymous_resume_is_attributed_not_null``.
+        """
+        job = _mk()
+        J.pause_job(job["id"])
+        J.resume_job(job["id"])
+        J.pause_job(job["id"], caller="test:pause")
+        J.resume_job(job["id"], caller="test:resume")
+
+        emitted = (
+            _payloads(bus, EventType.CRON_PAUSED)
+            + _payloads(bus, EventType.CRON_RESUMED)
+        )
+        assert len(emitted) == 4, "expected 2 pauses + 2 resumes"
+        for payload in emitted:
+            assert payload["caller"], f"null/blank caller survived: {payload}"
+            assert payload["caller_source"] in ("threaded", "derived")
+
+
+class TestCallerSourceIsHonest:
+    def test_a_derived_caller_is_never_labelled_threaded(self, store, bus, monkeypatch):
+        """The whole point of the second field.
+
+        A derived value that claimed to be threaded would be worse than the null
+        it replaced: null is visibly missing evidence, a mislabelled derivation
+        is invisibly weak evidence.
+        """
+        from events.producers import cron_lifecycle_emitter as E
+
+        monkeypatch.delenv("HERMES_CALLER", raising=False)
+        monkeypatch.setattr(E.sys, "argv", ["/somewhere/bare_script.py"])
+
+        job = _mk()
+        J.pause_job(job["id"], reason="x")
+        payload = _payloads(bus, EventType.CRON_PAUSED)[-1]
+
+        assert payload["caller_source"] == "derived"
+        assert payload["caller"].startswith("script:")
+
+    def test_the_anonymous_warning_survives_the_derivation(self, store, bus, caplog):
+        """Deriving a value must not silence the nag that says to thread one."""
+        import logging
+
+        job = _mk()
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            J.pause_job(job["id"], reason="x")
+
+        assert "pause_job called anonymously" in caplog.text
