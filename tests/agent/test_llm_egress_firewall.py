@@ -278,6 +278,27 @@ def test_only_exact_policy_allowlisted_static_wrappers_accompany_source(tmp_path
     assert "sanitized_segment_forbidden" in sanitized_exc.value.decision.reason_codes
 
 
+def test_firewall_binds_requests_to_its_configured_policy_digest(tmp_path):
+    request = TypedOutboundRequest(
+        payload={"messages": [LiteralSegment("ordinary prompt")]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(
+            tmp_path,
+            policy_digest="policy-2",
+            static_literals={"ordinary prompt"},
+        ).preflight(
+            request,
+            _route(base_url="http://127.0.0.1:1234"),
+            grants=(),
+        )
+    assert "policy_digest_mismatch" in exc_info.value.decision.reason_codes
+
+
 @pytest.mark.parametrize(
     ("wrapper", "reason"),
     [

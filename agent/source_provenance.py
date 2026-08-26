@@ -17,6 +17,7 @@ from pathlib import Path
 import stat
 from threading import RLock
 from typing import Iterator
+import uuid
 
 from agent.file_safety import get_read_block_error
 from agent.llm_egress_firewall import SourceGrant
@@ -243,13 +244,36 @@ class SourceProvenanceRegistry:
                 self._grants.pop(request_id, None)
 
 
-def provenance_kwargs_for_agent(agent, *, request_id: str | None = None) -> dict[str, object]:
+def provenance_kwargs_for_agent(
+    agent,
+    *,
+    request_id: str | None = None,
+    establish_turn: bool = False,
+) -> dict[str, object]:
     """Return authenticated context-reference kwargs for a live agent turn."""
 
     session_id = str(getattr(agent, "session_id", "") or "")
-    turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+    registry = getattr(agent, "_source_provenance_registry", None)
+    if not isinstance(registry, SourceProvenanceRegistry):
+        registry = SourceProvenanceRegistry()
+        agent._source_provenance_registry = registry
+
+    if establish_turn:
+        previous_turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+        previous_request_id = str(getattr(agent, "_current_api_request_id", "") or "")
+        if previous_request_id:
+            registry.clear_request(previous_request_id)
+        if previous_turn_id:
+            registry.clear_turn(previous_turn_id)
+        turn_id = f"{session_id or 'session'}:context:{uuid.uuid4().hex[:8]}"
+        agent._source_provenance_pending_turn_id = turn_id
+    else:
+        turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     resolved_request_id = str(
         request_id
+        # The conversation loop increments ``api_call_count`` before building
+        # its first provider request, so the first consuming identity is 1.
+        or (f"{turn_id}:api:1" if establish_turn and turn_id else "")
         or getattr(agent, "_current_api_request_id", "")
         or (f"{turn_id}:context" if turn_id else "")
     )
@@ -260,10 +284,6 @@ def provenance_kwargs_for_agent(agent, *, request_id: str | None = None) -> dict
     )
     if not all((session_id, turn_id, resolved_request_id, policy_digest)):
         return {}
-    registry = getattr(agent, "_source_provenance_registry", None)
-    if not isinstance(registry, SourceProvenanceRegistry):
-        registry = SourceProvenanceRegistry()
-        agent._source_provenance_registry = registry
     return {
         "source_provenance_registry": registry,
         "session_id": session_id,
@@ -279,11 +299,33 @@ def clear_agent_source_provenance(agent, *, request_id: str | None = None) -> No
     registry = getattr(agent, "_source_provenance_registry", None)
     if not isinstance(registry, SourceProvenanceRegistry):
         return
+    pending_turn_id = str(
+        getattr(agent, "_source_provenance_pending_turn_id", "") or ""
+    )
+    if pending_turn_id:
+        registry.clear_turn(pending_turn_id)
+        agent._source_provenance_pending_turn_id = None
     resolved_request_id = str(request_id or getattr(agent, "_current_api_request_id", "") or "")
     if resolved_request_id:
         registry.clear_request(resolved_request_id)
         return
     registry.clear_turn(str(getattr(agent, "_current_turn_id", "") or ""))
+
+
+def following_api_request_id(request_id: str, turn_id: str) -> str:
+    """Bind trusted tool output to the API request that will consume it."""
+
+    if not turn_id:
+        return request_id
+    prefix = f"{turn_id}:api:"
+    if request_id.startswith(prefix):
+        try:
+            return f"{prefix}{int(request_id[len(prefix):]) + 1}"
+        except ValueError:
+            pass
+    # An unparseable current request cannot be projected to an exact future
+    # request. Keep the read available but issue no usable grant.
+    return ""
 
 
 def _read_bounded_slice(path: Path, line_start: int, line_end: int) -> bytes:

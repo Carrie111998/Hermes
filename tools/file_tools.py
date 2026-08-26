@@ -137,6 +137,7 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
 def _issue_active_read_provenance(
     *,
     resolved: Path | PurePosixPath,
+    source_path: Path | None,
     offset: int,
     limit: int,
     returned_content: str,
@@ -152,7 +153,7 @@ def _issue_active_read_provenance(
     """
 
     context = active_source_provenance()
-    if context is None or not isinstance(resolved, Path):
+    if context is None or not isinstance(resolved, Path) or source_path is None:
         return
     if result_dict.get("error") or result_dict.get("truncated_by") or not returned_content:
         return
@@ -171,11 +172,21 @@ def _issue_active_read_provenance(
         if not selected:
             return
         raw = b"".join(selected)
-        expected = file_ops._add_line_numbers(raw.decode("utf-8"), offset)
+        decoded = raw.decode("utf-8")
+        from tools.tool_output_limits import get_max_line_length
+
+        # read_file's gutter renderer truncates individual long lines for
+        # display. A grant must identify bytes the model actually received,
+        # never the undisplayed suffix of a clamped line.
+        if any(len(line) > get_max_line_length() for line in decoded.split("\n")):
+            return
+        expected = file_ops._add_line_numbers(decoded, offset)
         if returned_content != expected:
             return
         context.registry.issue_file_slice(
-            path=resolved,
+            # Keep the unresolved spelling so leaf and ancestor symlinks are
+            # still visible to the registry's no-follow validation.
+            path=source_path,
             line_start=offset,
             line_end=offset + len(selected) - 1,
             content=raw,
@@ -1705,6 +1716,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 "block or produce infinite output."
             )
 
+        _source_path = None
+        if not _uses_container_paths(task_id):
+            _source_path = Path(_expand_tilde(path))
+            if not _source_path.is_absolute():
+                _source_path = Path(_resolve_base_dir(task_id)) / _source_path
         _resolved = _resolve_path_for_task(path, task_id)
 
         # ── Special-file type guard (stat-based) ──────────────────────
@@ -2059,6 +2075,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         if result.content == content_before_redaction:
             _issue_active_read_provenance(
                 resolved=_resolved,
+                source_path=_source_path,
                 offset=offset,
                 limit=limit,
                 returned_content=result.content,

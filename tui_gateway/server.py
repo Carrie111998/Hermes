@@ -11575,7 +11575,7 @@ def _run_prompt_submit(
                     cwd=cwd,
                     allowed_root=cwd,
                     context_length=ctx_len,
-                    **provenance_kwargs_for_agent(agent),
+                    **provenance_kwargs_for_agent(agent, establish_turn=True),
                 )
                 if ctx.blocked:
                     clear_agent_source_provenance(agent)

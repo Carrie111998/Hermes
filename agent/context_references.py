@@ -401,6 +401,9 @@ def _expand_file_reference(
     allowed_root: Path | None = None,
     provenance_context=None,
 ) -> tuple[str | None, str | None]:
+    source_path = Path(os.path.expanduser(ref.target))
+    if not source_path.is_absolute():
+        source_path = cwd / source_path
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
     if not path.exists():
@@ -426,7 +429,10 @@ def _expand_file_reference(
         text = raw_bytes.decode("utf-8")
         if provenance_context is not None:
             provenance_context.registry.issue_file_slice(
-                path=path,
+                # Preserve the caller's original path chain. Passing the
+                # resolved path here would erase a symlinked leaf or ancestor
+                # before SourceProvenanceRegistry can reject it.
+                path=source_path,
                 line_start=ref.line_start,
                 line_end=ref.line_end or ref.line_start,
                 content=raw_bytes,

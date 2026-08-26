@@ -16403,7 +16403,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     message,
                     cwd=os.getcwd(),
                     context_length=_ctx_len,
-                    **provenance_kwargs_for_agent(agent),
+                    **provenance_kwargs_for_agent(agent, establish_turn=True),
                 )
                 if _ctx_result.expanded or _ctx_result.blocked:
                     if _ctx_result.references:
