@@ -54,10 +54,13 @@ function renderSubmitHook({
   editor.dataset.slot = 'composer-rich-input'
   editor.textContent = text
   const editorRef = { current: editor }
+  const activeQueueSessionKeyRef = { current: sessionKey }
   const onCancel = vi.fn()
   const onSteer = vi.fn(async () => true)
   const onSubmit = vi.fn(async () => true)
   const queueCurrentDraft = vi.fn(() => true)
+  const loadIntoComposer = vi.fn()
+  const stashAt = vi.fn()
   let updatePaneVisible: Dispatch<SetStateAction<boolean>> | undefined
 
   const clearDraft = vi.fn(() => {
@@ -97,7 +100,7 @@ function renderSubmitHook({
       useComposerSubmit({
         actionsDisabled,
         activeQueueSessionKey: sessionKey,
-        activeQueueSessionKeyRef: { current: sessionKey },
+        activeQueueSessionKeyRef,
         attachments,
         busy,
         compacting,
@@ -109,7 +112,7 @@ function renderSubmitHook({
         exitQueuedEdit: vi.fn(() => false),
         focusInput: vi.fn(),
         inputDisabled,
-        loadIntoComposer: vi.fn(),
+        loadIntoComposer,
         onCancel,
         onSteer,
         onSubmit,
@@ -118,18 +121,21 @@ function renderSubmitHook({
         queuedPrompts: [],
         sessionId: 'runtime-session',
         setComposerText: vi.fn(),
-        stashAt: vi.fn()
+        stashAt
       }),
     { wrapper: Wrapper }
   )
 
   return {
+    activeQueueSessionKeyRef,
     clearDraft,
     hook,
+    loadIntoComposer,
     onCancel,
     onSteer,
     onSubmit,
     queueCurrentDraft,
+    stashAt,
     composerSurfaceId: resolvedSurfaceId,
     setPaneVisible(nextVisible: boolean) {
       if (!updatePaneVisible) {
@@ -140,6 +146,37 @@ function renderSubmitHook({
     }
   }
 }
+
+describe('useComposerSubmit rejection restoration', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('stashes a rejected A submission without overwriting the visible B draft', async () => {
+    let settle: ((accepted: boolean) => void) | undefined
+
+    const pending = new Promise<boolean>(resolve => {
+      settle = resolve
+    })
+
+    const { activeQueueSessionKeyRef, hook, loadIntoComposer, onSubmit, stashAt } = renderSubmitHook({
+      sessionKey: 'session-a'
+    })
+
+    onSubmit.mockImplementationOnce(() => pending)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('draft from A')
+      activeQueueSessionKeyRef.current = 'session-b'
+    })
+
+    await act(async () => settle?.(false))
+
+    expect(stashAt).toHaveBeenCalledWith('session-a', 'draft from A', [])
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+  })
+})
 
 describe('useComposerSubmit external request routing', () => {
   afterEach(() => {

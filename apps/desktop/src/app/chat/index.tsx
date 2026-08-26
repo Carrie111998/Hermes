@@ -109,6 +109,22 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onDismissError?: (messageId: string) => void
 }
 
+export function shouldShowChatBar({
+  activeSessionId,
+  isRoutedSessionView,
+  messagesEmpty,
+  resumeExhausted,
+  watchWindow
+}: {
+  activeSessionId: null | string | undefined
+  isRoutedSessionView: boolean
+  messagesEmpty: boolean
+  resumeExhausted: boolean
+  watchWindow: boolean
+}): boolean {
+  return !(isRoutedSessionView && messagesEmpty && !activeSessionId) && !resumeExhausted && !watchWindow
+}
+
 interface ChatHeaderProps {
   activeSessionId: null | string
   isRoutedSessionView: boolean
@@ -552,8 +568,13 @@ const ChatViewContent = memo(function ChatViewContent({
   // busy/session actions still point at A. ChatBar receives an independent
   // action fence below — typing stays enabled, every submit/steer/cancel/queue
   // path fails closed until the identities converge.
-  const showChatBar =
-    !(isRoutedSessionView && messagesEmpty && !activeSessionId) && !resumeExhausted && !isWatchWindow()
+  const showChatBar = shouldShowChatBar({
+    activeSessionId,
+    isRoutedSessionView,
+    messagesEmpty,
+    resumeExhausted,
+    watchWindow: isWatchWindow()
+  })
 
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 

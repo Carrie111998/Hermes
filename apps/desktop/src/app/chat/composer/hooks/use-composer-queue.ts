@@ -101,7 +101,7 @@ export function useComposerQueue({
   const drainFailuresRef = useRef(new Map<string, number>())
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
-    if (!activeQueueSessionKey || queueEdit) {
+    if (actionsDisabled || !activeQueueSessionKey || queueEdit) {
       return
     }
 
@@ -122,7 +122,7 @@ export function useComposerQueue({
   // saving the in-progress edit on each step. Stepping newer past the last
   // entry exits edit mode and restores the pre-edit draft.
   const stepQueuedEdit = (direction: -1 | 1) => {
-    if (!queueEdit) {
+    if (actionsDisabled || !queueEdit) {
       return false
     }
 
@@ -155,7 +155,7 @@ export function useComposerQueue({
   }
 
   const exitQueuedEdit = (action: 'cancel' | 'save'): boolean => {
-    if (!queueEdit) {
+    if (actionsDisabled || !queueEdit) {
       return false
     }
 

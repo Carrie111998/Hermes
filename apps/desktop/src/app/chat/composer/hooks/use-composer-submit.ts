@@ -90,7 +90,13 @@ export function useComposerSubmit({
     const submittedAttachments = attachments ?? []
 
     const restore = () => {
-      loadIntoComposer(text, submittedAttachments)
+      // The mounted composer may now be showing another route. Preserve the
+      // rejected payload in A's stash, but never paint it over B's visible
+      // editor or attachments after a session switch.
+      if (activeQueueSessionKeyRef.current === submittedScope) {
+        loadIntoComposer(text, submittedAttachments)
+      }
+
       // Use the scope captured at dispatch, not whatever session is focused
       // now — the gateway can reject well after the user has switched away,
       // and re-stashing into the currently-focused session would overwrite

@@ -75,7 +75,7 @@ vi.mock('./sidebar/session-actions-menu', async () => {
   }
 })
 
-const { ChatView } = await import('./index')
+const { ChatView, shouldShowChatBar } = await import('./index')
 
 function assistantMessage(id: string, text: string): ChatMessage {
   return {
@@ -111,6 +111,47 @@ function chatViewProps() {
     onTranscribeAudio: vi.fn()
   }
 }
+
+describe('shouldShowChatBar', () => {
+  it('preserves initial-loading, exhausted, watch, and normal visibility', () => {
+    expect(
+      shouldShowChatBar({
+        activeSessionId: null,
+        isRoutedSessionView: true,
+        messagesEmpty: true,
+        resumeExhausted: false,
+        watchWindow: false
+      })
+    ).toBe(false)
+    expect(
+      shouldShowChatBar({
+        activeSessionId: 'runtime-a',
+        isRoutedSessionView: true,
+        messagesEmpty: false,
+        resumeExhausted: true,
+        watchWindow: false
+      })
+    ).toBe(false)
+    expect(
+      shouldShowChatBar({
+        activeSessionId: 'runtime-a',
+        isRoutedSessionView: true,
+        messagesEmpty: false,
+        resumeExhausted: false,
+        watchWindow: true
+      })
+    ).toBe(false)
+    expect(
+      shouldShowChatBar({
+        activeSessionId: 'runtime-a',
+        isRoutedSessionView: true,
+        messagesEmpty: false,
+        resumeExhausted: false,
+        watchWindow: false
+      })
+    ).toBe(true)
+  })
+})
 
 describe('ChatView render isolation', () => {
   beforeEach(() => {

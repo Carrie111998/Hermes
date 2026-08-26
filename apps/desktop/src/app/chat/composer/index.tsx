@@ -685,14 +685,14 @@ export function ChatBar({
     // Tab must not fall through to the browser — it would move focus out of
     // the composer mid-completion, which reads as the popover "eating" the
     // keypress. Swallow it; the refresh lands with the items.
-    if (trigger && triggerLoading && triggerItems.length === 0 && event.key === 'Tab') {
+    if (!actionsDisabled && trigger && triggerLoading && triggerItems.length === 0 && event.key === 'Tab') {
       event.preventDefault()
       triggerKeyConsumedRef.current = true
 
       return
     }
 
-    if (trigger && triggerItems.length > 0) {
+    if (!actionsDisabled && trigger && triggerItems.length > 0) {
       if (event.key === 'ArrowDown') {
         event.preventDefault()
         triggerKeyConsumedRef.current = true
@@ -777,6 +777,7 @@ export function ChatBar({
     // `/personality creative`. Space/Tab still commit what's typed as a single
     // directive chip; Enter falls through to submit (send it as-is).
     if (
+      !actionsDisabled &&
       trigger?.kind === '/' &&
       !triggerItems.length &&
       (event.key === ' ' || event.key === 'Tab') &&
@@ -794,7 +795,7 @@ export function ChatBar({
     // ArrowUp/ArrowDown navigate, in priority order: the queue (edit entries in
     // place) then sent-message history. The history ring is derived from live
     // session messages each press — single source of truth, no mirror.
-    if (event.key === 'ArrowUp') {
+    if (!actionsDisabled && event.key === 'ArrowUp') {
       const currentDraft = draftRef.current
 
       // Editing a queued turn → walk to the older entry.
@@ -835,7 +836,7 @@ export function ChatBar({
       return
     }
 
-    if (event.key === 'ArrowDown') {
+    if (!actionsDisabled && event.key === 'ArrowDown') {
       // Editing a queued turn → walk to the newer entry (past the newest exits).
       if (queueEdit) {
         event.preventDefault()
@@ -929,7 +930,7 @@ export function ChatBar({
 
     if (event.key === 'Escape') {
       // Editing a queued turn → Esc cancels the edit, restoring the prior draft.
-      if (queueEdit) {
+      if (!actionsDisabled && queueEdit) {
         event.preventDefault()
         exitQueuedEdit('cancel')
 
@@ -970,7 +971,7 @@ export function ChatBar({
   // Branch / worktree hand-offs (CodingStatusRow). Owns the worktree open +
   // branch-off/convert/list/switch actions; draft travels into the new session.
   const { handleBranchOff, handleConvertBranch, handleListBranches, handleSwitchBranch, openInWorktree } =
-    useComposerBranch({ clearDraft, cwd, draftRef })
+    useComposerBranch({ actionsDisabled, clearDraft, cwd, draftRef, sessionKey: activeQueueSessionKey })
 
   // Global Esc-to-cancel when the chat (not the composer input) has focus.
   // Same explicit-halt semantics as the Stop button: park the queue.
@@ -997,6 +998,7 @@ export function ChatBar({
     onSubmit,
     onTranscribeAudio,
     sessionId,
+    submissionKey: activeQueueSessionKey,
     target: scope.target
   })
 
@@ -1274,7 +1276,7 @@ export function ChatBar({
             ref={composerRef}
           >
             {isHelpHint && <HelpHint />}
-            {trigger && !argStageEmpty && (
+            {!actionsDisabled && trigger && !argStageEmpty && (
               <ComposerTriggerPopover
                 activeIndex={triggerActive}
                 items={triggerItems}
@@ -1330,21 +1332,23 @@ export function ChatBar({
                     composerSurfaceGlass
                   )}
                 />
-                <CodingStatusRow
-                  onBranchOff={handleBranchOff}
-                  onConvertBranch={handleConvertBranch}
-                  onListBranches={handleListBranches}
-                  // A tile's rail reviews ITS worktree: pin the pane's scope to
-                  // this surface's cwd. Main keeps the classic follow-the-
-                  // active-session scope (null).
-                  onOpen={() => toggleReview(scope.target === 'main' ? null : (cwd ?? null), scope.target)}
-                  onOpenWorktree={openInWorktree}
-                  onSwitchBranch={handleSwitchBranch}
-                  // Blank in a bot chat: the row hides itself without a repo,
-                  // and stops probing git / GitHub for a surface that has no
-                  // branch to show. Cheaper than a second composer.
-                  repoPath={botChat ? undefined : cwd}
-                />
+                {!actionsDisabled && (
+                  <CodingStatusRow
+                    onBranchOff={handleBranchOff}
+                    onConvertBranch={handleConvertBranch}
+                    onListBranches={handleListBranches}
+                    // A tile's rail reviews ITS worktree: pin the pane's scope to
+                    // this surface's cwd. Main keeps the classic follow-the-
+                    // active-session scope (null).
+                    onOpen={() => toggleReview(scope.target === 'main' ? null : (cwd ?? null), scope.target)}
+                    onOpenWorktree={openInWorktree}
+                    onSwitchBranch={handleSwitchBranch}
+                    // Blank in a bot chat: the row hides itself without a repo,
+                    // and stops probing git / GitHub for a surface that has no
+                    // branch to show. Cheaper than a second composer.
+                    repoPath={botChat ? undefined : cwd}
+                  />
+                )}
                 <div
                   className={cn(
                     'relative z-1 flex min-h-0 w-full flex-col gap-(--composer-row-gap) overflow-hidden rounded-[inherit] px-(--composer-surface-pad-x) py-(--composer-surface-pad-y) transition-opacity duration-200 ease-out',
@@ -1357,10 +1361,10 @@ export function ChatBar({
                   {/* Contribution seams: banners above, a row below, inline
                     additions beside the "+" menu and before the controls.
                     All four render nothing until something contributes. */}
-                  <ContribSlot area={COMPOSER_AREAS.top} />
+                  {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.top} />}
                   <VoiceActivity state={voiceActivityState} />
                   <VoicePlaybackActivity />
-                  {queueEdit && editingQueuedPrompt && (
+                  {!actionsDisabled && queueEdit && editingQueuedPrompt && (
                     <div className="flex items-center justify-between gap-2 rounded-lg border border-[color-mix(in_srgb,var(--dt-composer-ring)_32%,transparent)] bg-accent/18 px-2 py-1">
                       <div className="min-w-0 text-[0.7rem] text-muted-foreground/88">
                         {t.composer.editingQueuedInComposer}
@@ -1394,16 +1398,16 @@ export function ChatBar({
                     )}
                   >
                     <div className="flex translate-y-[3px] items-start gap-(--composer-control-gap) self-start [grid-area:menu]">
-                      {contextMenu}
-                      <ContribSlot area={COMPOSER_AREAS.leading} />
+                      {!actionsDisabled && contextMenu}
+                      {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.leading} />}
                     </div>
                     <div className="min-w-0 [grid-area:input]">{input}</div>
                     <div className="flex min-w-0 items-center justify-end gap-(--composer-control-gap) [grid-area:controls]">
-                      <ContribSlot area={COMPOSER_AREAS.actions} />
+                      {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.actions} />}
                       {controls}
                     </div>
                   </div>
-                  <ContribSlot area={COMPOSER_AREAS.bottom} />
+                  {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.bottom} />}
                 </div>
               </div>
             </div>

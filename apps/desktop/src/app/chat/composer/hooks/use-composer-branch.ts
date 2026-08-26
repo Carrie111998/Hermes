@@ -1,13 +1,15 @@
-import { type MutableRefObject, useCallback } from 'react'
+import { type MutableRefObject, useCallback, useRef } from 'react'
 
 import { listRepoBranches, requestStartWorkSession, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
 
 import { useComposerScope } from '../scope'
 
 interface UseComposerBranchOptions {
+  actionsDisabled: boolean
   clearDraft: () => void
   cwd: null | string | undefined
   draftRef: MutableRefObject<string>
+  sessionKey: string | null
 }
 
 /**
@@ -17,20 +19,41 @@ interface UseComposerBranchOptions {
  * instead of getting stashed under this one. Backend coupling (cwd + the
  * projects store) is the only dependency; nothing about ChatBar's render.
  */
-export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBranchOptions) {
+export function useComposerBranch({ actionsDisabled, clearDraft, cwd, draftRef, sessionKey }: UseComposerBranchOptions) {
   const scope = useComposerScope()
+  const actionEpochRef = useRef({ key: sessionKey, value: 0 })
+
+  if (actionEpochRef.current.key !== sessionKey) {
+    actionEpochRef.current = { key: sessionKey, value: actionEpochRef.current.value + 1 }
+  }
+
+  const renderActionEpoch = actionEpochRef.current.value
+  const actionStateRef = useRef({ actionsDisabled, clearDraft, cwd, draftRef })
+
+  actionStateRef.current = { actionsDisabled, clearDraft, cwd, draftRef }
+
+  const actionIsCurrent = useCallback(
+    () => actionEpochRef.current.value === renderActionEpoch && !actionStateRef.current.actionsDisabled,
+    [renderActionEpoch]
+  )
 
   // Hand a worktree off to the controller: open a fresh session anchored there,
   // carrying the composer draft as its first turn. Clearing here means the draft
   // travels to the new session instead of getting stashed under this one.
   const openInWorktree = useCallback(
     (path: string) => {
-      const text = draftRef.current
-      clearDraft()
+      if (!actionIsCurrent()) {
+        return
+      }
+
+      const action = actionStateRef.current
+      const text = action.draftRef.current
+
+      action.clearDraft()
       scope.attachments.clear()
       requestStartWorkSession(path, text)
     },
-    [clearDraft, draftRef]
+    [actionIsCurrent, scope.attachments]
   )
 
   // Branch off into a NEW worktree (base = branch name, or current HEAD). A
@@ -38,14 +61,18 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
   // draft; a missing cwd / remote backend no-ops (the row hides the affordance).
   const handleBranchOff = useCallback(
     async (branch: string, base?: string) => {
-      const repoPath = cwd?.trim()
+      if (!actionIsCurrent()) {
+        return
+      }
+
+      const repoPath = actionStateRef.current.cwd?.trim()
       const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
 
       if (result) {
         openInWorktree(result.path)
       }
     },
-    [cwd, openInWorktree]
+    [actionIsCurrent, openInWorktree]
   )
 
   // Convert an EXISTING branch into a fresh worktree + session (no new branch).
@@ -53,13 +80,17 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
   // anchored there carrying the draft.
   const handleConvertBranch = useCallback(
     async (branch: string, path?: null | string, isDefault?: boolean) => {
+      if (!actionIsCurrent()) {
+        return
+      }
+
       if (path?.trim()) {
         openInWorktree(path)
 
         return
       }
 
-      const repoPath = cwd?.trim()
+      const repoPath = actionStateRef.current.cwd?.trim()
 
       if (repoPath && isDefault) {
         await switchBranchInRepo(repoPath, branch)
@@ -74,24 +105,32 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
         openInWorktree(result.path)
       }
     },
-    [cwd, openInWorktree]
+    [actionIsCurrent, openInWorktree]
   )
 
   const handleListBranches = useCallback(async () => {
-    const repoPath = cwd?.trim()
+    if (!actionIsCurrent()) {
+      return []
+    }
+
+    const repoPath = actionStateRef.current.cwd?.trim()
 
     return repoPath ? listRepoBranches(repoPath) : []
-  }, [cwd])
+  }, [actionIsCurrent])
 
   const handleSwitchBranch = useCallback(
     async (branch: string) => {
-      const repoPath = cwd?.trim()
+      if (!actionIsCurrent()) {
+        return
+      }
+
+      const repoPath = actionStateRef.current.cwd?.trim()
 
       if (repoPath) {
         await switchBranchInRepo(repoPath, branch)
       }
     },
-    [cwd]
+    [actionIsCurrent]
   )
 
   return { handleBranchOff, handleConvertBranch, handleListBranches, handleSwitchBranch, openInWorktree }

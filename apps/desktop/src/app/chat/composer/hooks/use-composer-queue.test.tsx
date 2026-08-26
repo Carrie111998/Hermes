@@ -35,18 +35,25 @@ function renderQueueHook(
   const onCancel = overrides.onCancel ?? vi.fn()
   const onSteer = overrides.onSteer
   const queueEditRef: { current: QueueEditState | null } = { current: null }
+  const draftRef = { current: '' }
+  const loadIntoComposer = vi.fn()
+
+  const initialProps: { actionsDisabled?: boolean; busy: boolean } = {
+    actionsDisabled: overrides.actionsDisabled,
+    busy: overrides.busy ?? false
+  }
 
   const hook = renderHook(
-    ({ busy }: { busy: boolean }) =>
+    ({ actionsDisabled, busy }: { actionsDisabled?: boolean; busy: boolean }) =>
       useComposerQueue({
-        actionsDisabled: overrides.actionsDisabled ?? false,
+        actionsDisabled: actionsDisabled ?? overrides.actionsDisabled ?? false,
         activeQueueSessionKey: SESSION_KEY,
         attachments: [],
         busy,
         clearDraft: () => undefined,
-        draftRef: { current: '' },
+        draftRef,
         focusInput: () => undefined,
-        loadIntoComposer: () => undefined,
+        loadIntoComposer,
         onCancel,
         onSteer,
         onSubmit,
@@ -54,10 +61,10 @@ function renderQueueHook(
         queueSessionKey: SESSION_KEY,
         sessionId: 'rt-session-queue-hook'
       }),
-    { initialProps: { busy: overrides.busy ?? false } }
+    { initialProps }
   )
 
-  return { hook, onCancel, onSubmit }
+  return { draftRef, hook, loadIntoComposer, onCancel, onSubmit }
 }
 
 describe('useComposerQueue park integration', () => {
@@ -103,6 +110,30 @@ describe('useComposerQueue park integration', () => {
     expect(onSteer).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+  })
+
+  it('blocks queue edit, save, cancel, and stepping while identities disagree', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first queued draft' })!
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second queued draft' })
+    const { draftRef, hook, loadIntoComposer } = renderQueueHook({ busy: true })
+
+    act(() => hook.result.current.beginQueuedEdit(first))
+    expect(hook.result.current.queueEdit?.entryId).toBe(first.id)
+
+    loadIntoComposer.mockClear()
+    draftRef.current = 'draft typed during transition'
+    hook.rerender({ actionsDisabled: true, busy: true })
+
+    act(() => {
+      expect(hook.result.current.stepQueuedEdit(1)).toBe(false)
+      expect(hook.result.current.exitQueuedEdit('save')).toBe(false)
+      expect(hook.result.current.exitQueuedEdit('cancel')).toBe(false)
+      hook.result.current.beginQueuedEdit(first)
+    })
+
+    expect(getQueuedPrompts(SESSION_KEY)[0]?.text).toBe('first queued draft')
+    expect(hook.result.current.queueEdit?.entryId).toBe(first.id)
+    expect(loadIntoComposer).not.toHaveBeenCalled()
   })
 
   it('holds a parked queue at the idle settle (the Stop edge)', async () => {
