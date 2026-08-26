@@ -180,12 +180,56 @@ def test_per_tool_mapping_parses_and_ignores_legacy_names():
     assert cfg.per_tool == {"todo": 10, "text_to_speech": 0}
 
 
-def test_per_tool_unknown_loop_caps_key_warns_instead_of_silence(capsys):
-    LoopCapConfig.from_mapping({"max_web_searches": 50, "todo": 10})
-    out = capsys.readouterr().out
-    assert "todo" in out and "per_tool" in out, (
+def test_per_tool_unknown_loop_caps_key_warns_instead_of_silence(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="agent.tool_guardrails"):
+        LoopCapConfig.from_mapping({"max_web_searches": 50, "todo": 10})
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "todo" in joined and "per_tool" in joined, (
         "a dropped cap key must warn — silence looks like a working cap"
     )
+
+
+def test_per_tool_invalid_cap_warns_and_stays_uncapped(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="agent.tool_guardrails"):
+        cfg = LoopCapConfig.from_mapping(
+            {"per_tool": {"web_search": "ten", "todo": -3, "tts": 4}}
+        )
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "web_search" in joined and "invalid cap" in joined
+    assert "todo" in joined and "invalid cap" in joined
+    # Valid caps still parse; invalid ones degrade to uncapped (0).
+    assert cfg.per_tool["tts"] == 4
+    assert cfg.per_tool["web_search"] == 0
+    assert cfg.per_tool["todo"] == 0
+
+
+def test_per_tool_keys_normalized_case_insensitively(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="agent.tool_guardrails"):
+        cfg = LoopCapConfig.from_mapping({"per_tool": {"TODO": 2}})
+    # Lookup at runtime uses the lowercase tool name.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=False, loop_caps=cfg)
+    )
+    for _ in range(2):
+        assert controller.before_call("todo", {"n": 1}).action == "allow"
+    assert controller.before_call("todo", {"n": 1}).action == "block"
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "normalized to 'todo'" in joined
+
+
+def test_per_tool_mapping_is_read_only():
+    cfg = LoopCapConfig.from_mapping({"per_tool": {"todo": 3}})
+    try:
+        cfg.per_tool["todo"] = 99  # type: ignore[index]
+    except TypeError:
+        return
+    raise AssertionError("per_tool mapping must be immutable")
 
 
 def test_per_tool_cap_blocks_any_named_tool_regardless_of_hard_stop():

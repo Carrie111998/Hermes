@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
+
+logger = logging.getLogger(__name__)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -223,18 +227,54 @@ class LoopCapConfig:
         )
         if unknown:
             # A silently-dropped cap looks identical to "no cap configured" —
-            # tell the user their key did nothing (#92476).
-            print(
-                "⚠ tool_loop_guardrails.loop_caps: unrecognized key(s) "
-                f"{', '.join(unknown)} — expected max_web_searches, "
-                "max_subagents, or per_tool."
+            # tell the user their key did nothing (#92476). logger, not
+            # print(): this parser also runs inside long-lived server
+            # processes where stdout is a machine-readable channel.
+            logger.warning(
+                "tool_loop_guardrails.loop_caps: unrecognized key(s) %s — "
+                "expected max_web_searches, max_subagents, or per_tool.",
+                ", ".join(unknown),
             )
         raw_per_tool = data.get("per_tool")
         per_tool: dict[str, int] = {}
         if isinstance(raw_per_tool, Mapping):
             for tool_name, raw_cap in raw_per_tool.items():
-                cap = _non_negative_int(raw_cap, 0)
-                per_tool[str(tool_name)] = cap
+                name_str = str(tool_name)
+                normalized = name_str.strip().lower()
+                # Accept plain non-negative ints and numeric strings; anything
+                # else would silently coerce to 0 (=uncapped) inside
+                # _non_negative_int, so surface the misconfiguration instead
+                # (#92476 review).
+                cap = 0
+                ok = False
+                if isinstance(raw_cap, bool):
+                    pass
+                elif isinstance(raw_cap, int):
+                    ok = raw_cap >= 0
+                    cap = raw_cap if ok else 0
+                else:
+                    try:
+                        parsed = int(str(raw_cap))
+                        ok = parsed >= 0
+                        cap = parsed if ok else 0
+                    except (TypeError, ValueError):
+                        ok = False
+                if not ok:
+                    logger.warning(
+                        "tool_loop_guardrails.loop_caps.per_tool[%s]: "
+                        "invalid cap %r ignored — tool runs uncapped. "
+                        "Use a non-negative integer.",
+                        name_str,
+                        raw_cap,
+                    )
+                if normalized != name_str:
+                    logger.warning(
+                        "tool_loop_guardrails.loop_caps.per_tool[%s]: "
+                        "normalized to '%s' (matching is case-insensitive).",
+                        name_str,
+                        normalized,
+                    )
+                per_tool[normalized] = cap
         return cls(
             max_web_searches=_non_negative_int(
                 data.get("max_web_searches"), defaults.max_web_searches
@@ -242,7 +282,7 @@ class LoopCapConfig:
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
             ),
-            per_tool=per_tool,
+            per_tool=MappingProxyType(per_tool),
         )
 
 
