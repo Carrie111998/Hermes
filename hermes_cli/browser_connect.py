@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
@@ -196,6 +197,155 @@ def discover_local_cdp_url(port: int, timeout: float = 1.0) -> str | None:
         if is_browser_debug_ready(url, timeout=timeout):
             return url
     return None
+
+
+# --- CDP page-target primitives ---------------------------------------------
+#
+# agent/grok_session.py and agent/gemini_session.py both scrape a logged-in tab
+# over CDP, and both need the same four operations: enumerate an origin's page
+# tabs, decide whether one is actually alive, open a throwaway tab, close it
+# again. They live here once because they must behave IDENTICALLY -- the
+# liveness probe in particular encodes a defect that was expensive to find
+# (2026-08-25) and trivial to re-derive wrongly.
+
+#: Budget for :func:`target_is_responsive`. Deliberately tiny next to a
+#: caller's settle window (grok 15s, gemini 30s): the whole point is to reject
+#: a dead tab in ~3s rather than discover it a full window later.
+CDP_LIVENESS_TIMEOUT = 3.0
+
+
+def cdp_call(ws_url: str, method: str, params: dict | None = None, *, timeout: float) -> dict:
+    """One CDP command/response round trip on a fresh websocket.
+
+    Raises on transport failure, on a CDP-level ``error`` reply, and on a
+    reply that never arrives -- callers that want degradation catch it.
+    """
+    from websocket import create_connection
+
+    ws = create_connection(ws_url, timeout=timeout, suppress_origin=True)
+    try:
+        ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+        deadline = time.monotonic() + timeout
+        # Wall clock AND an iteration cap: the socket timeout bounds a target
+        # that goes silent, the cap bounds one that streams events forever.
+        for _ in range(max(1, int(timeout)) * 20):
+            if time.monotonic() >= deadline:
+                break
+            frame = ws.recv()
+            if isinstance(frame, bytes):
+                frame = frame.decode("utf-8")
+            message = json.loads(frame)
+            if not isinstance(message, dict):
+                continue
+            if message.get("id") != 1:
+                continue  # interleaved protocol event; keep reading
+            if "error" in message:
+                raise RuntimeError(f"CDP error: {message['error']}")
+            return message.get("result") or {}
+        raise RuntimeError(f"CDP response timeout: {method}")
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def target_is_responsive(ws_url: str, *, timeout: float = CDP_LIVENESS_TIMEOUT) -> bool:
+    """Whether the tab's renderer actually executes JavaScript right now.
+
+    Chrome freezes and discards background tabs, and a FROZEN renderer is
+    indistinguishable from a healthy one by every cheap signal: it still
+    appears in ``/json/list`` with a valid ``webSocketDebuggerUrl``, and the
+    websocket still CONNECTS -- that handshake is browser-level, not
+    renderer-level. Only an actual evaluation tells them apart, and against a
+    frozen tab it HANGS to the full timeout rather than erroring. So this must
+    stay a real ``Runtime.evaluate`` under a SHORT timeout; do not weaken it to
+    a connection check or a ``/json/list`` presence check.
+
+    Diagnosed on grok_session 2026-08-25, where an undetected frozen tab left
+    the xai row unavailable for 39h; applied to gemini_session the same day,
+    where a live control found 6 of 8 page tabs frozen on this box.
+
+    NOT the same failure as a WEDGED tab (gemini_session's fresh-tab retry):
+    a wedged tab is alive and runs JS, it merely never completes a lazy RPC
+    chain, which only a full settle window reveals. Different failures,
+    different detection costs -- do not collapse them.
+    """
+    try:
+        cdp_call(
+            ws_url,
+            "Runtime.evaluate",
+            {"expression": "1", "returnByValue": True},
+            timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def find_page_targets(http_url: str, origin: str, *, timeout: float = 3.0) -> list[tuple[str, str]]:
+    """``(target_id, webSocketDebuggerUrl)`` for every page tab under ``origin``.
+
+    A LIST, not the first match: a long-backgrounded tab can be frozen while
+    another is fine, and picking blindly is what stranded grok on a dead tab
+    for 39h. A target with no id is skipped -- unclosable means unusable.
+    """
+    import urllib.request
+
+    found: list[tuple[str, str]] = []
+    try:
+        with urllib.request.urlopen(f"{http_url}/json", timeout=timeout) as resp:
+            targets = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return found
+    if not isinstance(targets, list):
+        return found
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        url = str(target.get("url") or "")
+        ws = str(target.get("webSocketDebuggerUrl") or "")
+        tid = str(target.get("id") or "")
+        if url.startswith(origin) and target.get("type") == "page" and ws and tid:
+            found.append((tid, ws))
+    return found
+
+
+def open_page_target(http_url: str, url: str, *, timeout: float = 5.0) -> tuple[str, str] | None:
+    """Open a background tab at ``url``; return ``(target_id, ws_url)``.
+
+    The id comes back so the caller can CLOSE what it opened. Without it a
+    5-minute poll against a persistently failing provider leaks 288 tabs a day.
+    """
+    import urllib.request
+
+    try:
+        # PUT: newer Chrome requires the PUT method on /json/new.
+        req = urllib.request.Request(f"{http_url}/json/new?{url}", method="PUT")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            target = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(target, dict):
+        return None
+    ws = str(target.get("webSocketDebuggerUrl") or "")
+    tid = str(target.get("id") or "")
+    return (tid, ws) if ws and tid else None
+
+
+def close_target(http_url: str, target_id: str, *, timeout: float = 5.0) -> bool:
+    """Close a tab we opened. Best-effort: a leaked tab must not fail a scrape."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"{http_url}/json/close/{target_id}", timeout=timeout
+        ) as resp:
+            resp.read()
+    except Exception as exc:
+        logger.debug("browser_connect: could not close target %s: %s", target_id, exc)
+        return False
+    return True
 
 
 def local_port_in_use(port: int, timeout: float = 0.5) -> bool:
