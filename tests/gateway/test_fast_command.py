@@ -124,6 +124,59 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     assert route["request_overrides"] == {"service_tier": "priority"}
 
 
+def test_turn_route_preserves_provider_request_overrides_without_fast_mode():
+    runner = _make_runner()
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://custom.example/v1",
+        "provider": "custom",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+        "request_overrides": {
+            "extra_body": {"enable_thinking": True, "reasoning_effort": "high"},
+        },
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner, "hi", "custom-model", runtime_kwargs
+    )
+
+    assert route["request_overrides"] == runtime_kwargs["request_overrides"]
+
+
+def test_cached_agent_turn_refresh_preserves_custom_extra_body():
+    """Two cached turns retain provider overrides while turn flags change."""
+    agent = SimpleNamespace(
+        request_overrides={
+            "extra_body": {
+                "enable_thinking": True,
+                "reasoning_effort": "high",
+            }
+        }
+    )
+
+    # Normal turn: the gateway call-site refresh must not replace provider state.
+    gateway_run._apply_gateway_turn_request_overrides(agent, {})
+    first_turn = dict(agent.request_overrides)
+
+    # A transient fast-mode turn may add its own key, but it must not erase the
+    # provider extra_body. Returning to normal must clear only the transient key.
+    gateway_run._apply_gateway_turn_request_overrides(
+        agent, {"service_tier": "priority"}
+    )
+    gateway_run._apply_gateway_turn_request_overrides(agent, {})
+
+    assert first_turn == {
+        "extra_body": {
+            "enable_thinking": True,
+            "reasoning_effort": "high",
+        }
+    }
+    assert agent.request_overrides == first_turn
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()

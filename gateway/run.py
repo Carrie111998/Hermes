@@ -1230,6 +1230,44 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+_GATEWAY_TURN_OVERRIDE_KEYS = ("service_tier", "speed")
+
+
+def _merge_gateway_turn_request_overrides(
+    existing_overrides: Optional[Dict[str, Any]],
+    turn_overrides: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge transient turn overrides without dropping provider defaults.
+
+    Custom providers can contribute persistent ``request_overrides`` such as
+    ``extra_body``. Fast/priority mode contributes turn-scoped keys. Preserve
+    the former, clear stale turn keys, then apply the current turn payload.
+    """
+    merged = dict(existing_overrides or {})
+    for key in _GATEWAY_TURN_OVERRIDE_KEYS:
+        merged.pop(key, None)
+
+    turn = dict(turn_overrides or {})
+    existing_extra = merged.get("extra_body")
+    turn_extra = turn.get("extra_body")
+    if isinstance(existing_extra, dict) and isinstance(turn_extra, dict):
+        turn["extra_body"] = {**existing_extra, **turn_extra}
+
+    merged.update(turn)
+    return merged
+
+
+def _apply_gateway_turn_request_overrides(
+    agent: Any,
+    turn_overrides: Optional[Dict[str, Any]],
+) -> None:
+    """Refresh a cached agent's turn overrides while retaining provider state."""
+    agent.request_overrides = _merge_gateway_turn_request_overrides(
+        getattr(agent, "request_overrides", None),
+        turn_overrides,
+    )
+
+
 def _stamp_hygiene_compression_provenance(
     agent: Any,
     desc: str,
@@ -2876,6 +2914,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_tokens": max_tokens,
     }
 
@@ -3016,6 +3055,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "request_overrides": dict(runtime.get("request_overrides") or {}),
     }
 
 
@@ -3074,6 +3114,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
+                    "request_overrides": dict(runtime.get("request_overrides") or {}),
                     "model": entry.get("model"),
                 }
             except Exception as fb_exc:
@@ -5874,7 +5915,10 @@ class TurnRunner:
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
-        agent.request_overrides = turn_route.get("request_overrides") or {}
+        _apply_gateway_turn_request_overrides(
+            agent,
+            turn_route.get("request_overrides"),
+        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -8262,14 +8306,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
-            route["request_overrides"] = {}
+            route["request_overrides"] = dict(
+                runtime_kwargs.get("request_overrides") or {}
+            )
             return route
 
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides or {}
+        route["request_overrides"] = _merge_gateway_turn_request_overrides(
+            runtime_kwargs.get("request_overrides"),
+            overrides,
+        )
         return route
 
     def _sync_session_model_from_agent(self, session_id: str, agent: Any) -> None:
