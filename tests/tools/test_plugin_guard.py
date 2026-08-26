@@ -113,6 +113,20 @@ class TestCleanPlugin:
         ]
         assert not any(f.pattern_id == "dns_exfil" for f in result.findings)
 
+    def test_js_arrow_with_extra_spaces_also_safe(self, tmp_path):
+        # Backtrack-proofing: `\s+` can greedily consume spaces then
+        # backtrack. `host  => ${host}` (two spaces) must NOT slip past
+        # the single-position lookahead — the (?!.*=>) catches it.
+        files = dict(BASE_FILES)
+        files["pane.js"] = (
+            "const f = host  => `served on ${host}`;\n"  # two spaces
+        )
+        plugin = _mk_plugin(tmp_path, files)
+        result = scan_plugin(plugin, source="owner/repo")
+        assert not any(f.pattern_id == "dns_exfil" for f in result.findings), [
+            (f.pattern_id, f.severity, f.file) for f in result.findings
+        ]
+
     def test_dns_exfil_still_dangerous_in_shell_context(self, tmp_path):
         # The underlying threat keeps full severity for plugins: a shell
         # line doing DNS resolution with variable interpolation stays

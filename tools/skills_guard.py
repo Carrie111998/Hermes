@@ -179,7 +179,11 @@ THREAT_PATTERNS = [
     # the identifier followed by `=>` is a parameter binding, not a DNS lookup,
     # and the `$` further along the line belongs to a template literal. Real
     # shell lookups (`host $X.attacker.example`) are unaffected.
-    (r'(?<![-/])\b(dig|nslookup|host)\s+(?!=>)[^\n]*\$',
+    # The `(?!=>)(?!.*=>)` pair is backtrack-proof: `\s+` greedily consumes
+    # spaces then backtracks; without `(?!.*=>)`, `host  => ${host}` (two
+    # spaces) slips past the single-position lookahead by backtracking to
+    # one space and seeing ` >` instead of `=>`.
+    (r'(?<![-/])\b(dig|nslookup|host)\s+(?!=>)(?!.*=>)[^\n]*\$',
      "dns_exfil", "critical", "exfiltration",
      "DNS lookup with variable interpolation (possible DNS exfiltration)"),
     (r'>\s*/tmp/[^\s]*\s*&&\s*(curl|wget|nc|python)',

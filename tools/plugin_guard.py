@@ -117,9 +117,9 @@ CODE_EXEMPT_PATTERN_IDS = {
 # applies to skills (where any such reference is a tamper signal).
 #
 # ``dns_exfil`` targets shell lines like ``host $VAR``; JS template
-# literals such as `served on ${host}` match by accident (the word "host"
-# followed by "$" on one line). Code files get the warn-tier remap; docs
-# keep full severity.
+# literals such as `served on ${host}` matched by accident (the word "host"
+# followed by "$" on one line). The regex itself was narrowed in
+# skills_guard.py (negative lookahead for `=>`); no severity remap needed.
 SEVERITY_REMAP = {
     "binary_file": "high",
     "hermes_env_access": "medium",
