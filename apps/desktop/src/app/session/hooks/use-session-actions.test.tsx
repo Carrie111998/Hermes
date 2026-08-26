@@ -491,6 +491,31 @@ async function createWith(
 describe('startFreshSessionDraft', () => {
   afterEach(() => cleanup())
 
+  it('detaches the sidebar New session action from the current project', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    $projectTree.set([
+      {
+        id: 'p_app',
+        label: 'App',
+        path: '/repo/app',
+        repos: [{ groups: [], id: '/repo/app', label: 'app', path: '/repo/app', sessionCount: 0 }],
+        sessionCount: 0
+      }
+    ])
+    $projectScope.set('p_app')
+
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    act(() => handle!.selectSidebarItem({ action: 'new-session' } as never))
+
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+    expect($currentCwd.get()).toBe('')
+    expect($newChatWorkspaceTarget.get()).toBeNull()
+  })
+
   it('can reset machine-bound session state without closing the current overlay route', async () => {
     const navigate = vi.fn()
     const requestGateway = vi.fn(async () => ({}) as never)

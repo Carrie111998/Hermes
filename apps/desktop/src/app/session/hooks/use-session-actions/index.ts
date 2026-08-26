@@ -41,6 +41,7 @@ import {
   $projectScope,
   beginSessionMutation,
   endSessionMutation,
+  exitProjectScope,
   resolveNewSessionCwd,
   tombstoneSessions,
   untombstoneSessions
@@ -566,7 +567,8 @@ export function useSessionActions({
     (item: SidebarNavItem) => {
       if (item.action === 'new-session') {
         setWorkspaceScope('sessions')
-        startFreshSessionDraft()
+        exitProjectScope()
+        startFreshSessionDraft({ workspaceTarget: null })
 
         return
       }
