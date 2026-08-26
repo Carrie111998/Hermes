@@ -2079,7 +2079,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": label},
                     "type": btn_type,
-                    "value": {"hermes_action": action_name, "approval_id": approval_id},
+                    "value": {
+                        "hermes_action": action_name,
+                        "approval_id": approval_id,
+                        "_thread_id": (metadata or {}).get("thread_id") or "",
+                    },
                 }
 
             actions = [_btn("✅ Allow Once", "approve_once", "primary")]
@@ -2128,7 +2132,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     @staticmethod
-    def _build_update_prompt_card(*, prompt: str, default: str, prompt_id: int) -> Dict[str, Any]:
+    def _build_update_prompt_card(*, prompt: str, default: str, prompt_id: int, thread_id: str = "") -> Dict[str, Any]:
         default_hint = f"\n\nDefault: `{default}`" if default else ""
 
         def _btn(label: str, answer: str, btn_type: str) -> dict:
@@ -2139,6 +2143,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "value": {
                     "hermes_update_prompt_action": answer,
                     "update_prompt_id": prompt_id,
+                    "_thread_id": thread_id or "",
                 },
             }
 
@@ -2172,7 +2177,12 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             prompt_id = next(self._update_prompt_counter)
             payload = json.dumps(
-                self._build_update_prompt_card(prompt=prompt, default=default, prompt_id=prompt_id),
+                self._build_update_prompt_card(
+                    prompt=prompt,
+                    default=default,
+                    prompt_id=prompt_id,
+                    thread_id=str((metadata or {}).get("thread_id") or ""),
+                ),
                 ensure_ascii=False,
             )
             response = await self._feishu_send_with_retry(
@@ -3078,6 +3088,12 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_tag = str(getattr(action, "tag", "") or "button")
         action_value = getattr(action, "value", {}) or {}
+        # Cards we send carry the originating thread id in a hidden button value
+        # (``_thread_id``) so a card-tap reply stays in the same Feishu thread
+        # instead of falling back to the group's main channel. The card-action
+        # event itself carries no thread context, so this round-trip is the
+        # only way to recover it.
+        callback_thread_id = str(action_value.get("_thread_id") or "") or None
 
         synthetic_text = f"/card {action_tag}"
         if action_value:
@@ -3095,7 +3111,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=None,
+            thread_id=callback_thread_id,
             user_id_alt=sender_profile["user_id_alt"],
         )
         synthetic_event = MessageEvent(
