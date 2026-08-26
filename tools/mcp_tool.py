@@ -2999,11 +2999,9 @@ class MCPServerTask:
             # os.kill probe below only runs when psutil is unavailable.
             import psutil
 
-            if not psutil.pid_exists(pid):
-                continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
-            return False  # at least one child alive
-        return True
+            if psutil.pid_exists(pid):
+                return False  # at least one child alive → not all dead
+        return True  # every tracked child has exited
 
     async def _watch_stdio_children(self) -> None:
         """Poll child liveness while a stdio RPC is in flight (#81995).
