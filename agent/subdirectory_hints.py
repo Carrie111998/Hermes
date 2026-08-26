@@ -299,7 +299,7 @@ class SubdirectoryHintTracker:
                         hint_path,
                         digest[:12],
                     )
-                    break
+                    continue
                 self._loaded_digests.add(digest)
                 # Same security scan as startup context loading
                 content = _scan_context_content(content, filename)
@@ -319,8 +319,6 @@ class SubdirectoryHintTracker:
                     except (ValueError, RuntimeError):
                         pass  # keep absolute
                 found_hints.append((rel_path, content))
-                # First match wins per directory (like startup loading)
-                break
             except Exception as exc:
                 logger.debug("Could not read %s: %s", hint_path, exc)
 
