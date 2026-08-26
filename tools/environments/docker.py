@@ -901,27 +901,7 @@ class DockerEnvironment(BaseEnvironment):
             self._container_id = result.stdout.strip()
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")
         
-        # Ensure /etc/passwd has an entry for the host UID we're running as.
-        # The image's baked-in users don't know about arbitrary host UIDs,
-        # and tools like ssh/git call getpwuid() internally and fail hard
-        # with "No user exists for uid N" if it's missing. Idempotent: the
-        # `id -u` guard skips re-adding on container reuse.
-        if self._run_as_host_user:
-            user_spec = _resolve_host_user_spec()
-            if user_spec is not None:
-                uid, gid = user_spec.split(":")
-                setup_cmd = [
-                    self._docker_exe, "exec", "-u", "root", self._container_id,
-                    "bash", "-c",
-                    f"id -u {uid} >/dev/null 2>&1 || "
-                    f"(echo 'hermes:x:{uid}:{gid}:Hermes User:/root:/bin/bash' >> /etc/passwd && "
-                    f"echo 'hermes:x:{gid}:' >> /etc/group)"
-                ]
-                try:
-                    subprocess.run(setup_cmd, capture_output=True, timeout=10,
-                                   stdin=subprocess.DEVNULL)
-                except Exception as e:
-                    logger.warning("Failed to add passwd entry for host UID: %s", e)
+        self._ensure_host_passwd_entry()
 
         # Build the init-time env forwarding args (used only by init_session
         # to inject host env vars into the snapshot; subsequent commands get
@@ -1004,6 +984,43 @@ class DockerEnvironment(BaseEnvironment):
         """Return True if the output indicates the container no longer exists."""
         return any(p in output for p in self._NO_CONTAINER_PATTERNS)
 
+    def _ensure_host_passwd_entry(self) -> None:
+        """Ensure /etc/passwd has an entry for the host UID we're running as.
+    
+        The image's baked-in users don't know about arbitrary host UIDs,
+        and tools like ssh/git call getpwuid() internally and fail hard
+        with "No user exists for uid N" if it's missing. Idempotent: the
+        `id -u` guard skips re-adding on container reuse. Must be called
+        after any path that (re)establishes self._container_id — initial
+        creation, container reuse, and recovery-created replacements alike
+        — since a nameless UID left over from a missed call site would
+        silently reintroduce the same ssh/git failure after recovery.
+        """
+        if not self._run_as_host_user:
+            return
+        user_spec = _resolve_host_user_spec()
+        if user_spec is None:
+            return
+        uid, gid = user_spec.split(":")
+        setup_cmd = [
+            self._docker_exe, "exec", "-u", "root", self._container_id,
+            "bash", "-c",
+            f"id -u {uid} >/dev/null 2>&1 || "
+            f"(echo 'hermes:x:{uid}:{gid}:Hermes User:/root:/bin/bash' >> /etc/passwd && "
+            f"echo 'hermes:x:{gid}:' >> /etc/group)"
+        ]
+        try:
+            result = subprocess.run(setup_cmd, capture_output=True, timeout=10,
+                                     stdin=subprocess.DEVNULL)
+            if result.returncode != 0:
+                logger.warning(
+                    "passwd entry setup exited %d for uid %s: %s",
+                    result.returncode, uid,
+                    result.stderr.decode(errors="replace").strip(),
+                )
+        except Exception as e:
+            logger.warning("Failed to add passwd entry for host UID: %s", e)
+
     def _recreate_container(self) -> bool:
         """Recreate the container after it was removed out-of-band.
 
@@ -1074,6 +1091,10 @@ class DockerEnvironment(BaseEnvironment):
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                 logger.error("Recovery: failed to create new container: %s", e)
                 return False
+
+        # After any recovery path (reuse, restart, or fresh create) has
+        # settled self._container_id, before resuming normal init.
+        self._ensure_host_passwd_entry()
 
         # 3. Re-initialize session snapshot in the (re)created container.
         try:
