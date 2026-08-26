@@ -42,6 +42,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   clearReadBaseline,
+  getSessionOwnerHint,
   knownSessionProfile,
   lineageAliases,
   markSessionRead,
@@ -754,7 +755,12 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
 
   const storedSessionId = storedSessionIdForRuntimeId(sessionId) ?? sessionId
 
-  return sessionTileOwnerRoute(storedSessionId) ?? knownSessionProfile($sessions.get(), storedSessionId)
+  return (
+    sessionTileOwnerRoute(storedSessionId) ??
+    getSessionOwnerHint(storedSessionId) ??
+    getSessionOwnerHint(sessionId) ??
+    knownSessionProfile($sessions.get(), storedSessionId)
+  )
 }
 
 /**
@@ -811,7 +817,7 @@ export function storedSessionIdForRuntimeId(sessionId: string): null | string {
 export function setSessionTileWorkspaceScope(storedSessionId: string, scope: SessionTileWorkspaceScope): boolean {
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.workspaceMode === 'bots' ? scope.ownerRoute : undefined
+  const ownerRoute = scope.ownerRoute ?? tile?.ownerRoute
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (
@@ -1066,7 +1072,7 @@ export function openSessionTile(
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        ownerRoute: workspaceScope.ownerRoute,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,

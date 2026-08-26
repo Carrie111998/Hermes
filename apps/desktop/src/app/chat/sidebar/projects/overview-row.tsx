@@ -1,10 +1,14 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useRef } from 'react'
 
+import { ConnectionOriginTag } from '@/app/chat/connection-origin-tag'
 import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { scopeKeyFromProjectFields } from '@/lib/project-address'
 import { cn } from '@/lib/utils'
+import { $connectionsRegistry } from '@/store/connections'
 
 import {
   SIDEBAR_LEAD_ICON_SIZE,
@@ -89,12 +93,22 @@ export function ProjectOverviewRow({
 }: ProjectOverviewRowProps) {
   const { t } = useI18n()
   const s = t.sidebar
-  const isActive = project.id === activeProjectId
-  const [open, toggleOpen] = useWorkspaceNodeOpen(project.id)
-  // The appearance popover anchors here (the full row) so it opens flush with
-  // the sidebar's content edge regardless of which side the sidebar is on.
   const rowRef = useRef<HTMLDivElement>(null)
-  const fetched = (previewSessions ?? []).slice(0, PROJECT_PREVIEW_COUNT)
+  const scopeKey = scopeKeyFromProjectFields(project)
+  const [open, toggleOpen] = useWorkspaceNodeOpen(scopeKey, false)
+  const isActive = project.id === activeProjectId
+  const registry = useStore($connectionsRegistry)
+
+  const originConnection =
+    project.connectionId && project.connectionId !== 'local'
+      ? (registry?.connections.find(connection => connection.id === project.connectionId) ?? null)
+      : null
+
+  const origin = originConnection && originConnection.kind !== 'local' ? originConnection : null
+
+  // Prefer the live preview rows handed in by the parent (already overlaid with
+  // `$sessions`); fall back to the project's own previewSessions / latest slice.
+  const fetched = previewSessions ?? project.previewSessions ?? []
   const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, PROJECT_PREVIEW_COUNT)) : []
 
   const lead = reorderable ? (
@@ -130,9 +144,12 @@ export function ProjectOverviewRow({
         <SidebarRowLink
           aria-label={s.projects.enter(project.label)}
           labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
-          onClick={() => onEnter?.(project.id)}
+          onClick={() => onEnter?.(scopeKey)}
         >
-          {project.label}
+          <span className="inline-flex min-w-0 items-center gap-1.5">
+            <span className="min-w-0 truncate">{project.label}</span>
+            {origin && <ConnectionOriginTag connection={origin} quiet />}
+          </span>
         </SidebarRowLink>
       }
       lead={lead}
@@ -163,7 +180,7 @@ export function ProjectOverviewRow({
     // project in the overview — the parallel to the entered-project wrapper's
     // `data-sessions-project` (index.tsx), which only fires once you've drilled
     // in. Here it's present on every row of the list.
-    <div className={cn(dragging && 'relative z-10')} data-sessions-project={project.id} ref={ref} style={style}>
+    <div className={cn(dragging && 'relative z-10')} data-sessions-project={scopeKey} ref={ref} style={style}>
       {/* Home has no per-project actions, so it gets no right-click menu. */}
       {project.isNoProject ? (
         shell
@@ -172,7 +189,7 @@ export function ProjectOverviewRow({
           {shell}
         </ProjectContextMenu>
       )}
-      {open && preview.length > 0 && <SidebarRowNest>{renderRows?.(preview)}</SidebarRowNest>}
+      {open && preview.length > 0 && renderRows && <SidebarRowNest>{renderRows(preview)}</SidebarRowNest>}
     </div>
   )
 }

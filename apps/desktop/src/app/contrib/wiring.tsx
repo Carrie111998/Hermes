@@ -35,6 +35,7 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -43,7 +44,7 @@ import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
 import { $desktopBoot } from '@/store/boot'
 import { requestVoiceConversationStart } from '@/store/composer'
-import { $activeConnectionId } from '@/store/connections'
+import { $activeConnectionId, startSessionOnSource } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { notify } from '@/store/notifications'
@@ -58,7 +59,7 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
-import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
+import { $startWorkSessionRequest, connectionIdForProjectPath, followActiveSessionCwd, profileForProjectPath } from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -72,6 +73,7 @@ import {
   $selectedStoredSessionId,
   $sessionResumeRequest,
   $sessions,
+  getSessionOwnerHint,
   knownSessionProfile,
   sessionMatchesStoredId,
   sessionPinId,
@@ -358,6 +360,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       let owner: SessionOwnerScope =
         (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
+        (routingSessionId ? getSessionOwnerHint(routingSessionId) : undefined) ??
         knownSessionProfile($sessions.get(), routingSessionId)
 
       if (!owner && routingSessionId) {
@@ -746,6 +749,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Clear a failed turn's red error banner. Errors are renderer-local (never
   // persisted): a bare error placeholder is dropped entirely; a partial-output
   // failure keeps its content and sheds the error. Both the runtime cache AND
+  const { t } = useI18n()
+
   // the live $messages view must be updated — preserveLocalAssistantErrors
   // re-grafts any still-errored view message on the next session.info flush.
   const dismissError = useCallback(
@@ -1046,7 +1051,24 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       navigate(CRON_ROUTE)
     },
     onNavigate: selectSidebarItem,
-    onNewSessionInWorkspace: path => startSessionInWorkspace(path, { openTab: true }),
+    onNewSessionInWorkspace: path => {
+      const start = () => startSessionInWorkspace(path, { openTab: true })
+      const connectionId = connectionIdForProjectPath(path)
+      const profile = profileForProjectPath(path)
+      const activeId = $activeConnectionId.get() || 'local'
+
+      // Reciprocal: route through the project's stored source even when that
+      // source is local and chrome is remote (skipping local previously broke +).
+      if (connectionId && connectionId !== activeId) {
+        void startSessionOnSource(connectionId, start, profile ? { profile } : undefined).catch(err =>
+          notify({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
+        )
+
+        return
+      }
+
+      start()
+    },
     onNewSessionSplit: dir => void openNewSessionTile(dir),
     onPasteClipboardImage: opts => composer.pasteClipboardImage(opts),
     onPickFiles: () => void composer.pickContextPaths('file'),

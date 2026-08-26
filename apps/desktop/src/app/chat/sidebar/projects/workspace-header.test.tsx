@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { StartWorkButton, WorkspaceAddButton, WorkspaceMenu, WorkspaceShowMoreButton } from './workspace-header'
+import { StartWorkButton, WorkspaceAddButton, WorkspaceHeader, WorkspaceMenu, WorkspaceShowMoreButton } from './workspace-header'
 
 afterEach(cleanup)
 
@@ -50,6 +50,23 @@ describe('WorkspaceAddButton', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'New session in Test D' }))
     expect(onClick).toHaveBeenCalledOnce()
+  })
+})
+
+describe('WorkspaceHeader origin', () => {
+  it('renders a quiet gateway suffix next to the lane label', () => {
+    render(
+      <WorkspaceHeader
+        icon={<span>icon</span>}
+        label="bragi"
+        onToggle={vi.fn()}
+        open
+        origin={<span data-slot="connection-origin-tag">mimir</span>}
+      />
+    )
+
+    expect(screen.getByRole('button', { name: /bragi/ })).toBeTruthy()
+    expect(screen.getByText('mimir')).toBeTruthy()
   })
 })
 

@@ -5,6 +5,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import type * as React from 'react'
 import { type FC, useEffect, useRef } from 'react'
 
+import type { DesktopRegistryConnection } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type SidebarListRow } from '@/lib/session-date-groups'
@@ -31,6 +32,7 @@ interface SessionRowCommonProps {
   onResume: () => void
   reorderable?: boolean
   showProfile?: boolean
+  connection?: DesktopRegistryConnection | null
 }
 
 export interface VirtualSessionListProps {
@@ -49,6 +51,7 @@ export interface VirtualSessionListProps {
   onToggleUnread: (sessionId: string) => void
   pinned: boolean
   showProfileTags?: boolean
+  connection?: DesktopRegistryConnection | null
   sortable: boolean
 }
 
@@ -73,6 +76,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   onToggleUnread,
   pinned,
   showProfileTags = false,
+  connection = null,
   sortable
 }) => {
   const { t } = useI18n()
@@ -142,6 +146,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     const commonProps: SessionRowCommonProps = {
       branchStem,
       card,
+      connection,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       onArchive: () => onArchiveSession(session.id),

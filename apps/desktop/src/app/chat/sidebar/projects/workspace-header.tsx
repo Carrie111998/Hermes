@@ -187,6 +187,7 @@ export function WorkspaceHeader({
   label,
   onToggle,
   open,
+  origin,
   title,
   ref,
   ...rest
@@ -197,6 +198,8 @@ export function WorkspaceHeader({
   label: string
   onToggle: () => void
   open: boolean
+  /** Quiet gateway suffix (Cursor-style host label) when the lane is foreign. */
+  origin?: React.ReactNode
   /** Hover tooltip — the lane's full on-disk path (worktree / repo root). */
   title?: string
 } & React.ComponentProps<'div'>) {
@@ -219,6 +222,7 @@ export function WorkspaceHeader({
       >
         <SidebarRowLead>{icon}</SidebarRowLead>
         <LaneLabel label={label} title={title ? `${label}\n${title}` : label} />
+        {origin && <span className="min-w-0 shrink-0">{origin}</span>}
         <DisclosureCaret
           className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition group-hover/workspace:opacity-100"
           open={open}

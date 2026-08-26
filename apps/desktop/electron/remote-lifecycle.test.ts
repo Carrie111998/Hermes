@@ -496,6 +496,7 @@ test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
   assert.match(cmd, /serve --isolated/)
   assert.match(cmd, /--host 127\.0\.0\.1 --port 0/)
+  assert.match(cmd, /HERMES_DASHBOARD_PUBLIC_URL=http:\/\/127\.0\.0\.1/)
   assert.doesNotMatch(cmd, /--skip-build|--no-open/)
   assert.doesNotMatch(cmd, /\bdashboard\b/)
   assert.match(cmd, /--profile/)

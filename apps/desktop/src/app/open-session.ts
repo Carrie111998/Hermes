@@ -15,6 +15,7 @@
  *     the bridge has no session-window support.
  */
 import type { WorkspaceMode } from '@/contrib/types'
+import type { DesktopRegistryConnection } from '@/global'
 import { $activeSessionId, $selectedStoredSessionId, markSessionRead } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import {
@@ -37,6 +38,22 @@ export interface OpenSessionWorkspaceScope {
   workspaceMode: WorkspaceMode
   workspaceOwnerKey?: string
   workspaceTabTitle?: string
+}
+
+/** Tab/tile scope for a sidebar section owned by a registered gateway. */
+export function workspaceScopeForConnection(connection?: DesktopRegistryConnection | null): OpenSessionWorkspaceScope {
+  if (!connection || connection.kind === 'local') {
+    return { workspaceMode: 'sessions' }
+  }
+
+  return {
+    ownerRoute: {
+      connectionId: connection.id,
+      mode: 'remote',
+      profile: connection.remoteProfile || 'default'
+    },
+    workspaceMode: 'sessions'
+  }
 }
 
 /**
@@ -152,11 +169,7 @@ export function openSession(
       return
     }
 
-    if (botWorkspaceScope) {
-      openSessionTile(storedSessionId, 'center', undefined, undefined, botWorkspaceScope)
-    } else {
-      openSessionTile(storedSessionId, 'center')
-    }
+    openSessionTile(storedSessionId, 'center', undefined, undefined, workspaceScope)
 
     return
   }

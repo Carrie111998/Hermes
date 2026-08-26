@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -15,29 +15,54 @@ import { GenerateButton } from '@/components/ui/generate-button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Tip } from '@/components/ui/tooltip'
+import type { DesktopRegistryConnection } from '@/global'
 import { useI18n } from '@/i18n'
+import { Check, Cloud, Monitor, Network, Terminal } from '@/lib/icons'
 import { type ProjectIdeaTemplate, randomIdeaTemplates } from '@/lib/project-idea-templates'
+import { selectableCardClass } from '@/lib/selectable-card'
 import { cn } from '@/lib/utils'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { notifyError } from '@/store/notifications'
 import {
   $projectDialog,
   addProjectFolder,
   closeProjectDialog,
+  connectionIdForProjectId,
   createProject,
   generateProjectIdea,
   pickProjectFolder,
   renameProject
 } from '@/store/projects'
 
+const GATEWAY_KIND_ICON: Record<DesktopRegistryConnection['kind'], typeof Monitor> = {
+  cloud: Cloud,
+  local: Monitor,
+  remote: Network,
+  ssh: Terminal
+}
+
 // Single dialog mounted once in the sidebar; it renders create / rename /
 // add-folder flows driven by the $projectDialog atom. Folders are chosen via
-// the native directory picker (reused from the default-project-dir setting).
+// the remote-aware picker pinned to the selected gateway (create) or the
+// project's stamped connection (add-folder).
 export function ProjectDialog() {
   const { t } = useI18n()
   const p = t.sidebar.projects
   const state = useStore($projectDialog)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
   const open = state !== null
   const mode = state?.mode ?? 'create'
+
+  const gateways = useMemo(() => registry?.connections ?? [], [registry])
+  const showGatewayPicker = mode === 'create' && gateways.length > 1
+
+  const kindLabels: Record<DesktopRegistryConnection['kind'], string> = {
+    cloud: t.settings.connections.kindCloud,
+    local: t.settings.connections.kindLocal,
+    remote: t.settings.connections.kindRemote,
+    ssh: t.settings.connections.kindSsh
+  }
 
   const [name, setName] = useState('')
   const [folders, setFolders] = useState<string[]>([])
@@ -45,6 +70,7 @@ export function ProjectDialog() {
   const [templates, setTemplates] = useState<ProjectIdeaTemplate[]>([])
   const [generatingIdea, setGeneratingIdea] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [gatewayId, setGatewayId] = useState('local')
   const nameRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -55,12 +81,13 @@ export function ProjectDialog() {
       setTemplates(randomIdeaTemplates())
       setGeneratingIdea(false)
       setSubmitting(false)
+      setGatewayId(activeConnectionId || gateways.find(conn => conn.kind === 'local')?.id || gateways[0]?.id || 'local')
 
       if (mode !== 'add-folder') {
         window.setTimeout(() => nameRef.current?.select(), 0)
       }
     }
-  }, [open, mode, state?.name])
+  }, [open, mode, state?.name, activeConnectionId, gateways])
 
   const onOpenChange = (next: boolean) => {
     if (!next) {
@@ -87,9 +114,17 @@ export function ProjectDialog() {
     }
   }
 
+  const folderConnectionId = () => {
+    if (mode === 'add-folder' && state?.projectId) {
+      return connectionIdForProjectId(state.projectId) || activeConnectionId || 'local'
+    }
+
+    return gatewayId
+  }
+
   const pickFolder = async () => {
     try {
-      const dir = await pickProjectFolder()
+      const dir = await pickProjectFolder(folderConnectionId())
 
       if (!dir) {
         return
@@ -124,7 +159,15 @@ export function ProjectDialog() {
     // A project owns sessions by folder (cwd-prefix), so creation requires at
     // least one — a folder-less project couldn't hold a session anyway.
     if (mode === 'create' && trimmed && folders.length) {
-      await runSubmit(() => createProject({ folders, idea: idea.trim() || undefined, name: trimmed, use: true }))
+      await runSubmit(() =>
+        createProject({
+          connectionId: gatewayId,
+          folders,
+          idea: idea.trim() || undefined,
+          name: trimmed,
+          use: true
+        })
+      )
     }
   }
 
@@ -144,6 +187,15 @@ export function ProjectDialog() {
     } finally {
       setGeneratingIdea(false)
     }
+  }
+
+  const selectGateway = (id: string) => {
+    if (id === gatewayId) {
+      return
+    }
+
+    setGatewayId(id)
+    setFolders([])
   }
 
   const title = mode === 'rename' ? p.renameTitle : mode === 'add-folder' ? p.addFolderTitle : p.createTitle
@@ -173,6 +225,41 @@ export function ProjectDialog() {
             ref={nameRef}
             value={name}
           />
+        )}
+
+        {showGatewayPicker && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{p.gatewayLabel}</span>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {gateways.map(conn => {
+                const Icon = GATEWAY_KIND_ICON[conn.kind]
+                const active = conn.id === gatewayId
+
+                return (
+                  <button
+                    aria-pressed={active}
+                    className={cn(
+                      'flex w-full flex-col p-3 text-left disabled:cursor-not-allowed disabled:opacity-50',
+                      selectableCardClass({ active, prominent: true })
+                    )}
+                    disabled={submitting}
+                    key={conn.id}
+                    onClick={() => selectGateway(conn.id)}
+                    type="button"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+                      <span className="min-w-0 truncate text-[0.8125rem] font-medium">{conn.label}</span>
+                      {active ? <Check className="ml-auto size-3.5 shrink-0 text-primary" /> : null}
+                    </div>
+                    <p className="mt-1.5 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">
+                      {kindLabels[conn.kind]}
+                    </p>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
         )}
 
         {mode === 'create' && (

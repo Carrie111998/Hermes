@@ -27,6 +27,7 @@ import {
   deleteProject,
   openProjectAddFolder,
   openProjectRename,
+  projectNodeScopeKey,
   revealPath,
   setActiveProject,
   setProjectAppearance
@@ -66,7 +67,7 @@ function useProjectActions({
   }
 
   const confirmDelete = async () => {
-    await deleteProject(project.id)
+    await deleteProject(projectNodeScopeKey(project))
 
     if (scoped) {
       onExitScope?.()
@@ -91,7 +92,7 @@ function useProjectActions({
           icon: 'target',
           key: 'set-active',
           label: p.menuSetActive,
-          onSelect: () => void setActiveProject(project.id)
+          onSelect: () => void setActiveProject(projectNodeScopeKey(project))
         }
       ]
 

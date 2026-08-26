@@ -5,6 +5,7 @@ import type { DesktopConnectionsRegistry } from '@/global'
 
 const $activeGatewayProfile = atom('default')
 const $newChatProfile = atom<null | string>(null)
+const $newChatRoute = atom<null | { connectionId: string; mode?: 'local' | 'remote'; profile: string }>(null)
 const $showAllProfiles = atom(false)
 
 const $connection = atom<null | {
@@ -15,15 +16,18 @@ const $connection = atom<null | {
 }>(null)
 
 const ensureGatewayAgent = vi.fn(async (_connectionId: null | string, _profile: string): Promise<void> => undefined)
+const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string): Promise<void> => undefined)
 const refreshActiveProfile = vi.fn(async () => undefined)
 const requestFreshSession = vi.fn()
 const wipeSessionListsForGatewaySwitch = vi.fn()
 
 vi.mock('@/store/session', () => ({ $connection }))
+vi.mock('@/store/gateway', () => ({ openGatewayForAgent }))
 vi.mock('@/store/gateway-switch', () => ({ wipeSessionListsForGatewaySwitch }))
 vi.mock('@/store/profile', () => ({
   $activeGatewayProfile,
   $newChatProfile,
+  $newChatRoute,
   $showAllProfiles,
   ensureGatewayAgent,
   normalizeProfileKey: (name: null | string | undefined) => (name ?? '').trim() || 'default',
@@ -39,7 +43,8 @@ const {
   refreshConnectionsRegistry,
   _resetConnectionsForTests,
   selectConnection,
-  setConnectionsRegistry
+  setConnectionsRegistry,
+  startSessionOnSource
 } = await import('./connections')
 
 const registry: DesktopConnectionsRegistry = {
@@ -63,7 +68,10 @@ beforeEach(() => {
   $connection.set(null)
   $activeGatewayProfile.set('default')
   $newChatProfile.set(null)
+  $newChatRoute.set(null)
   $showAllProfiles.set(false)
+  openGatewayForAgent.mockReset()
+  openGatewayForAgent.mockResolvedValue(undefined)
   ensureGatewayAgent.mockReset()
   ensureGatewayAgent.mockImplementation(async connectionId => {
     $connection.set({
@@ -290,5 +298,94 @@ describe('selectConnection', () => {
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
     expect(wipeSessionListsForGatewaySwitch).not.toHaveBeenCalled()
     expect($connection.get()?.mode).toBe('remote')
+  })
+})
+
+describe('startSessionOnSource', () => {
+  it('opens a fresh draft in place on the same source (no dial)', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    $newChatRoute.set({ connectionId: 'homelab', profile: 'default' })
+    const openDraft = vi.fn()
+
+    await startSessionOnSource('local', openDraft)
+
+    expect(openDraft).toHaveBeenCalledTimes(1)
+    expect(openGatewayForAgent).not.toHaveBeenCalled()
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toBeNull()
+  })
+
+  it('pins the session to another source without moving chrome', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    $activeGatewayProfile.set('research')
+    $newChatProfile.set(null)
+
+    const openDraft = vi.fn(() => {
+      // Production startFreshSessionDraft clears the previous draft owner.
+      $newChatRoute.set(null)
+    })
+
+    await startSessionOnSource('homelab', openDraft)
+
+    expect(openGatewayForAgent).toHaveBeenCalledWith('homelab', 'default')
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    expect(openDraft).toHaveBeenCalledTimes(1)
+    expect($connection.get()?.connectionId).toBe('local')
+    expect($activeGatewayProfile.get()).toBe('research')
+    expect($newChatRoute.get()).toEqual({ connectionId: 'homelab', mode: 'remote', profile: 'default' })
+    expect(wipeSessionListsForGatewaySwitch).not.toHaveBeenCalled()
+    expect(requestFreshSession).not.toHaveBeenCalled()
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+    expect($newChatProfile.get()).toBeNull()
+  })
+
+  it('is a no-op when the target source is not registered', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    const openDraft = vi.fn()
+
+    await startSessionOnSource('unknown', openDraft)
+
+    expect(openDraft).not.toHaveBeenCalled()
+    expect(openGatewayForAgent).not.toHaveBeenCalled()
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+  })
+
+  it('rejects AND does NOT open a draft when the target cannot be warmed', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'local', mode: 'local' })
+    $activeGatewayProfile.set('research')
+    openGatewayForAgent.mockRejectedValueOnce(new Error('offline'))
+    const openDraft = vi.fn()
+
+    await expect(startSessionOnSource('homelab', openDraft)).rejects.toThrow('offline')
+
+    expect(openDraft).not.toHaveBeenCalled()
+    expect($connection.get()?.connectionId).toBe('local')
+    expect($activeGatewayProfile.get()).toBe('research')
+    expect($newChatRoute.get()).toBeNull()
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+  })
+
+  it('routes + onto local with the project stored profile when chrome is remote', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'work' })
+    $activeGatewayProfile.set('work')
+    $newChatRoute.set(null)
+
+    const openDraft = vi.fn(() => {
+      $newChatRoute.set(null)
+    })
+
+    await startSessionOnSource('local', openDraft, { profile: 'home' })
+
+    expect(openGatewayForAgent).toHaveBeenCalledWith('local', 'home')
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    expect(openDraft).toHaveBeenCalledTimes(1)
+    expect($connection.get()?.connectionId).toBe('homelab')
+    expect($activeGatewayProfile.get()).toBe('work')
+    expect($newChatRoute.get()).toEqual({ connectionId: 'local', mode: 'local', profile: 'home' })
   })
 })

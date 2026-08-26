@@ -21,6 +21,8 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
+  $foreignGatewaySessions,
+  $foreignGatewaySessionsLoading,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
@@ -38,6 +40,8 @@ import {
   sessionPinId,
   setCurrentCwd,
   setCurrentCwdTransient,
+  setForeignGatewaySessions,
+  setForeignGatewaySessionsLoading,
   setRememberedRoute,
   setRememberedSessionId,
   setSelectedStoredSessionId,
@@ -970,5 +974,44 @@ describe('knownSessionProfile', () => {
     // probe, not silently route the RPC to whatever profile is on screen.
     expect(knownSessionProfile([], 'totally-unknown')).toBeUndefined()
     expect(knownSessionProfile([], null)).toBeUndefined()
+  })
+})
+
+describe('foreign gateway session aggregation', () => {
+  const foreignSession = (over: Partial<SessionInfo>): SessionInfo => makeSessionInfo({ id: 'mimir-1', ...over })
+
+  beforeEach(() => {
+    $foreignGatewaySessions.set({})
+    $foreignGatewaySessionsLoading.set({})
+  })
+
+  it('stores each foreign gateway slice keyed by connectionId without touching $sessions', () => {
+    setForeignGatewaySessions('mimir', [foreignSession({ id: 'm1' }), foreignSession({ id: 'm2' })])
+    setForeignGatewaySessions('surtr', [foreignSession({ id: 's1' })])
+
+    expect($foreignGatewaySessions.get().mimir).toHaveLength(2)
+    expect($foreignGatewaySessions.get().surtr).toHaveLength(1)
+    // The active connection's own list is untouched by aggregation.
+    expect($sessions.get()).toEqual([])
+  })
+
+  it('replaces a gateway slice in place while preserving the other gateways', () => {
+    setForeignGatewaySessions('mimir', [foreignSession({ id: 'm1' })])
+    setForeignGatewaySessions('surtr', [foreignSession({ id: 's1' })])
+
+    setForeignGatewaySessions('mimir', [foreignSession({ id: 'm3' })])
+
+    expect($foreignGatewaySessions.get().mimir.map(s => s.id)).toEqual(['m3'])
+    expect($foreignGatewaySessions.get().surtr.map(s => s.id)).toEqual(['s1'])
+  })
+
+  it('tracks a per-gateway loading flag', () => {
+    expect($foreignGatewaySessionsLoading.get().mimir).toBeUndefined()
+
+    setForeignGatewaySessionsLoading('mimir', true)
+    expect($foreignGatewaySessionsLoading.get().mimir).toBe(true)
+
+    setForeignGatewaySessionsLoading('mimir', false)
+    expect($foreignGatewaySessionsLoading.get().mimir).toBe(false)
   })
 })

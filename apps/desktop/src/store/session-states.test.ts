@@ -4,7 +4,7 @@ import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $selectedStoredSessionId, setSessions } from '@/store/session'
+import { $selectedStoredSessionId, setSessionOwnerHint, setSessions } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
   $sessionStates,
@@ -571,6 +571,24 @@ describe('sessionTileOwnerRoute', () => {
     expect(sessionTileOwnerRoute('plain')).toBeUndefined()
   })
 
+  it('keeps ownerRoute on an ordinary sessions-mode tile', () => {
+    const ownerRoute = { connectionId: 'mimir', mode: 'remote' as const, profile: 'default' }
+
+    $selectedStoredSessionId.set(null)
+    openSessionTile('ssh-chat', 'right', undefined, undefined, { ownerRoute, workspaceMode: 'sessions' })
+
+    expect(sessionTileOwnerRoute('ssh-chat')).toEqual(ownerRoute)
+  })
+
+  it('does not drop ownerRoute when re-scoping a sessions-mode tile', () => {
+    const ownerRoute = { connectionId: 'mimir', mode: 'remote' as const, profile: 'default' }
+
+    $sessionTiles.set([{ ownerRoute, storedSessionId: 'ssh-chat', workspaceMode: 'sessions' }])
+    setSessionTileWorkspaceScope('ssh-chat', { workspaceMode: 'sessions' })
+
+    expect(sessionTileOwnerRoute('ssh-chat')).toEqual(ownerRoute)
+  })
+
   it('returns undefined when the session has no tile', () => {
     $sessionTiles.set([])
 
@@ -607,6 +625,15 @@ describe('knownOwnerForSession / requestForOwnedSession (#91684 client half)', (
     setSessions([{ id: 'stored-2', profile: 'loki' } as never])
 
     expect(knownOwnerForSession('stored-2')).toBe('loki')
+  })
+
+  it('prefers a connection-qualified owner hint over the session row profile', () => {
+    setSessions([{ id: 'stored-hint', profile: 'loki' } as never])
+    setSessionOwnerHint('stored-hint', { connectionId: 'homelab', profile: 'default' })
+    setSessionOwnerHint('rt-hint', { connectionId: 'homelab', profile: 'default' })
+
+    expect(knownOwnerForSession('stored-hint')).toEqual({ connectionId: 'homelab', profile: 'default' })
+    expect(knownOwnerForSession('rt-hint')).toEqual({ connectionId: 'homelab', profile: 'default' })
   })
 
   it('returns undefined (ambient) when no owner is known, and for null ids', () => {

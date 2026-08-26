@@ -30,7 +30,8 @@ import {
   setMessages,
   touchSessionActivity
 } from '@/store/session'
-import { $sessionStates } from '@/store/session-states'
+import { requestForSessionProfile } from '@/store/session-request-router'
+import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -121,6 +122,23 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
     async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = sanitizeComposerInput(rawText).trim()
       const usingComposerAttachments = !options?.attachments
+
+      const requestOwnedGateway = <T>(
+        sessionKey: null | string | undefined,
+        method: string,
+        params?: Record<string, unknown>,
+        timeoutMs?: number
+      ): Promise<T> => {
+        const owner = knownOwnerForSession(sessionKey)
+
+        if (owner && typeof owner === 'object' && owner.connectionId.trim()) {
+          return requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs)
+        }
+
+        return timeoutMs === undefined
+          ? requestGateway<T>(method, params)
+          : requestGateway<T>(method, params, timeoutMs)
+      }
 
       // Drop undefined/null holes a session switch or draft restore can leave in
       // the attachments array (same bug class as AttachmentList #49624). Without
@@ -592,7 +610,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             : await singleFlightSessionResume(targetStoredSessionId, async () => {
                 const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
 
-                return requestGateway<{ session_id: string }>('session.resume', {
+                return requestOwnedGateway<{ session_id: string }>(targetStoredSessionId, 'session.resume', {
                   session_id: targetStoredSessionId,
                   source: 'desktop',
                   omit_messages: true,
@@ -767,10 +785,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             recoverStoredSessionId,
             liveId =>
               withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestOwnedGateway(
+                  recoverStoredSessionId ?? liveId,
+                  'prompt.submit',
+                  submitParams(liveId),
+                  PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                )
               ),
             {
-              requestGateway,
+              requestGateway: (method, params, timeoutMs) =>
+                requestOwnedGateway(recoverStoredSessionId ?? sessionId, method, params, timeoutMs),
               driftReason: sessionDriftReason,
               onRecovered: recoveredId => {
                 if (onRuntimeRecovered) {

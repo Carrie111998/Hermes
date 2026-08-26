@@ -2,12 +2,14 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useState } from 'react'
 
+import { ConnectionOriginTag, sharedSessionsOrigin } from '@/app/chat/connection-origin-tag'
 import { Codicon } from '@/components/ui/codicon'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { displayPath } from '@/lib/display-path'
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
 import { setWorkspaceNodeOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { newSessionInProfile, selectProfile } from '@/store/profile'
@@ -35,9 +37,17 @@ interface SidebarWorkspaceGroupProps {
   // When set (linked worktree rows), shows a remove affordance that runs a real
   // `git worktree remove`.
   onRemove?: () => void
+  /** Owning gateway when this lane sits under a foreign project. */
+  connectionId?: string
 }
 
-export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemove }: SidebarWorkspaceGroupProps) {
+export function SidebarWorkspaceGroup({
+  group,
+  renderRows,
+  onNewSession,
+  onRemove,
+  connectionId
+}: SidebarWorkspaceGroupProps) {
   const { t } = useI18n()
   const s = t.sidebar
   const isProfileGroup = group.mode === 'profile'
@@ -45,6 +55,15 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   // that leaves this profile's spend unchanged doesn't repaint its header.
   const usage = useStoreSelector($sessionProfilesUsage, all => all[group.id])
   const rankIds = useStore($sidebarSessionRankIds)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
+  const projectOrigin =
+    connectionId && connectionId !== 'local'
+      ? (registry?.connections.find(connection => connection.id === connectionId) ?? null)
+      : null
+  const groupOrigin =
+    (projectOrigin && projectOrigin.kind !== 'local' ? projectOrigin : null) ??
+    sharedSessionsOrigin(group.sessions, registry, activeConnectionId)
   // Empty worktree/branch lanes start collapsed — they only show a "No sessions
   // yet" placeholder, so defaulting them open just adds noise. Profile lanes and
   // lanes that already hold sessions default open.
@@ -105,11 +124,12 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
 
   // Profile groups start a fresh session in that profile but keep the
   // all-profiles browse view; workspace groups seed the new session's cwd.
-  // Main checkout lanes are branch-targeted.
   const addButton = (onNewSession || isProfileGroup) && (
     <WorkspaceAddButton label={s.newSessionIn(group.label)} onClick={() => void handleNewSession()} />
   )
 
+  // Prefer the project stamp; fall back to a shared session origin for mixed
+  // lists that still share one foreign gateway.
   return (
     <SidebarRowStack>
       {isProfileGroup ? (
@@ -160,6 +180,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
             label={group.label}
             onToggle={toggleOpen}
             open={open}
+            origin={groupOrigin ? <ConnectionOriginTag connection={groupOrigin} quiet /> : undefined}
             title={group.path ? displayPath(group.path) : undefined}
           />
         </WorkspaceContextMenu>

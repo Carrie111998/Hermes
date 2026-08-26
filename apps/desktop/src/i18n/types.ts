@@ -667,6 +667,8 @@ export interface Translations {
       kindRemoteDesc: string
       kindCloudDesc: string
       kindSshDesc: string
+      emptySources: string
+      startFailed: string
       labelTitle: string
       labelDesc: string
       labelPlaceholder: string
@@ -1827,6 +1829,7 @@ export interface Translations {
       renameTitle: string
       addFolderTitle: string
       namePlaceholder: string
+      gatewayLabel: string
       foldersLabel: string
       ideaLabel: string
       ideaPlaceholder: string

@@ -56,6 +56,13 @@ export interface SidebarProjectTree {
   // claimed. It has no folder, so no repo/worktree structure — its one lane
   // exists only to carry the rows.
   isNoProject?: boolean
+  /** Registry connection that owns this project. Local / chrome-active omit. */
+  connectionId?: string
+  /**
+   * Profile namespace for this row's projects.db. Required for multi-profile
+   * ownership — same backend id can exist under two profiles on one gateway.
+   */
+  profile?: string
   repos: SidebarWorkspaceTree[]
   sessionCount: number
   // Tokens and spend over the same sessions `sessionCount` counts, summed by

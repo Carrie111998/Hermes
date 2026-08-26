@@ -728,10 +728,15 @@ def should_require_dashboard_auth(
 ) -> bool:
     """Return whether the dashboard auth gate must be active.
 
-    The browser-facing URL is part of the exposure boundary: a non-loopback
-    ``dashboard.public_url`` requires authentication even when a reverse proxy
-    reaches a backend bound to loopback. Callers may pass the already-resolved
-    host set so startup and request validation use the same snapshot.
+    Pure exposure decision: a non-loopback bind, or a non-loopback
+    ``dashboard.public_url`` (reverse-proxy Host trust), requires authentication.
+    Callers may pass the already-resolved host set so startup and request
+    validation use the same snapshot.
+
+    Desktop/SSH token-mode exceptions are NOT decided here — ambient markers
+    like ``HERMES_DESKTOP=1`` must not override an operator-declared public URL.
+    ``start_server`` may strip non-loopback public hosts only after a positive
+    transport-specific child proof (see ``_desktop_token_mode_child_proof``).
     """
     if trusted_public_hosts is None:
         trusted_public_hosts = _dashboard_public_hosts()
@@ -739,6 +744,110 @@ def should_require_dashboard_auth(
         candidate not in _LOOPBACK_HOST_VALUES
         for candidate in trusted_public_hosts
     )
+
+
+_SSH_OWNER_NONCE_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _ssh_desktop_child_proof(
+    ssh_session_token: Optional[str],
+    ssh_owner_nonce: Optional[str],
+    headless: bool,
+) -> bool:
+    """Exact SSH isolated-serve child: loopback args already checked by caller."""
+    if not headless:
+        return False
+    if not (ssh_session_token or "").strip():
+        return False
+    if not ssh_owner_nonce or not _SSH_OWNER_NONCE_RE.fullmatch(ssh_owner_nonce):
+        return False
+    return True
+
+
+def _local_desktop_child_proof() -> bool:
+    """Exact local Desktop-owned backend: minted session token + parent ownership.
+
+    Requires the parent-watchdog coordinates Desktop already passes
+    (``HERMES_PARENT_PID`` + atomic marker/nonce, ``HERMES_SPAWN`` purpose
+    ``serve``, and a live parent). Ambient ``HERMES_DESKTOP=1`` alone is not
+    enough — that marker is inherited by descendants and is not ownership.
+    """
+    if not (os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or "").strip():
+        return False
+
+    raw_pid = os.environ.get("HERMES_PARENT_PID")
+    try:
+        desktop_pid = int(raw_pid or "")
+    except (TypeError, ValueError):
+        return False
+    if desktop_pid <= 0:
+        return False
+
+    start_marker = os.environ.get("HERMES_PARENT_START_MARKER")
+    nonce = os.environ.get("HERMES_PARENT_NONCE")
+    has_marker = start_marker is not None
+    has_nonce = nonce is not None
+    if has_marker != has_nonce:
+        return False
+    if has_marker and (
+        not _valid_parent_start_marker(start_marker or "")
+        or not nonce
+        or nonce != nonce.strip()
+    ):
+        return False
+
+    spawn = os.environ.get("HERMES_SPAWN") or ""
+    parts = spawn.split(":")
+    if len(parts) < 5 or parts[0] != "v1" or parts[2] != "serve":
+        return False
+
+    # Fail closed when the declared parent is gone / not the exact process.
+    if _is_serve_orphaned(desktop_pid, start_marker):
+        return False
+    return True
+
+
+def _desktop_token_mode_child_proof(
+    *,
+    host: str,
+    headless: bool,
+    ssh_session_token: Optional[str],
+    ssh_owner_nonce: Optional[str],
+) -> bool:
+    """True only for the exact Desktop-owned loopback token backend.
+
+    SSH: process-local ``ssh_session_token`` + ``ssh_owner_nonce`` on headless
+    serve. Local: parent ownership proof + minted session token. Missing or
+    partial proof leaves the public-URL gate engaged.
+    """
+    if host not in _LOOPBACK_HOST_VALUES:
+        return False
+    if _ssh_desktop_child_proof(ssh_session_token, ssh_owner_nonce, headless):
+        return True
+    if _local_desktop_child_proof():
+        return True
+    return False
+
+
+def _trusted_hosts_for_startup(
+    *,
+    host: str,
+    headless: bool,
+    ssh_session_token: Optional[str],
+    ssh_owner_nonce: Optional[str],
+) -> frozenset[str]:
+    """Resolve Host trust for this process; Desktop children drop foreign public URLs."""
+    trusted = _dashboard_public_hosts()
+    if _desktop_token_mode_child_proof(
+        host=host,
+        headless=headless,
+        ssh_session_token=ssh_session_token,
+        ssh_owner_nonce=ssh_owner_nonce,
+    ):
+        # Operator public_url describes a different browser-facing dashboard;
+        # this loopback/headless child is only reached via Desktop's tunnel.
+        return frozenset(h for h in trusted if h in _LOOPBACK_HOST_VALUES)
+    return trusted
 
 
 def _host_header_hostname(host_header: str) -> str:
@@ -19447,7 +19556,14 @@ def start_server(
     # request middleware never reloads config. Any non-loopback public hostname
     # engages the auth gate even when the backend itself remains on loopback;
     # otherwise the SPA's local session token would become remotely reachable.
-    app.state.trusted_public_hosts = _dashboard_public_hosts()
+    # Desktop/SSH children with a positive ownership proof drop foreign public
+    # hosts here — ambient HERMES_DESKTOP must not bypass the shared predicate.
+    app.state.trusted_public_hosts = _trusted_hosts_for_startup(
+        host=host,
+        headless=headless,
+        ssh_session_token=ssh_session_token,
+        ssh_owner_nonce=ssh_owner_nonce,
+    )
     # Stash the auth-gate flag on app.state so middleware / SPA-token injection /
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.
