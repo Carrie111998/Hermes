@@ -275,6 +275,22 @@ class UpdateLock:
         self.path = path or update_marker_path()
         self.acquired = False
         self.holder: UpdateHolder | None = None
+        self.failure_reason: str | None = None
+
+    def _fail(self, action: str, exc: BaseException) -> bool:
+        self.failure_reason = (
+            f"✗ Hermes could not claim update ownership at {self.path} "
+            f"while {action}: {exc}.\n\n"
+            "  No update files were changed. Check access to the Hermes home "
+            "directory, then retry."
+        )
+        logger.warning(
+            "Could not claim update ownership at %s while %s: %s",
+            self.path,
+            action,
+            exc,
+        )
+        return False
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -286,24 +302,22 @@ class UpdateLock:
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
         """
+        self.acquired = False
+        self.holder = None
+        self.failure_reason = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            logger.debug(
-                "Could not create update marker directory %s: %s",
-                self.path.parent,
-                exc,
-            )
-            return False
+            return self._fail("creating the marker directory", exc)
 
-        with _ownership_transaction():
-            existing = _read_live_update_unlocked(self.path)
-            if existing is not None:
-                if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
-                    return True
-                self.holder = existing
-                return False
-            try:
+        try:
+            with _ownership_transaction():
+                existing = _read_live_update_unlocked(self.path)
+                if existing is not None:
+                    if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                        return True
+                    self.holder = existing
+                    return False
                 claim = self.path.with_name(
                     f"{self.path.name}.claim-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
                 )
@@ -314,11 +328,10 @@ class UpdateLock:
                     os.link(claim, self.path)
                 finally:
                     claim.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning("Could not publish update marker %s: %s", self.path, exc)
-                return False
-            self.acquired = True
-            return True
+                self.acquired = True
+                return True
+        except OSError as exc:
+            return self._fail("publishing the ownership marker", exc)
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""

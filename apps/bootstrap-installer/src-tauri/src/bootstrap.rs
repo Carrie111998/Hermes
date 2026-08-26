@@ -464,18 +464,8 @@ async fn run_bootstrap(
         ownership_home.join(".hermes-update-in-progress"),
     ) {
         Ok(guard) => guard,
-        Err(owner) => {
-            let mins = owner.age_secs / 60;
-            let secs = owner.age_secs % 60;
-            let elapsed = if mins > 0 {
-                format!("{mins}m {secs}s")
-            } else {
-                format!("{secs}s")
-            };
-            let msg = format!(
-                "Another Hermes install or update is already running (PID {}, started {} ago). Wait for it to finish, then retry.",
-                owner.pid, elapsed
-            );
+        Err(error) => {
+            let msg = error.user_message();
             emit_event(
                 &app,
                 BootstrapEvent::Failed {

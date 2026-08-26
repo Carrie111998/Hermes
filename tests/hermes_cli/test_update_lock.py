@@ -197,6 +197,9 @@ def test_unwritable_marker_location_fails_closed(tmp_path):
 
     assert lock.acquire() is False
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
+    assert lock.holder is None
+    assert lock.failure_reason is not None
+    assert "No update files were changed" in lock.failure_reason
 
 
 class TestHandoffFromOrchestratingUpdater:

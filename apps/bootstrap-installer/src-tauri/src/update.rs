@@ -175,6 +175,49 @@ pub(crate) struct MarkerOwner {
     pub(crate) age_secs: u64,
 }
 
+pub(crate) enum MarkerAcquireError {
+    Owned(MarkerOwner),
+    Infrastructure {
+        action: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl MarkerAcquireError {
+    fn infrastructure(action: &'static str, path: &Path, source: std::io::Error) -> Self {
+        Self::Infrastructure {
+            action,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    pub(crate) fn user_message(&self) -> String {
+        match self {
+            Self::Owned(owner) => {
+                let mins = owner.age_secs / 60;
+                let secs = owner.age_secs % 60;
+                let elapsed = if mins > 0 {
+                    format!("{mins}m {secs}s")
+                } else {
+                    format!("{secs}s")
+                };
+                format!(
+                    "Another Hermes install or update is already running (PID {}, started {} ago). \
+                     Wait for it to finish, then retry.",
+                    owner.pid, elapsed
+                )
+            }
+            Self::Infrastructure { action, path, source } => format!(
+                "Hermes could not claim update ownership at {} while {}: {}. \
+                 No install files were changed. Check access to the Hermes home directory, then retry.",
+                path.display(), action, source
+            ),
+        }
+    }
+}
+
 /// Read the marker and report a live owner, if any. `None` for every "no live
 /// update" case — absent, unreadable, malformed, dead pid, or past the ceiling
 /// — matching `readLiveUpdateMarker` in the Electron gate. Never panics.
@@ -266,18 +309,26 @@ fn pid_is_alive(pid: u32) -> bool {
 
 impl UpdateMarkerGuard {
     /// Claim the marker, or report the live updater that already owns it.
-    ///
-    /// Writing is best-effort: a write failure must NOT abort the update (the
-    /// gate degrades to "no marker => proceed", i.e. exactly the pre-marker
-    /// behavior), so we log and carry on with a guard that still attempts
-    /// cleanup of whatever may exist at the path.
-    pub(crate) fn acquire(path: PathBuf) -> Result<Self, MarkerOwner> {
+    pub(crate) fn acquire(path: PathBuf) -> Result<Self, MarkerAcquireError> {
+        Self::acquire_with_link(path, |source, destination| {
+            std::fs::hard_link(source, destination)
+        })
+    }
+
+    fn acquire_with_link<F>(path: PathBuf, link: F) -> Result<Self, MarkerAcquireError>
+    where
+        F: Fn(&Path, &Path) -> std::io::Result<()>,
+    {
         let pid = std::process::id();
         let _transaction = match MarkerTransaction::acquire() {
             Ok(transaction) => transaction,
             Err(err) => {
                 tracing::warn!(?path, %err, "could not acquire update ownership mutex");
-                return Err(MarkerOwner { pid: 0, age_secs: 0 });
+                return Err(MarkerAcquireError::infrastructure(
+                    "acquiring the ownership mutex",
+                    &path,
+                    err,
+                ));
             }
         };
         for _attempt in 0..2 {
@@ -288,12 +339,16 @@ impl UpdateMarkerGuard {
                     // Adopt that claim verbatim so retries cannot reset its age.
                     return Ok(Self { path, owned: true });
                 }
-                return Err(owner);
+                return Err(MarkerAcquireError::Owned(owner));
             }
             if path.exists() {
                 if let Err(err) = std::fs::remove_file(&path) {
                     tracing::warn!(?path, %err, "could not reclaim stale update marker");
-                    return Err(MarkerOwner { pid: 0, age_secs: 0 });
+                    return Err(MarkerAcquireError::infrastructure(
+                        "reclaiming the stale marker",
+                        &path,
+                        err,
+                    ));
                 }
             }
             let started_at = std::time::SystemTime::now()
@@ -301,7 +356,13 @@ impl UpdateMarkerGuard {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    return Err(MarkerAcquireError::infrastructure(
+                        "creating the marker directory",
+                        &path,
+                        err,
+                    ));
+                }
             }
             let claim = path.with_file_name(format!(
                 "{}.claim-{pid}-{}",
@@ -323,10 +384,14 @@ impl UpdateMarkerGuard {
                     if let Err(err) = write!(marker, "{pid}\n{started_at}\n") {
                         let _ = std::fs::remove_file(&claim);
                         tracing::warn!(?path, %err, "could not write update-in-progress marker");
-                        return Ok(Self { path, owned: false });
+                        return Err(MarkerAcquireError::infrastructure(
+                            "writing the ownership marker",
+                            &path,
+                            err,
+                        ));
                     }
                     drop(marker);
-                    let linked = std::fs::hard_link(&claim, &path);
+                    let linked = link(&claim, &path);
                     let _ = std::fs::remove_file(&claim);
                     match linked {
                         Ok(()) => return Ok(Self { path, owned: true }),
@@ -335,7 +400,11 @@ impl UpdateMarkerGuard {
                         }
                         Err(err) => {
                             tracing::warn!(?path, %err, "could not publish update-in-progress marker");
-                            return Ok(Self { path, owned: false });
+                            return Err(MarkerAcquireError::infrastructure(
+                                "publishing the ownership marker",
+                                &path,
+                                err,
+                            ));
                         }
                     }
                 }
@@ -346,16 +415,27 @@ impl UpdateMarkerGuard {
                 }
                 Err(err) => {
                     tracing::warn!(?path, %err, "could not create update-in-progress marker");
-                    return Ok(Self { path, owned: false });
+                    return Err(MarkerAcquireError::infrastructure(
+                        "creating the ownership marker",
+                        &path,
+                        err,
+                    ));
                 }
             }
         }
 
         if let Some(owner) = live_marker_owner(&path) {
-            return Err(owner);
+            return Err(MarkerAcquireError::Owned(owner));
         }
         tracing::warn!(?path, "update marker ownership changed repeatedly while claiming");
-        Err(MarkerOwner { pid: 0, age_secs: 0 })
+        Err(MarkerAcquireError::infrastructure(
+            "publishing the ownership marker",
+            &path,
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "ownership changed repeatedly",
+            ),
+        ))
     }
 
     /// Release the marker as soon as every mutating stage has completed.
@@ -413,20 +493,8 @@ async fn run_update(app: AppHandle) -> Result<()> {
         crate::paths::update_in_progress_marker(),
     ) {
         Ok(guard) => guard,
-        Err(owner) => {
-            let mins = owner.age_secs / 60;
-            let secs = owner.age_secs % 60;
-            let elapsed = if mins > 0 {
-                format!("{mins}m {secs}s")
-            } else {
-                format!("{secs}s")
-            };
-            let msg = format!(
-                "Another Hermes update is already running (PID {}, started {} ago). \
-                 Wait for it to finish, or close the window or dashboard tab that \
-                 started it, then try again.",
-                owner.pid, elapsed
-            );
+        Err(error) => {
+            let msg = error.user_message();
             emit(
                 &app,
                 BootstrapEvent::Failed {
@@ -1542,10 +1610,15 @@ mod tests {
             .unwrap_or(0);
         std::fs::write(&marker, format!("{foreign_pid}\n{started_at}")).unwrap();
 
-        let owner = UpdateMarkerGuard::acquire(marker.clone())
+        let error = UpdateMarkerGuard::acquire(marker.clone())
             .err()
             .expect("acquire must be refused while a foreign updater is live");
-        assert_eq!(owner.pid, foreign_pid);
+        match error {
+            MarkerAcquireError::Owned(owner) => assert_eq!(owner.pid, foreign_pid),
+            MarkerAcquireError::Infrastructure { .. } => {
+                panic!("live contention must be reported as an owner")
+            }
+        }
 
         // The refused guard must not delete the live owner's marker.
         assert!(marker.exists(), "refused acquire must leave the marker intact");
@@ -1571,12 +1644,8 @@ mod tests {
             .saturating_sub(2);
         std::fs::write(&marker, format!("{}\n{started_at}", std::process::id())).unwrap();
 
-        let guard = UpdateMarkerGuard::acquire(marker.clone()).unwrap_or_else(|owner| {
-            panic!(
-                "own-pid pre-write must be adoptable, got foreign owner pid={}",
-                owner.pid
-            )
-        });
+        let guard = UpdateMarkerGuard::acquire(marker.clone())
+            .unwrap_or_else(|_| panic!("own-pid pre-write must be adoptable"));
         assert!(marker.exists(), "adopted guard must own the marker");
         let body = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(
@@ -1755,6 +1824,44 @@ mod tests {
             "reclaiming rewrites the stale marker with our pid"
         );
         drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acquire_fails_closed_when_claim_cannot_be_created() {
+        let dir = unique_tmp_dir("marker-create-failure");
+        let not_a_dir = dir.join("not-a-directory");
+        std::fs::write(&not_a_dir, "file").unwrap();
+        let marker = not_a_dir.join(".hermes-update-in-progress");
+
+        let error = UpdateMarkerGuard::acquire(marker)
+            .err()
+            .expect("claim must fail");
+        assert!(matches!(
+            error,
+            MarkerAcquireError::Infrastructure { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acquire_fails_closed_when_claim_cannot_be_published() {
+        let dir = unique_tmp_dir("marker-publish-failure");
+        let marker = dir.join(".hermes-update-in-progress");
+
+        let error = UpdateMarkerGuard::acquire_with_link(marker.clone(), |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        })
+        .err()
+        .expect("publication failure must refuse mutation");
+        assert!(matches!(
+            error,
+            MarkerAcquireError::Infrastructure { .. }
+        ));
+        assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
