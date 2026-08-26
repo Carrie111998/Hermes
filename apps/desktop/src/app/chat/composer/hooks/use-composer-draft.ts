@@ -9,6 +9,7 @@ import '@/store/suggestion-providers/skill'
 import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import {
@@ -181,11 +182,23 @@ export function useComposerDraft({
     [paintDraft]
   )
 
+  // Gate on keep-alive visibility: an inactive tab's composer stays MOUNTED
+  // (hidden behind `data-pane-hidden`), so without this check a background
+  // session whose turn just finished (`inputDisabled` flipping false) or that
+  // recovered from a gateway reconnect re-runs this effect and calls
+  // `.focus()` — yanking keyboard focus off the tab the user is typing in.
+  // `usePaneVisible` reads the same visibility policy every document-wide
+  // lookup obeys (see pane-visibility.ts) and defaults to true for surfaces
+  // outside a tab stack, so tiles, pop-outs, and secondary windows are
+  // unaffected. The user's own click into the composer still focuses it via
+  // ChatBar's onFocus; only programmatic auto-focus is suppressed here.
+  const paneVisible = usePaneVisible()
+
   useEffect(() => {
-    if (!inputDisabled) {
+    if (!inputDisabled && paneVisible) {
       focusInput()
     }
-  }, [focusInput, focusKey, focusRequestId, inputDisabled])
+  }, [focusInput, focusKey, focusRequestId, inputDisabled, paneVisible])
 
   // The mirror of the `markActiveComposer` above: give the key back when this
   // composer goes away (a session tile closing, a pane unmounting). Covers both
