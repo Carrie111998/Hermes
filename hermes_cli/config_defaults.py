@@ -589,6 +589,16 @@ DEFAULT_CONFIG = {
         # argument, which forces a real-profile local session even under a
         # cloud browser backend. Toggle in the desktop Settings → Browser section.
         "use_real_profile": False,
+        # Opt-in: prefer the LIVE-profile path over the profile copy. When true
+        # (and use_real_profile is on), Hermes sets the RemoteDebuggingAllowed
+        # policy and drives the user's real profile in place via a debug port,
+        # which decrypts cookies natively — the only approach that works on
+        # Windows (App-Bound Encryption defeats profile copies there), and which
+        # avoids the copy's fork/staleness elsewhere. Needs the browser closed
+        # and a one-time consent the agent may not be able to grant (a UAC
+        # prompt on Windows); falls back to the copy path when it can't be set
+        # up. Ported from @kshitijk4poor's browser-real-profile-fix. Default false.
+        "real_profile_live": False,
         "allow_unsafe_evaluate": False,  # Legacy override: when true, browser_console(expression=...) bypasses the restrict_evaluate denylist entirely
         "restrict_evaluate": False,  # Opt-in denylist blocking sensitive JS primitives (cookies/storage/clipboard/network/form values) in browser_console(expression=...)
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.

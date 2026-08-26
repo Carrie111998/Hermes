@@ -626,6 +626,94 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     return dst, None
 
 
+# ---------------------------------------------------------------------------
+# Live-profile enablement (opt-in alternative to the profile copy)
+#
+# Ported from @kshitijk4poor's ``browser-real-profile-fix``. The
+# ``RemoteDebuggingAllowed`` enterprise policy overrides Chrome 136+'s block on
+# ``--remote-debugging-port`` for the default user-data-dir, letting the agent
+# attach to the user's LIVE profile — which decrypts cookies natively (the real
+# browser decrypts its own store in place), unlike a copy. Each setter returns
+# True on success; callers fall back to the copy path on False. Note: on
+# Windows the policy write lives under ``HKCU\\Software\\Policies`` and needs an
+# elevated (UAC) process, which a non-elevated agent does not have.
+# ---------------------------------------------------------------------------
+def _ensure_policy_darwin(browser: str) -> bool:
+    """Set RemoteDebuggingAllowed via ``defaults write`` on macOS."""
+    domain = {
+        "chrome": "com.google.Chrome",
+        "chromium": "org.chromium.Chromium",
+        "brave": "com.brave.Browser",
+        "edge": "com.microsoft.edgemac",
+    }.get(browser, "com.google.Chrome")
+    try:
+        subprocess.run(
+            ["defaults", "write", domain, "RemoteDebuggingAllowed", "-bool", "true"],
+            capture_output=True, timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_policy_windows(browser: str) -> bool:
+    """Set RemoteDebuggingAllowed via registry on Windows (needs elevation)."""
+    try:
+        import winreg  # type: ignore
+    except Exception:
+        return False
+    root_map = {
+        "chrome": r"Software\Policies\Google\Chrome",
+        "edge": r"Software\Policies\Microsoft\Edge",
+        "brave": r"Software\Policies\BraveSoftware\Brave",
+        "chromium": r"Software\Policies\Chromium",
+    }
+    subkey = root_map.get(browser, root_map["chrome"])
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "RemoteDebuggingAllowed", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        # HKCU\Software\Policies is ACL-protected; the write needs an elevated
+        # process (a UAC secure-desktop consent), which a non-elevated agent
+        # cannot obtain. Fall back to the copy path.
+        return False
+
+
+def _ensure_policy_linux(browser: str) -> bool:
+    """Drop a RemoteDebuggingAllowed managed-policy JSON on Linux (needs root)."""
+    paths = {
+        "chrome": "/etc/opt/chrome/policies/managed/hermes-real-profile.json",
+        "edge": "/etc/opt/edge/policies/managed/hermes-real-profile.json",
+        "brave": "/etc/brave/policies/managed/hermes-real-profile.json",
+        "chromium": "/etc/chromium/policies/managed/hermes-real-profile.json",
+    }
+    target = paths.get(browser, paths["chrome"])
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        import json
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump({"RemoteDebuggingAllowed": True}, f)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_remote_debugging_policy(browser: str, system: str | None = None) -> bool:
+    """Set the RemoteDebuggingAllowed policy for ``browser``; True on success.
+
+    Ported from @kshitijk4poor (#95520 / browser-real-profile-fix). On failure
+    the caller falls back to the profile-copy path.
+    """
+    system = system or platform.system()
+    if system == "Darwin":
+        return _ensure_policy_darwin(browser)
+    if system == "Windows":
+        return _ensure_policy_windows(browser)
+    return _ensure_policy_linux(browser)
+
+
 def active_profile_directory(data_dir: str) -> str:
     """Return the profile sub-directory the browser was last using.
 

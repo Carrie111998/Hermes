@@ -1535,6 +1535,106 @@ def _agent_browser_close_session(session_name: str) -> None:
         logger.debug("real-profile session close failed: %s", e)
 
 
+# Port used for the live-profile browser instance (opt-in path below).
+_REAL_PROFILE_LIVE_PORT = 9231
+
+
+def _use_real_profile_live() -> bool:
+    """Whether to prefer the LIVE-profile path over the profile copy.
+
+    Reads ``browser.real_profile_live`` (default False) per call. When on and it
+    succeeds, Hermes drives the user's real profile in place (via a
+    policy-enabled debug port) instead of a copy — which decrypts cookies
+    natively. It falls back to the copy path when the policy/launch can't be
+    set up (e.g. no privileges, or the browser is already running without a
+    debug port). Opt-in because it needs the browser closed and a one-time
+    consent the agent may not be able to grant (a UAC prompt on Windows).
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            return bool(browser_cfg.get("real_profile_live", False))
+    except Exception as e:
+        logger.debug("Could not read real_profile_live from config: %s", e)
+    return False
+
+
+def _launch_real_profile_chrome(exe: str, data_dir: str, port: int) -> None:
+    """Launch the real browser with ``--remote-debugging-port`` on its profile.
+
+    Ported from @kshitijk4poor's browser-real-profile-fix. Detached: the browser
+    outlives this call. If it is already running on this profile (SingletonLock
+    present) we skip launching — the caller's CDP attach will use the existing
+    instance IF the policy exposed its port.
+    """
+    if os.path.exists(os.path.join(data_dir, "SingletonLock")):
+        return
+    try:
+        subprocess.Popen(
+            [
+                exe,
+                f"--remote-debugging-port={port}",
+                "--remote-allow-origins=*",
+                "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={data_dir}",
+                "about:blank",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        logger.debug("real-profile live launch failed: %s", e)
+
+
+def _real_profile_cdp_live(browser: str) -> tuple:
+    """Attach to the user's LIVE profile via a policy-enabled debug port.
+
+    Ported from @kshitijk4poor's browser-real-profile-fix. Sets the
+    ``RemoteDebuggingAllowed`` policy (overrides Chrome 136+'s default-dir
+    block), launches the user's real browser on their real profile dir with an
+    explicit devtools port, and returns the HTTP CDP endpoint once it answers.
+    Unlike the copy path this decrypts cookies natively — but it needs the
+    browser closed (or an already-debug-enabled instance) and privileges the
+    agent may lack (a UAC secure-desktop consent on Windows). Returns
+    ``(None, message)`` on any failure so the caller falls back to the copy.
+    """
+    from hermes_cli.browser_connect import (
+        chromium_executable,
+        ensure_remote_debugging_policy,
+        real_profile_data_dir,
+    )
+
+    data_dir = real_profile_data_dir(browser)
+    if not data_dir or not os.path.isdir(data_dir):
+        return None, f"the '{browser}' profile directory was not found ({data_dir!r})"
+    exe = chromium_executable(browser)
+    if not exe:
+        return None, f"could not locate the '{browser}' browser binary"
+    if not ensure_remote_debugging_policy(browser):
+        return None, (
+            "could not set the RemoteDebuggingAllowed policy — it needs "
+            "elevation/consent the agent may not have (e.g. a UAC prompt on "
+            "Windows)"
+        )
+    cdp = f"http://127.0.0.1:{_REAL_PROFILE_LIVE_PORT}"
+    if not _cdp_http_ready(cdp):
+        _launch_real_profile_chrome(exe, data_dir, _REAL_PROFILE_LIVE_PORT)
+        for _ in range(20):
+            if _cdp_http_ready(cdp):
+                break
+            time.sleep(0.5)
+    if not _cdp_http_ready(cdp):
+        return None, (
+            "the real-profile browser did not expose a devtools endpoint — it "
+            "may already be running without a debug port (close it and retry)"
+        )
+    return cdp, None
+
+
 def _real_profile_cdp() -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
@@ -1588,6 +1688,21 @@ def _real_profile_cdp() -> tuple:
                 "pre-release Chromium channel (Beta / Dev / Canary), which "
                 "real-profile browsing does not support. Set your default to a "
                 "stable Chrome / Edge / Brave / Chromium, or turn the toggle off."
+            )
+        # Opt-in LIVE-profile path (browser.real_profile_live): drive the user's
+        # real profile in place via a policy-enabled debug port instead of a
+        # copy — it decrypts cookies natively (the only thing that works on
+        # Windows, and avoids the copy's fork/staleness elsewhere). Falls
+        # through to the copy path when it can't be set up. Ported from
+        # @kshitijk4poor's browser-real-profile-fix.
+        if _use_real_profile_live():
+            live_cdp, live_err = _real_profile_cdp_live(browser)
+            if live_cdp:
+                _real_profile_cdp_cache["cdp"] = live_cdp
+                logger.info("real-profile LIVE browser ready for %s at %s", browser, live_cdp)
+                return live_cdp, None
+            logger.info(
+                "real-profile live path unavailable, falling back to copy: %s", live_err
             )
         if sys.platform == "win32":
             # App-Bound Encryption (Chrome/Edge 127+) binds the cookie
