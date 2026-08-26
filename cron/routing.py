@@ -60,8 +60,18 @@ class CronRoute:
 
 _RISK_RE = re.compile(
     r"\b(?:prod(?:uction)?|deploy|release|publish|payment|billing|credential|"
-    r"secret|password|token|permission|access|rotate|delete|remove|refund|"
-    r"financial|invoice|legal|external\s+send)\b",
+    r"secret|password|permission|access|rotate|delete|remove|refund|"
+    r"financial|invoice|legal|external\s+send|"
+    r"(?:api|access|auth(?:entication)?|bearer|oauth|refresh|service)\s+tokens?)\b",
+    re.IGNORECASE,
+)
+# A risk word in an explicit prohibition is not an instruction to perform the
+# risky action. Keep the check clause-local so a later positive action in the
+# same prompt still wins (e.g. "do not deploy; deploy after approval").
+_RISK_NEGATION_RE = re.compile(
+    r"\b(?:no|not|never|without|don['’]?t|do\s+not|does\s+not|did\s+not|"
+    r"cannot|can['’]?t|avoid|prevent|read[- ]only|sem|não|nao|nunca|"
+    r"jamais|evite|evitar|somente\s+leitura|apenas\s+leitura)\b",
     re.IGNORECASE,
 )
 _MULTI_STEP_RE = re.compile(
@@ -110,6 +120,22 @@ def _schedule_minutes(schedule: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _has_risk_signal(text: str) -> bool:
+    """Return whether a prompt contains a positive, actionable risk signal."""
+    for match in _RISK_RE.finditer(text):
+        # Stop at sentence/line boundaries. A negation in an earlier clause
+        # must not suppress a later independent risky instruction.
+        clause_start = max(
+            text.rfind(delimiter, 0, match.start())
+            for delimiter in (".", "!", "?", "\n", ";")
+        ) + 1
+        prefix = text[clause_start : match.start()]
+        if _RISK_NEGATION_RE.search(prefix):
+            continue
+        return True
+    return False
+
+
 def classify_cron_job(
     *,
     prompt: str | None = None,
@@ -147,7 +173,7 @@ def classify_cron_job(
         except (TypeError, ValueError):
             interval_minutes = None
 
-    inferred_risk = bool(risk) if isinstance(risk, bool) else bool(_RISK_RE.search(prompt_text))
+    inferred_risk = bool(risk) if isinstance(risk, bool) else _has_risk_signal(prompt_text)
     inferred_multi_step = (
         bool(multiple_steps)
         if isinstance(multiple_steps, bool)

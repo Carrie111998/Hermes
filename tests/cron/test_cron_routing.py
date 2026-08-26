@@ -42,6 +42,46 @@ def test_classify_script_backed_job_as_deterministic():
 
 
 
+def test_negated_risk_language_does_not_make_a_job_critical():
+    from cron.routing import classify_cron_job
+
+    result = classify_cron_job(
+        prompt=(
+            "Somente leitura. NUNCA autoaplique nada: apenas sugira. "
+            "Sem merge/deploy/gasto."
+        ),
+        schedule={"kind": "interval", "minutes": 1440},
+    )
+
+    assert result.signals["risk"] is False
+    assert result.slot != "critical"
+
+
+def test_cost_tokens_are_not_treated_as_secret_credentials():
+    from cron.routing import classify_cron_job
+
+    result = classify_cron_job(
+        prompt="Analise eficiência de tokens e custo do relatório.",
+        schedule={"kind": "interval", "minutes": 1440},
+    )
+
+    assert result.signals["risk"] is False
+    assert result.slot != "critical"
+
+
+def test_positive_token_credential_instruction_remains_critical():
+    from cron.routing import classify_cron_job
+
+    result = classify_cron_job(
+        prompt="Revogue o access token de produção após a falha de autenticação.",
+        schedule={"kind": "once"},
+    )
+
+    assert result.signals["risk"] is True
+    assert result.slot == "critical"
+
+
+
 def test_classify_high_risk_job_as_critical():
     from cron.routing import classify_cron_job
 
