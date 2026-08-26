@@ -1456,8 +1456,48 @@ def _update_complete_message(pre_version: str | None) -> str:
     if post_version:
         return f"✓ Update complete! (v{post_version})"
     return "✓ Update complete!"
- 
- 
+
+
+def _post_update_sqlite_runtime_status():
+    """Return whether the interpreter used after update has safe SQLite."""
+    from hermes_constants import project_venv_dir
+    from hermes_cli.sqlite_runtime import probe_sqlite_runtime
+
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT)
+    python = (
+        venv_python_path(venv_dir, windows=_m()._is_windows())
+        if venv_dir is not None
+        else Path(sys.executable)
+    )
+    info = probe_sqlite_runtime(python)
+    return info is not None and not info.wal_reset_vulnerable, info
+
+
+def _print_verified_update_completion(message: str) -> bool:
+    """Print a success completion only after probing the next Hermes runtime."""
+    if not message.startswith("✓"):
+        _print_update_completion(message)
+        return False
+    sqlite_runtime_ok, sqlite_info = _post_update_sqlite_runtime_status()
+    if sqlite_runtime_ok:
+        _print_update_completion(message)
+        return True
+    print()
+    if sqlite_info is None:
+        detail = "the post-update SQLite runtime could not be verified"
+    else:
+        detail = (
+            f"SQLite {sqlite_info.sqlite_version_string} still has the "
+            "WAL-reset corruption bug"
+        )
+    print(f"⚠ Update partially complete — {detail}.")
+    print(
+        "  Rebuild the Hermes venv with a uv-managed Python, restart Hermes, "
+        "then verify with `hermes doctor`."
+    )
+    return False
+
+
 def _clear_stale_sqlite_sidecars(db_path: Path) -> None:
     """Delete the WAL / shared-memory / rollback-journal files next to *db_path*.
 
@@ -1484,11 +1524,12 @@ def _print_update_summary(
     node_failures: list,
     desktop_build_ok: bool,
     pre_update_version: str | None,
-) -> None:
+) -> bool:
     """Final update banner. A failed Desktop rebuild is non-fatal for the
     Python side, but must not print ``✓ Update complete!`` (#88251)."""
+    sqlite_runtime_ok, sqlite_info = _post_update_sqlite_runtime_status()
     print()
-    if node_failures or not desktop_build_ok:
+    if node_failures or not desktop_build_ok or not sqlite_runtime_ok:
         parts = []
         if node_failures:
             parts.append(
@@ -1498,14 +1539,30 @@ def _print_update_summary(
             parts.append(
                 "the desktop app was not rebuilt and is still on the previous build"
             )
+        if not sqlite_runtime_ok:
+            if sqlite_info is None:
+                parts.append("the post-update SQLite runtime could not be verified")
+            else:
+                parts.append(
+                    f"SQLite {sqlite_info.sqlite_version_string} still has the "
+                    "WAL-reset corruption bug"
+                )
         print("⚠ Update partially complete — " + "; ".join(parts) + ".")
         if node_failures:
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
         if not desktop_build_ok:
             print("  Run `hermes desktop` to retry the desktop rebuild.")
+        if not sqlite_runtime_ok:
+            print(
+                "  The Python runtime remediation did not complete. Run `hermes "
+                "update` again; if SQLite is unchanged, rebuild the Hermes venv "
+                "with a uv-managed Python, restart Hermes, then verify with "
+                "`hermes doctor`."
+            )
     else:
         _print_update_completion(_update_complete_message(pre_update_version))
+    return desktop_build_ok and sqlite_runtime_ok
 
 
 def _write_gateway_update_exit_code(ok: bool) -> None:
@@ -1957,7 +2014,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
             "Post-update state.db integrity check (zip path) failed: %s", exc
         )
 
-    _print_update_summary(
+    update_complete = _print_update_summary(
         node_failures=node_failures,
         desktop_build_ok=desktop_build_ok,
         pre_update_version=pre_update_version,
@@ -1977,11 +2034,11 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         from hermes_cli.update_receipt import finalize_update_receipt
 
         finalize_update_receipt(
-            "success" if (desktop_build_ok and not node_failures) else "partial"
+            "success" if update_complete and not node_failures else "partial"
         )
     except Exception as _receipt_exc:
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
-    return desktop_build_ok
+    return update_complete
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -6799,7 +6856,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
-                _repair_node_deps_on_current_checkout(_print_update_completion)
+                _repair_node_deps_on_current_checkout(
+                    _print_verified_update_completion
+                )
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
@@ -7669,7 +7728,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as exc:
             logger.debug("Sibling cron auto-restore check failed: %s", exc)
 
-        _print_update_summary(
+        update_complete = _print_update_summary(
             node_failures=node_failures,
             desktop_build_ok=desktop_build_ok,
             pre_update_version=pre_update_version,
@@ -7800,11 +7859,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #
         # Writing the marker here — after git pull + pip install succeed but
         # before we attempt the restart — ensures the new gateway sees it
-        # regardless of how we die. Gated on desktop_build_ok (#88251): a
-        # Desktop rebuild failure must not be reported as "0" — the gateway's
-        # /update watcher (gateway/run.py) polls this file.
+        # regardless of how we die. The verified summary includes Desktop and
+        # SQLite-runtime health, so neither failure is reported as "0" to the
+        # gateway watcher (gateway/run.py).
         if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+            _write_gateway_update_exit_code(update_complete)
 
         gateway_fleet_restart_incomplete = False
         # Snapshot of gateways running before we touch anything. Stays empty
@@ -8752,7 +8811,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             from hermes_cli.update_receipt import finalize_update_receipt
 
             _receipt_path = finalize_update_receipt(
-                "partial" if gateway_fleet_restart_incomplete else "success",
+                (
+                    "partial"
+                    if gateway_fleet_restart_incomplete or not update_complete
+                    else "success"
+                ),
                 fleet=_fleet_snapshot,
             )
             if _receipt_path is not None:
