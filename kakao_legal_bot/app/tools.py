@@ -401,7 +401,7 @@ def _related_tool(
             rows = await asyncio.to_thread(graph.notes_for, anchor, limit)
             if rows:
                 entity = await asyncio.to_thread(graph.entity, anchor)
-                key = entity.key if entity is not None else anchor
+                key = entity.display if entity is not None else anchor
                 state.cite(key)
                 blocks.append(f"[{key} 를 다루는 자료 {len(rows)}건 — 최신 순]")
                 blocks.extend(

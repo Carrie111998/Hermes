@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .citation import alias_table, parse_statute
+from .citation import alias_table, entity_key, parse_statute
 from .note import CASE, STATUTE, WikiNote
 
 STATUTE_ENTITY = "statute"
@@ -89,6 +89,21 @@ def classify(key: str) -> str:
     if any(char.isdigit() for char in text) and parse_statute(text) is not None:
         return STATUTE_ENTITY
     return KEYWORD_ENTITY
+
+
+def _canonical(key: str) -> tuple[str, str, str]:
+    """``(종류, 그래프 키, 보일 이름)``.
+
+    키는 띄어쓰기를 지운 형태입니다 — 같은 법이 문서마다 다르게 띄어 쓰여
+    두 마디로 갈라지는 것을 막습니다. 보일 이름은 띄어 쓴 쪽을 씁니다.
+    """
+    kind = classify(key)
+    display = re.sub(r"\s+", " ", (key or "").strip())
+    if kind == STATUTE_ENTITY:
+        ref = parse_statute(display)
+        if ref is not None:
+            display = ref.key
+    return kind, entity_key(display), display
 
 
 @dataclass(frozen=True)
@@ -188,20 +203,21 @@ class WikiGraph:
             return note_id
 
     def _entity_id_locked(self, key: str) -> int:
-        kind = classify(key)
-        canonical = key.strip()
-        if kind == STATUTE_ENTITY:
-            ref = parse_statute(canonical)
-            if ref is not None:
-                canonical = ref.key
+        kind, canonical, display = _canonical(key)
         row = self._conn.execute(
-            "SELECT id FROM entities WHERE kind = ? AND key = ?", (kind, canonical)
+            "SELECT id, display FROM entities WHERE kind = ? AND key = ?", (kind, canonical)
         ).fetchone()
         if row is not None:
+            # 띄어 쓴 이름이 나중에 나오면 그쪽으로 갈아 끼웁니다 — 허브노트
+            # 제목은 사람이 읽는 것이니까요.
+            if display.count(" ") > str(row["display"] or "").count(" "):
+                self._conn.execute(
+                    "UPDATE entities SET display = ? WHERE id = ?", (display, row["id"])
+                )
             return int(row["id"])
         cursor = self._conn.execute(
             "INSERT INTO entities(kind, key, display, note_count) VALUES(?,?,?,0)",
-            (kind, canonical, canonical),
+            (kind, canonical, display),
         )
         return int(cursor.lastrowid or 0)
 
@@ -225,12 +241,7 @@ class WikiGraph:
 
     # ── 조회 ─────────────────────────────────────────────────────────────
     def entity(self, key: str) -> EntityRow | None:
-        kind = classify(key)
-        canonical = key.strip()
-        if kind == STATUTE_ENTITY:
-            ref = parse_statute(canonical)
-            if ref is not None:
-                canonical = ref.key
+        kind, canonical, _display = _canonical(key)
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM entities WHERE kind = ? AND key = ?", (kind, canonical)
@@ -401,7 +412,7 @@ class WikiGraph:
             grouped.setdefault(str(row["kind"]), []).append(row)
 
         head = {
-            "title": entity.key,
+            "title": entity.display,
             "kind": "허브",
             "entity": _ENTITY_LABELS.get(entity.kind, entity.kind),
             "note_count": str(entity.note_count),
@@ -410,7 +421,7 @@ class WikiGraph:
         lines.extend(f"{key}: {value}" for key, value in head.items())
         lines.append("---")
         lines.append("")
-        lines.append(f"# {entity.key}")
+        lines.append(f"# {entity.display}")
         lines.append("")
         lines.append(f"이 {_ENTITY_LABELS.get(entity.kind, '항목')}을 다루는 문서 {entity.note_count}개.")
         lines.append("")
@@ -439,7 +450,7 @@ class WikiGraph:
         for entity in self.hubs(min_notes=min_notes):
             folder = root / _ENTITY_LABELS.get(entity.kind, "기타")
             folder.mkdir(parents=True, exist_ok=True)
-            (folder / f"{safe_filename(entity.key)}.md").write_text(
+            (folder / f"{safe_filename(entity.display)}.md").write_text(
                 self.render_hub(entity), encoding="utf-8"
             )
             written += 1
@@ -457,7 +468,7 @@ class WikiGraph:
             for entity in entities:
                 folder = _ENTITY_LABELS[kind]
                 lines.append(
-                    f"- [[{folder}/{safe_filename(entity.key)}|{entity.key}]] "
+                    f"- [[{folder}/{safe_filename(entity.display)}|{entity.display}]] "
                     f"— {entity.note_count}개 문서"
                 )
             lines.append("")

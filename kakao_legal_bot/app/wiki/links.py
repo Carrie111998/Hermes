@@ -59,6 +59,77 @@ def linked_targets(text: str) -> list[str]:
     return list(seen)
 
 
+# 「X」란 · "X"이란 · ‘X’라 함은 — 법률문서가 스스로 밝히는 정의어입니다.
+_DEFINED_TERM = re.compile(
+    r"[\"'“”‘’「『]\s*(?P<term>[가-힣][가-힣A-Za-z0-9·\s]{1,14}?)\s*[\"'“”‘’」』]"
+    r"\s*(?:이)?(?:란|라\s*함은|라\s*한다)"
+)
+# 소제목처럼 보이지만 자료의 뼈대가 아니라 서지·부속 항목인 것들.
+_NOT_A_TERM = {
+    "저자정보", "관련조문", "참고문헌", "목차", "차례", "각주", "조문", "주석",
+    "머리말", "서문", "판례색인", "색인", "부록", "약어표", "일러두기",
+}
+_HEADING_NOISE = re.compile(
+    r"^(?:[IVXLⅠ-Ⅹ0-9]+[.)]?\s*)+|^제?\s*\d+\s*[장절관조]\s*|[.\s]+$"
+)
+
+
+def defined_terms(text: str) -> list[str]:
+    """그 문서가 정의한 용어. ``[[ ]]`` 표시가 없어도 이건 확실한 키워드입니다.
+
+    법률문서는 중요한 낱말을 반드시 정의하고 넘어갑니다 —
+    ``"정비구역"이란 …을 말한다``. 그 낱말이 곧 그 문서의 주제어입니다.
+    """
+    found: dict[str, None] = {}
+    for match in _DEFINED_TERM.finditer(text or ""):
+        term = re.sub(r"\s+", " ", match.group("term")).strip()
+        # '안다', '유효하다' 같은 서술어는 정의어가 아니라 인용된 말입니다.
+        if term.endswith(("다", "까", "요", "함", "지")) or term in _NOT_A_TERM:
+            continue
+        if 2 <= len(term.replace(" ", "")) <= 20:
+            found.setdefault(term, None)
+    return list(found)
+
+
+# 우리 법률서적은 문단마다 방주번호를 답니다 — "[3315] 1. 서 설".
+# 마크다운 소제목이 아니어서 지나치기 쉽지만, 그 책의 진짜 뼈대입니다.
+_MARGIN_HEADING = re.compile(
+    r"^\s*\[(?P<no>\d{2,6})\]\s*(?:[\dIVXⅠ-Ⅹ]+\s*[.)]\s*)?(?P<title>[^\n]{2,30}?)\s*$",
+    re.MULTILINE,
+)
+
+
+def margin_headings(text: str) -> list[tuple[str, str]]:
+    """``(방주번호, 제목)`` — 인용할 때 쪽수 대신 쓰는 안정된 좌표입니다."""
+    found: list[tuple[str, str]] = []
+    for match in _MARGIN_HEADING.finditer(text or ""):
+        title = re.sub(r"\s+", " ", match.group("title")).strip(" .·-—")
+        if 2 <= len(title.replace(" ", "")) <= 24:
+            found.append((match.group("no"), title))
+    return found
+
+
+def heading_terms(text: str, limit: int = 30) -> list[str]:
+    """소제목에서 번호를 떼어 낸 것. 그 문서의 뼈대이자 주제어입니다."""
+    found: dict[str, None] = {}
+    for _number, title in margin_headings(text):
+        if title not in _NOT_A_TERM:
+            found.setdefault(title, None)
+        if len(found) >= limit:
+            return list(found)
+    for match in _HEADING_RE.finditer(text or ""):
+        raw = re.sub(r"\[\[|\]\]|[*_`]", "", match.group(1))
+        term = _HEADING_NOISE.sub("", raw).strip(" .·-—[]()【】")
+        term = re.sub(r"\s+", " ", term)
+        if term in _NOT_A_TERM:
+            continue
+        if 2 <= len(term.replace(" ", "")) <= 24 and not term.isdigit():
+            found.setdefault(term, None)
+        if len(found) >= limit:
+            break
+    return list(found)
+
+
 def _mask(text: str) -> str:
     """치환하면 안 되는 자리를 같은 길이의 공백으로 덮는다."""
     masked = list(text)

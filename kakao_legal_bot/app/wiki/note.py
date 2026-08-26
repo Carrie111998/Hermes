@@ -29,8 +29,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-from .citation import extract_citations
-from .links import keyword_weights, linked_targets
+from .citation import entity_key, extract_citations
+from .links import defined_terms, heading_terms, keyword_weights, linked_targets
 
 FENCE = "---"
 
@@ -229,9 +229,18 @@ class WikiNote:
         것을 더해 주는 것뿐입니다.
         """
         citations = extract_citations(self.body, default_law=default_law)
-        self.statutes = _merge(self.statutes, citations.statute_displays())
+        self.statutes = _prefer_spaced(_merge(self.statutes, citations.statute_displays()))
         self.cases = _merge(self.cases, citations.case_keys())
-        self.keywords = _merge(self.keywords, linked_targets(self.body))
+
+        marked = linked_targets(self.body)
+        if marked:
+            self.keywords = _merge(self.keywords, marked)
+        else:
+            # ``[[ ]]`` 표시가 없는 자료도 많습니다. 그런 자료에서는 문서가
+            # 스스로 정의한 용어와 소제목이 가장 정직한 주제어입니다.
+            self.keywords = _merge(
+                self.keywords, [*defined_terms(self.body), *heading_terms(self.body)]
+            )
         self.weights = keyword_weights(self.body, extra=self.keywords)
 
         if self.kind == CASE:
@@ -291,6 +300,36 @@ class WikiNote:
             if value and not _ISO_DATE.match(value):
                 missing.append(f"{key} 는 YYYY-MM-DD 여야 합니다 (지금: {value})")
         return missing
+
+
+def _prefer_spaced(values: list[str]) -> list[str]:
+    """같은 조문이 띄어쓰기만 다르게 두 번 실리지 않게.
+
+    온주의 링크는 ``고용보험및산업재해보상보험의…`` 처럼 붙여 쓰고 본문은
+    띄어 씁니다. 둘은 같은 조문이므로 읽기 좋은 쪽 하나만 남깁니다.
+    """
+    from .citation import parse_statute
+
+    def group_of(value: str) -> str:
+        ref = parse_statute(value)
+        return entity_key(ref.key if ref is not None else value)
+
+    def better(candidate: str, current: str) -> bool:
+        # 자세한 쪽(제1항까지 적힌 것)을, 같은 자세함이면 띄어 쓴 쪽을.
+        if len(candidate) != len(current):
+            return len(candidate) > len(current)
+        return candidate.count(" ") > current.count(" ")
+
+    best: dict[str, str] = {}
+    for value in values:
+        key = group_of(value)
+        current = best.get(key)
+        if current is None or better(value, current):
+            best[key] = value
+    seen: dict[str, None] = {}
+    for value in values:
+        seen.setdefault(best[group_of(value)], None)
+    return list(seen)
 
 
 def _merge(existing: list[str], additions: list[str]) -> list[str]:

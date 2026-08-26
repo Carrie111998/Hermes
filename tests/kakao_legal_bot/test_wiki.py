@@ -293,7 +293,7 @@ def test_notes_that_were_superseded_are_kept_out_of_related(tmp_path):
 
 
 def test_hubs_are_the_things_more_than_one_document_talks_about(graph):
-    keys = {entity.key for entity in graph.hubs(min_notes=2)}
+    keys = {entity.display for entity in graph.hubs(min_notes=2)}
     assert "민법 제618조" in keys
     assert "형법 제329조" not in keys  # 한 문서에만 나온다
 

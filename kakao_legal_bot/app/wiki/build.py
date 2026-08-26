@@ -25,6 +25,7 @@ from ..config import get_settings
 from .graph import WikiGraph
 from .lint import apply_supersession, lint
 from .note import CASE, COMMENTARY, FORM, PRACTICE, STATUTE, WikiNote
+from .sources import main_law_of, read_source
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "wiki_prompt.md"
 
@@ -71,19 +72,38 @@ def iter_notes(directory: Path) -> list[WikiNote]:
             continue  # 자동 생성된 허브노트
         if note.kind == "기타":
             note.kind = guess_kind(path)
-        notes.append(note.enrich(default_law=_default_law(path)))
+        notes.append(note.enrich(default_law=_default_law(path) or main_law_of(text, str(path))))
     return notes
 
 
-def _default_law(path: Path) -> str:
-    """민법 주석서 폴더 안이면 '제618조'만 적어도 민법으로 읽습니다."""
-    from .citation import alias_table
+_SOURCE_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt"}
 
-    text = str(path)
-    for full in sorted(alias_table().full_names, key=len, reverse=True):
-        if full.replace(" ", "") in text.replace(" ", ""):
-            return full
-    return ""
+
+def _source_files(root: Path) -> list[Path]:
+    """원문 폴더의 자료 파일. HTML 과 같은 이름의 .md 가 있으면 HTML 을 씁니다."""
+    files = [
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in _SOURCE_SUFFIXES
+        and not path.name.startswith((".", "_"))
+    ]
+    html_stems = {
+        path.with_suffix("") for path in files if path.suffix.lower() in {".html", ".htm"}
+    }
+    return [
+        path
+        for path in files
+        if path.suffix.lower() in {".html", ".htm"} or path.with_suffix("") not in html_stems
+    ]
+
+
+def _default_law(path: Path) -> str:
+    """폴더·파일 이름에서 그 자료의 주된 법령을 읽는다.
+
+    민법 주석서 폴더 안이라면 "제618조"만 적어도 민법으로 읽힙니다.
+    """
+    return main_law_of("", str(path))
 
 
 # ── stub ─────────────────────────────────────────────────────────────────
@@ -96,40 +116,39 @@ def make_stubs(raw_dir: Path, wiki_dir: Path, overwrite: bool = False) -> tuple[
     """
     made = skipped = 0
     jobs: list[dict[str, object]] = []
-    for path in sorted(raw_dir.rglob("*.md")):
-        if path.name.startswith("."):
-            continue
+    for path in sorted(_source_files(raw_dir)):
         relative = path.relative_to(raw_dir)
-        target = wiki_dir / relative
+        target = (wiki_dir / relative).with_suffix(".md")
         if target.exists() and not overwrite:
             skipped += 1
             continue
-        body = path.read_text(encoding="utf-8")
         source = str(Path("raw") / relative)
-        note = WikiNote(
-            path=str(relative),
-            title=path.stem,
-            kind=guess_kind(path),
-            source=source,
-            collection=relative.parts[0] if len(relative.parts) > 1 else "",
-            body=f"<!-- 여기에 wiki_prompt.md 규칙대로 씁니다. 원문: {source} -->\n",
-        )
-        note.body = body  # 인용 추출용
-        note.enrich(default_law=_default_law(path))
+        note = read_source(path)
+        note.path = str(relative.with_suffix(".md"))
+        note.source = source
+        note.collection = relative.parts[0] if len(relative.parts) > 1 else ""
+        if note.kind in {"기타", ""}:
+            note.kind = guess_kind(path)
+        extracted = note.body
         note.body = (
             f"<!-- TODO: wiki_prompt.md 규칙대로 다시 씁니다. 원문: {source} -->\n"
             f"<!-- frontmatter 의 조문·판례·키워드는 원문에서 기계적으로 뽑은 것입니다. -->\n"
         )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(note.to_markdown(), encoding="utf-8")
+        # HTML 은 그대로 두면 코덱스가 못 읽습니다. 구조를 살려 옮긴 본문을
+        # 원문 옆에 나란히 둡니다 — 무엇이 근거였는지가 남아야 하니까요.
+        if path.suffix.lower() in {".html", ".htm"}:
+            path.with_suffix(".md").write_text(extracted, encoding="utf-8")
         jobs.append(
             {
                 "raw": str(path),
                 "wiki": str(target),
                 "kind": note.kind,
-                "statutes": note.statutes,
-                "cases": note.cases,
-                "keywords": note.keywords,
+                "main_law": note.extra.get("main_law", ""),
+                "statutes": note.statutes[:40],
+                "cases": note.cases[:40],
+                "keywords": note.keywords[:40],
             }
         )
         made += 1
@@ -232,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(graph.stats(), ensure_ascii=False, indent=2))
             print("\n[가장 많이 언급되는 것]")
             for entity in graph.hubs(min_notes=2, limit=15):
-                print(f"  {entity.note_count:4}  {entity.key}")
+                print(f"  {entity.note_count:4}  {entity.display}")
             print("\n[백링크가 많은 문서]")
             for row in graph.important_notes(limit=10):
                 print(f"  {row['inbound']:4}  {row['title']}")
