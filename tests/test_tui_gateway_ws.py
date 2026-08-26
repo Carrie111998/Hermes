@@ -106,6 +106,37 @@ def test_ws_connection_registers_then_disconnect_unregisters_live_transport(monk
         server._live_transports.clear()
 
 
+def test_event_only_ws_rejects_rpc_before_dispatch(monkeypatch):
+    sent = []
+    inbound = iter([json.dumps({"jsonrpc": "2.0", "id": 7, "method": "session.resume", "params": {}})])
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+    monkeypatch.setattr(server, "dispatch", lambda *_args: (_ for _ in ()).throw(AssertionError("dispatch reached")))
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            try:
+                return next(inbound)
+            except StopIteration:
+                raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(ws_mod.handle_ws(FakeWS(), allowed_methods=frozenset()))
+
+    rejection = next(frame for frame in sent if frame.get("id") == 7)
+    assert rejection["error"] == {
+        "code": -32601,
+        "message": "method not allowed on read-only transport",
+    }
+
+
 def test_ws_disconnect_releases_wake_word_owner(monkeypatch):
     released = []
     created = []

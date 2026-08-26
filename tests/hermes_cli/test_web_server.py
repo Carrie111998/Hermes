@@ -5183,7 +5183,8 @@ class TestHashedAssetCacheHeaders:
         assert "window.__HERMES_SPECTATOR__=true" in resp.text
         assert 'window.__HERMES_BASE_PATH__=""' in resp.text
         assert 'window.__HERMES_SPECTATOR_BASE_PATH__="/spectator"' in resp.text
-        assert "window.__HERMES_SESSION_TOKEN__=" in resp.text
+        assert "window.__HERMES_SPECTATOR_TOKEN__=" in resp.text
+        assert "window.__HERMES_SESSION_TOKEN__=" not in resp.text
 
     def test_spectator_prefix_separates_api_and_static_scopes(self, tmp_path, monkeypatch):
         client = self._client(tmp_path, monkeypatch)
@@ -5201,6 +5202,32 @@ class TestHashedAssetCacheHeaders:
         assert asset.headers["cache-control"] == self._IMMUTABLE
         assert "no-store" in worker.headers["cache-control"]
         assert "no-store" in version.headers["cache-control"]
+
+
+class TestSpectatorServerScope:
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, _isolate_hermes_home):
+        from starlette.testclient import TestClient
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
+        self.ws = ws
+        self.client = TestClient(ws.app, raise_server_exceptions=False)
+        self.headers = {ws._SPECTATOR_HEADER_NAME: ws._SPECTATOR_TOKEN}
+
+    def test_scoped_credential_reads_sessions(self):
+        assert self.client.get("/api/sessions", headers=self.headers).status_code == 200
+
+    def test_scoped_credential_rejects_mutation_before_route_dispatch(self):
+        response = self.client.post("/api/config", headers=self.headers, json={})
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Spectator is read-only"}
+
+    def test_scoped_credential_rejects_non_audited_get(self):
+        response = self.client.get("/api/env", headers=self.headers)
+        assert response.status_code == 403
 
 
 class TestDashboardComponentHealth:

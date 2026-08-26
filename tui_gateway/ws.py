@@ -322,6 +322,7 @@ async def handle_ws(
     *,
     auth_identity: dict | None = None,
     subprotocol: str | None = None,
+    allowed_methods: frozenset[str] | None = None,
 ) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
 
@@ -331,6 +332,10 @@ async def handle_ws(
     only identity authority for browser-controller registration. Existing
     callers (stdio-free harnesses, the embedded TUI child) omit it and get a
     ``None`` transport identity — unchanged behaviour.
+
+    ``allowed_methods=frozenset()`` creates an event-only transport: global
+    broadcasts still reach the peer, while every inbound JSON-RPC method is
+    rejected before dispatch. The iPad spectator uses this server-side fence.
     """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
@@ -470,6 +475,20 @@ async def handle_ws(
             # response dict, which we write here from the loop.
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
+
+            if allowed_methods is not None and req_method not in allowed_methods:
+                ok = await transport.write_async(
+                    {
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32601, "message": "method not allowed on read-only transport"},
+                        "id": req_id if req_id is not None else None,
+                    }
+                )
+                if not ok:
+                    disconnect_reason = "send_failed_after_method_rejection"
+                    send_failures += 1
+                    break
+                continue
 
             if req_method == "gateway.ping":
                 ok = await transport.write_async(

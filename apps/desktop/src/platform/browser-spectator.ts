@@ -1,6 +1,6 @@
 import type { HermesApiRequest, HermesConnection } from '@/global'
 
-const SESSION_HEADER = 'X-Hermes-Session-Token'
+const SPECTATOR_HEADER = 'X-Hermes-Spectator-Token'
 const READ_ONLY_PREFIXES = [
   '/api/config',
   '/api/hermes/version',
@@ -15,7 +15,7 @@ declare global {
   interface Window {
     __HERMES_AUTH_REQUIRED__?: boolean
     __HERMES_BASE_PATH__?: string
-    __HERMES_SESSION_TOKEN__?: string
+    __HERMES_SPECTATOR_TOKEN__?: string
     __HERMES_SPECTATOR__?: boolean
     __HERMES_SPECTATOR_BASE_PATH__?: string
   }
@@ -65,12 +65,13 @@ export function assertSpectatorReadRequest(request: HermesApiRequest): void {
 export async function browserSpectatorApi<T>(request: HermesApiRequest): Promise<T> {
   assertSpectatorReadRequest(request)
 
+  const token = window.__HERMES_SPECTATOR_TOKEN__
+  if (!token) throw new Error('Spectator credential is unavailable')
+
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), request.timeoutMs ?? 30_000)
   const headers = new Headers({ Accept: 'application/json' })
-  const token = window.__HERMES_SESSION_TOKEN__
-
-  if (token) headers.set(SESSION_HEADER, token)
+  headers.set(SPECTATOR_HEADER, token)
 
   try {
     const response = await fetch(requestPath(request), {
@@ -101,23 +102,9 @@ export async function browserSpectatorApi<T>(request: HermesApiRequest): Promise
 }
 
 async function websocketAuth(): Promise<readonly [string, string]> {
-  if (!window.__HERMES_AUTH_REQUIRED__) {
-    const token = window.__HERMES_SESSION_TOKEN__ ?? ''
-    if (!token) throw new Error('Spectator session token is unavailable')
-    return ['token', token]
-  }
-
-  const response = await fetch(`${basePath()}/api/auth/ws-ticket`, {
-    credentials: 'include',
-    method: 'POST'
-  })
-
-  if (!response.ok) throw new Error(`/api/auth/ws-ticket: HTTP ${response.status}`)
-
-  const body = (await response.json()) as { ticket?: string }
-  if (!body.ticket) throw new Error('/api/auth/ws-ticket returned no ticket')
-
-  return ['ticket', body.ticket]
+  const token = window.__HERMES_SPECTATOR_TOKEN__ ?? ''
+  if (!token) throw new Error('Spectator credential is unavailable')
+  return ['spectator', token]
 }
 
 export async function browserSpectatorConnection(): Promise<HermesConnection> {

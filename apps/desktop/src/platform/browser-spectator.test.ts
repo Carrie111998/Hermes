@@ -17,7 +17,7 @@ describe('browser spectator transport', () => {
     vi.stubGlobal('fetch', vi.fn())
     window.history.replaceState({}, '', '/')
     window.__HERMES_BASE_PATH__ = ''
-    window.__HERMES_SESSION_TOKEN__ = undefined
+    window.__HERMES_SPECTATOR_TOKEN__ = undefined
     window.__HERMES_AUTH_REQUIRED__ = false
     window.__HERMES_SPECTATOR__ = true
   })
@@ -27,7 +27,7 @@ describe('browser spectator transport', () => {
   })
 
   it('permits audited GET endpoints and scopes the profile', async () => {
-    window.__HERMES_SESSION_TOKEN__ = 'loopback-secret'
+    window.__HERMES_SPECTATOR_TOKEN__ = 'read-only-secret'
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ sessions: [] }))
 
     await expect(
@@ -43,7 +43,7 @@ describe('browser spectator transport', () => {
       })
     )
     const headers = vi.mocked(fetch).mock.calls[0][1]?.headers as Headers
-    expect(headers.get('X-Hermes-Session-Token')).toBe('loopback-secret')
+    expect(headers.get('X-Hermes-Spectator-Token')).toBe('read-only-secret')
   })
 
   it.each([
@@ -58,32 +58,29 @@ describe('browser spectator transport', () => {
     expect(() => assertSpectatorReadRequest(request)).toThrow()
   })
 
-  it('mints a fresh single-use websocket ticket in authenticated mode', async () => {
+  it('uses the scoped spectator websocket credential in authenticated mode', async () => {
     window.__HERMES_AUTH_REQUIRED__ = true
-    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ ticket: 'one-shot' }))
-
-    const connection = await browserSpectatorConnection()
-
-    expect(fetch).toHaveBeenCalledWith('/api/auth/ws-ticket', {
-      credentials: 'include',
-      method: 'POST'
-    })
-    expect(connection.wsUrl).toBe('ws://localhost:3000/api/ws?ticket=one-shot')
-    expect(connection.authMode).toBe('oauth')
-    expect(connection.mode).toBe('remote')
-  })
-
-  it('uses the injected loopback token without placing it in REST storage', async () => {
-    window.__HERMES_SESSION_TOKEN__ = 'ephemeral'
+    window.__HERMES_SPECTATOR_TOKEN__ = 'read-only'
 
     const connection = await browserSpectatorConnection()
 
     expect(fetch).not.toHaveBeenCalled()
-    expect(connection.wsUrl).toBe('ws://localhost:3000/api/ws?token=ephemeral')
+    expect(connection.wsUrl).toBe('ws://localhost:3000/api/ws?spectator=read-only')
+    expect(connection.authMode).toBe('oauth')
+    expect(connection.mode).toBe('remote')
+  })
+
+  it('uses the scoped credential without placing it in connection storage', async () => {
+    window.__HERMES_SPECTATOR_TOKEN__ = 'ephemeral'
+
+    const connection = await browserSpectatorConnection()
+
+    expect(fetch).not.toHaveBeenCalled()
+    expect(connection.wsUrl).toBe('ws://localhost:3000/api/ws?spectator=ephemeral')
     expect(connection.token).toBe('')
   })
 
-  it('fails closed when neither authenticated mode nor a loopback token is available', async () => {
-    await expect(browserSpectatorConnection()).rejects.toThrow('session token is unavailable')
+  it('fails closed when the scoped credential is unavailable', async () => {
+    await expect(browserSpectatorConnection()).rejects.toThrow('Spectator credential is unavailable')
   })
 })
