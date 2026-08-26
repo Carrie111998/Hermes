@@ -29,6 +29,17 @@ def db(tmp_path):
     return SessionDB(db_path=tmp_path / "state.db")
 
 
+def _sessions_columns(db) -> frozenset:
+    """Real column set, read from the schema.
+
+    A hand-maintained list drifts: the first version of it omitted
+    `end_reason` and broke a test that had been passing.
+    """
+    return frozenset(
+        r[1] for r in db._conn.execute("PRAGMA table_info(sessions)").fetchall()
+    )
+
+
 def _insert(db, session_id, *, idle_days, **overrides):
     """Insert an open row that has done real work (the leaking shape)."""
     row = {
@@ -43,10 +54,19 @@ def _insert(db, session_id, *, idle_days, **overrides):
         "pinned": 0,
     }
     row.update(overrides)
-    cols = ", ".join(row)
+    # Column names come from an explicit allow-list rather than straight from
+    # the dict keys. Values were always bound as parameters, but interpolating
+    # caller-supplied **overrides keys into the statement text meant a typo'd
+    # kwarg produced a confusing SQL syntax error instead of a clear one — and
+    # it is a bad shape to copy into a helper that later takes real input.
+    unknown = set(row) - _sessions_columns(db)
+    if unknown:
+        raise ValueError(f"not a sessions column: {sorted(unknown)}")
+    cols = ", ".join(sorted(row))
     placeholders = ", ".join("?" for _ in row)
     db._conn.execute(
-        f"INSERT INTO sessions ({cols}) VALUES ({placeholders})", list(row.values())
+        f"INSERT INTO sessions ({cols}) VALUES ({placeholders})",
+        [row[c] for c in sorted(row)],
     )
     db._conn.commit()
     return session_id

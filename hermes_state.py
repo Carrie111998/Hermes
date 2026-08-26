@@ -6070,6 +6070,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         them ``api_server`` with a NULL key, and Matrix rows idle for 69 days
         under a 120-minute idle policy.
 
+        ``source`` and ``chat_type`` are returned so the caller can resolve the
+        row's effective reset policy (``get_reset_policy(platform,
+        session_type)``) rather than applying a flat age rule — the shipped
+        default is ``mode="none"``, so an age-only sweep would auto-reset
+        sessions on installs that configured nothing.
+
         Deliberately narrower than the in-memory path: it only reports rows
         idle far beyond any sane reset window (see ``_ORPHAN_SWEEP_MIN_IDLE_S``
         in ``gateway/run.py``), and skips ``pinned``/``archived`` rows, which
@@ -6082,7 +6088,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT s.id, s.session_key, s.source,
+                SELECT s.id, s.session_key, s.source, s.chat_type,
                        COALESCE(s.last_activity_at, s.started_at) AS last_active
                   FROM sessions s
                  WHERE s.ended_at IS NULL
