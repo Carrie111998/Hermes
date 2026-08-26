@@ -21,7 +21,10 @@ def proj(tmp_path, monkeypatch):
 
 class TestAutoMultiline:
     def test_newline_regex_matches_across_lines(self, proj):
-        r = json.loads(search_tool(r"def setup\(\):\n    init_db\(\)", path=str(proj), task_id="t-ml"))
+        # ``re:`` opts the pattern out of the default ``re.escape`` so the
+        # user-crafted regex (escaped parens + a newline) reaches rg with
+        # its semantics intact.
+        r = json.loads(search_tool(r"re:def setup\(\):\n    init_db\(\)", path=str(proj), task_id="t-ml"))
         assert "error" not in r
         assert r["total_count"] >= 1
         assert "multiline" in r.get("warning", "")

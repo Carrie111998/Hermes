@@ -853,6 +853,32 @@ def _pattern_has_regex_newline(pattern: str) -> bool:
     return "\n" in pattern or bool(_REGEX_NEWLINE_ESCAPE_RE.search(pattern))
 
 
+# Sentinel that opts a content-search pattern OUT of the default literal
+# escaping. The rest of the codebase (curator.py, approval.py,
+# skill_linter.py, hermes_state_search.py, honcho/oauth.py) uses
+# ``re.escape`` on user-supplied regexes for the same reason; this
+# opt-in keeps the documented "regex" semantics of search_files
+# reachable without making every literal-pattern call remember to escape.
+_PATTERN_REGEX_OPT_IN = "re:"
+
+
+def _safe_search_pattern(pattern: str) -> str:
+    """Return ``pattern`` safe to hand to rg/grep as a regex.
+
+    rg treats the pattern as a regex by default, so a user-provided
+    literal like ``[frx`` or ``host.com?`` parses as an invalid character
+    class / quantifier and crashes the search. Wrap with ``re.escape``
+    so metacharacters match literally — the common case for agent search
+    queries. Callers that genuinely want regex semantics (e.g.
+    ``def\\s+\\w+``, ``TODO|FIXME``) can opt in with the ``re:`` prefix;
+    the sentinel is stripped and the remainder is passed through to rg
+    unescaped.
+    """
+    if pattern.startswith(_PATTERN_REGEX_OPT_IN):
+        return pattern[len(_PATTERN_REGEX_OPT_IN):]
+    return re.escape(pattern)
+
+
 def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     """Return True for rg's hard error when multiline mode is required."""
     if not error:
@@ -2911,9 +2937,14 @@ class ShellFileOperations(FileOperations):
             return shown + (f" (+{extra} more)" if extra > 0 else "")
 
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        # Probe the same regex-escaped pattern the main search uses, so the
+        # probes never crash on a user-supplied metacharacter (defect class
+        # that hit the main rg path) and never silently disagree with what
+        # the main search actually looked for.
+        safe_pattern = _safe_search_pattern(pattern)
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_arg(safe_pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2930,7 +2961,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_arg(safe_pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2944,7 +2975,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+                f"{self._escape_shell_arg(safe_pattern)} {self._escape_native_tool_arg(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -3157,7 +3188,12 @@ class ShellFileOperations(FileOperations):
             cmd_parts.append("-c")  # Count per file
         
         # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # Add pattern and path. Wrap pattern in _safe_search_pattern so a
+        # literal like "[frx" matches the user-typed string instead of
+        # parsing as an unclosed character class. The helper has an "re:"
+        # opt-in for callers that actually want regex semantics (see
+        # _safe_search_pattern's docstring).
+        cmd_parts.append(self._escape_shell_arg(_safe_search_pattern(pattern)))
         # rg is a native Windows binary when installed via winget/cargo/choco:
         # it needs the C:/... path form, not the MSYS /c/... form (which
         # nothing converts back — Hermes sets MSYS_NO_PATHCONV for its bash).
@@ -3300,7 +3336,12 @@ class ShellFileOperations(FileOperations):
         # ``.*`` to exclude the entire search. Anchor relative paths at the
         # shell's live cwd; quoting $PWD separately keeps user paths escaped
         # while working across local, container, and remote backends.
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # Add pattern and path. Wrap pattern in _safe_search_pattern so a
+        # literal like "[frx" matches the user-typed string instead of
+        # parsing as an unclosed character class. The helper has an "re:"
+        # opt-in for callers that actually want regex semantics (see
+        # _safe_search_pattern's docstring).
+        cmd_parts.append(self._escape_shell_arg(_safe_search_pattern(pattern)))
         is_absolute = path.startswith(("/", "\\\\")) or bool(
             re.match(r"^[A-Za-z]:[\\/]", path)
         )

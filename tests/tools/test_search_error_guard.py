@@ -83,7 +83,10 @@ class TestSearchErrorGuard:
     def test_hard_error_is_surfaced(self, method, match_tree):
         # An invalid regex makes rg/grep exit 2 with only diagnostics in
         # stdout. The guard MUST surface it — not return empty matches.
-        res = _search(_ops(match_tree), method, "[", match_tree)
+        # ``re:`` opts the pattern out of the default ``re.escape`` so the
+        # malformed regex reaches rg/grep unchanged and exercises the
+        # error-surfacing path.
+        res = _search(_ops(match_tree), method, "re:[unclosed", match_tree)
         assert res.error is not None, "search error was silently swallowed"
         assert "Search failed" in res.error
         assert not res.matches
@@ -130,3 +133,70 @@ class TestSplitToolDiagnostics:
         assert diagnostics == ""
         assert "--" in payload
         assert "a.py-6-after" in payload
+
+
+class TestSafeSearchPattern:
+    """The default literal escape + ``re:`` opt-in for callers that want
+    real regex semantics. Regression coverage for the unescaped-pattern
+    injection bug — see _safe_search_pattern's docstring."""
+
+    @pytest.fixture
+    def literal_tree(self, tmp_path):
+        """A tree whose files contain literal regex metacharacters."""
+        (tmp_path / "a.txt").write_text("host.com? yes\n")
+        (tmp_path / "b.txt").write_text("c++ is great\n")
+        (tmp_path / "c.txt").write_text("[bracket] literal\n")
+        (tmp_path / "d.txt").write_text("literal [frx here\n")
+        return tmp_path
+
+    def test_literal_metachars_find_matches(self, literal_tree):
+        for pattern, expected_file in [
+            ("host.com?", "a.txt"),
+            ("c++",      "b.txt"),
+            ("[bracket]","c.txt"),
+            ("[frx",     "d.txt"),  # original repro pattern — must not crash
+        ]:
+            res = _ops(literal_tree).search(
+                pattern=pattern, path=str(literal_tree), target="content",
+            )
+            assert res.error is None, f"{pattern!r} errored: {res.error}"
+            assert any(m.path.endswith(expected_file) for m in res.matches), (
+                f"{pattern!r} did not match {expected_file}; "
+                f"got {[m.path for m in res.matches]}"
+            )
+
+    def test_plain_alphanumeric_unchanged(self, literal_tree):
+        # No-metachar pattern: re.escape is a no-op, behavior is identical
+        # to the pre-fix path.
+        res = _ops(literal_tree).search(
+            pattern="bracket", path=str(literal_tree), target="content",
+        )
+        assert res.error is None
+        assert any(m.path.endswith("c.txt") for m in res.matches)
+
+    def test_regex_opt_in_still_works(self, literal_tree):
+        # ``re:`` prefix opts out of literal-mode; real regex semantics land.
+        (literal_tree / "def.txt").write_text("def hello():\n    pass\n")
+        res = _ops(literal_tree).search(
+            pattern=r"re:def\s+\w+", path=str(literal_tree), target="content",
+        )
+        assert res.error is None
+        assert any(m.path.endswith("def.txt") for m in res.matches)
+
+    def test_regex_opt_in_malformed_still_surfaces_error(self, literal_tree):
+        # Opt-in + malformed regex must still surface the parse error.
+        res = _ops(literal_tree).search(
+            pattern="re:[unclosed", path=str(literal_tree), target="content",
+        )
+        assert res.error is not None
+        assert "Search failed" in res.error
+
+    def test_unit_escape_and_opt_in(self):
+        from tools.file_operations import _safe_search_pattern
+        # Plain string: escaped.
+        assert _safe_search_pattern("frx") == "frx"
+        assert _safe_search_pattern("[frx") == r"\[frx"
+        assert _safe_search_pattern("host.com?") == r"host\.com\?"
+        # Opt-in: prefix stripped, body NOT escaped.
+        assert _safe_search_pattern("re:def\\s+\\w+") == "def\\s+\\w+"
+        assert _safe_search_pattern("re:[frx") == "[frx"

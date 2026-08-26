@@ -36,9 +36,24 @@ class TestZeroMatchProbe:
         assert "a.py" in w and "b.py" in w
 
     def test_regex_metachar_literal_hint(self, proj):
+        # A pattern with regex metacharacters now defaults to literal
+        # matching — the main search finds the literal match without
+        # needing the probe-driven hint. The probe still fires for
+        # patterns the user *opted into* as real regex (``re:``) that
+        # have no matches in the file.
         d = proj / "proj"
         (d / "meta.py").write_text("result = lookup[key+1]\n")
         r = json.loads(search_tool("lookup[key+1]", path=str(d), task_id="t-zm"))
+        assert r["total_count"] >= 1
+        assert "meta.py" not in r.get("warning", "")  # no hint needed
+
+    def test_regex_opt_in_metachar_zero_match_gets_literal_hint(self, proj):
+        # When the user opts into real regex (``re:``) and the pattern
+        # has no matches, the probe's literal-match hint still fires —
+        # so the user can see "you wrote regex but the literal exists".
+        d = proj / "proj"
+        (d / "meta.py").write_text("result = lookup[key+1]\n")
+        r = json.loads(search_tool("re:lookup[key+1]", path=str(d), task_id="t-zm"))
         assert r["total_count"] == 0
         assert "literal match" in r.get("warning", "")
         assert "meta.py" in r.get("warning", "")
