@@ -13871,23 +13871,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["_handoff_active_session_key"] = claim_owner[
                             "active_session_key"
                         ]
-                        # AsyncSessionDB offloads the claim to a worker thread,
-                        # so cancelling this watcher does not cancel a SQLite
-                        # UPDATE already in flight. Reconcile the result before
-                        # propagating cancellation: a committed running claim
-                        # must be finalized rather than becoming invisible to
-                        # the pending-only watcher after restart.
+                        # Reconcile the offloaded claim across cancellation:
+                        # a committed running claim must be finalized rather
+                        # than becoming invisible to the pending-only watcher
+                        # after restart.
                         claim_task = asyncio.create_task(
                             self._session_db.claim_webhook_handoff(
                                 session_id, claim_owner_json
                             )
                         )
-                        try:
-                            claimed = await asyncio.shield(claim_task)
-                        except asyncio.CancelledError:
-                            try:
-                                claimed = await claim_task
-                            except Exception as claim_exc:
+                        claimed, claim_exc, was_cancelled = (
+                            await self._await_shielded_offloaded(claim_task)
+                        )
+                        if was_cancelled:
+                            if claim_exc is not None:
                                 # A failed task provides no proof that this
                                 # gateway won the pending-to-running CAS. Another
                                 # gateway may claim the row immediately after
@@ -13899,30 +13896,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "%s: %s",
                                     session_id,
                                     claim_exc,
-                                    exc_info=True,
+                                    exc_info=claim_exc,
                                 )
                                 claimed = False
                             if claimed:
-                                try:
-                                    cleanup_task = asyncio.create_task(
-                                        self._finalize_failed_webhook_handoff(
-                                            row,
-                                            "handoff claim was cancelled",
-                                        )
+                                cleanup_task = asyncio.create_task(
+                                    self._finalize_failed_webhook_handoff(
+                                        row,
+                                        "handoff claim was cancelled",
                                     )
-                                    try:
-                                        await asyncio.shield(cleanup_task)
-                                    except asyncio.CancelledError:
-                                        await cleanup_task
-                                except Exception as cleanup_exc:
+                                )
+                                _, cleanup_exc, _ = (
+                                    await self._await_shielded_offloaded(
+                                        cleanup_task
+                                    )
+                                )
+                                if cleanup_exc is not None:
                                     logger.error(
                                         "Cancelled webhook handoff claim cleanup "
                                         "failed for %s: %s",
                                         session_id,
                                         cleanup_exc,
-                                        exc_info=True,
+                                        exc_info=cleanup_exc,
                                     )
-                            raise
+                            raise asyncio.CancelledError
                     else:
                         # Preserve the established interactive claim behavior.
                         claimed = await self._session_db.claim_handoff(session_id)
@@ -13945,18 +13942,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     row["_handoff_claim_token"],
                                 )
                             )
-                            try:
-                                completed = await asyncio.shield(completion_task)
-                            except asyncio.CancelledError:
-                                try:
-                                    completed = await completion_task
-                                except Exception as completion_exc:
+                            completed, completion_exc, was_cancelled = (
+                                await self._await_shielded_offloaded(
+                                    completion_task
+                                )
+                            )
+                            if was_cancelled:
+                                if completion_exc is not None:
                                     logger.error(
                                         "Cancelled webhook handoff completion "
                                         "failed for %s: %s",
                                         session_id,
                                         completion_exc,
-                                        exc_info=True,
+                                        exc_info=completion_exc,
                                     )
                                     completed = False
                                 if not completed:
@@ -13968,7 +13966,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         and state.get("state") == "completed"
                                     )
                                 completion_published = bool(completed)
-                                raise
+                                raise asyncio.CancelledError
                             completion_published = bool(completed)
                             if not completed:
                                 logger.warning(
@@ -14030,6 +14028,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
+
+    @staticmethod
+    async def _await_shielded_offloaded(
+        task: "asyncio.Task",
+    ) -> tuple[Any, Optional[BaseException], bool]:
+        """Await an offloaded DB task behind a shield, surviving cancellation.
+
+        AsyncSessionDB offloads writes to worker threads, so cancelling the
+        awaiting coroutine never stops a SQLite transaction already in
+        flight. Returns ``(result, exception, cancelled)``: on owner
+        cancellation the task is first awaited to its true terminal outcome
+        so the caller can act on what actually committed, then the caller
+        must re-raise ``asyncio.CancelledError`` itself.
+        """
+        try:
+            return await asyncio.shield(task), None, False
+        except asyncio.CancelledError:
+            try:
+                result = await task
+            except Exception as exc:
+                return None, exc, True
+            return result, None, True
 
     def _new_webhook_handoff_claim_owner(
         self, row: Dict[str, Any]
@@ -14604,28 +14624,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             move_task = asyncio.create_task(_move_session_route())
-            try:
-                switched = await asyncio.shield(move_task)
-            except asyncio.CancelledError:
-                try:
-                    switched = await move_task
-                except Exception as move_exc:
-                    # move_session_route publishes no live state until its
-                    # primary CAS commits and contains no raising operation
-                    # after that commit. A task error therefore leaves the
-                    # source key authoritative for outer cancellation cleanup.
-                    logger.error(
-                        "Cancelled webhook handoff route move failed for %s: %s",
-                        handoff_session_id,
-                        move_exc,
-                        exc_info=True,
-                    )
-                else:
-                    if switched is not None:
-                        row["_handoff_active_session_key"] = session_key
-                raise
-            if switched is not None:
+            switched, move_exc, was_cancelled = (
+                await self._await_shielded_offloaded(move_task)
+            )
+            if move_exc is not None:
+                # move_session_route publishes no live state until its
+                # primary CAS commits and contains no raising operation
+                # after that commit. A task error therefore leaves the
+                # source key authoritative for outer cancellation cleanup.
+                logger.error(
+                    "Cancelled webhook handoff route move failed for %s: %s",
+                    handoff_session_id,
+                    move_exc,
+                    exc_info=move_exc,
+                )
+            elif switched is not None:
                 row["_handoff_active_session_key"] = session_key
+            if was_cancelled:
+                raise asyncio.CancelledError
         else:
             # Interactive handoffs have no gateway source route. Preserve the
             # established behavior: create/reuse the destination entry and
@@ -30564,9 +30580,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # An autonomous webhook handoff timeout is terminal from
                     # the watcher's point of view. Do not let it remove/end the
                     # route while the synchronous worker can still append,
-                    # compress, call tools, or perform external work.
+                    # compress, call tools, or perform external work. The wait
+                    # is bounded: one worker stuck in an uninterruptible call
+                    # must not park the singleton handoff watcher forever and
+                    # starve every later handoff behind it.
                     self._track_session_storage_quiescence()
-                    await _await_executor_quiescence()
+
+                    async def _bounded_quiescence(bound: float) -> bool:
+                        """Quiescence wait that survives owner cancellation.
+
+                        Returns True once the worker exited, False at the
+                        bound. wait_for cancels only the shield wrapper, so
+                        the worker task itself is never cancelled here.
+                        """
+                        deadline = time.monotonic() + bound
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                return _executor_task.done()
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(_executor_task),
+                                    remaining,
+                                )
+                            except asyncio.TimeoutError:
+                                return _executor_task.done()
+                            except asyncio.CancelledError:
+                                if _executor_task.done():
+                                    return True
+                                continue
+                            except Exception:
+                                return True
+                            else:
+                                return True
+
+                    _quiescence_bound = max(600.0, 2.0 * _agent_timeout)
+                    if not await _bounded_quiescence(_quiescence_bound):
+                        logger.error(
+                            "Webhook handoff worker for session %s ignored "
+                            "the hard interrupt for %.0fs; detaching it so "
+                            "the handoff fails visibly instead of freezing "
+                            "the handoff watcher",
+                            session_key,
+                            _quiescence_bound,
+                        )
+                        self._track_session_storage_quiescence(_executor_task)
+                        _executor_task.add_done_callback(
+                            consume_detached_task_result
+                        )
                 else:
                     # Preserve the established gateway-timeout contract for a
                     # genuinely wedged ordinary turn: return its diagnostic
