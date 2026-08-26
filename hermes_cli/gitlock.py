@@ -1,4 +1,4 @@
-"""Stale git lock-file recovery for update/check paths.
+"""Stale git artifact recovery for update/check paths.
 
 A crashed or killed ``git fetch`` on a shallow clone can leave
 ``.git/shallow.lock`` behind. Every later fetch then fails with::
@@ -13,8 +13,9 @@ lock files — they persist until a human removes them.
 
 This module provides two small, defensive helpers used by the update paths:
 
-* :func:`clear_stale_git_locks` — remove abandoned ``.git`` lock files (with
-  an age + git-process guard so a live fetch is never yanked).
+* :func:`clear_stale_git_locks` — remove abandoned ``.git`` lock files.
+* :func:`clear_stale_git_artifacts` — also remove aborted-fetch
+  ``objects/pack/tmp_pack_*`` files before they accumulate without bound.
 * :func:`is_ancestor_of_head` — ask whether a remote tip is already contained
   in HEAD. Used by the shallow-clone update check to avoid reporting a false
   "update available" when local cherry-picks sit on top of the remote tip.
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 # reasonable standard.
 STALE_LOCK_MIN_AGE_SECONDS = 10 * 60
 
+# ``index-pack`` writes incoming objects to ``tmp_pack_*`` before atomically
+# promoting a complete pack. Git normally removes these files, but a killed
+# fetch can strand them indefinitely. Keep a generous age guard for proactive
+# sweeps; callers may use zero immediately after their own fetch has failed.
+STALE_TEMP_PACK_MIN_AGE_SECONDS = 60 * 60
+
 # Lock files we know how to self-heal. ``shallow.lock`` is the one observed in
 # the wild (interrupted fetch on a shallow clone); the others are the same
 # class of failure (interrupted git operation) and harmless to clear when
@@ -56,19 +63,45 @@ def _git_proc_running() -> bool:
         if os.name == "nt":
             out = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
             ).stdout.lower()
             return "git.exe" in out
         out = subprocess.run(
-            ["pgrep", "-x", "git"], capture_output=True, text=True, timeout=10,
+            ["pgrep", "-x", "git"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         return out.returncode == 0
     except Exception:
-        logger.debug("git process probe failed; assuming no git running", exc_info=True)
-        return False
+        logger.debug("git process probe failed; skipping cleanup", exc_info=True)
+        return True
 
 
-def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> List[str]:
+def _clear_stale_git_locks(git_dir: Path, cutoff: float) -> List[str]:
+    """Remove known lock files older than ``cutoff`` without probing processes."""
+    removed: List[str] = []
+    for name in LOCK_NAMES:
+        lock_path = git_dir / name
+        try:
+            if lock_path.is_file() and lock_path.stat().st_mtime < cutoff:
+                lock_path.unlink()
+                removed.append(str(lock_path))
+                logger.info("Removed stale git lock %s", lock_path)
+        except OSError:
+            logger.debug("Could not clear %s (skipping)", lock_path, exc_info=True)
+    return removed
+
+
+def clear_stale_git_locks(
+    repo_root: Path, *, min_age_seconds: Optional[int] = None
+) -> List[str]:
     """Remove abandoned ``.git`` lock files under ``repo_root``.
 
     A lock is removed only when BOTH conditions hold:
@@ -89,17 +122,59 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
         logger.debug("git process running; skipping stale-lock sweep")
         return []
 
-    cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else STALE_LOCK_MIN_AGE_SECONDS)
-    removed: List[str] = []
-    for name in LOCK_NAMES:
-        lock_path = git_dir / name
+    cutoff = time.time() - (
+        min_age_seconds
+        if min_age_seconds is not None
+        else STALE_LOCK_MIN_AGE_SECONDS
+    )
+    return _clear_stale_git_locks(git_dir, cutoff)
+
+
+def clear_stale_git_artifacts(
+    repo_root: Path,
+    *,
+    lock_min_age_seconds: Optional[int] = None,
+    temp_pack_min_age_seconds: Optional[int] = None,
+) -> List[str]:
+    """Remove abandoned locks and fetch temp packs when no git process runs.
+
+    The default keeps young ``tmp_pack_*`` files because they may belong to a
+    fetch that ended only moments before the process probe. A caller handling
+    its own failed or timed-out fetch may pass ``temp_pack_min_age_seconds=0``
+    to remove that just-abandoned output immediately. Only Git's temporary pack
+    naming convention is matched; completed ``pack-*.pack`` files are never
+    touched. The function is best-effort and never raises.
+    """
+    git_dir = Path(repo_root) / ".git"
+    if not git_dir.is_dir():
+        return []
+    if _git_proc_running():
+        logger.debug("git process running; skipping stale-artifact sweep")
+        return []
+
+    lock_cutoff = time.time() - (
+        lock_min_age_seconds
+        if lock_min_age_seconds is not None
+        else STALE_LOCK_MIN_AGE_SECONDS
+    )
+    pack_cutoff = time.time() - (
+        temp_pack_min_age_seconds
+        if temp_pack_min_age_seconds is not None
+        else STALE_TEMP_PACK_MIN_AGE_SECONDS
+    )
+    removed = _clear_stale_git_locks(git_dir, lock_cutoff)
+    pack_dir = git_dir / "objects" / "pack"
+    if not pack_dir.is_dir():
+        return removed
+
+    for pack_path in pack_dir.glob("tmp_pack_*"):
         try:
-            if lock_path.is_file() and lock_path.stat().st_mtime < cutoff:
-                lock_path.unlink()
-                removed.append(str(lock_path))
-                logger.info("Removed stale git lock %s", lock_path)
+            if pack_path.is_file() and pack_path.stat().st_mtime <= pack_cutoff:
+                pack_path.unlink()
+                removed.append(str(pack_path))
+                logger.info("Removed abandoned git fetch pack %s", pack_path)
         except OSError:
-            logger.debug("Could not clear %s (skipping)", lock_path, exc_info=True)
+            logger.debug("Could not clear %s (skipping)", pack_path, exc_info=True)
     return removed
 
 

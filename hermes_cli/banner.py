@@ -133,6 +133,7 @@ def get_available_skills() -> Dict[str, List[str]]:
 
 # Cache update check results for 6 hours to avoid repeated git fetches
 _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
+BANNER_UPDATE_FETCH_TIMEOUT_SECONDS = 10
 
 # Sentinel returned when we know an update exists but can't count commits
 # (e.g. nix-built hermes — no local git history to count against).
@@ -275,6 +276,28 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
+def _run_banner_update_fetch(
+    repo_dir: Path,
+    *,
+    is_shallow: bool,
+    git_cmd: Optional[List[str]] = None,
+) -> subprocess.CompletedProcess:
+    """Run the passive fetch with process-tree-aware timeout recovery."""
+    from hermes_cli.update_cmd import _run_update_check_fetch
+
+    fetch_options = ["--quiet"]
+    if is_shallow:
+        fetch_options[:0] = ["--depth", "1"]
+    return _run_update_check_fetch(
+        git_cmd or ["git"],
+        fetch_options,
+        "origin",
+        "main",
+        repo_dir,
+        timeout_seconds=BANNER_UPDATE_FETCH_TIMEOUT_SECONDS,
+    )
+
+
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     """Count commits behind origin/main in a local checkout."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
@@ -319,14 +342,12 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
-        # Self-heal abandoned git lock files before fetching. A stale
-        # .git/shallow.lock from a crashed fetch makes the fetch fail, the
-        # exception below is swallowed, and stale refs get compared against
-        # HEAD — silently degrading the passive check until a human removes
-        # the lock (git never self-heals these).
-        from hermes_cli.gitlock import clear_stale_git_locks
+        # Self-heal abandoned git artifacts before fetching. Stale locks wedge
+        # later operations, while interrupted index-pack temp files otherwise
+        # accumulate across passive checks.
+        from hermes_cli.gitlock import clear_stale_git_artifacts
 
-        clear_stale_git_locks(repo_dir)
+        clear_stale_git_artifacts(repo_dir)
 
         # Scope the fetch to the one branch the behind-count compares against.
         # An unscoped ``git fetch origin`` transfers every remote head (~1,400
@@ -336,17 +357,12 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
-        if is_shallow:
-            fetch_args += ["--depth", "1"]
-        fetch_args.append("--quiet")
-        subprocess.run(
-            fetch_args,
-            capture_output=True, timeout=10,
-            cwd=str(repo_dir),
-        )
+        _run_banner_update_fetch(repo_dir, is_shallow=is_shallow)
     except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        # Offline or timeout — use stale refs, that's fine.
+        # The bounded fetch helper owns zero-age cleanup because only it knows
+        # whether the entire timed-out process tree is quiescent.
+        pass
 
     if is_shallow:
         # No history to count across the shallow boundary. `origin/main` may not
