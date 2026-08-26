@@ -187,6 +187,7 @@ export const zh: Translations = {
     edits: "代理管理",
     lastUsed: "最近使用",
     input: "输入",
+    cacheRead: "缓存读取",
     output: "输出",
     total: "总计",
     noUsageData: "该时间段暂无使用数据",

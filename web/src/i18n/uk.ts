@@ -189,6 +189,7 @@ export const uk: Translations = {
     edits: "Агент керує",
     lastUsed: "Останнє використання",
     input: "Вхід",
+    cacheRead: "Читання з кешу",
     output: "Вихід",
     total: "Усього",
     noUsageData: "Немає даних про використання за цей період",

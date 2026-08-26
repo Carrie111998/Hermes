@@ -189,6 +189,7 @@ export const zhHant: Translations = {
     edits: "代理管理",
     lastUsed: "最近使用",
     input: "輸入",
+    cacheRead: "快取讀取",
     output: "輸出",
     total: "總計",
     noUsageData: "此時間範圍內無使用資料",

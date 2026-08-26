@@ -189,6 +189,7 @@ export const ru: Translations = {
     edits: "Управляется агентом",
     lastUsed: "Последнее использование",
     input: "Ввод",
+    cacheRead: "Чтение из кэша",
     output: "Вывод",
     total: "Итого",
     noUsageData: "Нет данных об использовании за этот период",

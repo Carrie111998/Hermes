@@ -189,6 +189,7 @@ export const ja: Translations = {
     edits: "エージェント管理",
     lastUsed: "最終使用",
     input: "入力",
+    cacheRead: "キャッシュ読み取り",
     output: "出力",
     total: "合計",
     noUsageData: "この期間の使用データはありません",

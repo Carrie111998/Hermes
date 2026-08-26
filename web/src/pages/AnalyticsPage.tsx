@@ -16,6 +16,7 @@ import type {
   AnalyticsModelEntry,
   AnalyticsSkillEntry,
 } from "@/lib/api";
+import { inputWithCacheWrite, totalProcessedTokens } from "@/lib/analytics";
 import { timeAgo } from "@/lib/utils";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -132,7 +133,7 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
   if (daily.length === 0) return null;
 
   const maxTokens = Math.max(
-    ...daily.map((d) => d.input_tokens + d.output_tokens),
+    ...daily.map((d) => totalProcessedTokens(d)),
     1,
   );
 
@@ -168,9 +169,10 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
           style={{ height: CHART_HEIGHT_PX }}
         >
           {daily.map((d) => {
-            const total = d.input_tokens + d.output_tokens;
+            const total = totalProcessedTokens(d);
+            const inputTokens = inputWithCacheWrite(d);
             const inputH = Math.round(
-              (d.input_tokens / maxTokens) * CHART_HEIGHT_PX,
+              (inputTokens / maxTokens) * CHART_HEIGHT_PX,
             );
             const outputH = Math.round(
               (d.output_tokens / maxTokens) * CHART_HEIGHT_PX,
@@ -185,7 +187,10 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
                   <div className="font-mondwest normal-case bg-card border border-border px-2.5 py-1.5 text-xs text-foreground shadow-lg whitespace-nowrap">
                     <div className="font-medium">{formatDate(d.day)}</div>
                     <div>
-                      {t.analytics.input}: {formatTokens(d.input_tokens)}
+                      {t.analytics.input}: {formatTokens(inputTokens)}
+                    </div>
+                    <div>
+                      {t.analytics.cacheRead}: {formatTokens(d.cache_read_tokens)}
                     </div>
                     <div>
                       {t.analytics.output}: {formatTokens(d.output_tokens)}
@@ -234,7 +239,14 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
 
 function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
   const { t } = useI18n();
-  const { sorted, sortKey, sortDir, toggle } = useTableSort(daily, "day", "desc");
+  // "Input" reports newly-processed input (residual input + cache writes —
+  // see lib/analytics.ts), so sort on the same derived value, plus the raw
+  // cache-read column.
+  const rows = useMemo(
+    () => daily.map((d) => ({ ...d, input_total: inputWithCacheWrite(d) })),
+    [daily],
+  );
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(rows, "day", "desc");
 
   if (daily.length === 0) return null;
 
@@ -255,7 +267,8 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
               <tr className="border-b border-border text-muted-foreground text-xs">
                 <SortHeader label={t.analytics.date} col="day" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
                 <SortHeader label={t.sessions.title} col="sessions" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
-                <SortHeader label={t.analytics.input} col="input_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.input} col="input_total" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.cacheRead} col="cache_read_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
                 <SortHeader label={t.analytics.output} col="output_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
               </tr>
             </thead>
@@ -273,9 +286,12 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
                     </td>
                   <td className="text-right py-2 px-4">
                     <span style={{ color: "var(--series-input-token)" }}>
-                        {formatTokens(d.input_tokens)}
+                        {formatTokens(d.input_total)}
                       </span>
                   </td>
+                  <td className="text-right py-2 px-4 text-muted-foreground">
+                      {formatTokens(d.cache_read_tokens)}
+                    </td>
                   <td className="text-right py-2 pl-4">
                     <span style={{ color: "var(--series-output-token)" }}>
                         {formatTokens(d.output_tokens)}
@@ -546,12 +562,21 @@ export default function AnalyticsPage() {
                     {
                       label: t.analytics.totalTokens,
                       value: formatTokens(
-                        data.totals.total_input + data.totals.total_output,
+                        data.totals.total_input +
+                          data.totals.total_cache_write +
+                          data.totals.total_cache_read +
+                          data.totals.total_output,
                       ),
                     },
                     {
                       label: t.analytics.input,
-                      value: formatTokens(data.totals.total_input),
+                      value: formatTokens(
+                        data.totals.total_input + data.totals.total_cache_write,
+                      ),
+                    },
+                    {
+                      label: t.analytics.cacheRead,
+                      value: formatTokens(data.totals.total_cache_read),
                     },
                     {
                       label: t.analytics.output,

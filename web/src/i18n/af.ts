@@ -189,6 +189,7 @@ export const af: Translations = {
     edits: "Agent Bestuur",
     lastUsed: "Laas Gebruik",
     input: "Inset",
+    cacheRead: "Cache-lees",
     output: "Uitset",
     total: "Totaal",
     noUsageData: "Geen gebruiksdata vir hierdie tydperk nie",
