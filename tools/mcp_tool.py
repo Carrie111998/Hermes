@@ -6366,8 +6366,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
             _bump_server_error(server_name)
             logger.error(
-                "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, exc,
+                "MCP tool %s/%s call failed: %s: %s",
+                server_name, tool_name, type(exc).__name__, _exc_str(exc),
             )
             return tool_error(_sanitize_error(
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
