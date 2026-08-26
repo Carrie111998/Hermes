@@ -5512,9 +5512,11 @@ function botRosterMeta(bot, metaByName) {
   return own
 }
 
-function showsHandle(name, meta, bot) {
-  const display = displayName({ name }, meta)
-  return Boolean(name && display.toLowerCase() !== botHandle(name, bot).toLowerCase())
+function showsHandle(name, _meta, bot) {
+  // A handle is the stable, routable identity; the display title is only
+  // presentation. Always render it so single-word titles ("Ada" / @ada) are
+  // as discoverable and copyable as renamed or multi-word Bots.
+  return Boolean(name && botHandle(name, bot))
 }
 
 // ── canonical bot chat ───────────────────────────────────────────────────────
