@@ -1759,6 +1759,9 @@ def _local_ci_task(
         evidence_heading="Canonical PR audit receipt (JSON)",
         initial_status="running",
         max_retries=3,
+        # Local CI audits are always created dispatchable so the deterministic
+        # repository-owned lane can run even when feedback coding is gated.
+        max_runtime_seconds=900,
     )
 
 
