@@ -4803,7 +4803,7 @@ class GatewaySlashCommandsMixin:
             with open(temp_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
-            adapter = self.get_adapter(source.platform)
+            adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
             if adapter:
                 await adapter.send_document(
                     chat_id=source.chat_id,
