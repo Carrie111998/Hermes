@@ -2452,16 +2452,30 @@ def _command_detection_variants(command: str):
 def _is_verification_artifact_cleanup(command: str) -> bool:
     """Return whether *command* only removes one Hermes ad-hoc temp script."""
     try:
-        argv = shlex.split(command, posix=True)
+        # POSIX-mode shlex treats ``\\`` as an escape, so a native Windows
+        # path was tokenized with every separator eaten (``C:\\Users\\...``
+        # became ``C:Users...``) and the exemption could never match there.
+        # Keep POSIX semantics elsewhere; on Windows retain backslashes and
+        # strip one quote layer manually (#95456).
+        argv = shlex.split(command, posix=os.name != "nt")
     except ValueError:
         return False
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
         return False
 
     operand = argv[2]
+    if len(operand) >= 2 and operand[0] == operand[-1] and operand[0] in "\"'":
+        operand = operand[1:-1]
     temp_dir = os.path.realpath(tempfile.gettempdir())
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    # The verifier's nudge renders the temp dir with native separators, but
+    # the echoed command may spell the same path with either separator, so
+    # canonicalize separators on both sides before the exact-string check.
+    # Deliberately NOT os.path.normpath: it collapses ``..`` and the
+    # obfuscation-shaped traversals must stay non-exempt (#95456).
+    operand_cmp = operand.replace("\\", "/")
+    joined_cmp = os.path.join(temp_dir, basename).replace("\\", "/")
+    if operand_cmp != joined_cmp:
         return False
 
     target = os.path.realpath(operand)

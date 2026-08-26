@@ -123,6 +123,34 @@ class TestDetectDangerousRm:
                 None,
             )
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows backslash tokenization")
+    def test_verification_cleanup_exemption_matches_windows_paths(self):
+        """Native Windows spellings of the cleanup command exempt (#95456).
+
+        POSIX-mode shlex eats backslashes and ``os.path.join`` emits them,
+        so before the fix neither spelling could ever match on Windows.
+        """
+        temp_dir = r"C:\Users\Administrator\AppData\Local\Temp"
+        for command in (
+            f"rm -f {temp_dir}\\hermes-verify-example.py",
+            f'rm -f "{temp_dir}\\hermes-verify-example.py"',
+            "rm -f C:/Users/Administrator/AppData/Local/Temp/hermes-verify-example.py",
+        ):
+            assert detect_dangerous_command(command) == (False, None, None), command
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows backslash tokenization")
+    def test_verification_cleanup_exemption_still_rejects_windows_traversals(self):
+        """The Windows fix must not widen the exemption (#95456)."""
+        temp_dir = r"C:\Users\Administrator\AppData\Local\Temp"
+        for command in (
+            f"rm -rf {temp_dir}\\hermes-verify-example.py",
+            f"rm -f {temp_dir}\\hermes-verify-example.py C:\\other.py",
+            f"rm -f {temp_dir}\\nested\\..\\hermes-verify-example.py",
+            f"rm -f C:\\Windows\\Temp\\hermes-verify-example.py",
+            f"rm -f {temp_dir}\\hermes-verify-*",
+        ):
+            assert detect_dangerous_command(command)[0] is True, command
+
     def test_verification_cleanup_exemption_rejects_broader_deletions(self):
         commands = (
             "rm -rf /tmp/hermes-verify-example.py",
