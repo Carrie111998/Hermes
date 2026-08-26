@@ -1527,14 +1527,27 @@ class WebhookAdapter(BasePlatformAdapter):
         if (
             outcome is ProcessingOutcome.SUCCESS and agent_run_succeeded
         ) or media_only_agent_success:
-            # AsyncSessionDB writes run off-loop and cannot be cancelled once
-            # SQLite has started them. Keep this task alive through a caller
-            # cancellation and reconcile its durable result before Base invokes
-            # this hook a second time with CANCELLED. A persisted pending row
-            # must remain restart-recoverable, never be reaped by that second
-            # callback while its request commit is still in flight.
+            if event.metadata.get(_EVENT_HANDOFF_REQUESTED_KEY) or event.metadata.get(
+                _EVENT_HANDOFF_COMPLETION_ATTEMPTED_KEY
+            ):
+                # on_agent_run_persisted already published this success, or
+                # attempted to and deliberately left durable state for
+                # restart/provider-retry reconciliation. Nothing to add here.
+                return
+            # The runner invokes on_agent_run_persisted before this hook on
+            # every authoritative success, so reaching here without even an
+            # attempted publication is a contract violation. Fail loudly and
+            # finalize visibly rather than leaving a suppressed-delivery
+            # session dangling open.
+            logger.error(
+                "[webhook] Successful handoff run for %s completed without a "
+                "persisted-success publication attempt",
+                event.source.chat_id,
+            )
             await self._await_cancel_resistant(
-                self._request_webhook_handoff(event, str(handoff_to))
+                self._finalize_webhook_handoff(
+                    event, "webhook_handoff_request_failed"
+                )
             )
             return
 
@@ -2478,59 +2491,6 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         ):
             raise RuntimeError("marked session has no durable handoff request")
-
-    async def _request_webhook_handoff(
-        self, event: "MessageEvent", handoff_to: str
-    ) -> None:
-        """Compatibility fallback for runners without the persisted hook."""
-        if event.metadata.get(_EVENT_HANDOFF_REQUESTED_KEY) or event.metadata.get(
-            _EVENT_HANDOFF_COMPLETION_ATTEMPTED_KEY
-        ):
-            return
-
-        session_key: Optional[str] = None
-        session_id: Optional[str] = None
-        try:
-            if handoff_to not in _SUPPORTED_HANDOFF_TARGETS:
-                raise RuntimeError(f"unsupported handoff target '{handoff_to}'")
-            session_key, session_id = await self._resolve_webhook_session(event)
-            input_marker = await self.on_agent_run_started(
-                event,
-                session_key=session_key,
-                session_id=session_id,
-            )
-            if input_marker:
-                await self.on_agent_input_persisted(
-                    event,
-                    session_key=session_key,
-                    session_id=session_id,
-                )
-            await self.on_agent_run_persisted(
-                event,
-                session_key=session_key,
-                session_id=session_id,
-            )
-        except _HandoffRequestOwnershipConflict as exc:
-            event.metadata[_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY] = True
-            logger.error(
-                "[webhook] Handoff ownership conflict for %s: %s",
-                event.source.chat_id,
-                exc,
-            )
-        except Exception as exc:
-            logger.error(
-                "[webhook] Failed to request handoff for %s: %s",
-                event.source.chat_id,
-                exc,
-            )
-            if event.metadata.get(_EVENT_HANDOFF_OWNERSHIP_CONFLICT_KEY):
-                return
-            await self._finalize_webhook_handoff(
-                event,
-                "webhook_handoff_request_failed",
-                session_key=session_key,
-                session_id=session_id,
-            )
 
     async def _finalize_webhook_handoff(
         self,

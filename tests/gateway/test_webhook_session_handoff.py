@@ -2706,3 +2706,42 @@ async def test_legacy_route_does_not_consult_durable_handoff_index():
     await asyncio.sleep(0)
     claim.assert_not_awaited()
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_success_without_persisted_publication_finalizes_loudly():
+    """A success that skipped on_agent_run_persisted is a contract violation.
+
+    The runner publishes every authoritative success through the persisted
+    hook before on_processing_complete fires. With no publication and not
+    even an attempt recorded, the adapter must finalize the session visibly
+    instead of leaving a suppressed-delivery session dangling open.
+    """
+    adapter = _make_adapter({})
+    store, db = _wire_lifecycle_runner(adapter)
+    event, _ = _make_event(adapter)
+    event.agent_run_failed = False
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    store.remove_session_route_and_end.assert_awaited_once_with(
+        "key:webhook:alerts:delivery-1",
+        "session-exact",
+        "webhook_handoff_request_failed",
+    )
+    db.request_handoff_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_success_with_published_request_is_a_no_op():
+    """A success already published by the persisted hook needs no follow-up."""
+    adapter = _make_adapter({})
+    store, db = _wire_lifecycle_runner(adapter)
+    event, _ = _make_event(adapter)
+    event.agent_run_failed = False
+    event.metadata["_webhook_handoff_requested"] = True
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    store.remove_session_route_and_end.assert_not_awaited()
+    db.request_handoff_once.assert_not_awaited()
