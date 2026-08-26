@@ -133,6 +133,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("sakana/fugu-ultra",                      ""),
     # OpenRouter routers
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
+    ("openrouter/free",                        "free"),
     # Free tier
     ("openrouter/elephant-alpha",              "free"),
     ("z-ai/glm-5.2:free",                      "free"),
