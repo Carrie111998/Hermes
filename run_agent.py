@@ -2144,9 +2144,11 @@ class AIAgent:
         (translated to markers, then cleared each flush), not a persisted set.
 
         Note: the marker is stamped on the live/shared conversation dict, which
-        correctly makes re-persistence idempotent across turns. No code path
-        edits a persisted message's content/role in place expecting a re-write
-        (in-place compaction resets the seed and re-diffs by identity).
+        correctly makes re-persistence idempotent across turns. The normal
+        append-only path does not edit persisted messages in place; the one
+        exception is finalizer recovery, which uses the message's propagated
+        ``_row_id`` and ``SessionDB.ensure_assistant_message_content`` to fill
+        an already-persisted empty assistant row without appending a duplicate.
         """
         # Persistence-isolated agents (e.g. the background skill/memory review
         # fork) must NEVER write into the canonical session store. The fork
@@ -2418,8 +2420,10 @@ class AIAgent:
                     )
                     or 300.0,
                 )
-                for _written in _batch_msgs:
+                for _written, _stored in zip(_batch_msgs, _batch_rows):
                     _written[_DB_PERSISTED_MARKER] = True
+                    if "_row_id" in _stored:
+                        _written["_row_id"] = _stored["_row_id"]
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.

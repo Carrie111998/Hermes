@@ -109,6 +109,40 @@ describe('useMessageStream interim text sealing', () => {
     expect(assistants[0].interim).toBeFalsy()
   })
 
+  it('does not hydrate over streamed text when completion text is empty', async () => {
+    const hydrateFromStoredSession = vi.fn(async () => undefined)
+    stream = renderMessageStream(SID, { hydrateFromStoredSession })
+    await start()
+
+    await delta('streamed answer')
+    await complete('')
+
+    expect(assistantText()).toBe('streamed answer')
+    expect(hydrateFromStoredSession).not.toHaveBeenCalled()
+    expect(getState().busy).toBe(false)
+  })
+
+  it('still hydrates a reasoning-only turn when an earlier turn has text', async () => {
+    const hydrateFromStoredSession = vi.fn(async () => undefined)
+    stream = renderMessageStream(SID, { hydrateFromStoredSession })
+
+    await start()
+    await delta('previous answer')
+    await complete('previous answer')
+
+    await start()
+    await act(() =>
+      stream.handleEvent({
+        payload: { text: 'thinking about the new answer' },
+        session_id: SID,
+        type: 'reasoning.delta'
+      })
+    )
+    await complete('')
+
+    expect(hydrateFromStoredSession).toHaveBeenCalledTimes(1)
+  })
+
   it('dedupes interim text when the final response includes it', async () => {
     mountStream()
     await start()

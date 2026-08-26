@@ -32,18 +32,30 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 
 
-def _is_pure_tool_call_tail(msg: dict) -> bool:
-    """An assistant row with ``tool_calls`` but no visible text content of its own.
+def _recover_streamed_final_response(agent, final_response):
+    """Use delivered stream text when the terminal response is empty.
 
-    Such a row satisfies the role check (``tail role == "assistant"``) while
-    carrying none of the delivered answer — see the #43849/#44100 invariant
-    block in :func:`finalize_turn`. Uses :func:`flatten_message_text` so that
-    multimodal (list-type) content is evaluated by its text parts, not just
-    its type.
+    Stream consumers can receive the assistant text before a provider returns
+    its terminal message. If that terminal message is empty, treating it as an
+    authoritative empty answer loses the only copy that was shown to the user.
+    This recovery is deliberately limited to a genuinely empty string: ``None``
+    is reserved for the iteration-limit summary path, and non-empty responses
+    remain authoritative.
     """
-    if not msg.get("tool_calls"):
-        return False
-    return not flatten_message_text(msg.get("content")).strip()
+    if not isinstance(final_response, str) or final_response.strip():
+        return final_response
+
+    streamed = getattr(agent, "_current_streamed_assistant_text", "") or ""
+    if not isinstance(streamed, str) or not streamed.strip():
+        return final_response
+
+    strip_think_blocks = getattr(agent, "_strip_think_blocks", None)
+    try:
+        recovered = strip_think_blocks(streamed) if callable(strip_think_blocks) else streamed
+    except Exception:
+        recovered = streamed
+    recovered = recovered.strip() if isinstance(recovered, str) else ""
+    return recovered or final_response
 
 
 # Verification continuation scaffolding flags: verify-on-stop / pre_verify
@@ -142,6 +154,17 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    if not failed:
+        recovered_response = _recover_streamed_final_response(agent, final_response)
+        if recovered_response != final_response:
+            logger.warning(
+                "Empty terminal response recovered from delivered stream text "
+                "(session=%s, chars=%d)",
+                agent.session_id or "none",
+                len(recovered_response),
+            )
+            final_response = recovered_response
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -351,16 +374,19 @@ def finalize_turn(
                     messages,
                     {"role": "assistant", "content": final_response},
                 )
-            elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
-                # The tail IS an assistant row, but a *pure tool-call turn*:
-                # tool_calls with no text of its own. The role check alone
-                # leaves the #43849/#44100 invariant unmet — the user saw a
-                # response that never reached the transcript, and the next turn
-                # replays the user backlog and re-answers it (the very symptom
-                # this block was added for). Fill that row's empty content
-                # instead of appending, so the durable turn ends with the answer
-                # without disturbing the tool-call structure or creating an
-                # assistant→assistant pair.
+            elif (
+                isinstance(_tail, dict)
+                and _tail.get("content") != final_response
+                and not flatten_message_text(_tail.get("content")).strip()
+            ):
+                # The tail IS an assistant row, but carries no visible text.
+                # The role check alone leaves the #43849/#44100 invariant
+                # unmet — the user saw a response that never reached the
+                # transcript, and the next turn replays the user backlog and
+                # re-answers it (the very symptom this block was added for).
+                # Fill that row's empty content instead of appending, so the
+                # durable turn ends with the answer without disturbing the
+                # tool-call structure or creating an assistant→assistant pair.
                 #
                 # The ``content != final_response`` guard prevents filling when
                 # the tail already carries the final response text (verification
@@ -368,23 +394,49 @@ def finalize_turn(
                 # reused as the terminal response, #65919 §7).
                 _tail["content"] = final_response
                 # The normal assistant builder already stamps this row. Cover
-                # legacy/exceptional pure-tool tails before they become a
-                # delivered final response.
+                # legacy/exceptional empty tails before they become a delivered
+                # final response.
                 stamp_message_timestamp(_tail)
                 # The row may have already been flushed to SQLite by the
                 # incremental tool-call persist (conversation_loop.py:4990),
                 # which stamps ``_DB_PERSISTED_MARKER`` so subsequent flushes
-                # skip it. Pop the marker so the next ``_persist_session``
-                # re-writes the filled content to the durable store —
-                # otherwise ``/resume`` reloads ``content=""`` and the bug
-                # resurfaces cross-session.
-                _tail.pop(_DB_PERSISTED_MARKER, None)
-                # The bounded flush-scan cursor (run_agent.py) skips the
-                # identity-matched prefix of its previous snapshot on the
-                # assumption that no live dict loses the marker in place —
-                # this pop is the one place that does. Invalidate it so the
-                # filled row is re-examined instead of skipped.
-                agent._db_flush_scan_prefix = None
+                # skip it. Update that row in place when its identity is
+                # available; appending it again would leave the empty row in
+                # state.db and create a duplicate assistant response.
+                _row_id = _tail.get("_row_id")
+                _session_db = getattr(agent, "_session_db", None)
+                _ensure_content = getattr(
+                    _session_db, "ensure_assistant_message_content", None
+                )
+                _canonical_content = None
+                if (
+                    isinstance(_row_id, int)
+                    and not isinstance(_row_id, bool)
+                    and callable(_ensure_content)
+                ):
+                    _canonical_content = _ensure_content(
+                        agent.session_id, _row_id, final_response
+                    )
+
+                if isinstance(_canonical_content, str) and _canonical_content.strip():
+                    # A concurrent writer may have won the conditional update;
+                    # adopt its content so the returned result and live history
+                    # agree with the durable row.
+                    _tail["content"] = _canonical_content
+                    final_response = _canonical_content
+                    # The conditional DB update either filled this row or
+                    # observed another writer fill it. Keep the marker so the
+                    # append-only flush cannot create a second assistant row.
+                    _tail[_DB_PERSISTED_MARKER] = True
+                else:
+                    # No durable row exists for this tail (or the running
+                    # object uses an older DB implementation). Let the normal
+                    # append path persist the newly-filled message.
+                    _tail.pop(_DB_PERSISTED_MARKER, None)
+                    # The bounded flush-scan cursor skips the identity-matched
+                    # prefix of its previous snapshot. Invalidate it because
+                    # this tail's persistence disposition changed in place.
+                    agent._db_flush_scan_prefix = None
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
