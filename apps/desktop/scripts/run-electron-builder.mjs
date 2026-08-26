@@ -50,7 +50,10 @@ if (dist && fs.existsSync(distBinary(dist))) {
     const architectures = classifyMachOArchitectures(distBinary(dist))
     const archFlag = electronBuilderArchFlag(architectures)
     if (!archFlag) {
-      console.error("[run-electron-builder] cannot determine the local Electron architecture")
+      console.error(
+        "[run-electron-builder] cannot determine the local Electron architecture; " +
+          "pass an explicit --x64, --arm64 or --universal flag to skip detection"
+      )
       process.exit(1)
     }
     args.push(archFlag)
