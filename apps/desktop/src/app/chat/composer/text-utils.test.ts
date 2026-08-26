@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { blobDedupeKey, detectTrigger, extractClipboardFiles, extractClipboardImageBlobs } from './text-utils'
+import { blobDedupeKey, detectTrigger, extractClipboardFiles, extractClipboardImageBlobs, mobileComposerKeepsEnterAsNewline } from './text-utils'
 
 describe('detectTrigger', () => {
   it('detects a bare slash trigger with an empty query', () => {
@@ -167,6 +167,14 @@ describe('detectTrigger', () => {
 
   it('still anchors at-mention triggers strictly at the token edge', () => {
     expect(detectTrigger('@file:path with space')).toBeNull()
+  })
+})
+
+describe('mobileComposerKeepsEnterAsNewline', () => {
+  it('reserves every Enter-key variant for writing on mobile while preserving Desktop submit behavior', () => {
+    expect(mobileComposerKeepsEnterAsNewline(true, 'Enter')).toBe(true)
+    expect(mobileComposerKeepsEnterAsNewline(true, 'a')).toBe(false)
+    expect(mobileComposerKeepsEnterAsNewline(false, 'Enter')).toBe(false)
   })
 })
 

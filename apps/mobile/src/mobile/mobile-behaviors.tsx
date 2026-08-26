@@ -6,7 +6,7 @@ import { useLocation, useNavigate } from 'react-router'
 
 import { COMMAND_CENTER_ROUTE, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '@/app/routes'
 import { hudTargetSessionId } from '@/app/hud/handoff'
-import { requestComposerAttachFiles, requestComposerInsert } from '@/app/chat/composer/focus'
+import { requestComposerAttachFiles, requestComposerFocus, requestComposerInsert } from '@/app/chat/composer/focus'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { allPaneIds } from '@/components/pane-shell/tree/model'
 import { $hiddenTreePanes, $layoutTree } from '@/components/pane-shell/tree/store'
@@ -19,6 +19,7 @@ import { openCommandPalette } from '@/store/command-palette'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { toggleHud } from '@/store/hud'
 import { $previewTabs, closeRightRailTab, newBrowserTab, openPreview } from '@/store/preview'
+import { $nativeNotifyPrefs, resumeNativeNotifications, silenceNativeNotificationsFor } from '@/store/native-notifications'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
   $fileBrowserOpen,
@@ -45,6 +46,7 @@ import {
   shouldDismissDrawerAfterSessionChange,
   shouldRevealPaneForDrawerChange,
 } from './mobile-policy'
+import { consumePendingMobileQuickAction, listenForMobileQuickActions } from '~bridge/mobile-quick-actions'
 import { consumePendingInboundShare, listenForInboundShare } from '~bridge/inbound-share'
 
 /**
@@ -100,6 +102,8 @@ export function MobileBehaviors() {
     [hiddenPanes, panes, tree],
   )
   const hapticsMuted = useStore($hapticsMuted)
+  const nativeNotifyPrefs = useStore($nativeNotifyPrefs)
+  const notificationsSilenced = nativeNotifyPrefs.silencedUntil > Date.now()
   const leftTitlebarTools = useTitlebarToolContributions('left')
   const rightTitlebarTools = useTitlebarToolContributions('right')
   const appActions = useMemo<MobileToolbarAction[]>(
@@ -124,6 +128,15 @@ export function MobileBehaviors() {
         label: hapticsMuted ? t.titlebar.unmuteHaptics : t.titlebar.muteHaptics,
         onSelect: toggleHapticsMuted,
       },
+      {
+        group: 'system',
+        id: 'silent-notifications',
+        label: notificationsSilenced ? 'Resume notifications' : 'Pause notifications for 1 hour',
+        onSelect: () => {
+          if (notificationsSilenced) resumeNativeNotifications()
+          else silenceNativeNotificationsFor(60 * 60 * 1000)
+        },
+      },
       { group: 'view', id: 'flip-panes', label: t.titlebar.swapSidebarSides, onSelect: togglePanesFlipped },
       {
         group: 'system',
@@ -133,7 +146,7 @@ export function MobileBehaviors() {
       },
       { group: 'system', id: 'settings', label: t.titlebar.openSettings, onSelect: () => navigate(SETTINGS_ROUTE) },
     ],
-    [hapticsMuted, navigate, previewTabs.length, t],
+    [hapticsMuted, navigate, notificationsSilenced, previewTabs.length, t],
   )
   const runContributedToolbarTool = useCallback(
     (tool: MobileToolbarContextAction) => {
@@ -186,6 +199,34 @@ export function MobileBehaviors() {
 
     previewTabsRef.current = previewTabs
   }, [previewTabs])
+
+  // Widget/notification entry point: New task opens a visible fresh composer.
+  // It never sends text or starts recording; the user remains in control of
+  // what reaches the remote agent and when the Send button is pressed.
+  useEffect(() => {
+    let disposed = false
+    let stopListening: () => void = () => undefined
+
+    const handleAction = () => {
+      navigate(NEW_CHAT_ROUTE)
+      requestComposerFocus('main')
+    }
+
+    void consumePendingMobileQuickAction().then(action => {
+      if (!disposed && action === 'newTask') handleAction()
+    })
+    void listenForMobileQuickActions(action => {
+      if (!disposed && action === 'newTask') handleAction()
+    }).then(stop => {
+      if (disposed) stop()
+      else stopListening = stop
+    })
+
+    return () => {
+      disposed = true
+      stopListening()
+    }
+  }, [navigate])
 
   // A share is an explicit Android user action. Keep its text in the draft and
   // stage its files as ordinary composer attachments; never auto-send content

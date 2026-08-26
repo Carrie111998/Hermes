@@ -9,9 +9,11 @@ import {
   invokePluginNotifyActivate,
   NATIVE_NOTIFICATION_KINDS,
   respondToApprovalAction,
+  resumeNativeNotifications,
   sendTestNativeNotification,
   setNativeNotifyEnabled,
-  setNativeNotifyKind
+  setNativeNotifyKind,
+  silenceNativeNotificationsFor
 } from './native-notifications'
 import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from './notify-baseline'
 import { $approvalRequest, setApprovalRequest } from './prompts'
@@ -41,6 +43,7 @@ beforeEach(() => {
   notify.mockClear()
   desktopWindow.hermesDesktop = { notify } as unknown as Window['hermesDesktop']
   setNativeNotifyEnabled(true)
+  resumeNativeNotifications()
 
   for (const kind of NATIVE_NOTIFICATION_KINDS) {
     setNativeNotifyKind(kind, true)
@@ -135,6 +138,20 @@ describe('dispatchNativeNotification preferences', () => {
     expect(notify).not.toHaveBeenCalled()
 
     dispatchNativeNotification({ kind: 'turnError', sessionId, title: 'boom' })
+    expect(notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('temporarily silences every kind without discarding the saved per-kind choices', () => {
+    const sessionId = freshSession()
+    setActiveSessionId(sessionId)
+    silenceNativeNotificationsFor(60_000)
+
+    dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done' })
+    dispatchNativeNotification({ kind: 'approval', sessionId, title: 'approve' })
+    expect(notify).not.toHaveBeenCalled()
+
+    resumeNativeNotifications()
+    dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done' })
     expect(notify).toHaveBeenCalledTimes(1)
   })
 

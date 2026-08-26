@@ -74,7 +74,7 @@ import { useComposerScope } from './scope'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
 import { SuggestionPills } from './suggestion-pills'
-import { extractClipboardFiles, extractClipboardImageBlobs, openDirectiveScope } from './text-utils'
+import { extractClipboardFiles, extractClipboardImageBlobs, mobileComposerKeepsEnterAsNewline, openDirectiveScope } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
 import { isRedoShortcut, isUndoShortcut } from './undo-history'
@@ -217,6 +217,7 @@ export function ChatBar({
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
   const inputDisabled = disabled && !reconnecting
+  const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
   // selectors); typing never re-renders the chrome. ChatBar owns `queueEditRef`
@@ -848,6 +849,13 @@ export function ChatBar({
       return
     }
 
+    // On phones, Enter always remains a writing key. The explicit Send control
+    // is the only message-submit affordance, avoiding accidental sends from a
+    // soft keyboard, a hardware keyboard, or a multiline paste follow-up.
+    if (mobileComposerKeepsEnterAsNewline(mobileRenderer, event.key)) {
+      return
+    }
+
     // Cmd/Ctrl+Enter queues a follow-up while a turn runs. Plain Enter steers
     // a text-only draft, so both live-turn actions stay reachable by keyboard.
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
@@ -1242,6 +1250,11 @@ export function ChatBar({
               e.preventDefault()
 
               if (composingRef.current) {
+                return
+              }
+
+              const submitter = (e.nativeEvent as SubmitEvent).submitter as HTMLElement | null
+              if (mobileRenderer && !submitter?.hasAttribute('data-composer-send')) {
                 return
               }
 
