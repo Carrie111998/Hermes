@@ -134,7 +134,11 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
     } catch (error) {
       if (isSessionNotFoundError(error)) {
         markSessionRpcBlocked(request.sessionId)
+
+        return
       }
+
+      throw error
     }
   }
 }
