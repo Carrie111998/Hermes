@@ -7470,6 +7470,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         # immediately when the queue is idle.
                         try:
                             if hasattr(agent, "shutdown_memory_provider"):
+                                # Teardown is deliberately inline on the
+                                # request thread, so flush_pending's bounded
+                                # wait plus shutdown_all()'s drain land in
+                                # this call's tail latency.  Timed at debug
+                                # level so that cost is measurable rather
+                                # than assumed: against a slow memory backend
+                                # this is the difference between a few
+                                # milliseconds and the full 5s budget, and
+                                # under request bursts it serializes teardown
+                                # behind new arrivals.  If the numbers show
+                                # it hurting, the answer is a bounded shared
+                                # teardown worker or a flush budget derived
+                                # from the remaining request deadline — not a
+                                # detached thread per request, which would
+                                # reintroduce the unbounded-thread growth
+                                # this block exists to remove.
+                                _teardown_started = time.perf_counter()
                                 _mm = getattr(agent, "_memory_manager", None)
                                 if _mm is not None and hasattr(_mm, "flush_pending"):
                                     try:
@@ -7477,6 +7494,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                     except Exception:
                                         pass
                                 agent.shutdown_memory_provider()
+                                logger.debug(
+                                    "api_server memory-provider teardown took %.3fs",
+                                    time.perf_counter() - _teardown_started,
+                                )
                         except Exception:
                             logger.debug(
                                 "api_server memory-provider teardown failed",
