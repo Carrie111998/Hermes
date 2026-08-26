@@ -379,7 +379,11 @@ def clarify_tool(
         # Empty questions array → fall through to the single-question path.
 
     if not question or not question.strip():
-        return tool_error("Question text is required.")
+        return tool_error(
+            "No question provided. Pass questions=[{question: '...', "
+            "choices?: [...], multi_select?: bool}, ...] — a single question "
+            "is a one-entry array."
+        )
 
     question = question.strip()
 
@@ -437,59 +441,35 @@ def check_clarify_requirements() -> bool:
 CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
-        "Ask the user a question when you need a decision, clarification, or "
-        "feedback before proceeding. Three modes: single-select (up to "
-        f"{MAX_CHOICES} choices — put your recommended option FIRST, the UI "
-        "marks it '(Recommended)' and auto-appends an 'Other' free-text row), "
-        "multi-select (multi_select=true, checkboxes), open-ended (omit "
-        "choices). Need several independent answers? Pass them ALL in the "
-        "`questions` array in one call — one form beats a chain of clarify "
-        "calls. Options "
-        "go ONLY in `choices`, never enumerated inside the question text (the "
-        "UI renders choices as pickable rows; options written into the "
-        "question are dead prose the user can't click). Prefer deciding "
+        "Ask the user one or more questions when you need a decision, "
+        "clarification, or feedback before proceeding. Pass every question "
+        f"in `questions` (1-{MAX_QUESTIONS} entries) — a single question is a "
+        "one-entry array, and several INDEPENDENT questions belong in ONE "
+        "call (one form beats a chain of clarify calls; if one answer would "
+        "change another question, ask separately). Per question: "
+        f"single-select (up to {MAX_CHOICES} choices — put your recommended "
+        "option FIRST, the UI marks it '(Recommended)' and auto-appends an "
+        "'Other' free-text row), multi-select (multi_select=true), or "
+        "open-ended (omit choices). Options go ONLY in `choices`, never "
+        "enumerated inside the question text (choices render as pickable "
+        "rows; options written into the question are dead prose the user "
+        "can't click). Result: {responses: [...]} in question order (plus "
+        "timed_out=true if the user stopped part-way). Prefer deciding "
         "low-stakes questions yourself; don't use this for dangerous-command "
         "confirmation (the terminal tool handles that)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "question": {
-                "type": "string",
-                "description": (
-                    "The question itself, and ONLY the question — options go "
-                    "in `choices`, not here."
-                ),
-            },
-            "choices": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": MAX_CHOICES,
-                "description": (
-                    "The selectable options, one per element, recommended "
-                    "option FIRST (do not write '(Recommended)' yourself). "
-                    "Omit only for a genuinely open-ended question."
-                ),
-            },
-            "multi_select": {
-                "type": "boolean",
-                "description": (
-                    "True = user can pick multiple choices (user_response "
-                    "becomes a list). Default false = single-select."
-                ),
-            },
             "questions": {
                 "type": "array",
+                "minItems": 1,
                 "maxItems": MAX_QUESTIONS,
                 "description": (
-                    f"Batch mode: 2-{MAX_QUESTIONS} INDEPENDENT questions "
-                    "answered on one form (each with its own choices/"
-                    "multi_select; optional `id` echoed in the matching "
-                    "response). Overrides the top-level question/choices — put "
-                    "a short batch title in `question`. Result: {responses: "
-                    "[...]}, plus timed_out=true if the user stopped part-way. "
-                    "If one answer would change another question, ask "
-                    "separately instead."
+                    "The question(s). Each: question text (options excluded), "
+                    "optional choices (recommended first; omit for free-text), "
+                    "optional multi_select, optional `id` echoed in the "
+                    "matching response."
                 ),
                 "items": {
                     "type": "object",
@@ -506,8 +486,13 @@ CLARIFY_SCHEMA = {
                     "required": ["question"],
                 },
             },
+            # NOTE: the handler also accepts the legacy single-question shape
+            # (`question` + `choices` + `multi_select` at top level) for old
+            # transcripts and external callers, and a top-level `question`
+            # alongside `questions` is used as the batch form's title.
+            # Deliberately unadvertised: one documented way to call.
         },
-        "required": ["question"],
+        "required": ["questions"],
     },
 }
 
