@@ -750,3 +750,23 @@ def test_wrapper_ownership_accepts_shim_via_symlinked_home(tmp_path, monkeypatch
         resolve_fn=lambda: sys.argv[0] if sys.argv[0] else None,
         checkout_root=lexical_checkout,
     ) == str(shim)
+
+
+def test_needs_interpreter_case_insensitive_match(tmp_path, monkeypatch):
+    """Interpreter paths with uppercase must not flag own venv scripts.
+
+    The shebang is lowercased for comparison; the interpreter dir must
+    be too (conda env names, usernames, uv's ephemeral .tmpXXX dirs all
+    carry uppercase - an asymmetric compare would prefix the venv's own
+    console script spuriously).
+    """
+    venv_bin = tmp_path / "MyEnv" / "bin"
+    venv_bin.mkdir(parents=True)
+    interpreter = venv_bin / "python"
+    interpreter.write_text("", encoding="utf-8")
+
+    console_script = venv_bin / "hermes"
+    console_script.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
+    monkeypatch.setattr(lde.sys, "executable", str(interpreter))
+
+    assert lde._needs_interpreter(console_script) is False

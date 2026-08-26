@@ -452,8 +452,12 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # Compare the LEXICAL interpreter directory (abspath, not resolve()):
     # on uv venvs the resolved parent is the base interpreter's dir, which
     # makes a perfectly valid ``.venv/bin/python`` shebang look foreign
-    # (#94443 review case 1).
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    # (#94443 review case 1). Both sides casefolded: the shebang is already
+    # lowercased above, and interpreter paths legitimately contain uppercase
+    # (conda env names, usernames, uv's ephemeral build dirs) — an
+    # asymmetric compare would flag the venv's own console script as
+    # foreign and prefix it spuriously.
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable)).lower()
     return exe_dir not in shebang
 
 
