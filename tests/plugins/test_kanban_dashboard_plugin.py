@@ -141,6 +141,30 @@ def test_running_card_clock_uses_current_attempt_start_after_reclaim(client):
     assert task["started_at"] == run.started_at
 
 
+def test_task_drawer_clock_agrees_with_card_after_reclaim(client):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Retry drawer work", "assignee": "worker"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, created["id"])
+        run = kb.latest_run(conn, created["id"])
+        assert run is not None
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (run.started_at - 3600, created["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{created['id']}").json()["task"]
+
+    # Drawer must report the active attempt's start, same as the card.
+    assert detail["started_at"] == run.started_at
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
@@ -1253,4 +1277,5 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
+
 
