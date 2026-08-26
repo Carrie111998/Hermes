@@ -2748,19 +2748,6 @@ def _fetch_codex_oauth_context_lengths_with_source(
     return result, True
 
 
-def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
-    """Probe the ChatGPT Codex /models endpoint for per-slug context windows.
-
-    Codex OAuth imposes its own context limits that differ from the direct
-    OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex). The
-    `context_window` field in each model entry is the authoritative source.
-
-    Returns a ``{slug: context_window}`` dict. Empty on failure.
-    """
-    result, _fresh = _fetch_codex_oauth_context_lengths_with_source(access_token)
-    return result
-
-
 def _resolve_codex_oauth_context_length_with_source(
     model: str, access_token: str = ""
 ) -> Tuple[Optional[int], str]:
@@ -3711,17 +3698,6 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
         else:
             shadow[k] = v
     return shadow
-
-
-def _estimate_message_chars(msg: Dict[str, Any]) -> int:
-    """Char count for token estimation, excluding base64 image data.
-
-    Base64 images are counted via `_count_image_tokens` instead; including
-    their raw chars here would massively overestimate token usage.
-    """
-    if not isinstance(msg, dict):
-        return len(str(msg))
-    return len(str(_wire_message_shadow(msg)))
 
 
 def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:

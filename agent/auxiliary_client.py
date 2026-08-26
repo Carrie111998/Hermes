@@ -5932,26 +5932,6 @@ def _try_main_fallback_chain(
         )
     return None, None, ""
 
-
-def _resolve_single_provider(
-    provider: str,
-    model: Optional[str] = None,
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> Optional[Any]:
-    """Resolve a single provider entry from fallback_chain to an OpenAI client.
-
-    Uses the existing provider resolution infrastructure where possible.
-    """
-    # Reuse resolve_provider_client which handles provider→client mapping.
-    client, resolved_model = resolve_provider_client(
-        provider=provider,
-        model=model,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-    )
-    return client
-
 def _resolve_auto_route(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
@@ -9043,19 +9023,6 @@ def _client_streams_internally(client: Any) -> bool:
         AnthropicAuxiliaryClient,
         BedrockAuxiliaryClient,
     ))
-
-
-def _is_streaming_rejected_error(exc: Exception) -> bool:
-    """Provider explicitly refused a streamed chat.completions request."""
-    err = str(exc).lower()
-    if "stream_options" in err:
-        return True
-    return "stream" in err and (
-        "not supported" in err
-        or "unsupported" in err
-        or "not allowed" in err
-        or "disabled" in err
-    )
 
 
 def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:

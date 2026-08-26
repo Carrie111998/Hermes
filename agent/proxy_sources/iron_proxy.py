@@ -2376,13 +2376,6 @@ def get_status() -> ProxyStatus:
     return status
 
 
-def _read_tunnel_port_from_config() -> Optional[int]:
-    listen = _read_http_listen_from_config()
-    if listen is None:
-        return None
-    return listen[1]
-
-
 def _read_http_listen_from_config() -> Optional[Tuple[str, int]]:
     """Return ``(host, port)`` of the configured sandbox-facing listener.
 
