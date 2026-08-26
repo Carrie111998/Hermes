@@ -801,8 +801,11 @@ export function useVoiceConversation({
 
   // Unmount-only: `handle` is recreated by the recorder hook on every render,
   // so depending on it would tear down the active turn during normal updates.
-  useEffect(
-    () => () => {
+  // eslint-disable-next-line no-restricted-syntax -- imperative mount lifetime, not mirrored reactive state
+  useEffect(() => {
+    mountedRef.current = true
+
+    return () => {
       mountedRef.current = false
       lifetimeRef.current += 1
       pendingStartRef.current = false
@@ -810,9 +813,8 @@ export function useVoiceConversation({
       stopVoicePlayback()
       handle.cancel()
       dropSpeechSession()
-    },
-    [] // eslint-disable-line react-hooks/exhaustive-deps
-  )
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   return { end, level, muted, start, status, stopTurn, toggleMute }
 }

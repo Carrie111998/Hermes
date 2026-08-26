@@ -39,6 +39,40 @@ describe('useMicRecorder acquisition ownership', () => {
     vi.restoreAllMocks()
   })
 
+  it('acquires and starts recording after StrictMode effect replay', async () => {
+    const starts = vi.fn()
+    const constructors = vi.fn()
+
+    class MediaRecorderMock {
+      static isTypeSupported() {
+        return false
+      }
+
+      mimeType = ''
+      ondataavailable = null
+      onerror = null
+      onstop = null
+      start = starts
+
+      constructor() {
+        constructors()
+      }
+    }
+
+    Object.defineProperty(globalThis, 'MediaRecorder', { configurable: true, value: MediaRecorderMock })
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [] })) }
+    })
+    const hook = renderHook(() => useMicRecorder(copy), { reactStrictMode: true })
+
+    await act(async () => hook.result.current.handle.start())
+
+    expect(constructors).toHaveBeenCalledTimes(1)
+    expect(starts).toHaveBeenCalledTimes(1)
+    expect(hook.result.current.recording).toBe(true)
+  })
+
   it('stops every late getUserMedia track after cancel', async () => {
     const acquisition = deferred<MediaStream>()
     const stop = vi.fn()

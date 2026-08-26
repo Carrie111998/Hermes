@@ -151,6 +151,26 @@ describe('useVoiceConversation full-duplex barge-in', () => {
 
   afterEach(cleanup)
 
+  it('enters listening after StrictMode effect replay', async () => {
+    const hook = renderHook(
+      () =>
+        useVoiceConversation({
+          busy: false,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit: vi.fn(),
+          onTranscribeAudio: vi.fn(async () => 'hello'),
+          pendingResponse: () => null
+        }),
+      { reactStrictMode: true }
+    )
+
+    await act(async () => hook.result.current.start())
+
+    await waitFor(() => expect(hook.result.current.status).toBe('listening'))
+    expect(micHandle.start).toHaveBeenCalledTimes(1)
+  })
+
   it('arms the barge monitor during generation (before any reply audio exists)', async () => {
     const { hook } = renderConversation()
 

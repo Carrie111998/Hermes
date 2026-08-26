@@ -102,14 +102,16 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     silenceTriggeredRef.current = false
   }
 
-  useEffect(
-    () => () => {
+  // eslint-disable-next-line no-restricted-syntax -- imperative mount lifetime, not mirrored reactive state
+  useEffect(() => {
+    mountedRef.current = true
+
+    return () => {
       mountedRef.current = false
       startSequenceRef.current += 1
       cleanup()
-    },
-    []
-  )
+    }
+  }, [])
 
   const startMeter = (stream: MediaStream, options: MicRecorderOptions) => {
     const audioWindow = window as Window & { webkitAudioContext?: BrowserAudioContext }
