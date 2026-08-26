@@ -571,6 +571,11 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
+    # Resolve this once before backend-aware input persistence. The same task
+    # id selects the environment here and scopes all later file operations.
+    effective_task_id = task_id or str(uuid.uuid4())
+    agent._current_task_id = effective_task_id
+
     # Oversized-paste offload (ingestion chokepoint). This is the single point
     # every non-interactive input path (piped stdin, ``-p``, gateway, HTTP API)
     # funnels through before the turn's user message is built. When a user
@@ -586,7 +591,10 @@ def build_turn_context(
 
         user_message, persist_user_message, _spilled = (
             maybe_offload_oversized_message(
-                agent, user_message, persist_user_message
+                agent,
+                user_message,
+                persist_user_message,
+                task_id=effective_task_id,
             )
         )
         if _spilled is not None:
@@ -605,9 +613,6 @@ def build_turn_context(
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
-    # Generate unique task_id if not provided to isolate VMs between tasks.
-    effective_task_id = task_id or str(uuid.uuid4())
-    agent._current_task_id = effective_task_id
     turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
     if not turn_id:
         turn_id = (

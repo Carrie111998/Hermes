@@ -421,6 +421,9 @@ _CACHE_DIRS: list[tuple[str, str]] = [
     # read spilled results at the translated path instead of needing a
     # separate in-sandbox copy.
     ("cache/spillover", "cache/spillover"),
+    # Whole oversized user inputs keep their established profile-local path
+    # while remaining readable through remote file tools.
+    ("pastes", "pastes"),
     # Desktop/clipboard/PDF uploads land in the flat top-level ``images/`` dir
     # (tui_gateway attach RPCs), not under ``cache/``. Mount it so vision can
     # reach uploads inside sandbox containers (#69575). No legacy alias exists,

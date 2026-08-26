@@ -82,6 +82,9 @@ class _FakeAgent:
         self._last_ctx_overflow_warn = None
         self._interrupt_requested = False
         self._memory_write_origin = "assistant_tool"
+        self._oversized_input_enabled = False
+        self._oversized_input_char_threshold = 50_000
+        self._current_task_id = ""
         self._stream_context_scrubber = None
         self._stream_think_scrubber = None
         # Attributes the prologue assigns; recorded for assertions.
@@ -208,6 +211,26 @@ def test_returns_turn_context_with_user_message_appended():
     assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_oversized_offload_receives_effective_task_id(monkeypatch):
+    agent = _FakeAgent()
+    agent._oversized_input_enabled = True
+    agent._oversized_input_char_threshold = 1
+    captured = {}
+
+    def _capture(_agent, message, persisted, *, task_id):
+        captured["task_id"] = task_id
+        return message, persisted, None
+
+    monkeypatch.setattr(
+        "agent.oversized_paste.maybe_offload_oversized_message", _capture
+    )
+    ctx = _build(agent, user_message="large", task_id="effective-task-42")
+
+    assert captured["task_id"] == "effective-task-42"
+    assert ctx.effective_task_id == "effective-task-42"
+    assert agent._current_task_id == "effective-task-42"
 
 
 def test_user_message_preserves_platform_event_timestamp():

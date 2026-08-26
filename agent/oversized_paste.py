@@ -1,76 +1,30 @@
-"""Offload an oversized pasted user message to ONE retrievable file.
+"""Offload an oversized pasted user message to one retrievable file.
 
-The daily pain this fixes: when a user pastes a large blob into the chat,
-downstream context handling elides the middle into a lossy
-``[... N chars ...]`` marker that the agent has **no way to retrieve**.
-The model then complains that the content "came broken" with references it
-cannot open.
-
-The fix intercepts the paste at ingestion, the single point where every
-non-interactive input path (piped stdin, ``-p``, the gateway, and the HTTP
-API) turns raw user text into the current turn's user message, BEFORE any
-lossy elision can happen.  The ENTIRE paste is written to one stable file
-under ``$HERMES_HOME/pastes/`` and the message is replaced with a single
-RESOLVABLE reference: an absolute path the ``read_file`` tool can open, plus
-an explicit instruction telling the model how to retrieve the full content.
-
-Nothing is elided.  The reference round-trips to the complete original bytes.
-
-The interactive TUI already collapses bracketed pastes to a file reference
-(see ``cli.py`` ``handle_paste``); this module closes the same gap for every
-other ingestion path so the behaviour is uniform.
+The full input is persisted before downstream context handling can elide it.
+The replacement message contains the backend-visible path that the task's file
+operations can read.
 """
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Detection default: a paste at or above this many characters is offloaded.
-# Chosen to clear ordinary prose/code messages comfortably while catching the
-# "dumped a whole log / minified JSON / giant file" case that produces the
-# broken ``[...]`` references.  Overridable via config
-# ``oversized_input.char_threshold``.
 DEFAULT_CHAR_THRESHOLD = 50_000
 
 
-def _paste_dir() -> Path:
-    """Resolve ``$HERMES_HOME/pastes`` as a real, absolute directory.
-
-    Uses :func:`hermes_constants.get_hermes_home` (the single source of truth
-    that honours the ``HERMES_HOME`` env var / active profile), never the
-    display-only ``~/.hermes`` string, so the reference the model receives is a
-    genuinely openable absolute path.
-    """
-    from hermes_constants import get_hermes_home
-
-    return get_hermes_home() / "pastes"
+def _stable_paste_filename(content: str) -> str:
+    """Return a content-addressed filename for an input paste."""
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"paste_{digest}.txt"
 
 
-def _stable_paste_path(content: str) -> Path:
-    """Return a stable, unique file path for this paste.
-
-    The name embeds a content hash so re-pasting the identical blob reuses one
-    file (no directory bloat) and a timestamp so distinct pastes never collide.
-    """
-    digest = hashlib.sha256(
-        content.encode("utf-8", "surrogatepass")
-    ).hexdigest()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return _paste_dir() / f"paste_{stamp}_{digest[:12]}.txt"
-
-
-def _build_reference(path: Path, content: str) -> str:
-    """Build the single resolvable reference that replaces the paste.
-
-    The text is explicit about (a) what happened, (b) the absolute path, and
-    (c) exactly how to retrieve the full, unabridged content, so a model that
-    needs the body knows precisely how to open it.
-    """
+def _build_reference(path: str, content: str) -> str:
+    """Build the single resolvable reference that replaces the paste."""
     n_chars = len(content)
     n_lines = content.count("\n") + 1
     return (
@@ -78,57 +32,67 @@ def _build_reference(path: Path, content: str) -> str:
         f"readable ({n_chars:,} characters, {n_lines:,} lines). This is the "
         f"COMPLETE, unabridged paste, nothing was elided or truncated.\n"
         f"Full content file (absolute path): {path}\n"
-        f"To read it, call the read_file tool with "
-        f"path=\"{path}\". read_file paginates via offset/limit, so use those "
-        f"to page through it if it is very large. Prefer search_files over "
-        f"read_file if you only need to find a specific section.]"
+        f"To read it, call the read_file tool with path=\"{path}\". "
+        f"read_file paginates via offset/limit, so use those to page through "
+        f"it if it is very large. Prefer search_files over read_file if you "
+        f"only need to find a specific section.]"
     )
 
 
 def _threshold(agent: Any) -> int:
-    """Effective character threshold for this agent (config-overridable)."""
+    """Return the effective character threshold for this agent."""
     raw = getattr(agent, "_oversized_input_char_threshold", None)
     if raw is None:
         return DEFAULT_CHAR_THRESHOLD
     try:
-        val = int(raw)
+        return int(raw)
     except (TypeError, ValueError):
         return DEFAULT_CHAR_THRESHOLD
-    # A threshold of 0 or below disables offloading (documented opt-out).
-    return val
 
 
 def _enabled(agent: Any) -> bool:
-    """Whether ingestion offloading is enabled for this agent."""
+    """Return whether ingestion offloading is enabled for this agent."""
     return bool(getattr(agent, "_oversized_input_enabled", True))
 
 
 def should_offload(agent: Any, content: Any) -> bool:
-    """True when ``content`` is a plain string large enough to offload."""
-    if not _enabled(agent):
-        return False
-    if not isinstance(content, str) or not content:
+    """Return whether plain string content is large enough to offload."""
+    if not _enabled(agent) or not isinstance(content, str) or not content:
         return False
     threshold = _threshold(agent)
-    if threshold <= 0:
-        return False
-    return len(content) >= threshold
+    return threshold > 0 and len(content) >= threshold
 
 
-def write_paste_file(content: str) -> Optional[Path]:
-    """Persist the ENTIRE paste to one file and return its absolute path.
-
-    Returns ``None`` (fail-soft) if the write fails, so the caller falls
-    through to the unchanged, pre-existing behaviour.
-    """
+def _resolve_active_environment(task_id: str):
+    """Return or lazily create the environment selected by the task id."""
     try:
-        path = _stable_paste_path(content)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Idempotent: an identical prior paste already wrote these exact bytes.
-        if not path.exists():
-            path.write_text(content, encoding="utf-8", errors="surrogatepass")
-        return path.resolve()
-    except Exception as exc:  # pragma: no cover, disk edge
+        from tools.terminal_tool import ensure_task_env, get_active_env
+
+        return get_active_env(task_id) or ensure_task_env(task_id)
+    except Exception as exc:
+        logger.debug("oversized-paste environment resolution failed: %s", exc)
+        return None
+
+
+def write_paste_file(content: str, task_id: str = "default") -> Optional[str | Path]:
+    """Persist the full input and return its backend-visible path."""
+    try:
+        from tools.tool_result_storage import persist_backend_visible_content
+
+        env = _resolve_active_environment(task_id)
+        path = persist_backend_visible_content(
+            content,
+            _stable_paste_filename(content),
+            env=env,
+            host_subdir="pastes",
+            encoding_errors="strict",
+        )
+        if path is None:
+            return None
+        if env is None:
+            return Path(path)
+        return path
+    except Exception as exc:
         logger.warning("oversized-paste offload write failed: %s", exc)
         return None
 
@@ -137,34 +101,27 @@ def maybe_offload_oversized_message(
     agent: Any,
     user_message: Any,
     persist_user_message: Any = None,
-) -> Tuple[Any, Any, Optional[Path]]:
-    """Offload an oversized string user message to one retrievable file.
-
-    Returns ``(user_message, persist_user_message, path)``.  When the message
-    is offloaded, both the API-facing and persisted content become the single
-    resolvable reference (so a reload does not re-inflate and re-trigger), and
-    ``path`` is the absolute paste file.  When nothing is offloaded the inputs
-    are returned unchanged with ``path=None``.
-    """
+    *,
+    task_id: str = "default",
+) -> Tuple[Any, Any, Optional[str | Path]]:
+    """Replace oversized input with one task-readable file reference."""
     if not should_offload(agent, user_message):
         return user_message, persist_user_message, None
 
-    path = write_paste_file(user_message)
+    if "task_id" in inspect.signature(write_paste_file).parameters:
+        path = write_paste_file(user_message, task_id=task_id)
+    else:
+        # Preserve compatibility with one-argument wrappers of the original
+        # local-only helper.
+        path = write_paste_file(user_message)
     if path is None:
         return user_message, persist_user_message, None
 
-    reference = _build_reference(path, user_message)
+    reference = _build_reference(str(path), user_message)
     logger.info(
         "Offloaded oversized paste (%d chars) to %s",
         len(user_message),
         path,
     )
-    # Persisted content also becomes the reference: the file IS the durable
-    # home of the full bytes, and re-hydrating the raw blob on reload would
-    # just re-trigger this path.
-    new_persist = (
-        reference
-        if isinstance(persist_user_message, str)
-        else persist_user_message
-    )
+    new_persist = reference if isinstance(persist_user_message, str) else persist_user_message
     return reference, new_persist, path

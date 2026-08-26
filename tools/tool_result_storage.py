@@ -142,24 +142,38 @@ def _is_host_side_env(env) -> bool:
         return False
 
 
-def _write_to_spillover(content: str, filename: str):
-    """Write content host-side to $HERMES_HOME/cache/spillover.
+def _write_to_host_cache(
+    content: str,
+    filename: str,
+    *,
+    host_subdir: str = SPILLOVER_SUBDIR,
+    encoding_errors: str = "replace",
+):
+    """Write content under the active profile's Hermes home.
 
     Returns the absolute path string on success, None on failure.
     """
     try:
-        spill_dir = get_spillover_dir()
-        spill_dir.mkdir(parents=True, exist_ok=True)
-        path = spill_dir / filename
-        path.write_text(content, encoding="utf-8", errors="replace")
+        from hermes_constants import get_hermes_home
+
+        storage_dir = get_hermes_home() / host_subdir
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        path = storage_dir / filename
+        path.write_text(content, encoding="utf-8", errors=encoding_errors)
     except OSError as exc:
-        logger.warning("Spillover write failed for %s: %s", filename, exc)
+        logger.warning("Backend-visible write failed for %s: %s", filename, exc)
         return None
-    _prune_spillover_once()
+    if host_subdir == SPILLOVER_SUBDIR:
+        _prune_spillover_once()
     return str(path)
 
 
-def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
+def _write_to_spillover(content: str, filename: str):
+    """Write content host-side to $HERMES_HOME/cache/spillover."""
+    return _write_to_host_cache(content, filename)
+
+
+def _sandbox_visible_host_path(host_path: str, env) -> str | None:
     """Return the path where a remote backend can read *host_path*, or None.
 
     ``cache/spillover`` is one of the auto-mounted/synced cache dirs
@@ -265,6 +279,48 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     return result.get("returncode", 1) == 0
 
 
+def persist_backend_visible_content(
+    content: str,
+    filename: str,
+    *,
+    env=None,
+    host_subdir: str = SPILLOVER_SUBDIR,
+    encoding_errors: str = "replace",
+) -> str | None:
+    """Persist text and return the path visible to the active backend.
+
+    Local sessions receive the profile-safe host path. Remote sessions first
+    use the mounted or synced translation of that path, then fall back to the
+    backend's temporary directory when translation is unavailable or unreadable.
+    """
+    if host_subdir == SPILLOVER_SUBDIR and encoding_errors == "replace":
+        host_path = _write_to_spillover(content, filename)
+    else:
+        host_path = _write_to_host_cache(
+            content,
+            filename,
+            host_subdir=host_subdir,
+            encoding_errors=encoding_errors,
+        )
+    if _is_host_side_env(env):
+        return host_path
+    if env is None:
+        return None
+
+    if host_path is not None:
+        visible = _sandbox_visible_host_path(host_path, env)
+        if visible is not None:
+            return visible
+
+    remote_path = f"{_resolve_storage_dir(env)}/{filename}"
+    try:
+        if _write_to_sandbox(content, remote_path, env):
+            return remote_path
+    except Exception as exc:
+        logger.warning("Sandbox write failed for %s: %s", filename, exc)
+    return None
+
+
 def _build_persisted_message(
     preview: str,
     has_more: bool,
@@ -347,43 +403,13 @@ def maybe_persist_tool_result(
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
-    # Always persist host-side first: $HERMES_HOME/cache/spillover is the
-    # single canonical home for spilled results (with the other Hermes-owned
-    # caches, pruned by gateway housekeeping) regardless of backend.
-    host_path = _write_to_spillover(content, filename)
-
-    if _is_host_side_env(env):
-        if host_path is not None:
-            logger.info(
-                "Persisted large tool result: %s (%s, %d chars -> %s)",
-                tool_name, tool_use_id, len(content), host_path,
-            )
-            return _build_persisted_message(preview, has_more, len(content), host_path)
-    elif env is not None:
-        # Remote backend: the spillover dir is auto-mounted (docker) or
-        # file-synced (modal/ssh/daytona) into the sandbox, so reference the
-        # translated path when the sandbox can actually read it.
-        if host_path is not None:
-            visible = _sandbox_visible_spillover_path(host_path, env)
-            if visible is not None:
-                logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
-                    tool_name, tool_use_id, len(content), visible, host_path,
-                )
-                return _build_persisted_message(preview, has_more, len(content), visible)
-        # Fallback: write into the sandbox temp dir (pre-existing containers
-        # without the spillover mount, translation/probe failures).
-        storage_dir = _resolve_storage_dir(env)
-        remote_path = f"{storage_dir}/{filename}"
-        try:
-            if _write_to_sandbox(content, remote_path, env):
-                logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s)",
-                    tool_name, tool_use_id, len(content), remote_path,
-                )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
-        except Exception as exc:
-            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+    file_path = persist_backend_visible_content(content, filename, env=env)
+    if file_path is not None:
+        logger.info(
+            "Persisted large tool result: %s (%s, %d chars -> %s)",
+            tool_name, tool_use_id, len(content), file_path,
+        )
+        return _build_persisted_message(preview, has_more, len(content), file_path)
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
