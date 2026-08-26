@@ -503,6 +503,18 @@ class TestFormatCompatibility:
             # declaring the raw bytes with a mislabeled media_type.
             assert mime not in _UNIVERSALLY_SUPPORTED_MIMES
 
+    def test_ftyp_scan_does_not_read_past_declared_box(self):
+        from agent.image_routing import _sniff_mime_from_bytes
+
+        raw = (16).to_bytes(4, "big") + b"ftypisom" + b"\x00\x00\x00\x00" + b"heicxxxx"
+        assert _sniff_mime_from_bytes(raw) is None
+
+    def test_mif1_plus_avif_sniffs_as_avif_not_heic(self):
+        from agent.image_routing import _sniff_mime_from_bytes
+
+        raw = (24).to_bytes(4, "big") + b"ftypmif1" + b"\x00\x00\x00\x00" + b"avif"
+        assert _sniff_mime_from_bytes(raw) == "image/avif"
+
     def test_svg_sniffed_correctly(self):
         from agent.image_routing import _sniff_mime_from_bytes
         assert _sniff_mime_from_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>') == "image/svg+xml"

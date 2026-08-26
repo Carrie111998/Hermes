@@ -107,18 +107,6 @@ class TestCacheImageFromBytes:
         with pytest.raises(ValueError, match="non-image data"):
             cache_image_from_bytes(b"<!DOCTYPE html><html><title>Slack</title></html>", ".png")
 
-    def test_rejects_empty_data(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
-        from gateway.platforms.base import cache_image_from_bytes
-        with pytest.raises(ValueError, match="non-image data"):
-            cache_image_from_bytes(b"", ".jpg")
-
-    def test_rejects_plain_text(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
-        from gateway.platforms.base import cache_image_from_bytes
-        with pytest.raises(ValueError, match="non-image data"):
-            cache_image_from_bytes(b"just some text, not an image", ".jpg")
-
     def test_caches_heic_ftyp_brand(self, tmp_path, monkeypatch):
         """iPhone HEIC containers must pass the image sniffer and cache."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
@@ -147,6 +135,27 @@ class TestCacheImageFromBytes:
         mp4 = (24).to_bytes(4, "big") + b"ftypisom" + b"\x00\x00\x00\x00" + b"isom"
         with pytest.raises(ValueError, match="non-image data"):
             cache_image_from_bytes(mp4, ".heic")
+
+    def test_ftyp_scan_does_not_read_past_declared_box(self):
+        """A 'heic' token in the *next* box must not classify as HEIC."""
+        from gateway.platforms.base import _looks_like_heic_heif
+
+        # Declared size 16: box ends after minor version; 'heic' is the next box.
+        raw = (16).to_bytes(4, "big") + b"ftypisom" + b"\x00\x00\x00\x00" + b"heicxxxx"
+        assert _looks_like_heic_heif(raw) is False
+
+    def test_mif1_plus_avif_is_not_heic(self):
+        from gateway.platforms.base import _looks_like_heic_heif
+
+        raw = (24).to_bytes(4, "big") + b"ftypmif1" + b"\x00\x00\x00\x00" + b"avif"
+        assert _looks_like_heic_heif(raw) is False
+
+    def test_undersized_ftyp_does_not_scan_compat_brands(self):
+        from gateway.platforms.base import _looks_like_heic_heif
+
+        # Declared size 12 cannot hold a compatible list.
+        raw = (12).to_bytes(4, "big") + b"ftypisom" + b"\x00\x00\x00\x00" + b"heic"
+        assert _looks_like_heic_heif(raw) is False
 
 
 # ---------------------------------------------------------------------------

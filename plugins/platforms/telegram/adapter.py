@@ -258,13 +258,6 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".heic": "image/heic",
     ".heif": "image/heif",
 }
-_TELEGRAM_HEIC_EXTENSIONS = {".heic", ".heif"}
-_TELEGRAM_HEIC_MIMES = {
-    "image/heic",
-    "image/heif",
-    "image/heic-sequence",
-    "image/heif-sequence",
-}
 
 def _coerce_duration_seconds(value: Any) -> Optional[int]:
     """Round a raw length to whole positive seconds, or None if unusable."""
@@ -10070,53 +10063,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
                     file_obj = await doc.get_file()
                     image_bytes = await file_obj.download_as_bytearray()
-                    raw_image = bytes(image_bytes)
                     image_ext = (
                         ext
                         if ext in _TELEGRAM_IMAGE_EXTENSIONS
                         else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                     )
                     try:
-                        cached_path = cache_image_from_bytes(raw_image, ext=image_ext)
+                        cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
                     except ValueError as e:
-                        # HEIC/HEIF from iOS often arrives as a Telegram document.
-                        # Pillow stock decode and older sniffers may still reject
-                        # the payload; preserve the original bytes so the agent
-                        # (and any HEIF-capable tools) can still process the photo
-                        # instead of dropping it as "could not be read".
-                        from gateway.platforms.base import _looks_like_heic_heif
-
-                        is_heic = (
-                            ext in _TELEGRAM_HEIC_EXTENSIONS
-                            or doc_mime in _TELEGRAM_HEIC_MIMES
-                            or _looks_like_heic_heif(raw_image)
-                        )
-                        if is_heic:
-                            cached_path = cache_document_from_bytes(
-                                raw_image,
-                                original_filename or f"photo{image_ext or '.heic'}",
-                            )
-                            event.message_type = MessageType.PHOTO
-                            event.media_urls = [cached_path]
-                            event.media_types = [
-                                doc_mime
-                                if doc_mime in _TELEGRAM_HEIC_MIMES
-                                else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/heic")
-                            ]
-                            logger.info(
-                                "[Telegram] Cached HEIC/HEIF image-document at %s "
-                                "(raw fallback after image-cache rejection: %s)",
-                                cached_path,
-                                _redact_telegram_error_text(e),
-                            )
-                            media_group_id = getattr(msg, "media_group_id", None)
-                            if media_group_id:
-                                await self._queue_media_group_event(str(media_group_id), event)
-                            else:
-                                batch_key = self._photo_batch_key(event, msg)
-                                self._enqueue_photo_event(batch_key, event)
-                            return
-
                         logger.warning(
                             "[Telegram] Failed to cache image document: %s",
                             _redact_telegram_error_text(e),

@@ -623,6 +623,39 @@ def decide_image_input_mode(
 # The shrink-on-reject path loses 1 API call + maybe 1s of Pillow work when
 # it fires, which is cheaper than permanent quality loss.
 
+_AVIF_FTYP_BRANDS = frozenset({b"avif", b"avis", b"av01"})
+_HEIF_FTYP_BRANDS = frozenset(
+    {
+        b"heic",
+        b"heix",
+        b"hevc",
+        b"hevx",
+        b"heim",
+        b"heis",
+        b"hevm",
+        b"hevs",
+        b"heif",
+        b"mif1",
+        b"msf1",
+    }
+)
+
+
+def _isobmff_ftyp_brands(raw: bytes) -> tuple[bytes, ...]:
+    """Return major + compatible brands from a ``ftyp`` box, or empty.
+
+    Compatible brands are scanned only inside the declared box size.
+    """
+    if len(raw) < 12 or raw[4:8] != b"ftyp":
+        return ()
+    brands = [raw[8:12]]
+    declared = int.from_bytes(raw[:4], "big")
+    if declared >= 16:
+        end = min(len(raw), declared)
+        for i in range(16, end - 3, 4):
+            brands.append(raw[i : i + 4])
+    return tuple(brands)
+
 
 def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     """Detect image MIME from magic bytes. Returns None if unrecognised.
@@ -652,25 +685,14 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     if raw.startswith(b"BM"):
         return "image/bmp"
     # ISO-BMFF family (HEIC/HEIF/AVIF): bytes 4..8 == 'ftyp', major brand at 8..12.
-    # HEIC/HEIF brands must stay aligned with gateway.platforms.base
-    # ``_HEIC_HEIF_FTYP_BRANDS`` so Telegram/document caches that accept HEIF
-    # still enter the non-universal transcode path (not JPEG fallback).
+    # Brand set stays aligned with gateway.platforms.base. Scan only inside
+    # the declared ftyp box; AVIF brands win when both families appear.
     if len(raw) >= 12 and raw[4:8] == b"ftyp":
-        brand = raw[8:12]
-        if brand in {b"avif", b"avis"}:
+        brands = set(_isobmff_ftyp_brands(raw))
+        if brands & _AVIF_FTYP_BRANDS:
             return "image/avif"
-        heif_brands = {
-            b"heic", b"heix", b"hevc", b"hevx",
-            b"heim", b"heis", b"hevm", b"hevs",
-            b"heif", b"mif1", b"msf1",
-        }
-        if brand in heif_brands:
+        if brands & _HEIF_FTYP_BRANDS:
             return "image/heic"
-        # Compatible brands start at offset 16 (same scan window as base.py).
-        end = min(len(raw), 64)
-        for i in range(16, end - 3, 4):
-            if raw[i : i + 4] in heif_brands:
-                return "image/heic"
     # TIFF: II*\0 (little-endian) or MM\0* (big-endian)
     if raw[:4] in {b"II*\x00", b"MM\x00*"}:
         return "image/tiff"

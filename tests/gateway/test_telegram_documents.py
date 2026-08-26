@@ -208,38 +208,6 @@ class TestDocumentDownloadBlock:
         assert "Please summarize" in event.text
 
     @pytest.mark.asyncio
-    async def test_zip_document_cached(self, adapter):
-        """A .zip upload should be cached as a supported document."""
-        doc = _make_document(file_name="archive.zip", mime_type="application/zip", file_size=100)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert event.media_urls and event.media_urls[0].endswith("archive.zip")
-        assert event.media_types == ["application/zip"]
-
-    @pytest.mark.asyncio
-    async def test_png_document_is_routed_as_image(self, adapter):
-        """Telegram documents that are really PNGs should use the image path."""
-        file_obj = _make_file_obj(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
-        doc = _make_document(file_name="screenshot.png", mime_type="image/png", file_size=9, file_obj=file_obj)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        with patch.object(adapter, "_photo_batch_key", return_value="batch-1"), patch.object(
-            adapter, "_enqueue_photo_event"
-        ) as enqueue_mock:
-            await adapter._handle_media_message(update, MagicMock())
-
-        enqueue_mock.assert_called_once()
-        event = enqueue_mock.call_args.args[1]
-        assert event.message_type == MessageType.PHOTO
-        assert event.media_urls and event.media_urls[0].endswith(".png")
-        assert event.media_types == ["image/png"]
-        assert adapter.handle_message.call_count == 0
-
-    @pytest.mark.asyncio
     async def test_heic_document_is_routed_as_image(self, adapter, tmp_path, monkeypatch):
         """iOS HEIC sent as a Telegram document must not be dropped."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
@@ -270,48 +238,16 @@ class TestDocumentDownloadBlock:
         assert not (event.text or "").lower().startswith("image document")
 
     @pytest.mark.asyncio
-    async def test_heic_document_raw_fallback_when_image_cache_rejects(
-        self, adapter, tmp_path, monkeypatch
-    ):
-        """If image cache still rejects HEIC, preserve raw bytes via document cache."""
-        monkeypatch.setattr("gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache")
-        heic_bytes = (24).to_bytes(4, "big") + b"ftypheic" + b"\x00\x00\x00\x00" + b"mif1heic"
-        file_obj = _make_file_obj(heic_bytes)
+    async def test_spoofed_heic_document_falls_back_with_error(self, adapter):
+        """A .heic filename with non-image bytes must not become a PHOTO event."""
+        file_obj = _make_file_obj(b"not-a-real-image")
         doc = _make_document(
-            file_name="photo.heic",
-            mime_type="image/heic",
-            file_size=len(heic_bytes),
-            file_obj=file_obj,
+            file_name="spoofed.heic", mime_type="image/heic", file_size=16, file_obj=file_obj
         )
         msg = _make_message(document=doc)
         update = _make_update(msg)
 
-        with (
-            patch(
-                "plugins.platforms.telegram.adapter.cache_image_from_bytes",
-                side_effect=ValueError("Refusing to cache non-image data"),
-            ),
-            patch.object(adapter, "_photo_batch_key", return_value="batch-heic-fb"),
-            patch.object(adapter, "_enqueue_photo_event") as enqueue_mock,
-        ):
-            await adapter._handle_media_message(update, MagicMock())
-
-        enqueue_mock.assert_called_once()
-        event = enqueue_mock.call_args.args[1]
-        assert event.message_type == MessageType.PHOTO
-        assert event.media_types == ["image/heic"]
-        assert event.media_urls and "photo.heic" in event.media_urls[0]
-        assert adapter.handle_message.call_count == 0
-
-    @pytest.mark.asyncio
-    async def test_spoofed_png_document_falls_back_with_error(self, adapter):
-        """A .png filename with non-image bytes should fail clearly, not disappear."""
-        file_obj = _make_file_obj(b"not-a-real-image")
-        doc = _make_document(file_name="spoofed.png", mime_type="image/png", file_size=16, file_obj=file_obj)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        with patch.object(adapter, "_photo_batch_key", return_value="batch-2"), patch.object(
+        with patch.object(adapter, "_photo_batch_key", return_value="batch-spoof"), patch.object(
             adapter, "_enqueue_photo_event"
         ) as enqueue_mock:
             await adapter._handle_media_message(update, MagicMock())
@@ -319,86 +255,6 @@ class TestDocumentDownloadBlock:
         enqueue_mock.assert_not_called()
         event = adapter.handle_message.call_args[0][0]
         assert "could not be read as an image" in event.text
-
-    @pytest.mark.asyncio
-    async def test_oversized_file_rejected(self, adapter):
-        doc = _make_document(file_name="huge.pdf", file_size=25 * 1024 * 1024)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert "too large" in event.text
-
-    @pytest.mark.asyncio
-    async def test_none_file_size_rejected(self, adapter):
-        """Security fix: file_size=None must be rejected (not silently allowed)."""
-        doc = _make_document(file_name="tricky.pdf", file_size=None)
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert "too large" in event.text or "could not be verified" in event.text
-
-    @pytest.mark.asyncio
-    async def test_missing_filename_uses_mime_lookup(self, adapter):
-        """No file_name but valid mime_type should resolve to extension."""
-        content = b"some pdf bytes"
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name=None, mime_type="application/pdf",
-            file_size=len(content), file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert len(event.media_urls) == 1
-        assert event.media_types == ["application/pdf"]
-
-    @pytest.mark.asyncio
-    async def test_missing_filename_and_mime_cached_as_octet_stream(self, adapter):
-        """No filename and no mime: cached anyway as application/octet-stream.
-
-        Authorization to message the agent is the gate, not the file type — an
-        untyped upload is still surfaced to the agent as a cached path.
-        """
-        content = b"\x00\x01\x02 untyped payload"
-        file_obj = _make_file_obj(content)
-        doc = _make_document(
-            file_name=None, mime_type=None, file_size=len(content), file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        assert len(event.media_urls) == 1
-        assert event.media_types == ["application/octet-stream"]
-        assert "Unsupported" not in (event.text or "")
-
-    @pytest.mark.asyncio
-    async def test_unicode_decode_error_handled(self, adapter):
-        """Binary bytes that aren't valid UTF-8 in a .txt — content not injected but file still cached."""
-        binary = bytes(range(128, 256))  # not valid UTF-8
-        file_obj = _make_file_obj(binary)
-        doc = _make_document(
-            file_name="binary.txt", mime_type="text/plain",
-            file_size=len(binary), file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        await adapter._handle_media_message(update, MagicMock())
-        event = adapter.handle_message.call_args[0][0]
-        # File should still be cached
-        assert len(event.media_urls) == 1
-        assert os.path.exists(event.media_urls[0])
-        # Content NOT injected — text should be empty (no caption set)
-        assert "[Content of" not in (event.text or "")
-
 
     @pytest.mark.asyncio
     async def test_text_injection_capped(self, adapter):

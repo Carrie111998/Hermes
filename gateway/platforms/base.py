@@ -851,21 +851,36 @@ _HEIC_HEIF_FTYP_BRANDS = frozenset(
         b"msf1",  # HEIF image sequence
     }
 )
+_AVIF_FTYP_BRANDS = frozenset({b"avif", b"avis", b"av01"})
+
+
+def _isobmff_ftyp_brands(data: bytes) -> tuple[bytes, ...]:
+    """Return major + compatible brands from a ``ftyp`` box, or empty.
+
+    Compatible brands are scanned only inside the declared box size.
+    A size below 16 means "no compatible list" — never fall back to a
+    fixed 64-byte window (that reads the *next* box).
+    """
+    if len(data) < 12 or data[4:8] != b"ftyp":
+        return ()
+    brands = [data[8:12]]
+    declared = int.from_bytes(data[:4], "big")
+    if declared >= 16:
+        end = min(len(data), declared)
+        for i in range(16, end - 3, 4):
+            brands.append(data[i : i + 4])
+    return tuple(brands)
 
 
 def _looks_like_heic_heif(data: bytes) -> bool:
     """Return True if *data* looks like a HEIC/HEIF ISO-BMFF container."""
-    if len(data) < 12 or data[4:8] != b"ftyp":
+    brands = set(_isobmff_ftyp_brands(data))
+    if not brands:
         return False
-    # Major brand
-    if data[8:12] in _HEIC_HEIF_FTYP_BRANDS:
-        return True
-    # Compatible brands start at offset 16; scan a short window only.
-    end = min(len(data), 64)
-    for i in range(16, end - 3, 4):
-        if data[i : i + 4] in _HEIC_HEIF_FTYP_BRANDS:
-            return True
-    return False
+    # AVIF shares the ISO-BMFF container; do not treat it as HEIC.
+    if brands & _AVIF_FTYP_BRANDS:
+        return False
+    return bool(brands & _HEIC_HEIF_FTYP_BRANDS)
 
 
 def _looks_like_image(data: bytes) -> bool:
