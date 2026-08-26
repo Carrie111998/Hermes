@@ -197,11 +197,19 @@ class TestFederationConfigSync:
             "config_hash": original_hash,
             "config": "model: different\n",
         }
-        s.handle_config_sync(msg)
+        import asyncio
+        asyncio.get_event_loop().run_until_complete(s.handle_config_sync(msg))
 
-        # Config should not be applied (same hash)
+        # Same hash → skip: neither the hash nor the config file changes,
+        # and no ack is sent. Regression: the coroutine was previously
+        # never awaited, so this test passed vacuously without ever
+        # exercising the same-hash skip path (pytest emitted
+        # RuntimeWarning: coroutine ... was never awaited).
+        assert s._local_config_hash == original_hash
         config_content = s.config_path.read_text()
         assert "gpt-4" in config_content  # Original content preserved
+        assert "different" not in config_content  # Remote config NOT applied
+        s.adapter.send.assert_not_called()  # Skip path sends no CONFIG_ACK
 
     def test_apply_remote_config_atomic(self, tmp_path):
         s = self._make_sync(tmp_path)
