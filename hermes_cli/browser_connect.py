@@ -598,6 +598,31 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                 pass
     except OSError as e:
         return None, f"could not snapshot the '{browser}' profile into {dst}: {e}"
+    # A running browser can hold the cookie DB under an exclusive lock (the
+    # norm on Windows), so the copy above can silently produce an empty jar and
+    # the agent would then browse logged-out. If the source profile has a
+    # cookie DB but none of non-zero size reached the copy, fail closed rather
+    # than launch an authless profile.
+    _cookie_rels = ("<profile>/Network/Cookies", "<profile>/Cookies")
+    _profiles = _profile_subdirs(src)
+
+    def _has_cookies(root: str) -> bool:
+        for prof in _profiles:
+            for rel in _cookie_rels:
+                p = os.path.join(root, rel.replace("<profile>", prof))
+                try:
+                    if os.path.isfile(p) and os.path.getsize(p) > 0:
+                        return True
+                except OSError:
+                    continue
+        return False
+
+    if _has_cookies(src) and not _has_cookies(dst):
+        return None, (
+            f"could not copy the '{browser}' cookie database into the snapshot "
+            "— it is likely locked by a running browser (common on Windows). "
+            "Close the browser and retry, or turn browser.use_real_profile off."
+        )
     return dst, None
 
 
