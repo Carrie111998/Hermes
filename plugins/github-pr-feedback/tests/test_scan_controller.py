@@ -1894,6 +1894,14 @@ def test_scan_suppresses_high_confidence_self_resolution_receipts(tmp_path: Path
             "Merge remains gated; no CI configuration, required checks, or safety gates were "
             "modified.",
         ),
+        (
+            "issue_comment",
+            "Re: local PR CI audit receipt 4743945a -- already resolved at this PR's "
+            "current head. Validated at {sha} (canonical PR head): "
+            "scripts/run_hygiene_lane.py exits 0 -- all 42 admission checks pass. "
+            "The failures predate the shared stable-base repair and are fixed by lineage "
+            "with no edit to this branch. No gates or caps weakened; no merge action taken.",
+        ),
     ],
 )
 def test_scan_suppresses_factual_owner_ci_completion_comments(

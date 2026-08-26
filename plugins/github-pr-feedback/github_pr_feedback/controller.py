@@ -1170,6 +1170,23 @@ def _is_self_resolution_receipt(feedback: Feedback, *, owner_login: str) -> bool
         return True
     if _has_unresolved_action(body):
         return False
+    reconciled_ci_receipt = (
+        body.startswith("re: local pr ci audit receipt ")
+        and "already resolved" in body
+        and re.search(r"\b[0-9a-f]{40,64}\b", body) is not None
+        and any(marker in body for marker in ("run_static_lane.py", "run_hygiene_lane.py"))
+        and (
+            _LANE_PASS_EVIDENCE.search(body) is not None
+            or re.search(r"\bchecks?\s+pass\b", body) is not None
+        )
+        and any(
+            marker in body
+            for marker in ("no edit to this branch", "no source files were changed")
+        )
+        and any(marker in body for marker in ("no merge action", "no merge performed"))
+    )
+    if reconciled_ci_receipt:
+        return True
     if (
         "pr-maintenance-receipt:v1" in body
         and "status=completed" in body
