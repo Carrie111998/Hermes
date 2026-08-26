@@ -429,7 +429,10 @@ describe('settled tool run', () => {
 
 // A diff is what the user reviews, so it is never what gets summarized away.
 // It stays on screen at the point in the turn where it happened, with the
-// activity either side of it collapsing around it.
+// activity either side of it collapsing around it. The row itself starts
+// collapsed (#95248) — file name and +/- counts ride the summary line while
+// the full diff waits one click away — and opening it restores the
+// expanded-edit chrome.
 describe('a file edit among ordinary activity', () => {
   it('stays visible between the two runs it interrupted', async () => {
     const { container } = render(<GroupHarness message={editBetweenRunsMessage()} />)
@@ -443,12 +446,31 @@ describe('a file edit among ordinary activity', () => {
     expect(shape).toEqual(['summary', 'row', 'summary'])
   })
 
-  it('keeps the diff itself on screen rather than behind the summary', async () => {
+  it('starts its row collapsed, with no diff panel mounted', async () => {
     const { container } = render(<GroupHarness message={editBetweenRunsMessage()} />)
+
+    await screen.findByText('Explored 2 files')
+
+    expect(container.querySelector('[data-tool-row][data-tool-open]')).toBeNull()
+    // The expanded-edit marker rides on open state — styles.css keeps an
+    // expanded edit at full strength and lets a collapsed one fade like any
+    // other row — so it must be absent while collapsed.
+    expect(container.querySelector('[data-file-edit]')).toBeNull()
+    expect(container.querySelector('[data-slot="file-diff-panel"]')).toBeNull()
+  })
+
+  it('expands on click to show the diff behind its expanded-edit marker', async () => {
+    const { container } = render(<GroupHarness message={editBetweenRunsMessage()} />)
+
+    await screen.findByText('Explored 2 files')
+
+    fireEvent.click(container.querySelector('[data-tool-row] button[aria-expanded="false"]') as Element)
 
     await waitFor(() => {
       expect(container.querySelector('[data-tool-row][data-file-edit]')).not.toBeNull()
     })
+
+    expect(container.querySelector('[data-slot="file-diff-panel"]')).not.toBeNull()
   })
 })
 

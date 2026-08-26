@@ -369,8 +369,13 @@ function ToolEntry({ part }: ToolEntryProps) {
   const sideDiff = useStore($toolInlineDiff(toolCallId ?? ''))
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(result)
   const isFileEdit = isFileEditTool(toolName)
-  const defaultOpen = Boolean(inlineDiff)
-  const open = useDisclosureOpen(disclosureId, defaultOpen)
+
+  // Diff-bearing rows start collapsed (#95248): expanded-by-default diffs
+  // buried the transcript during edit-heavy sessions. The one-line summary —
+  // file name, status, +/- counts — is all a settled row shows until opened;
+  // clicking still expands, and a manual toggle persists over this default
+  // ($toolDisclosureOpen wins whenever the row has been touched before).
+  const open = useDisclosureOpen(disclosureId)
   const canDismiss = !isPending && !embedded
   // Only animate entries that mount while their message is actively
   // streaming — historical sessions mount with `messageRunning === false`,
