@@ -525,6 +525,11 @@ def build_turn_context(
                 raise RuntimeError(
                     "durable input marker is not the pending transcript tail"
                 )
+            replayed_content = conversation_history[replay_idx].get("content")
+            if replayed_content is None:
+                # Validate before the pop so a raise leaves the caller's
+                # history list unmutated.
+                raise RuntimeError("durable input marker has no user content")
             replayed_persisted_user_msg = conversation_history.pop(replay_idx)
             # JSONL/direct callers may still supply the public transcript key.
             # Normalize it to the transport-stripped internal form before this
@@ -533,9 +538,6 @@ def build_turn_context(
             replayed_persisted_user_msg[
                 "_platform_message_id"
             ] = persist_user_message_id
-            replayed_content = replayed_persisted_user_msg.get("content")
-            if replayed_content is None:
-                raise RuntimeError("durable input marker has no user content")
             replayed_persisted_user_msg["_db_persisted"] = True
             user_message = replayed_content
             persist_user_message = replayed_content
@@ -1439,8 +1441,11 @@ def build_turn_context(
     #
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
+    # A durable replay discards recomputed context below to resend the exact
+    # committed bytes — skip the prefetch entirely so no work is wasted and
+    # no recall indicator is shown for context the model never receives.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and replayed_persisted_user_msg is None:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):

@@ -557,3 +557,37 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+@pytest.mark.parametrize("identity_key", ["message_id", "_platform_message_id"])
+def test_alternation_repair_preserves_durable_replay_marker(identity_key):
+    """A crash-left user;user wedge must not destroy the delivery marker.
+
+    Durable admission can commit its marked webhook row behind an unanswered
+    user row from an earlier crash.  Load-time alternation repair merges the
+    pair; the surviving row must carry the absorbed row's identity or the
+    provider retry cannot find the marker and appends the already-committed
+    input a second time.
+    """
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    class _DummyAgent:
+        session_id = "probe"
+        _last_flushed_db_idx = 0
+
+    messages = [
+        {"role": "assistant", "content": "previous answer"},
+        {"role": "user", "content": "wedged unanswered input"},
+        {
+            "role": "user",
+            "content": "webhook prompt",
+            identity_key: "delivery-marker",
+        },
+    ]
+    repairs = repair_message_sequence(_DummyAgent(), messages)
+    assert repairs == 1
+    tail = messages[-1]
+    assert tail["role"] == "user"
+    assert tail[identity_key] == "delivery-marker"
+    assert "webhook prompt" in tail["content"]
+    assert "wedged unanswered input" in tail["content"]

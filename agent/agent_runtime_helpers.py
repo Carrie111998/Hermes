@@ -799,6 +799,15 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # bytes previously sent for the pre-merge message) — drop it
                 # so replay can't substitute stale bytes.
                 drop_stale_api_content(prev)
+                # Carry the absorbed row's durable identity when the survivor
+                # has none: a webhook delivery marker on the absorbed row must
+                # stay findable, or a provider retry after a crash-left
+                # user;user wedge appends the already-committed input again.
+                for identity_key in ("message_id", "_platform_message_id"):
+                    if prev.get(identity_key) is None and msg.get(
+                        identity_key
+                    ) is not None:
+                        prev[identity_key] = msg[identity_key]
                 repairs += 1
                 continue
         merged.append(msg)
