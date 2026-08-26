@@ -32,6 +32,22 @@ a dependency you happen to be able to edit, not as your codebase.
 | `tests/` (everything except `tests/server/`) | Upstream framework tests. |
 | `AGENTS.md` (below this map) | The upstream contributor guide. It describes **Hermes**, not the product. |
 
+## What the Hermes layer can no longer do
+
+Removing the frontend trees killed the surfaces built from them. The product
+path -- `hermes -z <prompt> --skills <skill> --yolo`, which is all
+`server/agent_service.py` invokes -- is unaffected, but these are dead:
+
+- `hermes gui` / the Electron desktop app (`apps/desktop/`)
+- `hermes tui` (`ui-tui/`, `tui_gateway/`)
+- `hermes dashboard` and its SPA (`web/`)
+- `scripts/install.{sh,ps1}`'s desktop-install steps
+
+Roughly a hundred comments and docstrings across `hermes_cli/`, `agent/` and
+`gateway/` still name paths under those trees. They are prose, not code
+references -- don't treat a mention of `tui_gateway/server.py` in a comment as
+a live dependency.
+
 ## Where things run
 
 - Container: `Dockerfile.interfaze-api` + `docker-compose.interfaze.yml`. These
