@@ -549,7 +549,16 @@ const GROUP_CHAT_SYNC_MAX_BYTES = 48000
 const GROUP_CHAT_SYNC_MESSAGES = 16
 const GROUP_CHAT_SYNC_TEXT_CHARS = 1200
 const GROUP_CHAT_SYNC_IMAGE_CHARS = 24000
+// #94863: low-frequency backstop pull while a default-profile gateway is
+// reachable. Without this, a peer's writes are only observed at hydrate
+// or on a gateway transition — a connected-but-idle Desktop's renderer
+// misses every entry the peer appends until the next reconnect. The
+// interval is intentionally larger than the publish-side debounce so the
+// backstop never starves a write in flight; small enough that the
+// "missing-message" window is bounded to ~this many seconds.
+const GROUP_CHAT_SYNC_BACKSTOP_PULL_MS = 5000
 let groupChatSyncTimer = null
+let groupChatSyncBackstopTimer = null
 // Fan-out scheduler state, keyed by gateway connectionId ('' = active/local).
 // Every connected gateway carries the full projection so a room survives any
 // single gateway being removed and surfaces on every remote backend.
@@ -1407,11 +1416,92 @@ function stopGroupChatServerSync() {
     clearTimeout(groupChatSyncTimer)
     groupChatSyncTimer = null
   }
+  // #94863: cancel the backstop pull on dispose so a disabled plugin does
+  // not keep polling profiles.configure after the UI has unmounted.
+  if (groupChatSyncBackstopTimer !== null) {
+    clearTimeout(groupChatSyncBackstopTimer)
+    groupChatSyncBackstopTimer = null
+  }
   for (const timer of groupChatSyncRetryTimers.values()) {
     clearTimeout(timer)
   }
   groupChatSyncRetryTimers.clear()
   groupChatSyncRetryCounts.clear()
+}
+
+/** #94863: low-frequency backstop pull. The publish side drives a flush
+ *  only when this Desktop writes — a connected but idle Desktop never
+ *  re-reads the gateway's projection, so a peer's writes are invisible
+ *  until the next hydrate or gateway transition. The backstop re-reads
+ *  every GROUP_CHAT_SYNC_BACKSTOP_PULL_MS while at least one room is
+ *  tracked locally; the merge is a no-op when nothing changed. Feature-
+ *  detected for hosts without timers (older embedded VMs).
+ *
+ *  Implementation note: the reschedule MUST run via a real timer (not a
+ *  microtask chain) so a synchronous-host test fixture whose setTimeout
+ *  fires inline does not re-enter this function from the same microtask
+ *  pass. The `setTimeout(..., 0)` here is intentional — the actual
+ *  interval lives in the outer setTimeout's delay. */
+function scheduleGroupChatBackstopPull() {
+  if (groupChatSyncDisposed || typeof setTimeout !== 'function') {
+    return
+  }
+  // Synchronous-host test fixtures override setTimeout with a function
+  // that calls the callback inline (returning 0). A real timer host —
+  // Electron renderer, browser, Node's native setTimeout — returns a
+  // positive numeric handle and defers the callback. The backstop would
+  // otherwise recurse indefinitely in those test fixtures. Probe with a
+  // 0-ms timer and only run if the host returns a positive handle.
+  const probe = setTimeout(() => undefined, 0)
+  if (typeof probe !== 'number' || probe <= 0) {
+    // Synchronous host — no periodic pull. Tests opt in via deferredTimers.
+    return
+  }
+  clearTimeout(probe)
+  if (groupChatSyncBackstopTimer !== null) {
+    clearTimeout(groupChatSyncBackstopTimer)
+  }
+  // #94863 CI: a truthful timer host never fires BEFORE its requested
+  // delay. Test fixtures whose setTimeout answers with a positive handle
+  // but runs callbacks via setImmediate (with a no-op clearTimeout) fire
+  // instantly; re-arming on such a host turns this function into an
+  // event-loop busy-loop that OOMs long test runs. Record when the timer
+  // was armed and refuse to re-arm if it fired early — those hosts get a
+  // single pull per arm instead of an unbounded chain.
+  const armedAt = Date.now()
+  groupChatSyncBackstopTimer = setTimeout(() => {
+    groupChatSyncBackstopTimer = null
+    if (groupChatSyncDisposed) {
+      return
+    }
+    if (Date.now() - armedAt < GROUP_CHAT_SYNC_BACKSTOP_PULL_MS) {
+      // Host does not truly defer timers — do not re-arm.
+      return
+    }
+    void (async () => {
+      if (groupChatSyncDisposed) {
+        return
+      }
+      try {
+        // Pull is a no-op for an empty local cache; the publish side
+        // will already have run when this Desktop wrote, so a quiet
+        // room still wakes up to any peer delta the gateway has
+        // absorbed since the last hydrate / flush.
+        const hadRooms = Object.keys($groupChats.get() || {}).length > 0
+        if (hadRooms) {
+          await pullGroupChatServerState().catch(() => false)
+        }
+      } catch {
+        // Pull errors are intentionally swallowed — they must never
+        // cascade into the publish side or surface as user-visible
+        // failures. The next tick retries.
+      }
+      // Re-arm via a fresh macro-task timer.
+      if (!groupChatSyncDisposed) {
+        scheduleGroupChatBackstopPull()
+      }
+    })()
+  }, GROUP_CHAT_SYNC_BACKSTOP_PULL_MS)
 }
 
 /** Debounced, pull-merge-write server mirror, fanned out to every reachable
@@ -1487,6 +1577,9 @@ function handleSessionsGatewayTransition() {
   void pullGroupChatServerState()
     .catch(() => false)
     .then(() => scheduleGroupChatServerSync($groupChats.get()))
+    // #94863: keep the backstop pull alive across gateway swaps so peer
+    // writes continue to surface on the freshly-bound gateway.
+    .then(() => scheduleGroupChatBackstopPull())
 }
 
 // ── cross-connection bot relay ────────────────────────────────────────────
@@ -7128,11 +7221,25 @@ function appendGroupChatEntry(group, from, text, thread, images) {
   // loop both committing the same member reply) lands back-to-back and
   // byte-identical. Drop the echo instead of flooding the room. User
   // entries and non-adjacent repeats are never touched.
+  //
+  // #94863: the single-entry check is too narrow. A double-append that
+  // lands with one intervening entry (e.g., a user reply, another
+  // member's reply, or a stray watermark bump between the two echoes)
+  // bypasses the back-to-back check and floods the room with a phantom
+  // duplicate. Widen the check to a sliding window of the most recent
+  // GROUP_CHAT_DEDUPE_APPEND_WINDOW entries — covers the typical
+  // round-robin scope (a handful of member turns between two echoes of
+  // the same reply) without growing unbounded across longer
+  // conversations. The helper itself still takes a single prior entry
+  // (its callers and tests rely on that); we drive it across the
+  // window here at the entry point.
   const priorLog = ($groupChats.get()[group] || {}).log || []
-  const lastEntry = priorLog[priorLog.length - 1]
-
-  if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {
-    return lastEntry
+  const windowStart = Math.max(0, priorLog.length - GROUP_CHAT_DEDUPE_APPEND_WINDOW)
+  for (let i = priorLog.length - 1; i >= windowStart; i--) {
+    const candidate = priorLog[i]
+    if (isDuplicateGroupAppend(candidate, from, entry.text, entry.thread)) {
+      return candidate
+    }
   }
 
   updateGroupChat(group, room => {
@@ -7770,6 +7877,16 @@ function shouldCommitMemberTurn(epochAtDispatch, currentEpoch, newerUserEntryInT
  *  a residual double-append fires back-to-back; two legitimately identical
  *  replies hours apart (or with anything in between) are never dropped. */
 const GROUP_DUPLICATE_APPEND_WINDOW_MS = 10 * 60 * 1000
+
+// #94863: appendGroupChatEntry widens the back-to-back check to a sliding
+// window of recent log entries — a double-append separated by one or two
+// intervening replies (e.g., the same member's reply harvested twice with
+// a user follow-up in between) used to flood the room. The window size
+// covers one typical round-robin scope: a handful of member turns between
+// two echoes of the same reply. Larger windows risk hiding legitimate
+// short-interval re-replies; smaller windows leave the gap open. Eight
+// matches the typical 3-5 member room's last full round plus a little slack.
+const GROUP_CHAT_DEDUPE_APPEND_WINDOW = 8
 
 function isDuplicateGroupAppend(lastEntry, from, text, thread, now = Date.now()) {
   if (!lastEntry || !from || from.kind !== 'member' || lastEntry.from?.kind !== 'member') {
@@ -15259,6 +15376,13 @@ export default {
           // empty overwrite and then rendering an empty conversation.
           await pullGroupChatServerState().catch(() => false)
           scheduleGroupChatServerSync($groupChats.get())
+          // #94863: also start the low-frequency backstop pull so peer
+          // writes surface without waiting for the next gateway
+          // transition. A freshly hydrated Desktop that has not yet
+          // written anything still benefits — the peer's responses to a
+          // user prompt that landed just before this Desktop went idle
+          // would otherwise sit unread until the next reconnect.
+          scheduleGroupChatBackstopPull()
         })
         .catch(() => undefined)
     } catch {
