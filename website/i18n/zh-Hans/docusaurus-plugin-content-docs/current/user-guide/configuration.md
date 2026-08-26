@@ -1217,24 +1217,21 @@ display:
   runtime_footer:         # Gateway：在最终回复中附加运行时上下文页脚
     enabled: false
     fields: ["model", "context_pct", "cwd"]
-  file_mutation_verifier: true    # 当本轮 write_file/patch 调用失败时附加建议性页脚
+  file_mutation_verifier: true    # 失败的文件变更先后台恢复，仍失败时简洁说明阻塞
   language: en            # 静态消息的 UI 语言（审批提示、部分 gateway 回复）。en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
 
 ### 文件变更验证器
 
-当 `display.file_mutation_verifier` 为 `true`（默认）时，每当本轮中 `write_file` 或 `patch` 调用失败且从未被对同一路径的成功写入取代时，Hermes 会在 assistant 的最终响应中附加一行建议。这捕获了"批量并行补丁，一半静默失败，模型总结成功"这类过度声明，而无需您在每次编辑后手动运行 `git status`。
+当 `display.file_mutation_verifier` 为 `true`（默认）时，Hermes 会持续跟踪本轮中失败的 `write_file` 和 `patch` 调用。agent 停止前会获得一次后台恢复机会，并通过受支持的方式验证变更。对于受保护的 Hermes 配置，agent 应使用 `hermes config set` 或 `unset` 恢复，再用 `hermes config get` 验证，而不是重试被阻止的文件工具。
 
-示例页脚：
+如果文件变更仍未解决，Hermes 会替换尝试生成的最终响应，因此流式或已写出的成功声明不会与失败说明同时保留。普通回复仅显示一句简洁说明，不包含本地路径、工具名称或原始错误：
 
 ```
-⚠️ File-mutation verifier: 3 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
-  • concepts/automatic-organization.md — [patch] Could not find match for old_string
-  • concepts/lora.md — [patch] Could not find match for old_string
-  • concepts/rag-pipeline.md — [patch] Could not find match for old_string
+The requested change did not take effect, and I’m blocked.
 ```
 
-设置 `file_mutation_verifier: false`（或 `HERMES_FILE_MUTATION_VERIFIER=0`）以禁止页脚。验证器仅在轮次结束时有真实失败未解决时触发 —— 在同一轮次内重试失败补丁并成功的模型不会为该文件触发它。
+如果 agent 已经使用完全相同的句子，Hermes 不会重复添加。如果您明确要求查看文件变更验证器的原始详情或失败编辑的完整技术诊断，Hermes 会保留包含路径、工具名称和错误预览的详细诊断页脚。设置 `file_mutation_verifier: false`（或 `HERMES_FILE_MUTATION_VERIFIER=0`）可同时禁用后台恢复门和最终安全兜底。
 
 ### 静态消息的 UI 语言
 

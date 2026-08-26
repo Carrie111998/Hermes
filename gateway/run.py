@@ -5476,6 +5476,24 @@ class TurnRunner:
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
                             if ctx._run_still_current():
+                                _active_agent = ctx.agent_holder[0]
+                                if (
+                                    text
+                                    and _active_agent is not None
+                                    and getattr(
+                                        _active_agent,
+                                        "_turn_failed_file_mutations",
+                                        None,
+                                    )
+                                ):
+                                    # A failed mutation makes post-tool prose an
+                                    # untrusted candidate until recovery/final
+                                    # verification. Buffer it backstage: the
+                                    # authoritative final is delivered by
+                                    # finish(final_text), so non-editable and
+                                    # split transports never expose a success
+                                    # claim that cannot be retracted.
+                                    return
                                 _stream_consumer.on_delta(text)
                                 # Tee to the streaming-TTS consumer (#60671).
                                 if _stts_consumer_ref is not None:
@@ -5490,6 +5508,17 @@ class TurnRunner:
         if _stream_delta_cb is None and _stts_consumer_ref is not None:
             def _stream_delta_cb(text: str) -> None:
                 if ctx._run_still_current():
+                    _active_agent = ctx.agent_holder[0]
+                    if (
+                        text
+                        and _active_agent is not None
+                        and getattr(
+                            _active_agent,
+                            "_turn_failed_file_mutations",
+                            None,
+                        )
+                    ):
+                        return
                     _stts_consumer_ref.on_delta(text)
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
@@ -6443,8 +6472,8 @@ class TurnRunner:
 
         # Signal the stream consumer that the agent is done. Pass the
         # completed final_response as the authoritative finalize payload:
-        # it includes post-stream augmentation (file-mutation verifier
-        # footer, turn-completion explainer) the consumer's accumulator
+        # it includes post-stream augmentation (file-mutation failure
+        # notice, turn-completion explainer) the consumer's accumulator
         # never saw, so the seal/final edit delivers the TRUE final and no
         # separate corrective send fires (live finding #11). Failed turns
         # pass nothing — error text is delivered by the gateway's normal
@@ -6463,7 +6492,10 @@ class TurnRunner:
                 isinstance(result, dict)
                 and not result.get("failed")
                 and not result.get("interrupted")
-                and result.get("completed") is not False
+                and (
+                    result.get("completed") is not False
+                    or result.get("file_mutation_blocked") is True
+                )
             ):
                 _fr = result.get("final_response")
                 if isinstance(_fr, str) and _fr.strip() and _fr != "(empty)":
@@ -6621,6 +6653,7 @@ class TurnRunner:
                 "failure_reason": result.get("failure_reason"),
                 "partial": result.get("partial", False),
                 "completed": result.get("completed"),
+                "file_mutation_blocked": result.get("file_mutation_blocked", False),
                 "interrupted": result.get("interrupted", False),
                 "interrupt_message": result.get("interrupt_message"),
                 "error": result.get("error"),
@@ -6693,6 +6726,10 @@ class TurnRunner:
                 ctx.result_holder[0].get("failure_reason") if ctx.result_holder[0] else None
             ),
             "completed": ctx.result_holder[0].get("completed") if ctx.result_holder[0] else None,
+            "file_mutation_blocked": (
+                ctx.result_holder[0].get("file_mutation_blocked", False)
+                if ctx.result_holder[0] else False
+            ),
             "interrupted": ctx.result_holder[0].get("interrupted", False) if ctx.result_holder[0] else False,
             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,
@@ -30360,26 +30397,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
-                # existing streamed message instead of sending a duplicate.
+                # existing streamed message instead of sending a duplicate. Use
+                # the same conservative delivery checks as stale-finalize
+                # reconciliation above: a split tail is not the whole response,
+                # ``__no_edit__`` is not editable, and an unsuccessful result
+                # must fall through to the normal final send.
                 _sc_msg_id = _sc.message_id
-                if _sc_msg_id:
+                _sc_adapter = getattr(_sc, "adapter", None)
+                if getattr(_sc, "_turn_split_delivery", False):
+                    logger.info(
+                        "Transformed streamed response for session %s used multi-message split delivery; skipping in-place reconciliation and delivering the complete response via normal final send.",
+                        session_key or "?",
+                    )
+                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
-                        await _sc.adapter.edit_message(
+                        _transform_edit_res = await _sc_adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transform_edit_res, "success", True):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Transformed-response reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
+                                session_key or "?",
+                                getattr(_transform_edit_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
-                            "Failed to edit streamed message for session %s: %s",
+                            "Failed to edit transformed streamed message for session %s: %s; sending complete response via normal final send.",
                             session_key or "?", _edit_err,
                         )
+                else:
+                    logger.info(
+                        "Transformed streamed response for session %s has no editable message; delivering complete response via normal final send.",
+                        session_key or "?",
+                    )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

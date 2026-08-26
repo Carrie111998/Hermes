@@ -278,7 +278,7 @@ Useful flags: `--days N` (history window, default 90), `--min-count N`
 
 ## File Write Safety {#file-write-safety}
 
-Before `write_file` or `patch` touches disk, Hermes checks the target path against a denylist and an optional sandbox. Blocked writes return an error to the agent immediately — **there is no approval prompt** and no way to override from the chat UI. The model may still claim the edit succeeded; when `display.file_mutation_verifier` is on (default), trust the [file-mutation verifier footer](./configuration.md#file-mutation-verifier) over the assistant's closing summary.
+Before `write_file` or `patch` touches disk, Hermes checks the target path against a denylist and an optional sandbox. Blocked writes return an error to the agent immediately — **there is no approval prompt** and no way to override from the chat UI. When `display.file_mutation_verifier` is on (default), Hermes gives the agent one backstage recovery pass and prevents an unresolved failed edit from being reported as success. See [file-mutation verifier](./configuration.md#file-mutation-verifier).
 
 ### Protected paths (always blocked)
 

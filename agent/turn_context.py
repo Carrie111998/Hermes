@@ -1351,8 +1351,15 @@ def build_turn_context(
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    agent._turn_file_mutation_fingerprint_bytes = 0
+    agent._turn_file_mutation_fingerprint_budget_exhausted = False
+    agent._turn_file_mutation_fingerprint_phase_bytes = {}
+    agent._turn_file_mutation_fingerprint_exhausted_phases = set()
+    agent._turn_file_mutation_fingerprint_lock = threading.Lock()
+    agent._turn_file_mutation_state_lock = threading.Lock()
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
+    agent._file_mutation_recovery_nudges = 0
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

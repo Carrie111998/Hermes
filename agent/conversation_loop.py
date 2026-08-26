@@ -8213,9 +8213,47 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_file_mutation_recovery_synthetic")
                     )
                 ):
                     messages.pop()
+
+                # Failed file writes/patches get one backstage recovery pass
+                # before the turn can stop. Unlike verification-stop, the
+                # attempted answer is not shown or persisted: it may still
+                # falsely claim success. The turn finalizer remains the
+                # fail-closed backstop if recovery cannot land.
+                _mutation_nudge = None
+                _mutation_attempt = getattr(
+                    agent, "_file_mutation_recovery_nudges", 0
+                )
+                if _mutation_attempt < 1:
+                    try:
+                        _mutation_nudge = agent._build_file_mutation_recovery_nudge(
+                            final_response
+                        )
+                    except Exception:
+                        logger.debug(
+                            "file-mutation recovery stop-loop check failed",
+                            exc_info=True,
+                        )
+
+                if _mutation_nudge:
+                    agent._file_mutation_recovery_nudges = _mutation_attempt + 1
+                    final_msg["finish_reason"] = "file_mutation_recovery_required"
+                    final_msg["_file_mutation_recovery_synthetic"] = True
+                    append_message(messages, final_msg)
+                    append_message(messages, {
+                        "role": "user",
+                        "content": _mutation_nudge,
+                        "_file_mutation_recovery_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug("file-mutation recovery nudge issued")
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = False
+                    final_response = None
+                    continue
 
                 try:
                     from agent.verification_stop import (

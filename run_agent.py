@@ -223,6 +223,13 @@ from agent.tool_dispatch_helpers import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
+_FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES = 64 * 1024 * 1024
+# Each verifier phase (failure capture, recovery gate, finalization) gets this
+# aggregate cap. Separate bounded phases keep a later recovery observable even
+# when the earlier snapshot consumed its full allowance.
+_FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES = 2 * _FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES
+
+
 # Internal flags that mark a message as ephemeral empty-response/prefill
 # recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
 # injected after an empty response, the terminal "(empty)" sentinel, and the
@@ -243,6 +250,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_file_mutation_recovery_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
@@ -3682,19 +3690,29 @@ class AIAgent:
         args: Dict[str, Any],
         result: Any,
         is_error: bool,
+        task_id: Optional[str] = None,
+        expected_state: Optional[Dict[str, Dict[str, Any]]] = None,
+        fingerprint_failures: bool = True,
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
-        On failure, store ``{path: {error_preview, tool}}`` entries.  On
+        On failure, store per-target error and post-attempt snapshot data.  On
         success, remove any prior failure entries for the same paths (the
-        model recovered within the turn).  Silently no-ops if the per-turn
-        state dict hasn't been initialised yet (e.g. a tool dispatched
-        outside ``run_conversation``).
+        model recovered within the turn).  Failed attempts retain a content
+        fingerprint of the target *after* the failed tool returned; this lets
+        the turn finalizer recognize a later recovery through terminal/CLI
+        without treating the failed tool call itself as proof of a change.
+        Silently no-ops if the per-turn state dict hasn't been initialised yet
+        (e.g. a tool dispatched outside ``run_conversation``).
         """
         if tool_name not in _FILE_MUTATING_TOOLS:
             return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
+            return
+        if expected_state is not None and state is not expected_state:
+            return
+        if not self._file_mutation_verifier_enabled():
             return
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
@@ -3716,21 +3734,249 @@ class AIAgent:
                         pass
         if is_error and not landed:
             preview = _extract_error_preview(result)
-            for path in targets:
+            reported_paths: List[str] = []
+            reported_path_map: Dict[str, str] = {}
+            try:
+                result_data = json.loads(result) if isinstance(result, str) else result
+                if isinstance(result_data, dict):
+                    raw_path_map = result_data.get("resolved_path_map")
+                    if isinstance(raw_path_map, dict):
+                        reported_path_map = {
+                            str(key): str(value)
+                            for key, value in raw_path_map.items()
+                            if isinstance(value, str)
+                        }
+                    raw_paths = result_data.get("resolved_paths")
+                    if isinstance(raw_paths, list):
+                        reported_paths = [str(item) for item in raw_paths]
+                    elif isinstance(result_data.get("resolved_path"), str):
+                        reported_paths = [result_data["resolved_path"]]
+            except (TypeError, ValueError):
+                pass
+            for index, path in enumerate(targets):
+                reported_path = (
+                    reported_path_map.get(path)
+                    or (reported_paths[index] if index < len(reported_paths) else None)
+                )
+                resolved_path = reported_path or self._resolve_file_mutation_target(
+                    path, task_id=task_id,
+                )
+                fingerprint = None
+                if fingerprint_failures and resolved_path:
+                    _, fingerprint = self._snapshot_file_mutation_target(
+                        resolved_path,
+                        task_id=task_id,
+                        resolved_path=resolved_path,
+                        fingerprint_phase="capture",
+                    )
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
-                # message shouldn't silently overwrite the original.
+                # message shouldn't silently overwrite the original.  The
+                # snapshot IS refreshed, though: a newer failed attempt must
+                # not be cleared by a change that happened before that attempt.
                 if path not in state:
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
                     }
+                state[path]["resolved_path"] = resolved_path
+                state[path]["fingerprint"] = fingerprint
+                state[path]["task_id"] = task_id
         else:
             for path in targets:
                 state.pop(path, None)
 
+            # A failed relative-path attempt followed by a successful tool
+            # call that reports an absolute/resolved path is the same target.
+            # Clear those aliases too instead of leaving a stale failure.
+            if state:
+                successful_paths = set(targets)
+                successful_paths.update(
+                    _extract_landed_file_mutation_paths(tool_name, args, result)
+                )
+                resolved_successes = {
+                    resolved
+                    for path in successful_paths
+                    if (resolved := self._resolve_file_mutation_target(
+                        path, task_id=task_id,
+                    ))
+                }
+                for failed_path, info in list(state.items()):
+                    if info.get("resolved_path") in resolved_successes:
+                        state.pop(failed_path, None)
+
+    @staticmethod
+    def _resolve_file_mutation_target(
+        path: str,
+        *,
+        task_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Canonicalize a target using the file tool's backend-aware path rules.
+
+        This is lexical identity only: remote targets need canonical aliases so
+        a recognized successful mutation can clear an equivalent failed path,
+        but they must never be inspected through the host filesystem.
+        """
+        try:
+            from tools.file_tools import _resolve_path
+
+            effective_task_id = task_id or "default"
+            return str(_resolve_path(str(path), effective_task_id))
+        except Exception:
+            return None
+
+    def _snapshot_file_mutation_target(
+        self,
+        path: str,
+        *,
+        task_id: Optional[str] = None,
+        resolved_path: Optional[str] = None,
+        fingerprint_phase: str = "capture",
+    ) -> tuple[Optional[str], Optional[tuple]]:
+        """Return a canonical target and, when local and budgeted, its fingerprint.
+
+        Canonicalization applies to every backend for alias matching.  Content
+        inspection applies only to the local backend: host-side inspection of
+        Docker/SSH/Modal paths could observe an unrelated file with the same
+        spelling and incorrectly suppress a real warning.
+
+        Fingerprints consume one aggregate byte budget per verifier phase. Snapshot
+        requests are serialized in tool-result arrival order and target order
+        within each result.  Once the next regular file does not fit,
+        fingerprinting stops for the turn; that target and every later target
+        remain conservatively unresolved.
+        """
+        resolved_text = resolved_path or self._resolve_file_mutation_target(
+            path, task_id=task_id,
+        )
+        if not resolved_text:
+            return None, None
+        try:
+            from tools.file_tools import _terminal_env_type_for_task
+
+            effective_task_id = task_id or "default"
+            if _terminal_env_type_for_task(effective_task_id) != "local":
+                return resolved_text, None
+
+            resolved = Path(resolved_text)
+            try:
+                stat_result = resolved.stat()
+            except FileNotFoundError:
+                return resolved_text, ("missing",)
+            if not resolved.is_file():
+                return resolved_text, (
+                    "other",
+                    stat_result.st_mode,
+                    stat_result.st_size,
+                    stat_result.st_mtime_ns,
+                )
+            # A failed edit must not trigger an unbounded hidden read of a
+            # giant target at both failure time and turn finalization.  For
+            # large files, stay conservative and leave the warning unresolved.
+            if stat_result.st_size > _FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES:
+                return resolved_text, None
+
+            budget_lock = getattr(self, "_turn_file_mutation_fingerprint_lock", None)
+            if budget_lock is None:
+                budget_lock = threading.Lock()
+                self._turn_file_mutation_fingerprint_lock = budget_lock
+            with budget_lock:
+                phase_bytes = getattr(
+                    self, "_turn_file_mutation_fingerprint_phase_bytes", None
+                )
+                if phase_bytes is None:
+                    phase_bytes = {}
+                    self._turn_file_mutation_fingerprint_phase_bytes = phase_bytes
+                exhausted_phases = getattr(
+                    self,
+                    "_turn_file_mutation_fingerprint_exhausted_phases",
+                    None,
+                )
+                if exhausted_phases is None:
+                    exhausted_phases = set()
+                    self._turn_file_mutation_fingerprint_exhausted_phases = exhausted_phases
+                if fingerprint_phase in exhausted_phases:
+                    return resolved_text, None
+                used = int(phase_bytes.get(fingerprint_phase, 0))
+                remaining_budget = max(
+                    0,
+                    _FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES - used,
+                )
+                if stat_result.st_size > remaining_budget:
+                    exhausted_phases.add(fingerprint_phase)
+                    self._turn_file_mutation_fingerprint_budget_exhausted = True
+                    return resolved_text, None
+                # Reserve before reading so concurrent tool-result workers can
+                # never collectively hash beyond the aggregate turn cap.  A
+                # failed/racing read keeps its reservation conservatively.
+                phase_bytes[fingerprint_phase] = used + stat_result.st_size
+                self._turn_file_mutation_fingerprint_bytes = max(phase_bytes.values())
+
+            digest = hashlib.sha256()
+            with resolved.open("rb") as handle:
+                bytes_left = stat_result.st_size
+                while bytes_left:
+                    chunk = handle.read(min(1024 * 1024, bytes_left))
+                    if not chunk:
+                        return resolved_text, None
+                    digest.update(chunk)
+                    bytes_left -= len(chunk)
+
+            # If the file changed while it was read, the digest is not a safe
+            # baseline.  Its reserved bytes still count against the turn
+            # budget.
+            final_stat = resolved.stat()
+            if (
+                final_stat.st_size != stat_result.st_size
+                or final_stat.st_mtime_ns != stat_result.st_mtime_ns
+            ):
+                return resolved_text, None
+            return resolved_text, ("file", stat_result.st_size, digest.hexdigest())
+        except Exception:
+            # Verification is advisory and must never break turn finalization.
+            return resolved_text, None
+
+    def _unresolved_file_mutation_failures(
+        self,
+        *,
+        fingerprint_phase: str = "final",
+    ) -> Dict[str, Dict[str, Any]]:
+        """Filter stale failures whose targets changed after the failed call.
+
+        A changed, still-present fingerprint is evidence of follow-up mutation
+        via a route the file-tool result tracker cannot see (for example
+        ``hermes config set`` executed through ``terminal``). The verifier
+        intentionally does not parse arbitrary shell/helper semantics; the
+        task contract treats an observed post-failure target change as the
+        recovery signal. Deleted, missing, or unreadable targets stay
+        unresolved so unrelated removal cannot suppress the warning.
+        """
+        if not self._file_mutation_verifier_enabled():
+            return {}
+        failed = getattr(self, "_turn_failed_file_mutations", None) or {}
+        unresolved: Dict[str, Dict[str, Any]] = {}
+        for path, info in failed.items():
+            baseline = info.get("fingerprint")
+            resolved_path = info.get("resolved_path")
+            if baseline is None or not resolved_path:
+                unresolved[path] = info
+                continue
+            current_resolved, current = self._snapshot_file_mutation_target(
+                resolved_path,
+                task_id=info.get("task_id"),
+                fingerprint_phase=fingerprint_phase,
+            )
+            if (
+                current_resolved != resolved_path
+                or current is None
+                or current == ("missing",)
+                or current == baseline
+            ):
+                unresolved[path] = info
+        return unresolved
+
     def _file_mutation_verifier_enabled(self) -> bool:
-        """Check whether the per-turn file-mutation verifier footer is on.
+        """Check whether the per-turn file-mutation verifier is on.
 
         Config path: ``display.file_mutation_verifier`` (bool, default True).
         ``HERMES_FILE_MUTATION_VERIFIER`` env var overrides config.  Exposed
@@ -3816,9 +4062,10 @@ class AIAgent:
             return ""
         lines = [
             "⚠️ File-mutation verifier: "
-            f"{len(failed)} file(s) were NOT modified this turn despite any "
-            "wording above that may suggest otherwise. Run `git status` or "
-            "`read_file` to confirm."
+            f"{len(failed)} failed file mutation target(s) remain unresolved. "
+            "No later change to these targets was detected despite any wording "
+            "above that may suggest recovery. Run `git status` or `read_file` "
+            "to confirm."
         ]
         shown = 0
         for path, info in failed.items():
@@ -3838,6 +4085,98 @@ class AIAgent:
         # already backticked above; the lookbehind keeps it from being
         # double-wrapped).
         return cls._neutralize_footer_paths("\n".join(lines))
+
+    _FILE_MUTATION_BLOCKED_MESSAGE = (
+        "The requested change did not take effect, and I’m blocked."
+    )
+
+    @staticmethod
+    def _file_mutation_raw_diagnostics_requested(user_message: Any) -> bool:
+        """Return true only for an explicit request for low-level edit diagnostics."""
+        text = " ".join(flatten_message_text(user_message).lower().split())
+        if not text:
+            return False
+        explicit_detail = (
+            re.search(r"\braw\b", text) is not None
+            or "full technical" in text
+            or "technical diagnostic" in text
+            or "stack trace" in text
+            or "exact error" in text
+        )
+        mutation_context = (
+            "file-mutation" in text
+            or "file mutation" in text
+            or "failed file edit" in text
+            or "failed edit" in text
+            or "verifier" in text
+        )
+        return explicit_detail and mutation_context
+
+    @classmethod
+    def _apply_file_mutation_failure_notice(
+        cls,
+        final_response: str,
+        failed: Dict[str, Dict[str, Any]],
+        *,
+        user_message: Any,
+    ) -> str:
+        """Make unresolved mutation failure honest without exposing internals.
+
+        The verifier is a safety backstop, not a user-action request. Normal
+        replies therefore collapse to one stable plain-English sentence and no
+        path, tool, error preview, or contradictory success claim. A model that
+        already stated the block plainly is left untouched. Explicit requests
+        for raw diagnostics retain the detailed legacy footer.
+        """
+        if not failed:
+            return final_response
+        response = (final_response or "").rstrip()
+        if cls._file_mutation_raw_diagnostics_requested(user_message):
+            footer = cls._format_file_mutation_failure_footer(failed)
+            if not footer:
+                return cls._FILE_MUTATION_BLOCKED_MESSAGE
+            # Diagnostics are opt-in, but the no-false-success invariant is
+            # not. Always use the canonical block before technical detail so a
+            # contradictory success sentence cannot survive by also containing
+            # the required failure phrase.
+            return cls._FILE_MUTATION_BLOCKED_MESSAGE + "\n\n" + footer
+        if cls._file_mutation_response_is_honestly_blocked(response):
+            return response
+        return cls._FILE_MUTATION_BLOCKED_MESSAGE
+
+    @classmethod
+    def _file_mutation_response_is_honestly_blocked(cls, response: str) -> bool:
+        """Recognize only a complete, non-contradictory blocked response."""
+        normalized = " ".join(
+            (response or "").casefold().replace("’", "'").split()
+        )
+        return re.fullmatch(
+            r"the requested change did not take effect(?:, and|\.)(?: i'm| i am) blocked\.?",
+            normalized,
+        ) is not None
+
+    def _build_file_mutation_recovery_nudge(self, final_response: str) -> Optional[str]:
+        """Ask the model to recover an unresolved failed edit before stopping."""
+        if not self._file_mutation_verifier_enabled():
+            return None
+        failed = self._unresolved_file_mutation_failures(
+            fingerprint_phase="recovery_gate"
+        )
+        if not failed:
+            return None
+        if self._file_mutation_response_is_honestly_blocked(final_response):
+            return None
+        return (
+            "A file mutation from this turn is still unresolved. Do not stop or "
+            "claim success yet. Recover using the correct supported path and "
+            "verify that the requested change actually landed. For protected "
+            "Hermes configuration, use `hermes config set`/`unset` and then "
+            "`hermes config get`; do not retry patch/write_file. If recovery is "
+            "not possible, state exactly: “"
+            + self._FILE_MUTATION_BLOCKED_MESSAGE
+            + "” Do not expose verifier internals, raw tool errors, or local paths "
+            "unless the user explicitly requested technical diagnostics."
+        )
 
     def _turn_completion_explainer_enabled(self) -> bool:
         """Check whether the end-of-turn completion explainer footer is on.

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.turn_finalizer import finalize_turn
+from run_agent import AIAgent
 
 
 class FakeAgent:
@@ -128,6 +129,111 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert isinstance(result["messages"][-1]["timestamp"], float)
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_finalizer_replaces_raw_mutation_footer_with_concise_blocked_notice(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+    monkeypatch.setattr(
+        agent,
+        "_unresolved_file_mutation_failures",
+        lambda: {
+            "/tmp/source-secret.py": {
+                "tool": "patch",
+                "error_preview": "old_string not found",
+            }
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_apply_file_mutation_failure_notice",
+        AIAgent._apply_file_mutation_failure_notice,
+        raising=False,
+    )
+    messages = [{"role": "user", "content": "fix the source"}]
+
+    result = finalize_turn(
+        agent,
+        final_response="Done — the source is fixed.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="fix the source",
+        original_user_message="fix the source",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    final = result["final_response"]
+    assert final == "The requested change did not take effect, and I’m blocked."
+    assert "source is fixed" not in final
+    assert "File-mutation verifier" not in final
+    assert "source-secret.py" not in final
+    assert "old_string" not in final
+    assert result["response_transformed"] is True
+    assert result["pre_transform_response"] == "Done — the source is fixed."
+    assert result["completed"] is False
+    assert result["failed"] is False
+    assert result["file_mutation_blocked"] is True
+    assert result["messages"][-1]["content"] == final
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == final
+
+
+def test_plugin_cannot_restore_false_success_after_mutation_backstop(monkeypatch):
+    agent = FakeAgent()
+    monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+    monkeypatch.setattr(
+        agent,
+        "_unresolved_file_mutation_failures",
+        lambda: {
+            "/tmp/source-secret.py": {
+                "tool": "patch",
+                "error_preview": "old_string not found",
+            }
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_apply_file_mutation_failure_notice",
+        AIAgent._apply_file_mutation_failure_notice,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **_kwargs: ["Plugin says the source is fixed."]
+        if name == "transform_llm_output"
+        else [],
+    )
+
+    result = finalize_turn(
+        agent,
+        final_response="Done — the source is fixed.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "fix the source"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="fix the source",
+        original_user_message="fix the source",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
+    assert result["pre_transform_response"] == "Done — the source is fixed."
+    assert result["messages"][-1]["content"] == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == AIAgent._FILE_MUTATION_BLOCKED_MESSAGE
 
 
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(

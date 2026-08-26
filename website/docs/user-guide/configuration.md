@@ -1853,32 +1853,21 @@ Both keys are display-only and CLI-only: they are suppressed in quiet mode, when
 
 ### File-mutation verifier
 
-When `display.file_mutation_verifier` is `true` (default), Hermes appends a one-line advisory to the assistant's final response whenever a `write_file` or `patch` call failed during the turn and was never superseded by a successful write to the same path. This catches the "batch of parallel patches, half silently fail, model summarises success" class of over-claim without requiring you to manually run `git status` after every edit.
+When `display.file_mutation_verifier` is `true` (default), Hermes tracks failed `write_file` and `patch` calls through the end of the turn. Before the agent can stop, it gets one backstage chance to recover through a supported path and verify the change. This includes protected Hermes configuration: the agent should recover with `hermes config set` or `unset`, then verify with `hermes config get`, rather than retrying a blocked file tool.
 
-Example footer:
+If the mutation is still unresolved, Hermes replaces the attempted final response so a streamed or written success claim cannot survive beside the failure. Ordinary replies contain one concise sentence, without local paths, tool names, or raw errors:
 
 ```
-⚠️ File-mutation verifier: 3 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
-  • concepts/automatic-organization.md — [patch] Could not find match for old_string
-  • concepts/lora.md — [patch] Could not find match for old_string
-  • concepts/rag-pipeline.md — [patch] Could not find match for old_string
+The requested change did not take effect, and I’m blocked.
 ```
 
-Set `file_mutation_verifier: false` (or `HERMES_FILE_MUTATION_VERIFIER=0`) to suppress the footer. The verifier only fires when real failures are outstanding at turn end — a model that retries a failed patch and succeeds within the same turn will not trigger it for that file.
+If the agent already says that exact sentence, Hermes does not duplicate it. If you explicitly ask for the raw file-mutation verifier details or full technical diagnostics for the failed edit, Hermes preserves the detailed diagnostic footer with paths, tool names, and error previews. Set `file_mutation_verifier: false` (or `HERMES_FILE_MUTATION_VERIFIER=0`) to disable the recovery gate and final safety backstop.
 
-**Trust the verifier over the model's summary.** The footer means the listed files were **not** modified on disk, even if the assistant's closing message says the task is done. Common causes:
+The verifier remains conservative: an unreadable, deleted, remote, oversized, or otherwise unverified target stays unresolved. A later successful file-tool result or verified on-disk change clears the failure. Common causes include:
 
 - **Write denied** — path is on the credential denylist or outside `HERMES_WRITE_SAFE_ROOT` (see [File write safety](./security.md#file-write-safety))
 - **Patch mismatch** — `old_string` did not match the file on disk
 - **Syntax gate** — candidate content failed JSON/YAML/TOML validation before write
-
-Example footer when writes are blocked:
-
-```
-⚠️ File-mutation verifier: 2 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
-  • ~/.hermes/cron/jobs.json — [patch] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
-  • ~/.hermes/scripts/monitor.py — [write_file] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
-```
 
 If writes to Hermes state (cron jobs, skills, scripts under `~/.hermes/`) are failing, check whether `HERMES_WRITE_SAFE_ROOT` is set in your environment. For cron changes, use the `cronjob` tool or `hermes cron edit` instead of patching `jobs.json` directly.
 

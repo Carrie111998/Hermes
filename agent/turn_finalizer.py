@@ -46,14 +46,15 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
-# Verification continuation scaffolding flags: verify-on-stop / pre_verify
-# inject a synthetic user nudge to keep the agent going one more turn.
-# These nudges must be stripped from returned/live history to avoid
-# role-alternation breaks and poisoning the resumed transcript. The
-# assistant response is real content and is not flagged. (#65919 §7)
+# Continuation scaffolding flags: verify-on-stop / pre_verify inject only a
+# synthetic user nudge, while mutation recovery flags both the untrusted
+# assistant candidate and its synthetic nudge. Every flagged message must be
+# stripped from returned/live history to avoid false-success persistence,
+# role-alternation breaks, and resumed-transcript poisoning. (#65919 §7)
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_file_mutation_recovery_synthetic",
 )
 
 
@@ -105,12 +106,12 @@ def _record_kanban_budget_exhausted(
         )
 
 
-def _drop_verification_continuation_scaffolding(messages) -> None:
-    """Remove verification-continuation nudge messages from *messages* in place.
+def _drop_verification_continuation_scaffolding(messages: list) -> None:
+    """Remove continuation scaffolding messages from *messages* in place.
 
-    Only the synthetic nudges carry these flags, so this strips just the
-    nudges while preserving the real attempted-final-answer that was
-    persisted to state.db.
+    Verify-on-stop and pre_verify preserve their unflagged attempted final
+    answer. Mutation recovery deliberately flags its candidate too because it
+    may falsely claim a failed edit succeeded.
     """
     messages[:] = [
         m for m in messages
@@ -234,6 +235,38 @@ def finalize_turn(
         )
     )
 
+    _response_transformed = False
+    _pre_transform_response = None
+    _failed_mutations = {}
+
+    # File-mutation verifier user-facing backstop. Apply it before persistence
+    # so an unresolved edit cannot leave a false success claim in the durable
+    # transcript even when the displayed final is corrected later.
+    if not interrupted:
+        try:
+            _failed_mutations = (
+                agent._unresolved_file_mutation_failures()
+                if agent._file_mutation_verifier_enabled()
+                else {}
+            )
+            if _failed_mutations:
+                # The model stopped, but the requested operation did not
+                # complete. Keep delivery healthy while preventing automation
+                # consumers from advancing this as a completed turn.
+                completed = False
+                _before_mutation_notice = final_response or ""
+                _after_mutation_notice = agent._apply_file_mutation_failure_notice(
+                    _before_mutation_notice,
+                    _failed_mutations,
+                    user_message=original_user_message,
+                )
+                if _after_mutation_notice != _before_mutation_notice:
+                    _pre_transform_response = _before_mutation_notice
+                    _response_transformed = True
+                    final_response = _after_mutation_notice
+        except Exception as _ver_err:
+            logger.debug("file-mutation verifier notice failed: %s", _ver_err)
+
     # Preflight can seed the display count before the provider receives the
     # request. Roll that estimate back only when an interrupt wins the race
     # before any successful provider response. Compaction state remains owned
@@ -299,10 +332,10 @@ def finalize_turn(
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
-        # Drop verification-continuation nudges (synthetic user messages)
-        # from the live history before the tail-assistant check — only the
-        # nudges need stripping; the assistant candidate persists in
-        # state.db. (#65919 §7)
+        # Drop continuation scaffolding before the tail-assistant check.
+        # Verification gates preserve their unflagged assistant candidates;
+        # mutation recovery also strips its flagged false-success candidate.
+        # (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
 
         # When the turn was interrupted and the last message is a tool
@@ -512,31 +545,6 @@ def finalize_turn(
     else:
         logger.info(_diag_msg, *_diag_args)
 
-    # File-mutation verifier footer.
-    # If one or more ``write_file`` / ``patch`` calls failed during this
-    # turn and were never superseded by a successful write to the same
-    # path, append an advisory footer to the assistant response.  This
-    # catches the specific case — reported by Ben Eng (#15524-adjacent)
-    # — where a model issues a batch of parallel patches, half of them
-    # fail with "Could not find old_string", and the model summarises
-    # the turn claiming every file was edited.  The user then has to
-    # manually run ``git status`` to catch the lie.  With this footer
-    # the truth is surfaced on every turn, so over-claiming is
-    # structurally impossible past the model.
-    #
-    # Gate: only applied when a real text response exists for this
-    # turn and the user didn't interrupt.  Empty/interrupted turns
-    # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
-        try:
-            _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
-            if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
-                    final_response = final_response.rstrip() + "\n\n" + footer
-        except Exception as _ver_err:
-            logger.debug("file-mutation verifier footer failed: %s", _ver_err)
-
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content
     # after retries, a partial/truncated stream, a still-pending tool
@@ -544,7 +552,7 @@ def finalize_turn(
     # blank or fragmentary response box with no consolidated reason why
     # the agent stopped (#34452).  Surface a single user-visible
     # explanation derived from ``_turn_exit_reason``, mirroring the
-    # file-mutation verifier footer pattern above.
+    # file-mutation verifier backstop pattern above.
     #
     # Gate carefully so healthy turns stay quiet:
     #   - ``text_response(...)`` exits never produce an explanation
@@ -595,9 +603,6 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
-    _response_transformed = False
-    _pre_transform_response = None
-
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
@@ -612,12 +617,27 @@ def finalize_turn(
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
+            _plugin_response_transformed = False
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
-                    _pre_transform_response = final_response
+                    if _pre_transform_response is None:
+                        _pre_transform_response = final_response
                     final_response = _hook_result
                     _response_transformed = True
+                    _plugin_response_transformed = True
                     break  # First non-empty string wins
+
+            # A plugin transform is downstream of persistence and may replace
+            # the concise mutation block. Re-apply the same fail-closed surface
+            # only when a hook actually changed the response; the durable row
+            # already contains the pre-hook blocked result.
+            if _plugin_response_transformed and not interrupted:
+                if _failed_mutations:
+                    final_response = agent._apply_file_mutation_failure_notice(
+                        final_response,
+                        _failed_mutations,
+                        user_message=original_user_message,
+                    )
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
@@ -706,6 +726,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "file_mutation_blocked": bool(_failed_mutations),
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls

@@ -1416,8 +1416,9 @@ DEFAULT_CONFIG = {
         # write_file / patch call failed during the turn and was never
         # superseded by a successful write to the same path.  This catches
         # the "batch of parallel patches, half fail, model claims success"
-        # class of over-claim that otherwise forces users to run
-        # `git status` to verify edits landed.  Set false to suppress.
+        # class of over-claim. Gives the agent one backstage recovery pass,
+        # then fails closed with a concise user-facing block. Set false to
+        # disable both the recovery pass and final backstop.
         "file_mutation_verifier": True,
         # Nous credits status-bar notices (usage bands, grant-spent, depleted /
         # restored).  When false, no credits notices are emitted — balance data
