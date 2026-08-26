@@ -41,6 +41,9 @@ if not PYTHON.exists():
 
 HIDDEN_MARKER = "WAKE-MARKER-canon-7c1f"
 VISIBLE_TEXT = "VISIBLE-ROW something the person typed"
+CHILD_TEXT = "CHILD-ROW written after the compression rotation"
+ALT_TEXT = "ALT-PROFILE-ROW belonging to another profile"
+SESSION_TITLE = "a title a person might type"
 
 
 def enqueue(home: Path, event_id: str, key: str, body: str) -> str:
@@ -124,6 +127,7 @@ def main() -> int:
 
     # A visible row, so "canonical shows more" is not vacuously true.
     conn = sqlite3.connect(str(PROBE_HOME / "state.db"), timeout=10)
+    conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (SESSION_TITLE, key))
     conn.execute(
         "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
         (key, "user", VISIBLE_TEXT, "2026-08-26T10:00:00Z"),
@@ -154,6 +158,11 @@ def main() -> int:
         hidden_rows = [m for m in rows if m.get("display_kind") == "hidden"]
         check("hidden rows are labelled as such, not silently mixed in",
               len(hidden_rows) >= 1, f"{len(hidden_rows)} labelled")
+        # row_id is part of the declared RPC shape, so it has to actually arrive. The raw stamp is
+        # ``_row_id``; a projection checking only the renamed spelling silently carries none.
+        with_ids = [m for m in rows if m.get("row_id") is not None]
+        check("durable rows carry their row_id", len(with_ids) == len(rows),
+              f"{len(with_ids)} of {len(rows)} rows have one")
         check("it reports which session it resolved to",
               canon["result"].get("resolved_session_id") is not None,
               str(canon["result"].get("resolved_session_id")))
@@ -214,6 +223,93 @@ def main() -> int:
     finally:
         owner.close()
 
+    # ── the lineage choice, made executable ──────────────────────────────
+    # canonical_history deliberately returns the LINEAGE rather than the tip-only model history.
+    # Auto-compression ends a session and forks a child, so a marker written before that rotation
+    # lives on the parent. A tip-only read would report it absent -- and "absent" is the one answer
+    # that authorises saying a wake a second time.
+    child = key + "_c"
+    conn = sqlite3.connect(str(PROBE_HOME / "state.db"), timeout=10)
+    conn.execute(
+        "INSERT INTO sessions (id, source, parent_session_id, started_at, message_count) "
+        "VALUES (?, 'tui', ?, ?, 1)",
+        (child, key, "2026-08-26T11:00:00Z"),
+    )
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+        (child, "user", CHILD_TEXT, "2026-08-26T11:00:01Z"),
+    )
+    conn.commit()
+    conn.close()
+
+    compressed = Gateway("C", PROBE_HOME)
+    try:
+        answer = compressed.call("session.canonical_history", {"session_id": key})
+        ok = "result" in answer
+        check("canonical_history answers on a compressed parent", ok,
+              json.dumps(answer.get("error", ""))[:160])
+        if ok:
+            result = answer["result"]
+            check("it resolves the parent forward to the compression child",
+                  result.get("resolved_session_id") == child,
+                  f"resolved={result.get('resolved_session_id')} expected={child}")
+            rows = result["messages"]
+            check("the pre-compression hidden marker is STILL evidence",
+                  count_marker(rows, HIDDEN_MARKER) == 1,
+                  f"{count_marker(rows, HIDDEN_MARKER)} -- a tip-only read would say 0")
+            check("and the child's own later row is there too",
+                  count_marker(rows, CHILD_TEXT) == 1)
+    finally:
+        compressed.close()
+
+    # ── profile isolation ────────────────────────────────────────────────
+    # A profile-scoped read must open THAT profile's state.db. Reading the launch profile's
+    # transcript while being asked about another one would be evidence from the wrong machine's
+    # worth of conversation.
+    alt_home = PROBE_HOME / "profiles" / "alt"
+    (alt_home).mkdir(parents=True, exist_ok=True)
+    alt_key = "20260826_000000_altses"
+    # Built by Hermes' own SessionDB rather than by copying DDL out of the live database. Reading
+    # sqlite_master from a file that gateway processes keep opening and closing produced an
+    # intermittent SQLITE_IOERR -- and a probe that fails for reasons unrelated to its subject is
+    # worse than no probe.
+    subprocess.run(
+        [str(PYTHON), "-c",
+         "import sys;from pathlib import Path;from hermes_state import SessionDB;"
+         "db=SessionDB(db_path=Path(sys.argv[1]));db.close()",
+         str(alt_home / "state.db")],
+        cwd=str(REPO), capture_output=True, text=True, check=True,
+    )
+    alt_db = sqlite3.connect(str(alt_home / "state.db"), timeout=30)
+    alt_db.execute(
+        "INSERT INTO sessions (id, source, started_at, message_count) VALUES (?, 'tui', ?, 1)",
+        (alt_key, "2026-08-26T12:00:00Z"),
+    )
+    alt_db.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+        (alt_key, "user", ALT_TEXT, "2026-08-26T12:00:01Z"),
+    )
+    alt_db.commit()
+    alt_db.close()
+
+    scoped = Gateway("P", PROBE_HOME)
+    try:
+        answer = scoped.call("session.canonical_history", {"session_id": alt_key, "profile": "alt"})
+        ok = "result" in answer
+        check("a profile-scoped read finds the other profile's session", ok,
+              json.dumps(answer.get("error", ""))[:200])
+        if ok:
+            rows = answer["result"]["messages"]
+            check("and returns ITS transcript", count_marker(rows, ALT_TEXT) == 1,
+                  f"{len(rows)} rows")
+            check("and not the launch profile's", count_marker(rows, HIDDEN_MARKER) == 0)
+        # The same id must NOT be found without the profile, or the scoping proves nothing.
+        unscoped = scoped.call("session.canonical_history", {"session_id": alt_key})
+        check("and that session is invisible without the profile",
+              unscoped.get("error", {}).get("code") == 4007, json.dumps(unscoped)[:140])
+    finally:
+        scoped.close()
+
     # ── an unknown session is an answer, not a crash ─────────────────────
     last = Gateway("U", PROBE_HOME)
     try:
@@ -221,6 +317,12 @@ def main() -> int:
         check("an unknown session is refused cleanly",
               missing.get("error", {}).get("code") == 4007,
               json.dumps(missing)[:160])
+        # EXACT ADDRESSING. session.resume accepts a title because a person types one; an evidence
+        # API must not, or a stale or colliding title silently answers about a different
+        # conversation and a machine reader has no way to notice.
+        titled = last.call("session.canonical_history", {"session_id": SESSION_TITLE})
+        check("a title is NOT accepted as a session id",
+              titled.get("error", {}).get("code") == 4007, json.dumps(titled)[:160])
         blank = last.call("session.canonical_history", {})
         check("and a missing id is refused cleanly",
               blank.get("error", {}).get("code") == 4006, json.dumps(blank)[:160])

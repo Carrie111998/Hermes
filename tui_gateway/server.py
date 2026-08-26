@@ -8292,7 +8292,11 @@ def _canonical_messages(history: list[dict]) -> list[dict]:
         for key in ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items"):
             if m.get(key):
                 row[key] = True
-        for key in ("row_id", "message_row_id"):
+        # ``_row_id`` is the raw stamp SessionDB puts on persisted rows; the display projection
+        # renames it to ``row_id`` on the way out. Checking only the renamed spelling meant this
+        # projection silently never carried one, which matters now that row_id is part of a
+        # declared RPC shape external readers may come to depend on.
+        for key in ("_row_id", "row_id", "message_row_id"):
             if m.get(key) is not None:
                 row["row_id"] = m.get(key)
                 break

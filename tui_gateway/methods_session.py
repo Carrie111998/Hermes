@@ -2854,13 +2854,16 @@ def _(rid, params: dict) -> dict:
     try:
         if db is None:
             return _db_unavailable_error(rid, code=5000)
+        # EXACTLY ADDRESSED, with no title fallback.
+        #
+        # session.resume accepts a title because a person types one. This is an evidence API, and
+        # its caller already holds the durable key. Accepting "id, or else whatever a title happens
+        # to resolve to" would let a stale or colliding title return the transcript of a DIFFERENT
+        # conversation -- and a machine reader would have no way to notice it had been answered
+        # about the wrong one.
         found = db.get_session(target)
         if not found:
-            found = db.get_session_by_title(target)
-            if found:
-                target = found["id"]
-            else:
-                return _err(rid, 4007, "session not found")
+            return _err(rid, 4007, "session not found")
 
         # The same tip resolution session.resume performs. A wake delivered before an
         # auto-compression rotation lives on the parent, and a reader anchored on the wrong end of
