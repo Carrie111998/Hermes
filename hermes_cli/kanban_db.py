@@ -3796,7 +3796,8 @@ def set_model_override(
             pass
         else:
             conn.execute(
-                "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
+                "UPDATE tasks SET model_override = ?, provider_override = ?, "
+                "routing_tier = NULL, route_snapshot = NULL WHERE id = ?",
                 (model, provider, task_id),
             )
             _append_event(
