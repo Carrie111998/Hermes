@@ -50,6 +50,9 @@ async def test_handoff_posts_one_visible_anchor_before_message_thread_creation(
         create_thread=AsyncMock(side_effect=AssertionError("unanchored thread path")),
     )
     adapter = _adapter_with_parent(parent)
+    adapter._threads.mark = MagicMock(
+        side_effect=lambda thread_id: events.append(("mark", thread_id))
+    )
 
     result = await adapter.create_handoff_thread(PARENT_ID, "Daily writing prompt")
 
@@ -69,7 +72,9 @@ async def test_handoff_posts_one_visible_anchor_before_message_thread_creation(
                 "reason": THREAD_REASON,
             },
         ),
+        ("mark", "987654321"),
     ]
+    adapter._threads.mark.assert_called_once_with(result)
     parent.send.assert_awaited_once()
     seed_message.create_thread.assert_awaited_once()
     parent.create_thread.assert_not_awaited()
@@ -132,12 +137,31 @@ async def test_handoff_anchor_send_failure_returns_none_without_direct_thread():
         create_thread=AsyncMock(side_effect=AssertionError("unanchored thread path")),
     )
     adapter = _adapter_with_parent(parent)
+    adapter._threads.mark = MagicMock()
 
     result = await adapter.create_handoff_thread(PARENT_ID, "Daily writing prompt")
 
     assert result is None
     parent.send.assert_awaited_once()
     parent.create_thread.assert_not_awaited()
+    adapter._threads.mark.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handoff_anchor_without_create_method_never_marks_participation():
+    parent = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace()),
+        create_thread=AsyncMock(side_effect=AssertionError("unanchored thread path")),
+    )
+    adapter = _adapter_with_parent(parent)
+    adapter._threads.mark = MagicMock()
+
+    result = await adapter.create_handoff_thread(PARENT_ID, "Daily writing prompt")
+
+    assert result is None
+    parent.send.assert_awaited_once()
+    parent.create_thread.assert_not_awaited()
+    adapter._threads.mark.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -150,6 +174,7 @@ async def test_handoff_anchor_thread_failure_returns_none_and_leaves_terse_orpha
         create_thread=AsyncMock(side_effect=AssertionError("unanchored thread path")),
     )
     adapter = _adapter_with_parent(parent)
+    adapter._threads.mark = MagicMock()
 
     result = await adapter.create_handoff_thread(PARENT_ID, "Daily writing prompt")
 
@@ -160,6 +185,21 @@ async def test_handoff_anchor_thread_failure_returns_none_and_leaves_terse_orpha
     )
     seed_message.create_thread.assert_awaited_once()
     parent.create_thread.assert_not_awaited()
+    adapter._threads.mark.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handoff_invalid_parent_id_never_marks_participation():
+    adapter = _adapter_with_parent(SimpleNamespace())
+    adapter._threads.mark = MagicMock()
+
+    result = await adapter.create_handoff_thread("not-a-snowflake", "Daily writing prompt")
+
+    assert result is None
+    client = adapter._client
+    assert client is not None
+    client.get_channel.assert_not_called()
+    adapter._threads.mark.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -179,9 +219,11 @@ async def test_handoff_rejects_unsupported_parent_types(
     )
     parent = UnsupportedParent()
     adapter = _adapter_with_parent(parent)
+    adapter._threads.mark = MagicMock()
 
     result = await adapter.create_handoff_thread(PARENT_ID, "Daily writing prompt")
 
     assert result is None
     parent.send.assert_not_awaited()
     parent.create_thread.assert_not_awaited()
+    adapter._threads.mark.assert_not_called()

@@ -47,4 +47,13 @@ class TestDiscordThreadPersistence:
         assert "aaa" in adapter2._threads
         assert "bbb" in adapter2._threads
 
+    def test_tracker_instance_reloads_marked_handoff_from_temp_home(self, tmp_path):
+        from gateway.platforms.helpers import ThreadParticipationTracker
 
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            tracker = ThreadParticipationTracker("discord")
+            tracker.mark("987654321")
+
+            restarted_tracker = ThreadParticipationTracker("discord")
+
+        assert "987654321" in restarted_tracker

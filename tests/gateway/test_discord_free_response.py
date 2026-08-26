@@ -228,6 +228,72 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
 
 
 @pytest.mark.asyncio
+async def test_marked_handoff_thread_accepts_plain_message_without_mention(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    thread = FakeThread(
+        channel_id=987654321,
+        parent=FakeTextChannel(channel_id=123456789, name="writers-room"),
+    )
+    adapter._threads.mark(str(thread.id))
+
+    admitted = await adapter._handle_message(
+        make_message(channel=thread, content="The scene continues without a mention.")
+    )
+
+    assert admitted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "The scene continues without a mention."
+    assert event.source.chat_id == str(thread.id)
+    assert event.source.thread_id == str(thread.id)
+
+
+@pytest.mark.asyncio
+async def test_unmarked_handoff_thread_rejects_plain_message_without_mention(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    thread = FakeThread(
+        channel_id=987654321,
+        parent=FakeTextChannel(channel_id=123456789, name="writers-room"),
+    )
+
+    admitted = await adapter._handle_message(
+        make_message(channel=thread, content="The scene continues without a mention.")
+    )
+
+    assert admitted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_thread_require_mention_rejects_plain_message_in_marked_thread(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    thread = FakeThread(
+        channel_id=987654321,
+        parent=FakeTextChannel(channel_id=123456789, name="writers-room"),
+    )
+    adapter._threads.mark(str(thread.id))
+
+    admitted = await adapter._handle_message(
+        make_message(channel=thread, content="The scene continues without a mention.")
+    )
+
+    assert admitted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
     """Quote-replies should stay in-channel instead of trying to create a thread."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)

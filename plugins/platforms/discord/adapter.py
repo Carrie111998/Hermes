@@ -7414,6 +7414,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=1440,
                 reason="Hermes session handoff",
             )
+            self._threads.mark(str(thread.id))
             return str(thread.id)
         except Exception as exc:
             logger.warning(
