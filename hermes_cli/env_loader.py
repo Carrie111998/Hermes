@@ -80,6 +80,7 @@ _PROFILE_MANAGED_ENV_KEYS: frozenset[str] = frozenset({
     "HERMES_COPILOT_ACP_ARGS",
     "COPILOT_CLI_PATH",
     "COPILOT_ACP_BASE_URL",
+    "HERMES_DASHBOARD_PUBLIC_URL",
 })
 
 

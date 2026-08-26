@@ -483,6 +483,7 @@ def test_shell_exported_credentials_survive_cleanup(tmp_path, monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "12345:token-from-shell")
     # A profile-managed routing key inherited alongside them IS cleared.
     monkeypatch.setenv("HERMES_ACP_AUTH_METHOD", "cursor_login")
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "http://mini.tailcf05f.ts.net:9119")
 
     load_hermes_dotenv(hermes_home=home)
 
@@ -490,6 +491,7 @@ def test_shell_exported_credentials_survive_cleanup(tmp_path, monkeypatch):
     assert os.getenv("ANTHROPIC_API_KEY") == "sk-ant-from-shell"
     assert os.getenv("TELEGRAM_BOT_TOKEN") == "12345:token-from-shell"
     assert "HERMES_ACP_AUTH_METHOD" not in os.environ
+    assert "HERMES_DASHBOARD_PUBLIC_URL" not in os.environ
 
 
 def test_cleanup_scope_is_the_profile_managed_set():
