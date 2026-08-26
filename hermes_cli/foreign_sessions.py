@@ -348,11 +348,23 @@ def parse_kimi_session(path: Path) -> Dict[str, Any]:
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
             origin = message.get("origin")
-            kind = origin.get("kind") if isinstance(origin, dict) else None
-            # "injection" rows are context wrappers and "task" rows are async
-            # delegation notices — neither is typed input. turn.prompt records
+            # Only rows Kimi tags as typed input are imported. This is an
+            # ALLOWLIST on purpose: role=="user" is a transport role, not a
+            # statement about authorship, and Kimi keeps adding
+            # machine-generated kinds under it. A survey of real wire logs
+            # found "injection" (context wrappers), "task" (async delegation
+            # notices), "system_trigger" (goal-loop nudges),
+            # "background_task" (job-completion notifications) and
+            # "skill_activation" (skill instruction preambles) alongside the
+            # genuine "user" rows — so a denylist both misses kinds shipping
+            # today and fails open on every future one. turn.prompt records
             # duplicate every typed user message and are ignored entirely.
-            if kind in ("injection", "task"):
+            #
+            # A missing ``origin`` is treated as typed input for
+            # backward-compatibility with wires written before Kimi tagged
+            # message provenance; a *present* origin must say "user", which
+            # is what makes this fail closed against protocol drift.
+            if isinstance(origin, dict) and origin.get("kind") != "user":
                 continue
             text = _flatten_blocks(message.get("content"), source="kimi")
             if not text or _is_wrapper_text(text):
@@ -395,6 +407,11 @@ def list_kimi_sessions(root: Optional[Path] = None) -> List[ForeignSession]:
     results: List[ForeignSession] = []
     if not root.is_dir():
         return results
+    # Only the "main" agent's wire is a conversation the user had. Subagent
+    # wires (``agents/agent-0/``, ``agent-1/``, ... — they do exist in real
+    # session dirs) are delegated work, not typed dialogue, and importing
+    # them would surface fragments of one session as separate ones. Layout
+    # observed on Kimi wire protocol 1.5; revisit if that changes.
     for wire in sorted(root.glob("*/*/agents/main/wire.jsonl")):
         parsed = parse_kimi_session(wire)
         if not parsed["turns"]:

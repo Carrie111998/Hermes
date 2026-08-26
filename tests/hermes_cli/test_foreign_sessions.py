@@ -145,9 +145,25 @@ def _write_kimi_fixture(tmp_path, extra_lines=None):
             "origin": {"kind": "user"},
         },
         append_user("Summarize the repo please."),
-        # injected context / async-task notices are not typed input
+        # A wire written before Kimi tagged provenance: no origin at all.
+        # Backward-compatibility says treat it as typed input.
+        {
+            "type": "context.append_message",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "And check the tests."}],
+                "id": "msg_untagged",
+            },
+        },
+        # Every machine-generated kind observed on real wires rides the same
+        # role=="user" transport and must stay out of the imported turns.
         append_user("<system-reminder>injected wrapper", kind="injection"),
         append_user("async delegation finished", kind="task"),
+        append_user("Continue working toward the active goal.", kind="system_trigger"),
+        append_user("<notification>bun run check completed", kind="background_task"),
+        append_user("Skill tool loaded instructions.", kind="skill_activation"),
+        # A kind this parser has never seen — an allowlist must drop it too.
+        append_user("some future machine row", kind="totally_new_kind"),
         loop_event({"type": "step.begin", "turnId": "0", "step": 1}),
         loop_event(
             {"type": "content.part", "part": {"type": "think", "think": "secret reasoning"}}
@@ -165,6 +181,16 @@ def _write_kimi_fixture(tmp_path, extra_lines=None):
         ),
         loop_event(
             {"type": "tool.result", "toolCallId": "tool_1", "result": {"output": "ok"}}
+        ),
+        # A second call back-to-back: the two bracketed summaries must stay
+        # readable once _merge_turns folds them into one assistant turn.
+        loop_event(
+            {
+                "type": "tool.call",
+                "name": "Read",
+                "args": {"path": "README.md"},
+                "toolCallId": "tool_2",
+            }
         ),
         loop_event(
             {
@@ -369,13 +395,48 @@ def test_parse_kimi_session(tmp_path):
     all_text = "\n".join(t["content"] for t in turns)
     # the typed message appears exactly once (turn.prompt duplicate ignored)
     assert all_text.count("Summarize the repo please.") == 1
-    # injection/task-origin user rows are not typed input
+    # non-"user" origin rows are not typed input
     assert "system-reminder" not in all_text
     assert "async delegation" not in all_text
+    # an untagged row (pre-provenance wire) still counts as typed input
+    assert "And check the tests." in all_text
     # thinking stays out; the tool call is a bracketed assistant summary
     assert "secret reasoning" not in all_text
     assert "[ran tool: Bash]" in all_text
     assert all(set(t) == {"role", "content"} for t in turns)
+
+
+def test_kimi_origin_filter_is_an_allowlist_not_a_denylist(tmp_path):
+    """Every machine-generated ``role=="user"`` kind must stay out.
+
+    role=="user" is a transport role, not a claim about authorship: Kimi
+    ships several machine-generated kinds on it, and a denylist of the two
+    known ones both missed kinds already in the wild and would fail open on
+    every kind added later.
+    """
+    f = _write_kimi_fixture(tmp_path)
+    all_text = "\n".join(t["content"] for t in parse_kimi_session(f)["turns"])
+
+    assert "Continue working toward the active goal." not in all_text
+    assert "bun run check completed" not in all_text
+    assert "Skill tool loaded instructions." not in all_text
+    # the point of the allowlist: an unknown future kind is dropped by default
+    assert "some future machine row" not in all_text
+
+
+def test_kimi_adjacent_tool_calls_stay_readable_when_merged(tmp_path):
+    """Two back-to-back tool calls must not run together into one blob.
+
+    Each call becomes a synthetic assistant row that ``_merge_turns`` folds
+    into its neighbors; the join has to keep the bracketed names separate.
+    """
+    f = _write_kimi_fixture(tmp_path)
+    all_text = "\n".join(t["content"] for t in parse_kimi_session(f)["turns"])
+
+    assert "[ran tool: Bash]" in all_text
+    assert "[ran tool: Read]" in all_text
+    assert "[ran tool: Bash][ran tool: Read]" not in all_text
+    assert "[ran tool: Bash]\n\n[ran tool: Read]" in all_text
 
 
 def test_parse_kimi_session_skips_malformed_lines(tmp_path):
