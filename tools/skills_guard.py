@@ -174,8 +174,12 @@ THREAT_PATTERNS = [
      "reads secret via Ruby ENV[]"),
 
     # ── Exfiltration: DNS and staging ──
-    # Do not match flag names such as llama.cpp `--host 127.0.0.1 --port $PORT`.
-    (r'(?<![-/])\b(dig|nslookup|host)\s+[^\n]*\$',
+    # Do not match flag names such as llama.cpp `--host 127.0.0.1 --port $PORT`,
+    # and do not match JS arrow functions like `host => `served on ${host}`` —
+    # the identifier followed by `=>` is a parameter binding, not a DNS lookup,
+    # and the `$` further along the line belongs to a template literal. Real
+    # shell lookups (`host $X.attacker.example`) are unaffected.
+    (r'(?<![-/])\b(dig|nslookup|host)\s+(?!=>)[^\n]*\$',
      "dns_exfil", "critical", "exfiltration",
      "DNS lookup with variable interpolation (possible DNS exfiltration)"),
     (r'>\s*/tmp/[^\s]*\s*&&\s*(curl|wget|nc|python)',

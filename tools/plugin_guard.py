@@ -108,10 +108,23 @@ CODE_EXEMPT_PATTERN_IDS = {
 # actually READING the file still trips ``read_secrets_file`` (critical).
 # ``curl | sh`` install instructions are common in plugin READMEs; keep them
 # at warn tier (caution) rather than an unoverridable block.
+#
+# ``agent_config_mod`` fires on the literal filename AGENTS.md/CLAUDE.md —
+# which is ALSO the documented convention for shipping agent setup guidance
+# inside a plugin repo ("your agent can read this repo's AGENTS.md"). A
+# prose MENTION is not a config WRITE; keep it warn-tier for plugins so
+# legitimate docs don't hard-block installs, while the critical tier still
+# applies to skills (where any such reference is a tamper signal).
+#
+# ``dns_exfil`` targets shell lines like ``host $VAR``; JS template
+# literals such as `served on ${host}` match by accident (the word "host"
+# followed by "$" on one line). Code files get the warn-tier remap; docs
+# keep full severity.
 SEVERITY_REMAP = {
     "binary_file": "high",
     "hermes_env_access": "medium",
     "curl_pipe_shell": "high",
+    "agent_config_mod": "high",
 }
 
 # Structural limits — plugins are real codebases, far larger than skills.
