@@ -2675,6 +2675,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             ):
                 fb_api_mode = "bedrock_converse"
 
+        from agent.fallback_safety import fallback_runtime_block_reason
+
+        runtime_block = fallback_runtime_block_reason(fb, fb_api_mode)
+        if runtime_block is not None:
+            unavailable.add(fb_key)
+            logger.warning("Fallback rejected: %s", runtime_block)
+            return agent._try_activate_fallback(reason)
+
         old_model = agent.model
         old_provider = agent.provider
 
@@ -2694,6 +2702,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        agent._active_fallback_entry = dict(fb)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream

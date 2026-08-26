@@ -633,6 +633,15 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            from agent.fallback_safety import fallback_tool_block_reason
+
+            block_message = fallback_tool_block_reason(
+                agent, function_name, final_args
+            )
+            if block_message is not None:
+                block_error_type = "fallback_safety_block"
+
+        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():

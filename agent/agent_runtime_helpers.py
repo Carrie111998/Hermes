@@ -1787,6 +1787,7 @@ def restore_primary_runtime(agent) -> bool:
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
+        agent._active_fallback_entry = None
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
 
@@ -3214,9 +3215,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
 
+    # Fallback safety is a mandatory runtime boundary independent of plugin
+    # hooks and human approvals. Keep it here so direct invoke_tool callers
+    # cannot bypass the managed sequential/concurrent dispatcher.
+    from agent.fallback_safety import fallback_tool_block_reason
+
+    block_message: Optional[str] = fallback_tool_block_reason(
+        agent, function_name, function_args
+    )
+    block_error_type = "fallback_safety_block"
+
     # Check plugin hooks for a block or approval directive before executing.
-    block_message: Optional[str] = None
-    if not pre_tool_block_checked:
+    if block_message is None and not pre_tool_block_checked:
+        block_error_type = "plugin_block"
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
             block_message, modified_args = _dispatch_pre_tool_call_hooks(
@@ -3245,7 +3256,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 status="blocked",
-                error_type="plugin_block",
+                error_type=block_error_type,
                 error_message=block_message,
                 middleware_trace=list(_tool_middleware_trace),
             )
