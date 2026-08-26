@@ -368,6 +368,18 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "when you need to verify an action's effect."
                 ),
             },
+            "persist_image": {
+                "type": "boolean",
+                "description": (
+                    "If true, save this capture's image to the on-disk "
+                    "image cache so it can be attached or shared later. "
+                    "Off by default: captures are otherwise used only "
+                    "transiently within this tool response and are not "
+                    "written to disk. Set this only when the user has "
+                    "explicitly asked to keep, attach, or share a "
+                    "screenshot."
+                ),
+            },
         },
         "required": ["action"],
     },

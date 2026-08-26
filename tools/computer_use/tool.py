@@ -696,6 +696,10 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
 
 def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
     capture_after = bool(args.get("capture_after"))
+    # B-5 (security-review.md SS3.10): persistence to the on-disk image
+    # cache is opt-in, not automatic -- only when the caller explicitly
+    # asks to keep/attach/share the capture. See _capture_response().
+    persist_image = bool(args.get("persist_image"))
 
     if action == "capture":
         mode = str(args.get("mode", "som"))
@@ -708,7 +712,11 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
                 "window_id": args.get("window_id"),
             })
         cap = backend.capture(**capture_kwargs)
-        return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
+        return _capture_response(
+            cap,
+            max_elements=_coerce_max_elements(args.get("max_elements")),
+            persist=persist_image,
+        )
 
     if action == "wait":
         seconds = float(args.get("seconds", 1.0))
@@ -728,7 +736,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         if not app:
             return json.dumps({"error": "focus_app requires `app`"})
         res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, persist_image)
 
     # cua-driver's typed browser surface is namespaced inside the existing
     # computer_use tool so it cannot collide with native browser/MCP tools.
@@ -868,7 +876,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, persist_image)
 
     if action == "drag":
         has_elements = args.get("from_element") is not None and args.get("to_element") is not None
@@ -886,7 +894,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, persist_image)
 
     if action == "scroll":
         coord = args.get("coordinate") or (None, None)
@@ -899,24 +907,24 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, persist_image)
 
     if action == "type":
         res = backend.type_text(args.get("text", ""),
                                 delivery_mode=delivery_mode, bring_to_front=bring_to_front)
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, persist_image)
 
     if action == "key":
         res = backend.key(args.get("keys", ""),
                           delivery_mode=delivery_mode, bring_to_front=bring_to_front)
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, persist_image)
 
     if action == "set_value":
         value = args.get("value")
         if value is None:
             return json.dumps({"error": "set_value requires `value`"})
         res = backend.set_value(value=str(value), element=args.get("element"))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, persist_image)
 
     # Do NOT alias unknown actions (we never repair bad model output), but
     # name the nearest real action: live QA showed a model emitting
@@ -1166,7 +1174,9 @@ def _coerce_max_elements(value: Any) -> int:
     return n
 
 
-def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
+def _capture_response(
+    cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS, persist: bool = False,
+) -> Any:
     total_elements = len(cap.elements)
     visible_elements = cap.elements[:max_elements]
     truncated_elements = max(0, total_elements - len(visible_elements))
@@ -1195,9 +1205,15 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             or image_dimensions[1] < _MIN_PROVIDER_IMAGE_DIMENSION
         )
     )
+    # B-5 (security-review.md SS3.10): only write the capture to the
+    # on-disk image cache when the caller explicitly opted in via
+    # persist_image=True. Screenshots can contain password managers,
+    # mail, and other D2/D3-class content -- default is transient,
+    # in-context-only, matching the documented "no persistence without
+    # explicit user action" decision.
     screenshot_path = (
         _persist_capture_image(cap)
-        if cap.png_b64 and cap.mode != "ax" and not image_too_small
+        if persist and cap.png_b64 and cap.mode != "ax" and not image_too_small
         else None
     )
 
@@ -1580,6 +1596,7 @@ def _route_capture_through_aux_vision(
 
 def _maybe_follow_capture(
     backend: ComputerUseBackend, res: ActionResult, do_capture: bool,
+    persist_image: bool = False,
 ) -> Any:
     if not do_capture:
         return _text_response(res)
@@ -1604,7 +1621,7 @@ def _maybe_follow_capture(
         logger.warning("follow-up capture failed: %s", e)
         return _text_response(res)
     # Combine action summary with the capture.
-    resp = _capture_response(cap)
+    resp = _capture_response(cap, persist=persist_image)
     if isinstance(resp, dict) and resp.get("_multimodal"):
         # Keep the complete evidence/verdict contract visible when an image is
         # attached; otherwise capture_after would accidentally discard the
@@ -1673,10 +1690,19 @@ _MAX_CAPTURE_FILES = 20
 def _persist_capture_image(cap: CaptureResult) -> Optional[str]:
     """Save a capture in Hermes' media cache and return its absolute path.
 
-    Captures are normally embedded only in the model's tool context. Persisting
-    a bounded copy gives attachment-capable surfaces a real file to deliver
-    when the user explicitly asks for the screenshot. This is best-effort: an
-    unwritable cache must never break computer control.
+    Called only when the caller opted in via ``persist_image=True`` (see
+    ``_capture_response`` / B-5, security-review.md SS3.10) -- captures are
+    otherwise embedded only in the model's tool context and never touch
+    disk. Persisting a bounded copy gives attachment-capable surfaces a
+    real file to deliver when the user explicitly asked for the
+    screenshot. This is best-effort: an unwritable cache must never break
+    computer control.
+
+    Retention is bounded two ways: a file-count cap (below, always
+    active) and a time-based sweep triggered right here on every write --
+    not just via the gateway's hourly housekeeping thread, which a
+    CLI-only session may never start (see cleanup_image_cache in
+    gateway.platforms.base).
     """
     if not cap.png_b64:
         return None
@@ -1706,6 +1732,17 @@ def _persist_capture_image(cap: CaptureResult) -> Optional[str]:
 
         path = cache_dir / f"computer_use_{_uuid.uuid4().hex}{ext}"
         path.write_bytes(raw)
+
+        # Self-triggered time-based sweep so retention doesn't depend on
+        # the gateway housekeeping thread being alive. Best-effort: a
+        # sweep failure must never fail the capture itself.
+        try:
+            from gateway.platforms.base import cleanup_image_cache
+
+            cleanup_image_cache()
+        except Exception:
+            pass
+
         return str(path)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("computer_use: screenshot persistence failed: %s", exc)

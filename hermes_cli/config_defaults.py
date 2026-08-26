@@ -2467,6 +2467,14 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
+        # Hours to keep persisted images (including opt-in computer_use
+        # screenshots, see tools/computer_use/tool.py's persist_image
+        # parameter) in the on-disk image cache before they're deleted.
+        # Enforced both by the gateway's hourly housekeeping sweep and by
+        # a sweep triggered on every persisted write, so a CLI-only
+        # session (no gateway thread) still gets time-based expiry, not
+        # just the separate file-count cap.
+        "image_cache_max_age_hours": 24,
     },
 
     "cron": {

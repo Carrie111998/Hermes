@@ -964,12 +964,47 @@ def _cleanup_cache_dir(cache_dir: Path, max_age_hours: int) -> int:
     return removed
 
 
-def cleanup_image_cache(max_age_hours: int = 24) -> int:
+DEFAULT_IMAGE_CACHE_MAX_AGE_HOURS = 24
+
+
+def get_image_cache_max_age_hours() -> int:
+    """
+    Retention period (hours) for the image cache, incl. persisted
+    computer_use screenshots (B-5, security-review.md SS3.10).
+
+    Reads ``security.image_cache_max_age_hours`` from config.yaml.
+    Non-fatal if config is unreadable or the value is missing/unparseable
+    -- falls back to DEFAULT_IMAGE_CACHE_MAX_AGE_HOURS. This turns what
+    used to be an undocumented function-default constant into an
+    explicit, configurable security decision.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly as _load_config
+        cfg = _load_config()  # read-only: .get() only, never mutated
+    except Exception:
+        return DEFAULT_IMAGE_CACHE_MAX_AGE_HOURS
+    sec = cfg.get("security", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(sec, dict) or "image_cache_max_age_hours" not in sec:
+        return DEFAULT_IMAGE_CACHE_MAX_AGE_HOURS
+    try:
+        return int(sec["image_cache_max_age_hours"])
+    except (TypeError, ValueError):
+        return DEFAULT_IMAGE_CACHE_MAX_AGE_HOURS
+
+
+def cleanup_image_cache(max_age_hours: Optional[int] = None) -> int:
     """
     Delete cached images older than *max_age_hours*.
 
+    Defaults to get_image_cache_max_age_hours() (config-driven, see
+    above) rather than a bare constant, so every caller -- the gateway's
+    hourly housekeeping and computer_use's self-triggered sweep alike --
+    honors the same, explicitly documented retention decision.
+
     Returns the number of files removed.
     """
+    if max_age_hours is None:
+        max_age_hours = get_image_cache_max_age_hours()
     return _cleanup_cache_dir(get_image_cache_dir(), max_age_hours)
 
 

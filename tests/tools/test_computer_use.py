@@ -2577,19 +2577,43 @@ class TestCaptureScreenshotPersistence:
     def test_multimodal_capture_exposes_shareable_screenshot(
         self, tmp_path, monkeypatch,
     ):
+        # B-5 (security-review.md SS3.10): persistence is opt-in, so this
+        # test -- which specifically covers the persisted-screenshot path
+        # -- must ask for it explicitly via persist=True.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.computer_use import tool as cu_tool
 
         monkeypatch.setattr(
             cu_tool, "_should_route_through_aux_vision", lambda: False,
         )
-        out = cu_tool._capture_response(self._capture())
+        out = cu_tool._capture_response(self._capture(), persist=True)
 
         screenshot_path = out["meta"]["screenshot_path"]
         assert screenshot_path in out["text_summary"]
         assert "MEDIA:" not in out["text_summary"]
         assert screenshot_path.startswith(str(tmp_path / "cache" / "images"))
         assert Path(screenshot_path).read_bytes() == base64.b64decode(self._PNG_B64)
+
+    def test_capture_without_persist_flag_does_not_write_to_disk(
+        self, tmp_path, monkeypatch,
+    ):
+        # B-5 (security-review.md SS3.10): the documented decision is
+        # "flüchtig, keine Persistenz ohne ausdrückliche
+        # Nutzerentscheidung" -- verify the actual default behavior
+        # matches that decision, not just the opt-in path when it's
+        # requested.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setattr(
+            cu_tool, "_should_route_through_aux_vision", lambda: False,
+        )
+        out = cu_tool._capture_response(self._capture())  # persist defaults to False
+
+        assert "screenshot_path" not in out.get("meta", {})
+        cache_dir = tmp_path / "cache" / "images"
+        written = list(cache_dir.glob("computer_use_*.*")) if cache_dir.exists() else []
+        assert written == []
 
     def test_capture_cache_is_bounded(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
