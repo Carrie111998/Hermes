@@ -2399,6 +2399,7 @@ DEFAULT_CONFIG = {
 
     # Mattermost platform settings (gateway mode)
     "mattermost": {
+        "command_prefix": "!",          # Alternate prefix for typed Hermes commands; "" disables it
         "require_mention": True,       # Require @mention to respond in channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)

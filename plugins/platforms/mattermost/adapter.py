@@ -86,6 +86,36 @@ def _with_mentions_disabled(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _rewrite_known_typed_command(text: str, prefix: str) -> str:
+    """Rewrite a known Mattermost-friendly command prefix to ``/``.
+
+    Mattermost clients intercept unregistered slash commands before they
+    reach the WebSocket. Only rewrite commands the gateway can dispatch so
+    ordinary prose such as ``!important`` remains normal text.
+    """
+    if not prefix or not text.startswith(prefix):
+        return text
+
+    remainder = text[len(prefix):]
+    if not remainder or remainder[:1].isspace():
+        return text
+
+    try:
+        from hermes_cli.commands import is_gateway_known_command
+
+        first_token = remainder.split(maxsplit=1)[0]
+        command_name = first_token.split("@", 1)[0].lower()
+        if (
+            command_name
+            and "/" not in command_name
+            and is_gateway_known_command(command_name)
+        ):
+            return "/" + remainder
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return text
+
+
 def check_mattermost_requirements() -> bool:
     """Return True if the Mattermost adapter runtime dependency is available."""
     try:
@@ -114,6 +144,9 @@ class MattermostAdapter(BasePlatformAdapter):
     """Gateway adapter for Mattermost (self-hosted or cloud)."""
 
     splits_long_messages = True  # send() chunks via truncate_message(MAX_POST_LENGTH)
+    # Mattermost intercepts typed native slash commands. This alternate
+    # prefix reaches Hermes and is normalized only for registered commands.
+    typed_command_prefix = "!"
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.MATTERMOST)
@@ -126,6 +159,14 @@ class MattermostAdapter(BasePlatformAdapter):
 
         self._bot_user_id: str = ""
         self._bot_username: str = ""
+        command_prefix = config.extra.get("command_prefix", "!")
+        self._command_prefix = (
+            command_prefix.strip() if isinstance(command_prefix, str) else "!"
+        )
+        # Shared gateway prompts interpolate typed_command_prefix. When the
+        # alternate prefix is disabled, advertise the native slash form rather
+        # than rendering invalid bare commands such as ``approve``.
+        self.typed_command_prefix = self._command_prefix or "/"
 
         # aiohttp session + websocket handle
         self._session: Any = None  # aiohttp.ClientSession
@@ -928,6 +969,14 @@ class MattermostAdapter(BasePlatformAdapter):
         ):
             thread_id = post_id
 
+        # Mattermost clients reserve typed slash commands for native
+        # integrations. Normalize the configured alternate prefix only when
+        # it names a registered gateway/plugin command, matching Slack's
+        # behavior and preserving ordinary prose such as ``!important``.
+        message_text = _rewrite_known_typed_command(
+            message_text, self._command_prefix
+        )
+
         # Determine message type.
         file_ids = post.get("file_ids") or []
         msg_type = MessageType.TEXT
@@ -1215,8 +1264,8 @@ def interactive_setup() -> None:
     print()
     print_info("📬 Home Channel: where Hermes delivers cron job results and notifications.")
     print_info("   To get a channel ID: click channel name → View Info → copy the ID")
-    print_info("   You can also set this later by typing /set-home in a Mattermost channel.")
-    home_channel = prompt("Home channel ID (leave empty to set later with /set-home)").strip()
+    print_info("   You can also set this later by typing !sethome in a Mattermost channel.")
+    home_channel = prompt("Home channel ID (leave empty to set later with !sethome)").strip()
     if home_channel:
         save_env_value("MATTERMOST_HOME_CHANNEL", home_channel)
     else:
@@ -1237,18 +1286,14 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     Mirrors the legacy ``mattermost_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The MattermostAdapter reads its runtime configuration via
-    ``os.getenv()`` for ``MATTERMOST_REQUIRE_MENTION``,
-    ``MATTERMOST_FREE_RESPONSE_CHANNELS``, and
-    ``MATTERMOST_ALLOWED_CHANNELS``.  Rather than rewrite those call sites
-    to read from ``PlatformConfig.extra``, this hook keeps the env-driven
-    model and merely owns the YAML→env translation here, next to the
-    adapter that consumes it.
+    The MattermostAdapter reads mention/channel settings via ``os.getenv()``
+    and receives ``command_prefix`` through ``PlatformConfig.extra``. Rather
+    than teach core ``gateway/config.py`` this platform schema, the hook keeps
+    the translation next to the adapter that consumes it.
 
-    Env vars take precedence over YAML — every assignment is guarded
-    by ``not os.getenv(...)`` so an explicit env var survives a config.yaml
-    update.  Returns ``None`` because no extras are seeded into
-    ``PlatformConfig.extra`` directly (everything flows through env).
+    Env vars take precedence over YAML for the legacy env-backed settings.
+    ``command_prefix`` is behavioral config and intentionally remains a YAML
+    extra rather than a new user-facing environment variable.
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
@@ -1263,7 +1308,12 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    extras = {}
+    if "command_prefix" in mattermost_cfg:
+        prefix = mattermost_cfg["command_prefix"]
+        if isinstance(prefix, str):
+            extras["command_prefix"] = prefix.strip()
+    return extras or None
 
 
 # ---------------------------------------------------------------------------
@@ -1311,12 +1361,9 @@ def register(ctx) -> None:
         # Interactive setup wizard — replaces the central
         # hermes_cli/setup.py::_setup_mattermost function.
         setup_fn=interactive_setup,
-        # YAML→env config bridge — owns the translation of
-        # ``config.yaml`` ``mattermost:`` keys (require_mention,
-        # free_response_channels, allowed_channels) into ``MATTERMOST_*``
-        # env vars that the adapter reads via ``os.getenv()``.  Replaces
-        # the hardcoded block that used to live in ``gateway/config.py``.
-        # Hook contract: #24836 / #25443.
+        # YAML config bridge — owns translation of ``mattermost:`` keys.
+        # Mention/channel settings retain their legacy internal env bridge;
+        # command_prefix is returned as PlatformConfig.extra behavioral config.
         apply_yaml_config_fn=_apply_yaml_config,
         # Auth env vars for _is_user_authorized() integration.
         allowed_users_env="MATTERMOST_ALLOWED_USERS",

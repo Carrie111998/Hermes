@@ -20,6 +20,7 @@ Before setup, here's the part most people want to know: how Hermes behaves once 
 | **Public/private channels** | Hermes responds when you `@mention` it. Without a mention, Hermes ignores the message. |
 | **Threads** | If `MATTERMOST_REPLY_MODE=thread`, Hermes replies in a thread under your message. Thread context stays isolated from the parent channel. |
 | **Shared channels with multiple users** | By default, Hermes isolates session history per user inside the channel. Two people talking in the same channel do not share one transcript unless you explicitly disable that. |
+| **Commands** | Type `!help`, `!model`, etc. because Mattermost reserves `/commands` for native integrations. Only registered Hermes commands are rewritten; ordinary text such as `!important` stays text. |
 
 :::tip
 If you want Hermes to reply as threaded conversations (nested under your original message), set `MATTERMOST_REPLY_MODE=thread`. The default is `off`, which sends flat messages in the channel.
@@ -161,9 +162,12 @@ Optional behavior settings in `~/.hermes/config.yaml`:
 
 ```yaml
 group_sessions_per_user: true
+mattermost:
+  command_prefix: "!"  # Set to "" to disable the alternate prefix
 ```
 
 - `group_sessions_per_user: true` keeps each participant's context isolated inside shared channels and threads
+- `mattermost.command_prefix` sets the typed prefix that Hermes normalizes to `/` for known commands only
 
 ### Start the Gateway
 
@@ -183,9 +187,9 @@ You can run `hermes gateway` in the background or as a systemd service for persi
 
 You can designate a "home channel" where the bot sends proactive messages (such as cron job output, reminders, and notifications). There are two ways to set it:
 
-### Using the Slash Command
+### Using a Command
 
-Type `/sethome` in any Mattermost channel where the bot is present. That channel becomes the home channel.
+Type `!sethome` in any Mattermost channel where the bot is present. That channel becomes the home channel. Mattermost may intercept `/sethome` as an unregistered native command before Hermes receives it.
 
 ### Manual Configuration
 
