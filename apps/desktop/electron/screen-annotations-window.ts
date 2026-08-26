@@ -153,6 +153,13 @@ export function createScreenAnnotationsController({
     // is a one-way door (hud-ipc.ts), which is fine here: it never reopens.
     next.setIgnoreMouseEvents(true)
 
+    // Invisible to screen-capture APIs (macOS sharingType none / Windows
+    // WDA_MONITOR). The live-subtitle loop samples the display this overlay
+    // floats over; an overlay that shows up in that capture OCRs its own
+    // painted translation forever (feedback loop). The user still sees every
+    // mark — capture APIs don't.
+    next.setContentProtection(true)
+
     try {
       next.setVisibleOnAllWorkspaces(true, {
         skipTransformProcessType: true,
