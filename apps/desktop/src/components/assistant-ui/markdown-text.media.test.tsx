@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $connection } from '@/store/session'
@@ -79,3 +79,79 @@ describe('MarkdownImage media routing', () => {
     expect(container.querySelector('audio')).toBeNull()
   })
 })
+
+// Regression for the "fullscreen button does nothing" report: Electron's
+// renderer never services macOS's native media-controls fullscreen button, so
+// chat videos must expose our own HTML5-fullscreen toggle (labeled button +
+// double-click) instead of relying on the native controls.
+describe('MediaAttachment video fullscreen', () => {
+  afterEach(cleanup)
+
+  const renderVideo = async (text = `[clip](#media:%2Ftmp%2Fclip.mp4)`) => {
+    const { container } = render(<MarkdownTextContent isRunning={false} text={text} />)
+
+    await waitFor(() => expect(container.querySelector('video')).not.toBeNull())
+
+    return container
+  }
+
+  it('exposes a labeled Fullscreen button next to the filename', async () => {
+    const container = await renderVideo()
+
+    expect(screen.getByRole('button', { name: 'Fullscreen' })).not.toBeNull()
+    // The native controls stay on for play/seek/volume.
+    expect(container.querySelector('video[controls]')).not.toBeNull()
+  })
+
+  it('requests element fullscreen on the video when clicked', async () => {
+    const container = await renderVideo()
+    const video = container.querySelector('video')!
+
+    const requestFullscreen = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(video, 'requestFullscreen', { configurable: true, value: requestFullscreen })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))
+
+    expect(requestFullscreen).toHaveBeenCalledTimes(1)
+  })
+
+  it('toggles via double-click and exits when already fullscreen', async () => {
+    const container = await renderVideo()
+    const video = container.querySelector('video')!
+
+    const requestFullscreen = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(video, 'requestFullscreen', { configurable: true, value: requestFullscreen })
+    const exitFullscreen = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(window.document, 'exitFullscreen', { configurable: true, value: exitFullscreen })
+    Object.defineProperty(window.document, 'fullscreenElement', {
+      configurable: true,
+      get: () => null
+    })
+
+    fireEvent.doubleClick(video)
+    expect(requestFullscreen).toHaveBeenCalledTimes(1)
+
+    Object.defineProperty(window.document, 'fullscreenElement', {
+      configurable: true,
+      get: () => video
+    })
+
+    fireEvent.doubleClick(video)
+    expect(exitFullscreen).toHaveBeenCalledTimes(1)
+
+    delete (window.document as any).fullscreenElement
+    delete (window.document as any).exitFullscreen
+  })
+
+  it('swallows a rejected requestFullscreen instead of throwing', async () => {
+    const container = await renderVideo()
+
+    Object.defineProperty(container.querySelector('video')!, 'requestFullscreen', {
+      configurable: true,
+      value: vi.fn().mockRejectedValue(new Error('denied'))
+    })
+
+    expect(() => fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))).not.toThrow()
+  })
+})
+

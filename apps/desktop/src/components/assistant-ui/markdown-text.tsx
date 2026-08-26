@@ -8,7 +8,7 @@ import {
   tailBoundedRemend
 } from '@assistant-ui/react-streamdown'
 import type { code as streamdownCode } from '@streamdown/code'
-import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
+import { type ComponentProps, memo, useEffect, useMemo, useRef, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
@@ -208,18 +208,7 @@ function MediaAttachment({ path }: { path: string }) {
   }
 
   if (kind === 'video' && src) {
-    return (
-      <span className="my-3 block max-w-2xl rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3">
-        <span className="mb-2 block truncate text-xs font-medium text-muted-foreground">{name}</span>
-        <video
-          className="block max-h-112 w-full rounded-lg bg-black"
-          controls
-          onError={() => setFailed(true)}
-          src={src}
-        />
-        {failed && <OpenMediaButton kind="video" path={path} />}
-      </span>
-    )
+    return <VideoAttachment failed={failed} name={name} onError={() => setFailed(true)} open={open} src={src} />
   }
 
   return (
@@ -235,6 +224,77 @@ function MediaAttachment({ path }: { path: string }) {
         {failed ? `Open ${name}` : `Loading ${name}...`}
       </a>
       {openFailed && <OpenMediaFailedNote name={name} />}
+    </span>
+  )
+}
+
+// Inline chat video player. Electron's renderer never services macOS's native
+// media-controls fullscreen button (the AVKit-style overlay fullscreen path is
+// a silent no-op in Electron windows), so we drive HTML5 fullscreen ourselves:
+// a labeled button in the header row plus double-click on the video.
+// requestFullscreen works fine in our frameless windows.
+function VideoAttachment({
+  failed,
+  name,
+  onError,
+  open,
+  src
+}: {
+  failed: boolean
+  name: string
+  onError: () => void
+  open: () => void
+  src: string
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen()
+
+      return
+    }
+
+    const element = videoRef.current
+
+    if (!element) {
+      return
+    }
+
+    void element.requestFullscreen().catch(() => {
+      // Fullscreen denied (e.g. window without a screen) — stay inline quietly.
+    })
+  }
+
+  return (
+    <span className="my-3 block max-w-2xl rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3">
+      <span className="mb-2 flex items-center justify-between gap-2">
+        <span className="truncate text-xs font-medium text-muted-foreground">{name}</span>
+        <button
+          className="ref shrink-0 text-xs font-medium text-muted-foreground hover:text-foreground"
+          onClick={toggleFullscreen}
+          type="button"
+        >
+          Fullscreen
+        </button>
+      </span>
+      <video
+        className="block max-h-112 w-full rounded-lg bg-black"
+        controls
+        onDoubleClick={toggleFullscreen}
+        onError={onError}
+        playsInline
+        ref={videoRef}
+        src={src}
+      />
+      {failed && <OpenMediaFailedNote name={name} />}
+      {failed && (
+        <span className="block">
+          <button className="mt-2 ref text-xs font-medium text-muted-foreground hover:text-foreground" onClick={open} type="button">
+            Open video file
+          </button>
+        </span>
+      )}
     </span>
   )
 }
