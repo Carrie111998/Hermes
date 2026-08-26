@@ -58,7 +58,6 @@ from typing import Callable, Dict, Any, Iterator, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
 def get_env_value(name, default=None):
@@ -4507,7 +4506,7 @@ TTS_SCHEMA = {
             },
             "output_path": {
                 "type": "string",
-                "description": f"Optional custom file path to save the audio. Defaults to {display_hermes_home()}/audio_cache/<timestamp>.mp3"
+                "description": "Optional custom file path to save the audio. Defaults to the active profile's audio_cache/<timestamp>.mp3 in the Hermes home"
             },
             "speed": {
                 "type": "number",
