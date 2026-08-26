@@ -184,7 +184,9 @@ function TerminalRailItem({ active, canCloseOthers, index, term, toggleHint }: T
             autoFocus
             onChange={event => setDraftTitle(event.target.value)}
             onKeyDown={event => {
-              if (event.key === 'Enter') {
+              // Skip Enter pressed to commit an IME composition (ja/zh users):
+              // saving mid-composition would take a half-composed name.
+              if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
                 event.preventDefault()
                 saveRename()
               }

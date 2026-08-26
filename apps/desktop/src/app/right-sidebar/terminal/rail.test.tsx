@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $bindings } from '@/store/keybinds'
@@ -101,5 +101,62 @@ describe('TerminalRail', () => {
 
     expect(screen.queryByRole('dialog')).toBeNull()
     expect($terminals.get()[0]?.title).toBe('PowerShell')
+  })
+
+  it('ignores the Enter that commits an IME composition, then saves on the next plain Enter', async () => {
+    render(<TerminalRail />)
+
+    openTabContextMenu('1. PowerShell')
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename…' }))
+
+    const input = await screen.findByRole('textbox')
+    fireEvent.change(input, { target: { value: 'サーバー' } })
+
+    // With a ja/zh IME active, the Enter that ends the composition arrives
+    // flagged as such — saving then would take a half-composed name.
+    const composingEnter = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter' })
+    Object.defineProperty(composingEnter, 'isComposing', { value: true })
+    fireEvent(input, composingEnter)
+    expect(screen.queryByRole('dialog')).not.toBeNull()
+    expect($terminals.get()[0]?.title).toBe('PowerShell')
+
+    // The following plain Enter (composition over) commits normally.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect($terminals.get()[0]).toMatchObject({ auto: false, title: 'サーバー' })
+  })
+
+  it('treats a whitespace-only name like an emptied one, keeping the previous label', async () => {
+    render(<TerminalRail />)
+
+    openTabContextMenu('1. PowerShell')
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename…' }))
+
+    const input = await screen.findByRole('textbox')
+    fireEvent.change(input, { target: { value: '   ' } })
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Save' }))
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect($terminals.get()[0]?.title).toBe('PowerShell')
+  })
+
+  it('focuses the rename input on open and releases it on cancel', async () => {
+    render(<TerminalRail />)
+
+    openTabContextMenu('1. PowerShell')
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename…' }))
+
+    const dialog = await screen.findByRole('dialog')
+    const input = within(dialog).getByRole<HTMLInputElement>('textbox')
+
+    // eslint-disable-next-line no-restricted-globals -- asserting real focus requires the live document
+    await waitFor(() => expect(document.activeElement).toBe(input))
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull()
+      // eslint-disable-next-line no-restricted-globals -- asserting real focus requires the live document
+      expect(document.activeElement).not.toBe(input)
+    })
   })
 })
