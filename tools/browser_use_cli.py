@@ -566,14 +566,9 @@ def _resolve_backend_cdp(
     # configs follow the same runtime contract.
     provider_key = str(getattr(provider, "name", "") or "").strip().lower()
     if provider_key == _BACKEND_KEY:
-        try:
-            from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, read_selection
+        from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, read_selection
 
-            managed_selection = read_selection("browser") == NOUS_MANAGED_PROVIDER
-        except Exception:
-            managed_selection = is_truthy_value(
-                _read_browser_cfg().get("use_gateway"), default=False
-            )
+        managed_selection = read_selection("browser") == NOUS_MANAGED_PROVIDER
         if not managed_selection:
             # Named BU cloud browsers are exclusive to their daemon — no shared
             # tab to isolate from.
