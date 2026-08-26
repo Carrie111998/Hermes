@@ -272,22 +272,22 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     scheduler provider here (no live adapters; delivery falls back to the
     per-platform send path).
 
-    Every local profile's store is ticked, not just this backend's own
-    (#69377's desktop sibling): the desktop pools per-profile backends and
-    reaps them after ~10 idle minutes, so a secondary profile's ticker dies
-    with its backend and that profile's jobs silently stop firing until the
-    user next opens it ("tasks on the sleeping profile could be idle" —
-    community report, Aug 2026). The primary backend outlives the pool, so it
-    owns every profile's tick, exactly like a multiplex gateway. External
-    providers keep the single-store behavior — their registries are not
-    profile-scoped (see _notify_cron_provider_for_profile).
+    Every local profile is a candidate, not an implicit Desktop-owned store.
+    The built-in provider takes a profile-local scheduler ownership lease before
+    recovery, heartbeat, or dispatch. A dedicated or intentional multiplex
+    gateway has higher priority and atomically preempts Desktop fallback. Desktop
+    keeps retrying unowned candidates so it can take over after a lease expires.
 
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the per-store ``cron/.tick.lock`` file lock, so this never double-fires
-    alongside a real gateway or a live pool backend on the same profile home —
-    whichever process grabs the lock first wins the tick.
+    The per-store ``cron/.tick.lock`` remains the short critical section for one
+    tick. It is not scheduler ownership. The ownership mutex is held through the
+    final token check and tick submission, which closes the process-discovery
+    and check-then-execute races.
     """
-    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+    from cron.scheduler_provider import (
+        InProcessCronScheduler,
+        bind_external_scheduler_ownership,
+        resolve_cron_scheduler,
+    )
 
     provider = resolve_cron_scheduler()
 
@@ -297,17 +297,37 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             from hermes_cli.profiles import profiles_to_serve
 
             profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
-                start_kwargs["profile_homes"] = profile_homes
-                _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
-                )
         except Exception:
-            # Fail open to the single-store ticker — the active profile's
-            # jobs must keep firing even if profile enumeration breaks.
-            _log.exception("Desktop cron: profile enumeration failed; ticking active profile only")
+            # Ownership is profile-scoped. If the complete candidate set cannot
+            # be resolved, do not silently tick the active profile under a
+            # possibly wrong Desktop runtime.
+            _log.exception("Desktop cron: profile enumeration failed; scheduler not started")
+            return
+        if not profile_homes:
+            _log.error("Desktop cron: no profile homes resolved; scheduler not started")
+            return
+        start_kwargs.update(
+            profile_homes=profile_homes,
+            owner_kind="desktop-fallback",
+            runtime_id=f"desktop:{os.getpid()}",
+        )
+        _log.info(
+            "Desktop cron scheduler will arbitrate %d profile candidate(s): %s",
+            len(profile_homes),
+            [name for name, _home in profile_homes],
+        )
+    else:
+        from hermes_cli.profiles import get_active_profile_name
+        from hermes_constants import get_hermes_home
+
+        _cron_profile = get_active_profile_name() or "default"
+        provider = bind_external_scheduler_ownership(
+            provider,
+            profile_home=get_hermes_home(),
+            profile=_cron_profile,
+            runtime_id=f"desktop:{os.getpid()}",
+            owner_kind="desktop-fallback",
+        )
 
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
     provider.start(stop_event, **start_kwargs)

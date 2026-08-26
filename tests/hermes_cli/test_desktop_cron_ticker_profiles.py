@@ -10,6 +10,7 @@ every profile's store — the desktop sibling of the multiplex-gateway fix for
 
 from pathlib import Path
 import threading
+import time
 
 import pytest
 
@@ -38,6 +39,9 @@ class _RecordingExternal:
 
     def start(self, stop_event, **kwargs):
         self.start_kwargs = kwargs
+
+    def stop(self):
+        return None
 
 
 @pytest.fixture()
@@ -70,23 +74,23 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     assert builtin.start_kwargs["profile_homes"] == homes
 
 
-def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
+def test_single_profile_still_uses_explicit_ownership(monkeypatch, _providers, tmp_path):
     _sp, builtin = _providers
     import hermes_cli.profiles as profiles_mod
 
-    monkeypatch.setattr(
-        profiles_mod,
-        "profiles_to_serve",
-        lambda **_kw: [("default", tmp_path / "root")],
-    )
+    homes = [("default", tmp_path / "root")]
+    monkeypatch.setattr(profiles_mod, "profiles_to_serve", lambda **_kw: homes)
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=9)
 
-    assert builtin.start_kwargs == {"interval": 9}
+    assert builtin.start_kwargs["interval"] == 9
+    assert builtin.start_kwargs["profile_homes"] == homes
+    assert builtin.start_kwargs["owner_kind"] == "desktop-fallback"
+    assert builtin.start_kwargs["runtime_id"].startswith("desktop:")
 
 
-def test_enumeration_failure_fails_open(monkeypatch, _providers):
-    """The active profile's jobs keep firing even if profile listing breaks."""
+def test_enumeration_failure_fails_closed(monkeypatch, _providers):
+    """Unknown profile scope must not fall back to an unowned active store."""
     _sp, builtin = _providers
     import hermes_cli.profiles as profiles_mod
 
@@ -97,7 +101,36 @@ def test_enumeration_failure_fails_open(monkeypatch, _providers):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=11)
 
-    assert builtin.start_kwargs == {"interval": 11}
+    assert builtin.start_kwargs is None
+
+
+def test_desktop_passes_explicit_fallback_owner_identity(monkeypatch, _providers, tmp_path):
+    _sp, builtin = _providers
+    import hermes_cli.profiles as profiles_mod
+
+    homes = [("default", tmp_path / "root"), ("brand", tmp_path / "brand")]
+    monkeypatch.setattr(profiles_mod, "profiles_to_serve", lambda **_kw: homes)
+
+    ws._start_desktop_cron_ticker(threading.Event(), interval=17)
+
+    assert builtin.start_kwargs["owner_kind"] == "desktop-fallback"
+    assert builtin.start_kwargs["runtime_id"].startswith("desktop:")
+    assert builtin.start_kwargs["profile_homes"] == homes
+
+
+def test_desktop_profile_enumeration_failure_fails_closed(monkeypatch, _providers):
+    _sp, builtin = _providers
+    import hermes_cli.profiles as profiles_mod
+
+    monkeypatch.setattr(
+        profiles_mod,
+        "profiles_to_serve",
+        lambda **_kw: (_ for _ in ()).throw(RuntimeError("profiles unreadable")),
+    )
+
+    ws._start_desktop_cron_ticker(threading.Event(), interval=19)
+
+    assert builtin.start_kwargs is None
 
 
 def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):
@@ -115,6 +148,19 @@ def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):
         lambda **_kw: [("default", tmp_path / "a"), ("b", tmp_path / "b")],
     )
 
-    ws._start_desktop_cron_ticker(threading.Event(), interval=13)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=ws._start_desktop_cron_ticker,
+        args=(stop,),
+        kwargs={"interval": 13},
+    )
+    thread.start()
+    deadline = time.monotonic() + 2
+    while external.start_kwargs is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    thread.join(timeout=5)
 
-    assert external.start_kwargs == {"interval": 13}
+    assert not thread.is_alive()
+    assert external.start_kwargs == {"adapters": None, "loop": None, "interval": 13}
+    assert "profile_homes" not in external.start_kwargs

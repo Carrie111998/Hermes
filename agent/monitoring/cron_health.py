@@ -18,7 +18,7 @@ from cron.jobs import (
     get_ticker_success_age,
     load_jobs,
 )
-from cron.scheduler import get_running_job_ids
+from cron.scheduler import get_running_cron_runs
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
@@ -187,7 +187,7 @@ def build_cron_health_snapshot() -> CronHealthSnapshot:
 
     try:
         metrics.append(
-            GatewayMetric("hermes.cron.jobs.running", len(get_running_job_ids()), {})
+            GatewayMetric("hermes.cron.jobs.running", len(get_running_cron_runs()), {})
         )
     except Exception:
         logger.debug("cron running-job metric unavailable", exc_info=True)

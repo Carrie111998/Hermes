@@ -1157,9 +1157,9 @@ def _try_dispatch_background_run(
         # authoritative (atomic) check is try_register_running_job inside
         # _run_claimed_job on the worker.
         try:
-            from cron.scheduler import get_running_job_ids
+            from cron.scheduler import is_cron_job_running
 
-            if job_id in get_running_job_ids():
+            if is_cron_job_running(job_id):
                 return {
                     "claimed": False,
                     "success": False,

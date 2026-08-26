@@ -2209,6 +2209,41 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     )
 
 
+def _cron_scheduler_start_kwargs(runner, cron_provider, *, loop) -> Dict[str, Any]:
+    """Build an explicit profile/runtime identity for gateway cron ownership."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": loop}
+    if not isinstance(cron_provider, InProcessCronScheduler):
+        return kwargs
+
+    active_profile = runner._active_profile_name()
+    multiplex = bool(getattr(runner.config, "multiplex_profiles", False))
+    if multiplex:
+        profile_homes = _multiplex_profile_homes(runner.config)
+        owner_kind = "gateway-multiplex"
+    else:
+        profile_homes = [(active_profile, get_hermes_home())]
+        owner_kind = "gateway-dedicated"
+
+    served_names = {name for name, _home in profile_homes}
+    per_profile_adapters = {active_profile: runner.adapters}
+    for name, adapter_map in getattr(runner, "_profile_adapters", {}).items():
+        if name in served_names:
+            per_profile_adapters[name] = adapter_map
+
+    kwargs.update(
+        profile_homes=profile_homes,
+        profile_adapters=per_profile_adapters,
+        owner_kind=owner_kind,
+        runtime_id=f"gateway:{active_profile}:{os.getpid()}",
+        can_dispatch=lambda: not (
+            runner._draining or runner._external_drain_active
+        ),
+    )
+    return kwargs
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -8619,8 +8654,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         can't be imported (e.g. a minimal test double for this class).
         """
         try:
-            from cron.scheduler import get_running_job_ids
-            return len(get_running_job_ids())
+            from cron.scheduler import get_running_cron_runs
+            return len(get_running_cron_runs())
         except Exception:
             return 0
 
@@ -8849,9 +8884,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # mid-job freeze. Here an unreadable source counts as work (sentinel 1)
         # so the machine stays awake until the source is readable again.
         try:
-            from cron.scheduler import get_running_job_ids
+            from cron.scheduler import get_running_cron_runs
 
-            cron_count = len(get_running_job_ids())
+            cron_count = len(get_running_cron_runs())
         except Exception:  # noqa: BLE001 - unreadable source => assume busy
             logger.debug("scale-to-zero: cron work count unreadable — staying awake", exc_info=True)
             cron_count = 1
@@ -31539,6 +31574,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler,
+        bind_external_scheduler_ownership,
         resolve_cron_scheduler,
         scheduler_for_profile_mode,
     )
@@ -31548,39 +31584,27 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         resolve_cron_scheduler(),
         multiplex_profiles=multiplex_cron,
     )
-    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
-
-    # Multiplex profiles: tell the built-in ticker which profile homes to
-    # tick so secondary-profile cron jobs actually fire (#69377).
-    # Without this, only the process-global HERMES_HOME (default profile)
-    # is iterated and every secondary profile's cron store is silently
-    # ignored — jobs show as "scheduled" with a valid next_run_at but
-    # never execute because no ticker owns that store.
-    if (
-        isinstance(cron_provider, InProcessCronScheduler)
-        and multiplex_cron
-    ):
-        try:
-            profile_homes = _multiplex_profile_homes(runner.config)
-            if profile_homes:
-                cron_start_kwargs["profile_homes"] = profile_homes
-                logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
-                    len(profile_homes),
-                    [p[0] if isinstance(p, tuple) else p for p in profile_homes],
-                )
-        except Exception as exc:
-            logger.warning(
-                "Could not resolve profile homes for multiplex cron: %s",
-                exc,
-            )
-
-    # External cron providers own their remote scheduling contract. Only the
-    # in-process ticker polls local due jobs, so only it receives the local
-    # external-drain dispatch gate.
+    if not isinstance(cron_provider, InProcessCronScheduler):
+        _cron_profile = runner._active_profile_name()
+        cron_provider = bind_external_scheduler_ownership(
+            cron_provider,
+            profile_home=get_hermes_home(),
+            profile=_cron_profile,
+            runtime_id=f"gateway:{_cron_profile}:{os.getpid()}",
+            owner_kind="gateway-dedicated",
+        )
+    cron_start_kwargs = _cron_scheduler_start_kwargs(
+        runner,
+        cron_provider,
+        loop=asyncio.get_running_loop(),
+    )
     if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
+        _owned_candidates = cron_start_kwargs.get("profile_homes", [])
+        logger.info(
+            "Cron scheduler will arbitrate %d profile candidate(s) as %s: %s",
+            len(_owned_candidates),
+            cron_start_kwargs.get("owner_kind"),
+            [p[0] if isinstance(p, tuple) else p for p in _owned_candidates],
         )
     cron_thread = threading.Thread(
         target=cron_provider.start,

@@ -56,6 +56,9 @@ def is_multiplex_active() -> bool:
 _SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
     "_SECRET_SCOPE", default=None
 )
+_SECRET_SCOPE_AUTHORITATIVE: ContextVar[bool] = ContextVar(
+    "_SECRET_SCOPE_AUTHORITATIVE", default=False
+)
 
 
 class UnscopedSecretError(RuntimeError):
@@ -82,9 +85,36 @@ def reset_secret_scope(token: Token) -> None:
     _SECRET_SCOPE.reset(token)
 
 
+def set_authoritative_secret_scope(
+    secrets: Optional[Mapping[str, str]],
+) -> tuple[Token, Token]:
+    """Install a scope whose misses never fall through to process credentials.
+
+    Desktop cron can arbitrate several profiles without enabling the gateway's
+    process-global multiplex mode. This context-local flag gives those cron
+    workers the same fail-closed credential boundary without changing unrelated
+    Desktop turns.
+    """
+    scope_token = _SECRET_SCOPE.set(secrets)
+    authoritative_token = _SECRET_SCOPE_AUTHORITATIVE.set(True)
+    return scope_token, authoritative_token
+
+
+def reset_authoritative_secret_scope(tokens: tuple[Token, Token]) -> None:
+    """Restore a scope installed by :func:`set_authoritative_secret_scope`."""
+    scope_token, authoritative_token = tokens
+    _SECRET_SCOPE_AUTHORITATIVE.reset(authoritative_token)
+    _SECRET_SCOPE.reset(scope_token)
+
+
 def current_secret_scope() -> Optional[Mapping[str, str]]:
     """Return the active secret mapping, or None when no scope is installed."""
     return _SECRET_SCOPE.get()
+
+
+def is_secret_scope_authoritative() -> bool:
+    """Whether scope misses must not read or mutate process-global secrets."""
+    return _SECRET_SCOPE_AUTHORITATIVE.get()
 
 
 # ── genuinely-global env vars (NOT per-profile secrets) ──────────────────
@@ -178,7 +208,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE:
+        if _MULTIPLEX_ACTIVE or _SECRET_SCOPE_AUTHORITATIVE.get():
             return default
         # Multiplex off: the scope is an overlay over the process environment,
         # not an isolation boundary — there is no other profile to leak from.

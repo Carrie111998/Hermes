@@ -946,6 +946,26 @@ class TestRunJobSessionPersistence:
         # reset MUST precede the reload, else _APPLIED_HOMES no-ops the re-pull.
         assert call_order[:2] == ["reset", "load"], call_order
 
+    def test_authoritative_scope_skips_profile_dotenv_helper(self, tmp_path):
+        from agent.secret_scope import (
+            reset_authoritative_secret_scope,
+            set_authoritative_secret_scope,
+        )
+        from cron.scheduler import _reload_cron_dotenv_if_safe
+
+        tokens = set_authoritative_secret_scope({"PROFILE_ONLY": "brand"})
+        try:
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache") as reset_cache, \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv") as reload_env:
+                reloaded = _reload_cron_dotenv_if_safe(reset_external_cache=True)
+        finally:
+            reset_authoritative_secret_scope(tokens)
+
+        assert reloaded is False
+        reset_cache.assert_not_called()
+        reload_env.assert_not_called()
+
     def test_run_job_clears_stale_auto_delivery_thread_id_between_jobs(self, tmp_path, monkeypatch):
         jobs = [
             {

@@ -99,12 +99,13 @@ class TestMarkRunningJobsInterrupted:
     def test_sets_interrupted_flag_for_consumption_by_run_one_job(self):
         import cron.scheduler as sched
 
-        sched._running_job_ids.add("job-1")
+        run_key = sched._cron_run_key("job-1")
+        sched._running_job_ids.add(run_key)
 
         with patch("cron.scheduler.mark_job_run"):
             sched.mark_running_jobs_interrupted("shutdown")
 
-        assert "job-1" in sched._interrupted_job_ids
+        assert run_key in sched._interrupted_job_ids
 
     def test_one_job_marking_failure_does_not_block_the_others(self):
         """mark_job_run raising for one job (e.g. a jobs.json write race)
@@ -150,8 +151,9 @@ class TestMarkRunningJobsInterrupted:
             replacement = {**claimed, "fire_claim": replacement_claim}
             jobs.save_jobs([replacement])
 
-            sched._running_job_ids.add(created["id"])
-            sched._running_fire_owners[created["id"]] = {
+            run_key = sched._cron_run_key(created["id"], profile_home)
+            sched._running_job_ids.add(run_key)
+            sched._running_fire_owners[run_key] = {
                 object(): (stale_owner, profile_home)
             }
             marked = sched.mark_running_jobs_interrupted("shutdown")
@@ -173,7 +175,8 @@ class TestRunningFireOwnerRegistry:
         }
 
         def _observe_registry(current_job, run):
-            assert list(sched._running_fire_owners[current_job["id"]].values()) == [
+            run_key = sched._cron_run_key(current_job["id"])
+            assert list(sched._running_fire_owners[run_key].values()) == [
                 ("owner-1", sched._get_hermes_home().resolve())
             ]
             return True

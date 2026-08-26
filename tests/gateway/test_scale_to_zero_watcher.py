@@ -438,7 +438,7 @@ def _work_count_runner(monkeypatch, *, agents=0, cron_ids=(), api_runs=0):
         r, "_scale_to_zero_idle_timeout_seconds", lambda: 300.0, raising=False
     )
     monkeypatch.setattr(
-        "cron.scheduler.get_running_job_ids", lambda: set(cron_ids)
+        "cron.scheduler.get_running_cron_runs", lambda: tuple(cron_ids)
     )
     api_adapter = SimpleNamespace(active_agent_work_count=lambda: api_runs)
     from gateway.platforms.base import Platform
@@ -471,7 +471,7 @@ def test_unreadable_cron_source_fails_awake(monkeypatch):
     def _boom():
         raise RuntimeError("registry unavailable")
 
-    monkeypatch.setattr("cron.scheduler.get_running_job_ids", _boom)
+    monkeypatch.setattr("cron.scheduler.get_running_cron_runs", _boom)
     assert r._scale_to_zero_is_idle() is False
 
 
