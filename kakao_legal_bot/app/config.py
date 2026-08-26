@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 
 
 def _env(name: str, default: str = "") -> str:
@@ -231,6 +232,15 @@ class Settings:
     )
     public_base_url: str = field(default_factory=lambda: _env("PUBLIC_BASE_URL").rstrip("/"))
     admin_token: str = field(default_factory=lambda: _env("ADMIN_TOKEN"))
+    # How a finished draft reaches the lawyer. E-mail is for the *client*;
+    # the lawyer reads drafts on a phone, in the same app the consultation
+    # happens in.  full | link | both | off
+    draft_delivery: str = field(default_factory=lambda: _env("DRAFT_DELIVERY", "both").lower())
+    # Above this, the body is not pasted into KakaoTalk — a 20-message wall
+    # is unreadable and the link is better. The notice + link still go.
+    draft_kakao_max_chars: int = field(
+        default_factory=lambda: _env_int("DRAFT_KAKAO_MAX_CHARS", 4000)
+    )
 
     # ── Outbound e-mail (final documents go to the client by e-mail) ─────
     smtp_host: str = field(default_factory=lambda: _env("SMTP_HOST"))
@@ -267,6 +277,19 @@ class Settings:
             self.llm_provider, PROVIDER_CREDENTIALS["anthropic"]
         )
         return getattr(self, key_field), getattr(self, url_field)
+
+    def admin_url(self, path: str = "") -> str:
+        """A one-tap link to the lawyer's own pages, token included.
+
+        The link is only ever sent to the lawyer's own KakaoTalk room. Making
+        them type a token on a phone between hearings means the dashboard
+        does not get opened, and an unread queue is worse than a link in a
+        private chat. Rotate ``ADMIN_TOKEN`` if that room is ever exposed.
+        """
+        if not self.public_base_url or not self.admin_token:
+            return ""
+        separator = "&" if "?" in path else "?"
+        return f"{self.public_base_url}/admin{path}{separator}token={quote(self.admin_token)}"
 
     @property
     def total_answer_budget_s(self) -> float:

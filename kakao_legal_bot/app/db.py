@@ -662,6 +662,72 @@ class Database:
             ),
         )
 
+    # ── dashboard ────────────────────────────────────────────────────────
+    def dashboard_snapshot(self, since: float, room_limit: int = 25) -> dict[str, Any]:
+        """One read for the whole 업무 대시보드.
+
+        The lawyer opens this on a phone between hearings, so it is one
+        query pass and one page — not five endpoints to poke at.
+        """
+
+        def count(sql: str, params: Sequence[Any] = ()) -> int:
+            row = self._query_one(sql, params)
+            return int(row["n"]) if row else 0
+
+        drafts_by_status = {
+            str(row["status"]): int(row["n"])
+            for row in self._query("SELECT status, COUNT(*) AS n FROM drafts GROUP BY status")
+        }
+        rooms = self._query(
+            "SELECT r.*, "
+            "  (SELECT text FROM messages m WHERE m.room_id = r.room_id "
+            "    ORDER BY m.id DESC LIMIT 1) AS last_text, "
+            "  (SELECT role FROM messages m WHERE m.room_id = r.room_id "
+            "    ORDER BY m.id DESC LIMIT 1) AS last_role "
+            "FROM rooms r ORDER BY r.updated_at DESC LIMIT ?",
+            (room_limit,),
+        )
+        return {
+            "today": {
+                "questions": count(
+                    "SELECT COUNT(*) AS n FROM messages WHERE role = 'user' AND created_at >= ?",
+                    (since,),
+                ),
+                "answers": count(
+                    "SELECT COUNT(*) AS n FROM answers WHERE created_at >= ?", (since,)
+                ),
+                "new_rooms": count(
+                    "SELECT COUNT(*) AS n FROM rooms WHERE created_at >= ?", (since,)
+                ),
+                "new_drafts": count(
+                    "SELECT COUNT(*) AS n FROM drafts WHERE created_at >= ?", (since,)
+                ),
+                "slow_answers": count(
+                    "SELECT COUNT(*) AS n FROM answers WHERE created_at >= ? AND latency_ms >= 90000",
+                    (since,),
+                ),
+            },
+            "drafts_by_status": drafts_by_status,
+            "waiting_review": self.list_drafts("pending_review", 20),
+            "waiting_generation": [
+                *self.list_drafts("pending_generation", 20),
+                *self.list_drafts("generating", 20),
+            ],
+            "failed": self.list_drafts("generation_failed", 10),
+            "approved": self.list_drafts("approved", 20),
+            "intakes": self._query(
+                "SELECT * FROM intakes WHERE status IN "
+                "('form_sent','collecting','report_review','quoted') "
+                "ORDER BY updated_at DESC LIMIT 20"
+            ),
+            "escalated": self._query(
+                "SELECT * FROM consultations WHERE status = 'awaiting_lawyer' "
+                "ORDER BY updated_at DESC LIMIT 20"
+            ),
+            "rooms": rooms,
+            "outbox_depth": self.outbox_depth(),
+        }
+
     def count_answers_since(self, room_id: str, since: float) -> int:
         row = self._query_one(
             "SELECT COUNT(*) AS n FROM answers WHERE room_id = ? AND created_at >= ?",

@@ -30,9 +30,10 @@ HELP_LAWYER = """[변호사 전용 명령]
 - /조용        이 방에서 모아 완전 정지 (다시 /재개)
 - /자동        이 방을 1:1 상담방으로 표시 — 호출 없이도 응답 (/수동 으로 해제)
 - /초안        검토 대기 중인 초안 목록
+- /초안 12     12번 초안 본문을 이 방으로 다시 보내기
 - /승인 12     12번 초안 승인 (발송은 별도)
 - /발송 12     12번 초안을 상담자 이메일로 발송
-- /상태        서버 상태"""
+- /상태        서버 상태 · 업무 현황 링크"""
 
 
 async def handle_command(services: Services, event: IrisEvent, decision: Decision) -> None:
@@ -99,6 +100,21 @@ async def handle_command(services: Services, event: IrisEvent, decision: Decisio
         return
 
     if command == "draft_list":
+        # "/초안 12" — send that document back into this room. The lawyer
+        # scrolled past it, or wants to read it again on the phone.
+        wanted = args.strip().lstrip("#")
+        if wanted.isdigit():
+            from .workflows import notify_draft_ready  # local import: avoids a cycle
+
+            draft = await asyncio.to_thread(db.get_draft, int(wanted))
+            if draft is None:
+                await reply(f"#{wanted} 초안을 찾을 수 없습니다.")
+            elif draft.awaiting_worker:
+                await reply(f"#{wanted} 은 아직 작성 중입니다. ({draft.status})")
+            else:
+                await notify_draft_ready(services, int(wanted))
+            return
+
         review = await asyncio.to_thread(db.list_drafts, "pending_review", 10)
         waiting = [
             draft
@@ -122,8 +138,10 @@ async def handle_command(services: Services, event: IrisEvent, decision: Decisio
             for draft in waiting:
                 mark = "작성 실패" if draft.status == "generation_failed" else "대기 중"
                 lines.append(f"#{draft.id} {draft.kind} · {draft.title} ({mark})")
-        if settings.public_base_url:
-            lines.append(f"\n검토/수정: {settings.public_base_url}/admin/drafts")
+        link = settings.admin_url("/drafts")
+        if link:
+            lines.append(f"\n검토·수정: {link}")
+        lines.append("본문을 다시 보시려면 /초안 12 처럼 번호를 붙이세요.")
         await reply("\n".join(lines))
         return
 
@@ -174,6 +192,7 @@ async def handle_command(services: Services, event: IrisEvent, decision: Decisio
             f"- 전송 대기(outbox): {depth}\n"
             f"- 작성 대기 초안: {jobs}\n"
             f"- 검토 대기 초안: {pending}"
+            + (f"\n\n업무 현황: {settings.admin_url()}" if settings.admin_url() else "")
         )
         return
 

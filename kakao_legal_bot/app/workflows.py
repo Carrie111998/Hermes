@@ -105,6 +105,7 @@ async def _queue_for_worker(
         _transcript(history)[-8000:],
     )
     depth = await asyncio.to_thread(services.db.draft_queue_depth)
+    link = services.settings.admin_url()
     await services.sender.notify_lawyer(
         f"📝 초안 요청 접수 #{draft_id} — {request.kind} · {request.title}\n"
         f"방: {room_id}\n"
@@ -112,6 +113,7 @@ async def _queue_for_worker(
         f"---\n{request.instructions[:300]}\n"
         f"PC의 Codex 워커가 작성합니다. 대기 중 {depth}건.\n"
         f"(PC가 꺼져 있으면 켜실 때 처리됩니다)"
+        + (f"\n업무 현황: {link}" if link else "")
     )
     return draft_id
 
@@ -152,23 +154,47 @@ async def _generate_here(
 
 
 async def notify_draft_ready(services: Services, draft_id: int) -> None:
-    """Tell the lawyer a draft is sitting in the review queue."""
+    """Put the finished draft in front of the lawyer — in KakaoTalk.
+
+    E-mail is for the client. The lawyer reads drafts on a phone, between
+    hearings, in the same app the consultation happens in, so the document
+    itself goes to their room and the link is there for editing.
+    """
     draft = await asyncio.to_thread(services.db.get_draft, draft_id)
     if draft is None:
         return
-    preview = " ".join(draft.body.split())[:300]
-    link = (
-        f"\n검토/수정: {services.settings.public_base_url}/admin/drafts/{draft_id}"
-        if services.settings.public_base_url
-        else ""
-    )
-    await services.sender.notify_lawyer(
-        f"📄 초안 준비됨 #{draft_id} — {draft.kind} · {draft.title}\n"
-        f"방: {draft.room_id}\n"
-        f"상담자 이메일: {draft.client_email or '미등록'}\n"
-        f"---\n{preview}…{link}\n"
-        f"승인: /승인 {draft_id}   발송: /발송 {draft_id}"
-    )
+    settings = services.settings
+    mode = settings.draft_delivery
+    if mode == "off":
+        return
+
+    link = settings.admin_url(f"/drafts/{draft_id}")
+    body = draft.body.strip()
+    inline = mode in {"full", "both"} and 0 < len(body) <= settings.draft_kakao_max_chars
+
+    header = [
+        f"📄 초안 준비됨 #{draft_id} — {draft.kind} · {draft.title}",
+        f"방: {draft.room_id}",
+        f"상담자 이메일: {draft.client_email or '미등록'}",
+    ]
+    if not inline:
+        preview = " ".join(body.split())[: settings.lawyer_alert_preview_chars]
+        header.append(f"---\n{preview}…")
+        if body and mode in {"full", "both"}:
+            header.append(f"(본문 {len(body):,}자 — 길어서 링크로 보내드립니다)")
+    if link:
+        header.append(f"검토·수정: {link}")
+    else:
+        # Without a public URL there is no review page, so the KakaoTalk
+        # commands are the only way through. Say so rather than leaving a
+        # dead end.
+        header.append("(PUBLIC_BASE_URL·ADMIN_TOKEN 을 설정하시면 웹에서 수정하실 수 있습니다)")
+    header.append(f"승인: /승인 {draft_id}   발송: /발송 {draft_id}")
+
+    await services.sender.notify_lawyer("\n".join(header))
+    if inline:
+        # A separate message so the document can be copied out on its own.
+        await services.sender.notify_lawyer(f"📄 #{draft_id} {draft.title}\n\n{body}")
 
 
 async def notify_escalation(
@@ -178,11 +204,13 @@ async def notify_escalation(
         await asyncio.to_thread(
             services.db.update_consultation, consult_id, status="awaiting_lawyer"
         )
+    link = services.settings.admin_url()
     await services.sender.notify_lawyer(
         f"🔔 변호사 확인 요청\n"
         f"방: {room_name or room_id}\n"
         f"사유: {escalation.reason}\n"
         f"---\n{escalation.summary[:800]}"
+        + (f"\n\n업무 현황: {link}" if link else "")
     )
 
 
