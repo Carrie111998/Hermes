@@ -179,9 +179,10 @@ class TestSendWithRetryFallback:
             "thread_id": "10802",
             "telegram_dm_topic_reply_fallback": True,
             "direct_messages_topic_id": "10802",
+            "notify": True,
         }
         adapter._send_results = [
-            SendResult(success=False, error="Message thread not found"),
+            SendResult(success=False, error="Bad Request: topic deleted"),
             SendResult(success=True, message_id="parent_dm_ok"),
         ]
 
@@ -191,7 +192,32 @@ class TestSendWithRetryFallback:
 
         assert result.success
         assert len(adapter._send_calls) == 2
-        assert adapter._send_calls[1] == ("chat1", "completed response", None, None)
+        assert adapter._send_calls[1] == (
+            "chat1", "completed response", None, {"notify": True},
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_failure_without_private_dm_fallback_keeps_routing(self):
+        """Forum and group sends retain their normal plain-text fallback."""
+        adapter = _StubAdapter()
+        metadata = {"thread_id": "42", "notify": True}
+        adapter._send_results = [
+            SendResult(success=False, error="Message thread not found"),
+            SendResult(success=True, message_id="generic_fallback_ok"),
+        ]
+
+        result = await adapter._send_with_retry(
+            "chat1", "completed response", reply_to="10782", metadata=metadata,
+        )
+
+        assert result.success
+        assert len(adapter._send_calls) == 2
+        assert adapter._send_calls[1] == (
+            "chat1",
+            "(Response formatting failed, plain text:)\n\ncompleted response",
+            "10782",
+            metadata,
+        )
 
 
 # ---------------------------------------------------------------------------
