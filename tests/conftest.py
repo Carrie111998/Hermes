@@ -10,9 +10,6 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
    real one. (We do NOT also redirect HOME — that broke subprocesses in
    CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
    ``get_hermes_home()`` is a bug to fix at the callsite.)
-2b. **Isolated HERMES_DOTFILES_DIR.** Same reasoning for the dotfiles
-   root, so config-integrity seals land in a tempdir instead of the
-   operator's real ``hermes/config_integrity.jsonl``.
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
@@ -61,61 +58,45 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+_PRE_SANDBOX_DOTFILES_DIR = os.environ.get("HERMES_DOTFILES_DIR", "").strip()
+_PRE_SANDBOX_OBSIDIAN_VAULT = os.environ.get("OBSIDIAN_VAULT", "").strip()
+_PRE_SANDBOX_OBSIDIAN_VAULT_PATH = os.environ.get("OBSIDIAN_VAULT_PATH", "").strip()
+
 if not os.environ.get("HERMES_HOME"):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
-# Same window, same reasoning, for the dotfiles root. The config-integrity
-# watchdog appends one JSONL row per seal to
-# ``$HERMES_DOTFILES_DIR/hermes/config_integrity.jsonl``, resolving that path
-# at call time. Sandboxing HERMES_HOME alone puts the *config* in a tempdir but
-# still writes its seal to the operator's real, git-tracked log — and because
-# the row carries the tempdir's config_path, a consumer that reads the last row
-# then compares it against the live config sees a permanent mismatch. Measured
-# on a live install: 69 of 149 rows came from pytest temp configs, and the
-# operator's infra health check reported CONFIG INTEGRITY FAIL on every run.
 if not os.environ.get("HERMES_DOTFILES_DIR"):
     _SESSION_DOTFILES_DIR = tempfile.mkdtemp(prefix="hermes-test-dotfiles-")
     os.environ["HERMES_DOTFILES_DIR"] = _SESSION_DOTFILES_DIR
     atexit.register(shutil.rmtree, _SESSION_DOTFILES_DIR, True)
 
-#: HERMES_HOME as it stood when conftest was imported - i.e. before any test
-#: module could import code that configures logging. Recorded so the guard in
-#: tests/test_log_isolation.py can assert the sandbox existed AT THAT MOMENT.
-#: Reading os.environ from inside a test is useless here: the per-test
-#: `_isolate_env` fixture has sandboxed it by then, so the check would pass
-#: even with this block removed.
+if not os.environ.get("OBSIDIAN_VAULT"):
+    _SESSION_VAULT = tempfile.mkdtemp(prefix="hermes-test-vault-")
+    os.environ["OBSIDIAN_VAULT"] = _SESSION_VAULT
+    os.environ["OBSIDIAN_VAULT_PATH"] = _SESSION_VAULT
+    atexit.register(shutil.rmtree, _SESSION_VAULT, True)
+
 HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
-
-
-# ── Per-file process isolation ──────────────────────────────────────────────
-# Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
-# ``python -m pytest <file>`` subprocess per test file. Cross-file state
-# leakage (module-level dicts, ContextVars, caches) is impossible: each
-# file gets a clean Python interpreter. Intra-file ordering is the test
-# author's responsibility — if test A in foo.py mutates state that test B
-# in foo.py reads, that's a real bug to fix in the file (it would also
-# bite anyone running ``pytest tests/foo.py`` directly).
-#
-# This replaces the historic _reset_module_state autouse fixture (manual
-# state clearing) and the brief experiment with subprocess-per-test
-# isolation (too slow at ~17k tests).
-#
-# See ``scripts/run_tests_parallel.py`` for the runner.
+HERMES_DOTFILES_DIR_AT_CONFTEST_IMPORT = os.environ.get("HERMES_DOTFILES_DIR", "")
+OBSIDIAN_VAULT_AT_CONFTEST_IMPORT = os.environ.get("OBSIDIAN_VAULT", "")
+OBSIDIAN_VAULT_PATH_AT_CONFTEST_IMPORT = os.environ.get("OBSIDIAN_VAULT_PATH", "")
 
 
 # ── Credential env-var filter ──────────────────────────────────────────────
 #
 # Any env var in the current process matching ONE of these patterns is
-# unset for every test. Developers' local keys cannot leak into assertions
-# about "auto-detect provider when key present".
+# unset for every test and stripped at conftest module-import time.
+# Developers' local keys cannot leak into assertions about "auto-detect
+# provider when key present" or module-level collection imports.
 
 _CREDENTIAL_SUFFIXES = (
     "_API_KEY",
     "_TOKEN",
     "_SECRET",
     "_PASSWORD",
+    "_PASSPHRASE",
     "_CREDENTIALS",
     "_ACCESS_KEY",
     "_SECRET_ACCESS_KEY",
@@ -127,17 +108,21 @@ _CREDENTIAL_SUFFIXES = (
     "_CLIENT_SECRET",
     "_CORP_SECRET",
     "_AES_KEY",
+    "_AUTH_TOKEN",
 )
 
-# Explicit names (for ones that don't fit the suffix pattern)
+# Explicit names (for ones that don't fit the suffix pattern or explicit audit list)
 _CREDENTIAL_NAMES = frozenset({
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
+    "ANTHROPIC_API_KEY",
     "ANTHROPIC_TOKEN",
     "FAL_KEY",
     "GH_TOKEN",
     "GITHUB_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
+    "LINEAR_API_KEY",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
     "NOUS_API_KEY",
@@ -148,10 +133,14 @@ _CREDENTIAL_NAMES = frozenset({
     "MISTRAL_API_KEY",
     "DEEPSEEK_API_KEY",
     "KIMI_API_KEY",
+    "KIMI_CODING_API_KEY",
+    "KIMI_CN_API_KEY",
     "MOONSHOT_API_KEY",
     "GLM_API_KEY",
     "ZAI_API_KEY",
+    "Z_AI_API_KEY",
     "MINIMAX_API_KEY",
+    "MINIMAX_CN_API_KEY",
     "OLLAMA_API_KEY",
     "OPENVIKING_API_KEY",
     "COPILOT_API_KEY",
@@ -161,15 +150,22 @@ _CREDENTIAL_NAMES = frozenset({
     "PARALLEL_API_KEY",
     "EXA_API_KEY",
     "TAVILY_API_KEY",
+    "BRAVE_SEARCH_API_KEY",
+    "CAMOFOX_API_KEY",
+    "KREA_API_KEY",
+    "PORCUPINE_ACCESS_KEY",
     "WANDB_API_KEY",
     "ELEVENLABS_API_KEY",
     "HONCHO_API_KEY",
     "MEM0_API_KEY",
     "SUPERMEMORY_API_KEY",
     "RETAINDB_API_KEY",
+    "BRV_API_KEY",
     "HINDSIGHT_API_KEY",
     "HINDSIGHT_LLM_API_KEY",
     "DAYTONA_API_KEY",
+    "VERCEL_TOKEN",
+    "VERCEL_OIDC_TOKEN",
     "TWILIO_AUTH_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "DISCORD_BOT_TOKEN",
@@ -206,6 +202,35 @@ _CREDENTIAL_NAMES = frozenset({
     "VOICE_TOOLS_OPENAI_KEY",
     "BROWSER_USE_API_KEY",
     "CUSTOM_API_KEY",
+    "NOTION_API_KEY",
+    "AIRTABLE_API_KEY",
+    "TENOR_API_KEY",
+    "HERMES_CONFIG_PASSWORD",
+    "HERMES_CONFIG_PASSPHRASE",
+    "HERMES_LANGFUSE_PUBLIC_KEY",
+    "HERMES_LANGFUSE_SECRET_KEY",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "FIREWORKS_API_KEY",
+    "LM_API_KEY",
+    "ARCEEAI_API_KEY",
+    "GMI_API_KEY",
+    "KILOCODE_API_KEY",
+    "XIAOMI_API_KEY",
+    "UPSTAGE_API_KEY",
+    "TOKENHUB_API_KEY",
+    "AZURE_FOUNDRY_API_KEY",
+    "AZURE_ANTHROPIC_KEY",
+    "AZURE_CLIENT_SECRET",
+    "HF_TOKEN",
+    "DASHSCOPE_API_KEY",
+    "ALIBABA_CODING_PLAN_API_KEY",
+    "DEEPINFRA_API_KEY",
+    "NOVITA_API_KEY",
+    "NVIDIA_API_KEY",
+    "STEPFUN_API_KEY",
+    "OPENCODE_ZEN_API_KEY",
+    "OPENCODE_GO_API_KEY",
     "GATEWAY_PROXY_URL",
     "GEMINI_BASE_URL",
     "OPENAI_BASE_URL",
@@ -215,6 +240,7 @@ _CREDENTIAL_NAMES = frozenset({
     "XAI_BASE_URL",
     "AI_GATEWAY_BASE_URL",
     "ANTHROPIC_BASE_URL",
+    "GMI_BASE_URL",
 })
 
 
@@ -223,6 +249,86 @@ def _looks_like_credential(name: str) -> bool:
     if name in _CREDENTIAL_NAMES:
         return True
     return any(name.endswith(suf) for suf in _CREDENTIAL_SUFFIXES)
+
+
+# Strip credentials at conftest module-import time so collection imports cannot see real credentials
+for _name in list(os.environ.keys()):
+    if _looks_like_credential(_name):
+        os.environ.pop(_name, None)
+
+
+# ── Sandbox HERMES_HOME, HERMES_DOTFILES_DIR, OBSIDIAN_VAULT before ANY test module is imported ──
+# `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
+# `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
+# So merely importing it - which many test modules do, directly or
+# transitively - points the whole pytest session's logging at the operator's
+# real `~/.hermes/logs/agent.log` and `errors.log`.
+#
+# Similarly, watchdog and seal scripts inspect `HERMES_DOTFILES_DIR` and `HERMES_CONFIG`,
+# which if unset default to `~/Dev/dotfiles` and `~/.hermes/config.yaml`, polluting
+# real developer environments during test runs.
+#
+# The `_hermetic_environment` fixture below also sandboxes these paths, but fixtures run
+# AFTER collection imports test modules, by which point handlers and module-level singletons
+# already hold paths.
+#
+# conftest is imported before any test module, so setting them here closes that window.
+#
+# ORDER MATTERS: the kanban write guard's deny-list (further down) must know
+# the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
+# otherwise the deny-list would point at the throwaway tempdir and the guard
+# would silently stop protecting the operator's actual ~/.hermes (#69385).
+_SESSION_SANDBOX_DIR = Path(tempfile.mkdtemp(prefix="hermes-test-sandbox-"))
+atexit.register(shutil.rmtree, str(_SESSION_SANDBOX_DIR), True)
+
+_SESSION_HERMES_HOME = _SESSION_SANDBOX_DIR / "hermes_home"
+_SESSION_HERMES_HOME.mkdir(parents=True, exist_ok=True)
+(_SESSION_HERMES_HOME / "sessions").mkdir(parents=True, exist_ok=True)
+(_SESSION_HERMES_HOME / "cron").mkdir(parents=True, exist_ok=True)
+(_SESSION_HERMES_HOME / "memories").mkdir(parents=True, exist_ok=True)
+(_SESSION_HERMES_HOME / "skills").mkdir(parents=True, exist_ok=True)
+
+_SESSION_DOTFILES_DIR = _SESSION_SANDBOX_DIR / "dotfiles"
+_SESSION_DOTFILES_DIR.mkdir(parents=True, exist_ok=True)
+
+_SESSION_OBSIDIAN_VAULT = _SESSION_SANDBOX_DIR / "obsidian_vault"
+_SESSION_OBSIDIAN_VAULT.mkdir(parents=True, exist_ok=True)
+
+_SESSION_CONFIG_PATH = _SESSION_HERMES_HOME / "config.yaml"
+
+os.environ["HERMES_HOME"] = str(_SESSION_HERMES_HOME)
+os.environ["HERMES_BASE_HOME"] = str(_SESSION_HERMES_HOME)
+os.environ["HERMES_CONFIG_PATH"] = str(_SESSION_CONFIG_PATH)
+os.environ["HERMES_CONFIG"] = str(_SESSION_CONFIG_PATH)
+os.environ["HERMES_DOTFILES_DIR"] = str(_SESSION_DOTFILES_DIR)
+os.environ["HERMES_KANBAN_HOME"] = str(_SESSION_HERMES_HOME)
+os.environ["OBSIDIAN_VAULT"] = str(_SESSION_OBSIDIAN_VAULT)
+os.environ["OBSIDIAN_VAULT_PATH"] = str(_SESSION_OBSIDIAN_VAULT)
+
+#: Values captured at conftest import time before test modules import.
+HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
+HERMES_BASE_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_BASE_HOME", "")
+HERMES_CONFIG_PATH_AT_CONFTEST_IMPORT = os.environ.get("HERMES_CONFIG_PATH", "")
+HERMES_DOTFILES_DIR_AT_CONFTEST_IMPORT = os.environ.get("HERMES_DOTFILES_DIR", "")
+HERMES_KANBAN_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_KANBAN_HOME", "")
+OBSIDIAN_VAULT_AT_CONFTEST_IMPORT = os.environ.get("OBSIDIAN_VAULT", "")
+OBSIDIAN_VAULT_PATH_AT_CONFTEST_IMPORT = os.environ.get("OBSIDIAN_VAULT_PATH", "")
+
+
+# ── Per-file process isolation ──────────────────────────────────────────────
+# Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
+# ``python -m pytest <file>`` subprocess per test file. Cross-file state
+# leakage (module-level dicts, ContextVars, caches) is impossible: each
+# file gets a clean Python interpreter. Intra-file ordering is the test
+# author's responsibility — if test A in foo.py mutates state that test B
+# in foo.py reads, that's a real bug to fix in the file (it would also
+# bite anyone running ``pytest tests/foo.py`` directly).
+#
+# This replaces the historic _reset_module_state autouse fixture (manual
+# state clearing) and the brief experiment with subprocess-per-test
+# isolation (too slow at ~17k tests).
+#
+# See ``scripts/run_tests_parallel.py`` for the runner.
 
 
 # HERMES_* vars that change test behavior by being set. Unset all of these
@@ -439,8 +545,8 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # custom host resolution override/delete this explicitly.
     monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
 
-    # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
-    #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
+    # 3. Redirect HERMES_HOME, HERMES_DOTFILES_DIR, OBSIDIAN_VAULT to per-test tempdirs.
+    #    Code that reads ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
     #
     #    NOTE: We do NOT also redirect HOME. Doing so broke CI because
     #    some tests (and their transitive deps) spawn subprocesses that
@@ -455,15 +561,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
-
-    # 3a. Redirect HERMES_DOTFILES_DIR too. The config-integrity watchdog
-    #     resolves ``$HERMES_DOTFILES_DIR/hermes/config_integrity.jsonl`` at
-    #     call time, so a test that seals a tempdir config still appends to the
-    #     operator's real, git-tracked seal log without this.
     fake_dotfiles = tmp_path / "dotfiles_test"
     (fake_dotfiles / "hermes").mkdir(parents=True)
+
+    fake_vault = tmp_path / "obsidian_vault_test"
+    fake_vault.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
     monkeypatch.setenv("HERMES_DOTFILES_DIR", str(fake_dotfiles))
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(fake_vault))
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(fake_vault))
 
     # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
     #     at import time. When the module is first imported at collection (any

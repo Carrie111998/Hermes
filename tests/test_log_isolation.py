@@ -1,21 +1,17 @@
-"""The test suite must never write into the operator's real Hermes logs.
+"""The test suite must never write into the operator's real Hermes logs or dotfiles,
+and credentials must be strictly isolated at import time.
 
 `hermes_cli/main.py` calls `setup_logging()` at module scope, which resolves
 `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
 Importing it - which many test modules do, directly or transitively - wires
 the whole pytest session's logging to `<HERMES_HOME>/logs/agent.log`.
 
-If HERMES_HOME is not already sandboxed at that moment, that is the
-operator's real log. Measured on a live install, 126 warnings in a personal
-`agent.log` came from test runs rather than the running gateway: phantom
-`FakeTree` Discord failures and `rejected invalid API key` entries from
-`test_api_server_runs.py`. Noise like that makes genuine warnings hard to
-find precisely when someone is debugging.
+Similarly, config saving and integrity watchdog scripts inspect `HERMES_DOTFILES_DIR`
+and `HERMES_CONFIG`, which default to `~/Dev/dotfiles` and `~/.hermes/config.yaml`.
+If unisolated, test runs silently write seal entries into the real `dotfiles/hermes/config_integrity.jsonl`.
 
-The per-test env fixture cannot close this: fixtures run after collection has
-imported the test modules, and by then the handler holds an absolute path.
-`tests/conftest.py` sets HERMES_HOME at module scope for that reason - this
-guards the property so a refactor cannot quietly undo it.
+`tests/conftest.py` sets HERMES_HOME, HERMES_DOTFILES_DIR, OBSIDIAN_VAULT, etc.
+at module scope and strips credentials at import time for that reason.
 """
 
 import logging
@@ -28,6 +24,11 @@ import pytest
 def _real_hermes_home() -> Path:
     """Where the operator's logs live, ignoring any test sandboxing."""
     return Path.home() / ".hermes"
+
+
+def _real_dotfiles_dir() -> Path:
+    """Where the operator's dotfiles live, ignoring any test sandboxing."""
+    return Path.home() / "Dev" / "dotfiles"
 
 
 def _all_file_destinations() -> list[str]:
@@ -86,3 +87,73 @@ class TestLogIsolation:
             "the test session is writing into the operator's real Hermes logs:\n  "
             + "\n  ".join(offenders)
         )
+
+
+class TestEnvironmentIsolation:
+    def test_dotfiles_dir_is_sandboxed_before_imports(self):
+        from tests.conftest import HERMES_DOTFILES_DIR_AT_CONFTEST_IMPORT as dotfiles
+
+        assert dotfiles, "conftest must set HERMES_DOTFILES_DIR before test modules import"
+        assert Path(dotfiles).resolve() != _real_dotfiles_dir().resolve(), (
+            f"HERMES_DOTFILES_DIR pointed at operator's real dotfiles ({dotfiles}) when "
+            "conftest loaded; tests calling seal.py or config_integrity write to real jsonl"
+        )
+
+    def test_obsidian_vault_is_sandboxed_before_imports(self):
+        from tests.conftest import (
+            OBSIDIAN_VAULT_AT_CONFTEST_IMPORT as vault,
+            OBSIDIAN_VAULT_PATH_AT_CONFTEST_IMPORT as vault_path,
+        )
+
+        assert vault, "conftest must set OBSIDIAN_VAULT before test modules import"
+        assert vault_path, "conftest must set OBSIDIAN_VAULT_PATH before test modules import"
+        assert Path(vault).resolve() != (Path.home() / "Dev" / "obsidian-vault").resolve()
+        assert Path(vault_path).resolve() != (Path.home() / "Dev" / "obsidian-vault").resolve()
+
+    def test_looks_like_credential_detects_sensitive_keys(self):
+        from tests.conftest import _looks_like_credential
+
+        sensitive_keys = [
+            "LINEAR_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "MISTRAL_API_KEY",
+            "GROQ_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OPENROUTER_API_KEY",
+            "HERMES_CONFIG_PASSWORD",
+            "HERMES_CONFIG_PASSPHRASE",
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "CUSTOM_API_KEY",
+            "MY_SERVICE_SECRET",
+            "TEST_AUTH_TOKEN",
+            "WEBHOOK_SECRET",
+            "DB_PASSWORD",
+        ]
+        for key in sensitive_keys:
+            assert _looks_like_credential(key), f"Key {key} should be recognized as a credential"
+
+        harmless_keys = [
+            "PATH",
+            "PYTHONPATH",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "HOME",
+            "USER",
+            "HERMES_HOME",
+            "HERMES_DOTFILES_DIR",
+            "OBSIDIAN_VAULT",
+        ]
+        for key in harmless_keys:
+            assert not _looks_like_credential(key), f"Key {key} should not be flagged as a credential"
+
+    def test_no_credentials_present_in_test_environment(self):
+        from tests.conftest import _looks_like_credential
+
+        leaked = [k for k in os.environ.keys() if _looks_like_credential(k)]
+        assert leaked == [], f"Found unstripped credential env vars in test environment: {leaked}"
+
