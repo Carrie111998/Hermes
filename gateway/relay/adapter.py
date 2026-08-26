@@ -1960,7 +1960,10 @@ class RelayAdapter(BasePlatformAdapter):
         effective_reply_to = self._apply_slack_thread_anchor(
             chat_id, reply_to, send_metadata
         )
-        _unfurl = self._slack_unfurl_hints(self._platform_by_chat.get(str(chat_id)))
+        _unfurl = self._slack_unfurl_hints(
+            self._platform_by_chat.get(str(chat_id))
+            or getattr(self.descriptor, "platform", None)
+        )
         if _unfurl:
             send_metadata.update(_unfurl)
         result = await self._transport.send_outbound(
@@ -2459,7 +2462,10 @@ class RelayAdapter(BasePlatformAdapter):
         effective_reply_to = self._apply_slack_thread_anchor(
             chat_id, reply_to, media_metadata
         )
-        _media_unfurl = self._slack_unfurl_hints(self._platform_by_chat.get(str(chat_id)))
+        _media_unfurl = self._slack_unfurl_hints(
+            self._platform_by_chat.get(str(chat_id))
+            or getattr(self.descriptor, "platform", None)
+        )
         if _media_unfurl:
             media_metadata.update(_media_unfurl)
         action: Dict[str, Any] = {
