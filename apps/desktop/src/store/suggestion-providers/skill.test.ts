@@ -2,17 +2,15 @@ import { describe, expect, it } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 
-import { collidesWithWorkspace, skillHit, skillPattern, skillTouchedInMessages } from './skill'
+import { collidesWithWorkspace, skillHit, skillPattern, skillTouchedInMessages, stripSlashTokens } from './skill'
 
 // skillHit is the provider's real predicate: a whole-word match that the user
 // has finished typing (at least one character follows it).
 const hits = (name: string, draft: string) => skillHit(skillPattern(name), draft.toLowerCase())
 
-// Simulates the draft provider's haystack sanitization (strips slash commands).
-const hitsAfterSanitize = (name: string, draft: string) => {
-  const sanitized = draft.replace(/\s\/[\w-]+/g, ' ').toLowerCase()
-  return skillHit(skillPattern(name), sanitized)
-}
+// Exercises the provider's real haystack sanitizer, not a copy of it.
+const hitsAfterSanitize = (name: string, draft: string) =>
+  skillHit(skillPattern(name), stripSlashTokens(draft).toLowerCase())
 
 describe('skillPattern + skillHit', () => {
   it('matches the exact name as a completed whole word', () => {
