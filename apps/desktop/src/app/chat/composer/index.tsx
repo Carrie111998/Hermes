@@ -38,7 +38,7 @@ import { COMPOSER_AREAS, runComposerMiddleware } from './contrib'
 import { ComposerControls } from './controls'
 import { ComposerDirectiveActions } from './directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
-import { markActiveComposer, onComposerAttachImagesRequest } from './focus'
+import { markActiveComposer, onComposerAttachFilesRequest, onComposerAttachImagesRequest } from './focus'
 import { HelpHint } from './help-hint'
 import { useAtCompletions } from './hooks/use-at-completions'
 import { useComposerBranch } from './hooks/use-composer-branch'
@@ -96,6 +96,7 @@ export function ChatBar({
   onAddUrl,
   onAttachDroppedItems,
   onAttachImageBlob,
+  onCapturePhoto,
   onAttachPrCommentUrl,
   onPasteClipboardImage,
   onPickFiles,
@@ -267,6 +268,23 @@ export function ChatBar({
       }
     })
   }, [onAttachImageBlob, scope.target])
+
+  // Android share-sheet files are not drag events, but they follow the exact
+  // same File-bearing upload path once routed to the visible composer.
+  useEffect(() => {
+    if (!onAttachDroppedItems) {
+      return undefined
+    }
+
+    return onComposerAttachFilesRequest(({ files, target }) => {
+      if (target !== scope.target) {
+        return
+      }
+
+      triggerHaptic('selection')
+      void onAttachDroppedItems(files.map(file => ({ file, path: '' })))
+    })
+  }, [onAttachDroppedItems, scope.target])
 
   // Prior history belongs to the draft that just left — undoing into another
   // conversation's text is worse than having none.
@@ -965,6 +983,7 @@ export function ChatBar({
       onInsertText={insertText}
       onOpenUrlDialog={openUrlDialog}
       onPasteClipboardImage={onPasteClipboardImage}
+      onCapturePhoto={onCapturePhoto}
       onPickFiles={onPickFiles}
       onPickFolders={onPickFolders}
       onPickImages={onPickImages}

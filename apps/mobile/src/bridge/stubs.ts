@@ -9,6 +9,8 @@
  * methods return a real unsubscribe.
  */
 
+import { dataUrlForMobileFile, mobileImagePathForBytes, mobilePathForFile, selectMobilePaths, textForMobileFile } from './mobile-files'
+
 const noopUnsub = (): void => {}
 
 // A tiny "already booted, nothing to do" progress object.
@@ -89,18 +91,23 @@ export function makeStubs() {
     },
 
     requestMicrophoneAccess: async () => true,
+    requestNotificationPermission: async () => false,
+    capturePhoto: async () => null,
 
-    // Local filesystem (desktop-only). Remote files come via /api/files later.
-    readFileDataUrl: async () => '',
-    readFileText: async (filePath: string) => ({ path: filePath, text: '' }),
-    selectPaths: async () => [] as string[],
+    // The phone never exposes arbitrary local paths. It can still attach the
+    // exact bytes a user chose through Android's system document/photo picker.
+    readFileDataUrl: dataUrlForMobileFile,
+    readFileDataUrlForAttach: dataUrlForMobileFile,
+    readFileText: async (filePath: string) => ({ path: filePath, text: await textForMobileFile(filePath) }),
+    selectPaths: selectMobilePaths,
     readDir: async () => ({ entries: [] }),
-    getPathForFile: () => '',
+    getPathForFile: (file: File) => mobilePathForFile(file),
     sanitizeWorkspaceCwd: async (cwd?: null | string) => ({ cwd: cwd ?? '', sanitized: false }),
 
-    // Image capture/save (Phase 4).
+    // Images selected from Android's gallery/file picker keep their exact bytes
+    // in the same process-local attachment store as ordinary documents.
     saveImageFromUrl: async () => false,
-    saveImageBuffer: async () => '',
+    saveImageBuffer: async (data: ArrayBuffer | Uint8Array, ext: string) => mobileImagePathForBytes(data, ext),
     saveClipboardImage: async () => '',
 
     // Link / preview helpers.

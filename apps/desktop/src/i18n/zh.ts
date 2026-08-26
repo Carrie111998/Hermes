@@ -2614,6 +2614,7 @@ export const zh: Translations = {
     folder: '文件夹…',
     images: '图片…',
     pasteImage: '粘贴图片',
+    capturePhoto: '拍摄照片',
     url: 'URL…',
     promptSnippets: '提示词片段…',
     tipPre: '提示：输入 ',

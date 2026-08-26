@@ -43,9 +43,15 @@ interface AttachImagesDetail {
   target: ComposerTarget
 }
 
+interface AttachFilesDetail {
+  files: File[]
+  target: ComposerTarget
+}
+
 const FOCUS_EVENT = 'hermes:composer-focus'
 const INSERT_EVENT = 'hermes:composer-insert'
 const ATTACH_IMAGES_EVENT = 'hermes:composer-attach-images'
+const ATTACH_FILES_EVENT = 'hermes:composer-attach-files'
 const INSERT_REFS_EVENT = 'hermes:composer-insert-refs'
 const SUBMIT_EVENT = 'hermes:composer-submit'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
@@ -278,6 +284,21 @@ export const requestComposerAttachImages = (
 
 export const onComposerAttachImagesRequest = (handler: (detail: AttachImagesDetail) => void) =>
   subscribe<AttachImagesDetail>(ATTACH_IMAGES_EVENT, handler)
+
+/** Attach user-selected browser files (Android share sheet / picker) to the
+ * visible composer. The same downstream drop pipeline assigns local opaque
+ * handles and uploads bytes to a remote gateway without leaking a device path. */
+export const requestComposerAttachFiles = (
+  files: File[],
+  { target = 'active' }: { target?: ComposerTarget | 'active' } = {}
+) => {
+  if (files.length) {
+    dispatch<AttachFilesDetail>(ATTACH_FILES_EVENT, { files, target: resolve(target) })
+  }
+}
+
+export const onComposerAttachFilesRequest = (handler: (detail: AttachFilesDetail) => void) =>
+  subscribe<AttachFilesDetail>(ATTACH_FILES_EVENT, handler)
 
 /** Insert typed ref chips (carrying a display label) into a composer — the
  * structured cousin of {@link requestComposerInsert}, used for session links. */

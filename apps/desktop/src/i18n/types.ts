@@ -2063,6 +2063,7 @@ export interface Translations {
     folder: string
     images: string
     pasteImage: string
+    capturePhoto: string
     url: string
     promptSnippets: string
     tipPre: string

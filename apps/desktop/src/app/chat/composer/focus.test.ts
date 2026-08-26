@@ -6,9 +6,11 @@ import {
   blurComposerInput,
   getActiveComposer,
   markActiveComposer,
+  onComposerAttachFilesRequest,
   onComposerFocusRequest,
   onComposerModelMenuRequest,
   releaseActiveComposer,
+  requestComposerAttachFiles,
   requestComposerFocus,
   requestModelMenuToggle
 } from './focus'
@@ -219,6 +221,27 @@ describe('resolveActive / keep-alive tab heal', () => {
     markActiveComposer('edit')
 
     expect(getActiveComposer()).toBe('edit')
+  })
+})
+
+/** A chat surface inside a layout zone, mirroring ChatView-in-tree-group. */
+describe('requestComposerAttachFiles', () => {
+  it('routes externally shared files to the visible active composer', async () => {
+    mountSurface('main')
+    markActiveComposer('main')
+    const file = new File(['shared'], 'shared.txt', { type: 'text/plain' })
+    const seen: File[][] = []
+    const off = onComposerAttachFilesRequest(({ files, target }) => {
+      if (target === 'main') {
+        seen.push(files)
+      }
+    })
+
+    requestComposerAttachFiles([file])
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    off()
+
+    expect(seen).toEqual([[file]])
   })
 })
 

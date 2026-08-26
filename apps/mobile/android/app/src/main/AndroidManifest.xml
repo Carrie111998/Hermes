@@ -16,10 +16,24 @@
             android:label="@string/title_activity_main"
             android:theme="@style/AppTheme.NoActionBarLaunch"
             android:launchMode="singleTask"
+            android:grantUriPermissions="true"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Explicit share-sheet entry points. URI grants apply only to the
+                 item Steven chose to share; Hermes requests no media/storage
+                 library permission and the native bridge caps each item. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
 
@@ -40,6 +54,9 @@
          permission footprint minimal. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" tools:node="remove" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" tools:node="remove" />
+    <!-- Camera is requested only after the user taps Capture photo. Photos/files
+         otherwise use Android's system picker and URI grants, not broad storage. -->
+    <uses-permission android:name="android.permission.CAMERA" />
     <!-- Voice input (getUserMedia in the WebView). Capacitor's WebChromeClient
          requests the runtime grant when the chat starts a voice session. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />

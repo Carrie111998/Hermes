@@ -208,7 +208,7 @@ function TileChat({
   // store updates) re-renders the whole chat shell. The individual composer
   // functions are useCallback'd inside useComposerActions, so hoisting these
   // wrappers onto them keeps identity stable across renders.
-  const { addContextRefAttachment, pasteClipboardImage, pickContextPaths, pickImages, removeAttachment } = composer
+  const { addContextRefAttachment, captureImage, pasteClipboardImage, pickContextPaths, pickImages, removeAttachment } = composer
 
   const onAddUrl = useCallback(
     (url: string) => addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
@@ -250,6 +250,7 @@ function TileChat({
           onAddUrl={onAddUrl}
           onAttachDroppedItems={composer.attachDroppedItems}
           onAttachImageBlob={composer.attachImageBlob}
+          onCapturePhoto={captureImage}
           onAttachPrCommentUrl={composer.attachPrCommentUrl}
           onCancel={actions.cancelRun}
           onDeleteSelectedSession={noop}
