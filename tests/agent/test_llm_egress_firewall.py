@@ -676,6 +676,88 @@ def test_json_protocol_acronym_is_not_a_base64_false_positive(tmp_path):
     assert firewall(tmp_path).preflight(request, _route()).allowed
 
 
+@pytest.mark.parametrize(
+    "schema_atom",
+    [
+        "HERMES_KANBAN_DB",
+        "kanban_heartbeat",
+        "machine-readable",
+        "parent/child",
+        "path/to/file",
+        "skills/plugins/cron/memories",
+        "MIME",
+        "REQUIRED",
+        "2000",
+        "2026",
+        "4dae",
+        "HERMES_KANBAN_BRANCH",
+        "HERMES_KANBAN_WORKSPACE",
+        "max_runtime_seconds",
+        "optional-profile",
+    ],
+)
+def test_builtin_tool_schema_atoms_are_not_base64_false_positives(
+    tmp_path, schema_atom
+):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment(schema_atom)]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    assert firewall(tmp_path).preflight(request, _route()).allowed
+
+
+def test_fixed_hermes_task_id_is_not_a_base64_false_positive(tmp_path):
+    request = TypedOutboundRequest(
+        payload={"messages": [SanitizedSegment("work kanban task t_8c0aa909")]},
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    assert firewall(tmp_path).preflight(request, _route()).allowed
+
+
+def test_fixed_prompt_cache_key_is_not_a_base64_false_positive(tmp_path):
+    request = TypedOutboundRequest(
+        payload={
+            "parallel_tool_calls": True,
+            "prompt_cache_key": SanitizedSegment("pck_e3aec8aaa5993646a80a5660"),
+        },
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+    assert firewall(
+        tmp_path,
+        static_literals={"parallel_tool_calls", "prompt_cache_key", "true"},
+    ).preflight(request, _route()).allowed
+
+
+def test_content_free_violation_locations_never_return_keys_or_values():
+    from agent.llm_egress_firewall import content_free_violation_locations
+
+    private_path = "/Users/private/repository/file.py"
+    encoded = base64.b64encode(b"encoded private detail").decode("ascii")
+    result = content_free_violation_locations(
+        {"private-key-name": [{"content-key": private_path}], "metadata-key": encoded}
+    )
+    rendered = repr(result)
+    assert result == (
+        ("$.map[0].key", ("base64_payload",)),
+        ("$.map[0].value.sequence[0].map[0].value", ("private_absolute_path",)),
+        ("$.map[1].value", ("base64_payload",)),
+    )
+    assert "private-key-name" not in rendered
+    assert "content-key" not in rendered
+    assert "metadata-key" not in rendered
+    assert private_path not in rendered
+    assert encoded not in rendered
+
+
 def test_scanner_error_fails_closed(monkeypatch, tmp_path):
     def explode(*args, **kwargs):
         raise RuntimeError("scanner unavailable")

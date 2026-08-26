@@ -579,6 +579,14 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_rejects_self_referential_reclaim_and_crash_blockers():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "attempt-management evidence, not task blockers" in KANBAN_GUIDANCE
+    assert "Never block because an earlier worker crashed" in KANBAN_GUIDANCE
+    assert "Do not pass the literal environment-variable token" in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------

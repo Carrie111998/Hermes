@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from pathlib import Path
 from types import MappingProxyType
@@ -11,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from agent.llm_egress_firewall import (
     AuthorizedEgress,
+    EgressBlocked,
     LLMEgressFirewall,
     LiteralSegment,
     OutboundText,
@@ -23,6 +25,7 @@ from agent.llm_egress_firewall import (
     source_grant_digest,
     static_literal_sha256,
     validate_sanitized_text,
+    content_free_violation_locations,
 )
 from agent.source_provenance import DEFAULT_POLICY_DIGEST, SourceProvenanceRegistry
 
@@ -53,6 +56,7 @@ _PROTECTED_REMOTE_PROVIDERS = frozenset({
     "nous-portal",
     "nousresearch",
 })
+logger = logging.getLogger(__name__)
 
 
 def provider_uses_egress_firewall(provider: Any) -> bool:
@@ -92,6 +96,32 @@ def _approved_sanitized(text: str, *, cap: int) -> SanitizedSegment:
     return SanitizedSegment(text)
 
 
+def _approved_sanitized_segments(text: str, *, cap: int) -> list[SanitizedSegment]:
+    """Split text without weakening the per-segment admission boundary."""
+
+    if not isinstance(text, str):
+        raise TypeError("sanitized segment must be text")
+    if cap <= 0:
+        raise ValueError("sanitized segment cap must be positive")
+    if not text:
+        return [_approved_sanitized(text, cap=cap)]
+
+    segments: list[SanitizedSegment] = []
+    start = 0
+    byte_count = 0
+    for index, character in enumerate(text):
+        character_bytes = len(character.encode("utf-8"))
+        if byte_count and byte_count + character_bytes > cap:
+            segments.append(_approved_sanitized(text[start:index], cap=cap))
+            start = index
+            byte_count = 0
+        if character_bytes > cap:
+            raise ValueError("sanitized character exceeds byte cap")
+        byte_count += character_bytes
+    segments.append(_approved_sanitized(text[start:], cap=cap))
+    return segments
+
+
 def _segment_text(
     text: str,
     grant_texts: Sequence[tuple[str, SourceGrant]],
@@ -116,19 +146,22 @@ def _segment_text(
         cursor = chosen[1]
 
     if not matches:
-        return _approved_sanitized(text, cap=sanitized_cap)
+        sanitized = _approved_sanitized_segments(text, cap=sanitized_cap)
+        return sanitized[0] if len(sanitized) == 1 else OutboundText(tuple(sanitized))
 
     segments: list[SanitizedSegment | SourceBoundSegment] = []
     cursor = 0
     for start, end, grant in matches:
         if start > cursor:
-            segments.append(_approved_sanitized(text[cursor:start], cap=sanitized_cap))
+            segments.extend(
+                _approved_sanitized_segments(text[cursor:start], cap=sanitized_cap)
+            )
         digest = source_grant_digest(grant)
         segments.append(SourceBoundSegment(digest))
         used_grants[digest] = grant
         cursor = end
     if cursor < len(text):
-        segments.append(_approved_sanitized(text[cursor:], cap=sanitized_cap))
+        segments.extend(_approved_sanitized_segments(text[cursor:], cap=sanitized_cap))
     return segments[0] if len(segments) == 1 else OutboundText(tuple(segments))
 
 
@@ -300,11 +333,17 @@ def authorize_agent_sdk_kwargs(
             policy_digest: _structural_literal_hashes(body)
         },
     )
-    authorization = firewall.authorize(
-        request,
-        _route_for_agent(agent, route),
-        grants=tuple(used_grants.values()),
-    )
+    try:
+        authorization = firewall.authorize(
+            request,
+            _route_for_agent(agent, route),
+            grants=tuple(used_grants.values()),
+        )
+    except EgressBlocked:
+        locations = content_free_violation_locations(body)
+        if locations:
+            logger.warning("LLM egress blocked structural locations: %s", locations)
+        raise
     rebuilt = json.loads(authorization.payload_bytes)
     if not isinstance(rebuilt, dict):
         raise TypeError("authorized provider payload must be a JSON object")

@@ -43,6 +43,11 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
+        # Canonical per-profile reasoning depth. Runtime construction, gateway
+        # /reasoning persistence, and Kanban overrides all read this path.
+        # Keeping it in DEFAULT_CONFIG also makes `hermes config set` validate
+        # the key instead of incorrectly warning that the setting may be inert.
+        "reasoning_effort": "none",
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a
         # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —
@@ -2713,6 +2718,11 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Installed independent profile used when the stop guard has useful
+        # evidence but a worker exhausts its terminal-transition nudges. Empty
+        # keeps the handoff disabled rather than creating reviewerless review
+        # cards that route back to the implementer and wait for a human verdict.
+        "reviewer_profile": "",
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
