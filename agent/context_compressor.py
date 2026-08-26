@@ -2067,8 +2067,15 @@ def parse_model_threshold_tokens(raw: object) -> "dict[str, int]":
     """Validate a ``compression.threshold_tokens_by_model`` config mapping.
 
     Returns a ``{model-substring: absolute token cap}`` dict. Entries with
-    blank keys or non-positive/non-integer values are dropped with a
-    warning so a malformed config can never silently zero a threshold.
+    blank keys, non-string keys, or non-positive/non-integer values are
+    dropped with a warning so a malformed config can never silently zero a
+    threshold.
+
+    Non-string keys are rejected rather than stringified because YAML parses
+    a bare ``4.6:`` as a float, and ``str(4.6)`` is a two-digit substring that
+    matches every model carrying those characters — ``gpt-4.6-x``, ``kimi-4.6``
+    and anything else. That is far more likely an authoring slip than an
+    intended match, and the quoted form ``"4.6":`` still expresses it.
     """
     if not isinstance(raw, dict):
         if raw:
@@ -2079,7 +2086,14 @@ def parse_model_threshold_tokens(raw: object) -> "dict[str, int]":
         return {}
     out: dict[str, int] = {}
     for key, val in raw.items():
-        skey = str(key).strip()
+        if not isinstance(key, str):
+            logger.warning(
+                "compression.threshold_tokens_by_model[%r]: key must be a string "
+                "— dropped (quote it to match a literal substring)",
+                key,
+            )
+            continue
+        skey = key.strip()
         try:
             ival = int(val)  # type: ignore[arg-type]
         except (TypeError, ValueError):
@@ -2114,6 +2128,15 @@ def resolve_model_threshold(
     longest matching key wins (so ``glm-5.2-1M`` beats ``glm-5.2`` when the
     model is ``glm-5.2-1M``).  When no override matches, or when
     ``model_thresholds`` is empty/None, ``default`` is returned unchanged.
+
+    Matching is **case-insensitive**, via :func:`match_model_override`.  This
+    path used to compare with a plain ``key in model``, so a key whose case
+    did not match the runtime model name silently never applied — ``GLM``
+    against ``glm-5.2-1M`` did nothing.  Sharing one matcher with the per-model
+    token caps makes both speak the same language, and an existing
+    ``model_thresholds`` key that was mis-cased starts taking effect.  That is
+    the intended reading of what the operator wrote; it is called out here, and
+    locked by test, because it changes behavior for configs already on disk.
 
     This is a module-level helper so plugin context engines (e.g. LCM) can
     import and reuse the same resolution logic as the built-in compressor.
@@ -3102,7 +3125,7 @@ class ContextCompressor(ContextEngine):
         long-context 2x tier) without touching other models' windows.
         """
         if self.threshold_tokens_cap is not None and self.threshold_tokens_cap > 0:
-            _effective_cap = min(self.threshold_tokens_cap, self.context_length)
+            _effective_cap = self._cap_within_context(self.threshold_tokens_cap)
             if _effective_cap < self.threshold_tokens:
                 self.threshold_tokens = _effective_cap
         if self.model_threshold_tokens and self.model:
@@ -3113,11 +3136,24 @@ class ContextCompressor(ContextEngine):
                 # cap (e.g. an unparsed caller) must never zero the trigger.
                 if _effective_cap <= 0:
                     return
-                if self.context_length:
-                    _effective_cap = min(_effective_cap, self.context_length)
+                _effective_cap = self._cap_within_context(_effective_cap)
                 # Lower-only: a per-model cap never raises the threshold.
                 if _effective_cap < self.threshold_tokens:
                     self.threshold_tokens = _effective_cap
+
+    def _cap_within_context(self, cap: int) -> int:
+        """Clamp an absolute cap to the model's window, if the window is known.
+
+        Both caps above go through here so the ordering is stated once: clamp
+        to the context length, then let the caller apply it lower-only.
+
+        ``context_length`` of 0 means the window is *unknown*, not that it is
+        empty. Clamping to it would drive the trigger to zero and compress on
+        every single turn — which is what the global cap did before these two
+        clamps were unified. Leave an unknown window alone: the cap is still
+        lower-only at the call site, so an oversized one is a no-op anyway.
+        """
+        return min(cap, self.context_length) if self.context_length else cap
 
     @staticmethod
     def _effective_threshold_percent(

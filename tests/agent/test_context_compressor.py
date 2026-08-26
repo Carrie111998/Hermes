@@ -2286,6 +2286,48 @@ class TestThresholdTokensCap:
         assert comp_zero.threshold_tokens == baseline.threshold_tokens
 
 
+class TestCapClampWithUnknownContextLength:
+    """A context_length of 0 means unknown, not empty.
+
+    The two absolute caps clamped differently: the per-model one skipped the
+    clamp when context_length was falsy, the global one clamped anyway — to
+    zero — and then applied it lower-only, driving the trigger to 0 and
+    compressing on every turn. Both now go through one helper.
+    """
+
+    def test_global_cap_does_not_zero_the_trigger(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=0):
+            comp = ContextCompressor(
+                "model-a", threshold_percent=0.50, quiet_mode=True,
+                threshold_tokens_cap=180_000,
+            )
+            assert comp.context_length == 0  # precondition: window unknown
+            assert comp.threshold_tokens > 0
+
+    def test_per_model_cap_does_not_zero_the_trigger(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=0):
+            comp = ContextCompressor(
+                "grok-4.6", threshold_percent=0.50, quiet_mode=True,
+                model_threshold_tokens={"grok": 180_000},
+            )
+            assert comp.context_length == 0  # precondition: window unknown
+            assert comp.threshold_tokens > 0
+
+    def test_both_caps_clamp_identically_once_the_window_is_known(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=500_000):
+            via_global = ContextCompressor(
+                "grok-4.6", threshold_percent=0.50, quiet_mode=True,
+                threshold_tokens_cap=900_000,
+            )
+            via_per_model = ContextCompressor(
+                "grok-4.6", threshold_percent=0.50, quiet_mode=True,
+                model_threshold_tokens={"grok": 900_000},
+            )
+        # Both caps exceed the window, so both clamp to it and then lose to
+        # the lower ratio/floor result — no-ops, by the same route.
+        assert via_global.threshold_tokens == via_per_model.threshold_tokens == 375_000
+
+
 class TestMatchModelOverride:
     """The shared per-model matcher: longest case-insensitive substring wins."""
 
@@ -2309,6 +2351,32 @@ class TestMatchModelOverride:
         assert match_model_override("kimi-k3", None) == ""
 
 
+class TestResolveModelThresholdCaseInsensitivity:
+    """The legacy model_thresholds path changed from case-sensitive matching.
+
+    ``resolve_model_threshold`` compared with a plain ``key in model`` before
+    it shared :func:`match_model_override` with the token caps, so a mis-cased
+    key silently never applied. Configs already on disk are affected, so the
+    new behavior is pinned rather than left implicit.
+    """
+
+    def test_mis_cased_key_now_applies(self):
+        from agent.context_compressor import resolve_model_threshold
+        assert resolve_model_threshold("glm-5.2-1M", {"GLM-5.2": 0.4}, 0.5) == 0.4
+        assert resolve_model_threshold("GLM-5.2-1M", {"glm-5.2": 0.4}, 0.5) == 0.4
+
+    def test_longest_match_still_wins_across_cases(self):
+        from agent.context_compressor import resolve_model_threshold
+        thresholds = {"GLM": 0.6, "glm-5.2": 0.4}
+        assert resolve_model_threshold("GLM-5.2-1M", thresholds, 0.5) == 0.4
+
+    def test_no_match_still_returns_the_default(self):
+        from agent.context_compressor import resolve_model_threshold
+        assert resolve_model_threshold("kimi-k3", {"GROK": 0.4}, 0.5) == 0.5
+        assert resolve_model_threshold("kimi-k3", {}, 0.5) == 0.5
+        assert resolve_model_threshold("kimi-k3", None, 0.5) == 0.5
+
+
 class TestParseModelThresholdTokens:
     """Config-shape validation for compression.threshold_tokens_by_model."""
 
@@ -2326,11 +2394,29 @@ class TestParseModelThresholdTokens:
 
     def test_malformed_entries_dropped_with_warning(self, caplog):
         from agent.context_compressor import parse_model_threshold_tokens
-        raw = {"grok": 180_000, "": 5, "bad": "nan", "zero": 0, "neg": -1, 4.6: 100}
+        raw = {"grok": 180_000, "": 5, "bad": "nan", "zero": 0, "neg": -1}
         with caplog.at_level("WARNING"):
             out = parse_model_threshold_tokens(raw)
-        assert out == {"grok": 180_000, "4.6": 100}  # numeric key stringified
+        assert out == {"grok": 180_000}
         assert caplog.text.count("dropped") == 4
+
+    def test_non_string_keys_are_dropped_not_stringified(self, caplog):
+        """YAML turns a bare ``4.6:`` into a float, not the substring "4.6".
+
+        Stringifying it produced a two-character needle that matches every
+        model carrying those characters — gpt-4.6-x, kimi-4.6, anything —
+        which is an authoring slip far more often than an intended match.
+        """
+        from agent.context_compressor import parse_model_threshold_tokens
+        with caplog.at_level("WARNING"):
+            out = parse_model_threshold_tokens({"grok": 180_000, 4.6: 100, 5: 200})
+        assert out == {"grok": 180_000}
+        assert caplog.text.count("key must be a string") == 2
+
+    def test_quoted_numeric_key_still_works(self):
+        """The explicit form stays available for a deliberate numeric match."""
+        from agent.context_compressor import parse_model_threshold_tokens
+        assert parse_model_threshold_tokens({"4.6": 100}) == {"4.6": 100}
 
     def test_none_and_empty_are_clean_noops(self, caplog):
         from agent.context_compressor import parse_model_threshold_tokens

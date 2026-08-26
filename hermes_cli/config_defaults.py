@@ -959,9 +959,10 @@ DEFAULT_CONFIG = {
                                       # Default True since 2107b86024; set False to
                                       # restore the legacy rotating-compaction path.
         "model_thresholds": {},       # Per-model threshold overrides. Keys are
-                                      # substring-matched against the model name
-                                      # (longest match wins); values replace the
-                                      # global `threshold` for that model, e.g.
+                                      # case-insensitively substring-matched
+                                      # against the model name (longest match
+                                      # wins); values replace the global
+                                      # `threshold` for that model, e.g.
                                       #   model_thresholds:
                                       #     "glm-5.2": 0.40
                                       #     "claude-sonnet": 0.35
