@@ -922,6 +922,30 @@ class TestMCPServerTask:
         asyncio.run(_test())
 
 
+    def test_stdio_children_dead_returns_false_when_child_alive(self, monkeypatch):
+        from tools.mcp_tool import MCPServerTask
+
+        fake_psutil = SimpleNamespace(pid_exists=lambda pid: True)
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        server = MCPServerTask("test_srv")
+        server._stdio_child_pids = {1234}
+
+        assert server._stdio_children_dead() is False
+
+
+    def test_stdio_children_dead_returns_true_when_child_dead(self, monkeypatch):
+        from tools.mcp_tool import MCPServerTask
+
+        fake_psutil = SimpleNamespace(pid_exists=lambda pid: False)
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        server = MCPServerTask("test_srv")
+        server._stdio_child_pids = {1234}
+
+        assert server._stdio_children_dead() is True
+
+
 # ---------------------------------------------------------------------------
 # discover_mcp_tools toolset injection
 # ---------------------------------------------------------------------------
