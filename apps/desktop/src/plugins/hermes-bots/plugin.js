@@ -6814,6 +6814,8 @@ function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLines }) {
     '- Reply with ONE conversational message ONLY if you have something new worth adding: build on what was just said, claim or hand off work, answer a question aimed at you, or report a real result. Keep chatter short (1-3 sentences) — but when you are delivering a result, an answer the user asked for, or substantive work, give it at full quality and length; never thin out real content to fit the room.',
     '- If you have nothing new to add, reply with exactly "(pass)". Passing is good — it lets the conversation settle.',
     '- Mention a teammate as @name to pull them in; mention @user only for a judgment call or a result the user needs. Do not repeat points already made.',
+    '- Never commit to future work ("I will provide X", "I will follow up once Y") without an @mention that keeps the thread moving. Dispatch in this room happens ONLY via @mention — nothing else re-wakes anyone. A commitment with no @mention is a dead end: either @mention yourself so you get re-invoked once the condition is met, or @mention whoever should act next. Never leave a bare unaddressed promise as the last word in the room.',
+    '- If your commitment is real follow-up work (not a same-turn answer), also create a Kanban card for it via kanban_create (title = the commitment, assignee = whoever owns the follow-up, body citing this room + what unblocks it) before you rely on the @mention alone. A card on the board is visible and pollable outside the room transcript; a chat promise is not.',
     '- Never reveal content from your private 1:1 chats. Your reply text goes to the room verbatim — no preamble, no meta-commentary.'
   ].join('\n')
 }

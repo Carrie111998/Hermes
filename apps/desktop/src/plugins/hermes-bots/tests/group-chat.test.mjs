@@ -1471,6 +1471,25 @@ test('mention routing: @hermes resolves to the default member', () => {
   assert.equal(parsed.mentioned.size, 1)
 })
 
+test('turn prompt forbids a bare unaddressed commitment and directs it to Kanban', () => {
+  // Regression for the Aug 2026 MSTACK-style stall: a member committed to
+  // future work ("I'll provide X") with no @mention, which is the room's
+  // ONLY dispatch trigger — nothing ever re-woke anyone and the thread died
+  // silently. The room rules must explicitly forbid that dead end and give
+  // members a durable place (a Kanban card) to park the commitment instead
+  // of relying on chat prose alone.
+  const gc = load(() => '(pass)')
+  const prompt = gc.buildGroupChatTurnPrompt({
+    groupName: 'Core',
+    members: [{ name: 'default', title: '' }, { name: 'builder', title: '' }],
+    viewer: { name: 'default', title: '' },
+    deltaLines: []
+  })
+  assert.match(prompt, /Never commit to future work/)
+  assert.match(prompt, /Dispatch in this room happens ONLY via @mention/)
+  assert.match(prompt, /kanban_create/)
+})
+
 test('source contract: workspace speaker labels use displayName with a click-to-reveal handle', () => {
   // Speaker labels come from the roster displayName (default → Hermes)…
   assert.match(pluginSource, /displayName\(member \|\| \{ name: entry\.from\.name \}, meta\)/)
