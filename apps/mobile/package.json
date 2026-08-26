@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc -p tsconfig.app.json --noEmit",
+    "typecheck": "node --max-old-space-size=1200 ../../node_modules/typescript/bin/tsc -p tsconfig.app.json --noEmit",
     "test": "vitest run --config vitest.config.ts",
     "cap:sync": "cap sync",
     "cap:android": "cap sync android && cap open android",
