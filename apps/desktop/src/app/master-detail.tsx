@@ -129,7 +129,12 @@ export function MasterDetail({
   // survive navigation.
   if (mobileRenderer) {
     return (
-      <div className="flex h-full min-h-0 flex-col" data-mobile-master-detail="" data-testid="mobile-master-detail">
+      <div
+        className="flex h-full min-h-0 flex-col"
+        data-mobile-master-detail=""
+        data-mobile-master-detail-view={mobileView}
+        data-testid="mobile-master-detail"
+      >
         <div
           className="min-h-0 flex-1"
           data-master-detail-list=""

@@ -99,7 +99,13 @@ export function MobileToolbar({
       {menuOpen && (
         <>
           <button aria-label="Close desktop actions" className="mobile-toolbar-scrim" onClick={onClose} type="button" />
-          <section aria-label="Desktop actions" aria-modal="true" className="mobile-toolbar-menu" role="dialog">
+          <section
+            aria-label="Desktop actions"
+            aria-modal="true"
+            className="mobile-toolbar-menu"
+            data-mobile-toolbar-origin="top-right"
+            role="dialog"
+          >
             <header>
               <span>Hermes</span>
               <button aria-label="Close desktop actions" onClick={onClose} ref={closeButtonRef} type="button">

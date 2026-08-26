@@ -14,23 +14,28 @@ import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { useTitlebarToolContributions } from '@/app/contrib/panes'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { useI18n } from '@/i18n'
+import { hostPathLabel } from '@/lib/external-link'
 import { openCommandPalette } from '@/store/command-palette'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { toggleHud } from '@/store/hud'
-import { $previewTabs, closeRightRail } from '@/store/preview'
+import { $previewTabs, closeRightRailTab, newBrowserTab, openPreview } from '@/store/preview'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
   $fileBrowserOpen,
   $panesFlipped,
+  $rightRailActiveTabId,
   $sidebarOpen,
   CHAT_SIDEBAR_PANE_ID,
   FILE_BROWSER_PANE_ID,
+  selectRightRailTab,
   setFileBrowserOpen,
   setSidebarOpen,
   togglePanesFlipped,
 } from '@/store/layout'
 
 import { mobileWorkspacePanes } from './mobile-workspace-menu'
+import { MobilePreviewOverlay } from './mobile-preview-overlay'
+import { shouldOpenMobilePreview } from './mobile-preview-policy'
 import { MobileToolbar, type MobileToolbarAction } from './mobile-toolbar'
 import { mobileToolbarContextActions, type MobileToolbarContextAction } from './mobile-toolbar-model'
 import {
@@ -39,7 +44,6 @@ import {
   shouldCloseMobileDrawerFromSwipe,
   shouldDismissDrawerAfterSessionChange,
   shouldRevealPaneForDrawerChange,
-  shouldSuppressPreviewOnMobile,
 } from './mobile-policy'
 import { consumePendingInboundShare, listenForInboundShare } from '~bridge/inbound-share'
 
@@ -81,6 +85,13 @@ export function MobileBehaviors() {
   const tree = useStore($layoutTree)
   const hiddenPanes = useStore($hiddenTreePanes)
   const panes = useContributions('panes')
+  const previewTabs = useStore($previewTabs)
+  const activePreviewTabId = useStore($rightRailActiveTabId)
+  const [mobilePreviewOpen, setMobilePreviewOpen] = useState(false)
+  const mobilePreviewOpenRef = useRef(false)
+  mobilePreviewOpenRef.current = mobilePreviewOpen
+  const previewTabsRef = useRef(previewTabs)
+  const previewTabsInitializedRef = useRef(false)
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const workspaceMenuOpenRef = useRef(false)
   workspaceMenuOpenRef.current = workspaceMenuOpen
@@ -94,6 +105,14 @@ export function MobileBehaviors() {
   const appActions = useMemo<MobileToolbarAction[]>(
     () => [
       { id: 'new-chat', label: t.commandCenter.nav.newChat.title, onSelect: () => navigate(NEW_CHAT_ROUTE) },
+      {
+        id: 'preview',
+        label: t.preview.openPreview,
+        onSelect: () => {
+          if (!previewTabs.length) newBrowserTab()
+          setMobilePreviewOpen(true)
+        },
+      },
       { id: 'command-center', label: t.commandCenter.commandCenter, onSelect: () => navigate(COMMAND_CENTER_ROUTE) },
       { id: 'command-palette', label: t.commandCenter.paletteTitle, onSelect: openCommandPalette },
       { id: 'settings', label: t.titlebar.openSettings, onSelect: () => navigate(SETTINGS_ROUTE) },
@@ -111,7 +130,7 @@ export function MobileBehaviors() {
         onSelect: () => window.dispatchEvent(new CustomEvent('hermes:open-keybinds')),
       },
     ],
-    [hapticsMuted, navigate, t],
+    [hapticsMuted, navigate, previewTabs.length, t],
   )
   const runContributedToolbarTool = useCallback(
     (tool: MobileToolbarContextAction) => {
@@ -148,6 +167,22 @@ export function MobileBehaviors() {
     document.documentElement.toggleAttribute('data-mobile-toolbar-menu-open', workspaceMenuOpen)
     return () => document.documentElement.removeAttribute('data-mobile-toolbar-menu-open')
   }, [workspaceMenuOpen])
+
+  useEffect(() => {
+    const previous = previewTabsRef.current
+
+    if (previewTabsInitializedRef.current) {
+      if (previewTabs.length === 0) {
+        setMobilePreviewOpen(false)
+      } else if (shouldOpenMobilePreview(previous, previewTabs)) {
+        setMobilePreviewOpen(true)
+      }
+    } else {
+      previewTabsInitializedRef.current = true
+    }
+
+    previewTabsRef.current = previewTabs
+  }, [previewTabs])
 
   // A share is an explicit Android user action. Keep its text in the draft and
   // stage its files as ordinary composer attachments; never auto-send content
@@ -217,15 +252,10 @@ export function MobileBehaviors() {
     const dismissDrawerForSessionChange = () => {
       if (shouldDismissDrawerAfterSessionChange(anyDrawerOpen())) closeOpenDrawer()
     }
-    const dismissPhonePreview = () => {
-      if (shouldSuppressPreviewOnMobile(window.innerWidth, $previewTabs.get().length)) closeRightRail()
-    }
     const offSidebarAttr = $sidebarOpen.subscribe(syncDrawerAttr)
     const offFilesAttr = $fileBrowserOpen.subscribe(syncDrawerAttr)
     const offActiveSession = $activeSessionId.listen(dismissDrawerForSessionChange)
     const offStoredSession = $selectedStoredSessionId.listen(dismissDrawerForSessionChange)
-    const offPreview = $previewTabs.listen(dismissPhonePreview)
-    dismissPhonePreview()
 
     let swipeStart: { insideDrawer: boolean; x: number; y: number } | null = null
     const onPointerDown = (e: PointerEvent) => {
@@ -283,6 +313,10 @@ export function MobileBehaviors() {
         void Keyboard.hide()
         return
       }
+      if (mobilePreviewOpenRef.current) {
+        setMobilePreviewOpen(false)
+        return
+      }
       if (workspaceMenuOpenRef.current) {
         setWorkspaceMenuOpen(false)
         return
@@ -312,7 +346,6 @@ export function MobileBehaviors() {
       offFilesAttr()
       offActiveSession()
       offStoredSession()
-      offPreview()
       window.removeEventListener(PANE_TOGGLE_REVEAL_EVENT, onPaneReveal)
       document.removeEventListener('pointerdown', onPointerDown, true)
       document.removeEventListener('pointerup', onPointerUp, true)
@@ -348,16 +381,35 @@ export function MobileBehaviors() {
   // hamburger + left-edge swipe; every other Desktop control lives in one
   // ordered overflow sheet rather than becoming its own permanent rail.
   return (
-    <MobileToolbar
-      appActions={appActions}
-      contextActions={contributedToolbarTools}
-      menuOpen={workspaceMenuOpen}
-      onClose={() => setWorkspaceMenuOpen(false)}
-      onOpenSessions={toggleSessionDrawer}
-      onToggleMenu={() => setWorkspaceMenuOpen(open => !open)}
-      onWorkspacePane={openWorkspacePane}
-      sessionsOpen={sidebarOpen}
-      workspacePanes={workspacePanes}
-    />
+    <>
+      <MobileToolbar
+        appActions={appActions}
+        contextActions={contributedToolbarTools}
+        menuOpen={workspaceMenuOpen}
+        onClose={() => setWorkspaceMenuOpen(false)}
+        onOpenSessions={toggleSessionDrawer}
+        onToggleMenu={() => setWorkspaceMenuOpen(open => !open)}
+        onWorkspacePane={openWorkspacePane}
+        sessionsOpen={sidebarOpen}
+        workspacePanes={workspacePanes}
+      />
+      <MobilePreviewOverlay
+        activeTabId={activePreviewTabId}
+        onClose={() => setMobilePreviewOpen(false)}
+        onCloseTab={tabId => {
+          closeRightRailTab(tabId)
+          if (previewTabs.length <= 1) setMobilePreviewOpen(false)
+        }}
+        onNavigate={url => openPreview({ kind: 'url', label: hostPathLabel(url), source: url, url }, 'manual')}
+        onNewBrowserTab={() => {
+          newBrowserTab()
+          setMobilePreviewOpen(true)
+        }}
+        onOpenExternal={url => void window.hermesDesktop.openExternal(url)}
+        onSelectTab={selectRightRailTab}
+        open={mobilePreviewOpen}
+        tabs={previewTabs}
+      />
+    </>
   )
 }

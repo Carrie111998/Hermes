@@ -31,17 +31,20 @@ describe('mobile master-detail navigation', () => {
     const list = masterDetail.querySelector<HTMLElement>('[data-master-detail-list]')
     const detail = masterDetail.querySelector<HTMLElement>('[data-master-detail-detail]')
 
+    expect(masterDetail.getAttribute('data-mobile-master-detail-view')).toBe('browse')
     expect(list?.hidden).toBe(false)
     expect(detail?.hidden).toBe(true)
 
     fireEvent.click(screen.getByText('Example skill'))
 
+    expect(masterDetail.getAttribute('data-mobile-master-detail-view')).toBe('detail')
     expect(list?.hidden).toBe(true)
     expect(detail?.hidden).toBe(false)
     expect(screen.getByRole('button', { name: 'Back' })).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Back' }))
 
+    expect(masterDetail.getAttribute('data-mobile-master-detail-view')).toBe('browse')
     expect(list?.hidden).toBe(false)
     expect(detail?.hidden).toBe(true)
   })

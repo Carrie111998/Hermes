@@ -190,10 +190,21 @@ function existingPreviewAnchor(tabId: string): string | undefined {
   return other ? previewPaneId(other.id) : undefined
 }
 
+/** Native mobile owns preview tabs in its full-screen overlay. Mirroring the
+ * same tabs into the Desktop tree would recreate the side rail the mobile
+ * renderer deliberately removes. */
+export function shouldMirrorPreviewTiles(documentLike: Document | undefined = typeof document === 'undefined' ? undefined : document) {
+  return !documentLike?.documentElement.hasAttribute('data-hermes-mobile')
+}
+
 /** Keep pane contributions mirroring `$previewTabs`, keep the store's selection
  *  and the tree's active pane agreeing, and front a tile when its tab is
  *  selected. Call once from the root. */
 export function watchPreviewTiles(): void {
+  if (!shouldMirrorPreviewTiles()) {
+    return
+  }
+
   watchPreviewTileMirror()
 
   window.hermesDesktop?.onBrowserPopoutClosed?.(tabId => {
