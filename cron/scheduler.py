@@ -6617,11 +6617,12 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     claim = job.get("fire_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not owner:
-        return run(None)
+        return run(None, None)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
     lost_ownership = threading.Event()
+    side_effect_fenced = threading.Event()
     heartbeat_context = contextvars.copy_context()
 
     def _finish_unstarted(error: str) -> None:
@@ -6663,6 +6664,14 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
+                    if side_effect_fenced.is_set():
+                        # save/delivery holds this owner's per-job fence. The
+                        # heartbeat cannot acquire that same lock from another
+                        # thread, but no replacement owner can acquire it
+                        # either, so contention here is proof of protection,
+                        # not ownership loss.
+                        last_confirmed = time.monotonic()
+                        continue
                     lost_ownership.set()
                     logger.warning(
                         "Job '%s': fire claim ownership lost; interrupting stale run",
@@ -6709,7 +6718,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         return True
 
     try:
-        return run(lost_ownership)
+        return run(lost_ownership, side_effect_fenced)
     finally:
         stop.set()
         heartbeat_thread.join(timeout=1.0)
@@ -6755,7 +6764,7 @@ def run_one_job(
     try:
         return _run_with_fire_claim_heartbeat(
             job,
-            lambda lost_ownership: _run_one_job_body(
+            lambda lost_ownership, side_effect_fenced: _run_one_job_body(
                 job,
                 adapters=adapters,
                 loop=loop,
@@ -6766,6 +6775,7 @@ def run_one_job(
                     if cancel_event is not None
                     else lost_ownership
                 ),
+                fire_claim_fenced=side_effect_fenced,
                 execution_token=execution_token,
             ),
         )
@@ -6786,6 +6796,7 @@ def _run_one_job_body(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
+    fire_claim_fenced: Optional[threading.Event] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
     claim = job.get("fire_claim")
@@ -6797,7 +6808,23 @@ def _run_one_job_body(
     def _side_effect_fence():
         if fire_owner is None:
             return contextlib.nullcontext(True)
-        return fire_claim_fence(job["id"], expected_owner=fire_owner)
+
+        @contextlib.contextmanager
+        def _owned_fence():
+            try:
+                with fire_claim_fence(
+                    job["id"], expected_owner=fire_owner
+                ) as owns_claim:
+                    if owns_claim and fire_claim_fenced is not None:
+                        fire_claim_fenced.set()
+                    yield owns_claim
+            finally:
+                # Clear only after fire_claim_fence releases the lock. Until
+                # then heartbeat contention remains safe and expected.
+                if fire_claim_fenced is not None:
+                    fire_claim_fenced.clear()
+
+        return _owned_fence()
 
     def _fire_claim_ownership_lost() -> bool:
         if fire_claim_lost is not None and fire_claim_lost.is_set():

@@ -578,3 +578,66 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
         success=False,
         error="Fire claim ownership lost before terminal completion.",
     )
+
+
+def test_finite_bot_chat_delivery_does_not_report_its_own_claim_lock_as_lost(
+    monkeypatch,
+):
+    """A long Bot Chat delivery owns the fence, so lock contention is safe."""
+    import cron.scheduler as scheduler
+
+    delivery_active = threading.Event()
+    heartbeat_contended = threading.Event()
+    finish = MagicMock()
+
+    def heartbeat(*_args, **_kwargs):
+        if delivery_active.is_set():
+            heartbeat_contended.set()
+            return False
+        return True
+
+    @contextlib.contextmanager
+    def owned_fence(*_args, **_kwargs):
+        yield True
+
+    def deliver(*_args, **_kwargs):
+        delivery_active.set()
+        assert heartbeat_contended.wait(timeout=1)
+        delivery_active.clear()
+        return None
+
+    job = {
+        "id": "long-fenced-delivery",
+        "execution_id": "execution-long-delivery",
+        "name": "long-fenced-delivery",
+        "deliver": "bot-chat,telegram:1",
+        "schedule": {"kind": "once"},
+        "repeat": {"times": 1, "completed": 0},
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: None)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (True, "output", "response", None),
+    )
+    monkeypatch.setattr(scheduler, "fire_claim_fence", owned_fence)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "output.md")
+    monkeypatch.setattr(scheduler, "_deliver_result", deliver)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(scheduler, "finish_execution", finish)
+
+    with patch("agent.secret_scope.set_secret_scope", return_value=None), \
+         patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
+         patch("agent.secret_scope.reset_secret_scope"):
+        assert scheduler.run_one_job(job) is True
+
+    finish.assert_called_once_with(
+        "execution-long-delivery",
+        success=True,
+        error=None,
+        delivery_outcome="delivered",
+    )
