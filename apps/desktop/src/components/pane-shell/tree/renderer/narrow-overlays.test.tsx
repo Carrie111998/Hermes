@@ -95,10 +95,13 @@ describe('narrow overlay of a stacked zone', () => {
 
   it('publishes a close intent when the drawer X is pressed', () => {
     const closed: string[] = []
+
     const onReveal = (event: Event) => {
       const detail = (event as CustomEvent<{ id?: string; mode?: string }>).detail
-      if (detail?.mode === 'close' && detail.id) closed.push(detail.id)
+
+      if (detail?.mode === 'close' && detail.id) {closed.push(detail.id)}
     }
+
     window.addEventListener(PANE_TOGGLE_REVEAL_EVENT, onReveal)
 
     try {
@@ -115,10 +118,13 @@ describe('narrow overlay of a stacked zone', () => {
   it('places a dismissible mobile scrim behind a revealed drawer', () => {
     document.documentElement.setAttribute('data-hermes-mobile', '')
     const closed: string[] = []
+
     const onReveal = (event: Event) => {
       const detail = (event as CustomEvent<{ id?: string; mode?: string }>).detail
-      if (detail?.mode === 'close' && detail.id) closed.push(detail.id)
+
+      if (detail?.mode === 'close' && detail.id) {closed.push(detail.id)}
     }
+
     window.addEventListener(PANE_TOGGLE_REVEAL_EVENT, onReveal)
 
     try {

@@ -231,6 +231,7 @@ describe('requestComposerAttachFiles', () => {
     markActiveComposer('main')
     const file = new File(['shared'], 'shared.txt', { type: 'text/plain' })
     const seen: File[][] = []
+
     const off = onComposerAttachFilesRequest(({ files, target }) => {
       if (target === 'main') {
         seen.push(files)

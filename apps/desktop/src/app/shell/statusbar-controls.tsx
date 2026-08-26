@@ -15,8 +15,8 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Tip, TipKeybindLabel, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { ContribRender } from '@/contrib/react/boundary'
 import { useI18n } from '@/i18n'
-import { useKeybindHint } from '@/lib/keybinds/use-keybind-hint'
 import { MoreHorizontal } from '@/lib/icons'
+import { useKeybindHint } from '@/lib/keybinds/use-keybind-hint'
 import { cn } from '@/lib/utils'
 import {
   $statusbarHiddenIds,
@@ -102,13 +102,16 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
 
   const visible = (item: StatusbarItem) =>
     !item.hidden && (item.lockedVisible || !item.toggleLabel || !hiddenIds.includes(item.id))
+
   const visibleLeftItems = leftItems.filter(visible)
   const visibleRightItems = items.filter(visible)
   const mobileRenderer = typeof document !== 'undefined' && document.documentElement.hasAttribute('data-hermes-mobile')
   const mobileItems = [...visibleLeftItems, ...visibleRightItems]
+
   const mobilePrimaryItems = mobileRenderer
     ? mobileItems.filter(item => MOBILE_STATUSBAR_PRIMARY_IDS.has(item.id))
     : visibleLeftItems
+
   const mobileOverflowItems = mobileRenderer
     ? mobileItems.filter(item => !MOBILE_STATUSBAR_PRIMARY_IDS.has(item.id))
     : []
@@ -169,7 +172,7 @@ function MobileStatusbarMore({
   label: string
   navigate: ReturnType<typeof useNavigate>
 }) {
-  if (items.length === 0) return null
+  if (items.length === 0) {return null}
 
   return (
     <DropdownMenu>
@@ -316,7 +319,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
     // way profile-switcher.tsx stacks Popover/ContextMenu/Tooltip triggers.
     const trigger = (
       <DropdownMenuTrigger asChild>
-        <button data-statusbar-id={item.id} className={cn(STATUSBAR_ACTION_CLASS, item.className)} disabled={item.disabled} type="button">
+        <button className={cn(STATUSBAR_ACTION_CLASS, item.className)} data-statusbar-id={item.id} disabled={item.disabled} type="button">
           {content}
         </button>
       </DropdownMenuTrigger>
@@ -401,7 +404,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
   if (item.href || item.variant === 'link') {
     return (
       <Tip label={tooltipLabel}>
-        <a data-statusbar-id={item.id} className={cn(STATUSBAR_ACTION_CLASS, item.className)} href={item.href} rel="noreferrer" target="_blank">
+        <a className={cn(STATUSBAR_ACTION_CLASS, item.className)} data-statusbar-id={item.id} href={item.href} rel="noreferrer" target="_blank">
           {content}
         </a>
       </Tip>

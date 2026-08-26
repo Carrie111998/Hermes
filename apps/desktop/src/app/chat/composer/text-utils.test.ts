@@ -268,6 +268,7 @@ describe('extractClipboardFiles', () => {
     const image = new File(['image'], 'photo.png', { type: 'image/png', lastModified: 1 })
     const video = new File(['video'], 'clip.mp4', { type: 'video/mp4', lastModified: 2 })
     const document = new File(['notes'], 'notes.txt', { type: 'text/plain', lastModified: 3 })
+
     const clipboard = {
       files: {
         length: 3,

@@ -31,6 +31,7 @@ export function routeClipboardToComposer(clipboard: DataTransfer): boolean {
   if (blobs.length > 0) {
     requestComposerAttachImages(blobs)
   }
+
   if (files.length > 0) {
     requestComposerAttachFiles(files)
   }

@@ -7,9 +7,10 @@ export function notificationOutcomeSummary(value: string, maxLength = 140): stri
     .replace(/\s+/g, ' ')
     .trim()
 
-  if (!clean) return ''
+  if (!clean) {return ''}
 
   const firstSentence = clean.match(/^.+?(?:[.!?](?:\s|$)|$)/)?.[0]?.trim() || clean
   const clipped = firstSentence.length > maxLength ? `${firstSentence.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…` : firstSentence
+
   return `Outcome: ${clipped}`
 }

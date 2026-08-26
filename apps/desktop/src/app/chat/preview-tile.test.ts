@@ -27,6 +27,7 @@ describe('preview tile surface selection', () => {
     const nativeMobileDocument = {
       documentElement: { hasAttribute: (name: string) => name === 'data-hermes-mobile' }
     } as unknown as Document
+
     const desktopDocument = {
       documentElement: { hasAttribute: () => false }
     } as unknown as Document
