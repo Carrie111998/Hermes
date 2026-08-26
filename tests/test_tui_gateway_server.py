@@ -37,6 +37,27 @@ def _dispatch_sync(req: dict, transport=None) -> dict | None:
         reset_transport(token)
 
 
+class _BorrowedSessionDB:
+    """Delegate to a test DB while keeping production close calls harmless."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def close(self):
+        pass
+
+
+def _patch_session_db(monkeypatch, db) -> None:
+    monkeypatch.setattr(
+        server,
+        "_new_session_db",
+        lambda *_args, **_kwargs: _BorrowedSessionDB(db),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.
@@ -5135,7 +5156,7 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
             closed["count"] += 1
 
     monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_new_session_db", lambda *_a, **_k: None)
 
     session = _session(slash_worker=_FakeWorker())
 
@@ -6304,8 +6325,10 @@ def test_prompt_submit_refuses_ordinal_only_when_durable_history_is_unstamped(mo
         def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
             replaced.append((key, list(messages)))
 
+    db = _FakeDB()
     server._sessions["unstamped-durable-sid"] = _session(history=list(history))
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     monkeypatch.setattr(
         server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
     )
@@ -7459,7 +7482,7 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_new_session_db", lambda _session, _label: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
@@ -7480,7 +7503,7 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_new_session_db", lambda _session, _label: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
     server._ensure_session_db_row({"session_key": "k1", "source": "tool"})
@@ -7505,7 +7528,7 @@ def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_pat
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
@@ -7528,7 +7551,7 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_new_session_db", lambda _session, _label: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
     server._ensure_session_db_row({"session_key": "k1", "source": "desktop", "cwd": str(tmp_path)})
@@ -7555,7 +7578,7 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
                 {"key": key, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_new_session_db", lambda _session, _label: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "global/default")
 
     server._ensure_session_db_row(
@@ -7585,7 +7608,7 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
         def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
             created.append({"model": model, "model_config": model_config})
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_new_session_db", lambda _session, _label: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "global/default")
 
     server._ensure_session_db_row({"session_key": "k1", "model_override": None})
@@ -7623,6 +7646,38 @@ def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
     assert created[0]["db_path"] == profile_home / "state.db"
 
 
+def test_default_session_db_row_uses_launch_home_not_cached_global(monkeypatch, tmp_path):
+    """A default-profile session row must not reuse a stale global DB handle."""
+    from hermes_state import SessionDB
+
+    launch_home = tmp_path / "launch"
+    other_home = tmp_path / "profiles" / "other"
+    launch_home.mkdir()
+    other_home.mkdir(parents=True)
+
+    stale_db = SessionDB(db_path=other_home / "state.db")
+    monkeypatch.setattr(server, "_db", stale_db)
+    monkeypatch.setattr(server, "_db_error", None)
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+
+    server._ensure_session_db_row(
+        {
+            "session_key": "default-session",
+            "profile_home": None,
+            "model_override": {"model": "test-model"},
+            "source": "desktop",
+        }
+    )
+
+    launch_db = SessionDB(db_path=launch_home / "state.db")
+    try:
+        assert launch_db.get_session("default-session") is not None
+        assert stale_db.get_session("default-session") is None
+    finally:
+        launch_db.close()
+        stale_db.close()
+
+
 def test_session_title_clears_pending_after_persist(monkeypatch):
     class _FakeDB:
         def __init__(self):
@@ -7642,6 +7697,7 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
     emitted = []
     server._sessions["sid"] = _session(pending_title="stale")
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
     try:
         resp = server.handle_request(
@@ -7678,6 +7734,7 @@ def test_session_title_does_not_queue_noop_when_row_exists(monkeypatch):
 
     server._sessions["sid"] = _session(pending_title="stale")
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
     try:
         resp = server.handle_request(
             {
@@ -7701,6 +7758,7 @@ def test_session_title_get_falls_back_to_pending_when_db_read_throws(monkeypatch
 
     server._sessions["sid"] = _session(pending_title="queued title")
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.title", "params": {"session_id": "sid"}}
@@ -7728,6 +7786,7 @@ def test_session_title_get_retries_persist_for_pending_title(monkeypatch):
     db = _FakeDB()
     server._sessions["sid"] = _session(pending_title="queued title")
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.title", "params": {"session_id": "sid"}}
@@ -7756,6 +7815,7 @@ def test_session_title_get_retries_pending_even_when_db_has_title(monkeypatch):
     db = _FakeDB()
     server._sessions["sid"] = _session(pending_title="queued title")
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.title", "params": {"session_id": "sid"}}
@@ -7773,6 +7833,7 @@ def test_session_title_rejects_empty_title_with_specific_error_code(monkeypatch)
 
     server._sessions["sid"] = _session()
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
     try:
         resp = server.handle_request(
             {
@@ -7800,6 +7861,7 @@ def test_session_title_set_maps_valueerror_to_user_error(monkeypatch):
 
     server._sessions["sid"] = _session()
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
     try:
         resp = server.handle_request(
             {
@@ -7828,6 +7890,7 @@ def test_session_title_set_errors_when_row_lookup_fails_after_noop(monkeypatch):
 
     server._sessions["sid"] = _session()
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
     try:
         resp = server.handle_request(
             {
@@ -7893,6 +7956,7 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
 
     server._sessions["sid"] = session
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -10735,7 +10799,9 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
                 "updated_at": 1_700_000_060,
             }
 
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    db = _DB()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.status", "params": {"session_id": "sid"}}
@@ -11484,6 +11550,7 @@ def test_session_info_includes_session_title(monkeypatch):
             return "Dashboard title"
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    _patch_session_db(monkeypatch, _FakeDB())
 
     info = server._session_info(
         types.SimpleNamespace(tools=[], model="test/model", provider="openai-codex"),
@@ -12087,6 +12154,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+        _patch_session_db(monkeypatch, stub_db)
 
         resp = server.handle_request(
             {
@@ -12146,7 +12214,9 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
         ):
             raise OSError("disk full")
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
+    db = _FailDb()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     monkeypatch.setattr(
         server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
     )
@@ -12256,6 +12326,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+        _patch_session_db(monkeypatch, stub_db)
 
         # ordinal=1 means "truncate before the 2nd-from-last real user turn"
         # which is "first". The display_kind marker must NOT shift the ordinal.
@@ -12367,6 +12438,7 @@ def test_prompt_submit_truncate_translates_display_prefix_ordinal(monkeypatch):
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+        _patch_session_db(monkeypatch, stub_db)
 
         resp = server.handle_request(
             {
@@ -13913,7 +13985,7 @@ def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
     fake_mod = types.ModuleType("hermes_state")
 
     class _BrokenSessionDB:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             raise RuntimeError("locking protocol")
 
     fake_mod.SessionDB = _BrokenSessionDB
@@ -13923,6 +13995,31 @@ def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
 
     assert server._get_db() is None
     assert server._db_error == "locking protocol"
+
+
+def test_get_db_uses_launch_home_under_session_override(monkeypatch, tmp_path):
+    """The process-global handle must not bind to an ambient profile override."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "researcher"
+    launch_home.mkdir()
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    monkeypatch.setattr(server, "_db", None)
+    monkeypatch.setattr(server, "_db_error", None)
+
+    token = set_hermes_home_override(profile_home)
+    db = None
+    try:
+        db = server._get_db()
+        assert db is not None
+        assert db.db_path == launch_home / "state.db"
+    finally:
+        reset_hermes_home_override(token)
+        if db is not None:
+            db.close()
+        server._db = None
 
 
 @pytest.mark.real_agent_prewarm
@@ -14498,7 +14595,9 @@ def test_session_history_ships_durable_row_ids(monkeypatch):
         "created_at": 1.0,
         "last_active": 1.0,
     }
-    monkeypatch.setattr(server, "_get_db", lambda: _Db())
+    db = _Db()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.history", "params": {"session_id": "rowid-hist-sid"}}
@@ -15432,7 +15531,9 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
 
     previous_sessions = dict(server._sessions)
     server._sessions.clear()
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    db = _DB()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "find docs"}],
@@ -15565,6 +15666,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_new_session_db", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
@@ -18105,7 +18207,7 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
 
 @pytest.mark.parametrize("service_tier_override", ["priority", ""])
 def test_start_agent_build_passes_session_model_override(
-    monkeypatch, service_tier_override
+    monkeypatch, tmp_path, service_tier_override
 ):
     """A model staged on the session (e.g. by session.create from the desktop
     composer) must reach _make_agent so the first build runs on it directly —
@@ -18122,6 +18224,7 @@ def test_start_agent_build_passes_session_model_override(
 
     def fake_make_agent(sid, key, session_id=None, session_db=None, **kwargs):
         captured.update(kwargs)
+        captured["session_db"] = session_db
         return types.SimpleNamespace(model="claude-sonnet-4.6")
 
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
@@ -18135,6 +18238,9 @@ def test_start_agent_build_passes_session_model_override(
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
     monkeypatch.setattr(server, "_probe_config_health", lambda *_a: None)
+    launch_home = tmp_path / "launch"
+    launch_home.mkdir()
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
 
     sid = "build-sid"
     override = {"model": "claude-sonnet-4.6", "provider": "anthropic"}
@@ -18155,8 +18261,11 @@ def test_start_agent_build_passes_session_model_override(
         assert captured.get("model_override") == override
         assert captured.get("reasoning_config_override") == reasoning
         assert captured.get("service_tier_override") == service_tier_override
+        assert captured["session_db"].db_path == launch_home / "state.db"
         assert session["agent"].model == "claude-sonnet-4.6"
     finally:
+        if captured.get("session_db") is not None:
+            captured["session_db"].close()
         server._sessions.clear()
 
 
@@ -18186,6 +18295,7 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
 
     monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_new_session_db", lambda *_args: None)
     monkeypatch.setattr(server, "_make_agent", make_agent)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
     monkeypatch.setattr(server, "_load_show_reasoning", lambda: True)
@@ -19630,6 +19740,7 @@ def test_persist_branch_seed_keeps_reasoning_fields(monkeypatch, tmp_path):
     try:
         db.create_session("branch-key", source="tui")
         monkeypatch.setattr(server, "_get_db", lambda: db)
+        _patch_session_db(monkeypatch, db)
 
         server._persist_branch_seed(session)
 
@@ -19662,6 +19773,7 @@ def test_session_branch_keeps_reasoning_fields(monkeypatch, tmp_path):
     try:
         db.create_session("session-key", source="tui")
         monkeypatch.setattr(server, "_get_db", lambda: db)
+        _patch_session_db(monkeypatch, db)
         monkeypatch.setattr(server, "_new_session_key", lambda: "branch-key")
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
@@ -19895,6 +20007,7 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+        _patch_session_db(monkeypatch, stub_db)
 
         # The client counts three user bubbles (first=0, second=1, third=2) —
         # it never sees the pivot. Rewinding to "third" must cut exactly there.
@@ -19992,7 +20105,9 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_get_db", lambda: _StubDb())
+        db = _StubDb()
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        _patch_session_db(monkeypatch, db)
 
         resp = server.handle_request(
             {
@@ -20167,7 +20282,9 @@ def test_prompt_submit_row_id_resolves_via_db_when_memory_lacks_stamps(monkeypat
 
     sess = _session(history=list(live_history), session_key="db-row-key")
     server._sessions["db-row-resolve-sid"] = sess
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    db = _FakeDB()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
 
     try:
@@ -20230,6 +20347,7 @@ def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
     sid = "real-db-row-trunc-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
@@ -20426,6 +20544,7 @@ def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
     sid = "misalign-role-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    _patch_session_db(monkeypatch, db)
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
