@@ -408,6 +408,7 @@ export function ModelCatalogMenu({
                     const isCurrent = activeId !== null
                     const name = modelDisplayParts(family.id).name
                     const caps = group.provider.capabilities?.[family.id]
+                    const price = group.provider.pricing?.[family.id]
 
                     // Effective settings for this row: the live choice when it's
                     // the active model, otherwise its remembered preset. Row
@@ -423,9 +424,19 @@ export function ModelCatalogMenu({
                       effFast
                     )
 
+                    // $/Mtok pricing, same data + copy shape as the settings model
+                    // picker (model-picker.tsx) and onboarding — surfaced here too
+                    // so it's visible from wherever a model gets picked (#93360).
+                    const priceLabel = price?.free
+                      ? copy.free
+                      : price && (price.input || price.output)
+                        ? copy.price(price.input || '?', price.output || '?')
+                        : null
+
                     const meta = [
                       fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
-                      (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null
+                      (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null,
+                      priceLabel
                     ]
                       .filter(Boolean)
                       .join(' ')

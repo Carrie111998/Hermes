@@ -2957,7 +2957,9 @@ export const zh: Translations = {
       noModels: '未找到模型',
       editModels: '编辑模型…',
       refreshModels: '刷新模型',
-      fast: '快速'
+      fast: '快速',
+      free: '免费',
+      price: (input, output) => `${input} 输入 / ${output} 输出每 Mtok`
     },
     modelOptions: {
       noOptions: '此模型没有可用选项',

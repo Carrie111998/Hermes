@@ -2461,7 +2461,9 @@ export const ja = defineLocale({
       noModels: 'モデルが見つかりません',
       editModels: 'モデルを編集…',
       refreshModels: 'モデルを更新',
-      fast: '高速'
+      fast: '高速',
+      free: '無料',
+      price: (input, output) => `${input} 入力 / ${output} 出力 per Mtok`
     },
     modelOptions: {
       noOptions: 'このモデルにはオプションがありません',
