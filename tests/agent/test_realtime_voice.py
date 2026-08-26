@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from agent import realtime_voice_coordinator
 from agent import realtime_voice_registry
 from agent.realtime_voice import (
     HeardAudioBoundary,
@@ -174,6 +175,24 @@ async def test_coordinator_rejects_foreign_stale_and_regressing_heard_boundaries
     ) is False
     assert coordinator.report_audio_heard(observed[1], audio_end_ms=100) is True
     assert coordinator.report_audio_heard(observed[1], audio_end_ms=90) is False
+
+
+@pytest.mark.asyncio
+async def test_coordinator_rejects_foreign_event_when_identity_token_is_reused(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    emitted = RealtimeEvent.audio(b"emitted", item_id="item-1")
+    foreign = RealtimeEvent.audio(b"foreign", item_id="item-1")
+    monkeypatch.setattr(realtime_voice_coordinator, "id", lambda _event: 7, raising=False)
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", FakeSession([emitted])),
+        dispatch_tool=lambda _name, _args: "ok",
+    )
+    await coordinator.open(instructions="", tools=[])
+    [observed] = [event async for event in coordinator.events()]
+
+    assert coordinator.report_audio_heard(observed, audio_end_ms=100) is True
+    assert coordinator.report_audio_heard(foreign, audio_end_ms=120) is False
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ class RealtimeVoiceCoordinator:
         self._dispatch_tool = dispatch_tool
         self._session: RealtimeSession | None = None
         self._current_item_id: str | None = None
-        self._current_audio_events: set[int] = set()
+        self._current_audio_events: dict[int, RealtimeEvent] = {}
         self._heard_boundary: HeardAudioBoundary | None = None
 
     async def open(
@@ -59,7 +59,7 @@ class RealtimeVoiceCoordinator:
             or event.type is not RealtimeEventType.AUDIO
             or not event.item_id
             or event.item_id != self._current_item_id
-            or id(event) not in self._current_audio_events
+            or self._current_audio_events.get(id(event)) is not event
             or audio_end_ms < 0
         ):
             return False
@@ -84,7 +84,7 @@ class RealtimeVoiceCoordinator:
                     self._current_item_id = event.item_id
                     self._current_audio_events.clear()
                     self._heard_boundary = None
-                self._current_audio_events.add(id(event))
+                self._current_audio_events[id(event)] = event
             if event.type is RealtimeEventType.TOOL_CALL:
                 await self._dispatch(event, session)
             yield event
