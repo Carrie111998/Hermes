@@ -22,7 +22,7 @@ import { FoundrlyPortalChat } from './portal-chat-pane'
  * /admin/portal/chat (OTP + scoped tools). Hermes left-rail chat stays
  * separate. Do not import Agency native copilot IPC.
  */
-const WEB_URL = BRAND.foundrly?.webUrl ?? 'https://foundrly.intelli-verse-x.ai'
+const WEB_URL = BRAND.foundrly?.webUrl ?? 'https://getfoundrly.com'
 const ADMIN_URL = BRAND.foundrly?.adminPortalUrl ?? 'https://admin.intelli-verse-x.ai/admin/portal'
 
 const FOUNDRLY_MODES = ['chat', 'home'] as const

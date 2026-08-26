@@ -7,7 +7,7 @@
   "description": "Foundrly — AI co-founder desktop for local businesses.",
   "author": "Intelliverse X",
   "copyright": "Copyright © 2026 Intelliverse X",
-  "homepage": "https://foundrly.intelli-verse-x.ai",
+  "homepage": "https://getfoundrly.com",
   "protocolScheme": "foundrly",
   "icon": "assets/brands/foundrly/icon",
   "iconIco": "assets/brands/foundrly/icon.ico",
@@ -19,7 +19,7 @@
   "workspace": "foundrly",
   "workspaceLabel": "Foundrly",
   "foundrly": {
-    "webUrl": "https://foundrly.intelli-verse-x.ai",
+    "webUrl": "https://getfoundrly.com",
     "adminPortalUrl": "https://admin.intelli-verse-x.ai/admin/portal",
     "adminChatUrl": "https://admin.intelli-verse-x.ai/admin/portal/chat"
   }

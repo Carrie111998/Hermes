@@ -12925,7 +12925,7 @@ if (process.env.HERMES_DESKTOP_BRAND === 'foundrly') {
         brand: 'foundrly',
         workspace: 'persist:foundrly-home',
         portalPartition: 'persist:foundrly-portal',
-        webUrl: BRAND.foundrly?.webUrl ?? 'https://foundrly.intelli-verse-x.ai',
+        webUrl: BRAND.foundrly?.webUrl ?? 'https://getfoundrly.com',
         adminPortalUrl: BRAND.foundrly?.adminPortalUrl ?? 'https://admin.intelli-verse-x.ai/admin/portal',
         adminChatUrl: BRAND.foundrly?.adminChatUrl ?? 'https://admin.intelli-verse-x.ai/admin/portal/chat',
         settingsPath: FOUNDRLY_SETTINGS_PATH

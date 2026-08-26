@@ -64,7 +64,7 @@ export function foundrlySoulMd(opts?: {
   adminPortalUrl?: string
   adminChatUrl?: string
 }): string {
-  const webUrl = opts?.webUrl?.trim() || 'https://foundrly.intelli-verse-x.ai'
+  const webUrl = opts?.webUrl?.trim() || 'https://getfoundrly.com'
   const adminPortalUrl = opts?.adminPortalUrl?.trim() || 'https://admin.intelli-verse-x.ai/admin/portal'
   const adminChatUrl =
     opts?.adminChatUrl?.trim() || 'https://admin.intelli-verse-x.ai/admin/portal/chat'
