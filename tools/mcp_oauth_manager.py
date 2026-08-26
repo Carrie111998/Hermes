@@ -35,6 +35,7 @@ Design reference:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import threading
@@ -62,6 +63,31 @@ def _same_endpoint(a: str, b: str) -> bool:
         pa.scheme == pb.scheme
         and pa.netloc.lower() == pb.netloc.lower()
         and pa.path.rstrip("/") == pb.path.rstrip("/")
+    )
+
+
+def _equivalent_root_issuers(a: str, b: str) -> bool:
+    """Return whether issuer URLs differ only by the root path's slash.
+
+    RFC 8414 normally requires exact issuer string matching. This narrow
+    interoperability exception does not normalize scheme, authority, query,
+    fragment, or non-root paths, which can identify different issuers.
+    """
+    from urllib.parse import urlsplit
+
+    if not (a + "/" == b or b + "/" == a):
+        return False
+    try:
+        parsed = (urlsplit(a), urlsplit(b))
+    except ValueError:
+        return False
+    return all(
+        url.scheme
+        and url.netloc
+        and url.path in ("", "/")
+        and not url.query
+        and not url.fragment
+        for url in parsed
     )
 
 
@@ -501,6 +527,37 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self._hermes_server_name, exc,
                 )
 
+        async def _align_equivalent_metadata_issuer(self, response: Any) -> None:
+            """Align the SDK's expected issuer for a root-slash-only mismatch."""
+            expected = self.context.auth_server_url
+            if expected is None or getattr(response, "status_code", None) != 200:
+                return
+            try:
+                payload = json.loads(await response.aread())
+            except (TypeError, ValueError):
+                return
+            actual = payload.get("issuer") if isinstance(payload, dict) else None
+            if isinstance(actual, str) and _equivalent_root_issuers(actual, expected):
+                self.context.auth_server_url = actual
+
+        async def _align_equivalent_bound_issuer(self, response: Any) -> None:
+            """Keep credentials bound across a root-slash-only PRM mismatch."""
+            client_info = self.context.client_info
+            bound = getattr(client_info, "issuer", None)
+            if not isinstance(bound, str) or getattr(response, "status_code", None) != 200:
+                return
+            try:
+                payload = json.loads(await response.aread())
+            except (TypeError, ValueError):
+                return
+            servers = payload.get("authorization_servers") if isinstance(payload, dict) else None
+            if not isinstance(servers, list):
+                return
+            for advertised in servers:
+                if isinstance(advertised, str) and _equivalent_root_issuers(bound, advertised):
+                    client_info.issuer = advertised
+                    return
+
         async def async_auth_flow(self, request):  # type: ignore[override]
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with
@@ -538,6 +595,8 @@ def _make_hermes_provider_class() -> Optional[type]:
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
+                    await self._align_equivalent_bound_issuer(incoming)
+                    await self._align_equivalent_metadata_issuer(incoming)
                     outgoing = await inner.asend(incoming)
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
