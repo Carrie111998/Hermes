@@ -44,7 +44,7 @@ export interface BundleSkewResult {
 export type RunGit = (
   args: string[],
   options: { cwd: string }
-) => Promise<{ code: number; stderr: string; stdout: string }>
+) => Promise<{ code: number | null; stderr: string; stdout: string }>
 
 const NOT_STALE: BundleSkewResult = { desktopCommitsBehind: null, outOfSync: false }
 
