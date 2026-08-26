@@ -196,3 +196,13 @@ class TestRecoveryEndToEndClassification:
         )
         result = classify_api_error(err, provider="alibaba", model="qwen3.5-plus")
         assert result.reason == FailoverReason.multimodal_tool_content_unsupported
+
+    def test_lmstudio_variant_classifies(self):
+        """LM Studio rejects list-type tool content with a generic
+        'invalid messages in payload' messages error."""
+        err = _FakeApiError(
+            status_code=400,
+            message="invalid 'messages' in payload",
+        )
+        result = classify_api_error(err, provider="lmstudio", model="local")
+        assert result.reason == FailoverReason.multimodal_tool_content_unsupported

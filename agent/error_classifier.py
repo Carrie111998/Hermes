@@ -311,6 +311,8 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = [
     "expected string, got array",
     # Alibaba/DashScope variant
     "tool_call.content must be string",
+    # LM Studio: rejects list-type tool content with a generic messages error
+    "invalid 'messages' in payload",
 ]
 
 # Context overflow patterns
