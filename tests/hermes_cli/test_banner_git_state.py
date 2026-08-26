@@ -1,3 +1,5 @@
+import json
+import time
 from unittest.mock import MagicMock, patch
 
 
@@ -126,3 +128,35 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
         behind = banner._check_via_local_git(repo_dir)
 
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+
+
+def test_check_for_updates_invalidates_cache_when_local_head_changes(tmp_path):
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 2,
+                "rev": "old-head",
+                "ver": banner.VERSION,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with (
+        patch.object(banner, "get_hermes_home", return_value=tmp_path),
+        patch.object(banner, "_resolve_repo_dir", return_value=repo_dir),
+        patch.object(banner, "_git_stdout", return_value="new-head"),
+        patch.object(banner, "_check_via_local_git", return_value=0) as check,
+        patch("hermes_cli.config.detect_install_method", return_value="git"),
+    ):
+        behind = banner.check_for_updates()
+
+    assert behind == 0
+    check.assert_called_once_with(repo_dir)
+    assert json.loads(cache_file.read_text(encoding="utf-8"))["rev"] == "new-head"
