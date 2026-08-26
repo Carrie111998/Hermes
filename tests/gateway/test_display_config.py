@@ -139,6 +139,34 @@ class TestPlatformDefaults:
         for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk", "whatsapp_cloud"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
 
+    def test_no_edit_chat_adapters_are_tier_low(self):
+        """No-edit chat adapters must not inherit the verbose global profile.
+
+        Adapters without ``edit_message`` and without a table entry silently
+        fell through to ``_GLOBAL_DEFAULTS`` (tool_progress "all", interim
+        messages on) — tuned for editable bubbles — so every progress line
+        became its own permanent message (#95841). Buzz is excluded: it
+        supports messages edit and sits at TIER_MEDIUM (#99429)."""
+        from gateway.display_config import resolve_display_setting
+
+        for plat in ("irc", "line", "raft", "simplex", "teams"):
+            assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
+            assert resolve_display_setting({}, plat, "interim_assistant_messages") is False, plat
+            assert resolve_display_setting({}, plat, "long_running_notifications") is False, plat
+        # Lock in the deliberate #99429 placement: a later duplicate
+        # "buzz" entry in the table would silently override it.
+        assert resolve_display_setting({}, "buzz", "tool_progress") == "new"
+        assert resolve_display_setting({}, "buzz", "interim_assistant_messages") is True
+
+    def test_non_interactive_pipes_are_tier_minimal(self):
+        """ntfy (push pipe) and a2a (agent peer) stay final-answer only."""
+        from gateway.display_config import resolve_display_setting
+
+        for plat in ("ntfy", "a2a"):
+            assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
+            assert resolve_display_setting({}, plat, "tool_preview_length") == 0, plat
+            assert resolve_display_setting({}, plat, "interim_assistant_messages") is False, plat
+
 
     def test_telegram_mobile_chatter_defaults(self):
         """Telegram keeps real mid-turn signal (interim commentary + heartbeats)

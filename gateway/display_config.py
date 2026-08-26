@@ -182,6 +182,17 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "wecom":           {**_TIER_LOW, "streaming": True},
     "wecom_callback":  _TIER_LOW,
     "dingtalk":        _TIER_LOW,
+    # No-edit chat adapters (each progress message is permanent channel
+    # history). Without these entries they silently inherited the verbose
+    # _GLOBAL_DEFAULTS — tuned for editable bubbles — and every interim
+    # scratch line landed as its own permanent message (#95841; originally
+    # observed on buzz, which now sits at TIER_MEDIUM above via #99429
+    # because buzz-cli supports messages edit).
+    "irc":             _TIER_LOW,
+    "line":            _TIER_LOW,
+    "raft":            _TIER_LOW,
+    "simplex":         _TIER_LOW,
+    "teams":           _TIER_LOW,
 
     # Tier 4 — batch or non-interactive delivery
     "email":           _TIER_MINIMAL,
@@ -189,6 +200,14 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "webhook":         _TIER_MINIMAL,
     "homeassistant":   _TIER_MINIMAL,
     "api_server":      {**_TIER_HIGH, "tool_preview_length": 0},
+    # ntfy is a push-notification pipe, not an interactive surface — batch
+    # delivery semantics apply (#95841).
+    "ntfy":            _TIER_MINIMAL,
+    # A2A peers are agents, not humans: every interim message becomes a
+    # persisted/audited reply in the peer's conversation (see #95753 —
+    # interim text is stored verbatim), so keep the channel final-answer
+    # only (#95841).
+    "a2a":             _TIER_MINIMAL,
 }
 
 # Canonical set of per-platform overrideable keys (for validation).
