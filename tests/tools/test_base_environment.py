@@ -554,3 +554,24 @@ class TestWaitForProcessDrain:
         )
         assert result["returncode"] == 0
         assert "before-bg" in result["output"], result["output"]
+
+    def test_drain_falls_back_to_read_when_selector_register_fails(self):
+        """If the selector cannot register the fd (e.g. EPERM for a regular
+        file, or an already-closed fd), the drain must fall back to a direct
+        blocking read instead of silently dropping all output."""
+        import selectors as _selectors
+        from unittest import mock
+
+        class _RejectingSelector:
+            def register(self, fd, flags):
+                raise OSError("EPERM: operation not permitted")
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            _selectors, "DefaultSelector", lambda: _RejectingSelector()
+        ):
+            result = self._run('printf "fallback-output\\n"')
+        assert result["returncode"] == 0
+        assert "fallback-output" in result["output"], result["output"]
