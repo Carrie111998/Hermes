@@ -1400,6 +1400,12 @@ class PhotonAdapter(BasePlatformAdapter):
                 )
             )
             return
+        # Threaded-reply context, filled when the event is an iMessage reply
+        # (sidecar flattens spectrum's {content, target} into type="reply").
+        _reply_to_id: Optional[str] = None
+        _reply_to_text: Optional[str] = None
+        _reply_to_direction: Optional[str] = None
+
         if ctype == "text":
             text = content.get("text") or ""
             mtype = MessageType.TEXT
@@ -1408,6 +1414,21 @@ class PhotonAdapter(BasePlatformAdapter):
         elif ctype == "richlink":
             text = _format_richlink_content(content)
             mtype = MessageType.TEXT
+        elif ctype == "reply":
+            # iMessage threaded reply: the sidecar flattens spectrum's
+            # {content, target} into {type:"reply", text, reply_to_message_id,
+            # reply_to_text, reply_to_direction} so the user's actual reply
+            # text is preserved (previously fell through to "content type not
+            # handled" and the message was lost).
+            text = content.get("text") or ""
+            mtype = MessageType.TEXT
+            if not text:
+                # Replying to an attachment/voice-only target: keep the event
+                # alive with a marker instead of dropping the user's intent.
+                text = "(empty reply)"
+            _reply_to_id = content.get("reply_to_message_id")
+            _reply_to_text = content.get("reply_to_text")
+            _reply_to_direction = content.get("reply_to_direction")
         elif ctype == "group":
             text_parts: List[str] = []
             mtype = MessageType.TEXT
@@ -1479,6 +1500,9 @@ class PhotonAdapter(BasePlatformAdapter):
             timestamp=timestamp,
             media_urls=media_urls,
             media_types=media_types,
+            reply_to_message_id=_reply_to_id,
+            reply_to_text=_reply_to_text,
+            reply_to_is_own_message=_reply_to_direction == "outbound",
         )
         await self.handle_message(message_event)
 
