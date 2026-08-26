@@ -75,6 +75,25 @@ export default defineConfig({
     tailwindcss(),
     hermesDevToken(),
   ],
+  experimental: {
+    // Static index.html/CSS asset URLs are already rewritten server-side
+    // (see hermes_cli/web_server.py's X-Forwarded-Prefix handling) by
+    // string-replacing the literal "/assets/" paths baked into those files.
+    // That trick doesn't reach URLs baked into compiled JS for code-split
+    // chunks (React.lazy() route pages, the xterm vendor chunk, and any
+    // CSS those chunks pull in) -- those stay hardcoded to root-absolute
+    // paths and 404 once this app is proxied under a path prefix like
+    // /hermes. Route only JS-originated references through a runtime
+    // expression that reads the same window.__HERMES_BASE_PATH__ global
+    // web_server.py already injects (see src/lib/api.ts for the existing
+    // consumer). Leave html/css hosts on the default so the working
+    // server-side string-replacement path stays untouched.
+    renderBuiltUrl(filename, { hostType }) {
+      if (hostType === "js") {
+        return { runtime: `(window.__HERMES_BASE_PATH__ || "") + "/${filename}"` };
+      }
+    },
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
