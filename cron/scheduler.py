@@ -4237,6 +4237,134 @@ def _run_job_script_with_claim_heartbeat(
         heartbeat_thread.join(timeout=1.0)
 
 
+_POST_SCRIPT_TIMEOUT_SECONDS = 60
+
+
+def _run_post_script(job: dict, execution_id: str) -> None:
+    """Best-effort post-run hook for a cron job.
+
+    Some jobs need a deterministic step after the agent has finished and the
+    run has been recorded — declaring an outcome to an external tracker,
+    releasing a claim, kicking a downstream pipeline. ``post_script`` on the
+    job names a script that is executed after ``finish_execution`` on both
+    the success and the failure path, with ``HERMES_JOB_ID`` and
+    ``HERMES_RUN_ID`` in its environment. It is skipped on the fenced paths
+    (fire-claim ownership lost, gateway-shutdown interrupt) where the run's
+    outcome belongs to a replacement worker. A monitor job's suppressed
+    no-change tick DOES fire it: that tick is a recorded, successful run.
+
+    Containment and interpreter rules match ``_run_job_script``: the script
+    must live inside HERMES_HOME/scripts/ (path traversal, absolute-path
+    injection and symlink escape are all rejected), ``.sh``/``.bash`` run
+    under bash, anything else under the current Python interpreter, and the
+    environment goes through ``build_subprocess_env`` so Hermes-managed
+    secrets are not inherited (SECURITY.md §2.3).
+
+    Failures are logged but never fail the cron run itself — by the time
+    this hook runs, the run's status has already been recorded.
+    """
+    post_script = job.get("post_script")
+    if not post_script:
+        return
+
+    job_id = job.get("id")
+    scripts_dir = _get_hermes_home() / "scripts"
+    scripts_dir_resolved = scripts_dir.resolve()
+
+    # Same ingestion contract as _run_job_script: reject NUL bytes and
+    # unexpandable paths eagerly instead of crashing the scheduler.
+    if "\x00" in str(post_script):
+        logger.warning(
+            "Job '%s': post_script path contains a NUL byte: %r",
+            job_id, post_script,
+        )
+        return
+    try:
+        raw = Path(str(post_script)).expanduser()
+    except (ValueError, RuntimeError, OSError):
+        logger.warning(
+            "Job '%s': post_script is not a valid filesystem path: %r",
+            job_id, post_script,
+        )
+        return
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (scripts_dir / raw).resolve()
+
+    try:
+        path.relative_to(scripts_dir_resolved)
+    except ValueError:
+        logger.warning(
+            "Job '%s': post_script resolves outside the scripts directory "
+            "(%s): %r",
+            job_id, scripts_dir_resolved, post_script,
+        )
+        return
+
+    if not path.is_file():
+        logger.warning("Job '%s': post_script not found: %s", job_id, path)
+        return
+
+    suffix = path.suffix.lower()
+    if suffix in {".sh", ".bash"}:
+        _bash = shutil.which("bash") or (
+            "/bin/bash" if os.path.isfile("/bin/bash") else None
+        )
+        if _bash is None:
+            logger.warning(
+                "Job '%s': cannot run post_script %r: bash not found on PATH",
+                job_id, path.name,
+            )
+            return
+        argv = [_bash, str(path)]
+        env_overlay: dict[str, str] = {}
+    else:
+        python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+        if env_overlay:
+            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
+        else:
+            argv = [python_exe, str(path)]
+
+    try:
+        from tools.environments.local import build_subprocess_env
+
+        env = build_subprocess_env()
+    except Exception:
+        env = os.environ.copy()
+    env.update(env_overlay)
+    env["HERMES_JOB_ID"] = str(job_id or "")
+    env["HERMES_RUN_ID"] = str(execution_id or "")
+
+    popen_kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        popen_kwargs = {"creationflags": windows_hide_flags()}
+
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_POST_SCRIPT_TIMEOUT_SECONDS,
+            cwd=str(path.parent),
+            env=env,
+            **popen_kwargs,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Job '%s': post_script failed (rc=%s): %s",
+                job_id,
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+        else:
+            logger.info("Job '%s': post_script completed", job_id)
+    except Exception as e:
+        logger.warning("Job '%s': post_script raised: %s", job_id, e)
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Parse the last non-empty stdout line of a cron job's pre-check script
     as a wake gate.
@@ -7190,6 +7318,7 @@ def _run_one_job_body(
             error=error,
             delivery_outcome=delivery_outcome,
         )
+        _run_post_script(job, execution_id)
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
@@ -7286,7 +7415,12 @@ def _run_one_job_body(
                 job["id"], record_err,
             )
         if not isinstance(e, Exception):
+            # Cancellation / KeyboardInterrupt / SystemExit: the gateway is
+            # tearing down. The hook's subprocess would hold shutdown for up
+            # to _POST_SCRIPT_TIMEOUT_SECONDS, and this run's outcome is not
+            # final anyway — skip it and let the exception propagate.
             raise
+        _run_post_script(job, execution_id)
         return False
 
 

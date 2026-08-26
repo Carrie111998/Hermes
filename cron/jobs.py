@@ -1933,6 +1933,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    post_script: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1990,6 +1991,13 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        post_script: Optional path to a script run AFTER the run has been
+                recorded, on both the success and the failure path (same
+                resolution/containment rules as ``script``). It receives
+                ``HERMES_JOB_ID`` and ``HERMES_RUN_ID`` in its environment,
+                so a job can declare its outcome to an external tracker,
+                release a claim, or kick a downstream pipeline. Best-effort:
+                a failing post_script is logged, never fails the run.
         reasoning_effort: Optional per-job reasoning effort pin. One of the
                 canonical Hermes levels (none|minimal|low|medium|high|xhigh|
                 max|ultra, case-insensitive). When set, it wins over BOTH the
@@ -2037,6 +2045,8 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_post_script = str(post_script).strip() if isinstance(post_script, str) else None
+    normalized_post_script = normalized_post_script or None
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2111,6 +2121,9 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        # Optional hook run after the run is recorded, on both the success
+        # and the failure path — lets a job declare its outcome downstream.
+        "post_script": normalized_post_script,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
         # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
@@ -2247,13 +2260,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
-            # Normalize monitor fields the same way create_job does (empty
-            # string clears the field).
-            for _mon_field in ("monitor_script", "monitor_url"):
-                if _mon_field in updates:
-                    _mv = updates[_mon_field]
-                    _mv = str(_mv).strip() if isinstance(_mv, str) else None
-                    updates[_mon_field] = _mv or None
+            # Normalize the optional path/URL fields the same way create_job
+            # does (empty string clears the field).
+            for _opt_field in ("monitor_script", "monitor_url", "post_script"):
+                if _opt_field in updates:
+                    _ov = updates[_opt_field]
+                    _ov = str(_ov).strip() if isinstance(_ov, str) else None
+                    updates[_opt_field] = _ov or None
 
             # Validate/normalize the per-job reasoning effort pin the same
             # way create_job does: canonical grammar only, empty string (or
