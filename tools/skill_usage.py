@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,56 @@ def _read_bundled_manifest_names() -> Set[str]:
     return names
 
 
+def _read_name_file(path: Path) -> Set[str]:
+    """Read a newline-delimited name ledger, tolerating comments and I/O errors."""
+    if not path.exists():
+        return set()
+    try:
+        return {
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+    except OSError as e:
+        logger.debug("Failed to read skill name ledger %s: %s", path, e)
+        return set()
+
+
+def _read_bundled_provenance_names() -> Set[str]:
+    """Return names with durable evidence of bundled origin.
+
+    The active manifest intentionally drops skills removed from the current
+    catalog. ``.bundled_history`` retains that provenance, while the curator
+    suppression file repairs profiles archived before the history ledger was
+    introduced.
+    """
+    return (
+        _read_bundled_manifest_names()
+        | _read_name_file(_skills_dir() / ".bundled_history")
+        | read_suppressed_names()
+    )
+
+
+def _clear_historical_bundled_origin(skill_name: str) -> None:
+    """Let an explicit new local creation reclaim a removed bundled name."""
+    if skill_name in _read_bundled_manifest_names():
+        return
+    path = _skills_dir() / ".bundled_history"
+    names = _read_name_file(path)
+    if skill_name in names:
+        names.discard(skill_name)
+        try:
+            atomic_write_text(
+                path,
+                "\n".join(sorted(names)) + ("\n" if names else ""),
+                tmp_prefix=".bundled_history_",
+                preserve_mode=True,
+            )
+        except Exception as e:
+            logger.debug("Failed to clear bundled history for %s: %s", skill_name, e)
+    remove_suppressed_name(skill_name)
+
+
 def _read_hub_installed_names() -> Set[str]:
     """Return the set of skill names installed via the Skills Hub.
 
@@ -350,7 +401,7 @@ def list_agent_created_skill_names() -> List[str]:
     if not base.exists():
         return []
     hub = _read_hub_installed_names()
-    bundled = _read_bundled_manifest_names()
+    bundled = _read_bundled_provenance_names()
     prune_builtins = _prune_builtins_enabled()
     usage = load_usage()
 
@@ -426,7 +477,7 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
 
 def is_agent_created(skill_name: str) -> bool:
     """Whether *skill_name* is neither bundled nor hub-installed."""
-    off_limits = _read_bundled_manifest_names() | _read_hub_installed_names()
+    off_limits = _read_bundled_provenance_names() | _read_hub_installed_names()
     if skill_name in off_limits:
         return False
     return not (
@@ -441,7 +492,12 @@ def is_hub_installed(skill_name: str) -> bool:
 
 
 def is_bundled(skill_name: str) -> bool:
-    """Whether *skill_name* was seeded from the bundled repo skills."""
+    """Whether *skill_name* has durable evidence of bundled origin."""
+    return skill_name in _read_bundled_provenance_names()
+
+
+def is_currently_bundled(skill_name: str) -> bool:
+    """Whether the active sync manifest still tracks *skill_name*."""
     return skill_name in _read_bundled_manifest_names()
 
 
@@ -544,7 +600,7 @@ def list_unmanaged_skill_names() -> List[str]:
     if not base.exists():
         return []
     hub = _read_hub_installed_names()
-    bundled = _read_bundled_manifest_names()
+    bundled = _read_bundled_provenance_names()
     usage = load_usage()
 
     names: List[str] = []
@@ -957,6 +1013,7 @@ def record_created(
 
     facts = _mutate(skill_name, _apply)
     if isinstance(facts, dict):
+        _clear_historical_bundled_origin(skill_name)
         _emit_skill_lifecycle(
             skill_name,
             "created",
@@ -990,9 +1047,13 @@ def mark_agent_created(skill_name: str) -> None:
     _mutate(skill_name, _apply, require_curation_eligible=True)
 
 
-def set_state(skill_name: str, state: str) -> None:
-    """Set lifecycle state. No-op if *state* is invalid or the skill isn't
-    curator-manageable (hub skills, or built-ins with pruning disabled)."""
+def set_state(skill_name: str, state: str, *, force: bool = False) -> None:
+    """Set lifecycle state.
+
+    Automatic transitions require curator eligibility. ``force`` is reserved
+    for an explicit restore, which must reactivate a historical bundled skill
+    even when automatic built-in pruning is disabled.
+    """
     if state not in _VALID_STATES:
         logger.debug("set_state: invalid state %r for %s", state, skill_name)
         return
@@ -1011,7 +1072,11 @@ def set_state(skill_name: str, state: str) -> None:
             "previous_state": previous_state,
         }
 
-    facts = _mutate(skill_name, _apply, require_curation_eligible=True)
+    facts = _mutate(
+        skill_name,
+        _apply,
+        require_curation_eligible=not force,
+    )
     if not isinstance(facts, dict) or not facts.get("changed"):
         return
     action = {
@@ -1170,7 +1235,7 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
         )
     # A bundled built-in is upstream-owned UNLESS prune_builtins is on. With the
     # flag off, restoring over it would shadow the bundled version.
-    if is_bundled(skill_name) and not _prune_builtins_enabled():
+    if is_currently_bundled(skill_name) and not _prune_builtins_enabled():
         return False, (
             f"skill '{skill_name}' is now bundled; "
             "restore would shadow the upstream version"
@@ -1230,7 +1295,7 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     # Restoring a pruned built-in lifts its suppression so updates can manage it.
     remove_suppressed_name(skill_name)
 
-    set_state(skill_name, STATE_ACTIVE)
+    set_state(skill_name, STATE_ACTIVE, force=True)
     try:
         if _ledger is not None:
             _ledger.record_mutation(

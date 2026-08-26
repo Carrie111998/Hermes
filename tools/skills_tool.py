@@ -104,7 +104,7 @@ _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+def _skills_scan_signature(dirs_to_scan, disabled, archived=frozenset()) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
     O(#dirs + #categories) stat calls, not a recursive walk. Includes the
@@ -134,7 +134,7 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    return (tuple(sig), frozenset(disabled), frozenset(archived), platform)
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -688,9 +688,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
-        skip_disabled: If True, return ALL skills regardless of disabled
-            state (used by ``hermes skills`` config UI). Default False
-            filters out disabled skills.
+        skip_disabled: If True, return skills regardless of config-disabled
+            state (used by ``hermes skills`` config UI). Curator-archived local
+            skills remain excluded because archive is lifecycle state, not a
+            presentation toggle. Default False filters config-disabled skills.
 
     Returns:
         List of skill metadata dicts (name, description, category).
@@ -711,6 +712,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
+    try:
+        from tools.skill_usage import STATE_ARCHIVED, load_usage
+
+        archived = {
+            name
+            for name, record in load_usage().items()
+            if isinstance(record, dict) and record.get("state") == STATE_ARCHIVED
+        }
+    except Exception:
+        archived = set()
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -724,7 +735,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, disabled, archived)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -769,6 +780,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
                 if name in seen_names:
+                    continue
+                # Archive state applies to the profile-local copy only. A
+                # project skill with the same name has independent precedence
+                # and must remain discoverable.
+                if scan_dir == active_skills_dir and name in archived:
                     continue
                 if name in disabled:
                     continue

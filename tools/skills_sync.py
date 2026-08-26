@@ -19,7 +19,9 @@ Update logic:
   - DELETED by user (in manifest, absent from user dir): respected, not re-added.
   - REMOVED from bundled (in manifest, gone from repo): cleaned from manifest.
 
-The manifest lives at ~/.hermes/skills/.bundled_manifest.
+The active manifest lives at ~/.hermes/skills/.bundled_manifest. A separate
+``.bundled_history`` name ledger preserves provenance when a skill leaves the
+catalog; it never participates in update decisions.
 """
 
 import hashlib
@@ -94,6 +96,11 @@ def _manifest_file() -> Path:
     if configured != _MANIFEST_FILE_AT_IMPORT:
         return configured
     return _skills_dir() / ".bundled_manifest"
+
+
+def _bundled_history_file() -> Path:
+    """Return the active profile's append-only bundled-origin name ledger."""
+    return _skills_dir() / ".bundled_history"
 
 # Marker file written by `hermes profile create --no-skills` (named profiles)
 # and by the installer's `--no-skills` flag (the default ~/.hermes profile).
@@ -230,6 +237,37 @@ def _write_manifest(entries: Dict[str, str]):
         )
     except Exception as e:
         logger.debug("Failed to write skills manifest %s: %s", _manifest_file(), e, exc_info=True)
+
+
+def _read_bundled_history_names() -> Set[str]:
+    """Read names ever tracked as bundled, independent of current catalog state."""
+    path = _bundled_history_file()
+    if not path.exists():
+        return set()
+    try:
+        return {
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+    except OSError:
+        return set()
+
+
+def _write_bundled_history_names(names: Set[str]) -> None:
+    """Atomically persist bundled provenance without affecting sync decisions."""
+    path = _bundled_history_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = "\n".join(sorted(names)) + ("\n" if names else "")
+    try:
+        atomic_write_text(
+            path,
+            data,
+            tmp_prefix=".bundled_history_",
+            preserve_mode=True,
+        )
+    except Exception as e:
+        logger.debug("Failed to write bundled history %s: %s", path, e, exc_info=True)
 
 
 def _read_skill_name(skill_md: Path, fallback: str) -> str:
@@ -742,6 +780,7 @@ def sync_skills(quiet: bool = False) -> dict:
 
     _skills_dir().mkdir(parents=True, exist_ok=True)
     manifest = _read_manifest()
+    prior_manifest_names = set(manifest)
     bundled_skills = _discover_bundled_skills(bundled_dir)
     if essential_only:
         # Opted-out profile: only the essential skills are synced.
@@ -991,6 +1030,16 @@ def sync_skills(quiet: bool = False) -> dict:
                 logger.debug("Could not copy %s: %s", desc_md, e)
 
     _write_manifest(manifest)
+    # Manifest cleanup is an update-mechanics decision, not evidence that an
+    # on-disk copy became user/agent-authored. Preserve every name that sync has
+    # tracked, plus suppression records written by curator versions predating
+    # this ledger. This also self-heals profiles whose stale manifest entries
+    # were already cleaned by an earlier update.
+    bundled_history = _read_bundled_history_names()
+    bundled_history.update(prior_manifest_names)
+    bundled_history.update(manifest)
+    bundled_history.update(suppressed)
+    _write_bundled_history_names(bundled_history)
     optional_provenance_backfilled = _backfill_optional_provenance(quiet=quiet)
 
     return {

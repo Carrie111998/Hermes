@@ -217,6 +217,18 @@ class TestFindAllSkills:
         assert {s["name"] for s in skills} == {"skill-a", "skill-b", "axolotl"}
         assert [s["category"] for s in skills if s["name"] == "axolotl"] == ["mlops"]
 
+    def test_archived_usage_state_hides_resurrected_local_copy(self, tmp_path):
+        _make_skill(tmp_path, "archived-skill")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "tools.skill_usage.load_usage",
+            return_value={"archived-skill": {"state": "archived"}},
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            skills = _find_all_skills(skip_disabled=True)
+
+        assert "archived-skill" not in {s["name"] for s in skills}
+
 
     def test_description_falls_back_to_body_and_is_truncated(self, tmp_path):
         no_desc = tmp_path / "no-desc"

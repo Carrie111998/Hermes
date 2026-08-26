@@ -263,7 +263,9 @@ def build_learning_graph() -> dict[str, Any]:
     learned_skills = {
         name: node
         for name, node in all_skills.items()
-        if node.source != "base" and (node.created_by == "agent" or node.use_count > 0)
+        if node.source != "base"
+        and node.state != "archived"
+        and (node.created_by == "agent" or node.use_count > 0)
     }
     skill_edges = build_edges(learned_skills)
     memory_cards = _memory_cards()

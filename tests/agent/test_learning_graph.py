@@ -79,3 +79,33 @@ def test_full_payload_shape_and_edge_integrity(tmp_path):
     assert graph["stats"]["nodes"] == len(skill_nodes)
     assert graph["stats"]["memory_nodes"] == len(graph["memory"])
     assert all("timestamp" in n for n in graph["nodes"])
+
+
+def test_archived_skill_is_not_part_of_learning_graph(tmp_path, monkeypatch):
+    profile = tmp_path / "skills"
+    skill = profile / "archived-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: archived-skill\ndescription: Archived.\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        learning_graph,
+        "_load_usage",
+        lambda: {
+            "archived-skill": {
+                "state": "archived",
+                "created_by": "agent",
+                "use_count": 4,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        learning_graph,
+        "_skill_roots",
+        lambda: [("profile", profile)],
+    )
+
+    graph = learning_graph.build_learning_graph()
+
+    assert "archived-skill" not in {node["id"] for node in graph["nodes"]}

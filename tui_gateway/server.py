@@ -14102,14 +14102,14 @@ def _skill_usage_lookup():
     """
     try:
         from tools.skill_usage import (
-            _read_bundled_manifest_names,
+            _read_bundled_provenance_names,
             _read_hub_installed_names,
             activity_count,
             load_usage,
         )
 
         records = load_usage()
-        bundled = _read_bundled_manifest_names()
+        bundled = _read_bundled_provenance_names()
         hub = _read_hub_installed_names()
     except Exception as e:
         logger.debug("skill usage lookup unavailable: %s", e)

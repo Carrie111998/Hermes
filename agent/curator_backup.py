@@ -21,6 +21,7 @@ It DOES include:
     pointer — otherwise the curator would immediately re-fire on the next
     tick)
   - ``.bundled_manifest`` (so protection markers stay consistent)
+  - ``.bundled_history`` (so removed catalog skills retain their provenance)
   - ``.curator_suppressed`` (so rollback restores the set of pruned built-ins
     the re-seeder must leave archived)
 

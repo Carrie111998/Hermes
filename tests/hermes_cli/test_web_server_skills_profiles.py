@@ -7,6 +7,8 @@ process. Before the ``profile`` parameter existed, toggling a skill after
 These tests pin the new behavior: reads and writes land in the REQUESTED
 profile's HERMES_HOME, and the dashboard's own profile stays untouched.
 """
+import json
+
 import pytest
 import yaml
 
@@ -63,6 +65,27 @@ def _load_cfg(home):
 
 
 class TestProfileScopedSkills:
+
+    def test_list_uses_history_provenance_and_hides_archived_copy(
+        self, client, isolated_profiles
+    ):
+        default_skills = isolated_profiles["default"] / "skills"
+        default_skills.joinpath(".bundled_history").write_text(
+            "dashboard-skill\n", encoding="utf-8"
+        )
+        default = client.get("/api/skills")
+        assert default.status_code == 200
+        by_name = {skill["name"]: skill for skill in default.json()}
+        assert by_name["dashboard-skill"]["provenance"] == "bundled"
+
+        worker_skills = isolated_profiles["worker_alpha"] / "skills"
+        worker_skills.joinpath(".usage.json").write_text(
+            json.dumps({"worker-skill": {"state": "archived"}}),
+            encoding="utf-8",
+        )
+        worker = client.get("/api/skills", params={"profile": "worker_alpha"})
+        assert worker.status_code == 200
+        assert "worker-skill" not in {skill["name"] for skill in worker.json()}
 
 
     def test_toggle_writes_into_target_profile_only(self, client, isolated_profiles):

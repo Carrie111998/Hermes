@@ -86,6 +86,19 @@ def test_get_record_missing_returns_empty_record(skills_home):
     assert rec["archived_at"] is None
 
 
+def test_bundled_provenance_includes_history_and_suppression(skills_home):
+    from tools.skill_usage import is_bundled, provenance
+
+    skills = skills_home / "skills"
+    (skills / ".bundled_history").write_text("removed-upstream\n", encoding="utf-8")
+    (skills / ".curator_suppressed").write_text("archived-before-history\n", encoding="utf-8")
+
+    assert is_bundled("removed-upstream") is True
+    assert provenance("removed-upstream") == "bundled"
+    assert is_bundled("archived-before-history") is True
+    assert provenance("archived-before-history") == "bundled"
+
+
 def test_load_usage_handles_corrupt_file(skills_home):
     from tools.skill_usage import load_usage, _usage_file
     _usage_file().write_text("{ not json }", encoding="utf-8")
@@ -257,6 +270,45 @@ def test_created_skill_does_not_inherit_stale_identity_or_continuity(
     assert [event["provenance"] for event in events] == ["local", "local"]
     assert events[-1]["reused"] is False
     assert events[-1]["reuse_after_patch"] is False
+
+
+def test_explicit_creation_reclaims_removed_bundled_name(skills_home):
+    from tools import skill_usage
+
+    skills = skills_home / "skills"
+    history = skills / ".bundled_history"
+    suppressed = skills / ".curator_suppressed"
+    history.write_text("recreated\n", encoding="utf-8")
+    suppressed.write_text("recreated\n", encoding="utf-8")
+
+    skill_usage.record_created("recreated", agent_created=True)
+
+    assert skill_usage.provenance("recreated") == "agent"
+    assert "recreated" not in skill_usage.read_suppressed_names()
+    assert "recreated" not in skill_usage._read_name_file(history)
+
+
+def test_restore_reactivates_historical_bundled_skill_when_pruning_is_off(
+    skills_home, monkeypatch
+):
+    from tools import skill_usage
+
+    skills = skills_home / "skills"
+    archived = skills / ".archive" / "legacy"
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text(
+        "---\nname: legacy\ndescription: Legacy.\n---\n", encoding="utf-8"
+    )
+    (skills / ".bundled_history").write_text("legacy\n", encoding="utf-8")
+    skill_usage.save_usage({"legacy": {"state": skill_usage.STATE_ARCHIVED}})
+    monkeypatch.setattr(skill_usage, "_prune_builtins_enabled", lambda: False)
+
+    ok, _ = skill_usage.restore_skill("legacy")
+
+    assert ok is True
+    assert skill_usage.get_record("legacy")["state"] == skill_usage.STATE_ACTIVE
+    assert (skills / "legacy" / "SKILL.md").exists()
+
 
 def test_malformed_usage_counters_recover_without_losing_patch_reuse(
     skills_home,

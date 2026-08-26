@@ -432,7 +432,7 @@ async def get_skills(profile: Optional[str] = None):
     from tools.skills_tool import _find_all_skills
     from hermes_cli.skills_config import get_disabled_skills
     from tools.skill_usage import (
-        _read_bundled_manifest_names,
+        _read_bundled_provenance_names,
         _read_hub_installed_names,
         activity_count,
         load_usage,
@@ -447,7 +447,7 @@ async def get_skills(profile: Optional[str] = None):
             # without a per-skill manifest read): hub > bundled > agent, where
             # "agent" covers agent-authored AND local hand-made skills — the ones
             # the user may edit/delete from the UI.
-            bundled_names = _read_bundled_manifest_names()
+            bundled_names = _read_bundled_provenance_names()
             hub_names = _read_hub_installed_names()
         for s in skills:
             s["enabled"] = s["name"] not in disabled

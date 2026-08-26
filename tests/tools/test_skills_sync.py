@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from tools.skills_sync import (
     _get_bundled_dir,
+    _read_bundled_history_names,
     _read_manifest,
     _read_skill_name,
     _write_manifest,
@@ -483,6 +484,28 @@ class TestSyncSkills:
         assert not (skills_dir / "old-skill").exists()
         assert "removed-skill" in result["cleaned"]
         assert "removed-skill" not in manifest
+
+    def test_stale_manifest_cleanup_preserves_bundled_origin_history(self, tmp_path):
+        """A removed upstream skill keeps its catalog provenance after cleanup."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        orphan = skills_dir / "legacy-skill"
+        orphan.mkdir(parents=True)
+        (orphan / "SKILL.md").write_text(
+            "---\nname: legacy-skill\n---\nlegacy\n", encoding="utf-8"
+        )
+        manifest_file.write_text("legacy-skill:oldhash\n", encoding="utf-8")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+            manifest = _read_manifest()
+            history = _read_bundled_history_names()
+
+        assert "legacy-skill" in result["cleaned"]
+        assert "legacy-skill" not in manifest
+        assert "legacy-skill" in history
+        assert orphan.exists(), "sync must not delete a legacy skill behind the user's back"
 
 
     def test_copy_failure_does_not_poison_manifest_or_destroy_user_copy(self, tmp_path):
