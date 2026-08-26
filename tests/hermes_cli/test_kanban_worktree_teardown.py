@@ -75,9 +75,34 @@ def _branch_exists(repo: Path, branch: str) -> bool:
     return bool(out.strip())
 
 
+def _worktree_is_locked(repo: Path, worktree: Path) -> bool:
+    listing = _git("-C", str(repo), "worktree", "list", "--porcelain")
+    blocks = [block for block in listing.strip().split("\n\n") if block]
+    target = str(worktree.resolve())
+    return any(
+        block.splitlines()[0] == f"worktree {target}"
+        and any(line.startswith("locked") for line in block.splitlines()[1:])
+        for block in blocks
+    )
+
+
 # ---------------------------------------------------------------------------
 # _cleanup_worktree_workspace unit behavior
 # ---------------------------------------------------------------------------
+
+
+def test_materialized_task_worktree_is_locked_until_lifecycle_cleanup(repo: Path) -> None:
+    wt = _make_worktree(repo, "t_aabbccdd")
+    assert _worktree_is_locked(repo, wt)
+    attempted = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "remove", str(wt)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert attempted.returncode != 0
+    assert "locked working tree" in attempted.stderr
+    assert wt.is_dir()
 
 
 def test_clean_pushed_worktree_removed(repo: Path) -> None:
@@ -126,6 +151,48 @@ def test_non_git_dir_preserved(tmp_path: Path) -> None:
     plain.mkdir()
     kb._cleanup_worktree_workspace("t_ffff6666", str(plain))
     assert plain.is_dir()
+
+
+def test_foreign_locked_worktree_is_preserved(repo: Path) -> None:
+    wt = _make_worktree(repo, "t_f0f0f0f0")
+    _git("-C", str(repo), "worktree", "unlock", str(wt))
+    _git(
+        "-C", str(repo), "worktree", "lock", "--reason",
+        "active Hermes Kanban task wt/t_other", str(wt)
+    )
+    kb._cleanup_worktree_workspace("t_f0f0f0f0", str(wt))
+    assert wt.is_dir()
+    assert _worktree_is_locked(repo, wt)
+
+
+def test_relock_between_owned_unlock_and_remove_is_preserved(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _make_worktree(repo, "t_12121212")
+    original_run = subprocess.run
+    relocked = False
+
+    def run_with_relock(args, *positional, **kwargs):
+        nonlocal relocked
+        result = original_run(args, *positional, **kwargs)
+        if (
+            not relocked
+            and isinstance(args, list)
+            and args[-3:-1] == ["worktree", "unlock"]
+            and args[-1] == str(wt)
+        ):
+            relocked = True
+            _git(
+                "-C", str(repo), "worktree", "lock", "--reason",
+                "coding router result", str(wt)
+            )
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run_with_relock)
+    kb._cleanup_worktree_workspace("t_12121212", str(wt))
+    assert relocked
+    assert wt.is_dir()
+    assert _worktree_is_locked(repo, wt)
 
 
 def test_tree_dirtied_between_check_and_removal_preserved(
