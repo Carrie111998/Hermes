@@ -14,6 +14,32 @@ always stay on the bus for audit/critic consumers — these only gate chat):
     (2026-04-28 incident shape).
   * FlapGuard: state-transition collapse for up/down signals — the
     WhatsApp-bridge flap delivered 898 alternating messages/week.
+
+A fourth concept lives here because it is the same kind of decision:
+
+  * is_off_ladder_consecutive_failure(): cron_failed_consecutive is a
+    MONOTONE ESCALATING signal, not a flapping one, and RepeatGuard
+    cannot see that — normalize_for_fingerprint() collapses the one
+    field that carries the severity (``consecutive_errors``) to "N".
+    The ladder makes the producer effectively rising-edge: only
+    3, 6, 12, 24, 48 ... reach chat, and those bypass RepeatGuard
+    because the ladder IS their rate limit.
+
+Why both were needed (2026-08-25 postmortem). During the Docker outage
+postgres-sync emitted 22 cron_failed_consecutive events at
+priority=critical over 4h17m, reaching consecutive_errors=15. Four were
+delivered. Three of those four were accidents — a gateway restart wiping
+this module's in-memory state, and the error STRING changing — not
+severity. The v3 design foresaw the normalization tradeoff
+(docs/superpowers/specs/2026-07-18-notification-routing-v3-design.md,
+"a WARN that worsens only numerically ... is suppressed; rising-edge
+producers + 30-min window bound the delay") but both halves of that
+mitigation were false here: this producer is not rising-edge (it
+re-emits on every failure), and the window did not bound the delay
+because it SLID — every suppressed hit re-stamped it, and the job failed
+every ~13-15 min, inside the 30-min window, indefinitely. The result was
+that a four-hour outage was QUIETER than a transient blip, because by
+then the guard was warm.
 """
 
 from __future__ import annotations
@@ -88,11 +114,76 @@ def is_sustained_resource_repeat(event) -> bool:
             and payload.get("change") == "sustained_repeat")
 
 
+# cron_failed_consecutive ladder. Base MUST track
+# events.producers.cron_emitter.CONSECUTIVE_FAILURE_THRESHOLD — the first
+# rung has to be the first value the producer can ever emit, or the very
+# first alarm of an outage is the one that gets dropped. Kept as a literal
+# rather than an import because this module is deliberately dependency-free
+# (see is_sustained_resource_repeat); tests/events/test_noise_guards.py
+# asserts the two constants agree, so the duplication is checked, not
+# trusted.
+CONSECUTIVE_FAILURE_LADDER_BASE = 3
+
+
+def is_consecutive_failure_ladder_step(count) -> bool:
+    """True iff ``count`` is a rung: base * 2**k — 3, 6, 12, 24, 48, ...
+
+    Unbounded by construction: an outage lasting all night keeps halving
+    its own message rate instead of hitting a final rung and either going
+    silent or machine-gunning. bools are rejected explicitly because
+    ``isinstance(True, int)`` is True and ``True == 1`` would otherwise
+    make a malformed payload look like a near-rung.
+    """
+    if isinstance(count, bool) or not isinstance(count, int):
+        return False
+    if count < CONSECUTIVE_FAILURE_LADDER_BASE:
+        return False
+    quotient, remainder = divmod(count, CONSECUTIVE_FAILURE_LADDER_BASE)
+    if remainder:
+        return False
+    # power-of-two test: exactly one bit set
+    return quotient & (quotient - 1) == 0
+
+
+def is_off_ladder_consecutive_failure(event) -> bool:
+    """True → suppress this cron_failed_consecutive from CHAT (it stays on
+    the bus for audit/critic/digest, exactly like every other guard here).
+
+    Returns False for every other event type, and False for a payload whose
+    ``consecutive_errors`` is missing or not an int — an unreadable payload
+    must still page. Duck-typed for the same reason as
+    is_sustained_resource_repeat: no events.schema import.
+    """
+    type_string = getattr(getattr(event, "event_type", None), "type_string", "")
+    if type_string != "cron_failed_consecutive":
+        return False
+    payload = getattr(event, "payload", None) or {}
+    count = payload.get("consecutive_errors")
+    if isinstance(count, bool) or not isinstance(count, int):
+        return False
+    return not is_consecutive_failure_ladder_step(count)
+
+
 class RepeatGuard:
     """Suppress verbatim repeats of (key, text) within ``window_seconds``.
 
     Never apply to ACT-class routes (call-site responsibility): an
     operator action item must always land even if worded identically.
+
+    Two window disciplines, chosen per call (``sliding=``):
+
+      * SLIDING (default) — every suppressed hit re-stamps the entry, so
+        the key stays muted until the repeats actually STOP. Correct for
+        the flood this guard was built for: ``devflow-bridge: [SILENT]``
+        x1,522/week says nothing new on repeat, and the operator wants
+        silence until it changes.
+      * NON-SLIDING — the window is measured from the FIRST delivery and
+        is allowed to expire while repeats continue, so a persistent
+        condition costs one message per window instead of one message
+        ever. Correct for a SUSTAINED FAULT, where the repeat is not
+        "nothing new" but "still broken, N minutes longer". Call sites
+        pass sliding=False for WARN+CRITICAL routes; see the 2026-08-25
+        note in the module docstring for what the sliding default cost.
     """
 
     def __init__(self, window_seconds: float = 1800.0, max_entries: int = 512):
@@ -111,14 +202,34 @@ class RepeatGuard:
             normalize_for_fingerprint(text).encode("utf-8", "replace")
         ).hexdigest()
 
-    def is_repeat(self, key: str, text: str, now: Optional[float] = None) -> bool:
-        """Record and decide in one call: True → caller should suppress."""
+    def is_repeat(
+        self,
+        key: str,
+        text: str,
+        now: Optional[float] = None,
+        *,
+        sliding: bool = True,
+    ) -> bool:
+        """Record and decide in one call: True → caller should suppress.
+
+        ``sliding`` selects the window discipline (see the class docstring).
+        Keyword-only so a call site cannot select it by accident through the
+        ``now`` positional, which the tests pass.
+        """
         now = time.monotonic() if now is None else now
         fp = (key, self._fingerprint(text))
         last = self._seen.get(fp)
         if last is not None and (now - last) < self.window_seconds:
-            self._seen[fp] = now  # sliding window: a message that keeps
-            self._seen.move_to_end(fp)  # repeating stays suppressed
+            if sliding:
+                self._seen[fp] = now  # a message that keeps repeating
+                self._seen.move_to_end(fp)  # stays suppressed
+            else:
+                # Leave the original timestamp in place so the window can
+                # expire underneath a continuing fault. Still refresh LRU
+                # position: a key being actively suppressed must not be the
+                # first thing evicted by max_entries, or eviction would
+                # silently hand it a fresh window early.
+                self._seen.move_to_end(fp)
             self.suppressed_count += 1
             return True
         self._seen[fp] = now
